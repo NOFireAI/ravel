@@ -12,6 +12,14 @@
 //! every hit and every fresh decode, not here: the cache only stores and
 //! evicts.
 //!
+//! Both record caches are held to a byte budget as well as an entry cap,
+//! because neither record type has a bounded size: `CommitRecord` and
+//! `CompactionPart` both carry a `declared_column_stats` list that the format
+//! does not cap, and a `CompactionRecord` carries one input identity per
+//! compacted L0 segment. Each entry is charged an estimate of its live heap
+//! ([`commit_entry_resident_bytes`], [`compaction_entry_resident_bytes`]) and
+//! eviction runs until the tenant's summed charge is inside its budget.
+//!
 //! A `capacity` of 0 is the disabled sentinel (matching
 //! [`CatalogConfig::byte_cache_max_bytes`](crate::CatalogConfig::byte_cache_max_bytes)):
 //! nothing is admitted at all, so every read falls through to a store GET.
@@ -35,6 +43,43 @@ use ravel_types::{Signal, TenantHash};
 
 use crate::snapshot_format::{DecodedPart, DecodedPostings};
 
+/// Charged cost of one cached commit entry beyond its variable-length
+/// members: the `CommitRecord` struct (about 224 bytes of scalars and
+/// `Vec`/`String` headers), its `Arc` allocation, the [`RecordEntry`] wrapper's
+/// own fields, the key `String` header held twice (the entry map and the
+/// recency index) and the two collections' slot overhead. The members that
+/// vary in length are charged separately by [`commit_entry_resident_bytes`].
+const COMMIT_ENTRY_FIXED_BYTES: u64 = 416;
+
+/// Estimated live heap one cached commit entry holds, the figure
+/// [`TenantCache`] evicts against.
+///
+/// `CommitRecord.declared_column_stats` is a repeated field capped neither by
+/// the format (proto/ravel/commit.proto) nor by
+/// `ravel_commit::record::validate`, and the tenant-config declared-column path
+/// does not bound the count either
+/// (`ravel_commit::declared_stats`'s own
+/// `an_entry_count_above_any_declared_column_list_is_read_in_full` decodes
+/// 4,096 entries in one record), so an entry-count bound does not bound this
+/// cache's memory. Each statistic is charged on the same basis a compaction
+/// part's is ([`DECLARED_COLUMN_STAT_FIXED_BYTES`] plus its column name), since
+/// it is the same `DeclaredColumnMinMax` struct. An estimate, not a
+/// measurement of the allocator.
+fn commit_entry_resident_bytes(key: &str, record: &CommitRecord) -> u64 {
+    let stats: u64 = record
+        .declared_column_stats
+        .iter()
+        .map(|stat| DECLARED_COLUMN_STAT_FIXED_BYTES + stat.name.len() as u64)
+        .sum();
+    COMMIT_ENTRY_FIXED_BYTES
+        + 2 * key.len() as u64
+        + record.tenant_hash.len() as u64
+        + record.writer_id.len() as u64
+        + record.object_key.len() as u64
+        + record.content_hash.len() as u64
+        + stats
+}
+
 /// One cached commit record plus the recency stamp that positions it in
 /// [`TenantCache::by_use`].
 struct RecordEntry {
@@ -42,6 +87,9 @@ struct RecordEntry {
     /// Size of the raw object this was decoded from, captured at insert so a
     /// hit never re-derives it (see the module docs on accounting).
     bytes: u64,
+    /// What this entry is charged against the tenant's byte budget
+    /// ([`commit_entry_resident_bytes`]); not what a hit reports.
+    resident_bytes: u64,
     use_tick: u64,
 }
 
@@ -55,6 +103,8 @@ struct TenantCache {
     /// prewarm, then the sequential include pass).
     by_use: std::collections::BTreeMap<u64, String>,
     next_tick: u64,
+    /// Summed [`RecordEntry::resident_bytes`] of everything in `entries`.
+    charged_bytes: u64,
 }
 
 impl TenantCache {
@@ -72,7 +122,20 @@ impl TenantCache {
         Some(hit)
     }
 
-    fn insert(&mut self, key: String, record: Arc<CommitRecord>, bytes: u64, capacity: usize) {
+    /// Admit `record` and evict least-recently-used until the cache is inside
+    /// BOTH bounds: `max_bytes` of charged residency and `capacity` entries.
+    /// The byte bound is the one that holds this cache to its share of
+    /// `MAX_RECORD_CACHE_BYTES_PER_TENANT`, because `CommitRecord` carries an
+    /// uncapped `declared_column_stats` list and so has no bounded per-entry
+    /// size (see [`commit_entry_resident_bytes`]).
+    fn insert(
+        &mut self,
+        key: String,
+        record: Arc<CommitRecord>,
+        bytes: u64,
+        capacity: usize,
+        max_bytes: u64,
+    ) {
         if capacity == 0 {
             return;
         }
@@ -83,20 +146,25 @@ impl TenantCache {
         }
         let tick = self.next_tick;
         self.next_tick += 1;
+        let resident_bytes = commit_entry_resident_bytes(&key, &record);
+        self.charged_bytes = self.charged_bytes.saturating_add(resident_bytes);
         self.entries.insert(
             key.clone(),
             RecordEntry {
                 record,
                 bytes,
+                resident_bytes,
                 use_tick: tick,
             },
         );
         self.by_use.insert(tick, key);
-        while self.entries.len() > capacity {
+        while self.entries.len() > capacity || self.charged_bytes > max_bytes {
             let Some((_, evicted)) = self.by_use.pop_first() else {
                 break;
             };
-            self.entries.remove(&evicted);
+            if let Some(evicted) = self.entries.remove(&evicted) {
+                self.charged_bytes = self.charged_bytes.saturating_sub(evicted.resident_bytes);
+            }
         }
     }
 }
@@ -150,12 +218,33 @@ impl RecordCache {
         record: Arc<CommitRecord>,
         bytes: u64,
         capacity: usize,
+        max_bytes: u64,
     ) {
         self.tenants
             .lock()
             .entry(tenant)
             .or_default()
-            .insert(key, record, bytes, capacity);
+            .insert(key, record, bytes, capacity, max_bytes);
+    }
+
+    /// Charged residency currently held for `tenant`, the figure eviction
+    /// holds inside
+    /// [`CatalogConfig::commit_cache_max_bytes_per_tenant`](crate::CatalogConfig::commit_cache_max_bytes_per_tenant).
+    #[cfg(test)]
+    pub(crate) fn charged_bytes(&self, tenant: &TenantHash) -> u64 {
+        self.tenants
+            .lock()
+            .get(tenant)
+            .map_or(0, |cache| cache.charged_bytes)
+    }
+
+    /// Number of entries currently resident for `tenant`.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self, tenant: &TenantHash) -> usize {
+        self.tenants
+            .lock()
+            .get(tenant)
+            .map_or(0, |cache| cache.entries.len())
     }
 
     /// Drop every cached record for `tenant` whose key starts with `prefix`.
@@ -165,7 +254,16 @@ impl RecordCache {
     /// serve a record the sweep is about to physically remove.
     pub(crate) fn invalidate_prefix(&self, tenant: &TenantHash, prefix: &str) {
         if let Some(cache) = self.tenants.lock().get_mut(tenant) {
-            cache.entries.retain(|k, _| !k.starts_with(prefix));
+            let mut dropped: u64 = 0;
+            cache.entries.retain(|k, entry| {
+                if k.starts_with(prefix) {
+                    dropped = dropped.saturating_add(entry.resident_bytes);
+                    false
+                } else {
+                    true
+                }
+            });
+            cache.charged_bytes = cache.charged_bytes.saturating_sub(dropped);
             cache.by_use.retain(|_, k| !k.starts_with(prefix));
         }
     }
@@ -190,13 +288,17 @@ const COMPACTION_ENTRY_FIXED_BYTES: u64 = 320;
 /// `writer_id` heap allocation is charged on top, per input.
 const COMPACTION_INPUT_FIXED_BYTES: u64 = 40;
 /// Charged cost of one decoded `CompactionPart` struct as it sits in the
-/// `parts` vector: three `Vec<u8>` headers, six `u64`s, two `i64`s, two
-/// `u32`s and the `declared_column_stats` vector header. Its byte vectors and
+/// `parts` vector: three `Vec<u8>` headers (72), four `u64`s (32), two `i64`s
+/// (16), two `u32`s (8) and the `declared_column_stats` vector header (24),
+/// which is 152 rounded up to the next multiple of 16. Its byte vectors and
 /// statistics are charged on top.
 const COMPACTION_PART_FIXED_BYTES: u64 = 160;
 /// Charged cost of one decoded `DeclaredColumnMinMax` struct: a `String`
 /// header, a `u32`, two optional message-typed extrema and a `u64`. The
-/// column name's heap allocation is charged on top.
+/// column name's heap allocation is charged on top. Both record types carry
+/// this same struct, so both charge it the same way: on a `CompactionPart` via
+/// [`compaction_entry_resident_bytes`], on a `CommitRecord` via
+/// [`commit_entry_resident_bytes`].
 const DECLARED_COLUMN_STAT_FIXED_BYTES: u64 = 80;
 
 /// Estimated live heap one cached compaction entry holds, the figure
@@ -265,8 +367,9 @@ impl CompactionTenantCache {
     /// bounds: `max_bytes` of charged residency and `capacity` entries. The
     /// byte bound is the one that holds this cache to its share of
     /// `MAX_RECORD_CACHE_BYTES_PER_TENANT`, because a single compaction record
-    /// can hold thousands of inputs and so cost hundreds of times what one
-    /// commit-record entry does (see [`compaction_entry_resident_bytes`]). A
+    /// can hold thousands of inputs and so cost hundreds of times what an
+    /// ordinary commit-record entry does (see
+    /// [`compaction_entry_resident_bytes`]). A
     /// `max_bytes` of `0` is the disabled sentinel `cache_capacity_per_tenant
     /// == 0` resolves to: the entry is admitted and immediately evicted, so
     /// nothing is ever resident.
@@ -305,9 +408,9 @@ impl CompactionTenantCache {
 
 /// Decoded compaction-record cache, partitioned by tenant and keyed by full
 /// object key, like [`RecordCache`] (docs/catalog-and-mvcc.md step 2:
-/// compaction records are cached the same way commit records are) but bounded
-/// in BYTES rather than in entries: a compaction record's size grows with its
-/// input list, so an entry count does not bound its memory (see
+/// compaction records are cached the same way commit records are), bounded in
+/// BYTES as well as in entries like [`RecordCache`]: a compaction record's size
+/// grows with its input list, so an entry count does not bound its memory (see
 /// [`compaction_entry_resident_bytes`] and
 /// [`CatalogConfig::compaction_cache_max_bytes_per_tenant`](crate::CatalogConfig::compaction_cache_max_bytes_per_tenant)).
 /// Compaction records are immutable once published, so entries are only ever
@@ -707,6 +810,34 @@ mod tests {
         }
     }
 
+    /// A commit record carrying `columns` declared column statistics, the shape
+    /// whose size the entry-count bound could not see: each statistic is a
+    /// `DeclaredColumnMinMax` with its own name, and neither
+    /// proto/ravel/commit.proto nor `ravel_commit::record::validate` caps how
+    /// many a record carries.
+    fn record_with_declared_columns(
+        tenant_hash: [u8; 16],
+        shard: u32,
+        columns: usize,
+    ) -> CommitRecord {
+        CommitRecord {
+            declared_column_stats: (0..columns)
+                .map(|i| ravel_proto::commit::v1::DeclaredColumnMinMax {
+                    name: format!("attr.column_{i:04}"),
+                    declared_type: 1,
+                    min: None,
+                    max: None,
+                    null_count: 0,
+                })
+                .collect(),
+            ..record(tenant_hash, shard)
+        }
+    }
+
+    /// A budget wide enough that the entry cap is what binds, for the tests
+    /// that are about the entry cap.
+    const UNBOUNDED_BYTES: u64 = u64::MAX;
+
     #[test]
     fn miss_then_hit() {
         let cache = RecordCache::default();
@@ -719,6 +850,7 @@ mod tests {
             Arc::new(record([1; 16], 0)),
             42,
             10,
+            UNBOUNDED_BYTES,
         );
         assert!(cache.get(&tenant, "k", &accounting).is_some());
 
@@ -734,7 +866,14 @@ mod tests {
         let tenant = TenantHash([2; 16]);
         let accounting = QueryAccounting::new();
         for i in 0..5 {
-            cache.insert(tenant, format!("k{i}"), Arc::new(record([2; 16], 0)), 1, 3);
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(record([2; 16], 0)),
+                1,
+                3,
+                UNBOUNDED_BYTES,
+            );
         }
         // Oldest two evicted, most recent three retained.
         assert!(cache.get(&tenant, "k0", &accounting).is_none());
@@ -755,7 +894,14 @@ mod tests {
         let tenant = TenantHash([16; 16]);
         let accounting = QueryAccounting::new();
         for i in 0..3 {
-            cache.insert(tenant, format!("k{i}"), Arc::new(record([16; 16], 0)), 1, 3);
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(record([16; 16], 0)),
+                1,
+                3,
+                UNBOUNDED_BYTES,
+            );
         }
         // Read the oldest-inserted entry: now the least-recently-used is k1.
         assert!(cache.get(&tenant, "k0", &accounting).is_some());
@@ -765,6 +911,7 @@ mod tests {
             Arc::new(record([16; 16], 0)),
             1,
             3,
+            UNBOUNDED_BYTES,
         );
 
         assert!(
@@ -789,7 +936,14 @@ mod tests {
         let tenant = TenantHash([17; 16]);
         let accounting = QueryAccounting::new();
         for i in 0..3 {
-            cache.insert(tenant, format!("k{i}"), Arc::new(record([17; 16], 0)), 1, 3);
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(record([17; 16], 0)),
+                1,
+                3,
+                UNBOUNDED_BYTES,
+            );
         }
         cache.insert(
             tenant,
@@ -797,6 +951,7 @@ mod tests {
             Arc::new(record([17; 16], 0)),
             1,
             3,
+            UNBOUNDED_BYTES,
         );
         cache.insert(
             tenant,
@@ -804,6 +959,7 @@ mod tests {
             Arc::new(record([17; 16], 0)),
             1,
             3,
+            UNBOUNDED_BYTES,
         );
 
         assert!(cache.get(&tenant, "k0", &accounting).is_some());
@@ -817,7 +973,14 @@ mod tests {
         let cache = RecordCache::default();
         let tenant = TenantHash([18; 16]);
         let accounting = QueryAccounting::new();
-        cache.insert(tenant, "k".to_string(), Arc::new(record([18; 16], 0)), 1, 0);
+        cache.insert(
+            tenant,
+            "k".to_string(),
+            Arc::new(record([18; 16], 0)),
+            1,
+            0,
+            0,
+        );
         assert!(cache.get(&tenant, "k", &accounting).is_none());
     }
 
@@ -827,9 +990,286 @@ mod tests {
         let a = TenantHash([3; 16]);
         let b = TenantHash([4; 16]);
         let accounting = QueryAccounting::new();
-        cache.insert(a, "k".to_string(), Arc::new(record([3; 16], 0)), 1, 10);
+        cache.insert(
+            a,
+            "k".to_string(),
+            Arc::new(record([3; 16], 0)),
+            1,
+            10,
+            UNBOUNDED_BYTES,
+        );
         assert!(cache.get(&a, "k", &accounting).is_some());
         assert!(cache.get(&b, "k", &accounting).is_none());
+    }
+
+    /// `RECORD_CACHE_ENTRY_BYTES` is the planning rate the derived capacity is
+    /// sized against, so it has to bound what an ordinary entry actually
+    /// charges. Pins the 863-byte breakdown
+    /// `DEFAULT_CACHE_CAPACITY_PER_TENANT`'s documentation states, against real
+    /// keys rather than round numbers: a 119-byte commit key held twice, the
+    /// fixed struct cost, and the record's own heap (16-byte tenant hash,
+    /// 36-byte writer uuid, 125-byte data object key, 32-byte content hash).
+    #[test]
+    fn the_per_entry_planning_figure_bounds_an_ordinary_records_charge() {
+        let tenant = TenantHash([25; 16]);
+        let writer_id = uuid::Uuid::from_u128(1);
+        let content_hash = [7u8; 32];
+        let object_key = keys::data_key(
+            &tenant,
+            Signal::Metrics,
+            0,
+            writer_id,
+            1,
+            0,
+            &content_hash,
+        )
+        .expect("data key");
+        let key = keys::commit_key(&tenant, Signal::Metrics, 0, 0, writer_id, 1, 0)
+            .expect("commit key");
+        assert_eq!(key.len(), 119, "the commit key the breakdown is stated for");
+        assert_eq!(
+            object_key.len(),
+            125,
+            "the data object key the breakdown is stated for"
+        );
+
+        let ordinary = CommitRecord {
+            writer_id: writer_id.to_string(),
+            object_key,
+            content_hash: content_hash.to_vec(),
+            ..record([25; 16], 0)
+        };
+        let charge = commit_entry_resident_bytes(&key, &ordinary);
+        assert_eq!(
+            charge,
+            COMMIT_ENTRY_FIXED_BYTES + 2 * 119 + 16 + 36 + 125 + 32,
+            "the charge is the sum of the entry's parts, not a constant"
+        );
+        assert_eq!(charge, 863);
+        assert!(
+            charge <= crate::config::RECORD_CACHE_ENTRY_BYTES,
+            "the planning rate ({}) must bound an ordinary entry's charge ({charge}), or the \
+             derived capacity would promise residency the byte budget cannot give",
+            crate::config::RECORD_CACHE_ENTRY_BYTES
+        );
+    }
+
+    /// The charge is the sum of what the entry actually holds, so a record
+    /// carrying declared column statistics is charged for them. Pins the
+    /// arithmetic: a flat per-entry constant would make all three of these
+    /// equal.
+    #[test]
+    fn commit_entry_charge_counts_the_declared_column_list() {
+        let key = "t/ab/m/c/0000/0/w.1.0.cmt";
+        let base = record_with_declared_columns([26; 16], 0, 0);
+        let empty = commit_entry_resident_bytes(key, &base);
+        assert_eq!(
+            empty,
+            COMMIT_ENTRY_FIXED_BYTES + 2 * key.len() as u64 + 16 + 36 + 32,
+            "a stats-free record is the fixed cost, the key twice, and its own heap"
+        );
+
+        // Every generated name is `attr.column_NNNN`, 16 characters.
+        let per_stat = DECLARED_COLUMN_STAT_FIXED_BYTES + 16;
+        for columns in [1usize, 100, 200] {
+            let with = record_with_declared_columns([26; 16], 0, columns);
+            assert_eq!(
+                commit_entry_resident_bytes(key, &with),
+                empty + columns as u64 * per_stat,
+                "{columns} declared columns must be charged {columns} times over"
+            );
+        }
+        assert_eq!(
+            200 * per_stat,
+            19_200,
+            "a record with 200 declared columns carries about 19 KB of statistics alone, not \
+             the 900 bytes the planning rate assumes"
+        );
+    }
+
+    /// Issue #1735 fix round. The commit-record cache is bounded in BYTES, not
+    /// in entries: a few dozen records whose declared-column lists make each of
+    /// them more than twenty times the planning rate must evict down to the
+    /// budget even though their count stays far below the entry capacity.
+    ///
+    /// Rules out two wrong implementations. An eviction that compares the entry
+    /// COUNT against a byte-derived cap leaves all sixty resident (60 << 1,000)
+    /// and the assertion on `charged_bytes` fails at sixty times the per-entry
+    /// charge, far over the budget; the assertion is on summed bytes rather
+    /// than on length for exactly that reason. A charge that is the flat
+    /// `RECORD_CACHE_ENTRY_BYTES` constant instead of a measurement of
+    /// `declared_column_stats` also leaves all sixty resident (60 * 900 is
+    /// inside a 900,000-byte budget), and fails the proportionality block
+    /// below, which pins three different declared-column counts to three
+    /// charges that differ by exactly the per-statistic cost.
+    #[test]
+    fn commit_records_with_large_declared_column_lists_evict_on_bytes() {
+        let cache = RecordCache::default();
+        let tenant = TenantHash([27; 16]);
+        let capacity = 1_000;
+        let budget = capacity as u64 * crate::config::RECORD_CACHE_ENTRY_BYTES;
+        assert_eq!(budget, 900_000);
+
+        let record = Arc::new(record_with_declared_columns([27; 16], 0, 200));
+        let charge = commit_entry_resident_bytes("k0", &record);
+        assert!(
+            charge > 19_000,
+            "sanity: one such record is charged {charge} bytes, more than twenty times the 900 \
+             an entry cap assumes"
+        );
+        let expected_resident = (budget / charge) as usize;
+        assert_eq!(
+            expected_resident, 45,
+            "sanity: the budget holds exactly forty-five of these"
+        );
+
+        for i in 0..60 {
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                record.clone(),
+                1,
+                capacity,
+                budget,
+            );
+            assert!(
+                cache.charged_bytes(&tenant) <= budget,
+                "the charged total must stay inside the budget after every insert"
+            );
+        }
+
+        assert_eq!(
+            cache.charged_bytes(&tenant),
+            expected_resident as u64 * charge,
+            "residency is pinned to exactly the entries the budget holds, not to \
+             'something was evicted'"
+        );
+        assert_eq!(cache.entry_count(&tenant), expected_resident);
+        assert!(
+            60 < capacity,
+            "the entry cap is never reached here: only the byte bound can have evicted"
+        );
+
+        // Least-recently-used first: the fifteen earliest keys are gone.
+        let accounting = QueryAccounting::new();
+        for i in 0..15 {
+            assert!(
+                cache.get(&tenant, &format!("k{i}"), &accounting).is_none(),
+                "k{i} must have been evicted"
+            );
+        }
+        for i in 15..60 {
+            assert!(
+                cache.get(&tenant, &format!("k{i}"), &accounting).is_some(),
+                "k{i} must still be resident"
+            );
+        }
+
+        // The charge is measured per entry, not applied as one flat constant:
+        // records with different declared-column counts charge proportionally
+        // different amounts.
+        let none = commit_entry_resident_bytes("k", &record_with_declared_columns([27; 16], 0, 0));
+        let half =
+            commit_entry_resident_bytes("k", &record_with_declared_columns([27; 16], 0, 100));
+        let full =
+            commit_entry_resident_bytes("k", &record_with_declared_columns([27; 16], 0, 200));
+        let per_stat = DECLARED_COLUMN_STAT_FIXED_BYTES + 16;
+        assert_eq!(half - none, 100 * per_stat);
+        assert_eq!(full - none, 200 * per_stat);
+        assert_eq!(
+            full - none,
+            2 * (half - none),
+            "twice the declared columns is twice the declared-column charge"
+        );
+    }
+
+    /// The commit cache's per-tenant budget is the derived capacity times the
+    /// per-entry planning rate, the figure docs/catalog-and-mvcc.md,
+    /// docs/guides/caching.md and docs/guides/operations.md quote: 22.5 MB at
+    /// the cap and 9 MB at the floor `--disable-cache` holds.
+    #[test]
+    fn the_commit_budget_is_the_stated_per_cache_share() {
+        let at_cap = CatalogConfig {
+            cache_capacity_per_tenant: crate::config::MAX_CACHE_CAPACITY_PER_TENANT,
+            ..Default::default()
+        };
+        assert_eq!(at_cap.commit_cache_max_bytes_per_tenant(), 22_500_000);
+        assert_eq!(
+            at_cap.commit_cache_max_bytes_per_tenant(),
+            at_cap.compaction_cache_max_bytes_per_tenant(),
+            "the per-tenant budget is split equally between the two record caches"
+        );
+        assert_eq!(
+            at_cap.commit_cache_max_bytes_per_tenant() * crate::config::RECORD_CACHES_PER_TENANT,
+            crate::config::MAX_RECORD_CACHE_BYTES_PER_TENANT,
+            "both caches together are the stated 45 MB"
+        );
+
+        let at_floor = CatalogConfig {
+            cache_capacity_per_tenant: crate::config::DEFAULT_CACHE_CAPACITY_PER_TENANT,
+            ..Default::default()
+        };
+        assert_eq!(at_floor.commit_cache_max_bytes_per_tenant(), 9_000_000);
+    }
+
+    /// A tenant whose commit records carry no declared columns is still bounded
+    /// by the entry capacity, so the byte bound replaces nothing: both hold.
+    #[test]
+    fn small_commit_entries_still_evict_on_the_entry_cap() {
+        let cache = RecordCache::default();
+        let tenant = TenantHash([28; 16]);
+        let record = Arc::new(record_with_declared_columns([28; 16], 0, 0));
+        let charge = commit_entry_resident_bytes("k0", &record);
+        let budget = 10_000 * charge;
+
+        for i in 0..5 {
+            cache.insert(tenant, format!("k{i}"), record.clone(), 1, 3, budget);
+        }
+
+        assert_eq!(
+            cache.entry_count(&tenant),
+            3,
+            "the entry cap binds when the entries are small"
+        );
+        assert_eq!(cache.charged_bytes(&tenant), 3 * charge);
+    }
+
+    /// Tombstone-observation invalidation drops the commit cache's charge with
+    /// the entries, so a later insert is not evicted against bytes that are no
+    /// longer held.
+    #[test]
+    fn commit_invalidate_prefix_releases_the_charged_bytes() {
+        let cache = RecordCache::default();
+        let tenant = TenantHash([29; 16]);
+        let record = Arc::new(record_with_declared_columns([29; 16], 0, 10));
+        let budget = 10_000_000;
+        cache.insert(
+            tenant,
+            "m/c/0/1/a.cmt".to_string(),
+            record.clone(),
+            1,
+            100,
+            budget,
+        );
+        cache.insert(
+            tenant,
+            "m/c/0/2/b.cmt".to_string(),
+            record.clone(),
+            1,
+            100,
+            budget,
+        );
+        let both = cache.charged_bytes(&tenant);
+
+        cache.invalidate_prefix(&tenant, "m/c/0/1/");
+
+        assert_eq!(cache.entry_count(&tenant), 1);
+        assert_eq!(
+            cache.charged_bytes(&tenant),
+            commit_entry_resident_bytes("m/c/0/2/b.cmt", &record),
+            "the dropped entry's charge is released, not left on the tenant's total"
+        );
+        assert!(cache.charged_bytes(&tenant) < both);
     }
 
     /// A compaction record over `inputs` L0 segments, the shape whose size the
@@ -878,7 +1318,7 @@ mod tests {
             per_input * 1_800,
             136_800,
             "one L1 record over a shard-hour of 1,800 L0 segments is charged about 137 KB, \
-             not the 750 bytes an entry-count bound assumes"
+             not the 900 bytes an entry-count bound assumes"
         );
     }
 
@@ -899,19 +1339,19 @@ mod tests {
         let tenant = TenantHash([21; 16]);
         let capacity = 1_000;
         let budget = capacity as u64 * crate::config::RECORD_CACHE_ENTRY_BYTES;
-        assert_eq!(budget, 750_000);
+        assert_eq!(budget, 900_000);
 
         let record = Arc::new(compaction_record([21; 16], 1_800));
         let charge = compaction_entry_resident_bytes("c0", &record);
         assert!(
             charge > 100_000,
-            "sanity: one such record is charged {charge} bytes, far above the 750 an entry \
+            "sanity: one such record is charged {charge} bytes, far above the 900 an entry \
              cap assumes"
         );
         let expected_resident = (budget / charge) as usize;
         assert_eq!(
-            expected_resident, 5,
-            "sanity: the budget holds exactly five of these"
+            expected_resident, 6,
+            "sanity: the budget holds exactly six of these"
         );
 
         for i in 0..8 {
@@ -934,15 +1374,15 @@ mod tests {
             "the entry cap is never reached here: only the byte bound can have evicted"
         );
 
-        // Oldest-first: the three earliest keys are gone, the five newest stay.
+        // Oldest-first: the two earliest keys are gone, the six newest stay.
         let accounting = QueryAccounting::new();
-        for i in 0..3 {
+        for i in 0..2 {
             assert!(
                 cache.get(&tenant, &format!("c{i}"), &accounting).is_none(),
                 "c{i} must have been evicted"
             );
         }
-        for i in 3..8 {
+        for i in 2..8 {
             assert!(
                 cache.get(&tenant, &format!("c{i}"), &accounting).is_some(),
                 "c{i} must still be resident"
@@ -1037,7 +1477,7 @@ mod tests {
 
     /// The per-tenant budget is the derived capacity times the per-entry cost,
     /// the figure docs/guides/caching.md and docs/guides/operations.md quote:
-    /// 22.5 MB at the cap and 7.5 MB at the floor `--disable-cache` holds.
+    /// 22.5 MB at the cap and 9 MB at the floor `--disable-cache` holds.
     #[test]
     fn the_compaction_budget_is_the_stated_per_cache_share() {
         let at_cap = CatalogConfig {
@@ -1056,7 +1496,7 @@ mod tests {
             cache_capacity_per_tenant: crate::config::DEFAULT_CACHE_CAPACITY_PER_TENANT,
             ..Default::default()
         };
-        assert_eq!(at_floor.compaction_cache_max_bytes_per_tenant(), 7_500_000);
+        assert_eq!(at_floor.compaction_cache_max_bytes_per_tenant(), 9_000_000);
     }
 
     fn head(tenant_hash: [u8; 16], watermark_hour: u32) -> SnapshotHead {
