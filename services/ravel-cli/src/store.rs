@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
+use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store, resolve_s3_allow_http};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_types::TenantHash;
 
@@ -211,6 +211,19 @@ pub struct StoreArgs {
     #[arg(long, env = "RAVEL_S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
 
+    /// Accept a plaintext `http://` `--s3-endpoint` whose host is not
+    /// loopback. The S3 client's `allow_http` follows the endpoint's scheme,
+    /// and a plaintext endpoint on the network carries every object this
+    /// command writes and reads, plus the credentials signing those requests,
+    /// in the clear; the command refuses that combination unless this flag
+    /// says the operator meant it. A loopback `http://` endpoint (the local
+    /// MinIO every development launcher here points at) needs no flag, and an
+    /// `https://` endpoint is unaffected. Same flag, env var, and rule as
+    /// ravel-server's: both binaries call
+    /// [`ravel_object_store::s3::resolve_s3_allow_http`].
+    #[arg(long, env = "RAVEL_S3_ALLOW_HTTP")]
+    pub s3_allow_http: bool,
+
     #[arg(long, env = "RAVEL_S3_BUCKET")]
     pub s3_bucket: Option<String>,
 
@@ -374,7 +387,7 @@ pub fn build_store_with_list_page_size(
                 }
             };
             let endpoint = args.s3_endpoint.clone();
-            let allow_http = endpoint.is_some();
+            let allow_http = resolve_s3_allow_http(endpoint.as_deref(), args.s3_allow_http)?;
             let config = S3Config {
                 bucket,
                 region,
@@ -703,6 +716,108 @@ mod tests {
                 "the error must name both conflicting flags, got: {rendered}"
             );
         }
+    }
+
+    /// `--store s3` flags for `endpoint`, with `--s3-allow-http` when
+    /// `allow_http`. Mirrors ravel-server's `s3_cli` helper so the two
+    /// binaries' tests exercise the same invocation shape.
+    fn s3_args(endpoint: &str, allow_http: bool) -> StoreArgs {
+        let mut args = vec![
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ];
+        if allow_http {
+            args.push("--s3-allow-http");
+        }
+        StoreArgs::try_parse_from(args).expect("flags parse")
+    }
+
+    /// Issue #1707, the CLI half. `ravel-cli` ships in the server image and
+    /// the operator's store-qualification Job runs it against the cluster's
+    /// bucket with the cluster's credentials before any server pod exists, so
+    /// it obeys the same rule the server does: `allow_http` is decided by the
+    /// endpoint's URL scheme, not by whether an endpoint was set at all, and a
+    /// plaintext endpoint on the network is refused unless the operator passes
+    /// the flag.
+    ///
+    /// Both layers are asserted: [`resolve_s3_allow_http`] for the value the
+    /// S3 client is configured with (`build_store` exposes no way to read it
+    /// back off the built `S3Store`), and `build_store` itself, the S3 client
+    /// constructor every `ravel-cli` subcommand reaches, for the refusal.
+    ///
+    /// Non-vacuity (prove-the-test): restore `let allow_http =
+    /// endpoint.is_some();` in [`build_store_with_list_page_size`] and the
+    /// https case builds a plaintext-capable client while both refusals
+    /// vanish.
+    #[test]
+    fn s3_endpoint_scheme_decides_allow_http_and_plaintext_non_loopback_needs_the_flag() {
+        // https, and real AWS with no endpoint at all: never plaintext, so a
+        // redirect or a misconfigured proxy cannot downgrade the connection.
+        assert_eq!(
+            resolve_s3_allow_http(Some("https://s3.us-east-1.amazonaws.com"), false),
+            Ok(false),
+            "an https endpoint must not enable allow_http"
+        );
+        assert_eq!(
+            resolve_s3_allow_http(None, false),
+            Ok(false),
+            "no endpoint (real AWS) must not enable allow_http"
+        );
+        build_store(&s3_args("https://s3.us-east-1.amazonaws.com", false))
+            .expect("an https endpoint must build");
+
+        // Loopback plaintext: allowed, and unflagged. Every local-development
+        // launcher in this repo depends on this staying true.
+        for endpoint in [
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "http://[::1]:9000",
+        ] {
+            assert_eq!(
+                resolve_s3_allow_http(Some(endpoint), false),
+                Ok(true),
+                "{endpoint} is loopback plaintext and must enable allow_http unflagged"
+            );
+            build_store(&s3_args(endpoint, false))
+                .unwrap_or_else(|e| panic!("{endpoint} must build without the flag, got: {e}"));
+        }
+
+        // Plaintext to a host on the network: refused, and the error names the
+        // flag that accepts it.
+        let refusal = resolve_s3_allow_http(Some("http://minio:9000"), false)
+            .expect_err("plaintext to a non-loopback host must be refused");
+        assert_eq!(refusal.endpoint, "http://minio:9000");
+        let rendered = refusal.to_string();
+        assert!(
+            rendered.contains("--s3-allow-http"),
+            "the refusal must name the flag that accepts it, got: {rendered}"
+        );
+        let err = build_store_error(
+            &s3_args("http://minio:9000", false),
+            "build_store must refuse plaintext to a non-loopback host",
+        );
+        assert!(
+            err.contains("--s3-allow-http"),
+            "build_store's refusal must name the flag, got: {err}"
+        );
+
+        // The same endpoint with the flag: accepted, and plaintext is on.
+        assert_eq!(
+            resolve_s3_allow_http(Some("http://minio:9000"), true),
+            Ok(true),
+            "--s3-allow-http must enable plaintext to a non-loopback host"
+        );
+        build_store(&s3_args("http://minio:9000", true))
+            .expect("--s3-allow-http must let a plaintext non-loopback endpoint build");
     }
 
     /// `--s3-auth` defaults to `static`, and static mode still requires both
