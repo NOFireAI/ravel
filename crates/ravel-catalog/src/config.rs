@@ -46,9 +46,17 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 /// Past the bound the resolve's two passes evict each other and the tenant
 /// pays per-record GETs again, which is what
 /// `a_bound_below_the_hot_region_loses_the_saving` in
-/// tests/hot_record_cache.rs pins. The direction is safe: an under-sized
-/// cache costs what the old flat constant already cost everyone, it never
-/// over-allocates. This constant is the saturating
+/// tests/hot_record_cache.rs pins. The byte bound never over-allocates, but
+/// it is not free of a hit-rate cost the old flat entry count did not have:
+/// each declared column statistic adds at least
+/// `DECLARED_COLUMN_STAT_FIXED_BYTES` to an entry's charge, as
+/// `commit_entry_charge_counts_the_declared_column_list` in cache.rs pins, so
+/// a tenant whose records carry them holds fewer records than the flat 10,000
+/// the old constant held for everyone, and a wide-column tenant whose
+/// unsealed tail no longer fits re-reads that tail on each resolve. That is
+/// the trade the bound makes: a memory figure the code enforces, in place of
+/// an entry count that promised nothing about bytes. This constant is the
+/// saturating
 /// floor `derive_cache_capacity_per_tenant` never returns below, so a
 /// deployment with very few shards and a very long flush delay still gets the
 /// same protection the fixed constant used to give everyone.
@@ -200,9 +208,10 @@ pub const SIGNAL_STREAMS: u64 = 6;
 /// operator-settable through `--gc-max-flush-lifetime`. At
 /// `--gc-max-flush-lifetime 4h` the margin is 4h20m, the oldest unsealed hour
 /// can have started 5h20m ago, and the tail spans up to 5.34 hours, which
-/// this term under-counts by about 1.8x. The direction is safe (an
-/// under-sized cache costs what the flat constant cost, it never
-/// over-allocates), and at the shipped flush cadence
+/// this term under-counts by about 1.8x. Under-counting only ever shrinks the
+/// derived capacity, never grows it, so it cannot over-allocate; what it
+/// costs is hit rate on the tail that no longer fits, the same trade the byte
+/// bound makes above. At the shipped flush cadence
 /// [`MAX_CACHE_CAPACITY_PER_TENANT`] decides the result whatever this term
 /// says.
 pub const HOT_REGION_HOURS: u64 = 3;
