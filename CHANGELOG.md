@@ -55,14 +55,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or the environment variable is set, a `RavelCluster` in that state is refused
   with the field named in its status, and a `ravel-cli` invocation against one
   is refused the same way.
-  Job. **On upgrade**, a deployment already pointing at a plaintext
-  non-loopback endpoint will not start until the flag or the environment
-  variable is set, and a `ravel-cli` invocation against one is refused the
-  same way.
-  compose stack, kind, and the tests use. The operator gains
-  `spec.s3.allowHttp` for an in-cluster MinIO. **On upgrade**, a deployment
-  already pointing at a plaintext non-loopback endpoint will not start until
-  the flag or the environment variable is set.
 - **`ravel-cli load` reports a `--skip-rows` value past the end of the file
   instead of succeeding quietly** (issue #1713). The value was clamped to the
   file's row count and the run exited 0 having written nothing, and the
