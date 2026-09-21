@@ -24,7 +24,10 @@
 //! against the pinned Prometheus binary. A block generated without one
 //! publishes [`AgreedState::NotMeasured`] and the agreed score reads
 //! [`AGREED_NOT_MEASURED`], because a reached score rendered as a single
-//! headline reads as agreement it never measured.
+//! headline reads as agreement it never measured. That score is taken over the
+//! constructs the run actually compared ([`AgreedCounts`]); the constructs no
+//! corpus entry exercises are published as their own count beside it, never
+//! summed into the denominator.
 //!
 //! Scope of the enumerated surface: the 72 functions promql-parser 0.10 marks
 //! non-experimental, the 12 non-experimental aggregation operators, all 16
@@ -74,12 +77,21 @@ pub const DIFFERENTIAL_RUN_LABEL: &str = concat!(
 pub const REACHED_ROW_LABEL: &str =
     "**reached** (supported + intentionally rejected + accepted divergence / total)";
 
-/// The agreed score row's label.
-pub const AGREED_ROW_LABEL: &str = "**agreed with Prometheus** (constructs whose corpus entries matched the pinned binary / total)";
+/// The agreed score row's label. The denominator is the compared set, not the
+/// whole surface: a construct no corpus entry exercises was never put to
+/// Prometheus, and folding it into the denominator republishes, for agreement,
+/// the same two-meanings-in-one-figure collapse the reached/agreed split
+/// removed.
+pub const AGREED_ROW_LABEL: &str = "**agreed with Prometheus** (constructs whose corpus entries matched the pinned binary / constructs compared)";
 
 /// What the agreed score row reads when no [`RunReport`] was supplied. Never a
 /// number: an unmeasured agreement is not 0 of the surface and not all of it.
 pub const AGREED_NOT_MEASURED: &str = "not measured in this run";
+
+/// What the agreed score row reads when a [`RunReport`] was folded in but no
+/// construct was compared at all. Also never a number: `0/0` is not 0% and not
+/// 100%.
+pub const AGREED_NONE_COMPARED: &str = "no construct was compared";
 
 /// Prefix of a [`ConstructState::Supported`] `test` naming a corpus file in
 /// this crate. The run must show at least one entry from that exact file
@@ -286,6 +298,61 @@ pub enum AgreedState {
     Agreed,
     /// At least one exercising corpus entry did not match it.
     Diverged,
+}
+
+/// The three counts a folded-in differential run publishes, kept separate on
+/// purpose.
+///
+/// [`Self::agreed`] over [`Self::compared`] is the score; [`Self::not_compared`]
+/// is reported beside it and never inside it. Summing the third into the
+/// denominator would make a run in which Prometheus agreed with everything it
+/// saw publish less than full agreement, and would leave a reader unable to
+/// tell a construct that diverged from one the corpus never exercises.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgreedCounts {
+    /// Constructs whose every exercising corpus entry matched Prometheus.
+    pub agreed: usize,
+    /// Constructs at least one of whose exercising entries did not match.
+    pub diverged: usize,
+    /// Constructs no corpus entry exercises, so Prometheus never ran them.
+    pub not_compared: usize,
+}
+
+impl AgreedCounts {
+    /// The constructs the run actually put to Prometheus: the score's
+    /// denominator.
+    pub fn compared(&self) -> usize {
+        self.agreed + self.diverged
+    }
+
+    /// [`Self::agreed`] over [`Self::compared`] as a percentage, or `None` when
+    /// nothing was compared (which is not 0% and not 100%).
+    pub fn agreed_percent(&self) -> Option<f64> {
+        if self.compared() == 0 {
+            return None;
+        }
+        Some(percent(self.agreed, self.compared()))
+    }
+
+    /// The agreed score row's value: the score over the compared set with the
+    /// two other counts beside it, or [`AGREED_NONE_COMPARED`] when nothing was
+    /// compared.
+    pub fn render(&self) -> String {
+        match self.agreed_percent() {
+            Some(pct) => format!(
+                "{}/{} = {}% ({} diverged, {} not compared)",
+                self.agreed,
+                self.compared(),
+                pct,
+                self.diverged,
+                self.not_compared
+            ),
+            None => format!(
+                "{AGREED_NONE_COMPARED} ({} not compared)",
+                self.not_compared
+            ),
+        }
+    }
 }
 
 impl AgreedState {
@@ -1722,22 +1789,39 @@ impl ConformanceReport {
         Ok(())
     }
 
-    /// How many constructs the differential run showed agreeing with the
-    /// pinned Prometheus binary, or `None` when no run report was folded in.
+    /// The three counts the differential run produced, or `None` when no run
+    /// report was folded in.
     ///
     /// `None` is the honest answer to an unmeasured question, and it is what
     /// keeps the rendered score row from printing a number
     /// ([`AGREED_NOT_MEASURED`]).
-    pub fn agreed_count(&self) -> Option<usize> {
+    pub fn agreed_counts(&self) -> Option<AgreedCounts> {
         if !self.outcomes.iter().any(|o| o.agreed.is_some()) {
             return None;
         }
-        Some(
-            self.outcomes
-                .iter()
-                .filter(|o| o.agreed_state() == AgreedState::Agreed)
-                .count(),
-        )
+        let mut counts = AgreedCounts::default();
+        for outcome in &self.outcomes {
+            match outcome.agreed_state() {
+                AgreedState::Agreed => counts.agreed += 1,
+                AgreedState::Diverged => counts.diverged += 1,
+                AgreedState::NotCompared => counts.not_compared += 1,
+                // Unreachable while `apply_run_report` sets every outcome, and
+                // deliberately counted nowhere if that ever stops holding: a
+                // construct whose agreement was not measured belongs in
+                // neither the score nor the not-compared count.
+                AgreedState::NotMeasured => {}
+            }
+        }
+        Some(counts)
+    }
+
+    /// How many constructs the differential run showed agreeing with the
+    /// pinned Prometheus binary, or `None` when no run report was folded in.
+    ///
+    /// This is one of the three counts, not the score: the score's denominator
+    /// is [`AgreedCounts::compared`].
+    pub fn agreed_count(&self) -> Option<usize> {
+        self.agreed_counts().map(|counts| counts.agreed)
     }
 
     fn mark_failures(&mut self, failed: &BTreeSet<&str>) {
@@ -1883,12 +1967,8 @@ impl ConformanceReport {
             counts.total(),
             counts.reached_percent()
         ));
-        let agreed = match self.agreed_count() {
-            Some(agreed) => format!(
-                "{agreed}/{} = {}%",
-                counts.total(),
-                percent(agreed, counts.total())
-            ),
+        let agreed = match self.agreed_counts() {
+            Some(agreed) => agreed.render(),
             None => AGREED_NOT_MEASURED.to_string(),
         };
         out.push_str(&format!("| {AGREED_ROW_LABEL} | **{agreed}** |\n\n"));
@@ -3086,6 +3166,14 @@ fn an_attributed_helper() {}
             .expect("a report covering the corpus is accepted");
 
         assert_eq!(report.agreed_count(), Some(RATE_QUERY_CONSTRUCTS.len()));
+        assert_eq!(
+            report.agreed_counts(),
+            Some(AgreedCounts {
+                agreed: RATE_QUERY_CONSTRUCTS.len(),
+                diverged: 0,
+                not_compared: REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len(),
+            })
+        );
         let agreed: Vec<&str> = report
             .outcomes
             .iter()
@@ -3109,13 +3197,55 @@ fn an_attributed_helper() {}
             block.contains(DIFFERENTIAL_RUN_LABEL),
             "block was:\n{block}"
         );
+        // Everything Prometheus saw agreed, so the score is full agreement over
+        // the compared set. The constructs the corpus never exercises are a
+        // count beside it, not a share of the denominator.
         assert!(
             block.contains(&format!(
-                "| {AGREED_ROW_LABEL} | **{}/{} = ",
+                "| {AGREED_ROW_LABEL} | **{0}/{0} = 100% (0 diverged, {1} not compared)** |",
+                RATE_QUERY_CONSTRUCTS.len(),
+                REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len()
+            )),
+            "block was:\n{block}"
+        );
+        assert!(
+            !block.contains(&format!(
+                "**{}/{}",
                 RATE_QUERY_CONSTRUCTS.len(),
                 REGISTRY.len()
             )),
+            "the agreed score still divides by the whole surface:\n{block}"
+        );
+    }
+
+    /// A run report folded in over an empty corpus compared nothing at all.
+    /// `0/0` is neither 0% nor 100%, so the row says so in words, with the
+    /// not-compared count beside it.
+    #[test]
+    fn a_run_that_compared_nothing_publishes_no_percentage() {
+        let mut report = ConformanceReport::from_corpus(&[]);
+        report
+            .apply_run_report(&run_report(0, &[]))
+            .expect("a report covering an empty corpus is accepted");
+
+        let counts = report
+            .agreed_counts()
+            .expect("a folded-in report populates the agreed dimension");
+        assert_eq!(counts.compared(), 0);
+        assert_eq!(counts.not_compared, REGISTRY.len());
+        assert_eq!(counts.agreed_percent(), None);
+
+        let block = report.to_markdown();
+        assert!(
+            block.contains(&format!(
+                "| {AGREED_ROW_LABEL} | **{AGREED_NONE_COMPARED} ({} not compared)** |",
+                REGISTRY.len()
+            )),
             "block was:\n{block}"
+        );
+        assert!(
+            !block.contains(&format!("| {AGREED_ROW_LABEL} | **0/")),
+            "nothing compared is not zero agreement:\n{block}"
         );
     }
 
@@ -3141,6 +3271,14 @@ fn an_attributed_helper() {}
             .expect("a report covering the corpus is accepted");
 
         assert_eq!(report.agreed_count(), Some(0));
+        assert_eq!(
+            report.agreed_counts(),
+            Some(AgreedCounts {
+                agreed: 0,
+                diverged: RATE_QUERY_CONSTRUCTS.len(),
+                not_compared: REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len(),
+            })
+        );
         assert_eq!(report.outcomes[index].agreed_state(), AgreedState::Diverged);
         assert_eq!(report.outcomes[index].disagreements, vec!["t".to_string()]);
         assert!(report.outcomes[index].failures.is_empty());
@@ -3153,6 +3291,17 @@ fn an_attributed_helper() {}
         let block = report.to_markdown();
         assert!(
             block.contains("1 exercising entries diverged from Prometheus: t"),
+            "block was:\n{block}"
+        );
+        // A run that compared four constructs and agreed on none of them is 0%
+        // of the compared set, which is a different statement from having
+        // compared nothing.
+        assert!(
+            block.contains(&format!(
+                "| {AGREED_ROW_LABEL} | **0/{0} = 0% ({0} diverged, {1} not compared)** |",
+                RATE_QUERY_CONSTRUCTS.len(),
+                REGISTRY.len() - RATE_QUERY_CONSTRUCTS.len()
+            )),
             "block was:\n{block}"
         );
     }

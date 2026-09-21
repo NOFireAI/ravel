@@ -1469,13 +1469,22 @@ jobs:
   # https://github.com/prometheus/prometheus/releases/tag/v3.13.1's
   # sha256sums.txt, so this job fetches and verifies the real
   # binary and runs the differential comparison rather than skipping.
+  #
+  # It is also the only lane that can publish the conformance table's agreed
+  # score (ADR-0035): the differential run archives its RunReport as JSON and
+  # the second step folds that file into the conformance report. No other run
+  # has Prometheus in the loop, so the committed table in docs/query-engine.md
+  # stays the Ravel-only rendering and the agreed figures live in this job's
+  # log.
   promql-difftest:
     needs: changes
     # promql_area (ADR-0053 D4): only when ravel-promql, ravel-promql-difftest,
     # ravel-query, or workspace-level paths changed.
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.promql_area == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 until the conformance-table run joined this job: it links a second
+    # test binary against the same (datafusion-carrying) dependency graph.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1501,6 +1510,11 @@ jobs:
         env:
           RAVEL_DIFFTEST: "1"
           RAVEL_DIFFTEST_PROM_BIN: ${{ steps.fetch-prometheus.outputs.bin_path }}
+          # run_corpus archives the RunReport here before returning, so the
+          # report exists even when the step below panics on a mismatch. The
+          # next step folds it into the conformance table's agreed dimension,
+          # which nothing else can populate.
+          RAVEL_DIFFTEST_REPORT_OUT: ${{ github.workspace }}/difftest-run-report.json
         run: |
           set -o pipefail
           # nextest equivalent of `--test difftest_selectors -- --exact --nocapture`.
@@ -1524,6 +1538,38 @@ jobs:
           # libtest's "test result: ok. 1 passed".
           if ! grep -qE "1 tests? run: 1 passed" difftest-output.txt; then
             echo "::error::differential test did not run (expected 1 passed)"
+            exit 1
+          fi
+
+      # The only place the conformance table's agreed dimension can be
+      # populated: the report the step above archived is the sole producer of
+      # the JSON RAVEL_DIFFTEST_REPORT names. `always()` because a mismatching
+      # run is exactly the run whose agreed figure matters; the step above has
+      # already failed the job by then, and the report was written before it
+      # panicked.
+      - name: Publish the agreed conformance score
+        if: always()
+        env:
+          RAVEL_DIFFTEST_REPORT: ${{ github.workspace }}/difftest-run-report.json
+        run: |
+          set -o pipefail
+          if [ ! -f "$RAVEL_DIFFTEST_REPORT" ]; then
+            echo "::error::the differential run wrote no report to $RAVEL_DIFFTEST_REPORT"
+            exit 1
+          fi
+          # `--color never` for the same reason as above: the grep guards below
+          # read this output.
+          cargo nextest run --locked -p ravel-promql-difftest --test conformance_table \
+            --no-capture --color never 2>&1 | tee conformance-output.txt
+          # The agreed score is published by one test, which returns early when
+          # the report is missing. A lane that stops producing one must fail
+          # here rather than pass with the row unmeasured.
+          if grep -q "skipping: set RAVEL_DIFFTEST_REPORT" conformance-output.txt; then
+            echo "::error::the conformance run folded in no differential report"
+            exit 1
+          fi
+          if ! grep -q "PromQL agreement with the pinned Prometheus binary:" conformance-output.txt; then
+            echo "::error::the agreed score was not published"
             exit 1
           fi
 
