@@ -653,7 +653,7 @@ fn accepted_divergence_constructs(report: &ConformanceReport) -> Vec<&'static st
 
 /// A construct whose only evidence is a divergence an ADR accepts matched
 /// nothing, so it must not enter the agreed numerator under a row that reads
-/// "constructs whose corpus entries matched the pinned binary".
+/// "constructs whose compared corpus entries matched the pinned binary".
 /// `compare_ravel_error_prom_success` returns a non-mismatch exactly when the
 /// two engines disagree in the shape ADR-0030 accepts, and an ADR-0025
 /// `tolerance:` entry matches only within its declared ULP band; a clean run of
@@ -771,6 +771,41 @@ async fn an_accepted_divergence_is_not_published_as_agreement() {
              for a match:\n{block}"
         );
     }
+    // A construct can carry ADR-accepted entries beside matching ones. Those
+    // entries are still not compared for a match, so an agreed row names how
+    // many rather than publishing all of its evidence as agreement.
+    let mixed: Vec<_> = report
+        .outcomes
+        .iter()
+        .filter(|o| {
+            o.agreed_state() == AgreedState::Agreed
+                && o.evidence.iter().any(|e| e.accepted_divergence)
+        })
+        .collect();
+    assert!(
+        !mixed.is_empty(),
+        "no construct mixes accepted-divergence evidence with matching \
+         evidence, so this assertion proves nothing"
+    );
+    for outcome in &mixed {
+        let accepted = outcome
+            .evidence
+            .iter()
+            .filter(|e| e.accepted_divergence)
+            .count();
+        let total = outcome.evidence.len();
+        let entries = if accepted == 1 { "entry" } else { "entries" };
+        assert!(
+            block.contains(&format!(
+                "{accepted} of {total} exercising {entries} not compared for a \
+                 match: accepted divergences"
+            )),
+            "the row for '{}' publishes {accepted} accepted-divergence \
+             {entries} as agreement without saying so:\n{block}",
+            outcome.construct.name
+        );
+    }
+
     let diverged_row = report
         .outcomes
         .iter()

@@ -2614,7 +2614,7 @@ Prometheus binary in the loop, so what that row counts is **reached**: the
 constructs Ravel parsed and answered, classified as supported,
 intentionally rejected, or accepted divergence. Agreement with Prometheus is
 now a second, independent row, **agreed with Prometheus**, and it counts
-constructs whose exercising corpus entries matched the pinned binary in a
+constructs whose compared corpus entries matched the pinned binary in a
 differential run. It is populated only when a run report from that
 differential run (`RAVEL_DIFFTEST_REPORT`, a JSON `RunReport`) is folded into
 the generation, and it reads `not measured in this run` otherwise. A
@@ -2641,10 +2641,18 @@ as diverging was never put to Prometheus for a match: a
 `mode: ravel_error_prom_success` entry passes exactly when Ravel rejects and
 Prometheus accepts (ADR-0030), and an ADR-0025 `tolerance:` entry matches
 only within a declared ULP band. Counting either as agreement would publish a
-documented divergence under a row that reads "constructs whose corpus entries
-matched the pinned binary", so those constructs are counted on their own, and
-each such row says so in its evidence column. That is a third thing from both
-`agreed` and `diverged`, and a reader can tell all three apart in the block.
+documented divergence under a row that reads "constructs whose compared corpus
+entries matched the pinned binary", so those constructs are counted on their
+own, and each such row says so in its evidence column. That is a third thing
+from both `agreed` and `diverged`, and a reader can tell all three apart in the
+block.
+
+A construct can also carry ADR-accepted entries beside ordinary ones. It is
+scored on its ordinary entries, since those are the ones the run put to
+Prometheus for a match, and its row names how many of its entries were not
+compared. The construct count and the entry count answer different questions:
+`accepted divergence` in the score row counts constructs whose every entry is
+accepted, while a row's evidence column counts entries.
 
 Where the agreed figures are published: CI's `promql-difftest` job, and not
 the block above. The differential run writes its `RunReport` to the path
@@ -2679,7 +2687,7 @@ Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 | accepted divergence | 2 |
 | unclassified | 0 |
 | **reached** (supported + intentionally rejected + accepted divergence / total) | **132/132 = 100%** |
-| **agreed with Prometheus** (constructs whose corpus entries matched the pinned binary / constructs compared) | **not measured in this run** |
+| **agreed with Prometheus** (constructs whose compared corpus entries matched the pinned binary / constructs compared) | **not measured in this run** |
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |

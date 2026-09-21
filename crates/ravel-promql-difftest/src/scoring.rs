@@ -90,7 +90,12 @@ pub const REACHED_ROW_LABEL: &str =
 /// out of both halves for the same reason read the other way round: those
 /// entries matched nothing, so counting them in the numerator would publish a
 /// documented divergence as agreement.
-pub const AGREED_ROW_LABEL: &str = "**agreed with Prometheus** (constructs whose corpus entries matched the pinned binary / constructs compared)";
+///
+/// The label says "compared entries" because the unit of the numerator is the
+/// construct while the unit of an accepted divergence is the entry: a
+/// construct with a mix of ordinary and ADR-accepted entries is scored on the
+/// ordinary ones, and its row names how many entries were not compared.
+pub const AGREED_ROW_LABEL: &str = "**agreed with Prometheus** (constructs whose compared corpus entries matched the pinned binary / constructs compared)";
 
 /// What the agreed score row reads when no [`RunReport`] was supplied. Never a
 /// number: an unmeasured agreement is not 0 of the surface and not all of it.
@@ -302,7 +307,10 @@ pub enum AgreedState {
     /// A run report was folded in, but no corpus entry exercises this
     /// construct, so Prometheus never ran it.
     NotCompared,
-    /// Every exercising corpus entry matched the pinned Prometheus binary.
+    /// Every exercising corpus entry that was compared for a match matched the
+    /// pinned Prometheus binary. A construct in this state can still carry
+    /// ADR-accepted entries, which are not compared for a match; its row names
+    /// how many.
     Agreed,
     /// At least one exercising corpus entry did not match it.
     Diverged,
@@ -1793,11 +1801,14 @@ impl ConformanceReport {
     /// reached state: it lands in [`ConstructOutcome::disagreements`] and
     /// publishes as [`AgreedState::Diverged`].
     ///
-    /// The report must have run at least the corpus this conformance report
-    /// was built from. A [`RunReport`] carries its failures and a total, not
-    /// the name of every entry it executed, so entries a shorter run never
-    /// reached are indistinguishable from passing ones, and folding one in
-    /// would publish agreement for constructs Prometheus never saw.
+    /// The report must have run at least as many entries as the corpus this
+    /// conformance report was built from. That is a count check, not set
+    /// inclusion: a [`RunReport`] carries its failures and a total, not the
+    /// name of every entry it executed, so a report of equal size from a
+    /// different corpus still folds in. It refuses the case that shows up in
+    /// practice, a run over fewer entries, where entries the run never reached
+    /// are indistinguishable from passing ones and folding it in would publish
+    /// agreement for constructs Prometheus never saw.
     pub fn apply_run_report(&mut self, report: &RunReport) -> Result<(), ScoringError> {
         if report.total < self.corpus_entries {
             return Err(ScoringError::PartialRunReport {
@@ -2115,7 +2126,26 @@ impl ConformanceReport {
                     plural_entries(n)
                 ));
             }
-            AgreedState::Agreed | AgreedState::NotCompared | AgreedState::NotMeasured => {}
+            AgreedState::Agreed => {
+                // An agreed construct can still carry ADR-accepted entries
+                // beside its matching ones. Those were never compared for a
+                // match, so the row says how many rather than letting them
+                // ride along under the agreed state.
+                let accepted = outcome
+                    .evidence
+                    .iter()
+                    .filter(|e| e.accepted_divergence)
+                    .count();
+                if accepted > 0 {
+                    parts.push(format!(
+                        "{accepted} of {} exercising {} not compared for a \
+                         match: accepted divergences",
+                        outcome.evidence.len(),
+                        plural_entries(accepted)
+                    ));
+                }
+            }
+            AgreedState::NotCompared | AgreedState::NotMeasured => {}
         }
         if !outcome.construct.note.is_empty() {
             parts.push(collapse_whitespace(outcome.construct.note));

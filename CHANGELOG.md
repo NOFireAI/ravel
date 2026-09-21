@@ -32,8 +32,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a differential run actually compared, reads `not measured in this run` when
   no run report was folded in, and reports `not compared` and
   `accepted divergence` as their own counts rather than folding either into
-  the ratio. An ADR-accepted one-sided divergence is never published as
-  agreement. The difftest lane now writes the report the agreed row reads, so
+  the ratio. An ADR-accepted divergence is never counted as a match: a
+  construct whose every entry is one is counted on its own line, and a
+  construct that mixes them with ordinary entries is scored on the ordinary
+  ones and names the rest in its evidence column. The difftest lane now
+  writes the report the agreed row reads, so
   the figure can move at all.
 - **`--s3-endpoint` now decides whether plaintext is allowed, and a
   non-loopback `http://` endpoint is refused at startup** (issue #1707).
