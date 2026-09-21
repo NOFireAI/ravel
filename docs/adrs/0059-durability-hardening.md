@@ -126,7 +126,7 @@ its existing, correct comparison logic, not a rewrite.
 
 ### 3. New metrics family, following `render_maintain_safety_family`'s convention
 
-`ravel_scrub_checksum_mismatch_total{signal}`,
+`ravel_scrub_checksum_mismatch_total{signal,level}`,
 `ravel_scrub_postings_disagreement_total{signal}`,
 `ravel_scrub_seal_divergence_total{signal}` (missing/mismatched/orphaned
 as distinct label values on `reason`, matching the existing `Label`
@@ -135,6 +135,11 @@ covered this rotation, for operator visibility into cadence). No
 `tenant_hash` label, matching every existing family on the unauthenticated
 `/metrics` route (ADR-0044 §4) — this is not a new decision, it is
 following the established default every other family already follows.
+
+ADR-1686 amends the checksum-mismatch family: the corpus covers the live
+generation's compaction and rewrite output parts as well as L0 segments,
+and `level` (`l0`, `l1`, `rewrite`) names the tier the corrupt object came
+from, so a mismatch is no longer attributed to L0 by default.
 
 ### 4. Acceptance test targets a deterministic entry point, not cursor rotation
 

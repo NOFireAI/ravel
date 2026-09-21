@@ -13,9 +13,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carries a new `level` label** (issue #1686). The corpus previously skipped
   every compaction and rewrite record it listed, so a bit flip in an L1 or
   rewrite part was never checksummed; a live compaction or rewrite record's
-  parts now join the same rotation an L0 segment does, and a part whose
-  inputs a retention tombstone has since retired is excluded the same way a
-  tombstoned L0 segment already was. `ravel_scrub_checksum_mismatch_total`
+  parts now join the same rotation an L0 segment does. Only the live
+  generation's parts are scrubbed: a record another rewrite record names in
+  `superseded_record_key`, and a record in a bucket a retention tombstone has
+  retired, are both left out, so no operator is paged on rot in bytes no
+  query reads. `ravel_scrub_checksum_mismatch_total`
   now carries `level="l0"`, `level="l1"`, or `level="rewrite"` instead of one
   undifferentiated series per signal; a dashboard or alert rule that sums
   over `signal` alone still sees the same total, but one that names the
