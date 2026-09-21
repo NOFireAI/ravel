@@ -179,33 +179,139 @@ impl RecordCache {
     }
 }
 
+/// Charged cost of one cached compaction entry beyond its variable-length
+/// members: the `CompactionRecord` struct, its `Arc` allocation, the key
+/// `String` header held twice (map key and order queue) and the two
+/// collections' slot overhead. The members that vary in length are charged
+/// separately by [`compaction_entry_resident_bytes`].
+const COMPACTION_ENTRY_FIXED_BYTES: u64 = 320;
+/// Charged cost of one decoded `CompactionInputIdentity`: the struct itself
+/// (a `String` header and two `u64`s) as it sits in the `inputs` vector. Its
+/// `writer_id` heap allocation is charged on top, per input.
+const COMPACTION_INPUT_FIXED_BYTES: u64 = 40;
+/// Charged cost of one decoded `CompactionPart` struct as it sits in the
+/// `parts` vector: three `Vec<u8>` headers, six `u64`s, two `i64`s, two
+/// `u32`s and the `declared_column_stats` vector header. Its byte vectors and
+/// statistics are charged on top.
+const COMPACTION_PART_FIXED_BYTES: u64 = 160;
+/// Charged cost of one decoded `DeclaredColumnMinMax` struct: a `String`
+/// header, a `u32`, two optional message-typed extrema and a `u64`. The
+/// column name's heap allocation is charged on top.
+const DECLARED_COLUMN_STAT_FIXED_BYTES: u64 = 80;
+
+/// Estimated live heap one cached compaction entry holds, the figure
+/// [`CompactionTenantCache`] evicts against.
+///
+/// A `CompactionRecord` carries one `CompactionInputIdentity` per compacted L0
+/// segment and one `CompactionPart` per output object, neither capped by the
+/// format (proto/ravel/commit.proto) nor by
+/// `ravel_commit::record::validate_compaction`, so its size is not a constant
+/// and an entry-count bound does not bound this cache's memory. Same basis as
+/// the column-statistics cache's own
+/// [`heap_bytes`](crate::column_stats_resolve::LoadedColumnStats::heap_bytes):
+/// every struct that is held, plus every heap allocation hanging off it. An
+/// estimate, not a measurement of the allocator.
+fn compaction_entry_resident_bytes(key: &str, record: &CompactionRecord) -> u64 {
+    let inputs: u64 = record
+        .inputs
+        .iter()
+        .map(|input| COMPACTION_INPUT_FIXED_BYTES + input.writer_id.len() as u64)
+        .sum();
+    let parts: u64 = record
+        .parts
+        .iter()
+        .map(|part| {
+            let stats: u64 = part
+                .declared_column_stats
+                .iter()
+                .map(|stat| DECLARED_COLUMN_STAT_FIXED_BYTES + stat.name.len() as u64)
+                .sum();
+            COMPACTION_PART_FIXED_BYTES
+                + part.first_series_id.len() as u64
+                + part.last_series_id.len() as u64
+                + part.content_hash.len() as u64
+                + stats
+        })
+        .sum();
+    COMPACTION_ENTRY_FIXED_BYTES
+        + 2 * key.len() as u64
+        + record.tenant_hash.len() as u64
+        + record.input_set_hash.len() as u64
+        + inputs
+        + parts
+}
+
+struct CompactionEntry {
+    record: Arc<CompactionRecord>,
+    /// Size of the raw object this was decoded from, for the accounting a hit
+    /// records (see the module docs); not what eviction charges.
+    bytes: u64,
+    /// What this entry is charged against the tenant's byte budget
+    /// ([`compaction_entry_resident_bytes`]).
+    resident_bytes: u64,
+}
+
 #[derive(Default)]
 struct CompactionTenantCache {
-    entries: HashMap<String, (Arc<CompactionRecord>, u64)>,
+    entries: HashMap<String, CompactionEntry>,
     /// Insertion order, oldest first, for capacity-cap eviction.
     order: std::collections::VecDeque<String>,
+    /// Summed [`CompactionEntry::resident_bytes`] of everything in `entries`.
+    charged_bytes: u64,
 }
 
 impl CompactionTenantCache {
-    fn insert(&mut self, key: String, record: Arc<CompactionRecord>, bytes: u64, capacity: usize) {
+    /// Admit `record` and evict oldest-first until the cache is inside BOTH
+    /// bounds: `max_bytes` of charged residency and `capacity` entries. The
+    /// byte bound is the one that holds this cache to its share of
+    /// `MAX_RECORD_CACHE_BYTES_PER_TENANT`, because a single compaction record
+    /// can hold thousands of inputs and so cost hundreds of times what one
+    /// commit-record entry does (see [`compaction_entry_resident_bytes`]). A
+    /// `max_bytes` of `0` is the disabled sentinel `cache_capacity_per_tenant
+    /// == 0` resolves to: the entry is admitted and immediately evicted, so
+    /// nothing is ever resident.
+    fn insert(
+        &mut self,
+        key: String,
+        record: Arc<CompactionRecord>,
+        bytes: u64,
+        capacity: usize,
+        max_bytes: u64,
+    ) {
         if self.entries.contains_key(&key) {
             return;
         }
-        self.entries.insert(key.clone(), (record, bytes));
+        let resident_bytes = compaction_entry_resident_bytes(&key, &record);
+        self.charged_bytes = self.charged_bytes.saturating_add(resident_bytes);
+        self.entries.insert(
+            key.clone(),
+            CompactionEntry {
+                record,
+                bytes,
+                resident_bytes,
+            },
+        );
         self.order.push_back(key);
-        while self.order.len() > capacity.max(1) {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+        while self.charged_bytes > max_bytes || self.order.len() > capacity.max(1) {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.charged_bytes = self.charged_bytes.saturating_sub(evicted.resident_bytes);
             }
         }
     }
 }
 
 /// Decoded compaction-record cache, partitioned by tenant and keyed by full
-/// object key, exactly like [`RecordCache`] (docs/catalog-and-mvcc.md step
-/// 2: compaction records are cached the same way commit records are).
+/// object key, like [`RecordCache`] (docs/catalog-and-mvcc.md step 2:
+/// compaction records are cached the same way commit records are) but bounded
+/// in BYTES rather than in entries: a compaction record's size grows with its
+/// input list, so an entry count does not bound its memory (see
+/// [`compaction_entry_resident_bytes`] and
+/// [`CatalogConfig::compaction_cache_max_bytes_per_tenant`](crate::CatalogConfig::compaction_cache_max_bytes_per_tenant)).
 /// Compaction records are immutable once published, so entries are only ever
-/// capacity-cap evicted, except for one trigger: when a resolver observes a
+/// budget evicted, except for one trigger: when a resolver observes a
 /// bucket's retention tombstone it drops that bucket's cached compaction
 /// records via [`CompactionRecordCache::invalidate_prefix`] (ADR-0010 §10,
 /// the same tombstone-observation invalidation as [`RecordCache`]). Exclusion
@@ -228,7 +334,8 @@ impl CompactionRecordCache {
             .tenants
             .lock()
             .get(tenant)
-            .and_then(|c| c.entries.get(key).cloned());
+            .and_then(|c| c.entries.get(key))
+            .map(|entry| (entry.record.clone(), entry.bytes));
         match hit {
             Some((record, bytes)) => {
                 accounting.record_cache_hit();
@@ -249,21 +356,51 @@ impl CompactionRecordCache {
         record: Arc<CompactionRecord>,
         bytes: u64,
         capacity: usize,
+        max_bytes: u64,
     ) {
         self.tenants
             .lock()
             .entry(tenant)
             .or_default()
-            .insert(key, record, bytes, capacity);
+            .insert(key, record, bytes, capacity, max_bytes);
     }
 
     /// Drop every cached compaction record for `tenant` whose key starts with
     /// `prefix` (ADR-0010 §10 tombstone-observation invalidation).
     pub(crate) fn invalidate_prefix(&self, tenant: &TenantHash, prefix: &str) {
         if let Some(cache) = self.tenants.lock().get_mut(tenant) {
-            cache.entries.retain(|k, _| !k.starts_with(prefix));
+            let mut dropped: u64 = 0;
+            cache.entries.retain(|k, entry| {
+                if k.starts_with(prefix) {
+                    dropped = dropped.saturating_add(entry.resident_bytes);
+                    false
+                } else {
+                    true
+                }
+            });
+            cache.charged_bytes = cache.charged_bytes.saturating_sub(dropped);
             cache.order.retain(|k| !k.starts_with(prefix));
         }
+    }
+
+    /// Charged residency currently held for `tenant`, the figure eviction
+    /// holds inside
+    /// [`CatalogConfig::compaction_cache_max_bytes_per_tenant`](crate::CatalogConfig::compaction_cache_max_bytes_per_tenant).
+    #[cfg(test)]
+    pub(crate) fn charged_bytes(&self, tenant: &TenantHash) -> u64 {
+        self.tenants
+            .lock()
+            .get(tenant)
+            .map_or(0, |cache| cache.charged_bytes)
+    }
+
+    /// Number of entries currently resident for `tenant`.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self, tenant: &TenantHash) -> usize {
+        self.tenants
+            .lock()
+            .get(tenant)
+            .map_or(0, |cache| cache.entries.len())
     }
 
     /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
@@ -693,6 +830,233 @@ mod tests {
         cache.insert(a, "k".to_string(), Arc::new(record([3; 16], 0)), 1, 10);
         assert!(cache.get(&a, "k", &accounting).is_some());
         assert!(cache.get(&b, "k", &accounting).is_none());
+    }
+
+    /// A compaction record over `inputs` L0 segments, the shape whose size the
+    /// entry-count bound could not see: each input is a 36-character uuid
+    /// string plus two integers, and nothing in the format or in
+    /// `validate_compaction` caps how many a record carries.
+    fn compaction_record(tenant_hash: [u8; 16], inputs: usize) -> CompactionRecord {
+        CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.to_vec(),
+            signal: ravel_proto::commit::v1::Signal::Metrics as i32,
+            shard: 0,
+            ingest_hour_bucket: 0,
+            level: 1,
+            inputs: (0..inputs)
+                .map(|i| ravel_proto::commit::v1::CompactionInputIdentity {
+                    writer_id: uuid::Uuid::from_u128(i as u128).to_string(),
+                    writer_epoch: 1,
+                    writer_seq: i as u64,
+                })
+                .collect(),
+            input_set_hash: vec![0; 32],
+            parts: Vec::new(),
+            created_unix_ns: 0,
+        }
+    }
+
+    /// The charge is the sum of what the entry actually holds, so a record
+    /// with an input list is charged for it. Pins the arithmetic:
+    /// fixed overhead, the key held twice, the two byte vectors, and per
+    /// input its struct plus its 36-character uuid.
+    #[test]
+    fn compaction_entry_charge_counts_the_input_list() {
+        let key = "m/c/0/0/abc.cmp";
+        let empty = compaction_entry_resident_bytes(key, &compaction_record([20; 16], 0));
+        assert_eq!(
+            empty,
+            COMPACTION_ENTRY_FIXED_BYTES + 2 * key.len() as u64 + 16 + 32
+        );
+        let per_input = COMPACTION_INPUT_FIXED_BYTES + 36;
+        assert_eq!(
+            compaction_entry_resident_bytes(key, &compaction_record([20; 16], 1_800)),
+            empty + 1_800 * per_input
+        );
+        assert_eq!(
+            per_input * 1_800,
+            136_800,
+            "one L1 record over a shard-hour of 1,800 L0 segments is charged about 137 KB, \
+             not the 750 bytes an entry-count bound assumes"
+        );
+    }
+
+    /// Issue #1735 fix round. The compaction cache is bounded in BYTES, not in
+    /// entries: a handful of records whose input lists make each of them
+    /// hundreds of times the assumed per-entry cost must evict down to the
+    /// budget even though their count stays far below the entry capacity.
+    ///
+    /// Rules out two wrong implementations. An eviction that compares the
+    /// entry COUNT against a byte-derived cap leaves all eight resident
+    /// (8 << 1,000), so the charged total lands at eight times the per-entry
+    /// charge, well over the budget. An eviction applied to the commit-record
+    /// cache only leaves this cache on its entry cap, with the same result.
+    /// Both fail the exact assertions below, which are on charged bytes.
+    #[test]
+    fn oversized_compaction_entries_evict_on_bytes_not_count() {
+        let cache = CompactionRecordCache::default();
+        let tenant = TenantHash([21; 16]);
+        let capacity = 1_000;
+        let budget = capacity as u64 * crate::config::RECORD_CACHE_ENTRY_BYTES;
+        assert_eq!(budget, 750_000);
+
+        let record = Arc::new(compaction_record([21; 16], 1_800));
+        let charge = compaction_entry_resident_bytes("c0", &record);
+        assert!(
+            charge > 100_000,
+            "sanity: one such record is charged {charge} bytes, far above the 750 an entry \
+             cap assumes"
+        );
+        let expected_resident = (budget / charge) as usize;
+        assert_eq!(
+            expected_resident, 5,
+            "sanity: the budget holds exactly five of these"
+        );
+
+        for i in 0..8 {
+            cache.insert(tenant, format!("c{i}"), record.clone(), 1, capacity, budget);
+            assert!(
+                cache.charged_bytes(&tenant) <= budget,
+                "the charged total must stay inside the budget after every insert"
+            );
+        }
+
+        assert_eq!(
+            cache.charged_bytes(&tenant),
+            expected_resident as u64 * charge,
+            "residency is pinned to exactly the entries the budget holds, not to \
+             'something was evicted'"
+        );
+        assert_eq!(cache.entry_count(&tenant), expected_resident);
+        assert!(
+            8 < capacity,
+            "the entry cap is never reached here: only the byte bound can have evicted"
+        );
+
+        // Oldest-first: the three earliest keys are gone, the five newest stay.
+        let accounting = QueryAccounting::new();
+        for i in 0..3 {
+            assert!(
+                cache.get(&tenant, &format!("c{i}"), &accounting).is_none(),
+                "c{i} must have been evicted"
+            );
+        }
+        for i in 3..8 {
+            assert!(
+                cache.get(&tenant, &format!("c{i}"), &accounting).is_some(),
+                "c{i} must still be resident"
+            );
+        }
+    }
+
+    /// A tenant whose compaction records are small is still bounded by the
+    /// entry capacity, so the byte bound replaces nothing: both hold.
+    #[test]
+    fn small_compaction_entries_still_evict_on_the_entry_cap() {
+        let cache = CompactionRecordCache::default();
+        let tenant = TenantHash([22; 16]);
+        let record = Arc::new(compaction_record([22; 16], 0));
+        let charge = compaction_entry_resident_bytes("c0", &record);
+        let budget = 10_000 * charge;
+
+        for i in 0..5 {
+            cache.insert(tenant, format!("c{i}"), record.clone(), 1, 3, budget);
+        }
+
+        assert_eq!(
+            cache.entry_count(&tenant),
+            3,
+            "the entry cap binds when the entries are small"
+        );
+        assert_eq!(cache.charged_bytes(&tenant), 3 * charge);
+    }
+
+    /// `cache_capacity_per_tenant == 0` resolves to a `0` budget, and nothing
+    /// stays resident under it.
+    #[test]
+    fn a_zero_budget_holds_no_compaction_entry() {
+        let cache = CompactionRecordCache::default();
+        let tenant = TenantHash([23; 16]);
+        let accounting = QueryAccounting::new();
+        let config = CatalogConfig {
+            cache_capacity_per_tenant: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.compaction_cache_max_bytes_per_tenant(), 0);
+
+        cache.insert(
+            tenant,
+            "c0".to_string(),
+            Arc::new(compaction_record([23; 16], 0)),
+            1,
+            config.cache_capacity_per_tenant,
+            config.compaction_cache_max_bytes_per_tenant(),
+        );
+
+        assert_eq!(cache.charged_bytes(&tenant), 0);
+        assert!(cache.get(&tenant, "c0", &accounting).is_none());
+    }
+
+    /// Tombstone-observation invalidation drops the charge with the entries,
+    /// so a later insert is not evicted against bytes that are no longer held.
+    #[test]
+    fn invalidate_prefix_releases_the_charged_bytes() {
+        let cache = CompactionRecordCache::default();
+        let tenant = TenantHash([24; 16]);
+        let record = Arc::new(compaction_record([24; 16], 10));
+        let budget = 10_000_000;
+        cache.insert(
+            tenant,
+            "m/c/0/1/a.cmp".to_string(),
+            record.clone(),
+            1,
+            100,
+            budget,
+        );
+        cache.insert(
+            tenant,
+            "m/c/0/2/b.cmp".to_string(),
+            record.clone(),
+            1,
+            100,
+            budget,
+        );
+        let both = cache.charged_bytes(&tenant);
+
+        cache.invalidate_prefix(&tenant, "m/c/0/1/");
+
+        assert_eq!(cache.entry_count(&tenant), 1);
+        assert_eq!(
+            cache.charged_bytes(&tenant),
+            compaction_entry_resident_bytes("m/c/0/2/b.cmp", &record),
+            "the dropped entry's charge is released, not left on the tenant's total"
+        );
+        assert!(cache.charged_bytes(&tenant) < both);
+    }
+
+    /// The per-tenant budget is the derived capacity times the per-entry cost,
+    /// the figure docs/guides/caching.md and docs/guides/operations.md quote:
+    /// 22.5 MB at the cap and 7.5 MB at the floor `--disable-cache` holds.
+    #[test]
+    fn the_compaction_budget_is_the_stated_per_cache_share() {
+        let at_cap = CatalogConfig {
+            cache_capacity_per_tenant: crate::config::MAX_CACHE_CAPACITY_PER_TENANT,
+            ..Default::default()
+        };
+        assert_eq!(at_cap.compaction_cache_max_bytes_per_tenant(), 22_500_000);
+        assert_eq!(
+            at_cap.compaction_cache_max_bytes_per_tenant()
+                * crate::config::RECORD_CACHES_PER_TENANT,
+            crate::config::MAX_RECORD_CACHE_BYTES_PER_TENANT,
+            "both caches together are the stated 45 MB"
+        );
+
+        let at_floor = CatalogConfig {
+            cache_capacity_per_tenant: crate::config::DEFAULT_CACHE_CAPACITY_PER_TENANT,
+            ..Default::default()
+        };
+        assert_eq!(at_floor.compaction_cache_max_bytes_per_tenant(), 7_500_000);
     }
 
     fn head(tenant_hash: [u8; 16], watermark_hour: u32) -> SnapshotHead {

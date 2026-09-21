@@ -46,23 +46,47 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 /// deployment with very few shards and a very long flush delay still gets the
 /// same protection the fixed constant used to give everyone.
 ///
-/// An entry costs roughly 750 bytes (`RECORD_CACHE_ENTRY_BYTES`): a 119-byte
-/// commit key held twice (the map key and the recency index), the 200-byte
-/// decoded `CommitRecord` plus about 200 bytes of its own heap (tenant hash,
-/// writer uuid, data object key, content hash), and the two maps' slot
-/// overhead. The bound sizes TWO per-tenant caches, not one
-/// (`RECORD_CACHES_PER_TENANT`): [`CatalogConfig::cache_capacity_per_tenant`]
-/// is passed to both the commit-record cache and the L1 compaction-record
-/// cache (`crate::cache::RecordCache` and
-/// `crate::cache::CompactionRecordCache`), each bounded at that entry count
-/// independently, so the worst case per actively-queried tenant is twice the
-/// capacity in entries. At the cap that is 30,000 * 750 * 2 = 45 MB per
-/// tenant (22.5 MB per cache), reclaimed by the idle-tenant sweep
-/// ([`Catalog::evict_idle_tenants`](crate::Catalog::evict_idle_tenants)). A
-/// compaction record's own size varies with the input list it carries, and in
-/// steady state that cache holds far fewer entries than the commit-record one
-/// (one per compacted bucket, not one per L0 segment); 45 MB is the bound to
-/// budget against, not the expected residency.
+/// A commit-record entry costs roughly 750 bytes
+/// (`RECORD_CACHE_ENTRY_BYTES`): a 119-byte commit key held twice (the map key
+/// and the recency index), the 200-byte decoded `CommitRecord` plus about 200
+/// bytes of its own heap (tenant hash, writer uuid, data object key, content
+/// hash), and the two maps' slot overhead. That is an estimate for a record
+/// carrying no declared column statistics, not a per-entry bound the code
+/// enforces: `CommitRecord.declared_column_stats` is a repeated field
+/// (proto/ravel/commit.proto) and the commit-record cache evicts on entry
+/// count, so a tenant with many declared typed columns costs more per entry
+/// than this.
+///
+/// The capacity sizes TWO per-tenant caches, not one
+/// (`RECORD_CACHES_PER_TENANT`), and they are bounded differently:
+///
+/// * The commit-record cache (`crate::cache::RecordCache`) holds up to
+///   [`CatalogConfig::cache_capacity_per_tenant`] entries, so its footprint is
+///   that count times the per-entry estimate above: 22.5 MB at the
+///   30,000-entry cap.
+/// * The L1 compaction-record cache (`crate::cache::CompactionRecordCache`) is
+///   bounded in BYTES, at
+///   [`CatalogConfig::compaction_cache_max_bytes_per_tenant`] = `capacity *
+///   RECORD_CACHE_ENTRY_BYTES`, which is the footprint the entry count was
+///   assumed to buy. It has to be: a `CompactionRecord` carries one
+///   `CompactionInputIdentity` per compacted L0 segment, capped neither by the
+///   format (proto/ravel/commit.proto) nor by
+///   `ravel_commit::record::validate_compaction`, so one L1 record over a
+///   shard-hour that sealed 1,800 L0 records holds about 1,800 inputs and
+///   roughly 140 KB, about 190 times the per-entry estimate. Under an
+///   entry-count bound that cache could exceed its share of the figure below
+///   by two orders of magnitude before evicting anything. It charges each
+///   entry an estimate of its live heap
+///   (`crate::cache::compaction_entry_resident_bytes`) and evicts oldest-first
+///   until the summed charge is inside the budget; the entry count is capped
+///   at the capacity as well, so both bounds hold.
+///
+/// So the worst case per actively-queried tenant is `capacity *
+/// RECORD_CACHE_ENTRY_BYTES * RECORD_CACHES_PER_TENANT`: at the cap, 30,000 *
+/// 750 * 2 = 45 MB (22.5 MB per cache), reclaimed by the idle-tenant sweep
+/// ([`Catalog::evict_idle_tenants`](crate::Catalog::evict_idle_tenants)). The
+/// compaction half is enforced by that byte budget; the commit half rests on
+/// the per-entry estimate above.
 ///
 /// This is not one of the ADR-1170 carved caches: it is not a share of
 /// `memory_budget_bytes`, it is an entry-count bound sized from ingest
@@ -107,6 +131,14 @@ pub const MAX_RECORD_CACHE_BYTES_PER_TENANT: u64 = 45_000_000;
 /// each of the two caches. 30,000 entries. Deliberately above the
 /// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`] floor, so the clamp cannot invert.
 ///
+/// The two caches reach that byte figure by different routes, and only one of
+/// them is denominated in entries at all: the commit-record cache holds this
+/// many entries of an estimated [`RECORD_CACHE_ENTRY_BYTES`] each, while the
+/// compaction-record cache is bounded directly at the product,
+/// [`CatalogConfig::compaction_cache_max_bytes_per_tenant`], because its
+/// entries have no bounded size (see
+/// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`]).
+///
 /// The cost of the cap is stated rather than hidden: a tenant whose unsealed
 /// tail exceeds 30,000 records does not get the whole tail cached, and
 /// because a bound below the working set makes the resolve's two passes evict
@@ -145,6 +177,20 @@ pub const SIGNAL_STREAMS: u64 = 6;
 /// can therefore have STARTED 2h20m ago, so an unsealed tail spans up to
 /// 2.34 hours of ingest; 3 is that rounded up. Every record in it is read by
 /// every query over the tail, because no snapshot part covers it yet.
+///
+/// Like the flush-cadence term in [`derive_cache_capacity_per_tenant`], this
+/// is a lower bound on the tail rather than its worst case: it assumes the
+/// default seal parameters ([`DEFAULT_MAX_FLUSH_LIFETIME_NS`] 1h,
+/// [`DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`] 5m,
+/// [`DEFAULT_FOLD_SAFETY_MARGIN_NS`] 15m), and `max_flush_lifetime` is
+/// operator-settable through `--gc-max-flush-lifetime`. At
+/// `--gc-max-flush-lifetime 4h` the margin is 4h20m, the oldest unsealed hour
+/// can have started 5h20m ago, and the tail spans up to 5.34 hours, which
+/// this term under-counts by about 1.8x. The direction is safe (an
+/// under-sized cache costs what the flat constant cost, it never
+/// over-allocates), and at the shipped flush cadence
+/// [`MAX_CACHE_CAPACITY_PER_TENANT`] decides the result whatever this term
+/// says.
 pub const HOT_REGION_HOURS: u64 = 3;
 
 /// Bytes one cached record entry costs, the figure the operator-facing
@@ -153,9 +199,11 @@ pub const HOT_REGION_HOURS: u64 = 3;
 pub const RECORD_CACHE_ENTRY_BYTES: u64 = 750;
 
 /// Number of per-tenant caches [`CatalogConfig::cache_capacity_per_tenant`]
-/// bounds at that same entry count: the commit-record cache and the L1
-/// compaction-record cache. A per-tenant worst case is this many times
-/// capacity times [`RECORD_CACHE_ENTRY_BYTES`].
+/// sizes: the commit-record cache (bounded at that entry count) and the L1
+/// compaction-record cache (bounded at the equivalent byte budget,
+/// [`CatalogConfig::compaction_cache_max_bytes_per_tenant`]). A per-tenant
+/// worst case is this many times capacity times
+/// [`RECORD_CACHE_ENTRY_BYTES`].
 pub const RECORD_CACHES_PER_TENANT: u64 = 2;
 
 /// Derive the per-tenant record-cache capacity (in entries) from the tenant's
@@ -407,9 +455,12 @@ pub struct CatalogConfig {
     /// ([`DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`]).
     pub clock_skew_allowance_ns: i64,
     /// Bound on decoded commit records cached per tenant, in entries, evicted
-    /// least-recently-used. `0` disables the cache entirely. Default
-    /// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`], which carries the per-entry size
-    /// and the hot-region sizing rationale.
+    /// least-recently-used. `0` disables the cache entirely. It also sizes the
+    /// L1 compaction-record cache, whose entries have no bounded size and so
+    /// are bounded in bytes instead, at
+    /// [`compaction_cache_max_bytes_per_tenant`](Self::compaction_cache_max_bytes_per_tenant).
+    /// Default [`DEFAULT_CACHE_CAPACITY_PER_TENANT`], which carries the
+    /// per-entry size and the hot-region sizing rationale.
     pub cache_capacity_per_tenant: usize,
     /// Longest a writer may take to publish a commit record after its
     /// ingest hour ends, in nanoseconds. Part of the seal-watermark margin (ADR-0020). Default
@@ -555,6 +606,30 @@ pub struct CatalogConfig {
     /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`] for the measured basis. Default
     /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`].
     pub resolve_get_concurrency: usize,
+}
+
+impl CatalogConfig {
+    /// Byte budget the L1 compaction-record cache is held to, per tenant:
+    /// [`cache_capacity_per_tenant`](Self::cache_capacity_per_tenant) times
+    /// [`RECORD_CACHE_ENTRY_BYTES`], the footprint that entry count was
+    /// assumed to buy (22.5 MB at the 30,000-entry cap, 7.5 MB at the 10,000
+    /// floor `--disable-cache` holds).
+    ///
+    /// That cache cannot be bounded by an entry count: a `CompactionRecord`
+    /// carries one input identity per compacted L0 segment with no cap in the
+    /// format, so one entry can cost hundreds of times
+    /// [`RECORD_CACHE_ENTRY_BYTES`] (see
+    /// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`]). `crate::cache::CompactionRecordCache`
+    /// charges each entry an estimate of its live heap and evicts oldest-first
+    /// until the sum is within this.
+    ///
+    /// `0` follows the `cache_capacity_per_tenant == 0` disabled sentinel:
+    /// nothing stays resident.
+    pub fn compaction_cache_max_bytes_per_tenant(&self) -> u64 {
+        u64::try_from(self.cache_capacity_per_tenant)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(RECORD_CACHE_ENTRY_BYTES)
+    }
 }
 
 impl Default for CatalogConfig {
