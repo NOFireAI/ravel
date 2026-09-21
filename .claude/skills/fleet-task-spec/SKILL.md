@@ -156,21 +156,30 @@ Bash call, so exporting it from inside a task changes nothing. Setting it
 on the executor image is the real fix and is tracked on #1526.
 Commit with trailer "Refs: #N".
 
-CLAIMS AUDIT (answer in your report): list every sentence you wrote or
-edited in docs, HELP text, doc comments or an ADR that asserts a property
-of the system, and name the test or exact code line that makes it true.
-Delete or qualify any you cannot pair with one. Do not write "never" or
-"always" about behaviour you have not checked on every path, and recompute
-every number you state against the tree you are committing.
+CLAIMS AUDIT, before the commit you gate, reported afterwards: list every
+sentence you wrote or edited in docs, HELP text, doc comments or an ADR
+that asserts a property of the system, and name the test or exact code
+line that makes it true. Delete or qualify any you cannot pair with one.
+Do not write "never" or "always" about behaviour you have not checked on
+every path, and recompute every number you state against the tree you are
+committing. Running this after the gated commit means landing a
+documentation fixup on top of it, which is the shape "Format before you
+commit, not after" forbids.
 
-DISTINGUISHING TESTS: name at least TWO plausible WRONG implementations
-the acceptance test rules out, and show it failing against each, not only
-against deleted code. <When the shape is known, name them here: e.g. "one
-that counts per unit instead of per signal" and "one that hardcodes 1".>
+DISTINGUISHING TESTS, when this task delivers an acceptance test for a
+behaviour change: name at least TWO plausible WRONG implementations the
+test rules out, and show it failing against each, not only against deleted
+code. If it passes against either, it does not pin the behaviour. <When
+the shape is known, name them here: e.g. "one that counts per unit instead
+of per signal" and "one that hardcodes 1".>
 
 CLASS CLOSURE: <when this change is an instance of a pattern, name the
 grep> -- list every other site, and say fixed, out of scope with the
 reason, or already handled and where.
+
+OBSERVABILITY, when you add or document a metric family, label, flag or
+report field: a test asserts it appears on the real surface a reader is
+sent to. Name that test in your report.
 
 Self-check before the commit (see the checklist below): no tool-call
 artifacts in files, no debug_assert-only guards, generated docs
@@ -208,6 +217,9 @@ commit:
   check that runs after the work it was meant to prevent), it pins nothing.
 - **A pattern fixed at one site**: grep for the other instances before
   calling the class closed.
+- **A name with no surface**: a metric family, label, flag or report field
+  that a doc or HELP string names and nothing renders or produces. The
+  reader goes looking and finds nothing.
 - **Stray files**: nothing staged that the deliverables do not name
   (scratch scripts, logs, `__pycache__/`, editor droppings). `.gate-logs/`
   and `.dd-tools/` are covered by the tracked `.gitignore`; never
@@ -318,16 +330,11 @@ family nothing rendered.
 Each cost a full round. None would have survived the author reading their own
 sentence next to the code.
 
-So every spec carries this, and the executor answers it in the report:
-
-> CLAIMS AUDIT. Before your final commit, list every sentence you wrote or
-> edited in docs, HELP text, doc comments or an ADR that asserts a property
-> of the system, and name the test or the exact code line that makes it true.
-> Delete or qualify any sentence you cannot pair with one.
-
+The CLAIMS AUDIT paragraph in the Template above is the authoritative
+wording; copy it from there rather than from here, so the two cannot drift.
 Two rules inside it, both learned the expensive way:
 
-- **Never write "never" or "always" about a path you have not checked on
+- **Never write "never" or "always" about behaviour you have not checked on
   every path.** The recurring shape is a sentence true of the intra-cluster
   case and false of the federated one, or true of a cap refusal and false of
   a memory refusal. If the sentence needs a carve-out, the carve-out is the
@@ -352,14 +359,9 @@ derivation missing its signal multiplier passed a single-signal fixture. A
 stated mutation proof, written in the doc comment, turned out not to hold when
 the reviewer ran it.
 
-So the spec names the alternatives, not just the deletion:
-
-> DISTINGUISHING TESTS. Name at least TWO plausible WRONG implementations the
-> acceptance test rules out, and show it failing against each, not only
-> against deleted code. If it passes against either, it does not pin the
-> behaviour.
-
-Write those two into the spec yourself when you know the shape of the bug:
+So the spec names the alternatives, not just the deletion; the DISTINGUISHING
+TESTS paragraph in the Template above is the wording to copy. Write the two
+alternatives into the spec yourself when you know the shape of the bug:
 "a decoder that enforces the byte cap but not the frame cap" and "one that
 enforces both only after draining the stream" are better instructions than
 "demonstrate the test failing".
@@ -374,11 +376,8 @@ credentials. A "never a 503" carve-out was applied to three intra-cluster
 copies and missed three cross-cluster ones. A scrub corpus covering L0 but
 not the L1 parts that outlive it.
 
-Every spec whose change is an instance of a pattern says so:
-
-> CLASS CLOSURE. Grep the tree for every other site of this pattern, list each
-> one in your report, and say fixed, out of scope with the reason, or already
-> handled and where.
+Every spec whose change is an instance of a pattern says so, in the CLASS
+CLOSURE wording the Template above carries.
 
 The orchestrator writes the grep into the spec when the pattern is known
 ("every construction of S3Config", "every place a stream is drained before a
@@ -386,8 +385,9 @@ budget check"). An executor that only sees one call site will only fix one.
 
 ## Observability a doc names must render
 
-If the change adds or documents a metric family, a label, a flag or a report
-field, a test scrapes the real surface and asserts it appears. A
+The Template above carries this as its OBSERVABILITY line. If the change adds
+or documents a metric family, a label, a flag or a report field, a test
+scrapes the real surface and asserts it appears. A
 `flush_trigger_deferred_total` that exists in the crate and reaches no
 exposition is not shipped, and the help text that names it sends an operator
 looking for something that is not there. Same for a report row whose only
