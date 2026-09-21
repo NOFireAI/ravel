@@ -1106,6 +1106,7 @@ impl ShardActor {
                 }
                 Some(result) = self.flushes.join_next(), if !self.flushes.is_empty() => {
                     handle_flush_join_result(self.shard, result);
+                    self.record_queued_flushes();
                 }
             }
         }
@@ -1346,6 +1347,7 @@ impl ShardActor {
     async fn join_all_flushes(&mut self) {
         while let Some(result) = self.flushes.join_next().await {
             handle_flush_join_result(self.shard, result);
+            self.record_queued_flushes();
         }
     }
 
@@ -1422,6 +1424,33 @@ impl ShardActor {
         Ok(floor_ns)
     }
 
+    /// Whether `trigger` must be refused because this shard already has
+    /// `max_queued_flushes` flush tasks spawned and not yet reaped (issue
+    /// #1740). `JoinSet::len` is exactly that count: a task leaves the set only
+    /// when the select loop's reap arm or a drain joins it, so it covers both
+    /// the flushes executing against the object store and the ones parked on
+    /// the `max_inflight_flushes` semaphore. That parked queue is what ADR-1642
+    /// left unbounded, and under `IngestByteBudgetLimit::Unlimited` nothing
+    /// else bounds it.
+    ///
+    /// [`FlushTrigger::Manual`] is never refused. A drain (`FlushNow`,
+    /// shutdown, channel close) has no later tick to retry a refusal, so
+    /// refusing there would strand acknowledged buffered-mode rows on
+    /// teardown; it also needs no bound of its own, since `flush_all` awaits
+    /// every spawned flush before it returns.
+    fn queued_flush_cap_reached(&self, trigger: FlushTrigger) -> bool {
+        !matches!(trigger, FlushTrigger::Manual)
+            && self.flushes.len() >= self.config.queued_flush_cap()
+    }
+
+    /// Publishes this shard's spawned-but-unreaped flush-task count (issue
+    /// #1740). Called wherever `flushes` changes length, so the gauge always
+    /// reads the value the next trigger will be tested against.
+    fn record_queued_flushes(&self) {
+        self.metrics
+            .record_shard_flushes_queued(self.shard, self.flushes.len() as u64);
+    }
+
     /// Pins `buf`'s flush identity, then moves `buf`'s payload and waiters
     /// into a task spawned onto [`FlushCtx::run_flush`] (ADR-0067 decision
     /// 1). Everything runs here on the actor EXCEPT the `max_inflight_flushes`
@@ -1451,6 +1480,20 @@ impl ShardActor {
             // that ever changes, this returns without acking and the router
             // reads the dropped oneshot as a dead shard.
             debug_assert!(buf.waiters.is_empty());
+            return;
+        }
+        if self.queued_flush_cap_reached(trigger) {
+            // Issue #1740: this shard is already holding `max_queued_flushes`
+            // flush windows. Refuse the trigger rather than spawn another task
+            // to park on the semaphore, and put the buffer back exactly as it
+            // arrived: series, exemplars, waiters, `charges`, and the trigger
+            // bookkeeping (`flush_est_bytes`, `est_bytes`, `oldest_arrival_ns`)
+            // all ride back, so the age clock is not reset and the next tick
+            // re-fires this same trigger once a flush has been reaped. Nothing
+            // is acked and nothing is dropped, so this is a deferral, not a
+            // shed (ADR-1642 amendment).
+            self.metrics.record_shard_flush_trigger_deferred(self.shard);
+            self.tenants.insert(tenant, buf);
             return;
         }
         let raw_ns = self.clock.now_ns();
@@ -1663,6 +1706,7 @@ impl ShardActor {
             let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
             metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
+        self.record_queued_flushes();
     }
 }
 

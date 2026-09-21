@@ -1152,6 +1152,20 @@ pub struct Cli {
     /// memory"). Like `--max-inflight-ingest-requests` this is a per-process
     /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables the
     /// ceiling (the gauge is still tracked for `/metrics`).
+    ///
+    /// What `0` leaves unbounded is narrower than it was. Under ADR-1642 a
+    /// flush task is spawned at every trigger and acquires its concurrency
+    /// permit itself, so a stalled object store used to queue spawned flushes
+    /// with only this budget's shed to stop them, and `0` removed that. Issue
+    /// #1740 caps that queue by count instead: each shard refuses a size or
+    /// age trigger once it already holds `max_queued_flushes` spawned flushes
+    /// (default 8 per shard), leaving the rows buffered for the next tick
+    /// rather than shedding them, so the queue is bounded whatever this flag
+    /// is set to. Under `0`, then, spawned flush memory is bounded per shard
+    /// and buffered rows are bounded per tenant by the per-tenant buffer caps;
+    /// what is not bounded is their sum, which is exactly what this ceiling
+    /// bounds when it is enabled. A host with many active tenants can still
+    /// exhaust memory under `0` without any single bound being crossed.
     #[arg(long = "max-ingest-buffer-bytes", default_value_t = 512 * 1024 * 1024)]
     pub max_ingest_buffer_bytes: u64,
 
