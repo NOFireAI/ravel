@@ -59,6 +59,10 @@ services:
     command: ["--store", "s3", "store", "qualify"]
     environment:
       RAVEL_S3_ENDPOINT: http://minio:9000
+      # Set for when ravel-cli honours it: the CLI still derives allow_http
+      # from the endpoint being set at all, which is the other half of this
+      # issue. Ignored by any binary that does not know the variable.
+      RAVEL_S3_ALLOW_HTTP: "true"
       RAVEL_S3_BUCKET: ravel-dev
       RAVEL_S3_REGION: us-east-1
       RAVEL_S3_ACCESS_KEY: ravel
@@ -96,16 +100,23 @@ services:
       # dev bucket, so opt out explicitly. Safe on a reused minio-data/ too: an
       # existing unkeyed marker validates against this, keyed would not.
       - "--tenant-hash-unkeyed"
-      # RAVEL_S3_ENDPOINT below is plaintext http:// to the `minio` service,
-      # which is not loopback from inside this container, so startup refuses
-      # it without this flag. The traffic never leaves the compose network;
-      # a deployment reaching a real object store uses https:// instead.
-      - "--s3-allow-http"
     ports:
       - "127.0.0.1:4318:4318"
       - "127.0.0.1:4317:4317"
     environment:
       RAVEL_S3_ENDPOINT: http://minio:9000
+      # The endpoint above is plaintext http:// to the `minio` service, which
+      # is not loopback from inside this container, so startup refuses it
+      # without this. The traffic never leaves the compose network; a
+      # deployment reaching a real object store uses https:// instead.
+      #
+      # An environment variable rather than an argument, on purpose. The image
+      # pin above defaults to a published release that predates this flag, and
+      # an unknown ARGUMENT makes clap exit non-zero, so the stack would not
+      # start on the pinned default that the weekly quickstart leg runs. An
+      # unknown environment variable is ignored by the old binary and honoured
+      # by the new one, so both work.
+      RAVEL_S3_ALLOW_HTTP: "true"
       RAVEL_S3_BUCKET: ravel-dev
       RAVEL_S3_REGION: us-east-1
       RAVEL_S3_ACCESS_KEY: ravel
