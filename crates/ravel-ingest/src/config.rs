@@ -414,15 +414,22 @@ pub struct IngestConfig {
     /// That backstop is the only bound on one buffer's resident memory, and
     /// under [`IngestByteBudgetLimit::Unlimited`] nothing sheds behind it, so
     /// refusing a crossing would trade a bounded queue of flush tasks for an
-    /// unbounded buffer. Under memory pressure the queue therefore grows by
-    /// one window per backstop's worth of buffered memory, which is bounded
-    /// by how fast memory fills rather than by the flush cadence.
+    /// unbounded buffer. No count bounds that overshoot: an exempt spawn
+    /// consumes the whole buffer it fires on and the only re-insert path is
+    /// the ordinary one, so the same tenant crosses again after buffering
+    /// another backstop's worth and adds a window rather than replacing one.
+    /// Counting the buffers currently over their backstop describes one
+    /// instant, not the queue.
     ///
-    /// This is the count bound that holds under
-    /// [`IngestByteBudgetLimit::Unlimited`], where `try_charge` never sheds
-    /// and the byte budget bounds nothing: resident flush memory per shard is
-    /// then this many flush windows, plus one more per tenant buffer sitting
-    /// over its backstop, plus the tenant buffers themselves.
+    /// So this is the count bound on the ORDINARY triggers, and it is the
+    /// only bound they have under [`IngestByteBudgetLimit::Unlimited`], where
+    /// `try_charge` never sheds: resident flush memory per shard is then this
+    /// many flush windows, plus the tenant buffers themselves, plus however
+    /// many exempt windows the stall has accumulated, which only its length
+    /// bounds. Under [`IngestByteBudgetLimit::Bounded`] the budget bounds the
+    /// exempt windows instead, since a queued flush stays charged until its
+    /// PUTs complete and admission sheds once the charges reach the ceiling,
+    /// which stops the refill that would spawn the next one.
     ///
     /// Read through [`IngestConfig::queued_flush_cap`], which floors it at 1;
     /// 0 would refuse every trigger and never flush.

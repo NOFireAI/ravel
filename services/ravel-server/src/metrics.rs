@@ -862,6 +862,21 @@ pub struct IngestPipelineSnapshot {
     /// is: it stays at zero unless a shard is actually asked for a second
     /// concurrent flush.
     pub flush_permit_wait_ns_total: u64,
+    /// Flush tasks spawned and not yet reaped, summed across shards at
+    /// snapshot time: the queue depth `--max-queued-flushes` caps per shard
+    /// (issue #1740). A gauge, carried for every signal because the cap runs
+    /// in all three ingest pipelines. It can read above
+    /// `shard_count * max-queued-flushes`: a buffer over its memory backstop
+    /// spawns past the cap, which is what `flush_trigger_deferred_total`
+    /// staying flat under a rising depth distinguishes.
+    pub flushes_queued_total: u64,
+    /// Size and age flush triggers refused because their shard was already at
+    /// `--max-queued-flushes`, summed across shards (issue #1740). Cumulative,
+    /// and carried for every signal for the same reason
+    /// `flushes_queued_total` is. A refusal is a deferral: the buffer rides
+    /// back untouched and the next tick re-fires, so a rise means flush
+    /// latency slipped past `--max-flush-delay`, not that anything was shed.
+    pub flush_trigger_deferred_total: u64,
 }
 
 /// Exemplar admission counters, mirroring
@@ -960,6 +975,8 @@ impl IngestPipelineSnapshot {
             }),
             in_flight_flushes_total: snapshot.in_flight_flushes_total,
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
+            flushes_queued_total: snapshot.flushes_queued_total,
+            flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
         }
     }
 
@@ -998,6 +1015,8 @@ impl IngestPipelineSnapshot {
             adaptive_flushes: None,
             in_flight_flushes_total: snapshot.in_flight_flushes_total,
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
+            flushes_queued_total: snapshot.flushes_queued_total,
+            flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
         }
     }
 
@@ -1027,6 +1046,8 @@ impl IngestPipelineSnapshot {
             adaptive_flushes: None,
             in_flight_flushes_total: snapshot.in_flight_flushes_total,
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
+            flushes_queued_total: snapshot.flushes_queued_total,
+            flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
         }
     }
 }
@@ -1505,6 +1526,51 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_flush_permit_wait_seconds_total",
             &labels(mode, pipeline.signal),
             pipeline.flush_permit_wait_ns_total as f64 / 1_000_000_000.0,
+        );
+    }
+
+    // The queued-flush cap (issue #1740) and the refusals it produces. Both run
+    // in all three pipelines, so both are flat fields rather than
+    // `Option`-gated, the same as the two flush families above. The pair is
+    // read together: `--max-queued-flushes`' help sends an operator to the
+    // deferred counter, and the depth gauge is what says whether a flat
+    // counter means a healthy queue or the backstop exemption spawning past
+    // the cap.
+    write_header(
+        out,
+        "ravel_ingest_queued_flushes",
+        "Flush tasks spawned and not yet reaped, summed across shards at scrape time, by \
+         signal: the per-shard queue --max-queued-flushes caps (issue #1740). A gauge. It can \
+         exceed shard_count times the cap, because a tenant buffer over its memory backstop \
+         spawns whatever the queue depth; that case is this gauge rising while \
+         ravel_ingest_flush_trigger_deferred_total stays flat.",
+        "gauge",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_queued_flushes",
+            &labels(mode, pipeline.signal),
+            pipeline.flushes_queued_total,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_flush_trigger_deferred_total",
+        "Size and age flush triggers refused because their shard was already holding \
+         --max-queued-flushes spawned flush tasks (issue #1740), summed across shards, by \
+         signal. A refusal is a deferral, not a shed: the buffer rides back untouched and the \
+         next tick re-fires once a flush has been reaped, so a rise means flush latency slipped \
+         past --max-flush-delay and nothing was dropped.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_flush_trigger_deferred_total",
+            &labels(mode, pipeline.signal),
+            pipeline.flush_trigger_deferred_total,
         );
     }
 }
