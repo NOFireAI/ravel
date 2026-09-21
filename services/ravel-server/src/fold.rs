@@ -19,10 +19,13 @@
 //! fold is best-effort and a quiet failure here would look identical to
 //! "nothing new to fold."
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use ravel_catalog::Catalog;
+use ravel_catalog::{Catalog, FoldReport, RefoldRequest};
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock, SystemClock};
 use ravel_maintain::RetentionConfig;
@@ -33,6 +36,136 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::tenant_discovery::discover_and_restrict_by_lifecycle;
+
+/// Default [`RefoldQueue`] capacity: 256 pending `(tenant, signal)` requests.
+///
+/// Sized against the producer, not against tenant count: one maintain tick
+/// enqueues at most one request per owned `(tenant, signal)` pair, and the
+/// fold loops drain everything for their signal at the head of every tick, so
+/// the depth only grows while a fold tick is slower than a maintain tick. 256
+/// covers 85 tenants across the three [`FOLD_SIGNALS`] backing up for a whole
+/// fold interval without a single drop, and a drop costs nothing but latency:
+/// the next sweep still sees the hour blocked and re-sends it.
+pub const DEFAULT_REFOLD_QUEUE_CAPACITY: usize = 256;
+
+/// One sweep-to-fold hand-off: the ingest hours the sweep held on
+/// [`ravel_maintain::SnapshotBlock::Named`] for one `(tenant, signal)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefoldEntry {
+    tenant: TenantHash,
+    signal: Signal,
+    hours: BTreeSet<u32>,
+}
+
+/// The bounded sweep-to-fold re-fold channel (issue #1763 part b).
+///
+/// The maintain tick is the only producer: after sweeping a `(tenant, signal)`
+/// it sends the union of [`ravel_maintain::SweepReport::blocked_named_hours`]
+/// over the shards it swept. Each per-signal fold loop is the only consumer of
+/// its own signal's entries, and drains them at the head of its next tick into
+/// [`RefoldRequest`]s it passes to
+/// [`Catalog::fold_with_refold_request`].
+///
+/// Bounded with drop-oldest. `capacity` is a hard cap on queue depth; a send
+/// into a full queue discards the FRONT entry (the oldest, least likely to
+/// still be accurate) and counts it in [`Self::dropped_requests`]. Dropping is
+/// safe by construction rather than by luck: the sweep is stateless and
+/// re-derives the blocked set from the store every pass, so a dropped request
+/// is re-sent by the next sweep of that unit. The cost of a drop is one more
+/// fold interval of an hour naming pre-rewrite inputs, never a permanently
+/// uncollectable object.
+///
+/// Not a `tokio::sync::mpsc` channel: a `Sender` cannot evict the queue's
+/// front, so a bounded mpsc can only block the producer or drop the NEWEST
+/// value. Blocking the maintain tick on a lagging fold is the wrong trade for
+/// a best-effort hint, and dropping the newest inverts the intended policy.
+#[derive(Debug)]
+pub struct RefoldQueue {
+    capacity: usize,
+    pending: Mutex<VecDeque<RefoldEntry>>,
+    dropped: AtomicU64,
+}
+
+impl RefoldQueue {
+    /// A queue holding at most `capacity` pending requests. A `capacity` of 0
+    /// is raised to 1: a queue that drops everything it is given would make
+    /// the hand-off silently dead rather than bounded.
+    pub fn with_capacity(capacity: usize) -> Self {
+        RefoldQueue {
+            capacity: capacity.max(1),
+            pending: Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Enqueue one `(tenant, signal)`'s blocked hours, evicting the oldest
+    /// pending entry if the queue is full. An empty `hours` set is not
+    /// enqueued: there is nothing for a fold to reconcile, and enqueuing it
+    /// would let ordinary ticks evict real requests.
+    pub fn send(&self, tenant: TenantHash, signal: Signal, hours: BTreeSet<u32>) {
+        if hours.is_empty() {
+            return;
+        }
+        let entry = RefoldEntry {
+            tenant,
+            signal,
+            hours,
+        };
+        // A poisoned lock cannot corrupt anything here (the queue is a plain
+        // deque of owned values), and refusing the hand-off would be worse
+        // than serving a stale view of it, so recover the guard either way.
+        let mut pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while pending.len() >= self.capacity {
+            pending.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        pending.push_back(entry);
+    }
+
+    /// Remove and return every pending request for `signal`, merged per
+    /// tenant (a tenant swept twice between two fold ticks contributes the
+    /// union of both blocked sets, not the later one alone). Entries for other
+    /// signals are left in the queue for their own fold loop.
+    fn take_for_signal(&self, signal: Signal) -> BTreeMap<TenantHash, RefoldRequest> {
+        let mut pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut taken: BTreeMap<TenantHash, RefoldRequest> = BTreeMap::new();
+        let mut kept = VecDeque::with_capacity(pending.len());
+        for entry in pending.drain(..) {
+            if entry.signal == signal {
+                let request = taken.entry(entry.tenant).or_default();
+                for hour in entry.hours {
+                    request.insert(hour);
+                }
+            } else {
+                kept.push_back(entry);
+            }
+        }
+        *pending = kept;
+        taken
+    }
+
+    /// Requests evicted by a full queue since this queue was created. `0` in
+    /// the steady state; a rising value means the fold is not keeping up with
+    /// the sweep and some hours are taking extra fold intervals to reconcile.
+    pub fn dropped_requests(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Pending requests across every signal. Test and diagnostic accessor;
+    /// the loops themselves only ever drain.
+    pub fn pending_len(&self) -> usize {
+        match self.pending.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+}
 
 /// Default `fold_interval`: 5 minutes.
 pub const DEFAULT_FOLD_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -140,6 +273,26 @@ pub fn spawn(
     config: FoldTaskConfig,
     retention: Arc<RetentionConfig>,
 ) -> FoldTasks {
+    spawn_with_refold(catalog, store, fallback_allow, config, retention, None)
+}
+
+/// [`spawn`], with the sweep-to-fold re-fold channel connected.
+///
+/// `refold` is the consumer end of the queue a maintain tick in the same
+/// process sends to (issue #1763 part b). Each spawned loop drains only its
+/// own signal's requests, at the head of every tick, and passes them to
+/// [`Catalog::fold_with_refold_request`] so the targeted reconcile pass
+/// re-reads those hours even when they sit outside the fixed reconcile
+/// window. `None` (what [`spawn`] passes) folds exactly as before: an empty
+/// request on every tick.
+pub fn spawn_with_refold(
+    catalog: Arc<Catalog>,
+    store: Arc<dyn ObjectStoreBackend>,
+    fallback_allow: &[TenantHash],
+    config: FoldTaskConfig,
+    retention: Arc<RetentionConfig>,
+    refold: Option<Arc<RefoldQueue>>,
+) -> FoldTasks {
     if !config.enabled {
         return FoldTasks::none();
     }
@@ -168,6 +321,7 @@ pub fn spawn(
         let interval = config.fold_interval;
         let rng = Arc::clone(&rng);
         let retention = Arc::clone(&retention);
+        let refold = refold.clone();
         let handle = tokio::spawn(async move {
             run_loop(
                 catalog,
@@ -178,6 +332,7 @@ pub fn spawn(
                 interval,
                 rng,
                 retention,
+                refold,
                 rx,
             )
             .await;
@@ -198,6 +353,7 @@ async fn run_loop(
     interval: Duration,
     rng: Arc<dyn RngSource>,
     retention: Arc<RetentionConfig>,
+    refold: Option<Arc<RefoldQueue>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -230,11 +386,19 @@ async fn run_loop(
             );
         }
 
+        // Drain this signal's pending re-fold requests once per cycle, after
+        // discovery: a request for a tenant this cycle does not maintain has
+        // no fold to attach to, and holding it would keep evicting fresher
+        // ones. It is taken out of the queue either way, and the next sweep of
+        // that unit re-derives it.
+        let mut requests = take_refold_requests(refold.as_deref(), signal);
+
         for tenant in outcome.maintained {
             // The deployment-default retention window for this tenant, resolved
             // per tick from the CLI-derived RetentionConfig (ADR-0078). The fold
             // overlays the durable TenantConfig.retention_ns on top of it.
             let default_retention_ns = retention.window_for(&tenant);
+            let request = requests.remove(&tenant).unwrap_or_default();
             run_tenant_tick(
                 catalog.as_ref(),
                 store.as_ref(),
@@ -242,38 +406,90 @@ async fn run_loop(
                 signal,
                 folder_id,
                 interval,
+                SystemClock.now_ns(),
                 default_retention_ns,
+                &request,
             )
             .await;
         }
     }
 }
 
+/// Take every pending re-fold request for `signal` off the queue, merged per
+/// tenant. `None` (no queue connected) yields no requests, which is exactly
+/// what a fold with no sweep in its process sees.
+///
+/// `pub(crate)` so the maintain-side hand-off test drives the same drain the
+/// loop does instead of reconstructing a request by hand.
+pub(crate) fn take_refold_requests(
+    refold: Option<&RefoldQueue>,
+    signal: Signal,
+) -> BTreeMap<TenantHash, RefoldRequest> {
+    match refold {
+        Some(queue) => queue.take_for_signal(signal),
+        None => BTreeMap::new(),
+    }
+}
+
 /// One fold attempt for one tenant: the HEAD freshness peek, then
-/// [`Catalog::fold`] if it's stale. Split out from [`run_loop`] so discovery
-/// and the per-tenant fold logic stay independently readable.
+/// [`Catalog::fold_with_refold_request`] if it's stale. Split out from
+/// [`run_loop`] so discovery and the per-tenant fold logic stay independently
+/// readable.
+///
+/// `refold_request` is what the sweep asked this fold to reconcile. It is
+/// passed through even when empty, which is the same call
+/// [`Catalog::fold`] makes internally. A non-empty request does NOT bypass the
+/// freshness peek: a HEAD another replica folded within the last interval has
+/// already run its own targeted pass over whatever its own sweep found, and
+/// this replica's request survives in the store (the hour stays blocked) to be
+/// re-derived by the next sweep.
+///
+/// `now_ns` is the caller's clock reading, taken once per tenant by
+/// [`run_loop`] from [`SystemClock`]. Taking it as a parameter is what lets a
+/// test fold at a determined instant (CLAUDE.md testing patterns: time is
+/// injected) instead of at whatever the host's wall clock says, which for a
+/// fixture built on low ingest hours decides whether anything is sealed at
+/// all.
+///
+/// Returns the fold's own [`FoldReport`], or `None` when the freshness peek
+/// skipped this tick or the fold itself failed. [`run_loop`] logs and
+/// discards it; the maintain-side hand-off test asserts
+/// [`FoldReport::refold_hours_reconciled`] on it.
+///
+/// `pub(crate)` so that test folds through this exact function rather than
+/// calling the catalog directly.
 #[allow(clippy::too_many_arguments)]
-async fn run_tenant_tick(
+pub(crate) async fn run_tenant_tick(
     catalog: &Catalog,
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
     folder_id: Uuid,
     interval: Duration,
+    now_ns: i64,
     default_retention_ns: Option<i64>,
-) {
-    let now_ns = SystemClock.now_ns();
+    refold_request: &RefoldRequest,
+) -> Option<FoldReport> {
     if head_fresh_enough(store, tenant, signal, interval, now_ns).await {
         tracing::debug!(
             tenant = %tenant.to_hex(),
             signal = ?signal,
+            refold_hours_requested = refold_request.len(),
             "catalog fold: HEAD already fresh, skipping this tick"
         );
-        return;
+        return None;
     }
 
     match catalog
-        .fold(tenant, signal, folder_id, now_ns, &[], default_retention_ns)
+        .fold_with_refold_request(
+            tenant,
+            signal,
+            folder_id,
+            now_ns,
+            &[],
+            default_retention_ns,
+            refold_request,
+        )
         .await
     {
         Ok(report) => {
@@ -290,8 +506,11 @@ async fn run_tenant_tick(
                 list_requests = report.list_requests,
                 get_requests = report.get_requests,
                 put_requests = report.put_requests,
+                refold_hours_requested = refold_request.len(),
+                refold_hours_reconciled = report.refold_hours_reconciled,
                 "catalog fold complete"
             );
+            Some(report)
         }
         Err(err) => {
             tracing::warn!(
@@ -300,6 +519,7 @@ async fn run_tenant_tick(
                 error = %err,
                 "catalog fold failed; the index degrades to listing until a later fold succeeds"
             );
+            None
         }
     }
 }
