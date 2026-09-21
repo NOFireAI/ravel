@@ -409,10 +409,20 @@ pub struct IngestConfig {
     /// explicit flush-all, shutdown, channel close) are never refused, since
     /// nothing would retry them.
     ///
+    /// Neither is a trigger on a buffer that has crossed its memory backstop
+    /// ([`memory_backstop_crossed`]), so the queue CAN exceed this bound.
+    /// That backstop is the only bound on one buffer's resident memory, and
+    /// under [`IngestByteBudgetLimit::Unlimited`] nothing sheds behind it, so
+    /// refusing a crossing would trade a bounded queue of flush tasks for an
+    /// unbounded buffer. Under memory pressure the queue therefore grows by
+    /// one window per backstop's worth of buffered memory, which is bounded
+    /// by how fast memory fills rather than by the flush cadence.
+    ///
     /// This is the count bound that holds under
     /// [`IngestByteBudgetLimit::Unlimited`], where `try_charge` never sheds
     /// and the byte budget bounds nothing: resident flush memory per shard is
-    /// then this many flush windows plus the tenant buffers themselves.
+    /// then this many flush windows, plus one more per tenant buffer sitting
+    /// over its backstop, plus the tenant buffers themselves.
     ///
     /// Read through [`IngestConfig::queued_flush_cap`], which floors it at 1;
     /// 0 would refuse every trigger and never flush.
