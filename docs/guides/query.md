@@ -177,8 +177,11 @@ expressions, the `@` modifier, and vector matching are all supported. The
 generated conformance table in
 [docs/query-engine.md](../query-engine.md#promql-conformance-adr-0035) is
 authoritative: it classifies every construct as supported, intentionally
-rejected, or an accepted divergence, and its counts are regenerated from the
-differential test rather than written by hand.
+rejected, or an accepted divergence, and its counts are regenerated from a
+Ravel-only run rather than written by hand. That run measures what Ravel
+reaches and answers. Agreement with the pinned Prometheus binary is the
+table's separate `agreed with Prometheus` row, which the gated differential
+lane publishes.
 
 A handful of constructs are intentionally rejected. Each answers with a
 typed `422 unprocessable_entity` error naming the construct, never a panic and
