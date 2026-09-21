@@ -12,8 +12,10 @@
 //! `(tenant, signal, shard)` it holds data for, runs the content tier over the
 //! shard's committed data objects at every level: L0 commit records, and the
 //! L1 and rewrite parts a live compaction or erasure-rewrite record
-//! supersedes them with. A tombstoned bucket's compaction/rewrite records are
-//! excluded (retention's sweep may delete their parts at any time). (The
+//! supersedes them with. Only the live generation counts: a record another
+//! rewrite record names in `superseded_record_key` is excluded, and so is a
+//! tombstoned bucket's (retention's sweep may delete either one's parts at
+//! any time, and no query reads them meanwhile). (The
 //! maintenance and fold supervisors
 //! have since moved to the lifecycle-aware
 //! [`crate::tenant_discovery::discover_and_restrict_by_lifecycle`] under
@@ -23,8 +25,9 @@
 //!
 //! 1. LIST the shard's commit, compaction, rewrite, and tombstone records.
 //!    Decode each commit record and reconstruct the data object key it points
-//!    at; decode each live (non-tombstoned) compaction/rewrite record and
-//!    reconstruct its parts' keys the same way. Together these build the
+//!    at; decode each compaction/rewrite record, drop the tombstoned and
+//!    superseded ones, and reconstruct the survivors' parts' keys the same
+//!    way. Together these build the
 //!    rotation corpus ([`ScrubTarget`]s keyed by object key and tagged with a
 //!    [`ravel_maintain::ScrubLevel`], in key order).
 //! 2. Load this shard's persisted [`ScrubCursor`], size a per-tick byte budget
@@ -605,6 +608,14 @@ async fn run_shard_tick(
         String,
         (ravel_proto::commit::v1::CommitRecord, ScrubLevel),
     > = std::collections::HashMap::new();
+    // Compaction and rewrite records are decoded in the pass below but their
+    // parts are not expanded there: a bucket can hold a superseded generation
+    // alongside the live one until a horizon-gated sweep retires it, and only
+    // the full listing says which is which. Buffer them, resolve supersession
+    // once, then expand. Each record is still fetched exactly once.
+    let mut compaction_records: Vec<(String, ravel_proto::commit::v1::CompactionRecord)> =
+        Vec::new();
+    let mut rewrite_records: Vec<(String, ravel_proto::commit::v1::RewriteRecord)> = Vec::new();
     for meta in &metas {
         // L0 commit records, and the L1/rewrite parts a compaction or
         // erasure-rewrite record supersedes them with, all name objects
@@ -676,31 +687,7 @@ async fn run_shard_tick(
                         continue;
                     }
                 };
-                for part in &rec.parts {
-                    let part_key = match keys::reconstruct_l1_part_key(&rec, part) {
-                        Ok(key) => key,
-                        Err(err) => {
-                            tracing::warn!(
-                                key = %meta.key, error = %err,
-                                "scrub: could not reconstruct L1 part key; skipping this part this tick"
-                            );
-                            continue;
-                        }
-                    };
-                    let synthetic = ravel_proto::commit::v1::CommitRecord {
-                        signal: rec.signal,
-                        object_key: part_key.clone(),
-                        object_size: part.object_size,
-                        content_hash: part.content_hash.clone(),
-                        ..Default::default()
-                    };
-                    corpus.push(ScrubTarget {
-                        object_key: part_key.clone(),
-                        object_size: part.object_size,
-                        level: ScrubLevel::L1,
-                    });
-                    records.insert(part_key, (synthetic, ScrubLevel::L1));
-                }
+                compaction_records.push((meta.key.clone(), rec));
             }
             Ok(keys::BucketEntry::RewriteRecord(parsed)) => {
                 if tombstoned_hours.contains(&parsed.ingest_hour_bucket) {
@@ -726,31 +713,7 @@ async fn run_shard_tick(
                         continue;
                     }
                 };
-                for part in &rec.parts {
-                    let part_key = match keys::reconstruct_rewrite_part_key(&rec, part) {
-                        Ok(key) => key,
-                        Err(err) => {
-                            tracing::warn!(
-                                key = %meta.key, error = %err,
-                                "scrub: could not reconstruct rewrite part key; skipping this part this tick"
-                            );
-                            continue;
-                        }
-                    };
-                    let synthetic = ravel_proto::commit::v1::CommitRecord {
-                        signal: rec.signal,
-                        object_key: part_key.clone(),
-                        object_size: part.object_size,
-                        content_hash: part.content_hash.clone(),
-                        ..Default::default()
-                    };
-                    corpus.push(ScrubTarget {
-                        object_key: part_key.clone(),
-                        object_size: part.object_size,
-                        level: ScrubLevel::Rewrite,
-                    });
-                    records.insert(part_key, (synthetic, ScrubLevel::Rewrite));
-                }
+                rewrite_records.push((meta.key.clone(), rec));
             }
             Ok(keys::BucketEntry::Tombstone(_)) => continue,
             Err(err) => {
@@ -760,6 +723,85 @@ async fn run_shard_tick(
                 );
                 continue;
             }
+        }
+    }
+
+    // Drop superseded generations before expanding their parts. A rewrite
+    // record names the compaction or rewrite record it replaced in
+    // `superseded_record_key`, and each generation fully supersedes the one
+    // before it, so one hop resolves the live set (the same rule
+    // `ravel_maintain::erasure_rewrite` resolves a rewrite against). The
+    // superseded generation's parts survive until a horizon-gated sweep, and
+    // no query reads them: scrubbing them would page an operator on rot in
+    // bytes nothing depends on, and would spend tick budget that belongs to
+    // live data. Unlike the rewrite pass, an unresolvable shape here is not
+    // fatal; the scrub keeps whatever survives the filter and the next tick
+    // tries again.
+    let superseded: std::collections::HashSet<&str> = rewrite_records
+        .iter()
+        .filter(|(_, rec)| !rec.superseded_record_key.is_empty())
+        .map(|(_, rec)| rec.superseded_record_key.as_str())
+        .collect();
+
+    for (record_key, rec) in &compaction_records {
+        if superseded.contains(record_key.as_str()) {
+            continue;
+        }
+        for part in &rec.parts {
+            let part_key = match keys::reconstruct_l1_part_key(rec, part) {
+                Ok(key) => key,
+                Err(err) => {
+                    tracing::warn!(
+                        key = %record_key, error = %err,
+                        "scrub: could not reconstruct L1 part key; skipping this part this tick"
+                    );
+                    continue;
+                }
+            };
+            let synthetic = ravel_proto::commit::v1::CommitRecord {
+                signal: rec.signal,
+                object_key: part_key.clone(),
+                object_size: part.object_size,
+                content_hash: part.content_hash.clone(),
+                ..Default::default()
+            };
+            corpus.push(ScrubTarget {
+                object_key: part_key.clone(),
+                object_size: part.object_size,
+                level: ScrubLevel::L1,
+            });
+            records.insert(part_key, (synthetic, ScrubLevel::L1));
+        }
+    }
+
+    for (record_key, rec) in &rewrite_records {
+        if superseded.contains(record_key.as_str()) {
+            continue;
+        }
+        for part in &rec.parts {
+            let part_key = match keys::reconstruct_rewrite_part_key(rec, part) {
+                Ok(key) => key,
+                Err(err) => {
+                    tracing::warn!(
+                        key = %record_key, error = %err,
+                        "scrub: could not reconstruct rewrite part key; skipping this part this tick"
+                    );
+                    continue;
+                }
+            };
+            let synthetic = ravel_proto::commit::v1::CommitRecord {
+                signal: rec.signal,
+                object_key: part_key.clone(),
+                object_size: part.object_size,
+                content_hash: part.content_hash.clone(),
+                ..Default::default()
+            };
+            corpus.push(ScrubTarget {
+                object_key: part_key.clone(),
+                object_size: part.object_size,
+                level: ScrubLevel::Rewrite,
+            });
+            records.insert(part_key, (synthetic, ScrubLevel::Rewrite));
         }
     }
 
@@ -1691,6 +1733,216 @@ mod tests {
         assert_eq!(
             metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
             0
+        );
+    }
+
+    /// A superseded generation's parts stay out of the corpus (issue #1686).
+    /// Compacts a bucket, then publishes a rewrite record naming that
+    /// compaction record in `superseded_record_key`, so the bucket holds both
+    /// generations at once, which is the state an erasure rewrite leaves
+    /// behind until a horizon-gated sweep retires the older one. Both parts
+    /// are then corrupted in the same tick: the live rewrite part must be
+    /// counted, the superseded L1 part must not. Corrupting both is what
+    /// makes the `l1 == 0` assertion mean "filtered out" rather than "the
+    /// corpus was empty".
+    #[tokio::test]
+    async fn a_superseded_compaction_part_is_left_out_of_the_corpus() {
+        use ravel_commit::erasure;
+        use ravel_proto::commit::v1::{CompactionPart, RewriteDrop, RewriteRecord};
+
+        let store = MemoryStore::new();
+        let tenant_id = tenant();
+        let tenant_hash = tenant_id.hash();
+        let shard = 0u32;
+        let ingest_hour_bucket = 500_000u32;
+        let created_unix_ns = 500_000 * NS_PER_HOUR;
+
+        publish_segment(&store, 1, &["cpu"]).await;
+        publish_segment(&store, 2, &["mem"]).await;
+
+        let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, shard, 500_000);
+        let compact_clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let outcome = ravel_maintain::compact_bucket(
+            &store,
+            &compact_clock,
+            &ravel_maintain::CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+            "two sealed L0 inputs must compact, got {outcome:?}"
+        );
+
+        let prefix = keys::commit_shard_hour_prefix(&tenant_hash, Signal::Metrics, shard, 500_000)
+            .expect("prefix");
+        let metas = list_all(&store, &prefix).await.expect("list bucket");
+        let compaction_record_key = metas
+            .iter()
+            .map(|m| m.key.clone())
+            .find(|k| {
+                matches!(
+                    keys::partition_bucket_entry(k),
+                    Ok(keys::BucketEntry::CompactionRecord(_))
+                )
+            })
+            .expect("a compaction record was published");
+        let compaction_record_bytes = store
+            .get(&compaction_record_key, GetRange::Full)
+            .await
+            .expect("get compaction record")
+            .data;
+        let compaction_record = ravel_commit::record::decode_compaction(&compaction_record_bytes)
+            .expect("decode compaction record");
+        let l1_part_key =
+            keys::reconstruct_l1_part_key(&compaction_record, &compaction_record.parts[0])
+                .expect("l1 part key");
+
+        // The rewrite generation: a real RSEG segment as its single part, so
+        // the content tier can rehash it, and `superseded_record_key` naming
+        // the compaction record above.
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "cpu".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant_id, "cpu", &labels).expect("series id");
+        let series = vec![SeriesInput {
+            series_id,
+            labels,
+            samples: vec![Sample {
+                ts_ns: created_unix_ns,
+                value: 1.0,
+            }],
+        }];
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: Uuid::from_u128(3_000).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let rewrite_part_bytes = written.bytes;
+        let rewrite_part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: written.summary.blake3.to_vec(),
+            object_size: rewrite_part_bytes.len() as u64,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            run_count: 1,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            declared_column_stats: Vec::new(),
+        };
+        let request_id = Uuid::from_u128(0xEA5F);
+        let request_ids = vec![request_id.to_string()];
+        let input_set_hash = erasure::compute_rewrite_input_set_hash(
+            &[],
+            Some(compaction_record_key.as_str()),
+            &request_ids,
+        );
+        let rewrite_record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket,
+            inputs: Vec::new(),
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![rewrite_part.clone()],
+            drops: vec![RewriteDrop {
+                request_id: request_id.to_string(),
+                dropped_count: 1,
+            }],
+            created_unix_ns,
+            superseded_record_key: compaction_record_key.clone(),
+        };
+        let rewrite_part_key =
+            keys::reconstruct_rewrite_part_key(&rewrite_record, &rewrite_part).expect("part key");
+        store
+            .put(&rewrite_part_key, rewrite_part_bytes, PutOptions::default())
+            .await
+            .expect("put rewrite part object");
+        let rewrite_record_key =
+            keys::rewrite_record_key_for(&rewrite_record).expect("rewrite record key");
+        store
+            .put(
+                &rewrite_record_key,
+                ravel_commit::erasure::encode_rewrite(&rewrite_record),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put rewrite record");
+
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+
+        // Pre-corruption: both generations' parts are byte-correct, so a full
+        // tick is clean at every level whatever the filter admits.
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
+            0
+        );
+
+        for key in [&l1_part_key, &rewrite_part_key] {
+            let existing = store.get(key, GetRange::Full).await.expect("get part");
+            let mut corrupted = existing.data.to_vec();
+            corrupted[0] ^= 0x01;
+            store
+                .put(key, Bytes::from(corrupted), PutOptions::default())
+                .await
+                .expect("overwrite corrupted part");
+        }
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
+            1,
+            "the live rewrite part is still scrubbed, so the corpus is not empty"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0,
+            "the superseded compaction part must be left out of the corpus"
         );
     }
 }

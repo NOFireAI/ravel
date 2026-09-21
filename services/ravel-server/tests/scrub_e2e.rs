@@ -213,9 +213,9 @@ async fn injected_corruption_surfaces_on_metrics_through_the_real_scrub_task() {
             .text()
             .await
             .expect("metrics body");
-        if body
-            .contains("ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"metrics\"} 1")
-        {
+        if body.contains(
+            "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"metrics\",level=\"l0\"} 1",
+        ) {
             detected = true;
             break;
         }
