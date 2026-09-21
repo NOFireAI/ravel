@@ -28,15 +28,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carries a new `level` label** (issue #1686). The corpus previously skipped
   every compaction and rewrite record it listed, so a bit flip in an L1 or
   rewrite part was never checksummed; a live compaction or rewrite record's
-  parts now join the same rotation an L0 segment does. Only the live
-  generation's parts are scrubbed: a record another rewrite record names in
-  `superseded_record_key`, and a record in a bucket a retention tombstone has
-  retired, are both left out, so no operator is paged on rot in bytes no
-  query reads. `ravel_scrub_checksum_mismatch_total`
+  parts now join the same rotation an L0 segment does. The lineage filter
+  applies to the parts only: a compaction or rewrite record another rewrite
+  record names in `superseded_record_key`, and one in a bucket a retention
+  tombstone has retired, are both left out, so no operator is paged on rot in
+  bytes no query reads. L0 commit records carry no supersession or tombstone
+  check and are scrubbed whatever their lineage, so a `level="l0"` mismatch on
+  an hour a live compaction has already folded may name a redundant copy
+  rather than data a query can still reach.
+  `ravel_scrub_checksum_mismatch_total`
   now carries `level="l0"`, `level="l1"`, or `level="rewrite"` instead of one
   undifferentiated series per signal; a dashboard or alert rule that sums
   over `signal` alone still sees the same total, but one that names the
   metric without also grouping by `level` now gets three series back instead
+  of one. Neither the tick cadence nor the rotation period changes: the
+  per-tick byte budget is `total_corpus_bytes * tick / period`, so it scales
+  with the corpus and a full rotation still completes in about the configured
+  `--scrub-period`. What rises is the scrubber's steady-state read cost,
+  approximately in proportion to the share of the shard's bytes that now sit
+  in compaction or rewrite parts. On a fully compacted shard, whose L1 parts
+  hold roughly as many bytes as the L0 segments they folded and which are
+  still listed alongside them, that is close to a doubling of sustained scrub
+  GET bytes per tick. Size scrub read bandwidth against the corpus with parts
+  included, not against the L0 total.
   of one. The scrub tick cadence is unchanged: an operator should expect the
   first tick after upgrading to cover a larger corpus within the same
   per-tick byte budget, which can extend how long a full rotation takes on a

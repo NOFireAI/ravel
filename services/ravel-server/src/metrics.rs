@@ -29,10 +29,12 @@
 //! gauge and admission-wait counters into their `Pinned` and `Resolve`
 //! classes, and `carrier` added by ADR-0873 decision 2 to split the
 //! declared-statistics drop tally across its four carriers). The seventeen
-//! keys come from twenty `Label` variants: `RejectReason` and `ScrubReason`
-//! both render `reason`, and `Level` (log/tracing severity) and `ScrubLevel`
-//! (issue #1686, which part of the commit lineage -- `l0`/`l1`/`rewrite` -- a
-//! scrub target came from) both render `level`.
+//! keys come from twenty `Label` variants, because three pairs share a key:
+//! `RejectReason` and `ScrubReason` both render `reason`, `Level`
+//! (log/tracing severity) and `ScrubLevel` (issue #1686, which part of the
+//! commit lineage -- `l0`/`l1`/`rewrite` -- a scrub target came from) both
+//! render `level`, and `MergeMemoryKind` and `DeletedObjectKind` both render
+//! `kind`.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
