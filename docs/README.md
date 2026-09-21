@@ -140,7 +140,9 @@ The mental model, in the order it makes sense.
 - The PromQL conformance table, generated from a Ravel-only run that measures
   which constructs Ravel reaches and answers, is in
   [query-engine.md](query-engine.md). Agreement with the pinned Prometheus
-  binary is a separate row there, published by the differential lane.
+  binary is a separate row there; it reads `not measured in this run` in the
+  committed table, with the differential lane's counts in its job log. See the
+  README for the full statement.
 
 ## Deep dives
 
