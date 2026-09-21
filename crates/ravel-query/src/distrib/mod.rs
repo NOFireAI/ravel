@@ -1282,9 +1282,9 @@ impl SliceStreamDecoder {
     /// Replace the byte cap with `max_bytes`.
     ///
     /// The same seam as [`with_max_frames`](Self::with_max_frames), for the
-    /// same reason: [`codec::MAX_SLICE_RESPONSE_BYTES`] is sized so no ordinary
-    /// slice reaches it, so driving a real stream across the real constant
-    /// costs 64 MiB of wire traffic per test. The default stays
+    /// same reason: [`codec::MAX_SLICE_RESPONSE_BYTES`] is derived from the
+    /// sample budget, so driving a real stream across the real constant costs
+    /// more than 200 MB of wire traffic per test. The default stays
     /// [`codec::slice_byte_cap`], so a caller that does not call this is
     /// bounded by the constant.
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
@@ -1486,7 +1486,8 @@ mod slice_cap_tests {
 
     /// The byte cap is measured in wire frame bytes and reports what was
     /// actually accepted. Driven through the [`SliceStreamDecoder::with_max_bytes`]
-    /// test seam: the cap a real coordinator enforces is 64 MiB, which
+    /// test seam: the cap a real coordinator enforces is
+    /// [`codec::MAX_SLICE_RESPONSE_BYTES`], which
     /// `super::super::codec::slice_cap_tests` drives at its real value.
     #[test]
     fn byte_cap_refuses_and_reports_bytes_consumed() {
