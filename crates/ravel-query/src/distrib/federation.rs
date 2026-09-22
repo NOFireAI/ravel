@@ -863,6 +863,170 @@ mod tests {
         }
     }
 
+    /// A remote whose frames this coordinator refused to hold: the fetcher
+    /// yields the exact `DistribError` a [`SliceStreamDecoder`] cap breach
+    /// produces, which is what `FederationSliceFetcher::fetch` hands
+    /// [`Federation::fetch`] in production. `DistribError` is neither `Clone`
+    /// nor `Copy`, so the error is rebuilt per call.
+    ///
+    /// [`SliceStreamDecoder`]: crate::distrib::SliceStreamDecoder
+    struct CapBreachFetcher(Box<dyn Fn() -> DistribError + Send + Sync>);
+
+    #[async_trait]
+    impl SliceFetcher for CapBreachFetcher {
+        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            Err((self.0)())
+        }
+    }
+
+    /// The FEDERATED half of the refusal funnel (issue #1687 part B).
+    ///
+    /// `Federation::fetch`'s error arm routes a decoder cap breach through
+    /// `cap_refusal_error`, the same funnel the intra-cluster path uses;
+    /// `distrib::slice_cap_tests::distrib_error_keeps_a_cap_breach_in_the_budget_class`
+    /// pins that other half. Both arms exist so neither can drift, which only
+    /// holds while both are tested.
+    ///
+    /// What this asserts, and the wrong implementation each clause rules out:
+    ///
+    /// * It asserts on what `Federation::fetch` RETURNS, not on the
+    ///   `DistribError` the fetcher produced. The services-side
+    ///   `federation_fetch_refuses_a_slice_past_the_byte_cap` asserts the
+    ///   latter, which passes whatever the funnel then maps it to, because the
+    ///   fetcher error is produced before the funnel runs.
+    /// * The observed figure and the cap survive END TO END, so a federated arm
+    ///   that picks the right variant but re-derives its figures locally (from
+    ///   the constant, or from its own config) fails here.
+    /// * The result is compared against `cap_refusal_error`'s own output for the
+    ///   same error, over both cap kinds AND the non-cap arm the funnel declines
+    ///   to claim. A hand-rolled match at the federated site that covers one cap
+    ///   kind, or that claims an error the funnel returns `None` for, fails.
+    /// * The refusal renders as the 422 naming both figures, so the federated
+    ///   path's rendered response is covered, not only the intra-cluster one.
+    ///
+    /// `skip_unavailable` is held over both values: a budget refusal is a
+    /// verdict on the query, never an availability gap, so no flag masks it.
+    #[tokio::test]
+    async fn a_federated_cap_breach_keeps_the_budget_class() {
+        use crate::http::QueryErrorResponse;
+
+        const OVER_BYTES: u64 = codec::MAX_SLICE_RESPONSE_BYTES + 4_096;
+        const OVER_FRAMES: usize = codec::MAX_SLICE_RESPONSE_FRAMES + 1;
+
+        let breaches: Vec<(&str, fn() -> DistribError)> = vec![
+            ("the byte cap", || {
+                DistribError::Codec(codec::CodecError::SliceByteCapExceeded {
+                    bytes: OVER_BYTES,
+                    max: codec::MAX_SLICE_RESPONSE_BYTES,
+                })
+            }),
+            ("the frame cap", || {
+                DistribError::Codec(codec::CodecError::SliceFrameCapExceeded {
+                    frames: OVER_FRAMES,
+                    max: codec::MAX_SLICE_RESPONSE_FRAMES,
+                })
+            }),
+        ];
+
+        for (what, make) in breaches {
+            for skip in [true, false] {
+                let fed = one_remote(
+                    Arc::new(CapBreachFetcher(Box::new(make))),
+                    skip,
+                    Duration::from_secs(5),
+                );
+                let err = run(&fed).await.expect_err(
+                    "a coordinator cap breach fails the query whatever skip_unavailable says",
+                );
+
+                // The funnel is the single source: the federated path returns
+                // exactly what `cap_refusal_error` maps this breach to. Neither
+                // type is `PartialEq`, so compare the `Debug` rendering, which
+                // covers every field of both.
+                let expected = crate::distrib::cap_refusal_error(&make())
+                    .expect("the funnel claims a cap breach");
+                assert_eq!(
+                    format!("{err:?}"),
+                    format!("{expected:?}"),
+                    "the federated path did not return the funnel's mapping for {what}"
+                );
+
+                // And the figures, spelled out rather than only compared, so a
+                // refusal carrying re-derived counts fails here even if both
+                // sides were re-derived the same way.
+                match (&err, make()) {
+                    (
+                        QueryError::TooManySliceBytes { bytes, max },
+                        DistribError::Codec(codec::CodecError::SliceByteCapExceeded {
+                            bytes: seen,
+                            max: cap,
+                        }),
+                    ) => assert_eq!((*bytes, *max), (seen, cap), "{what}: figures changed"),
+                    (
+                        QueryError::TooManySliceFrames { frames, max },
+                        DistribError::Codec(codec::CodecError::SliceFrameCapExceeded {
+                            frames: seen,
+                            max: cap,
+                        }),
+                    ) => assert_eq!((*frames, *max), (seen, cap), "{what}: figures changed"),
+                    (other, _) => {
+                        panic!("{what}: expected the matching budget refusal, got {other:?}")
+                    }
+                }
+
+                // The rendered response: 422 naming the observed figure and the
+                // cap, on the federated path.
+                let rendered = QueryErrorResponse::from_query_error(err);
+                assert_eq!(
+                    rendered.status,
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "{what}: a cap breach is a refusal, not a retryable 503"
+                );
+                for figure in observed_and_cap(make()) {
+                    assert!(
+                        rendered.message.contains(&figure),
+                        "{what}: the 422 body omits {figure}: {}",
+                        rendered.message
+                    );
+                }
+            }
+        }
+
+        // The funnel's `None` arm: an error it does not claim is still the
+        // redacted federation fault, so a federated site that answered every
+        // error with a refusal fails here.
+        let fed = one_remote(
+            Arc::new(CapBreachFetcher(Box::new(|| DistribError::NoSummary))),
+            true,
+            Duration::from_secs(5),
+        );
+        let err = run(&fed)
+            .await
+            .expect_err("a malformed response is still a hard fault");
+        assert!(
+            crate::distrib::cap_refusal_error(&DistribError::NoSummary).is_none(),
+            "the funnel must not claim a non-cap error"
+        );
+        match err {
+            QueryError::Federation { cluster, .. } => assert_eq!(cluster, "eu-west"),
+            other => panic!("expected QueryError::Federation, got {other:?}"),
+        }
+    }
+
+    /// The observed figure and the cap a breach carries, as the strings a 422
+    /// body must contain.
+    fn observed_and_cap(err: DistribError) -> Vec<String> {
+        match err {
+            DistribError::Codec(codec::CodecError::SliceByteCapExceeded { bytes, max }) => {
+                vec![bytes.to_string(), max.to_string()]
+            }
+            DistribError::Codec(codec::CodecError::SliceFrameCapExceeded { frames, max }) => {
+                vec![frames.to_string(), max.to_string()]
+            }
+            other => panic!("not a cap breach: {other:?}"),
+        }
+    }
+
     // --- ADR-0071 amendment (#287, T5): the fan-out signals compose ----------
     //
     // "Federation composes once the per-signal SliceFetcher exists" is the
