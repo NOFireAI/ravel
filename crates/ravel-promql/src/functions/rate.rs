@@ -404,12 +404,9 @@ fn instant_value(samples: &[Sample], is_rate: bool) -> Option<f64> {
 /// [`mismatched_custom_buckets_warning`] through
 /// [`instant_value_hist_type_warning`].
 ///
-/// Dropping is NOT Prometheus v3.13.1's answer for differing bounds either
-/// (that version re-buckets both operands onto the intersection of their
-/// boundary sets, see [`FloatHistogram::combine_custom_reconciled`], which the
-/// binary-operator path uses). It is the conservative choice for a case with
-/// no oracle fixture, consistent with the other two reducers, not verified
-/// parity with upstream.
+/// Dropping is not upstream parity here either; see
+/// [`FloatHistogram::custom_bounds_match`]. It is the conservative choice for
+/// a case with no oracle fixture, consistent with the other two reducers.
 pub(crate) fn instant_value_hist(
     samples: &[TimedHistogram],
     is_rate: bool,
@@ -572,9 +569,9 @@ pub(crate) fn mixed_exponential_custom_schemas_warning() -> String {
 /// series both use custom buckets but carry different boundaries, so
 /// [`instant_value_hist`] drops the pair rather than differencing by bucket
 /// index across two boundary sets (issue #1851). This has no Prometheus
-/// counterpart: v3.13.1 reconciles differing bounds onto their intersection
-/// and raises an info instead of dropping, so the text says what Ravel did
-/// rather than porting an upstream message. Same text convention as
+/// counterpart (see [`FloatHistogram::custom_bounds_match`]), so the text
+/// says what Ravel did rather than porting an upstream message. Same text
+/// convention as
 /// [`native_histogram_not_counter_warning`].
 pub(crate) fn mismatched_custom_buckets_warning() -> String {
     "vector contains histograms with mismatched custom buckets".to_string()
