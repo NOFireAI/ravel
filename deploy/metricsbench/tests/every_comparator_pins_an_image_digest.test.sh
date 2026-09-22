@@ -289,7 +289,7 @@ d="$(new_tree kind_local_tag_is_exempt)"
 check "kind_local_tag_is_exempt: ravel-server:latest in ravelcluster-dev.yaml is not unpinned" \
   "${d}" 0 "examples/ravelcluster-dev.yaml:15: ravel-server:latest"
 check "kind_local_tag_is_exempt: ravel-operator:latest in operator.yaml is not unpinned" \
-  "${d}" 0 "operator/operator.yaml:41: ravel-operator:latest"
+  "${d}" 0 "operator/operator.yaml:53: ravel-operator:latest"
 check "kind_local_tag_is_exempt: exempt marker is used, not [UNPINNED]" \
   "${d}" 0 "[kind-local, exempt]"
 
