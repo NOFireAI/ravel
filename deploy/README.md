@@ -49,17 +49,29 @@ page because they are where each rule is explained, and the comparison is
 what stops them drifting into rules a reader can copy but nothing else
 ships.
 
-## Grafana dashboard (`grafana/dashboards/ravel.json`)
+## Grafana dashboard (`grafana/dashboards-standalone/ravel.json`)
 
-`grafana/dashboards/ravel.json` is the shipped dashboard over Ravel's own
+`grafana/dashboards-standalone/ravel.json` is the shipped dashboard over Ravel's own
 `ravel_` families: 36 panels in 6 rows, named Ingest, Query, Catalog fold,
 Maintenance, Object store and probe, and Alerting. Between them the panels
 reference 107 distinct `ravel_` metric names. Import it into Grafana and pick
 the Prometheus data source that scrapes your Ravel processes; the dashboard
 carries a single `ds` data-source variable and no hardcoded data-source uid.
 
-`grafana/dashboards/ravel-overview.json` is a different thing and stays as it
-is: it belongs to the quickstart compose stack and graphs the bundled
+It lives OUTSIDE `grafana/dashboards/`, and that placement is load-bearing.
+`deploy/docker-compose/ravel.yml` mounts the whole `grafana/dashboards`
+directory into the quickstart's Grafana, and
+`grafana/provisioning/dashboards/ravel.yaml` is a `type: file` provider over
+that path, so anything dropped in there is auto-provisioned. The quickstart
+scrapes no Ravel process: its collector declares only the `hostmetrics`
+receiver, so no `ravel_` series exists in the only datasource that dashboard
+could reach, and all 36 panels would draw nothing. A blank dashboard as the
+quickstart's first impression is the same silent failure this file's own test
+exists to prevent. Do not move it back under `grafana/dashboards/` without
+also giving the quickstart a scrape path for ravel-server's `/metrics`.
+
+`grafana/dashboards/ravel-overview.json` is a different thing and stays where
+it is: it belongs to the quickstart compose stack and graphs the bundled
 collector's host CPU, not any Ravel family.
 
 The same test that pins the rule file's names,
