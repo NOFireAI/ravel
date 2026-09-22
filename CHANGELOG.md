@@ -70,6 +70,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is never read again rather than missed by one generation; `docs/ingest.md`
   and ADR-1642 carry the arithmetic. Bounding the deferral itself is issue
   #1916.
+
   bounded buffer; and the server now **refuses to start** when
   `--max-inflight-flushes` exceeds `--max-queued-flushes`, since only a
   spawned task can hold a permit and the excess would silently reduce flush
