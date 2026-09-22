@@ -149,6 +149,27 @@ pub enum RwRejection {
         zero_count_bits: u64,
     },
 
+    /// A custom bound that is not finite. Prometheus' `checkHistogramCustomBounds`
+    /// refuses these as `ErrHistogramCustomBucketsInfinite`: the final `+Inf`
+    /// bucket is implicit and must not be written into `CustomValues`. A lone
+    /// NaN reaches here too, because the strictly-ascending check is vacuous
+    /// over a one-element list.
+    #[error(
+        "custom bucket bound with bit pattern {bound_bits:#018x} is not finite, which no custom-bucket layout defines"
+    )]
+    NativeHistogramCustomBucketsNonFinite { bound_bits: u64 },
+
+    /// More positive buckets than the boundary list can name. Prometheus'
+    /// `checkHistogramCustomBounds` refuses this as
+    /// `ErrHistogramCustomBucketsMismatch` ("custom bounds are too few"): `n`
+    /// bounds define at most `n + 1` buckets, the last being the implicit
+    /// `+Inf` one.
+    #[error(
+        "{buckets} positive bucket(s) need at least {} custom bound(s), but only {bounds} were sent",
+        buckets.saturating_sub(1)
+    )]
+    NativeHistogramCustomBucketsTooFew { buckets: u64, bounds: usize },
+
     #[error(
         "native histogram count is smaller than its zero_count or than the sum of its bucket counts, which the segment format's reader would reject as corrupted"
     )]
@@ -176,6 +197,8 @@ impl RwRejection {
             | RwRejection::NativeHistogramCustomBucketsNegativeSpans { .. }
             | RwRejection::NativeHistogramCustomBucketsZeroThreshold { .. }
             | RwRejection::NativeHistogramCustomBucketsZeroCount { .. }
+            | RwRejection::NativeHistogramCustomBucketsNonFinite { .. }
+            | RwRejection::NativeHistogramCustomBucketsTooFew { .. }
             | RwRejection::NativeHistogramCountInconsistent
             | RwRejection::TimestampOverflow => 1,
         }
@@ -747,15 +770,28 @@ fn build_histogram_sample(
 /// `zero_threshold` that is not a finite value at or above zero (see
 /// [`zero_threshold_is_admissible`], which the OTLP surface calls too).
 ///
-/// The rest apply only under `schema == -53`, where a custom-bucket layout
-/// has neither a negative side nor a zero bucket, so negative spans, a
-/// non-zero `zero_threshold`, and a non-zero `zero_count` are each refused.
-/// `-0.0` counts as zero for both float fields (see [`is_zero_f64`]); any
-/// other pattern, including a NaN `zero_count`, does not. Together with the
-/// `custom_values` rule above these are the four rules this surface enforces
-/// for the sentinel schema; the OTLP surface enforces them by refusing
-/// `scale == -53` outright, which is strictly stronger, so the shape cannot
-/// reach its normalizer at all.
+/// The rest apply only under `schema == -53`. A custom-bucket layout has
+/// neither a negative side nor a zero bucket, so negative spans, a non-zero
+/// `zero_threshold`, and a non-zero `zero_count` are each refused; `-0.0`
+/// counts as zero for both float fields (see [`is_zero_f64`]), and any other
+/// pattern, including a NaN `zero_count`, does not. The boundary list must
+/// also be non-empty and strictly ascending, carry only finite bounds, and
+/// name enough bounds for the buckets sent: `n` bounds define at most `n + 1`
+/// buckets, the last being the implicit `+Inf` one.
+///
+/// Those last two are separate rules rather than consequences of
+/// ascendingness. `windows(2)` is vacuous over a one-element list, so a lone
+/// NaN passes the ascending check, and a trailing `+Inf` is strictly greater
+/// than its predecessor. Both would reach the query side, where
+/// `bucket_bound` reads past the list as `+Inf`
+/// (`crates/ravel-promql/src/histogram.rs`), so two buckets would report the
+/// same upper bound and the last would span `[+Inf, +Inf]` for
+/// `histogram_quantile` to interpolate over.
+///
+/// That is the set Prometheus' `Histogram.Validate` and
+/// `checkHistogramCustomBounds` apply to the sentinel schema. The OTLP
+/// surface enforces them by refusing `scale == -53` outright, which is
+/// strictly stronger, so the shape cannot reach its normalizer at all.
 fn build_histogram_value(h: &ResolvedHistogram) -> Result<HistogramValue, RwRejection> {
     if h.schema < -53 {
         return Err(RwRejection::NativeHistogramSchemaUnsupported { schema: h.schema });
@@ -770,6 +806,17 @@ fn build_histogram_value(h: &ResolvedHistogram) -> Result<HistogramValue, RwReje
     let custom_values = if h.schema == -53 {
         if h.custom_values.is_empty() || !h.custom_values.windows(2).all(|w| w[0] < w[1]) {
             return Err(RwRejection::NativeHistogramCustomValuesMismatch);
+        }
+        // Finiteness is a separate rule from ascendingness, and the ascending
+        // check cannot stand in for it: `windows(2)` is empty over a
+        // one-element list, so a lone NaN passes it vacuously, and a trailing
+        // `+Inf` is strictly greater than its predecessor. Prometheus refuses
+        // both (`ErrHistogramCustomBucketsInfinite`); the final `+Inf` bucket
+        // is implicit and must not appear in `CustomValues`.
+        if let Some(bound) = h.custom_values.iter().find(|v| !v.is_finite()) {
+            return Err(RwRejection::NativeHistogramCustomBucketsNonFinite {
+                bound_bits: bound.to_bits(),
+            });
         }
         if !h.negative_spans.is_empty() {
             return Err(RwRejection::NativeHistogramCustomBucketsNegativeSpans {
@@ -810,6 +857,21 @@ fn build_histogram_value(h: &ResolvedHistogram) -> Result<HistogramValue, RwReje
     let negative_spans = build_spans(&h.negative_spans)?;
     let positive_expected = spans_bucket_count(&positive_spans);
     let negative_expected = spans_bucket_count(&negative_spans);
+
+    // `n` bounds define at most `n + 1` buckets, the last being the implicit
+    // `+Inf` one. Prometheus refuses more as `ErrHistogramCustomBucketsMismatch`.
+    // Without this the query side reads every bucket past the list through
+    // `custom_values.get(i - 1).unwrap_or(f64::INFINITY)`, so two buckets
+    // report the same `+Inf` upper bound and the last spans the degenerate
+    // interval `[+Inf, +Inf]` that `histogram_quantile` then interpolates over.
+    if let Some(bounds) = custom_values.as_ref().map(Vec::len)
+        && positive_expected > bounds as u64 + 1
+    {
+        return Err(RwRejection::NativeHistogramCustomBucketsTooFew {
+            buckets: positive_expected,
+            bounds,
+        });
+    }
 
     // The `count` oneof alone decides whether this sample is integer- or
     // float-valued, matching Prometheus's own `Histogram.IsFloatHistogram`.
@@ -1920,7 +1982,7 @@ mod tests {
         assert_eq!(out.histograms_written, 1);
     }
 
-    /// The zero side stays free under the exponential schemas: the four rules
+    /// The zero side stays free under the exponential schemas: the rules
     /// above are specific to the `-53` sentinel, not new blanket rules.
     #[test]
     fn exponential_schema_keeps_admitting_a_populated_zero_bucket() {
@@ -1932,7 +1994,7 @@ mod tests {
     }
 
     /// The acceptance test for the second round of issue #1858. It drives all
-    /// four rules the `-53` custom-buckets schema carries, on both ingest
+    /// the rules the `-53` custom-buckets schema carries, on both ingest
     /// surfaces, because the first round's defect was exactly a rule enforced
     /// on one surface only.
     ///
@@ -1947,7 +2009,7 @@ mod tests {
     /// (which would refuse `-0.0`) or a magnitude test (which would admit a
     /// subnormal).
     #[test]
-    fn all_four_custom_buckets_rules_are_enforced_on_both_surfaces() {
+    fn every_custom_buckets_rule_is_enforced_on_both_surfaces() {
         use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
         use opentelemetry_proto::tonic::metrics::v1::{
             AggregationTemporality, ExponentialHistogram, ExponentialHistogramDataPoint, Metric,
@@ -1974,6 +2036,23 @@ mod tests {
         let mut rule_4 = custom_buckets_histogram(1_000);
         rule_4.zero_count = Some(ResolvedCount::Int(1));
 
+        // A trailing +Inf is strictly greater than its predecessor, so the
+        // ascending check admits it; the implicit +Inf bucket must not be
+        // written into the boundary list.
+        let mut rule_5 = custom_buckets_histogram(1_000);
+        rule_5.custom_values = vec![0.5, 1.0, f64::INFINITY];
+
+        // A lone NaN has no `windows(2)` pair, so the ascending check is
+        // vacuously true over it.
+        let mut rule_6 = custom_buckets_histogram(1_000);
+        rule_6.custom_values = vec![f64::NAN];
+
+        // Three positive buckets against one bound. Two bounds are the most
+        // one can name, so the third bucket would read `+Inf` on the query
+        // side and the second would too.
+        let mut rule_7 = custom_buckets_histogram(1_000);
+        rule_7.custom_values = vec![0.5];
+
         let cases = [
             (rule_1, RwRejection::NativeHistogramCustomValuesMismatch),
             (
@@ -1991,6 +2070,25 @@ mod tests {
                 RwRejection::NativeHistogramCustomBucketsZeroCount {
                     kind: "integer",
                     zero_count_bits: 1,
+                },
+            ),
+            (
+                rule_5,
+                RwRejection::NativeHistogramCustomBucketsNonFinite {
+                    bound_bits: f64::INFINITY.to_bits(),
+                },
+            ),
+            (
+                rule_6,
+                RwRejection::NativeHistogramCustomBucketsNonFinite {
+                    bound_bits: f64::NAN.to_bits(),
+                },
+            ),
+            (
+                rule_7,
+                RwRejection::NativeHistogramCustomBucketsTooFew {
+                    buckets: 3,
+                    bounds: 1,
                 },
             ),
         ];
