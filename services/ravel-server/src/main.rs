@@ -496,6 +496,7 @@ async fn main() -> anyhow::Result<()> {
             retention,
             unit_concurrency: cli.maintain_unit_concurrency,
             stalled_after_intervals: cli.maintain_stalled_after_intervals,
+            heartbeat_interval: ravel_maintain::worker_set::DEFAULT_HEARTBEAT_INTERVAL,
         },
         alerting: AlertEvalConfig {
             enabled: !alert_rules.is_empty(),
