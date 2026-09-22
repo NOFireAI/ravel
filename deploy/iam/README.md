@@ -56,28 +56,68 @@ grants below are what remains deletable after that deny applies.
   and `t/*/*/del/*.dreq`. These are the objects the compaction, supersession,
   retention, and erasure-request sweeps physically remove.
 
-### Erasure-request objects: `t/*/*/del/*.dreq`
+### Erasure-request objects: the three grants the `.dreq` sweep needs
 
-ADR-0064 section 6: "Maintain gains delete on `del/*.dreq` **only**", and
-"`del/*.done` joins the deny-delete set for every role including Maintain".
+ADR-0064 section 6 grants Maintain three things on the erasure keyspace, in
+two sentences of the same bullet: "Query and Maintain gain read on `del/**`
+(resolve-time listing; pass scoping)", and "Maintain gains delete on
+`del/*.dreq` **only**" with "`del/*.done` joins the deny-delete set for every
+role including Maintain".
 
-The erasure-request sweep runs under the Maintain role and retires a request
-object at `t/<tenant_hash>/<signal>/del/<request_id>.dreq` once its erasure is
-complete, past the post-completion protection horizon, and no longer held by a
-legal hold or a still-resolvable superseded input
-(`crates/ravel-maintain/src/sweep.rs`). IAM is default-deny, so until this
-grant was added the shipped template refused that delete on every request
-object: completed `.dreq` objects accumulated and the query-time exclusion
-filter that reads them grew without bound.
+The erasure-request sweep is `sweep_erasure_requests_inner` in
+`crates/ravel-maintain/src/sweep.rs`. It runs under the Maintain role and
+retires a request object at
+`t/<tenant_hash>/<signal>/del/<request_id>.dreq` once its erasure is complete,
+past the post-completion protection horizon, and no longer held by a legal
+hold or a still-resolvable superseded input. One pass makes three object-store
+calls on the `del/` prefix, and each needs its own grant:
 
-The pattern is `*.dreq`, not `del/*`, because the completion records
-(`del/<request_id>.done`) are permanent erasure evidence and no role may delete
-them. `maintain_template_grants_delete_on_erasure_requests` in
-`crates/ravel-commit/tests/iam_templates.rs` asserts both halves against real
-key constructors, and
-`every_role_grants_exactly_the_expected_pattern_set` pins the resource list
-above by exact equality.
+| Call in `sweep.rs` | S3 operation | Grant |
+|---|---|---|
+| `list_all(store, &keys::del_prefix(tenant, signal))` | `s3:ListBucket` with `prefix=t/<tenant_hash>/<signal>/del/` | `MaintainList` `s3:prefix` `t/*/*/del/*` |
+| `store.get(&meta.key, GetRange::Full)` on each listed `.done` | `s3:GetObject` | `MaintainRead` `t/*/*/del/*.done` |
+| `store.delete(dreq_key)` | `s3:DeleteObject` | `MaintainDelete` `t/*/*/del/*.dreq` |
 
-An operator who applied `maintain.json` before this grant existed must
-re-apply it: the backlog of refused requests stays in the store until the
-Maintain credential actually holds the delete.
+IAM is default-deny and the calls run in that order, so the delete grant alone
+does nothing: the pass is refused with `AccessDenied` on the `ListBucket`
+before it reaches a single request object. The read grant is needed for the
+same reason one step later, because the completion record carries the
+timestamp the protection horizon is measured from and the sweep decodes it on
+every completed request.
+
+The grant scopes are narrower than the ADR's `del/**` read, and deliberately
+so: `*.done` and not `del/*` on the read, because the sweep parses request ids
+out of the listed `.dreq` KEYS and never fetches a `.dreq` body; `*.dreq` and
+not `del/*` on the delete, because completion records are permanent erasure
+evidence and no role may delete them.
+
+`maintain_template_covers_every_erasure_request_sweep_call` in
+`crates/ravel-commit/tests/iam_templates.rs` asserts each row of that table
+against the key constructor the call uses, and asserts that no pattern
+reaching `del/` reaches anything outside it.
+`maintain_template_grants_delete_on_erasure_requests` asserts the `.done` and
+`del/`-prefix exclusions on the delete side, and
+`every_role_grants_exactly_the_expected_pattern_set` pins all three pattern
+strings by exact equality.
+
+An operator who applied a copy of `maintain.json` older than all three grants
+must re-apply it. Re-applying restores the sweep's ability to run: on the next
+pass it lists the prefix, reads each completion, and deletes every request
+object whose protection horizon has elapsed and that no hold retains, so the
+backlog drains over the passes that follow rather than instantly. Requests
+whose horizon has not elapsed, or that a legal hold or a still-resolvable
+superseded input holds, are kept by design and are not part of that backlog.
+Re-applying a copy that carries the delete but not the list and read grants
+clears nothing at all: the pass is still refused at the `ListBucket`.
+
+Two known gaps in this template remain open and are NOT closed by the grants
+above. Both are tracked separately; neither is created by this change.
+
+- `pending_erasure_requests` in
+  `crates/ravel-maintain/src/erasure_rewrite.rs` GETs each pending `.dreq`
+  body to plan the rewrite. `MaintainRead` reaches `.done` only, so the
+  rewrite pass is refused on that read.
+- `query.json` grants no list or read under `del/`, while the resolver LISTs
+  `t/<tenant_hash>/<signal>/del/` per resolve to attach pending predicates
+  (`crates/ravel-commit/src/keys.rs`, `del_prefix`). ADR-0064's same bullet
+  gives Query that read.

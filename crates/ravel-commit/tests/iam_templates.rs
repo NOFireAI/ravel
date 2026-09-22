@@ -1783,6 +1783,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // maintenance cursors, and the GC/tenancy control objects; its deletes
     // cover the inputs compaction supersedes, the non-hold audit shard, and
     // the erasure request objects the .dreq sweep retires (ADR-0064 section 6).
+    // The del/ list prefix and the del/*.done read are that sweep's other two
+    // object-store calls, asserted against their call sites by
+    // maintain_template_covers_every_erasure_request_sweep_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1791,6 +1794,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/*/l1/*",
             "t/*/*/idem/*",
+            "t/*/*/del/*",
             "sys/maintain/workers/*",
         ],
         list_actions: &["s3:ListBucket"],
@@ -1801,6 +1805,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/maint/*",
             "t/*/u/*",
             "t/*/*/prov",
+            "t/*/*/del/*.done",
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
@@ -2483,6 +2488,167 @@ fn maintain_template_grants_delete_on_erasure_requests() {
                      (#1849)"
                 );
             }
+        }
+    }
+}
+
+/// Every object-store call the erasure-request sweep makes on the `del/`
+/// prefix must be reachable under the shipped Maintain template, and nothing
+/// wider than those calls need may reach it.
+///
+/// The sweep is `sweep_erasure_requests_inner` in
+/// `crates/ravel-maintain/src/sweep.rs`, and it touches `del/` three times:
+///
+/// - `let prefix = keys::del_prefix(tenant, signal); let objects =
+///   list_all(store, &prefix).await?` (one `s3:ListBucket` whose `prefix`
+///   parameter is `t/<tenant_hash>/<signal>/del/`),
+/// - `let got = store.get(&meta.key, GetRange::Full).await?` on each listed
+///   key that parses as an erasure completion (one `s3:GetObject` per
+///   `del/<request_id>.done`; the `.dreq` bodies are never read here),
+/// - `store.delete(dreq_key).await?` (one `s3:DeleteObject` per
+///   `del/<request_id>.dreq`).
+///
+/// `maintain_template_grants_delete_on_erasure_requests` covers the third call
+/// alone. The delete is useless without the other two: IAM is default-deny and
+/// the pass is refused at the LIST before it ever reaches a delete, so a
+/// template carrying the delete and neither of the others grants an authority
+/// the operation cannot exercise. Each assertion below names the call whose
+/// argument it is built from, and each axis is also checked for TIGHTNESS: a
+/// pattern that reaches `del/` must reach no key outside it, so widening the
+/// `s3:prefix` to `t/*` or the Get resource to `t/*` fails here as well as
+/// against `every_role_grants_exactly_the_expected_pattern_set`.
+#[test]
+fn maintain_template_covers_every_erasure_request_sweep_call() {
+    let tenant = test_tenant();
+    let request_id = Uuid::from_u128(3);
+    let maintain = load_policy("maintain");
+
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+
+    for signal in ALL_SIGNALS {
+        // Call 1: list_all(store, &keys::del_prefix(tenant, signal)).
+        let prefix = del_prefix(&tenant, signal);
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "maintain: no ListBucket s3:prefix admits {prefix:?}, the prefix \
+             sweep_erasure_requests_inner passes to list_all. The pass is \
+             refused with AccessDenied before it reaches any .dreq, so the \
+             delete grant is unreachable. s3:prefix values: {list_prefixes:?}"
+        );
+
+        // Call 2: store.get on each listed .done key.
+        let done =
+            erasure_completion_key(&tenant, signal, request_id).expect("erasure_completion_key");
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &done)),
+            "maintain: no GetObject Allow reaches the completion record \
+             {done:?}, which sweep_erasure_requests_inner GETs to decode the \
+             completion timestamp that anchors the protection horizon. Without \
+             it the pass fails on the first completed request. Grants: {gets:?}"
+        );
+
+        // Call 3: store.delete(dreq_key), already covered by
+        // maintain_template_grants_delete_on_erasure_requests and restated
+        // here so this test fails as a whole if the delete regresses.
+        let dreq = erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &dreq)),
+            "maintain: no delete Allow reaches the erasure request {dreq:?} \
+             (ADR-0064 §6). Grants: {deletes:?}"
+        );
+    }
+
+    // Tightness. Every pattern that reaches the erasure keyspace is measured
+    // against the whole key domain: a grant admitting a key outside `del/` is
+    // wider than the three calls above, and `t/*` -- which passes every
+    // functional assertion here -- is exactly that shape.
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.contains("/del/"))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside del/, so the tightness \
+         assertions below examine nothing"
+    );
+
+    // The witnesses that SELECT a pattern as an erasure-prefix grant exclude
+    // the audit signal, whose key prefix is `u`: `t/<hash>/u/del/...` is
+    // matched by Maintain's pre-existing `t/*/u/*` audit-keyspace read, which
+    // is written for `t/*/u/**` and spans one signal's `del/` by construction.
+    // That overlap predates this change and is unrelated to it, so selecting on
+    // it would make this assertion report the audit grant instead of a widened
+    // erasure grant. Every pattern written FOR `del/` reaches it under every
+    // signal, so nothing this test exists to catch escapes the narrowing: `t/*`
+    // is still selected, and still fails below.
+    assert_eq!(
+        Signal::Audit.key_prefix(),
+        "u",
+        "the audit signal's key prefix is what makes `t/*/u/*` span an erasure \
+         prefix; if it moved, this narrowing no longer describes the overlap it \
+         was written for and must be re-derived"
+    );
+    let erasure_signals: Vec<Signal> = ALL_SIGNALS
+        .iter()
+        .copied()
+        .filter(|s| *s != Signal::Audit)
+        .collect();
+    assert!(
+        !erasure_signals.is_empty(),
+        "no signal is left to witness the erasure keyspace with"
+    );
+    let erasure_witnesses: Vec<String> = erasure_signals
+        .iter()
+        .flat_map(|signal| {
+            [
+                del_prefix(&tenant, *signal),
+                erasure_request_key(&tenant, *signal, request_id).expect("erasure_request_key"),
+                erasure_completion_key(&tenant, *signal, request_id)
+                    .expect("erasure_completion_key"),
+            ]
+        })
+        .collect();
+
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:GetObject Allow", &gets),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns {
+            let reaches_erasure = erasure_witnesses.iter().any(|w| glob_matches(pattern, w));
+            if !reaches_erasure {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the erasure \
+                     keyspace AND {key:?}, which lies outside del/. The three \
+                     sweep calls need del/ and nothing else; a pattern that \
+                     spans both is over-granted (#1849)"
+                );
+            }
+        }
+    }
+
+    // The Get grant is scoped to what the sweep reads. The request bodies are
+    // parsed from their KEYS here and never fetched, so a Get reaching a
+    // `.dreq` is not justified by this pass. Audit is excluded for the reason
+    // given above: `t/*/u/*` reaches that signal's `.dreq` as a consequence of
+    // the audit keyspace's own read grant.
+    for signal in erasure_signals {
+        let dreq = erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
+        for pattern in &gets {
+            assert!(
+                !glob_matches(pattern, &dreq),
+                "maintain: GetObject Allow {pattern:?} reaches the request \
+                 object {dreq:?}. sweep_erasure_requests_inner never GETs a \
+                 .dreq; if a grant is being added for the rewrite pass's own \
+                 read in erasure_rewrite.rs, add it with that call site named \
+                 and update this assertion in the same commit (#1849)"
+            );
         }
     }
 }
