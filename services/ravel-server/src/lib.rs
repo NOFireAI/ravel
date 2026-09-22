@@ -2892,7 +2892,7 @@ pub async fn start(
     // look like two workers to the fleet).
     let maintain_worker = Arc::new(ravel_maintain::WorkerSet::new(
         <SystemClock as ravel_ingest::Clock>::now_ns(&SystemClock),
-        ravel_maintain::worker_set::DEFAULT_HEARTBEAT_INTERVAL,
+        config.maintain.heartbeat_interval,
         ravel_maintain::worker_set::DEFAULT_LIVENESS_FACTOR,
         config.maintain.unit_concurrency,
     ));

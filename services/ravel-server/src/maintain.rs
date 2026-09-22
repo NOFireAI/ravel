@@ -85,7 +85,7 @@ use ravel_commit::keys;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
-use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
+use ravel_maintain::worker_set::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, run_bounded};
 use ravel_maintain::{
     Bucket, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureRewriteOutcome,
     LeaseCheck, LegalHoldCheck, MaintainError, OrphanPass, PendingErasureRequest,
@@ -710,6 +710,15 @@ pub struct MaintenanceTaskConfig {
     /// `ravel_maintain_units_stalled` counts it (ADR-0065 stuck-owner
     /// mitigation). Default 3.
     pub stalled_after_intervals: u32,
+    /// Cadence of the shared `WorkerSet`'s membership heartbeat (ADR-0065
+    /// decision 1), forwarded to [`ravel_maintain::WorkerSet::new`] by
+    /// `ravel_server::start`. No CLI flag sets this; production always gets
+    /// the default below, matching the pre-existing hardcoded
+    /// `DEFAULT_HEARTBEAT_INTERVAL`. It exists as a struct field so a test
+    /// can build a `Mode::Maintain` `ServerConfig` with a heartbeat fast
+    /// enough that two-worker convergence does not depend on wall-clock
+    /// margin around the real 60s production cadence (issue #1852).
+    pub heartbeat_interval: Duration,
 }
 
 impl Default for MaintenanceTaskConfig {
@@ -722,6 +731,7 @@ impl Default for MaintenanceTaskConfig {
             retention: RetentionConfig::default(),
             unit_concurrency: DEFAULT_UNIT_CONCURRENCY,
             stalled_after_intervals: DEFAULT_STALLED_AFTER_INTERVALS,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
     }
 }
