@@ -37,6 +37,20 @@ use ravel_types::TenantId;
 const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
 
+/// Serializes every test in this file that can drive `Running::shutdown` past
+/// the outer `--shutdown-timeout` (issue #1742). Those tests move
+/// `ravel_server::drain_overrun_total()`, the process-global
+/// `DRAIN_OVERRUN_TOTAL` static in `services/ravel-server/src/lib.rs`; two of
+/// them racing inside the same before/after window would land both
+/// increments in one test's delta. Under `cargo-nextest` (what
+/// `scripts/affected-tests.sh` runs) every test already gets its own process,
+/// so this lock is a no-op there; under plain `cargo test`'s default
+/// multi-threaded runner, which shares one process across this whole file, it
+/// is load-bearing. Held for the full duration of the `shutdown()` call, not
+/// just around the counter reads, so a genuinely concurrent overrun from
+/// another locked test cannot land mid-drain either.
+static DRAIN_OVERRUN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The cluster fragment key the distributed test mints capabilities under.
 const FRAGMENT_KEY: [u8; 32] = [0x5au8; 32];
 
@@ -288,6 +302,10 @@ async fn sigterm_drains_buffered_records_in_gateway_mode() {
 /// finished and the overrun says the flush COMPLETED).
 #[tokio::test]
 async fn shutdown_timeout_during_ingest_flush_warns_records_may_not_be_durable() {
+    // This drain overruns the outer `--shutdown-timeout`; see
+    // `DRAIN_OVERRUN_TEST_LOCK`'s own doc comment for why.
+    let _overrun_guard = DRAIN_OVERRUN_TEST_LOCK.lock().await;
+
     /// Small so the test does not idle: the held flush cannot complete, so the
     /// whole budget elapses before `shutdown` returns.
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -349,6 +367,106 @@ async fn shutdown_timeout_during_ingest_flush_warns_records_may_not_be_durable()
     for id in gate.held() {
         assert!(gate.release(id), "releasing a held call must succeed");
     }
+}
+
+/// Issue #1742: `ravel_shutdown_drain_overrun_total`
+/// (`ravel_server::drain_overrun_total()`) increments by exactly 1 on the
+/// branch where `--shutdown-timeout` actually elapsed, not 0 (missed) and not
+/// more than 1 (a bug that increments per drain step rather than once per
+/// `shutdown()` call). Reuses the same `FaultStore` hold as
+/// `shutdown_timeout_during_ingest_flush_warns_records_may_not_be_durable` to
+/// force a real, deterministic overrun with no wall-clock wait in the test
+/// itself: the gate parks the flush PUT forever, so the outer
+/// `--shutdown-timeout` is the only thing that can resolve `shutdown()`.
+///
+/// `DRAIN_OVERRUN_TOTAL` is a process-global static
+/// (`services/ravel-server/src/lib.rs`'s `store_probe`-style counter), so
+/// this delta is only exact when this test does not share a process with
+/// another test that also drives a real overrun; `scripts/affected-tests.sh`
+/// runs this crate under `cargo-nextest`, which gives every test its own
+/// process, so no other test's overrun can land inside this window.
+///
+/// Prove-the-test: flip `if timed_out { record_drain_overrun(); }` in
+/// `Running::shutdown` (`services/ravel-server/src/lib.rs`) to an
+/// unconditional `record_drain_overrun();` call after the timeout, and this
+/// assertion still passes (a false negative for THIS test alone) but
+/// `drain_overrun_counter_stays_zero_on_a_clean_drain` below then observes 1
+/// instead of 0, which is how that mutation is actually caught.
+#[tokio::test]
+async fn drain_overrun_counter_increments_exactly_once_on_a_real_overrun() {
+    let _overrun_guard = DRAIN_OVERRUN_TEST_LOCK.lock().await;
+
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+    let running = start_server_configured(store.clone(), Mode::Gateway, None, |config| {
+        config.shutdown_timeout = SHUTDOWN_TIMEOUT;
+    })
+    .await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let request = export_request("held_metric", "demo", 3.0, now_ns());
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(request.encode_to_vec())
+        .send()
+        .await
+        .expect("buffered export request succeeds");
+    assert_eq!(response.status(), 200, "buffered export should be accepted");
+
+    let gate = faults.hold(Op::Put, Some(metrics_l0_prefix()), Occurrence::Always);
+
+    let before = ravel_server::drain_overrun_total();
+    let err = running
+        .shutdown()
+        .await
+        .expect_err("a drain cut off by the timeout is an error");
+    assert!(
+        err.to_string().contains("exceeded --shutdown-timeout"),
+        "sanity: this must be the overrun branch, got: {err}"
+    );
+    let after = ravel_server::drain_overrun_total();
+    assert_eq!(
+        after - before,
+        1,
+        "a real overrun must increment the counter by exactly 1, before={before} after={after}"
+    );
+
+    for id in gate.held() {
+        assert!(gate.release(id), "releasing a held call must succeed");
+    }
+}
+
+/// The counterpart to `drain_overrun_counter_increments_exactly_once_on_a_real_overrun`:
+/// a clean drain (nothing held, well within `--shutdown-timeout`) must leave
+/// `ravel_server::drain_overrun_total()` unchanged. Pinned separately, and at
+/// exactly 0 rather than merely "less than the overrun case", because the
+/// WRONG-2 mutation this pair exists to catch (`record_drain_overrun()`
+/// called unconditionally instead of only inside `if timed_out`) increments
+/// on every drain, this clean one included; a test that only checked the
+/// overrun case at 1 would pass against that mutation too, since 1 - 0 = 1
+/// either way if this test did not also assert 0 here.
+#[tokio::test]
+async fn drain_overrun_counter_stays_zero_on_a_clean_drain() {
+    let _overrun_guard = DRAIN_OVERRUN_TEST_LOCK.lock().await;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone(), Mode::Gateway, None).await;
+
+    let before = ravel_server::drain_overrun_total();
+    running.shutdown().await.expect("graceful shutdown");
+    let after = ravel_server::drain_overrun_total();
+
+    assert_eq!(
+        after - before,
+        0,
+        "a clean drain must not increment the overrun counter, before={before} after={after}"
+    );
 }
 
 /// Readiness flips to 503 before the first listener closes: a probe issued
@@ -864,6 +982,10 @@ impl ObjectStoreBackend for StalledAuditWrites {
 /// pipeline.
 #[tokio::test]
 async fn audit_drain_is_bounded_by_the_overall_shutdown_timeout() {
+    // This drain overruns the outer `--shutdown-timeout`; see
+    // `DRAIN_OVERRUN_TEST_LOCK`'s own doc comment for why.
+    let _overrun_guard = DRAIN_OVERRUN_TEST_LOCK.lock().await;
+
     /// Far above `DEFAULT_SHUTDOWN_TIMEOUT`, so `audit_drain_timeout`
     /// (`--audit-max-age` plus the pipeline's own drain grace) cannot be the
     /// bound that ends this shutdown.
