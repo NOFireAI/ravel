@@ -33,6 +33,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint serves the loaded configuration and reads no evaluation outcome;
   `/api/v1/alerts` is not served.
 
+- **A teardown drain that loses acknowledged buffered rows, or overruns
+  `--shutdown-timeout`, is now visible on `/metrics`** (issue #1742).
+  `ravel_ingest_flush_all_residue_tenants_total` renders the residual tenant
+  count a `DrainIntent::Teardown` flush already logged at ERROR, for all
+  three ingest signals; `ravel_shutdown_drain_overrun_total` renders whether
+  the last graceful drain ran past its timeout, set only on that branch. The
+  client-facing listener (which also serves `/metrics`) stops accepting new
+  connections before either value can change during the shutdown that sets
+  it, so a live scrape is unlikely to observe the exact event; see
+  [Reachability during shutdown](docs/guides/observability.md#reachability-during-shutdown).
+  The accompanying log line remains the reliable single-event signal.
+
 ### Changed
 
 

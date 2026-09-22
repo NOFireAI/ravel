@@ -6761,6 +6761,87 @@ mod tests {
         );
     }
 
+    /// Issue #1742: `ravel_ingest_flush_all_residue_tenants_total` must render
+    /// for all three ingest signals, each carrying its OWN pipeline's count.
+    /// The three values (4, 6, 9) are distinct from each other and from every
+    /// other counter this fixture sets, so a constructor that exported the
+    /// residue count for the metrics pipeline only (leaving logs/spans at the
+    /// snapshot default of 0) or that mixed up which snapshot's field feeds
+    /// which pipeline's sample fails here, not silently.
+    #[test]
+    fn flush_all_residue_renders_distinctly_for_every_signal() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                flush_all_residue_tenants: 4,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                flush_all_residue_tenants: 6,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
+                flush_all_residue_tenants: 9,
+                ..Default::default()
+            }),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            true,
+        );
+
+        assert!(
+            body.contains("# TYPE ravel_ingest_flush_all_residue_tenants_total counter\n"),
+            "residue family must declare its TYPE as a counter:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_flush_all_residue_tenants_total{mode=\"gateway\",signal=\"metrics\"} 4\n"
+            ),
+            "conversion must carry the metrics pipeline's own residue count:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_flush_all_residue_tenants_total{mode=\"gateway\",signal=\"logs\"} 6\n"
+            ),
+            "conversion must carry the log pipeline's own residue count, not the metrics \
+             pipeline's or zero:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_flush_all_residue_tenants_total{mode=\"gateway\",signal=\"spans\"} 9\n"
+            ),
+            "conversion must carry the span pipeline's own residue count, not another \
+             pipeline's or zero:\n{body}"
+        );
+    }
+
     /// Issue #1741: `ravel_ingest_in_flight_flushes` must render for a
     /// logs-only process. Before the fix, the render loop lived inside the
     /// `with_adaptive` block, which is empty whenever no pipeline sets
