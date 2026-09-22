@@ -1120,18 +1120,17 @@ pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<Fl
     if uses_custom && samples.iter().any(|(_, h)| !first.custom_bounds_match(h)) {
         return None;
     }
-    let prev0 = &samples[0].1;
     let last = &samples[samples.len() - 1].1;
 
     // Coarsest schema across the window: down-convert so bucket bounds are a
     // common subset (Prometheus' minSchema pass).
-    let mut min_scale = prev0.scale.min(last.scale);
+    let mut min_scale = first.scale.min(last.scale);
     for (_, h) in &samples[1..samples.len() - 1] {
         min_scale = min_scale.min(h.scale);
     }
 
     let mut result = last.copy_to_scale(min_scale);
-    result.sub_assign(&prev0.copy_to_scale(min_scale));
+    result.sub_assign(&first.copy_to_scale(min_scale));
 
     if is_counter {
         // Reset detection runs on the raw adjacent pair, not on the
@@ -1141,7 +1140,7 @@ pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<Fl
         // it), and pre-aligning both operands to the window minimum would hide
         // an increase that happened between two samples the window later
         // down-converts to one common scale.
-        let mut prev = prev0.clone();
+        let mut prev = first.clone();
         for (_, curr) in &samples[1..] {
             if curr.detect_reset(&prev) {
                 result.add_assign(&prev.copy_to_scale(min_scale));
