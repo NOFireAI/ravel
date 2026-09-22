@@ -69,54 +69,60 @@ The erasure-request sweep is `sweep_erasure_requests_inner` in
 retires a request object at
 `t/<tenant_hash>/<signal>/del/<request_id>.dreq` once its erasure is complete,
 past the post-completion protection horizon, and no longer held by a legal
-hold or a still-resolvable superseded input. One pass makes three object-store
-calls on the `del/` prefix, and each needs its own grant:
+hold or a still-resolvable superseded input. The lifecycle makes five
+object-store calls on the `del/` prefix, across two roles, and each needs its
+own grant. The set is derived from every call site that touches the prefix,
+not from the sweep alone: scoping it to one function is how an earlier draft
+shipped a delete grant whose own listing was refused.
 
-| Call in `sweep.rs` | S3 operation | Grant |
+| Call | S3 operation | Grant |
 |---|---|---|
-| `list_all(store, &keys::del_prefix(tenant, signal))` | `s3:ListBucket` with `prefix=t/<tenant_hash>/<signal>/del/` | `MaintainList` `s3:prefix` `t/*/*/del/*` |
-| `store.get(&meta.key, GetRange::Full)` on each listed `.done` | `s3:GetObject` | `MaintainRead` `t/*/*/del/*.done` |
-| `store.delete(dreq_key)` | `s3:DeleteObject` | `MaintainDelete` `t/*/*/del/*.dreq` |
+| `erase.rs` `store.put(&key, ...)` (`ravel-cli erase submit`) | `s3:PutObject` | `AdminWrite` `t/*/*/del/*.dreq` |
+| `erasure_rewrite.rs` `store.get(&key, GetRange::Full)` on each pending `.dreq` | `s3:GetObject` | `MaintainRead` `t/*/*/del/*` |
+| `maintain.rs` `write_erasure_completion` | `s3:PutObject` | `MaintainWrite` `t/*/*/del/*.done` |
+| `sweep.rs` `list_all(store, &keys::del_prefix(tenant, signal))` | `s3:ListBucket` with `prefix=t/<tenant_hash>/<signal>/del/` | `MaintainList` `s3:prefix` `t/*/*/del/*` |
+| `sweep.rs` `store.get(&meta.key, GetRange::Full)` on each listed `.done` | `s3:GetObject` | `MaintainRead` `t/*/*/del/*` |
+| `sweep.rs` `store.delete(dreq_key)` | `s3:DeleteObject` | `MaintainDelete` `t/*/*/del/*.dreq` |
 
-IAM is default-deny and the calls run in that order, so the delete grant alone
-does nothing: the pass is refused with `AccessDenied` on the `ListBucket`
-before it reaches a single request object. The read grant is needed for the
-same reason one step later, because the completion record carries the
-timestamp the protection horizon is measured from and the sweep decodes it on
-every completed request.
+IAM is default-deny, so no grant here is useful on its own. The sweep is
+refused with `AccessDenied` on the `ListBucket` before it reaches a single
+request object, which makes the delete grant unreachable; and without the
+`.done` write the sweep's completion lookup always misses, so every request
+counts as still pending and none is ever deleted.
 
-The grant scopes are narrower than the ADR's `del/**` read, and deliberately
-so: `*.done` and not `del/*` on the read, because the sweep parses request ids
-out of the listed `.dreq` KEYS and never fetches a `.dreq` body; `*.dreq` and
-not `del/*` on the delete, because completion records are permanent erasure
-evidence and no role may delete them.
+One scope is narrower than the ADR's `del/**`: the delete is `*.dreq` and not
+`del/*`, because completion records are permanent erasure evidence and no role
+may delete them. The read is `del/*` as the ADR writes it, because both object
+shapes under the prefix are fetched — the `.done` by the sweep, the `.dreq` by
+the rewrite pass.
 
 `maintain_template_covers_every_erasure_request_sweep_call` in
-`crates/ravel-commit/tests/iam_templates.rs` asserts each row of that table
-against the key constructor the call uses, and asserts that no pattern
+`crates/ravel-commit/tests/iam_templates.rs` asserts the three `sweep.rs` rows
+against the key constructor each call uses, and asserts that no pattern
 reaching `del/` reaches anything outside it.
+`erasure_lifecycle_calls_outside_the_sweep_are_reachable` asserts the other
+three rows the same way.
 `maintain_template_grants_delete_on_erasure_requests` asserts the `.done` and
 `del/`-prefix exclusions on the delete side, and
-`every_role_grants_exactly_the_expected_pattern_set` pins all three pattern
-strings by exact equality.
+`every_role_grants_exactly_the_expected_pattern_set` pins every pattern string
+by exact equality.
 
-An operator who applied a copy of `maintain.json` older than all three grants
-must re-apply it. Re-applying restores the sweep's ability to run: on the next
-pass it lists the prefix, reads each completion, and deletes every request
-object whose protection horizon has elapsed and that no hold retains, so the
-backlog drains over the passes that follow rather than instantly. Requests
-whose horizon has not elapsed, or that a legal hold or a still-resolvable
-superseded input holds, are kept by design and are not part of that backlog.
-Re-applying a copy that carries the delete but not the list and read grants
-clears nothing at all: the pass is still refused at the `ListBucket`.
+An operator who applied a copy of `maintain.json` or `admin.json` older than
+these grants must re-apply it. Re-applying restores the lifecycle: `ravel-cli
+erase submit` can write a `.dreq`, the rewrite pass can read it and write the
+matching `.done`, and the sweep then lists the prefix, reads each completion,
+and deletes every request object whose protection horizon has elapsed and that
+no hold retains, so the backlog drains over the passes that follow rather than
+instantly. Requests whose horizon has not elapsed, or that a legal hold or a
+still-resolvable superseded input holds, are kept by design and are not part of
+that backlog. A partial re-apply clears nothing: a copy carrying the delete but
+not the list is refused at the `ListBucket`, and one carrying list, read and
+delete but not the `.done` write leaves every request looking still-pending, so
+the sweep deletes none of them.
 
-Two known gaps in this template remain open and are NOT closed by the grants
-above. Both are tracked separately; neither is created by this change.
+One known gap remains open and is NOT closed by the grants above. It is
+tracked separately and is not created by this change.
 
-- `pending_erasure_requests` in
-  `crates/ravel-maintain/src/erasure_rewrite.rs` GETs each pending `.dreq`
-  body to plan the rewrite. `MaintainRead` reaches `.done` only, so the
-  rewrite pass is refused on that read.
 - `query.json` grants no list or read under `del/`, while the resolver LISTs
   `t/<tenant_hash>/<signal>/del/` per resolve to attach pending predicates
   (`crates/ravel-commit/src/keys.rs`, `del_prefix`). ADR-0064's same bullet
