@@ -23,6 +23,10 @@ protox = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Test-only: the two-surface acceptance test for issue #1858 drives the OTLP
+# ingest path with the same histogram shapes as this crate's, which needs the
+# OTLP data-point types to build a request.
+opentelemetry-proto = { workspace = true }
 
 [lints]
 workspace = true

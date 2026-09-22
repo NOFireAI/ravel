@@ -5066,6 +5066,7 @@ version = "0.15.0"
 dependencies = [
  "bytes",
  "hex",
+ "opentelemetry-proto",
  "proptest",
  "prost",
  "prost-build",

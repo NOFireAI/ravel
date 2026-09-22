@@ -230,6 +230,15 @@ pub enum Rejection {
     )]
     NativeHistogramScaleUnsupported { scale: i32 },
 
+    /// The `zero_threshold` field is carried as its bit pattern rather than
+    /// as an `f64` so this enum keeps its `Eq`, and so a NaN rejection
+    /// compares equal to itself in a test (NaN is not `==` NaN).
+    #[error(
+        "exponential histogram zero_threshold is {}, which is not a finite value at or above zero",
+        f64::from_bits(*.zero_threshold_bits)
+    )]
+    NativeHistogramZeroThresholdInvalid { zero_threshold_bits: u64 },
+
     #[error(
         "exponential histogram count is smaller than its zero_count plus bucket counts, which the segment format's reader would reject as corrupted"
     )]
@@ -408,6 +417,7 @@ impl Rejection {
             | Rejection::HistogramBoundsNotIncreasing
             | Rejection::HistogramCountOverflow
             | Rejection::NativeHistogramScaleUnsupported { .. }
+            | Rejection::NativeHistogramZeroThresholdInvalid { .. }
             | Rejection::NativeHistogramCountInconsistent
             | Rejection::NativeHistogramCountOverflow
             | Rejection::NonFiniteQuantile
@@ -557,6 +567,7 @@ mod tests {
                 Rejection::HistogramBoundsNotIncreasing => structural,
                 Rejection::HistogramCountOverflow => structural,
                 Rejection::NativeHistogramScaleUnsupported { .. } => structural,
+                Rejection::NativeHistogramZeroThresholdInvalid { .. } => structural,
                 Rejection::NativeHistogramCountInconsistent => structural,
                 Rejection::NativeHistogramCountOverflow => structural,
                 Rejection::NonFiniteQuantile => structural,
@@ -632,6 +643,9 @@ mod tests {
             Rejection::HistogramBoundsNotIncreasing,
             Rejection::HistogramCountOverflow,
             Rejection::NativeHistogramScaleUnsupported { scale: -54 },
+            Rejection::NativeHistogramZeroThresholdInvalid {
+                zero_threshold_bits: f64::NAN.to_bits(),
+            },
             Rejection::NativeHistogramCountInconsistent,
             Rejection::NativeHistogramCountOverflow,
             Rejection::NonFiniteQuantile,
@@ -647,7 +661,7 @@ mod tests {
 
         // One entry per variant, each a distinct one, so no variant is
         // covered twice while another is missing.
-        assert_eq!(variants.len(), 31);
+        assert_eq!(variants.len(), 32);
         for (i, a) in variants.iter().enumerate() {
             for b in &variants[i + 1..] {
                 assert_ne!(
