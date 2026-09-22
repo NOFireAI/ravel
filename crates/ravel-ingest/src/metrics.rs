@@ -607,10 +607,16 @@ pub struct ShardSkewStats {
     ///
     /// It can read ABOVE that ceiling, and that is not a bug. A tenant buffer
     /// over its memory backstop spawns whatever the trigger, because the
-    /// backstop is the only bound on that buffer's resident memory; the queue
-    /// then carries one extra window per such buffer. A reading above the cap
-    /// with no matching rise in `flush_trigger_deferred` is that exemption at
-    /// work, which is memory pressure, not a queue that lost its bound.
+    /// backstop is the only bound on that buffer's resident memory. No count
+    /// bounds that overshoot: an exempt spawn drains the buffer it fires on,
+    /// so the same tenant crosses again after buffering another backstop's
+    /// worth, and each crossing adds a window rather than replacing one.
+    /// Under [`crate::IngestByteBudgetLimit::Bounded`] the byte budget
+    /// bounds the accumulation; under
+    /// [`crate::IngestByteBudgetLimit::Unlimited`] only the length of the
+    /// store stall does. A reading above the cap with no matching rise in
+    /// `flush_trigger_deferred` is that exemption at work, which is memory
+    /// pressure, not a queue that lost its bound.
     ///
     /// Distinct from the pipeline's in-flight-flush gauge
     /// ([`IngestMetrics::in_flight_flushes_by_shard`]) in when it stops

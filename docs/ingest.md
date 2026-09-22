@@ -1387,11 +1387,12 @@ internal, read only through `shard_skew_by_shard()`. Per shard
   the last time that set changed length. This is the quantity
   `max_queued_flushes` caps (the ADR-1642 amendment), and it is the per-shard
   version of what `in_flight_flushes_total` sums: waiting and executing flushes
-  both count, since both hold a flush window. It can read above the cap, by
-  one window per tenant buffer past its memory backstop, since those spawn
-  whatever the queue depth; a reading above the cap while
-  `flush_trigger_deferred` stays flat is that exemption rather than a lost
-  bound.
+  both count, since both hold a flush window. It can read above the cap: a
+  tenant buffer past its memory backstop spawns whatever the queue depth, and
+  no count bounds how many such windows a stall accumulates. See "One trigger
+  is exempt" under "Pipelined flushes (ADR-0067)" above for what does bound
+  them; a reading above the cap while `flush_trigger_deferred` stays flat is
+  that exemption rather than a lost bound.
 - `flush_trigger_deferred`: counter, size or age triggers the shard refused
   because it was already at `max_queued_flushes` and the tenant's buffer was
   still under its memory backstop. A refused trigger leaves its
