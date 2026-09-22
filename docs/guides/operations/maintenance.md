@@ -268,8 +268,12 @@ them on a schedule instead. It runs only in `--mode maintain`, spawned per
 process alongside the maintenance loop.
 
 Each tick it re-discovers tenants from storage and, for every unit, verifies a
-bounded slice of that shard's committed L0 data objects: a section checksum
-re-check plus a whole-object rehash against the recorded content hash. A
+bounded slice of that shard's committed data objects, the L0 segments plus the
+compaction and rewrite output parts the catalog still serves (not a superseded
+generation's, not an overlap loser's, and none in a tombstoned bucket): a
+section checksum re-check plus a whole-object rehash against the recorded
+content hash. The [observability guide](../observability.md) records the
+lineage filter and the `level` label a mismatch is counted under. A
 persisted per-shard cursor advances the slice each tick, so a full rotation over
 the corpus completes in about the configured period.
 

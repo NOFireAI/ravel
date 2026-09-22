@@ -14,12 +14,19 @@
 //! L1 and rewrite parts a compaction or erasure-rewrite record supersedes them
 //! with.
 //!
-//! The lineage filter applies to the parts only. A compaction or rewrite
-//! record another rewrite record names in `superseded_record_key` is left out,
-//! and so is one in a tombstoned bucket: retention's sweep may delete either
-//! one's parts at any time, and no query reads them meanwhile. L0 commit
-//! records carry no such check (neither arm below tests supersession or a
-//! tombstone for them), so an L0 object a live compaction already folded is
+//! The lineage filter applies to the parts only, and it leaves out three
+//! shapes. A compaction or rewrite record another rewrite record names in
+//! `superseded_record_key` is left out, and so is one in a tombstoned bucket:
+//! retention's sweep may delete either one's parts at any time, and no query
+//! reads them meanwhile. A compaction record that loses its bucket's overlap
+//! component to another compaction record (two compactors racing, resolved
+//! through `ravel_catalog::select_authoritative_compaction_records`, the same
+//! selection the read path uses) is left out too, with a caveat the first two
+//! shapes do not carry: a node that has not adopted the overlap rule may still
+//! serve the loser's parts, and the loser is not horizon-bounded, so the sweep
+//! never reclaims them. L0 commit records carry no such check (the commit
+//! record arm below tests neither supersession, overlap, nor a tombstone for
+//! them), so an L0 object a live compaction already folded is
 //! still scrubbed, and a `level="l0"` mismatch on an already-compacted hour
 //! may name a copy nothing reads: the catalog puts a live compaction record's
 //! input identities into the query-time excluded set. (The
@@ -32,9 +39,9 @@
 //!
 //! 1. LIST the shard's commit, compaction, rewrite, and tombstone records.
 //!    Decode each commit record and reconstruct the data object key it points
-//!    at; decode each compaction/rewrite record, drop the tombstoned and
-//!    superseded ones, and reconstruct the survivors' parts' keys the same
-//!    way. Together these build the rotation corpus ([`ScrubTarget`]s in key
+//!    at; decode each compaction/rewrite record, drop the tombstoned ones,
+//!    the superseded ones, and the overlap losers, and reconstruct the
+//!    survivors' parts' keys the same way. Together these build the rotation corpus ([`ScrubTarget`]s in key
 //!    order) and, beside it, the per-key map holding the record to verify and
 //!    its [`ravel_maintain::ScrubLevel`]. The level lives in that map alone,
 //!    so the label a mismatch is counted under has one owner.
@@ -555,10 +562,12 @@ async fn scan_shards(
 }
 
 /// One content-tier tick over one `(tenant, signal, shard)`: build the rotation
-/// corpus from the shard's L0 commit records, advance this shard's persisted
-/// cursor by one budgeted slice, verify each object in the slice, and persist
-/// the advanced cursor. Every store error is logged and the tick is retried
-/// next cycle; nothing here mutates durable data.
+/// corpus from the shard's L0 commit records plus the parts of every
+/// compaction and rewrite record that survives the lineage filter the module
+/// doc describes, advance this shard's persisted cursor by one budgeted slice,
+/// verify each object in the slice, and persist the advanced cursor. Every
+/// store error is logged and the tick is retried next cycle; nothing here
+/// mutates durable data.
 #[allow(clippy::too_many_arguments)]
 async fn run_shard_tick(
     store: &dyn ObjectStoreBackend,
@@ -571,11 +580,13 @@ async fn run_shard_tick(
     covering: Option<&ravel_catalog::LoadedCoveringPostings>,
     metrics: &ScrubMetrics,
 ) {
-    // Build the corpus: every L0 data object referenced by a surviving commit
-    // record for this shard, keyed by data-object key so the cursor's
-    // key-ordered resume point is well defined. The commit record carries the
-    // object's size (for the byte budget) and the content hash
-    // `scrub_one_object` re-verifies against.
+    // Build the corpus: every L0 data object referenced by a commit record for
+    // this shard, and every part of a compaction or rewrite record that is not
+    // superseded, not an overlap loser, and not in a tombstoned bucket, keyed
+    // by object key so the cursor's key-ordered resume point is well defined.
+    // The commit record (for an L0 object) or the `CompactionPart` (for a
+    // part) carries the object's size (for the byte budget) and the content
+    // hash `scrub_one_object` re-verifies against.
     let prefix = match keys::commit_shard_prefix(tenant, signal, shard) {
         Ok(prefix) => prefix,
         Err(err) => {
@@ -752,8 +763,9 @@ async fn run_shard_tick(
         .map(|(_, rec)| rec.superseded_record_key.as_str())
         .collect();
 
-    // Supersession is only one of the two ways a compaction record's parts
-    // stop being served. The other is overlap (issue #1070): two compactors
+    // Supersession and the tombstone check in the listing pass are two of the
+    // three ways a compaction record's parts stop being served. The third is
+    // overlap (issue #1070): two compactors
     // racing leave two records in one bucket whose input sets share an L0
     // input, and the catalog keeps one authoritative record per overlap
     // component and ignores every other record's parts. Resolve it through

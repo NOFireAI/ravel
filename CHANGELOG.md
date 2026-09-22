@@ -67,6 +67,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which are still listed alongside them, that is close to a doubling of scrub
   GET bytes per tick. Size scrub read bandwidth against the corpus with parts
   included, not against the L0 total.
+
   of one. The scrub tick cadence is unchanged: an operator should expect the
   first tick after upgrading to cover a larger corpus within the same
   per-tick byte budget, which can extend how long a full rotation takes on a
