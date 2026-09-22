@@ -198,7 +198,9 @@ worse.
 
 **Recording rules are out of scope for v1.** Ravel has no recording-rule
 concept. `ravel-alerting` models alerting rules with a threshold condition,
-not Prometheus `record:` semantics, and there is no `/api/v1/rules`. The epic
+not Prometheus `record:` semantics. (Since #1711, `GET /api/v1/rules` does
+serve the loaded alerting rule set in the Prometheus response shape; it
+carries no `record:` rules, so the scope decision below is unaffected.) The epic
 lists them; this ADR removes them from v1 and names the gap rather than
 carrying an acceptance criterion nothing can satisfy.
 
@@ -214,7 +216,8 @@ counterpart in Ravel to measure:
 - `keep_firing_for:`;
 - rule-group evaluation order, interval and staleness between groups;
 - `ALERTS` / `ALERTS_FOR_STATE` synthetic series;
-- `/api/v1/rules` and `/api/v1/alerts`, which do not exist.
+- `/api/v1/alerts`, which does not exist; and recording rules on
+  `/api/v1/rules`, which serves alerting rules only.
 
 A corpus entry that needs any of those is not written, rather than written and
 reported `unsupported_construct`: the category means the engine cannot evaluate
