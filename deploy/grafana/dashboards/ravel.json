@@ -1,0 +1,1097 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "title": "Ravel",
+  "uid": "ravel",
+  "description": "Ravel's own ravel_* families, grouped by the subsystem that renders them. services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs asserts every metric name a target here references appears on a # TYPE line of a rendered /metrics body.",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "ds",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Ingest",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Acknowledged writes",
+      "description": "Requests Ravel answered, split by whether the write was durable. A rising err rate with a flat ok rate is the shape a store outage takes at the ingest surface.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "ok {{signal}}",
+          "expr": "sum by (signal) (rate(ravel_ingest_acks_ok_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "err {{signal}}",
+          "expr": "sum by (signal) (rate(ravel_ingest_acks_err_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Admission decisions",
+      "description": "Admitted data against the admission-control rejections, by the reason ADR-0051 names. RavelStructuralRejections and RavelEventTimeSkew alert on the reason= dimension of the second target.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "admitted {{signal}}",
+          "expr": "sum by (signal) (rate(ravel_admission_admitted_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "rejected {{reason}}",
+          "expr": "sum by (reason) (rate(ravel_admission_rejected_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Ingest bytes",
+      "description": "Wire bytes as received against the bytes admission charged. The two differ by whatever the transport decompressed; neither is a count of bytes written to object storage.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "wire {{signal}}",
+          "expr": "sum by (signal) (rate(ravel_ingest_wire_bytes_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "charged {{signal}}",
+          "expr": "sum by (signal) (rate(ravel_admission_admitted_bytes_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Flushes by trigger",
+      "description": "Which condition closed each segment. A fleet flushing almost entirely by age is writing small objects and will read slowly.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "size",
+          "expr": "sum(rate(ravel_ingest_flushes_by_size_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "age",
+          "expr": "sum(rate(ravel_ingest_flushes_by_age_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "age (adaptive)",
+          "expr": "sum(rate(ravel_ingest_flushes_by_age_adaptive_total[$__rate_interval]))"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "manual",
+          "expr": "sum(rate(ravel_ingest_flushes_manual_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Flush concurrency",
+      "description": "Flushes in flight against the seconds writers spent waiting for a flush permit. Permit wait climbing while in-flight sits at the configured maximum is the ceiling being reached.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "in flight",
+          "expr": "sum(ravel_ingest_in_flight_flushes)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "permit wait (s/s)",
+          "expr": "sum(rate(ravel_ingest_flush_permit_wait_seconds_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Ingest buffer and shedding",
+      "description": "Buffered bytes against the configured limit, with the two shed counters. Shedding with the buffer well under its limit points at the concurrency limiter, not at the byte budget.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "buffered bytes",
+          "expr": "sum(ravel_ingest_buffer_bytes)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "buffer limit",
+          "expr": "sum(ravel_ingest_buffer_bytes_limit)"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "shed (buffer)",
+          "expr": "sum(rate(ravel_ingest_buffer_shed_total[$__rate_interval]))"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "shed (concurrency)",
+          "expr": "sum(rate(ravel_ingest_concurrency_shed_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Active series and write faults",
+      "description": "Cardinality under admission control, and the four ingest faults that are never routine. A nonzero partial-write or shard-death rate means data was acknowledged and then lost a writer.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "active series",
+          "expr": "sum(ravel_admission_active_series)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "put retries",
+          "expr": "sum(rate(ravel_ingest_put_retries_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "partial writes",
+          "expr": "sum(rate(ravel_ingest_partial_writes_total[$__rate_interval]))"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "shard deaths",
+          "expr": "sum(rate(ravel_ingest_shard_deaths_total[$__rate_interval]))"
+        },
+        {
+          "refId": "E",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "shards condemned",
+          "expr": "sum(rate(ravel_ingest_shards_condemned_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Query",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 },
+      "panels": []
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Queries",
+      "description": "Completed queries across every read surface.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "queries",
+          "expr": "sum(rate(ravel_query_queries_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Object-store work per read",
+      "description": "Requests and bytes the read path issued. The two byte series count different things: s3_bytes is bytes as transferred, decompressed_bytes is what those bytes expanded to, so they must not be summed.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "requests",
+          "expr": "sum(rate(ravel_query_s3_requests_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "wire bytes",
+          "expr": "sum(rate(ravel_query_s3_bytes_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "decompressed bytes",
+          "expr": "sum(rate(ravel_query_decompressed_bytes_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Planner estimates",
+      "description": "What the planner charged against the query budget before the scan ran. Compare each against its actual on the panel to the left: an estimate far under the actual is a budget that cannot refuse the query it should have refused.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "estimated requests",
+          "expr": "sum(rate(ravel_query_estimated_requests_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "estimated store bytes",
+          "expr": "sum(rate(ravel_query_estimated_store_bytes_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "estimated decompressed bytes",
+          "expr": "sum(rate(ravel_query_estimated_decompressed_bytes_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Query result cache hit ratio",
+      "description": "Hits over hits plus misses. The denominator is clamped at 1 so an idle fleet reads 0 rather than dropping the series.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "hit ratio",
+          "expr": "sum(rate(ravel_query_cache_hits_total[$__rate_interval])) / clamp_min(sum(rate(ravel_query_cache_hits_total[$__rate_interval])) + sum(rate(ravel_query_cache_misses_total[$__rate_interval])), 1)"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Object cache traffic",
+      "description": "The block cache under the query path, split by the cache= family that serves each lookup.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "hits {{cache}}",
+          "expr": "sum by (cache) (rate(ravel_cache_hits_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "misses {{cache}}",
+          "expr": "sum by (cache) (rate(ravel_cache_misses_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "evictions",
+          "expr": "sum(rate(ravel_cache_evictions_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Cache residency and disk tier",
+      "description": "How full the cache is, what it serves, and the two disk-tier degradations. A nonzero degraded-to-miss rate means the disk tier is failing reads and the cache is silently behaving as a smaller one.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 42 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "resident bytes",
+          "expr": "sum(ravel_cache_resident_bytes)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "max bytes",
+          "expr": "sum(ravel_cache_max_bytes)"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "resident entries",
+          "expr": "sum(ravel_cache_resident_entries)"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "bytes served",
+          "expr": "sum(rate(ravel_cache_bytes_served_total[$__rate_interval]))"
+        },
+        {
+          "refId": "E",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "bytes admitted",
+          "expr": "sum(rate(ravel_cache_bytes_admitted_total[$__rate_interval]))"
+        },
+        {
+          "refId": "F",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "disk errors degraded to misses",
+          "expr": "sum(rate(ravel_cache_disk_errors_degraded_to_misses_total[$__rate_interval]))"
+        },
+        {
+          "refId": "G",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "disk entries expired",
+          "expr": "sum(rate(ravel_cache_disk_entries_expired_max_age_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Log block pruning",
+      "description": "The share of log blocks the postings index pruned before decode, and the blocks that survived to be scanned. A pruned share falling towards zero is the postings index stopping to pay for itself.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 42 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "pruned share",
+          "expr": "sum(rate(ravel_logs_prune_blocks_pruned_by_postings_total[$__rate_interval])) / clamp_min(sum(rate(ravel_logs_prune_blocks_total[$__rate_interval])), 1)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "blocks survived",
+          "expr": "sum(rate(ravel_logs_prune_blocks_survived_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Catalog fold",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Fold age by signal",
+      "description": "Seconds since any process last completed a fold of this signal. RavelCatalogFoldStalled pages on this crossing 4800s for 10m; the unsealed ingest span grows for as long as it climbs.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "{{signal}}",
+          "expr": "time() - max by (signal) (ravel_catalog_fold_last_success_timestamp_seconds)"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Fold cycles and failures",
+      "description": "A fold that is running and failing shows here before the age panel to the left crosses its threshold.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "cycles {{signal}}",
+          "expr": "sum by (signal) (rate(ravel_catalog_fold_cycles_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "failures {{signal}}",
+          "expr": "sum by (signal) (rate(ravel_catalog_fold_failures_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Declared-stat stamp coverage",
+      "description": "Stamped carriers read against stamped snapshot entries written, over the hour RavelFoldStampCoverageShortfall uses. Records above entries means stamps are being dropped, and the drop counter names the carrier to look at.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "stamped records read",
+          "expr": "sum(increase(ravel_catalog_fold_stamped_records_total[1h]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "stamped entries written",
+          "expr": "sum(increase(ravel_catalog_fold_stamped_entries_total[1h]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "drops {{carrier}}",
+          "expr": "sum by (carrier) (increase(ravel_declared_stats_drops_observed_total[1h]))"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Catalog integrity",
+      "description": "Three counters that must stay flat at zero. Any of them moving is a correctness event, not a capacity one.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "isolation breaches",
+          "expr": "sum(rate(ravel_catalog_isolation_breach_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "interlock violations",
+          "expr": "sum(rate(ravel_catalog_interlock_violations_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "compaction input-set conflicts",
+          "expr": "sum(rate(ravel_catalog_compaction_input_set_conflicts_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 103,
+      "type": "row",
+      "title": "Maintenance",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Maintenance cycle age",
+      "description": "Seconds since this process completed a maintenance cycle. Not aggregated across replicas on purpose: unit ownership is partitioned (ADR-0065), so a single dead loop strands its own units while its peers stay fresh.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 68 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "{{instance}}",
+          "expr": "time() - ravel_maintain_last_cycle_completed_timestamp_seconds"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Workers and units",
+      "description": "Live maintenance workers, the units they own, the units that stalled, and the L0 records still waiting to be folded in.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 68 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "workers live",
+          "expr": "sum(ravel_maintain_workers_live)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "units owned",
+          "expr": "sum(ravel_maintain_units_owned)"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "units stalled",
+          "expr": "sum(ravel_maintain_units_stalled)"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "l0 records pending",
+          "expr": "sum(ravel_maintain_l0_records_pending)"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Tenant coverage",
+      "description": "Tenants discovered against tenants actually maintained. A gap means some tenant's retention, compaction and GC are not running at all.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 68 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "discovered",
+          "expr": "sum(ravel_maintain_tenants_discovered)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "maintained",
+          "expr": "sum(ravel_maintain_tenants_maintained)"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "discovery failures",
+          "expr": "sum(rate(ravel_maintain_tenant_discovery_failures_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Orphans",
+      "description": "Objects the sweeper found unreferenced, what it withheld inside the safety window, and the quarantine flow. A refused quarantine is an object the sweeper wanted to move and could not.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 76 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "present {{signal}}",
+          "expr": "sum by (signal) (ravel_maintain_orphans_present)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "withheld",
+          "expr": "sum(ravel_maintain_orphans_withheld)"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "quarantined",
+          "expr": "sum(rate(ravel_maintain_orphans_quarantined_total[$__rate_interval]))"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "quarantine refused",
+          "expr": "sum(rate(ravel_maintain_orphans_quarantine_refused_total[$__rate_interval]))"
+        },
+        {
+          "refId": "E",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "quarantine reaped",
+          "expr": "sum(rate(ravel_maintain_quarantine_reaped_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Reclaim and safety brakes",
+      "description": "Physical deletes by kind, against the four brakes that stop the sweeper. The breaker, the conservation aborts and the loop panics each mean reclaim stopped on purpose or on a crash, not that there was nothing to reclaim.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 76 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "deleted {{kind}}",
+          "expr": "sum by (kind) (rate(ravel_maintain_objects_deleted_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "full sweep passes",
+          "expr": "sum(rate(ravel_maintain_full_sweep_passes_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "orphan breaker tripped",
+          "expr": "sum(rate(ravel_maintain_orphan_breaker_tripped_total[$__rate_interval]))"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "conservation aborts",
+          "expr": "sum(rate(ravel_maintain_conservation_aborts_total[$__rate_interval]))"
+        },
+        {
+          "refId": "E",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "loop panics",
+          "expr": "sum(rate(ravel_maintain_loop_panics_total[$__rate_interval]))"
+        },
+        {
+          "refId": "F",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "legal-hold refresh failures",
+          "expr": "sum(rate(ravel_maintain_legal_hold_refresh_failures_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Merge memory and process budget",
+      "description": "The k-way merge high-water marks against the ADR-1170 process budget. component= on the reserved gauge is not yet a real split: SQL reserves the whole process total today, so the two components must not be summed.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 84 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "rlog merge peak {{kind}}",
+          "expr": "max by (kind) (ravel_maintain_rlog_merge_peak_bytes)"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "memo warm-start units",
+          "expr": "sum(rate(ravel_maintain_memo_warm_start_units_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "budget bytes",
+          "expr": "max(ravel_memory_budget_bytes)"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "reserved {{component}}",
+          "expr": "max by (component) (ravel_memory_reserved_bytes)"
+        },
+        {
+          "refId": "E",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "handoff overlap",
+          "expr": "max(ravel_memory_handoff_overlap_bytes)"
+        },
+        {
+          "refId": "F",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "allocator {{stat}}",
+          "expr": "max by (stat) (ravel_process_allocator_bytes)"
+        }
+      ]
+    },
+    {
+      "id": 104,
+      "type": "row",
+      "title": "Object store and probe",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 92 },
+      "panels": []
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Store reachability",
+      "description": "The store probe's verdict, taken as a minimum so one unreachable replica is visible rather than averaged away.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 93 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "reachable",
+          "expr": "min(ravel_store_reachable)"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Probe failures and bucket protection",
+      "description": "Probe failures, and whether Ravel could establish that the bucket is versioned and protected. An unknown protection state is not a safe state.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 93 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "probe failures",
+          "expr": "sum(rate(ravel_store_probe_failures_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "protection unknown",
+          "expr": "max(ravel_bucket_protection_unknown)"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Store latency p99 by op",
+      "description": "The 99th percentile of the ravel_store_latency_seconds histogram, per object-store operation.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 93 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "p99 {{op}}",
+          "expr": "histogram_quantile(0.99, sum by (le, op) (rate(ravel_store_latency_seconds_bucket[$__rate_interval])))"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Store calls, attempts and errors",
+      "description": "Calls are logical operations; attempts are billed HTTP requests, so attempts above calls is expected (a multipart write or a ranged read issues several) and is not a retry count.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 101 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "calls {{op}}",
+          "expr": "sum by (op) (rate(ravel_store_calls_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "attempts {{op}}",
+          "expr": "sum by (op) (rate(ravel_store_attempts_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "ok {{op}}",
+          "expr": "sum by (op) (rate(ravel_store_ok_total[$__rate_interval]))"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "errors {{op}} {{error_kind}}",
+          "expr": "sum by (op, error_kind) (rate(ravel_store_errors_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Store bytes and mean latency",
+      "description": "Bytes as transferred per operation, and the histogram's own mean. The denominator is clamped at 1 so an operation with no calls in the window reads 0 rather than dropping out.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 101 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "bytes {{op}}",
+          "expr": "sum by (op) (rate(ravel_store_bytes_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "mean latency {{op}}",
+          "expr": "sum by (op) (rate(ravel_store_latency_seconds_sum[$__rate_interval])) / clamp_min(sum by (op) (rate(ravel_store_latency_seconds_count[$__rate_interval])), 1)"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Scrub and tenancy integrity",
+      "description": "The background scrub's three disagreement counters, its cursor, and the two provisioning and tenancy counters that say a process adopted state it should not have. Every series here is expected to stay flat at zero except the cursor.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 109 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "checksum mismatches",
+          "expr": "sum(rate(ravel_scrub_checksum_mismatch_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "postings disagreements",
+          "expr": "sum(rate(ravel_scrub_postings_disagreement_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "seal divergences",
+          "expr": "sum(rate(ravel_scrub_seal_divergence_total[$__rate_interval]))"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "scrub cursor",
+          "expr": "max(ravel_scrub_cursor_position)"
+        },
+        {
+          "refId": "E",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "shard count mismatches",
+          "expr": "sum(rate(ravel_provisioning_shard_count_mismatch_total[$__rate_interval]))"
+        },
+        {
+          "refId": "F",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "shard count drift",
+          "expr": "sum(rate(ravel_provisioning_shard_count_drift_total[$__rate_interval]))"
+        },
+        {
+          "refId": "G",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "unkeyed v1 adoptions",
+          "expr": "sum(rate(ravel_tenancy_v1_unkeyed_adoptions_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Durable auth and audit",
+      "description": "The durable token cache's refresh health, and audit write failures. Failing closed on stale state rejects live traffic; a failing audit write means a request was served with no durable record of it.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 109 },
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "refresh failures",
+          "expr": "sum(rate(ravel_durable_auth_refresh_failures_total[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "stale fail-closed",
+          "expr": "sum(rate(ravel_durable_auth_stale_fail_closed_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "on-miss rereads",
+          "expr": "sum(rate(ravel_durable_auth_on_miss_rereads_total[$__rate_interval]))"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "legendFormat": "audit write failures",
+          "expr": "sum(rate(ravel_audit_write_failures_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 105,
+      "type": "row",
+      "title": "Alerting",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 117 },
+      "panels": [
+        {
+          "id": 30,
+          "type": "timeseries",
+          "title": "Alert tick age",
+          "description": "Seconds since the alert evaluator last completed a tick. RavelAlertLoopStalled pages on this crossing 600s for 15m.",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 118 },
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "${ds}" },
+              "legendFormat": "{{instance}}",
+              "expr": "time() - ravel_alert_last_tick_completed_timestamp_seconds"
+            }
+          ]
+        },
+        {
+          "id": 31,
+          "type": "timeseries",
+          "title": "Tick outcomes",
+          "description": "How each evaluation tick ended. lease_not_held is the steady state of every replica that is not the lease holder and is not a fault; history_unavailable and lease_unavailable are.",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 118 },
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "${ds}" },
+              "legendFormat": "{{outcome}}",
+              "expr": "sum by (outcome) (rate(ravel_alert_ticks_total[$__rate_interval]))"
+            }
+          ]
+        },
+        {
+          "id": 32,
+          "type": "timeseries",
+          "title": "Rule evaluations",
+          "description": "Rules evaluated against rules that failed to evaluate. A failing rule fires nothing and reports nothing on its own.",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 118 },
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "${ds}" },
+              "legendFormat": "evaluated",
+              "expr": "sum(rate(ravel_alert_rules_evaluated_total[$__rate_interval]))"
+            },
+            {
+              "refId": "B",
+              "datasource": { "type": "prometheus", "uid": "${ds}" },
+              "legendFormat": "failed",
+              "expr": "sum(rate(ravel_alert_rules_failed_total[$__rate_interval]))"
+            }
+          ]
+        },
+        {
+          "id": 33,
+          "type": "timeseries",
+          "title": "Notification delivery",
+          "description": "Deliveries against failures. Failures rising while deliveries sit at zero is the shape RavelAlertNotificationsAllFailing pages on.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 126 },
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "${ds}" },
+              "legendFormat": "delivered",
+              "expr": "sum(rate(ravel_alert_notifications_delivered_total[$__rate_interval]))"
+            },
+            {
+              "refId": "B",
+              "datasource": { "type": "prometheus", "uid": "${ds}" },
+              "legendFormat": "failed",
+              "expr": "sum(rate(ravel_alert_notifications_failed_total[$__rate_interval]))"
+            }
+          ]
+        },
+        {
+          "id": 34,
+          "type": "timeseries",
+          "title": "Alert records and repeats",
+          "description": "Alert state records durably written, and repeat notifications queued behind them.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 126 },
+          "datasource": { "type": "prometheus", "uid": "${ds}" },
+          "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "${ds}" },
+              "legendFormat": "records written",
+              "expr": "sum(rate(ravel_alert_records_written_total[$__rate_interval]))"
+            },
+            {
+              "refId": "B",
+              "datasource": { "type": "prometheus", "uid": "${ds}" },
+              "legendFormat": "repeats queued",
+              "expr": "sum(rate(ravel_alert_repeats_queued_total[$__rate_interval]))"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -33,6 +33,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint serves the loaded configuration and reads no evaluation outcome;
   `/api/v1/alerts` is not served.
 
+- **A Grafana dashboard over Ravel's own metrics ships in
+  `deploy/grafana/dashboards/ravel.json`** (issue #1730). `deploy/` shipped a
+  rule file that pages on 37 metric names and one quickstart dashboard that
+  graphs host CPU, so an operator who got paged had nothing to open. The new
+  dashboard carries 36 panels in 6 rows (ingest, query, catalog fold,
+  maintenance, object store and probe, alerting) over 107 distinct `ravel_`
+  names, on a data-source variable rather than a hardcoded uid. The test that
+  pins the rule file's names now pins the dashboard's too: it extracts metric
+  names from each panel target's PromQL expression and asserts each one appears
+  on a `# TYPE` line of a rendered `/metrics` body, through the same scanner and
+  the same rendered bodies the rule file goes through, and it asserts that every
+  name the shipped rules alert on is graphed by some panel. The check covers
+  metric names; it does not validate the PromQL around them or the dashboard
+  against Grafana's schema.
+
 ### Changed
 
 - **A distributed query coordinator now decodes a slice incrementally under a
