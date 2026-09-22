@@ -299,12 +299,15 @@ impl ObjectStoreBackend for SharedKmsStore {
     }
 }
 
-/// The plaintext-endpoint rule (issue #1707), owned by `ravel-object-store`
-/// beside the `S3Config::allow_http` field it decides, because `ravel-cli`
-/// obeys the same rule against the same bucket and two copies of it would
-/// drift. Re-exported here for `Cli::validate` and [`build_store`], the two
-/// callers in this crate.
-pub use ravel_object_store::s3::{PlaintextS3Endpoint, resolve_s3_allow_http};
+/// The endpoint rules (the plaintext one from issue #1707, the missing-scheme
+/// one from issue #1911), owned by `ravel-object-store` beside the
+/// `S3Config::allow_http` field they decide, because `ravel-cli` obeys the same
+/// rules against the same bucket and two copies of them would drift.
+/// Re-exported here for `Cli::validate` and [`build_store`], the two callers in
+/// this crate.
+pub use ravel_object_store::s3::{
+    PlaintextS3Endpoint, S3EndpointRefusal, SchemelessS3Endpoint, resolve_s3_allow_http,
+};
 
 /// The argument error for `--s3-auth instance-role` combined with an inline
 /// credential (ADR-0106), or `None` when no inline credential is set.
@@ -792,9 +795,11 @@ mod tests {
         Cli::try_parse_from(args).expect("flags parse")
     }
 
-    /// Issue #1707. `allow_http` is decided by the endpoint's URL scheme, not
-    /// by whether an endpoint was set at all, and a plaintext endpoint on the
-    /// network refuses startup unless the operator passes the flag.
+    /// Issue #1707, plus the schemeless case from issue #1911. `allow_http` is
+    /// decided by the endpoint's URL scheme, not by whether an endpoint was set
+    /// at all; a plaintext endpoint on the network refuses startup unless the
+    /// operator passes the flag; and an endpoint carrying no scheme at all
+    /// refuses startup outright.
     ///
     /// Both layers are asserted: [`resolve_s3_allow_http`] for the value the
     /// S3 client is configured with (`build_store` exposes no way to read it
@@ -843,7 +848,7 @@ mod tests {
         // flag that accepts it.
         let refusal = resolve_s3_allow_http(Some("http://minio:9000"), false)
             .expect_err("plaintext to a non-loopback host must be refused");
-        assert_eq!(refusal.endpoint, "http://minio:9000");
+        assert_eq!(refusal.endpoint(), "http://minio:9000");
         let rendered = refusal.to_string();
         assert!(
             rendered.contains("--s3-allow-http"),
@@ -900,12 +905,46 @@ mod tests {
             );
         }
 
-        // An endpoint with no scheme is not decided by this rule: it stays
-        // plaintext-incapable (`false`), and it is not refused here.
+        // An endpoint with no scheme is refused (issue #1911): it is not a
+        // usable URL, and accepting it only moved the failure into
+        // `object_store`'s request signing, where the message names neither the
+        // endpoint nor the flag. A host name containing "http" is still
+        // schemeless, and `build_store` refuses both.
+        for endpoint in ["minio:9000", "my-http-proxy:9000"] {
+            let refusal = resolve_s3_allow_http(Some(endpoint), false)
+                .expect_err("a schemeless endpoint must be refused");
+            assert_eq!(
+                refusal,
+                S3EndpointRefusal::Schemeless(SchemelessS3Endpoint {
+                    endpoint: endpoint.to_string(),
+                }),
+                "{endpoint} must be refused as schemeless"
+            );
+            let err = match build_store(
+                &s3_cli(endpoint, false),
+                crate::config::DEFAULT_CACHE_MAX_BYTES,
+            ) {
+                // `BuiltStore` is not `Debug`, so `expect_err` is unavailable.
+                Ok(_) => panic!("build_store must refuse the schemeless endpoint {endpoint}"),
+                Err(err) => err,
+            };
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains(endpoint) && rendered.contains("https://"),
+                "build_store's refusal must name the endpoint and the fix, got: {rendered}"
+            );
+            // The plaintext flag accepts deliberate plaintext, not a missing
+            // scheme: there is no usable URL for it to accept.
+            assert!(
+                resolve_s3_allow_http(Some(endpoint), true).is_err(),
+                "{endpoint} must stay refused even with --s3-allow-http"
+            );
+        }
+        // An upper-case scheme is a scheme, and must not be swept up with them.
         assert_eq!(
-            resolve_s3_allow_http(Some("minio:9000"), false),
+            resolve_s3_allow_http(Some("HTTPS://minio:9000"), false),
             Ok(false),
-            "a schemeless endpoint must not enable allow_http"
+            "an upper-case https scheme is valid and must be accepted"
         );
     }
 
