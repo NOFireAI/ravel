@@ -23,7 +23,7 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/maint/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
-        "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.done",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*",
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
@@ -38,6 +38,7 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/maint/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.done",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/maintain/*"

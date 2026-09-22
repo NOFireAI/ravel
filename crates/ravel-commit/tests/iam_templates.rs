@@ -1783,9 +1783,13 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // maintenance cursors, and the GC/tenancy control objects; its deletes
     // cover the inputs compaction supersedes, the non-hold audit shard, and
     // the erasure request objects the .dreq sweep retires (ADR-0064 section 6).
-    // The del/ list prefix and the del/*.done read are that sweep's other two
+    // The del/ list prefix and the del/* read are that sweep's other two
     // object-store calls, asserted against their call sites by
-    // maintain_template_covers_every_erasure_request_sweep_call.
+    // maintain_template_covers_every_erasure_request_sweep_call. The read is
+    // del/* rather than del/*.done because the erasure rewrite pass GETs the
+    // .dreq body itself; the put reaches del/*.done because that pass writes
+    // the completion. Both are asserted by
+    // erasure_lifecycle_calls_outside_the_sweep_are_reachable.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1805,7 +1809,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/maint/*",
             "t/*/u/*",
             "t/*/*/prov",
-            "t/*/*/del/*.done",
+            "t/*/*/del/*",
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
@@ -1816,6 +1820,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/l1/*",
             "t/*/*/c/*",
             "t/*/*/maint/*",
+            "t/*/*/del/*.done",
             "sys/gc",
             "sys/tenancy",
             "sys/maintain/*",
@@ -1856,6 +1861,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/prov",
             "t/*/*/c/*",
             "t/*/u/*",
+            "t/*/*/del/*.dreq",
         ],
         put_actions: &["s3:PutObject"],
         deletes: &["sys/qualify/*"],
@@ -2504,7 +2510,9 @@ fn maintain_template_grants_delete_on_erasure_requests() {
 ///   parameter is `t/<tenant_hash>/<signal>/del/`),
 /// - `let got = store.get(&meta.key, GetRange::Full).await?` on each listed
 ///   key that parses as an erasure completion (one `s3:GetObject` per
-///   `del/<request_id>.done`; the `.dreq` bodies are never read here),
+///   `del/<request_id>.done`; this pass never reads a `.dreq` body, but
+///   another one does -- see
+///   `erasure_lifecycle_calls_outside_the_sweep_are_reachable`),
 /// - `store.delete(dreq_key).await?` (one `s3:DeleteObject` per
 ///   `del/<request_id>.dreq`).
 ///
@@ -2633,22 +2641,105 @@ fn maintain_template_covers_every_erasure_request_sweep_call() {
         }
     }
 
-    // The Get grant is scoped to what the sweep reads. The request bodies are
-    // parsed from their KEYS here and never fetched, so a Get reaching a
-    // `.dreq` is not justified by this pass. Audit is excluded for the reason
-    // given above: `t/*/u/*` reaches that signal's `.dreq` as a consequence of
-    // the audit keyspace's own read grant.
-    for signal in erasure_signals {
+    // No assertion here forbids a Get from reaching a `.dreq`. This pass parses
+    // request bodies from their KEYS and never fetches one, but
+    // `collect_pending_erasure_requests`
+    // (crates/ravel-maintain/src/erasure_rewrite.rs:147) GETs each `.dreq` to
+    // decode it, under the same Maintain identity, so the shape is justified
+    // outside this function and is asserted by
+    // `erasure_lifecycle_calls_outside_the_sweep_are_reachable`.
+}
+
+/// The `del/` calls the erasure lifecycle makes OUTSIDE
+/// `sweep_erasure_requests_inner`, which
+/// `maintain_template_covers_every_erasure_request_sweep_call` does not see.
+///
+/// That test is scoped to one function, and scoping a reachability check by
+/// FILE rather than by behaviour is how #1849 shipped a delete grant whose own
+/// listing was refused. Three more calls touch `del/` under two identities:
+///
+/// - Maintain GETs each pending `.dreq` to decode it:
+///   `let got = store.get(&key, GetRange::Full).await?` in
+///   `collect_pending_erasure_requests`
+///   (`crates/ravel-maintain/src/erasure_rewrite.rs:147`).
+/// - Maintain PUTs the completion record: `write_erasure_completion`
+///   (`services/ravel-server/src/maintain.rs:2358`) builds
+///   `del/<request_id>.done` and puts it. Without this the sweep's
+///   `completions.get(request_id)` always misses, every request counts as
+///   kept, and no `.dreq` is ever deleted -- the delete grant is reachable and
+///   still never fires.
+/// - Admin PUTs the request itself: `ravel-cli erase submit`
+///   (`services/ravel-cli/src/erase.rs:136`).
+///
+/// Admin's LIST and GET already span `del/` through its blanket `t/*`, so
+/// only its PUT is asserted here.
+#[test]
+fn erasure_lifecycle_calls_outside_the_sweep_are_reachable() {
+    let tenant = test_tenant();
+    let request_id = Uuid::from_u128(4);
+    let maintain = load_policy("maintain");
+    let admin = load_policy("admin");
+
+    let maintain_gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let maintain_puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let admin_puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+
+    for signal in ALL_SIGNALS {
         let dreq = erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
-        for pattern in &gets {
-            assert!(
-                !glob_matches(pattern, &dreq),
-                "maintain: GetObject Allow {pattern:?} reaches the request \
-                 object {dreq:?}. sweep_erasure_requests_inner never GETs a \
-                 .dreq; if a grant is being added for the rewrite pass's own \
-                 read in erasure_rewrite.rs, add it with that call site named \
-                 and update this assertion in the same commit (#1849)"
-            );
+        let done =
+            erasure_completion_key(&tenant, signal, request_id).expect("erasure_completion_key");
+
+        assert!(
+            maintain_gets.iter().any(|p| glob_matches(p, &dreq)),
+            "maintain: no GetObject Allow reaches the request object {dreq:?}, \
+             which collect_pending_erasure_requests GETs to decode the subject \
+             predicate (erasure_rewrite.rs:147). The rewrite pass is refused \
+             before it can erase anything. Grants: {maintain_gets:?}"
+        );
+        assert!(
+            maintain_puts.iter().any(|p| glob_matches(p, &done)),
+            "maintain: no PutObject Allow reaches the completion record \
+             {done:?}, which write_erasure_completion writes (maintain.rs:2358). \
+             With no .done the sweep counts every request as kept and deletes \
+             no .dreq, so the delete grant never fires. Grants: {maintain_puts:?}"
+        );
+        assert!(
+            admin_puts.iter().any(|p| glob_matches(p, &dreq)),
+            "admin: no PutObject Allow reaches the request object {dreq:?}, \
+             which `ravel-cli erase submit` writes (erase.rs:136). No erasure \
+             request can be submitted at all. Grants: {admin_puts:?}"
+        );
+    }
+
+    // Tightness: neither new grant may reach a key outside `del/`.
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.contains("/del/"))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside del/, so the tightness \
+         assertion below examines nothing"
+    );
+    let done_witness =
+        erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done witness");
+    let dreq_witness =
+        erasure_request_key(&tenant, Signal::Metrics, request_id).expect("dreq witness");
+    for (role, patterns, witness) in [
+        ("maintain put", &maintain_puts, &done_witness),
+        ("admin put", &admin_puts, &dreq_witness),
+    ] {
+        for pattern in patterns {
+            if !glob_matches(pattern, witness) {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "{role}: pattern {pattern:?} reaches the erasure keyspace \
+                     AND {key:?}, which lies outside del/ (#1849)"
+                );
+            }
         }
     }
 }

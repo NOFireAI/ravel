@@ -408,28 +408,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **The shipped Maintain IAM template now grants all three permissions the
-  erasure-request sweep needs** (issue #1849). ADR-0064 section 6 gives
-  Maintain read on `del/**` and delete on `del/*.dreq`, but
-  `deploy/iam/maintain.json` named no resource and no `s3:prefix` under `del/`
-  at all. IAM is default-deny, so on a deployment running the shipped template
-  the `.dreq` sweep was refused outright: completed erasure requests were never
-  retired, and the query-time exclusion filter that reads them grew without
-  bound for the life of the deployment. One pass of
-  `sweep_erasure_requests_inner` makes three calls on that prefix and each now
-  has its grant: `MaintainList` admits the `s3:prefix`
-  `t/*/*/del/*` the pass LISTs, `MaintainRead` reaches `t/*/*/del/*.done` for
-  the completion record whose timestamp anchors the protection horizon, and
-  `MaintainDelete` reaches `t/*/*/del/*.dreq` for the request object itself.
-  The delete grant alone was unreachable, since the pass fails on the
-  `ListBucket` before it sees a request object. Both reads are scoped tighter
-  than the ADR's `del/**`: the sweep parses request ids from `.dreq` keys and
-  never fetches a `.dreq` body. Completion records remain undeletable by every
-  role, including Maintain, as the ADR requires. An operator who already
-  applied an earlier copy of `maintain.json` must re-apply it; the fix is in
-  the template, not in any running binary, so upgrading Ravel alone changes
-  nothing. Re-applying lets the sweep run again and the backlog drains over
-  subsequent passes as each request's protection horizon elapses, not at once.
+- **The shipped IAM templates now grant every permission the selective-erasure
+  lifecycle needs** (issue #1849). ADR-0064 section 6 gives Maintain read on
+  `del/**` and delete on `del/*.dreq`, but `deploy/iam/maintain.json` named no
+  resource and no `s3:prefix` under `del/` at all. IAM is default-deny, so on a
+  deployment running the shipped template the `.dreq` sweep was refused
+  outright: completed erasure requests were never retired, and the query-time
+  exclusion filter that reads them grew without bound for the life of the
+  deployment. The grant set is now derived from every call site that touches
+  the prefix, not from one function: `MaintainList` admits the `s3:prefix`
+  `t/*/*/del/*` the sweep LISTs; `MaintainRead` reaches `t/*/*/del/*`, which
+  covers both the completion record whose timestamp anchors the protection
+  horizon and the `.dreq` body the erasure rewrite pass decodes;
+  `MaintainWrite` reaches `t/*/*/del/*.done` for the completion record that
+  pass writes; `MaintainDelete` reaches `t/*/*/del/*.dreq` for the request
+  object itself; and `AdminWrite` reaches `t/*/*/del/*.dreq`, which is what
+  `ravel-cli erase submit` PUTs. Each grant alone is unreachable without the
+  others: the sweep fails on the `ListBucket` before it sees a request object,
+  and with no `.done` writable it counts every request as still pending and
+  deletes nothing. Completion records remain undeletable by every role,
+  including Maintain, as the ADR requires, and no new pattern reaches a key
+  outside `del/`. An operator who already applied an earlier copy of either
+  template must re-apply it; the fix is in the templates, not in any running
+  binary, so upgrading Ravel alone changes nothing. Re-applying lets the
+  lifecycle run again and the backlog drains over subsequent passes as each
+  request's protection horizon elapses, not at once.
 - **An `--s3-endpoint` written with no URL scheme is refused at startup**
   (issue #1911). `minio:9000` used to be accepted by the endpoint rule, which
   only decides whether plaintext is allowed, and then killed the process from
