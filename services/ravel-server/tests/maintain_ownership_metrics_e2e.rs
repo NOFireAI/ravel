@@ -51,10 +51,22 @@ const SHARD_COUNT: u32 = 8;
 /// Heartbeat cadence the two-worker convergence test below drives its
 /// workers' shared `WorkerSet` at, via `MaintenanceTaskConfig::heartbeat_interval`
 /// (issue #1852), in place of the real `DEFAULT_HEARTBEAT_INTERVAL` (60s).
-/// The test only needs two ticks of this cadence to converge, so a small
-/// value lets the polling window below carry a wide margin without the test
-/// actually spending wall time waiting on it.
-const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+///
+/// `WorkerSet`'s liveness window is `DEFAULT_LIVENESS_FACTOR * H` = `3 * H`
+/// (crates/ravel-fleet/src/worker_set.rs `liveness_window_ns`), and its reap
+/// horizon is `REAP_WINDOW_FACTOR * window` = `6 * H` (`reap_horizon_ns`). A
+/// worker whose heartbeat write is delayed past the liveness window drops
+/// out of the live set the sibling reads, and past the reap horizon its
+/// heartbeat key is deleted outright, so `3 * H` must stay comfortably wider
+/// than ordinary scheduler delay on a loaded box. The previous value here
+/// (100ms) produced a 300ms liveness window; 300ms of scheduler delay on a
+/// CI box under load is ordinary noise, not a fault, so that value
+/// re-created the exact flake issue #1852 exists to fix, only tighter. 1s
+/// gives a 3s liveness window and a 6s reap horizon: a 10x margin over that
+/// 300ms failure point, while `H` itself stays 60x below the real 60s
+/// `DEFAULT_HEARTBEAT_INTERVAL`, so convergence below still costs about 1s
+/// of real wall time, not 60s.
+const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Build a `Mode::Maintain` config over `store`, with a 1-second maintenance
 /// interval so discovery-cycle-driven gauges (`units_owned`,
@@ -254,13 +266,16 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     }
 
     // Poll until BOTH workers report the full two-member live set. Whichever
-    // started first only picks this up on its own second heartbeat tick,
-    // real `2 * TEST_HEARTBEAT_INTERVAL` = 200ms after its loop began. 100
-    // iterations * 200ms sleep = 20s total window: a 100x margin over that
-    // 200ms convergence bound, generous enough to survive a loaded box
-    // without the test depending on wall time it does not control (unlike
-    // the pre-#1852 version of this test, which waited on the real 60s
-    // `DEFAULT_HEARTBEAT_INTERVAL` with only a 2x margin).
+    // started first only picks this up on its own second heartbeat tick:
+    // `tokio::time::interval`'s first tick fires immediately (t=0, possibly
+    // solo), its second one `TEST_HEARTBEAT_INTERVAL` later (t=H), so
+    // convergence is bounded by real `TEST_HEARTBEAT_INTERVAL` = 1s after
+    // that worker's own loop began. 100 iterations * 200ms sleep = 20s total
+    // window: a 20x margin over that 1s convergence bound, generous enough
+    // to survive a loaded box without the test depending on wall time it
+    // does not control (unlike the pre-#1852 version of this test, which
+    // waited on the real 60s `DEFAULT_HEARTBEAT_INTERVAL` with only a 2x
+    // margin).
     let mut converged = false;
     for _ in 0..100 {
         let body_a = scrape(&client, &base_a).await;
@@ -276,7 +291,7 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     assert!(
         converged,
         "both workers must report ravel_maintain_workers_live == 2 within the polling window \
-         (100 iterations * 200ms = 20s, a 100x margin over 2 * TEST_HEARTBEAT_INTERVAL = 200ms)"
+         (100 iterations * 200ms = 20s, a 20x margin over TEST_HEARTBEAT_INTERVAL = 1s)"
     );
 
     // A fresh discovery cycle must run under the now-converged live set
