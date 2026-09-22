@@ -10415,10 +10415,12 @@ mod tests {
         );
     }
 
-    /// Issue #1707 at the config layer: `validate()` runs on every start, so
-    /// the plaintext-endpoint rule refuses there too rather than waiting for
-    /// the store to be built. Loopback plaintext and the flagged form both
-    /// pass, and `--store memory` never consults the endpoint at all.
+    /// Issues #1707 and #1911 at the config layer: `validate()` runs on every
+    /// start (`main.rs` calls it before the store is built), so the endpoint
+    /// rules refuse there too rather than waiting for the store. Loopback
+    /// plaintext and the flagged form both pass, an endpoint with no scheme is
+    /// refused however its host is spelled, and `--store memory` never consults
+    /// the endpoint at all.
     #[test]
     fn plaintext_non_loopback_s3_endpoint_fails_validate() {
         let s3 = |args: &[&str]| {
@@ -10453,7 +10455,34 @@ mod tests {
         s3(&["--s3-endpoint", "https://s3.us-east-1.amazonaws.com"])
             .validate()
             .expect("an https endpoint must pass");
+
+        // An endpoint with no scheme is refused at validate (issue #1911),
+        // where it used to pass and kill the process later inside the S3
+        // client's request signing. A host whose name contains "http" is
+        // schemeless too; an upper-case scheme is a real scheme and passes.
+        for endpoint in ["minio:9000", "my-http-proxy:9000"] {
+            let err = s3(&["--s3-endpoint", endpoint])
+                .validate()
+                .expect_err("an endpoint with no scheme must refuse startup");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains(endpoint) && rendered.contains("https://"),
+                "names the endpoint and the fix: {rendered}"
+            );
+            // --s3-allow-http accepts deliberate plaintext, not a missing
+            // scheme: there is no usable URL for it to accept.
+            s3(&["--s3-endpoint", endpoint, "--s3-allow-http"])
+                .validate()
+                .expect_err("--s3-allow-http must not accept a schemeless endpoint");
+        }
+        s3(&["--s3-endpoint", "HTTPS://minio:9000"])
+            .validate()
+            .expect("an upper-case https scheme is a scheme and must pass");
+
         cli(&["--s3-endpoint", "http://minio:9000"])
+            .validate()
+            .expect("--store memory must not consult the S3 endpoint");
+        cli(&["--s3-endpoint", "minio:9000"])
             .validate()
             .expect("--store memory must not consult the S3 endpoint");
     }

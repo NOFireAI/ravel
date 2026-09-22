@@ -74,10 +74,13 @@ therefore refuses an `http://` endpoint whose host is not loopback unless
   loopback, so a plaintext in-cluster MinIO or floci needs the flag even
   though the traffic stays inside the cluster.
 - `https://...`: unaffected, and the flag does nothing.
-- `minio:9000`, or any endpoint written with no scheme: plaintext is not
-  enabled, and this rule does not refuse it. The S3 client rejects the value
-  when it signs the first request, on a message that names neither the
-  endpoint nor the flag, so always write the scheme.
+- `minio:9000`, or any endpoint written with no scheme: refused at startup.
+  An endpoint that begins with neither `https://` nor `http://` is not a
+  usable URL, so the refusal quotes the endpoint as it was written and asks
+  for the scheme. `--s3-allow-http` does not accept it: the flag chooses
+  between TLS and plaintext, and an endpoint with no scheme has asked for
+  neither. The scheme itself is matched without regard to case, so
+  `HTTPS://minio:9000` is an `https` endpoint.
 
 `ravel-cli` applies the same rule from the same code, with the same
 `--s3-allow-http` flag and `RAVEL_S3_ALLOW_HTTP` variable. It ships in the
