@@ -162,6 +162,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ravel-bench` builds under `--all-features`** (issue #1925). The
+  `read_path_accounting` binary's `Backend::Minio` variant carried an
+  unboxed `S3Config` (at least 224 bytes) next to a data-less `InProcess`
+  variant, so `clippy::large-enum-variant` failed the workspace under
+  `-D warnings` once `--all-features` was in play. The field is now boxed;
+  no call site's behavior changes.
+
 - **A `RavelCluster` held at the store-qualification gate keeps its
   `StoreQualified` condition when the reconcile then fails** (issue #36). The
   degraded status write replaces the whole `conditions` array and previously

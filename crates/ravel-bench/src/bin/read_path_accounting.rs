@@ -123,8 +123,10 @@ async fn main() {
 enum Backend {
     InProcess,
     // A live MinIO/S3 backend was reachable. (Not expected on the fleet
-    // executor; kept so the same harness runs on target hardware.)
-    Minio(ravel_object_store::s3::S3Config),
+    // executor; kept so the same harness runs on target hardware.) Boxed:
+    // S3Config is much larger than the InProcess variant, and clippy's
+    // large-enum-variant lint fires on the unboxed spread.
+    Minio(Box<ravel_object_store::s3::S3Config>),
 }
 
 async fn detect_backend() -> Backend {
@@ -135,7 +137,7 @@ async fn detect_backend() -> Backend {
     // bad creds, missing bucket), fall back to in-process.
     match ravel_object_store::s3::S3Store::new(config.clone()) {
         Ok(store) => match store.list_delimited("").await {
-            Ok(_) => Backend::Minio(config),
+            Ok(_) => Backend::Minio(Box::new(config)),
             Err(e) => {
                 eprintln!("note: S3 endpoint configured but unreachable ({e}); using in-process");
                 Backend::InProcess
@@ -304,8 +306,8 @@ async fn rseg_store(
             counting = store;
         }
         Backend::Minio(config) => {
-            let inner =
-                ravel_object_store::s3::S3Store::new(config.clone()).expect("build s3 for rseg");
+            let inner = ravel_object_store::s3::S3Store::new(config.as_ref().clone())
+                .expect("build s3 for rseg");
             let store = CountingBackend::new(inner);
             handle = CountingHandle::Backend(store.counters());
             let store = Arc::new(store);
