@@ -31,9 +31,10 @@
 //! `ServerConfig` construction.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
+use ravel_ingest::{Clock, SystemClock};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -67,6 +68,20 @@ static STORE_REACHABLE: AtomicBool = AtomicBool::new(true);
 /// readiness green.
 static PROBE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Unix time (nanoseconds) at which the last probe cycle COMPLETED, whatever
+/// its outcome. Set unconditionally at the end of every [`run_probe_cycle`],
+/// on both the success and the failure path: this is the one signal in this
+/// module that answers "is the probe task still running at all" rather than
+/// "was the store reachable last time it ran". `STORE_REACHABLE` and
+/// `PROBE_FAILURES_TOTAL` are both written only while the task is alive, so if
+/// the task dies (issue #1728: `spawn`'s `tokio::spawn` has no restart path
+/// and nothing observes its `JoinHandle`), they freeze at their last values
+/// and `/readyz` keeps reading a stale-but-plausible answer forever. Rendered
+/// at `/metrics` as `ravel_store_probe_last_run_timestamp_seconds`; its AGE is
+/// the probe-liveness signal (see docs/guides/observability.md). Starts `0`
+/// (no cycle has run yet in this process).
+static PROBE_LAST_RUN_UNIX_NS: AtomicI64 = AtomicI64::new(0);
+
 /// Whether the store is currently reachable (the `ravel_store_reachable` gauge
 /// source and one half of [`crate::health::Readiness::is_ready`]).
 pub fn store_reachable() -> bool {
@@ -77,6 +92,13 @@ pub fn store_reachable() -> bool {
 /// `ravel_store_probe_failures_total` counter source).
 pub fn probe_failures_total() -> u64 {
     PROBE_FAILURES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Unix time (nanoseconds) the last probe cycle completed, 0 if none has run
+/// yet in this process (the `ravel_store_probe_last_run_timestamp_seconds`
+/// gauge source).
+pub fn probe_last_run_unix_ns() -> i64 {
+    PROBE_LAST_RUN_UNIX_NS.load(Ordering::Relaxed)
 }
 
 fn set_store_reachable(reachable: bool) {
@@ -126,9 +148,19 @@ impl ProbeHysteresis {
 ///
 /// Public so an integration test can drive probe cycles deterministically
 /// against a controlled store, rather than sleeping through real intervals.
+///
+/// `clock` is injected (never `SystemTime::now()` in library logic, per repo
+/// convention) so a test can assert the exact value the liveness gauge takes.
+/// [`PROBE_LAST_RUN_UNIX_NS`] is stamped unconditionally, after both the
+/// success and the failure path below have already run: a failing cycle is
+/// still a cycle that completed, and the whole point of this gauge (issue
+/// #1728) is to distinguish "the probe is failing but alive" (which
+/// `PROBE_FAILURES_TOTAL` and `STORE_REACHABLE` already cover) from "the probe
+/// task died", which neither of those can show.
 pub async fn run_probe_cycle(
     store: &dyn ObjectStoreBackend,
     hysteresis: &mut ProbeHysteresis,
+    clock: &dyn Clock,
 ) -> bool {
     let ok = match store.get(TENANCY_MARKER_KEY, GetRange::Full).await {
         Ok(_) | Err(StoreError::NotFound) => true,
@@ -139,6 +171,7 @@ pub async fn run_probe_cycle(
     }
     let reachable = hysteresis.observe(ok);
     set_store_reachable(reachable);
+    PROBE_LAST_RUN_UNIX_NS.store(clock.now_ns(), Ordering::Relaxed);
     reachable
 }
 
@@ -188,7 +221,7 @@ pub fn spawn(store: Arc<dyn ObjectStoreBackend>, interval: Duration) -> StorePro
                 _ = tokio::time::sleep(crate::fold::jittered(interval, rng.as_ref())) => {}
                 _ = &mut rx => return,
             }
-            let reachable = run_probe_cycle(store.as_ref(), &mut hysteresis).await;
+            let reachable = run_probe_cycle(store.as_ref(), &mut hysteresis, &SystemClock).await;
             if !reachable {
                 tracing::warn!(
                     key = TENANCY_MARKER_KEY,
