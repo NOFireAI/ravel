@@ -111,8 +111,12 @@ overrides that cap for every gate run through it. On the 8-core box this
 paragraph is about, roughly 15 GB, gates.sh would not have capped at all
 and the core-derived 2 is the safer of the two. On a box where memory does
 not track cores at the usual ratio the two rules can disagree the other
-way, so if `nproc` and the memory you see look mismatched, say so in your
-report rather than assuming the derived number is right.
+way, so ACT on it rather than reporting it: read the memory you actually
+have (`/proc/meminfo` MemTotal, or `sysctl -n hw.memsize`) and export the
+LOWER of the core-derived value and 2 when that memory is 11 GB or less.
+Reporting a mismatch is too late, because the report is written after the
+gates have already run under the wrong value. Say which of the two bounds
+decided the number you used.
 
 Derive it; do not enumerate. This paragraph used to name two shapes,
 x86_64-with-16-cores and aarch64-with-4-cores, and branch on them. At
