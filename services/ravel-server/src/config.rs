@@ -4851,9 +4851,12 @@ impl Cli {
         // here would refuse the shipped defaults (40s + 3600s + 3600s against a
         // 7200s slack), which is a decision about ingest's deferral policy and
         // about a frozen read-side constant, not one to take in this check.
-        // Recorded beside ravel_catalog::FLUSH_BOUND_SLACK_HOURS and computed
-        // by ravel-ingest's the_flush_bound_slack_covers_a_deferred_flush;
-        // open on issue #1740.
+        // Recorded beside ravel_catalog::FLUSH_BOUND_SLACK_HOURS and measured
+        // by ravel-ingest's a_deferred_flush_can_overrun_the_flush_bound_slack.
+        // Pinning the bucket before the cap check instead does not resolve it:
+        // that spends the deferral out of the catalog's sealed-hour margin,
+        // where a late record is never read again rather than missed by one
+        // generation of a shard-count decrease. Open on issue #1916.
         let flush_bound_ns = duration_nanos_saturating(flush_cadence.max_flush_delay_idle)
             .saturating_add(duration_nanos_saturating(
                 ravel_ingest::IngestConfig::default().max_flush_lifetime,

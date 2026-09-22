@@ -45,10 +45,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on upgrade, which a refusal would have crash-looped with no field on the
   `RavelCluster` CRD able to raise the cap in response.
 
-  bounded buffer; and the server now **refuses to start** when
-  `--max-inflight-flushes` exceeds `--max-queued-flushes`, since only a
-  spawned task can hold a permit and the excess would silently reduce flush
-  concurrency.
+  A third thing to know: a deferred flush pins the ingest hour it eventually
+  opens in, not the one its refused trigger fired in, so a long deferral moves
+  which ingest hour the rows land in. Past two hours that is more than the
+  read side's scan slack covers, and a straggler deferred at the cap while a
+  `shard_count` decrease is activating can land in an hour the retiring
+  generation no longer scans. Watch
+  `ravel_ingest_flush_trigger_deferred_total`: a nonzero rate is the signal,
+  and it means the object store is the thing to look at. Pinning the hour
+  before the deferral instead was tried and reverted, because it moves the
+  same overrun onto the catalog's sealed-hour watermark, where a late record
+  is never read again rather than missed by one generation; `docs/ingest.md`
+  and ADR-1642 carry the arithmetic. Bounding the deferral itself is issue
+  #1916.
 - **The published PromQL conformance figure now says what it measures**
   (issue #1698). The committed table read `132/132 = 100%` under a heading
   that invites it to be read as agreement with Prometheus, while the block is

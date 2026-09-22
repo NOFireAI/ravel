@@ -9782,4 +9782,218 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             "the quarantine family renders exactly three samples:\n{body}"
         );
     }
+
+    /// A trigger the queued-flush cap really refused reaches the rendered
+    /// `/metrics` body as a nonzero
+    /// `ravel_ingest_flush_trigger_deferred_total`.
+    ///
+    /// Every other test of this family builds the snapshot by hand, so all of
+    /// them would keep passing if the shard actor stopped counting deferrals
+    /// or the router stopped summing them: they pin the renderer, not the
+    /// path. This one drives a live `IngestRouter` over a `FaultStore` whose
+    /// data PUT is held, takes the shard to its one-deep queue, has the next
+    /// age trigger refused, and only then snapshots and renders. The exact
+    /// count is asserted, not merely that it is nonzero, so a refusal counted
+    /// twice fails here as well.
+    ///
+    /// Paired with the ingest-side
+    /// `ravel_ingest::shard::tests::a_deferred_flush_takes_the_ingest_hour_it_opened_in`:
+    /// that one pins what a deferral does to the data, this one pins that an
+    /// operator can see the deferral happen. The second matters because of
+    /// what the first records. A deferral moves the ingest hour the rows land
+    /// in, past what the read-side scan slack covers, and this counter is the
+    /// only signal an operator has that it is happening (issue #1916).
+    #[tokio::test]
+    async fn a_real_deferral_renders_on_the_metrics_body() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::time::Duration;
+
+        use ravel_ingest::{
+            Clock, IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, WriteMode,
+        };
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_otlp::normalize::NormalizedPoint;
+        use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+        use tokio::sync::watch;
+
+        struct TestClock {
+            now_ns: AtomicI64,
+            wake_tx: watch::Sender<()>,
+        }
+
+        impl Clock for TestClock {
+            fn now_ns(&self) -> i64 {
+                self.now_ns.load(Ordering::SeqCst)
+            }
+
+            fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                let deadline = self
+                    .now_ns()
+                    .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+                let mut rx = self.wake_tx.subscribe();
+                Box::pin(async move {
+                    loop {
+                        if self.now_ns() >= deadline {
+                            return;
+                        }
+                        if rx.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                })
+            }
+        }
+
+        let (wake_tx, _rx) = watch::channel(());
+        let clock = Arc::new(TestClock {
+            now_ns: AtomicI64::new(1_700_000_000_000_000_000),
+            wake_tx,
+        });
+        let advance = |ns: i64| {
+            clock.now_ns.fetch_add(ns, Ordering::SeqCst);
+            let _ = clock.wake_tx.send(());
+        };
+
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        // One shard, one permit, one queue slot, and only the age trigger can
+        // fire: the second trigger is refused by construction.
+        let config = IngestConfig {
+            shard_count: 1,
+            target_bytes: 8 * 1024 * 1024,
+            max_flush_delay: Duration::from_millis(50),
+            flush_tick: Duration::from_millis(10),
+            max_inflight_flushes: 1,
+            max_queued_flushes: 1,
+            ..IngestConfig::default()
+        };
+        let router = Arc::new(
+            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
+                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let acme = TenantId::new("acme");
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+        let point = |host: &str| {
+            let labels = LabelSet::new(vec![
+                Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: "cpu_usage".to_string(),
+                },
+                Label {
+                    name: "host".to_string(),
+                    value: host.to_string(),
+                },
+            ])
+            .expect("distinct label names");
+            let series_id = SeriesId::compute(&acme, "cpu_usage", &labels).expect("series id");
+            NormalizedPoint {
+                series_id,
+                labels: Arc::new(labels),
+                sample: Sample {
+                    ts_ns: 1_000,
+                    value: 1.0,
+                },
+                is_monotonic_sum: false,
+            }
+        };
+        let write = |host: &'static str| {
+            let router = Arc::clone(&router);
+            let tenant = acme.clone();
+            let points = vec![point(host)];
+            tokio::spawn(async move {
+                router
+                    .write(tenant, points, WriteMode::Strict, Duration::from_secs(60))
+                    .await
+            })
+        };
+        // Cooperative polling only: every probe reads a metric the actor
+        // publishes, so no wall-clock wait decides anything here.
+        async fn until(mut probe: impl FnMut() -> bool) {
+            while !probe() {
+                tokio::task::yield_now().await;
+            }
+        }
+        let deferred = || {
+            router
+                .metrics()
+                .shard_skew_by_shard()
+                .into_iter()
+                .map(|(_, s)| s.flush_trigger_deferred)
+                .sum::<u64>()
+        };
+        let in_flight = || {
+            router
+                .metrics()
+                .in_flight_flushes_by_shard()
+                .into_iter()
+                .map(|(_, n)| n)
+                .sum::<u64>()
+        };
+
+        let parked = write("h0");
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        advance(100_000_000);
+        until(|| in_flight() == 1).await;
+        gate.wait_until_held(1).await;
+
+        let refused = write("h1");
+        until(|| router.metrics().snapshot().buffered_points_total >= 2).await;
+        advance(100_000_000);
+        until(|| deferred() >= 1 || in_flight() > 1).await;
+        assert_eq!(
+            in_flight(),
+            1,
+            "the trigger past the cap must be deferred, not spawned"
+        );
+
+        // Snapshot and render while the deferral is still the only thing that
+        // has happened, so the body below is about this refusal and nothing
+        // else.
+        let mut body = String::new();
+        render_ingest_family(
+            &mut body,
+            Mode::Gateway,
+            &[IngestPipelineSnapshot::from_metrics(
+                router.metrics().snapshot(),
+            )],
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_flush_trigger_deferred_total counter"),
+            "the deferral family must be declared:\n{body}"
+        );
+        assert_eq!(
+            body.matches(
+                "ravel_ingest_flush_trigger_deferred_total{mode=\"gateway\",signal=\"metrics\"} 1"
+            )
+            .count(),
+            1,
+            "the one refused trigger must render as exactly 1:\n{body}"
+        );
+        assert_eq!(
+            body.matches("ravel_ingest_queued_flushes{mode=\"gateway\",signal=\"metrics\"} 1")
+                .count(),
+            1,
+            "the queue depth the refusal was measured against renders beside \
+             it:\n{body}"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        parked
+            .await
+            .expect("parked write task")
+            .expect("parked write acks once the gate is released");
+        advance(100_000_000);
+        refused
+            .await
+            .expect("deferred write task")
+            .expect("deferred write acks once the cap clears");
+        router.flush_all().await;
+    }
 }
