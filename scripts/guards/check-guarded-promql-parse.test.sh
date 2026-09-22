@@ -134,6 +134,20 @@ pub fn redact(query: &str) -> Result<String, RedactError> {
 RS
 check "flags parser::parse reached through a self import" "${d}" 1 "redact.rs:4: bare-parse:"
 
+d="$(new_repo function_alias)"
+cat >"${d}/crates/ravel-promql/src/plan.rs" <<'RS'
+use promql_parser::parser::parse as pparse; // guarded-parse-allow: fixture text
+
+pub fn g(q: &str) -> Expr {
+    pparse(q).expect("parses")
+}
+
+pub fn g2(q: &str) -> Expr {
+    pparse(q).expect("parses")
+}
+RS
+check "flags calls through an ALIASED parse import" "${d}" 1 "plan.rs:4: bare-parse:"
+
 d="$(new_repo multiline_use)"
 cat >"${d}/crates/ravel-promql/src/plan.rs" <<'RS'
 use promql_parser::parser::{

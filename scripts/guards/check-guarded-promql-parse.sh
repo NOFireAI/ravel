@@ -78,7 +78,7 @@ roots=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
-      sed -n '2,66p' "$0"
+      sed -n '2,65p' "$0"
       exit 0
       ;;
     -*)
@@ -282,13 +282,15 @@ FNR == 1 {
   if (use_open) use_buf = use_buf " " code
 
   found = 0
-  if (entry_token(code)) {
+  # An aliased import (`use ...::parse as pparse;`) produces call lines with no
+  # entry token on them at all, so the scope loops must run OUTSIDE the
+  # entry_token gate. Gating them on it made the fn_scope branch unreachable
+  # and let one marker on the import silence every later call.
+  for (n in mod_scope) if (mod_entry(code, n)) found = 1
+  for (n in fn_scope) if (free_call(code, n)) found = 1
+  if (!found && entry_token(code)) {
     if (code ~ /promql_parser/) found = 1
     else if (use_open && use_buf ~ /promql_parser/) found = 1
-    else {
-      for (n in mod_scope) if (mod_entry(code, n)) found = 1
-      for (n in fn_scope) if (free_call(code, n)) found = 1
-    }
   }
 
   if (found) {
