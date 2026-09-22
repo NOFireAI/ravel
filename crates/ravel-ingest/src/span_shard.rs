@@ -176,11 +176,6 @@ struct SpanTenantBuf {
     /// spans this buffer holds. Dropped -- refunding the bytes -- when the
     /// buffer flushes (or its flush fails), never before.
     charges: Vec<Arc<IngestByteCharge>>,
-    /// The ingest-hour bucket the first trigger this buffer lost to the
-    /// queued-flush cap would have pinned, carried across every later deferral
-    /// round (issue #1740). See `shard::TenantBuf`'s field of the same
-    /// name for why the pin is taken before the cap check rather than after it.
-    pinned_ingest_hour_bucket: Option<u32>,
 }
 
 impl SpanTenantBuf {
@@ -1026,10 +1021,6 @@ impl SpanShardActor {
             debug_assert!(buf.waiters.is_empty());
             return;
         }
-        // Read once, before the cap check, so a refused trigger pins its
-        // ingest-hour bucket from the reading it fired on rather than from one
-        // taken a deferral later.
-        let raw_ns = self.clock.now_ns();
         if self.queued_flush_cap_reached(trigger, &buf) {
             // Issue #1740: this shard is already holding `max_queued_flushes`
             // flush windows, and this buffer is still under its memory
@@ -1042,18 +1033,14 @@ impl SpanShardActor {
             // and nothing is dropped, so this is a deferral, not a shed
             // (ADR-1642 amendment).
             //
-            // The ingest-hour bucket rides back too, pinned here from this
-            // trigger's own clock reading and kept across every later round
-            // (`get_or_insert`, so round two does not overwrite round one).
-            // An implausible reading pins nothing and is left to the flush-open
-            // path to reject fail-loud, which is where that check belongs.
-            if let Ok(bucket) = checked_ingest_hour_bucket(raw_ns) {
-                buf.pinned_ingest_hour_bucket.get_or_insert(bucket);
-            }
+            // The rows carry no ingest-hour bucket across the deferral; see
+            // `shard::ShardActor::flush_tenant` for why moving that pin ahead
+            // of this check is not the fix it looks like.
             self.metrics.record_shard_flush_trigger_deferred(self.shard);
             self.tenants.insert(tenant, buf);
             return;
         }
+        let raw_ns = self.clock.now_ns();
         // The flush-open stamp is decided before the buffer is consumed and
         // before `record_flush`: a refused flush never touched the store, so it
         // must not be counted as a flush that happened, and (on the retryable
@@ -1111,22 +1098,10 @@ impl SpanShardActor {
             max_ingest_ts_ns,
             waiters,
             charges,
-            pinned_ingest_hour_bucket,
             ..
         } = buf;
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
-            // A deferred flush keeps the bucket its first trigger pinned, so the
-            // gap between a record's routing and its bucket stays bounded by
-            // `max_flush_delay_idle` however many rounds the cap costs (issue
-            // #1740). `min`, not the carried value outright: `created_unix_ns`
-            // is stamped from `flush_open_ns`, and `ravel_commit::record`
-            // rejects a record whose `ingest_hour_bucket` is after its
-            // `created_unix_ns`'s hour, which a backwards clock step absorbed
-            // between the deferral and this flush could otherwise produce.
-            Ok(bucket) => match pinned_ingest_hour_bucket {
-                Some(pinned) => pinned.min(bucket),
-                None => bucket,
-            },
+            Ok(bucket) => bucket,
             Err(msg) => {
                 // Defensive: `flush_open_ns` was already hour-bucket-validated;
                 // if it ever fails here it is fail-loud like InvalidReading.
