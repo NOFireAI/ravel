@@ -45,7 +45,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/guides/observability.md` documents the alert and derives its
   threshold from the probe interval and the store backend's own worst-case
   cycle time, and it ships as `RavelStoreProbeStalled` in
-  `deploy/prometheus/ravel.rules.yaml`.
+  `deploy/prometheus/ravel.rules.yaml`. `RavelStoreProbeStalled` guards
+  against its own zero sentinel by requiring a real timestamp to have been
+  stamped at least once, which excludes a probe that dies, panics, or is
+  never spawned before its first cycle ever completes; the companion
+  `RavelStoreProbeNeverRan` rule covers exactly that excluded state, sized
+  from the same probe-interval-plus-worst-case-cycle-time arithmetic.
 
 - **`ravel-bench`'s ingest and end-to-end reports break out queue-deadline
   abandonment as its own `abandoned_queue_deadline` counter instead of
