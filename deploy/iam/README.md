@@ -52,17 +52,32 @@ grants below are what remains deletable after that deny applies.
 - **Admin** (`admin.json`): `AdminQualifyDelete` grants delete on
   `sys/qualify/*` only.
 - **Maintain** (`maintain.json`): `MaintainDelete` grants delete on
-  `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, and
-  `t/*/u/*/0001/*`. These are the objects the compaction, supersession, and
-  retention sweeps physically remove.
+  `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/u/*/0001/*`,
+  and `t/*/*/del/*.dreq`. These are the objects the compaction, supersession,
+  retention, and erasure-request sweeps physically remove.
 
-### A second gap: erasure-request objects
+### Erasure-request objects: `t/*/*/del/*.dreq`
 
-`MaintainDelete` grants no `t/*/*/del/*`. The erasure-request sweep runs under
-the Maintain role and deletes the request objects it has completed at
-`t/<tenant_hash>/<signal>/del/<request_id>.dreq`
-(`crates/ravel-maintain/src/sweep.rs`). IAM is default-deny, so with no `Allow`
-covering that prefix the shipped Maintain template refuses that delete and the
-completed `.dreq` object is left in place. That is a second tension between the
-shipped templates and the sweeps that run under them, alongside the
-`t/*/catalog/*/*` one above, and is tracked separately.
+ADR-0064 section 6: "Maintain gains delete on `del/*.dreq` **only**", and
+"`del/*.done` joins the deny-delete set for every role including Maintain".
+
+The erasure-request sweep runs under the Maintain role and retires a request
+object at `t/<tenant_hash>/<signal>/del/<request_id>.dreq` once its erasure is
+complete, past the post-completion protection horizon, and no longer held by a
+legal hold or a still-resolvable superseded input
+(`crates/ravel-maintain/src/sweep.rs`). IAM is default-deny, so until this
+grant was added the shipped template refused that delete on every request
+object: completed `.dreq` objects accumulated and the query-time exclusion
+filter that reads them grew without bound.
+
+The pattern is `*.dreq`, not `del/*`, because the completion records
+(`del/<request_id>.done`) are permanent erasure evidence and no role may delete
+them. `maintain_template_grants_delete_on_erasure_requests` in
+`crates/ravel-commit/tests/iam_templates.rs` asserts both halves against real
+key constructors, and
+`every_role_grants_exactly_the_expected_pattern_set` pins the resource list
+above by exact equality.
+
+An operator who applied `maintain.json` before this grant existed must
+re-apply it: the backlog of refused requests stays in the store until the
+Maintain credential actually holds the delete.

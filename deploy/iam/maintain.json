@@ -51,7 +51,8 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0001/*"
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0001/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.dreq"
       ]
     },
     {
