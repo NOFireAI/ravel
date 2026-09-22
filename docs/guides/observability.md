@@ -319,6 +319,10 @@ a `ravel-server` integration test asserts that every metric the shipped file
 names is one a running server renders, and a copy pasted out of this page is
 a copy nothing updates when the deployment does. The block is kept here
 because its comments explain the rule.
+[`deploy/grafana/dashboards-standalone/ravel.json`](../../deploy/grafana/dashboards-standalone/ravel.json)
+ships a dashboard graphing the same `ravel_` families these rules alert on,
+including a panel for the metric above; see `deploy/README.md` for where to
+import it.
 
 That test reads this page too. Every rule printed in a `yaml` block below is
 compared against the rule of the same name in the shipped file, expression,
