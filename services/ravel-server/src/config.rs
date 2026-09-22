@@ -1578,11 +1578,27 @@ pub struct Cli {
     /// This process's maximum flush lifetime, as a humantime duration (e.g.
     /// `1h`). Feeds the real compactor
     /// (`CompactorConfig::max_flush_lifetime_ns`), which governs the seal
-    /// margin and the orphan age gate. Omitted defaults to
-    /// `ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS` (1h). Not part
-    /// of the `sys/gc` must-match set (maintain validates only horizon and
-    /// grace), but kept alongside them so the compactor's GC-relevant knobs
-    /// are configured from one coherent group of flags.
+    /// margin, the orphan age gate, and the retention floor. Omitted defaults
+    /// to `ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS` (1h). Not
+    /// part of the `sys/gc` must-match set (maintain validates only horizon
+    /// and grace), but kept alongside them so the compactor's GC-relevant
+    /// knobs are configured from one coherent group of flags. UNSAFE below
+    /// the ingest path's real flush lifetime: a bucket a writer is still
+    /// flushing into can then be sealed before that writer's real interlock
+    /// has elapsed, voiding the erasure completion gate
+    /// (`bucket_erasure_completion` reports a pending erasure request
+    /// complete while a flush that can still publish into the bucket is in
+    /// flight) and undercutting the retention floor
+    /// (`CompactorConfig::retention_floor_ns`) it also derives.
+    /// `Cli::validate` refuses to start with this flag set below the ingest
+    /// pipeline's own compiled-in `max_flush_lifetime`
+    /// (`ravel_ingest::IngestConfig`; there is no flag to change it) for
+    /// exactly this reason -- unlike the `ravel-cli` maintenance commands'
+    /// own `--max-flush-lifetime`, which run once against a single named
+    /// tenant an operator has confirmed quiescent, this flag governs a live
+    /// process's compactor for every tenant it serves, so there is no
+    /// per-invocation "this tenant is quiescent" case that makes a lower
+    /// value safe here.
     #[arg(long, value_name = "DURATION")]
     pub gc_max_flush_lifetime: Option<String>,
 
@@ -4920,6 +4936,29 @@ impl Cli {
             );
         }
 
+        // Issue #1744: `--gc-max-flush-lifetime` feeds
+        // `CompactorConfig::max_flush_lifetime_ns`, which is the writer-
+        // interlock term in `seal_margin_ns`, `orphan_age_gate_ns`, and
+        // `retention_floor_ns`. The ingest pipeline's own `max_flush_lifetime`
+        // (ravel-ingest's real, fixed writer interlock; there is no flag to
+        // change it) is the true bound a writer is held to. A compactor value
+        // below that bound lets `Bucket::is_sealed` decide a bucket is sealed
+        // while a real writer, bound only by the longer true interlock, is
+        // still allowed to flush into it -- voiding the erasure completion
+        // gate (`bucket_erasure_completion` can then report a pending erasure
+        // request complete before every record that will ever land in the
+        // bucket has arrived) and undercutting the retention floor it also
+        // derives. Refuse rather than start on a value that can silently
+        // strand a completed-looking erasure. `ingest_max_flush_lifetime_floor_ns`
+        // is the single function both this check and
+        // `GcConfigValues::validate` (the durable `sys/gc` write path, which
+        // this flag does not pass through) call, so the floor cannot drift
+        // between the two validators.
+        if let Some(s) = self.gc_max_flush_lifetime.as_deref() {
+            let configured_ns = parse_gc_duration_ns("--gc-max-flush-lifetime", s)?;
+            check_gc_max_flush_lifetime_floor(s, configured_ns)?;
+        }
+
         // The dev header resolver trusts an unauthenticated `x-ravel-tenant`
         // header, and the single resolver chain it joins backs every public
         // listener: HTTP, remote-write, OTLP gRPC, and Flight SQL (via the
@@ -5442,7 +5481,11 @@ impl Cli {
             None => DEFAULT_GRACE_NS,
         };
         let max_flush_lifetime_ns = match self.gc_max_flush_lifetime.as_deref() {
-            Some(s) => parse_gc_duration_ns("--gc-max-flush-lifetime", s)?,
+            Some(s) => {
+                let ns = parse_gc_duration_ns("--gc-max-flush-lifetime", s)?;
+                check_gc_max_flush_lifetime_floor(s, ns)?;
+                ns
+            }
             None => DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
         Ok(GcRuntimeConfig {
@@ -5543,6 +5586,30 @@ fn parse_gc_duration_ns(flag: &str, s: &str) -> anyhow::Result<i64> {
         anyhow::bail!("{flag} '{s}' must be a positive duration, got {ns} ns");
     }
     Ok(ns)
+}
+
+/// Refuse a `--gc-max-flush-lifetime` value (already parsed to nanoseconds)
+/// below `ravel_maintain::ingest_max_flush_lifetime_floor_ns` (issue #1744).
+/// Called from both `Cli::validate` and `resolve_gc_runtime`, the latter
+/// being the single point `main` builds the real `CompactorConfig` from: a
+/// caller that resolved the runtime config without validating first (a test,
+/// a future embedder of `Cli`) would otherwise be able to construct one below
+/// the floor. `s` is the raw flag text, kept only so the error can quote what
+/// was typed.
+fn check_gc_max_flush_lifetime_floor(s: &str, configured_ns: i64) -> anyhow::Result<()> {
+    let floor_ns = ravel_maintain::ingest_max_flush_lifetime_floor_ns();
+    if configured_ns < floor_ns {
+        anyhow::bail!(
+            "--gc-max-flush-lifetime {s} ({configured_ns} ns) is below the ingest \
+             pipeline's own max_flush_lifetime floor of {floor_ns} ns (ravel-ingest's \
+             fixed writer interlock; there is no flag to change it): a compactor running \
+             below this floor can decide a bucket is sealed while a real writer is still \
+             allowed to flush into it, voiding the erasure completion gate \
+             (bucket_erasure_completion) and undercutting the retention floor it also \
+             derives. Raise --gc-max-flush-lifetime to at least the ingest floor."
+        );
+    }
+    Ok(())
 }
 
 /// Parse one `KEY:TYPE` declared-column spec (ADR-0090 decision 1), the shared
@@ -9182,6 +9249,76 @@ mod tests {
         assert_eq!(runtime.query_deadline, Duration::from_secs(3600));
         crate::gc_config::validate_query(&stored, runtime.query_deadline)
             .expect("a deadline equal to sys/gc.max_query_duration must pass");
+    }
+
+    /// Issue #1744 acceptance test: `--gc-max-flush-lifetime` below the
+    /// ingest pipeline's own (fixed, unconfigurable) `max_flush_lifetime`
+    /// must refuse startup. That value is the real writer interlock; a
+    /// compactor configured below it can decide a bucket is sealed while a
+    /// real writer, bound only by the longer true interlock, can still flush
+    /// into it, voiding the erasure completion gate and undercutting the
+    /// retention floor.
+    ///
+    /// The floor is READ, not typed: this test first asserts
+    /// `ingest_max_flush_lifetime_floor_ns` equals
+    /// `ravel_ingest::IngestConfig::default().max_flush_lifetime` computed
+    /// independently here, so a typed constant that merely happens to match
+    /// today's default would still leave this first assertion meaningful
+    /// (it fails the moment the two diverge). The refusal boundary itself is
+    /// then pinned exactly one nanosecond below that floor, not "some low
+    /// value".
+    #[test]
+    fn gc_max_flush_lifetime_below_the_ingest_floor_is_refused() {
+        let floor_ns = ravel_maintain::ingest_max_flush_lifetime_floor_ns();
+        let independently_computed_floor_ns = i64::try_from(
+            ravel_ingest::IngestConfig::default()
+                .max_flush_lifetime
+                .as_nanos(),
+        )
+        .expect("the compiled-in ingest default fits in i64 nanoseconds");
+        assert_eq!(
+            floor_ns, independently_computed_floor_ns,
+            "the enforced floor must be read from ravel_ingest::IngestConfig::default(), not a \
+             typed constant"
+        );
+
+        let below = format!("{}ns", floor_ns - 1);
+        let cli = Cli::try_parse_from(["ravel-server", "--gc-max-flush-lifetime", &below])
+            .expect("flag parses at the CLI layer");
+        let err = cli
+            .validate()
+            .expect_err("one nanosecond below the ingest floor must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--gc-max-flush-lifetime"),
+            "error must name the flag, got: {msg}"
+        );
+        assert!(
+            msg.contains(&below),
+            "error must name the value given, got: {msg}"
+        );
+        assert!(
+            msg.contains(&floor_ns.to_string()),
+            "error must name the floor, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("erasure completion gate")
+                || msg.contains("bucket_erasure_completion"),
+            "error must name the erasure completion gate this floor protects, got: {msg}"
+        );
+    }
+
+    /// Mirror of [`gc_max_flush_lifetime_below_the_ingest_floor_is_refused`]:
+    /// the floor itself, not one nanosecond below it, is the accepted
+    /// boundary (`<`, not `<=`, is what the check must use).
+    #[test]
+    fn gc_max_flush_lifetime_at_the_ingest_floor_is_accepted() {
+        let floor_ns = ravel_maintain::ingest_max_flush_lifetime_floor_ns();
+        let at_floor = format!("{floor_ns}ns");
+        let cli = Cli::try_parse_from(["ravel-server", "--gc-max-flush-lifetime", &at_floor])
+            .expect("flag parses at the CLI layer");
+        cli.validate()
+            .expect("the ingest floor itself must be accepted, not refused");
     }
 
     /// ADR-0076 decision 4: the three flush-cadence knobs move as a set.

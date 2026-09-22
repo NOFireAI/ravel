@@ -473,6 +473,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an exponential/custom mix. `resets` is the only caller whose answer changes:
   the three reducers above drop a differing-bounds window before any reset
   detection runs.
+- **`--gc-max-flush-lifetime` now refuses a value below the ingest pipeline's
+  own compiled-in flush lifetime, instead of accepting one** (issue #1744).
+  The flag had no lower floor: a value below ravel-ingest's fixed (and
+  currently unconfigurable) `max_flush_lifetime` let the compactor call a
+  bucket sealed before a real writer's flush interlock had actually elapsed,
+  which could void the erasure completion gate
+  (`bucket_erasure_completion` reporting a pending erasure request complete
+  while a flush that can still publish into that bucket was still in
+  flight) and undercut the retention floor derived from the same value. Both
+  the `--gc-max-flush-lifetime` startup check and the durable `sys/gc`
+  mutation path (`gc-config set`) now enforce the same floor, read fresh from
+  `ravel_ingest::IngestConfig::default().max_flush_lifetime` rather than a
+  duplicated constant. A `ravel-server` invocation, or a `gc-config set`
+  proposal, that used to start with a below-floor value now refuses at
+  startup or at write time instead.
 
 ## [0.15.0] - 2026-09-08
 
