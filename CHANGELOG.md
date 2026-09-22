@@ -171,6 +171,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   out the exact condition it built, `True` or `False` with its Pending or Failed
   reason, and records it before it creates or deletes the qualify Job, so a
   failure in that API call cannot drop it either.
+- **A query-worker registry record now needs more than a well-formed write to
+  join the query fleet's live set** (issue #1918). Writing an object at
+  `sys/query/workers/<uuid>` whose body `process_id` matches its own key was
+  previously sufficient: the shipped query role
+  (`deploy/iam/query.json`) grants `s3:PutObject` on the whole
+  `sys/query/workers/*` prefix to every process sharing its credentials, not
+  per key, so anything holding that credential could self-consistently forge
+  a worker at a fresh, unclaimed key. `QueryWorkers::record_at` now signs the
+  record with a keyed-BLAKE3 MAC over its fields at publish time
+  (`QueryWorkerRecord::mac`, configured via the new
+  `QueryWorkers::with_mac_keys`, following the same "first mints, all verify"
+  rotation rule as ADR-0071's fragment capabilities), and
+  `QueryWorkers::live_set_read` rejects a record whose MAC does not verify
+  with a typed `RecordMacError` before it can enter the live set, counting the
+  rejection in `QueryWorkers::mac_rejections`. A `QueryWorkers` built with no
+  MAC keys configured (the unchanged `new`/`with_defaults` default) signs and
+  verifies nothing, matching prior behavior; wiring the server's already
+  loaded fragment key material through `with_mac_keys` is a separate,
+  out-of-scope follow-up.
 
 ## [0.15.0] - 2026-09-08
 

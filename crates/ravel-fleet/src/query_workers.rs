@@ -3,8 +3,9 @@
 //!
 //! A query-role process that participates in fan-out registers itself the same
 //! way a maintain worker does (ADR-0065 decision 1, [`crate::worker_set`]): it
-//! writes, every heartbeat interval `H`, a [`QueryWorkerRecord`] to a key it
-//! alone ever writes:
+//! writes, every heartbeat interval `H`, a [`QueryWorkerRecord`] to its own
+//! key, MAC-signed with the cluster fragment key (see "Authenticating the
+//! record" below):
 //!
 //! ```text
 //! sys/query/workers/<process_id>
@@ -72,7 +73,52 @@
 //! of this reader's and is a reason to read the key rather than to drop it.
 //!
 //! [`live_set`]: QueryWorkers::live_set
+//!
+//! # Authenticating the record (issue #1918)
+//!
+//! Writing a well-formed object at `sys/query/workers/<process_id>` with a
+//! body whose `process_id` matches is not, by itself, proof that the
+//! advertised worker is real. The shipped query role
+//! (`deploy/iam/query.json`) grants `s3:PutObject` on the *whole*
+//! `sys/query/workers/*` prefix to every process holding that role's
+//! credentials -- it has no way to restrict a key to the one process that
+//! first claimed it, since S3-compatible IAM authorizes by prefix pattern,
+//! not by an object's own content. So the body/key match [`live_set_read`]
+//! already checked (worker identity is the key, never the body) rules out a
+//! record that disagrees with its own key; it does not rule out a
+//! self-consistent record forged at a fresh, unclaimed key by anything that
+//! holds the shared write credential.
+//!
+//! What closes that gap is a MAC: [`QueryWorkers::record_at`] computes a
+//! keyed BLAKE3 hash ([`record_mac`]) over the record's fields at publish
+//! time and carries it in the record itself as
+//! [`QueryWorkerRecord::mac`], so a reader verifies it from the object it
+//! already fetched, with no extra object-store request. The key is the same
+//! kind of per-cluster, operator-provisioned fragment key material
+//! ADR-0071's fragment capabilities are minted and verified with
+//! ([`crate::query_workers`] does not depend on `ravel-query` or
+//! `services/ravel-server`, so the MAC construction here is a local
+//! reimplementation of that same keyed-BLAKE3-over-canonical-bytes pattern,
+//! not a shared function): "first mints, all verify", so key rotation needs
+//! no flag day. [`QueryWorkers::live_set_read`] rejects a record whose MAC
+//! does not verify under any configured key with a typed
+//! [`RecordMacError`] (never a panic, never a silent pass) before it can
+//! enter the live set, and counts the rejection in
+//! [`QueryWorkers::mac_rejections`] so a forgery attempt is visible.
+//!
+//! A `QueryWorkers` built with no MAC keys configured
+//! ([`QueryWorkers::new`]/[`QueryWorkers::with_defaults`] default to none)
+//! signs nothing and verifies nothing: every record decodes and passes as
+//! it did before this section existed. That is deliberate back-compat for a
+//! caller that has not yet threaded its fragment key material through
+//! [`QueryWorkers::with_mac_keys`], not a claim that an unconfigured reader
+//! is protected against the forgery this section describes.
+//!
+//! [`live_set_read`]: QueryWorkers::live_set_read
+//! [`record_mac`]: record_mac
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
@@ -88,21 +134,155 @@ use crate::worker_set::{
 /// role's `sys/maintain/workers/`. Fixed verbatim; #864 and #865 depend on it.
 pub const QUERY_WORKERS_PREFIX: &str = "sys/query/workers/";
 
-/// The heartbeat key one query-worker process owns and alone ever writes.
+/// The heartbeat key one query-worker process advertises itself under. Any
+/// process holding the query role's write credential can `PutObject` this
+/// key (the shipped `deploy/iam/query.json` grants it prefix-wide, not
+/// per-key), so this name is not itself an access-control boundary; see
+/// "Authenticating the record" in the [module docs](self) for what is.
 pub fn query_worker_key(process_id: &str) -> String {
     format!("{QUERY_WORKERS_PREFIX}{process_id}")
 }
 
 /// The process id a heartbeat key names, or `None` if the key is not a
-/// well-formed `sys/query/workers/<uuid>` key. Worker identity is the key, not
-/// the record body (mirrors [`crate::worker_set`]'s `process_id_of`): the key
-/// is the one thing a single writer alone controls, so deriving identity from
-/// it means a record whose body disagrees with its key cannot smuggle a false
-/// identity into the live set. `list_all` yields the prefix itself and any
-/// unexpected nested key under it; both parse to `None` and are skipped.
+/// well-formed `sys/query/workers/<uuid>` key. Worker identity is the key,
+/// not the record body (mirrors [`crate::worker_set`]'s `process_id_of`): a
+/// record whose body disagrees with its key cannot smuggle a false identity
+/// into the live set under a DIFFERENT id than its own key names. It can
+/// still smuggle a fabricated worker under a fresh, self-consistent key,
+/// since the key is not exclusive to one writer (see "Authenticating the
+/// record" in the [module docs](self)); [`QueryWorkers::live_set_read`]'s
+/// MAC check is what rules that out. `list_all` yields the prefix itself and
+/// any unexpected nested key under it; both parse to `None` and are skipped.
 fn process_id_of(key: &str) -> Option<Uuid> {
     let raw = key.strip_prefix(QUERY_WORKERS_PREFIX)?;
     Uuid::parse_str(raw).ok()
+}
+
+/// Canonical, collision-free byte encoding of the fields a worker record's
+/// MAC covers (issue #1918). Mirrors `worker_set::unit_key`'s fixed-width
+/// convention: every variable-length field is length-prefixed so no pair of
+/// different field splits can ever encode to the same bytes.
+fn record_mac_bytes(
+    process_id: &Uuid,
+    fragment_endpoint: &str,
+    flight_sql_endpoint: &str,
+    protocol_version: u32,
+    started_unix_ns: i64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        16 + 4 + fragment_endpoint.len() + 4 + flight_sql_endpoint.len() + 4 + 8,
+    );
+    buf.extend_from_slice(process_id.as_bytes());
+    buf.extend_from_slice(&(fragment_endpoint.len() as u32).to_be_bytes());
+    buf.extend_from_slice(fragment_endpoint.as_bytes());
+    buf.extend_from_slice(&(flight_sql_endpoint.len() as u32).to_be_bytes());
+    buf.extend_from_slice(flight_sql_endpoint.as_bytes());
+    buf.extend_from_slice(&protocol_version.to_be_bytes());
+    buf.extend_from_slice(&started_unix_ns.to_be_bytes());
+    buf
+}
+
+/// The keyed-BLAKE3 MAC over one record's signable fields under one key
+/// (issue #1918). Mirrors the construction of `capability_mac` in
+/// `services/ravel-server`'s `distrib::codec` (keyed BLAKE3 over a canonical
+/// byte encoding), reimplemented locally: `ravel-fleet` does not depend on
+/// `ravel-query`, which owns that module.
+fn record_mac(
+    key: &[u8; 32],
+    process_id: &Uuid,
+    fragment_endpoint: &str,
+    flight_sql_endpoint: &str,
+    protocol_version: u32,
+    started_unix_ns: i64,
+) -> [u8; 32] {
+    *blake3::keyed_hash(
+        key,
+        &record_mac_bytes(
+            process_id,
+            fragment_endpoint,
+            flight_sql_endpoint,
+            protocol_version,
+            started_unix_ns,
+        ),
+    )
+    .as_bytes()
+}
+
+/// Constant-time byte comparison, so a MAC check cannot leak how many
+/// leading bytes matched through timing. Mirrors `services/ravel-server`'s
+/// `distrib::constant_time_eq` (reimplemented locally for the same reason as
+/// [`record_mac`]).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Why a sibling record's MAC failed to verify (issue #1918). Never a panic:
+/// a forged or corrupt record is data a hostile or buggy peer can produce at
+/// will, not a bug in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordMacError {
+    /// The record carries no `mac` (empty, including a pre-#1918 record that
+    /// never had the field).
+    Missing,
+    /// The `mac` field is not valid hex, or does not decode to 32 bytes.
+    Malformed,
+    /// The `mac` field decodes but matches no configured key.
+    Invalid,
+}
+
+impl std::fmt::Display for RecordMacError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            RecordMacError::Missing => "record carries no MAC",
+            RecordMacError::Malformed => "record MAC is not valid hex or not 32 bytes",
+            RecordMacError::Invalid => "record MAC does not verify under any configured key",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for RecordMacError {}
+
+/// Verify `record`'s MAC under any of `keys` (first mints, all verify: the
+/// ADR-0071 rotation rule reused verbatim). An empty `keys` list means MAC
+/// verification is not configured for this reader (see "Authenticating the
+/// record" in the [module docs](self)) and every record passes unchecked,
+/// matching this crate's behavior before issue #1918.
+fn verify_record_mac(keys: &[[u8; 32]], record: &QueryWorkerRecord) -> Result<(), RecordMacError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    if record.mac.is_empty() {
+        return Err(RecordMacError::Missing);
+    }
+    let decoded = hex::decode(&record.mac).map_err(|_| RecordMacError::Malformed)?;
+    let presented: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| RecordMacError::Malformed)?;
+    let process_id = Uuid::parse_str(&record.process_id).map_err(|_| RecordMacError::Malformed)?;
+    let verifies = keys.iter().any(|key| {
+        let expected = record_mac(
+            key,
+            &process_id,
+            &record.fragment_endpoint,
+            &record.flight_sql_endpoint,
+            record.protocol_version,
+            record.started_unix_ns,
+        );
+        constant_time_eq(&expected, &presented)
+    });
+    if verifies {
+        Ok(())
+    } else {
+        Err(RecordMacError::Invalid)
+    }
 }
 
 /// One query-worker process's self-owned membership record (ADR-0071),
@@ -134,6 +314,12 @@ fn process_id_of(key: &str) -> Option<Uuid> {
 ///   for the ADR-0071 version-skew fallback.
 /// - `started_unix_ns`: the liveness timestamp (see the [module docs](self)),
 ///   re-stamped with the current clock on every heartbeat.
+/// - `mac`: hex-encoded keyed-BLAKE3 MAC over the other fields (issue #1918;
+///   see "Authenticating the record" in the [module docs](self)).
+///   `#[serde(default)]` decodes a pre-#1918 record that never carried the
+///   field to an empty string, which fails verification like any other
+///   missing MAC rather than a decode error, so a rolling deploy never fails
+///   a decode on an old sibling's record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryWorkerRecord {
     pub process_id: String,
@@ -142,6 +328,8 @@ pub struct QueryWorkerRecord {
     pub flight_sql_endpoint: String,
     pub protocol_version: u32,
     pub started_unix_ns: i64,
+    #[serde(default)]
+    pub mac: String,
 }
 
 impl QueryWorkerRecord {
@@ -169,6 +357,14 @@ pub struct QueryWorkers {
     protocol_version: u32,
     heartbeat_interval: Duration,
     liveness_factor: u32,
+    /// MAC keys, first mints, all verify (ADR-0071 rotation rule). Empty
+    /// means MAC signing/verification is not configured: see
+    /// "Authenticating the record" in the [module docs](self).
+    mac_keys: Arc<Vec<[u8; 32]>>,
+    /// Records rejected by [`QueryWorkers::live_set_read`] for a MAC that
+    /// did not verify (issue #1918). Shared across clones via `Arc` so a
+    /// caller that clones this handle still reads one counter.
+    mac_rejections: Arc<AtomicU64>,
 }
 
 /// What one listing of `sys/query/workers/` yields: the live set, and the keys
@@ -204,7 +400,30 @@ impl QueryWorkers {
             protocol_version,
             heartbeat_interval,
             liveness_factor: liveness_factor.max(1),
+            mac_keys: Arc::new(Vec::new()),
+            mac_rejections: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Configure the MAC keys this handle signs its own heartbeat with and
+    /// verifies siblings' records against (issue #1918; see "Authenticating
+    /// the record" in the [module docs](self)). `keys` follows the ADR-0071
+    /// rotation rule: the first key mints, every key verifies, so a rotation
+    /// in progress needs no flag day. Additive on top of [`Self::new`] /
+    /// [`Self::with_defaults`], neither of which changed signature: an
+    /// unconfigured handle (the default) signs nothing and verifies nothing,
+    /// exactly as before this method existed.
+    #[must_use]
+    pub fn with_mac_keys(mut self, keys: Arc<Vec<[u8; 32]>>) -> Self {
+        self.mac_keys = keys;
+        self
+    }
+
+    /// How many sibling records this handle's [`Self::live_set_read`] has
+    /// rejected for a MAC that did not verify (issue #1918). A forgery
+    /// attempt against this reader is visible here, not just in the log.
+    pub fn mac_rejections(&self) -> u64 {
+        self.mac_rejections.load(Ordering::Relaxed)
     }
 
     /// A query worker with the ADR-0065 heartbeat defaults (`H = 60s`, `3 * H`
@@ -258,15 +477,32 @@ impl QueryWorkers {
         h.saturating_mul(i64::from(self.liveness_factor))
     }
 
-    /// The record this process advertises at `now_ns` (`started_unix_ns` is the
-    /// heartbeat stamp; see the [module docs](self)).
+    /// The record this process advertises at `now_ns` (`started_unix_ns` is
+    /// the heartbeat stamp; see the [module docs](self)), MAC-signed with
+    /// the first configured key if any is (issue #1918); an unconfigured
+    /// handle carries an empty `mac`.
     fn record_at(&self, now_ns: i64) -> QueryWorkerRecord {
+        let mac = self
+            .mac_keys
+            .first()
+            .map(|key| {
+                hex::encode(record_mac(
+                    key,
+                    &self.process_id,
+                    &self.fragment_endpoint,
+                    &self.flight_sql_endpoint,
+                    self.protocol_version,
+                    now_ns,
+                ))
+            })
+            .unwrap_or_default();
         QueryWorkerRecord {
             process_id: self.process_id.to_string(),
             fragment_endpoint: self.fragment_endpoint.clone(),
             flight_sql_endpoint: self.flight_sql_endpoint.clone(),
             protocol_version: self.protocol_version,
             started_unix_ns: now_ns,
+            mac,
         }
     }
 
@@ -300,9 +536,9 @@ impl QueryWorkers {
     /// so a draining query worker stops advertising itself to sibling
     /// coordinators immediately, rather than lingering in their live set until
     /// its stamp ages past the `3 * H` staleness window. Deletes only the one
-    /// key this process owns (`sys/query/workers/<process_id>`); a single writer
-    /// alone controls that key, so this never races another process. A missing
-    /// key is not an error (`delete` is idempotent).
+    /// key this process names (`sys/query/workers/<process_id>`); a missing
+    /// key is not an error (`delete` is idempotent), which also covers the
+    /// case of a stray delete racing this one.
     pub async fn delete_heartbeat(&self, store: &dyn ObjectStoreBackend) -> Result<(), StoreError> {
         store
             .delete(&query_worker_key(&self.process_id.to_string()))
@@ -320,14 +556,24 @@ impl QueryWorkers {
     /// record body (mirrors [`crate::worker_set::WorkerSet::live_set`]): a key
     /// that is not a well-formed `sys/query/workers/<uuid>` is skipped, and a
     /// record whose body `process_id` disagrees with the id its key names is
-    /// skipped as malformed. A single writer alone controls its own key, so a
-    /// body/key mismatch means a corrupt or forged record and must not enter
-    /// the live set under either identity.
+    /// skipped as malformed.
     ///
-    /// A corrupt or mismatched sibling record is skipped (treated as absent,
-    /// self-correcting next interval); only a failed LIST or GET is an `Err`,
-    /// which the caller treats fail-open, never freezing fan-out on a transient
-    /// read fault.
+    /// That alone is necessary but not sufficient (issue #1918): the shipped
+    /// query role grants `s3:PutObject` on the whole `sys/query/workers/*`
+    /// prefix to every process sharing its credentials, not per key, so a
+    /// body/key match proves a record is internally consistent, not that the
+    /// process advertising it is the one that actually started. What proves
+    /// that is the MAC: every non-self record must also verify under one of
+    /// this handle's configured [`Self::with_mac_keys`] keys or it is
+    /// rejected with a typed [`RecordMacError`] (never a panic, never a
+    /// silent pass) and counted in [`Self::mac_rejections`], before it can
+    /// enter the live set under either identity. See "Authenticating the
+    /// record" in the [module docs](self).
+    ///
+    /// A corrupt, mismatched, or unverified sibling record is skipped
+    /// (treated as absent, self-correcting next interval); only a failed LIST
+    /// or GET is an `Err`, which the caller treats fail-open, never freezing
+    /// fan-out on a transient read fault.
     ///
     /// A key the LIST result already shows as past the liveness window costs no
     /// GET at all (issue #1761; see the [module docs](self)), so the read cost
@@ -395,6 +641,19 @@ impl QueryWorkers {
                     key = %meta.key,
                     body_process_id = %record.process_id,
                     "query_workers: skipping a record whose body process_id disagrees with its key"
+                );
+                continue;
+            }
+            // Body/key agreement alone does not prove the record is genuine
+            // (issue #1918: the shipped IAM grants PutObject prefix-wide, not
+            // per key). The MAC does; reject and count anything that does not
+            // verify, before it can enter the live set.
+            if let Err(reason) = verify_record_mac(&self.mac_keys, &record) {
+                self.mac_rejections.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    key = %meta.key,
+                    error = %reason,
+                    "query_workers: rejecting a sibling record whose MAC does not verify"
                 );
                 continue;
             }
@@ -534,6 +793,7 @@ mod tests {
             flight_sql_endpoint: "worker-7.internal:9000".to_string(),
             protocol_version: 1,
             started_unix_ns: -12_345,
+            mac: "deadbeef".to_string(),
         };
         let bytes = record.encode().expect("encode");
         let decoded = QueryWorkerRecord::decode(&bytes).expect("decode");
@@ -555,6 +815,7 @@ mod tests {
         assert_eq!(decoded.fragment_endpoint, "10.0.0.1:9443");
         assert_eq!(decoded.protocol_version, 1);
         assert_eq!(decoded.started_unix_ns, 7);
+        assert_eq!(decoded.mac, "", "missing field defaults empty");
     }
 
     /// Heartbeats round-trip through a store: two workers each write their own
@@ -629,6 +890,7 @@ mod tests {
             flight_sql_endpoint: "10.9.9.9:9000".to_string(),
             protocol_version: 1,
             started_unix_ns: now,
+            mac: String::new(),
         };
         store
             .put(
@@ -664,6 +926,81 @@ mod tests {
                 .any(|r| r.process_id == body_id.to_string() || r.process_id == key_id.to_string()),
             "neither the key id nor the forged body id may enter the live set"
         );
+    }
+
+    /// A record whose body `process_id` matches its own key -- the check
+    /// `record_with_body_key_mismatch_is_excluded` proves -- is not enough by
+    /// itself (issue #1918): the shipped `deploy/iam/query.json` grants
+    /// `s3:PutObject` on the whole `sys/query/workers/*` prefix to every
+    /// process sharing the query role's credentials, so anything holding
+    /// that credential can write a self-consistent record at a fresh,
+    /// unclaimed key. With MAC verification configured, such a record must
+    /// still be rejected, and the rejection counted.
+    #[tokio::test]
+    async fn self_consistent_record_without_valid_mac_is_rejected_when_mac_configured() {
+        let store = MemoryStore::new();
+        let now = 1_000 * H_NS;
+        let keys: Arc<Vec<[u8; 32]>> = Arc::new(vec![[7u8; 32]]);
+        let reader = worker().with_mac_keys(keys);
+
+        let forged_id = Uuid::new_v4();
+        let forged = QueryWorkerRecord {
+            process_id: forged_id.to_string(),
+            fragment_endpoint: "10.6.6.6:9443".to_string(),
+            flight_sql_endpoint: "10.6.6.6:9000".to_string(),
+            protocol_version: 1,
+            started_unix_ns: now,
+            mac: String::new(),
+        };
+        store
+            .put(
+                &query_worker_key(&forged_id.to_string()),
+                forged.encode().expect("encode forged").into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("put self-consistent forged record");
+
+        let live = reader.live_set(&store, now).await.expect("live set");
+        assert_eq!(live.len(), 1, "only the reader itself survives");
+        assert!(
+            !live.iter().any(|r| r.process_id == forged_id.to_string()),
+            "a self-consistent record with no valid MAC must not enter the live set"
+        );
+        assert_eq!(
+            reader.mac_rejections(),
+            1,
+            "the MAC rejection is counted (issue #1918)"
+        );
+    }
+
+    /// A sibling record signed with a key the reader also has configured
+    /// verifies and is admitted: MAC verification is not "reject everything"
+    /// -- a genuinely correctly-signed record still enters the live set.
+    #[tokio::test]
+    async fn correctly_signed_sibling_record_is_admitted() {
+        let store = MemoryStore::new();
+        let now = 1_000 * H_NS;
+        let keys: Arc<Vec<[u8; 32]>> = Arc::new(vec![[7u8; 32]]);
+        let reader = worker().with_mac_keys(keys.clone());
+        let sibling = worker().with_mac_keys(keys);
+
+        sibling
+            .write_heartbeat(&store, now)
+            .await
+            .expect("sibling heartbeat");
+
+        let live = reader.live_set(&store, now).await.expect("live set");
+        assert_eq!(live.len(), 2, "reader plus the correctly-signed sibling");
+        assert!(
+            live.iter()
+                .any(|r| r.process_id == sibling.process_id().to_string()),
+            "a correctly signed record is admitted"
+        );
+        assert_eq!(reader.mac_rejections(), 0, "nothing was rejected");
     }
 
     /// After a worker deletes its own heartbeat, a sibling's live set stops
