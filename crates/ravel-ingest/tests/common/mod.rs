@@ -274,9 +274,12 @@ impl ObjectStoreBackend for SlowStore {
 /// classifies as split brain. That drives the `SplitBrain` panic inside the
 /// shard actor that owns the flush, killing that task.
 ///
-/// `key_contains` picks which commit keyspace the poison fires on, so a
-/// caller aims it at one signal's commits (`/c/` for the log router, `/s/c/`
-/// for the span router), and `signal` is stamped into the conflicting record
+/// `key_contains` is a SUBSTRING test over the key, not a signal selector. A
+/// commit key is `t/<tenant_hash>/<signal>/c/<shard>/<hour>/...`, so `/c/`
+/// matches EVERY signal's commits; `/s/c/` is the span-specific form. A
+/// caller that wants one signal must pass the signal-qualified prefix. The
+/// log router passes `/c/` only because it writes one signal in that test.
+/// `signal` is stamped into the conflicting record
 /// so what lands decodes as a record of the signal being written. The record
 /// is built for tenant `acme`, shard 0, which is what every caller writes as.
 ///
