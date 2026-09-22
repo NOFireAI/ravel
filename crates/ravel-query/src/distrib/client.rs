@@ -286,12 +286,33 @@ impl SliceFetcher for RemoteSliceFetcher {
 
 /// Decode a slice's full frame sequence into a [`SliceResponse`].
 ///
-/// This is the single decode implementation for a slice's frames.
-/// [`RemoteSliceFetcher`] drains its gRPC stream into a `Vec` and
-/// calls this; the server-side coordinator paths in `services/ravel-server`
-/// (the local no-hop fetch, an intra-cluster remote dispatch, and cross-cluster
-/// federation) collect their frames and call the same function, so the two
-/// sites cannot drift.
+/// This is the whole-sequence decode: it takes every frame at once, so its
+/// caller already holds the whole slice. Two callers remain, and neither reads
+/// a remote's stream unbounded on a shipped coordinator. [`RemoteSliceFetcher`]
+/// drains its gRPC stream into a `Vec` and calls this; it is the fetcher the
+/// in-process test and bench harnesses build, not one a `ravel-server` process
+/// constructs. `ravel-server`'s local no-hop fetch (`FragmentService::run_local`
+/// in `services/ravel-server/src/distrib.rs`) calls it on frames this same
+/// process just produced in-process, where there is no remote deciding how much
+/// it holds.
+///
+/// The two paths that DO read a remote's stream no longer call this: an
+/// intra-cluster remote dispatch (`RoutingSliceFetcher::remote_fetch`) and
+/// cross-cluster federation (`FederationSliceFetcher::fetch`), both in the same
+/// file, decode incrementally through
+/// [`SliceStreamDecoder`](crate::distrib::SliceStreamDecoder), which applies the
+/// per-slice frame and wire-byte caps before each frame is decoded (issue #1687
+/// part B).
+///
+/// So there are now two per-frame decode implementations, not one. Nothing
+/// structural holds them together:
+/// [`SliceStreamDecoder::push`](crate::distrib::SliceStreamDecoder::push)
+/// repeats the match below rather than calling into it, and a change to the
+/// frames a slice
+/// may carry has to be made in both. What keeps them from drifting is a test,
+/// `tests::the_incremental_decoder_agrees_with_the_whole_sequence_decode`, which
+/// feeds the same frame sequences to both and asserts they produce the same
+/// response and the same typed errors.
 ///
 /// Every malformation is a typed [`DistribError`], never a panic: a series
 /// frame that fails to decode ([`DistribError::Codec`]), a native-histogram
@@ -702,6 +723,87 @@ mod tests {
             codec::encode_histogram_records(&got.values),
             codec::encode_histogram_records(&hs.values)
         );
+    }
+
+    /// The anti-drift pin for the two per-frame decode implementations (issue
+    /// #1687 part B). Since the coordinator's remote paths moved to
+    /// `SliceStreamDecoder`, `push`/`finish` repeat this function's match rather
+    /// than calling into it, so the frames a slice may carry are decoded in two
+    /// places. This feeds identical sequences to both and asserts they agree, on
+    /// the accepted response and on the typed error for every terminal
+    /// malformation this function names.
+    ///
+    /// `SliceResponse` and `DistribError` are `Debug` but neither is `PartialEq`,
+    /// so the comparison is over their `Debug` rendering, which covers every
+    /// field of both.
+    #[test]
+    fn the_incremental_decoder_agrees_with_the_whole_sequence_decode() {
+        use crate::EngineConfig;
+        use crate::distrib::SliceStreamDecoder;
+
+        /// Run `frames` through the incremental decoder exactly as a
+        /// coordinator does: push until the first error, then `finish`.
+        fn incremental(frames: Vec<pb::FetchResponse>) -> Result<SliceResponse, DistribError> {
+            let mut decoder = SliceStreamDecoder::new(&EngineConfig::default());
+            for frame in frames {
+                decoder.push(frame)?;
+            }
+            decoder.finish()
+        }
+
+        let soa = series_soa();
+        let bad_series = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame {
+                series_id: vec![0u8; 15],
+                labels: Vec::new(),
+                runs: Vec::new(),
+            })),
+        };
+        let no_status = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                accounting: None,
+                series_returned: 0,
+                samples_returned: 0,
+                status: None,
+                raw_f64_pages: 0,
+                raw_f64_bytes: 0,
+            })),
+        };
+
+        let sequences: Vec<(&str, Vec<pb::FetchResponse>)> = vec![
+            (
+                "series then summary",
+                vec![series_frame(&soa), summary_frame(pb::status::Code::Ok)],
+            ),
+            (
+                "summary alone",
+                vec![summary_frame(pb::status::Code::BudgetExceeded)],
+            ),
+            ("no summary at all", vec![series_frame(&soa)]),
+            (
+                "two summaries",
+                vec![
+                    summary_frame(pb::status::Code::Ok),
+                    summary_frame(pb::status::Code::Ok),
+                ],
+            ),
+            (
+                "a malformed series frame",
+                vec![bad_series, summary_frame(pb::status::Code::Ok)],
+            ),
+            ("an empty frame", vec![pb::FetchResponse { frame: None }]),
+            ("a summary with no status", vec![no_status]),
+        ];
+
+        for (what, frames) in sequences {
+            let whole = decode_slice_frames(frames.clone());
+            let streamed = incremental(frames);
+            assert_eq!(
+                format!("{whole:?}"),
+                format!("{streamed:?}"),
+                "the two decoders disagree on {what}"
+            );
+        }
     }
 
     /// A summary that carries no status is a typed `MissingStatus` codec error.
