@@ -30,10 +30,11 @@
 //! arrive as deltas and are accumulated to the absolute counts storage
 //! holds, and every structural rule the RSEG v5 writer or reader enforces is
 //! re-checked here so an accepted point can never fail either (see
-//! [`build_histogram_value`]). Two shapes the writer would store but
-//! Prometheus refuses to build are rejected on top of those: a
-//! `zero_threshold` that is NaN, infinite, or negative, and a custom-buckets
-//! histogram (`schema == -53`) carrying negative spans.
+//! [`build_histogram_value`]). Shapes the writer would store but Prometheus
+//! refuses to build are rejected on top of those: a `zero_threshold` that is
+//! NaN, infinite, or negative, and a custom-buckets histogram
+//! (`schema == -53`) carrying negative spans, a non-zero `zero_threshold`, or
+//! a non-zero `zero_count`.
 
 use std::sync::Arc;
 
@@ -129,6 +130,25 @@ pub enum RwRejection {
     )]
     NativeHistogramCustomBucketsNegativeSpans { count: usize },
 
+    /// Carries the bit pattern for the same reason
+    /// [`RwRejection::NativeHistogramZeroThresholdInvalid`] does.
+    #[error(
+        "native histogram with the -53 custom-buckets schema has zero_threshold {}, which is not zero; a custom-bucket histogram has no zero bucket to size",
+        f64::from_bits(*.zero_threshold_bits)
+    )]
+    NativeHistogramCustomBucketsZeroThreshold { zero_threshold_bits: u64 },
+
+    /// `zero_count_bits` is the raw `u64` for an integer count and the IEEE
+    /// bit pattern for a float one, so the variant keeps its `Eq` and a NaN
+    /// `zero_count` compares equal to itself in a test.
+    #[error(
+        "native histogram with the -53 custom-buckets schema carries a non-zero {kind} zero_count; a custom-bucket histogram has no zero bucket to count into"
+    )]
+    NativeHistogramCustomBucketsZeroCount {
+        kind: &'static str,
+        zero_count_bits: u64,
+    },
+
     #[error(
         "native histogram count is smaller than its zero_count or than the sum of its bucket counts, which the segment format's reader would reject as corrupted"
     )]
@@ -154,6 +174,8 @@ impl RwRejection {
             | RwRejection::NativeHistogramCustomValuesMismatch
             | RwRejection::NativeHistogramZeroThresholdInvalid { .. }
             | RwRejection::NativeHistogramCustomBucketsNegativeSpans { .. }
+            | RwRejection::NativeHistogramCustomBucketsZeroThreshold { .. }
+            | RwRejection::NativeHistogramCustomBucketsZeroCount { .. }
             | RwRejection::NativeHistogramCountInconsistent
             | RwRejection::TimestampOverflow => 1,
         }
@@ -718,15 +740,22 @@ fn build_histogram_sample(
 /// which is not an inconsistency: OTLP has no field to carry boundaries at
 /// all, so there the sentinel can only ever arrive unbacked.
 ///
-/// Two checks here answer to Prometheus rather than to the RSEG writer,
+/// Some checks here answer to Prometheus rather than to the RSEG writer,
 /// because the writer accepts shapes Prometheus itself refuses to build and
-/// Ravel's query-side arithmetic would then have to reconcile them. Both are
-/// value validation, not structure: a `zero_threshold` that is not a finite
-/// value at or above zero (see [`zero_threshold_is_admissible`], which the
-/// OTLP surface calls too), and a custom-buckets histogram carrying negative
-/// spans, which `Histogram.Validate` rejects with
-/// `ErrHistogramCustomBucketsNegSpans` since a custom-bucket layout has no
-/// negative side to place them on.
+/// Ravel's query-side arithmetic would then have to reconcile them. All are
+/// value validation, not structure. One applies at every schema: a
+/// `zero_threshold` that is not a finite value at or above zero (see
+/// [`zero_threshold_is_admissible`], which the OTLP surface calls too).
+///
+/// The rest apply only under `schema == -53`, where a custom-bucket layout
+/// has neither a negative side nor a zero bucket, so negative spans, a
+/// non-zero `zero_threshold`, and a non-zero `zero_count` are each refused.
+/// `-0.0` counts as zero for both float fields (see [`is_zero_f64`]); any
+/// other pattern, including a NaN `zero_count`, does not. Together with the
+/// `custom_values` rule above these are the four rules this surface enforces
+/// for the sentinel schema; the OTLP surface enforces them by refusing
+/// `scale == -53` outright, which is strictly stronger, so the shape cannot
+/// reach its normalizer at all.
 fn build_histogram_value(h: &ResolvedHistogram) -> Result<HistogramValue, RwRejection> {
     if h.schema < -53 {
         return Err(RwRejection::NativeHistogramSchemaUnsupported { schema: h.schema });
@@ -746,6 +775,28 @@ fn build_histogram_value(h: &ResolvedHistogram) -> Result<HistogramValue, RwReje
             return Err(RwRejection::NativeHistogramCustomBucketsNegativeSpans {
                 count: h.negative_spans.len(),
             });
+        }
+        if !is_zero_f64(h.zero_threshold) {
+            return Err(RwRejection::NativeHistogramCustomBucketsZeroThreshold {
+                zero_threshold_bits: h.zero_threshold.to_bits(),
+            });
+        }
+        match h.zero_count {
+            None => {}
+            Some(ResolvedCount::Int(0)) => {}
+            Some(ResolvedCount::Int(v)) => {
+                return Err(RwRejection::NativeHistogramCustomBucketsZeroCount {
+                    kind: "integer",
+                    zero_count_bits: v,
+                });
+            }
+            Some(ResolvedCount::Float(v)) if is_zero_f64(v) => {}
+            Some(ResolvedCount::Float(v)) => {
+                return Err(RwRejection::NativeHistogramCustomBucketsZeroCount {
+                    kind: "float",
+                    zero_count_bits: v.to_bits(),
+                });
+            }
         }
         Some(h.custom_values.clone())
     } else {
@@ -832,6 +883,17 @@ fn build_histogram_value(h: &ResolvedHistogram) -> Result<HistogramValue, RwReje
         counts,
         reset_hint: reset_hint_from_wire(h.reset_hint),
     })
+}
+
+/// Whether `v` is one of the two IEEE zero patterns.
+///
+/// Compared by bit pattern rather than with `== 0.0` because this repository
+/// treats `-0.0` and a NaN payload as distinguishable in storage paths, so the
+/// decision to count `-0.0` as zero is stated here rather than inherited from
+/// IEEE equality. Every other pattern, including any NaN, is not zero.
+fn is_zero_f64(v: f64) -> bool {
+    let bits = v.to_bits();
+    bits == 0.0f64.to_bits() || bits == (-0.0f64).to_bits()
 }
 
 /// Map wire spans to storage spans. A zero-length span is rejected here
@@ -1052,6 +1114,19 @@ mod tests {
             reset_hint: 1,
             custom_values: vec![],
         }
+    }
+
+    /// A minimal well-formed custom-buckets histogram: the same positive side
+    /// as [`histogram`] under the `-53` sentinel schema, with the boundary
+    /// list that schema requires and the empty zero bucket it requires (no
+    /// zero side at all, so `zero_threshold` and `zero_count` are both zero).
+    fn custom_buckets_histogram(ts_ms: i64) -> ResolvedHistogram {
+        let mut h = histogram(ts_ms);
+        h.schema = -53;
+        h.custom_values = vec![0.5, 1.0, 2.5];
+        h.zero_threshold = 0.0;
+        h.zero_count = Some(ResolvedCount::Int(0));
+        h
     }
 
     /// The single admitted histogram sample from a one-series request.
@@ -1683,10 +1758,7 @@ mod tests {
     /// storage represents it losslessly.
     #[test]
     fn custom_bucket_histogram_is_admitted_with_its_boundaries() {
-        let mut h = histogram(1_000);
-        h.schema = -53;
-        h.custom_values = vec![0.5, 1.0, 2.5];
-        let out = normalize_histograms(vec![h]);
+        let out = normalize_histograms(vec![custom_buckets_histogram(1_000)]);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         let sample = expect_histogram(&out);
         assert_eq!(sample.value.scale, -53);
@@ -1723,9 +1795,7 @@ mod tests {
     /// would be stored as valid data.
     #[test]
     fn custom_buckets_with_negative_spans_is_rejected() {
-        let mut h = histogram(1_000);
-        h.schema = -53;
-        h.custom_values = vec![0.5, 1.0, 2.5];
+        let mut h = custom_buckets_histogram(1_000);
         h.negative_spans = vec![ResolvedSpan {
             offset: 0,
             length: 2,
@@ -1753,6 +1823,365 @@ mod tests {
         let out = normalize_histograms(vec![h]);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.histograms_written, 1);
+    }
+
+    // --- the custom-buckets zero side (issue #1858) ---
+
+    /// A custom-bucket layout has no zero bucket, so there is no interval for
+    /// `zero_threshold` to be the half-width of. Every non-zero pattern is
+    /// refused, including a subnormal, which the exponential schemas admit.
+    #[test]
+    fn custom_buckets_with_a_non_zero_zero_threshold_is_rejected() {
+        for threshold in [1e-9f64, f64::MIN_POSITIVE, 5e-324f64, 1.0] {
+            let mut h = custom_buckets_histogram(1_000);
+            h.zero_threshold = threshold;
+            assert_histogram_rejected(
+                h,
+                RwRejection::NativeHistogramCustomBucketsZeroThreshold {
+                    zero_threshold_bits: threshold.to_bits(),
+                },
+            );
+        }
+    }
+
+    /// Both IEEE zero patterns are zero for this rule, and both round-trip by
+    /// bit pattern. `-0.0` is admitted because Prometheus writes this rule as
+    /// `ZeroThreshold == 0` in Go, where `-0.0 == 0` holds; a check spelled as
+    /// bit equality against `+0.0` alone would refuse a payload Prometheus
+    /// accepts.
+    #[test]
+    fn custom_buckets_with_either_zero_threshold_zero_pattern_is_admitted() {
+        for threshold in [0.0f64, -0.0f64] {
+            let mut h = custom_buckets_histogram(1_000);
+            h.zero_threshold = threshold;
+            let out = normalize_histograms(vec![h]);
+            assert!(out.rejected.is_empty(), "{threshold:?}: {:?}", out.rejected);
+            assert_eq!(
+                expect_histogram(&out).value.zero_threshold.to_bits(),
+                threshold.to_bits(),
+                "{threshold:?} round-trips by bit pattern"
+            );
+        }
+    }
+
+    /// The same rule on the count side, for both count kinds: a custom-bucket
+    /// histogram has no zero bucket to count into. A NaN `zero_count` is not
+    /// zero, so it is refused rather than passed by a comparison that is false
+    /// for NaN.
+    #[test]
+    fn custom_buckets_with_a_non_zero_zero_count_is_rejected() {
+        let mut h = custom_buckets_histogram(1_000);
+        h.zero_count = Some(ResolvedCount::Int(1));
+        assert_histogram_rejected(
+            h,
+            RwRejection::NativeHistogramCustomBucketsZeroCount {
+                kind: "integer",
+                zero_count_bits: 1,
+            },
+        );
+
+        for zero_count in [1.0f64, f64::MIN_POSITIVE, 5e-324f64, f64::NAN] {
+            let mut h = custom_buckets_histogram(1_000);
+            // Keep the fixture a coherent float histogram: a float
+            // `zero_count` beside an integer `count` is a shape the
+            // mixed-kind rule refuses on its own grounds.
+            h.count = Some(ResolvedCount::Float(14.0));
+            h.positive_counts = vec![2.0, 5.0, 6.0];
+            h.positive_deltas = vec![];
+            h.zero_count = Some(ResolvedCount::Float(zero_count));
+            assert_histogram_rejected(
+                h,
+                RwRejection::NativeHistogramCustomBucketsZeroCount {
+                    kind: "float",
+                    zero_count_bits: zero_count.to_bits(),
+                },
+            );
+        }
+    }
+
+    /// An absent `zero_count` reads as zero (what a `GetZeroCountInt()` reader
+    /// sees), and a float `-0.0` is zero by the same decision the threshold
+    /// rule makes, so neither is refused.
+    #[test]
+    fn custom_buckets_with_an_absent_or_negative_zero_zero_count_is_admitted() {
+        let mut h = custom_buckets_histogram(1_000);
+        h.zero_count = None;
+        let out = normalize_histograms(vec![h]);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.histograms_written, 1);
+
+        let mut h = custom_buckets_histogram(1_000);
+        h.count = Some(ResolvedCount::Float(14.0));
+        h.positive_counts = vec![2.0, 5.0, 6.0];
+        h.positive_deltas = vec![];
+        h.zero_count = Some(ResolvedCount::Float(-0.0));
+        let out = normalize_histograms(vec![h]);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.histograms_written, 1);
+    }
+
+    /// The zero side stays free under the exponential schemas: the four rules
+    /// above are specific to the `-53` sentinel, not new blanket rules.
+    #[test]
+    fn exponential_schema_keeps_admitting_a_populated_zero_bucket() {
+        let out = normalize_histograms(vec![histogram(1_000)]);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        let sample = expect_histogram(&out);
+        assert_eq!(sample.value.zero_threshold.to_bits(), 1e-9f64.to_bits());
+        assert_eq!(out.histograms_written, 1);
+    }
+
+    /// The acceptance test for the second round of issue #1858. It drives all
+    /// four rules the `-53` custom-buckets schema carries, on both ingest
+    /// surfaces, because the first round's defect was exactly a rule enforced
+    /// on one surface only.
+    ///
+    /// The two surfaces enforce these differently and the test asserts each as
+    /// it is, not as a claimed equivalence: Remote Write admits the sentinel
+    /// schema and validates it rule by rule, while OTLP has no field to carry
+    /// bucket boundaries and so refuses `scale == -53` outright, which is
+    /// strictly stronger. A mutation that relaxes either side fails here.
+    ///
+    /// It also pins the `-0.0` decision on both zero-side fields, in both
+    /// directions, so "zero" cannot quietly become bit equality against `+0.0`
+    /// (which would refuse `-0.0`) or a magnitude test (which would admit a
+    /// subnormal).
+    #[test]
+    fn all_four_custom_buckets_rules_are_enforced_on_both_surfaces() {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            AggregationTemporality, ExponentialHistogram, ExponentialHistogramDataPoint, Metric,
+            ResourceMetrics, ScopeMetrics,
+            exponential_histogram_data_point::Buckets,
+            metric::Data as MetricData,
+        };
+
+        // Surface 1: Remote Write (RW1 and RW2 share this normalizer). One
+        // case per rule, each expressed as the single field that makes an
+        // otherwise well-formed custom-buckets histogram invalid.
+        let mut rule_1 = custom_buckets_histogram(1_000);
+        rule_1.custom_values = vec![];
+
+        let mut rule_2 = custom_buckets_histogram(1_000);
+        rule_2.negative_spans = vec![ResolvedSpan {
+            offset: 0,
+            length: 2,
+        }];
+        rule_2.negative_deltas = vec![1, 1];
+
+        let mut rule_3 = custom_buckets_histogram(1_000);
+        rule_3.zero_threshold = 1e-9;
+
+        let mut rule_4 = custom_buckets_histogram(1_000);
+        rule_4.zero_count = Some(ResolvedCount::Int(1));
+
+        let cases = [
+            (rule_1, RwRejection::NativeHistogramCustomValuesMismatch),
+            (
+                rule_2,
+                RwRejection::NativeHistogramCustomBucketsNegativeSpans { count: 1 },
+            ),
+            (
+                rule_3,
+                RwRejection::NativeHistogramCustomBucketsZeroThreshold {
+                    zero_threshold_bits: 1e-9f64.to_bits(),
+                },
+            ),
+            (
+                rule_4,
+                RwRejection::NativeHistogramCustomBucketsZeroCount {
+                    kind: "integer",
+                    zero_count_bits: 1,
+                },
+            ),
+        ];
+        for (h, expected) in cases {
+            let out = normalize_histograms(vec![h]);
+            assert!(out.histogram_points.is_empty(), "{expected:?}");
+            assert_eq!(out.histograms_written, 0, "{expected:?}");
+            assert_eq!(out.histograms_dropped, 1, "{expected:?}");
+            assert_eq!(out.rejected, vec![expected.clone()]);
+            // The sender-facing count this refusal is reported through; the
+            // server's dropped-points total sums exactly this.
+            assert_eq!(
+                out.rejected
+                    .iter()
+                    .map(RwRejection::rejected_count)
+                    .sum::<usize>(),
+                1,
+                "{expected:?}"
+            );
+            // The text an operator reads. The Remote Write surface answers
+            // 204 and reports the reason only through this rendering, so a
+            // message that did not name the field would leave a sender with
+            // nothing to fix.
+            let rendered = expected.to_string();
+            assert!(rendered.contains("-53"), "{rendered}");
+        }
+        // The rule-specific field name each message has to carry.
+        for (rendered, field) in [
+            (
+                RwRejection::NativeHistogramCustomValuesMismatch.to_string(),
+                "custom_values",
+            ),
+            (
+                RwRejection::NativeHistogramCustomBucketsNegativeSpans { count: 1 }.to_string(),
+                "negative span",
+            ),
+            (
+                RwRejection::NativeHistogramCustomBucketsZeroThreshold {
+                    zero_threshold_bits: 1e-9f64.to_bits(),
+                }
+                .to_string(),
+                "zero_threshold",
+            ),
+            (
+                RwRejection::NativeHistogramCustomBucketsZeroCount {
+                    kind: "integer",
+                    zero_count_bits: 1,
+                }
+                .to_string(),
+                "zero_count",
+            ),
+        ] {
+            assert!(rendered.contains(field), "{rendered}");
+        }
+
+        // The boundary values the rules 3 and 4 decisions rest on. `-0.0` is
+        // zero on both fields and stays admitted; the smallest subnormal is
+        // not zero on either and is refused, on a surface that admits that
+        // same subnormal under an exponential schema.
+        let mut minus_zero = custom_buckets_histogram(1_000);
+        minus_zero.zero_threshold = -0.0;
+        minus_zero.count = Some(ResolvedCount::Float(14.0));
+        minus_zero.positive_counts = vec![2.0, 5.0, 6.0];
+        minus_zero.positive_deltas = vec![];
+        minus_zero.zero_count = Some(ResolvedCount::Float(-0.0));
+        let out = normalize_histograms(vec![minus_zero]);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(
+            expect_histogram(&out).value.zero_threshold.to_bits(),
+            (-0.0f64).to_bits()
+        );
+
+        let mut subnormal = custom_buckets_histogram(1_000);
+        subnormal.zero_threshold = 5e-324;
+        assert_histogram_rejected(
+            subnormal,
+            RwRejection::NativeHistogramCustomBucketsZeroThreshold {
+                zero_threshold_bits: 5e-324f64.to_bits(),
+            },
+        );
+
+        let mut subnormal_count = custom_buckets_histogram(1_000);
+        subnormal_count.count = Some(ResolvedCount::Float(14.0));
+        subnormal_count.positive_counts = vec![2.0, 5.0, 6.0];
+        subnormal_count.positive_deltas = vec![];
+        subnormal_count.zero_count = Some(ResolvedCount::Float(5e-324));
+        assert_histogram_rejected(
+            subnormal_count,
+            RwRejection::NativeHistogramCustomBucketsZeroCount {
+                kind: "float",
+                zero_count_bits: 5e-324f64.to_bits(),
+            },
+        );
+
+        // Surface 2: OTLP, driven with the same four shapes. Its enforcement
+        // is the blanket refusal of the sentinel schema, so every case lands
+        // on the same typed rejection; what this pins is that not one of them
+        // is admitted.
+        let otlp_cases = [
+            // Rule 1: OTLP has no custom_values field at all, so the sentinel
+            // schema can only ever arrive unbacked.
+            ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                scale: -53,
+                ..Default::default()
+            },
+            // Rule 2: negative buckets under the sentinel schema.
+            ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                scale: -53,
+                count: 2,
+                negative: Some(Buckets {
+                    offset: 0,
+                    bucket_counts: vec![1, 1],
+                }),
+                ..Default::default()
+            },
+            // Rule 3: a non-zero zero_threshold under the sentinel schema.
+            ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                scale: -53,
+                zero_threshold: 1e-9,
+                ..Default::default()
+            },
+            // Rule 4: a non-zero zero_count under the sentinel schema.
+            ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                scale: -53,
+                count: 1,
+                zero_count: 1,
+                ..Default::default()
+            },
+        ];
+        for dp in otlp_cases {
+            let otlp = ravel_otlp::normalize::normalize_metrics(
+                &tenant(),
+                ExportMetricsServiceRequest {
+                    resource_metrics: vec![ResourceMetrics {
+                        scope_metrics: vec![ScopeMetrics {
+                            metrics: vec![Metric {
+                                name: "req_latency".to_string(),
+                                data: Some(MetricData::ExponentialHistogram(ExponentialHistogram {
+                                    data_points: vec![dp.clone()],
+                                    aggregation_temporality: AggregationTemporality::Cumulative
+                                        as i32,
+                                })),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                },
+                &IngestLimits::default(),
+                1_000,
+            );
+            assert!(otlp.histogram_points.is_empty(), "{dp:?}");
+            assert!(otlp.points.is_empty(), "{dp:?}");
+            assert_eq!(
+                otlp.rejected,
+                vec![Rejection::NativeHistogramScaleUnsupported { scale: -53 }],
+                "{dp:?}"
+            );
+            // The OTLP-side observability an operator reads the refusal
+            // under: the server's normalize-reject counter is fed by exactly
+            // this list, and the partial-success `error_message` by the
+            // rejection's own `Display`.
+            assert_eq!(
+                otlp.rejected[0].admission_class(),
+                Some(ravel_otlp::AdmissionClass::Structural),
+                "{dp:?}"
+            );
+            assert_eq!(
+                ravel_otlp::NormalizeRejectCounts::from_metric_rejections(&otlp.rejected),
+                ravel_otlp::NormalizeRejectCounts {
+                    skew: 0,
+                    structural: 1,
+                },
+                "{dp:?}"
+            );
+            assert_eq!(
+                otlp.rejected
+                    .iter()
+                    .map(Rejection::rejected_count)
+                    .sum::<usize>(),
+                1,
+                "{dp:?}"
+            );
+            assert!(otlp.rejected[0].to_string().contains("-53"), "{dp:?}");
+        }
     }
 
     // --- zero_threshold admission (issue #1858) ---
