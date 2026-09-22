@@ -1578,11 +1578,22 @@ pub struct Cli {
     /// This process's maximum flush lifetime, as a humantime duration (e.g.
     /// `1h`). Feeds the real compactor
     /// (`CompactorConfig::max_flush_lifetime_ns`), which governs the seal
-    /// margin and the orphan age gate. Omitted defaults to
+    /// margin, the orphan age gate, and the retention floor, and through the
+    /// seal margin gates the erasure completion gate: a pending erasure
+    /// request stays blocked until a bucket is sealed. Omitted defaults to
     /// `ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS` (1h). Not part
     /// of the `sys/gc` must-match set (maintain validates only horizon and
     /// grace), but kept alongside them so the compactor's GC-relevant knobs
-    /// are configured from one coherent group of flags.
+    /// are configured from one coherent group of flags. UNSAFE below the
+    /// ingest path's real flush lifetime: a bucket a writer is still
+    /// flushing into can then be sealed and compacted, and that writer's
+    /// later-published object is missed by the compaction -- voiding the
+    /// erasure completion gate (a pending erasure request can be reported
+    /// complete while records are still arriving) and the retention floor
+    /// it depends on, not just the seal margin. `Cli::validate` refuses any
+    /// value below `ravel_ingest::IngestConfig::default().max_flush_lifetime`
+    /// for exactly this reason; there is no supported way to set this flag
+    /// lower.
     #[arg(long, value_name = "DURATION")]
     pub gc_max_flush_lifetime: Option<String>,
 
@@ -4918,6 +4929,36 @@ impl Cli {
                 flush_cadence.min_flush_bytes,
                 target_bytes,
             );
+        }
+
+        // Issue #1744: `--gc-max-flush-lifetime` feeds
+        // `CompactorConfig::max_flush_lifetime_ns`, which derives the seal
+        // margin, the orphan age gate, and the retention floor, and through
+        // the seal margin gates `bucket_erasure_completion`: a pending
+        // erasure request stays blocked until the bucket is sealed. The
+        // ingest pipeline's own flush-abandonment budget
+        // (`ravel_ingest::IngestConfig::default().max_flush_lifetime`) is not
+        // itself configurable, so a compactor value below it lets a bucket
+        // seal, and a pending erasure complete against it, while a writer can
+        // still legally publish into that bucket -- voiding the erasure
+        // completion gate the retention floor depends on.
+        if let Some(s) = self.gc_max_flush_lifetime.as_deref() {
+            let configured_ns = parse_gc_duration_ns("--gc-max-flush-lifetime", s)?;
+            let floor_ns =
+                duration_nanos_saturating(ravel_ingest::IngestConfig::default().max_flush_lifetime);
+            if configured_ns < floor_ns {
+                anyhow::bail!(
+                    "--gc-max-flush-lifetime {:?} resolves to {configured_ns} ns, below the \
+                     ingest pipeline's own flush-abandonment budget of {floor_ns} ns \
+                     (ravel_ingest::IngestConfig::default().max_flush_lifetime). Below that \
+                     floor, a bucket a writer is still flushing into can seal before the writer \
+                     is done, voiding the erasure completion gate (a pending erasure request can \
+                     be reported complete while records are still arriving) and the retention \
+                     floor it depends on, not just the seal margin. Raise --gc-max-flush-lifetime \
+                     to at least {floor_ns} ns.",
+                    s,
+                );
+            }
         }
 
         // The dev header resolver trusts an unauthenticated `x-ravel-tenant`

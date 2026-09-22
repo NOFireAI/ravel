@@ -122,6 +122,17 @@ impl GcConfigValues {
     /// permanently bricked. Enforced at the single mutation choke point
     /// ([`set_gc_config`]), so a durable object can never hold a non-positive
     /// field.
+    ///
+    /// Issue #1744: also reject a `max_flush_lifetime_ns` below the ingest
+    /// pipeline's own flush-abandonment budget
+    /// (`ravel_ingest::IngestConfig::default().max_flush_lifetime`). This is
+    /// the durable `sys/gc` write path (`set_gc_config` is its sole caller),
+    /// which a deployment can reach directly via `ravel-cli gc-config set`
+    /// regardless of any per-process `--gc-max-flush-lifetime` CLI validation
+    /// (`ravel_server::config::Cli::validate`); without this check here, that
+    /// CLI-level floor binds nothing durable and a value below it can still
+    /// reach `CompactorConfig::max_flush_lifetime_ns` and void the erasure
+    /// completion gate.
     pub fn validate(&self) -> Result<(), GcConfigError> {
         for (field, got) in [
             ("protection_horizon_ns", self.protection_horizon_ns),
@@ -132,6 +143,18 @@ impl GcConfigValues {
             if got <= 0 {
                 return Err(GcConfigError::NonPositiveValue { field, got });
             }
+        }
+        let floor_ns = i64::try_from(
+            ravel_ingest::IngestConfig::default()
+                .max_flush_lifetime
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX);
+        if self.max_flush_lifetime_ns < floor_ns {
+            return Err(GcConfigError::MaxFlushLifetimeBelowIngestFloor {
+                got: self.max_flush_lifetime_ns,
+                floor_ns,
+            });
         }
         Ok(())
     }
@@ -198,6 +221,18 @@ pub enum GcConfigError {
          brick every mode's startup validation; refusing to write sys/gc"
     )]
     NonPositiveValue { field: &'static str, got: i64 },
+    #[error(
+        "proposed GC config has max_flush_lifetime_ns={got} ns, below the ingest pipeline's own \
+         flush-abandonment budget of {floor_ns} ns \
+         (ravel_ingest::IngestConfig::default().max_flush_lifetime): the compactor's writer \
+         interlock (seal margin, orphan age gate, and retention floor, and through the seal \
+         margin the erasure completion gate that keeps a pending erasure request blocked until \
+         every flush a writer could still publish has had its chance) assumes no writer \
+         publishes past that budget, so a lower value would let a bucket seal -- and a pending \
+         erasure complete against it -- while a writer can still legally publish into it; \
+         refusing to write sys/gc"
+    )]
+    MaxFlushLifetimeBelowIngestFloor { got: i64, floor_ns: i64 },
     #[error(
         "proposed GC config violates protection_horizon >= max_query_duration + grace + \
          clock_skew_allowance: protection_horizon={protection_horizon_ns} ns, \
