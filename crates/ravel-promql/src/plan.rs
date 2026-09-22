@@ -71,8 +71,7 @@ pub fn plan_selectors(
     eval_start_ms: i64,
     eval_end_ms: i64,
 ) -> Result<Vec<SelectorPlan>, Error> {
-    crate::complexity_guard::check(query)?;
-    let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
+    let expr = crate::complexity_guard::parse_guarded(query)?;
     let start_ns = eval::ms_to_ns(eval_start_ms)?;
     let end_ns = eval::ms_to_ns(eval_end_ms)?;
 

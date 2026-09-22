@@ -1010,13 +1010,13 @@ mod tests {
     /// defensive fallback directly.
     #[test]
     fn binary_over_non_scalar_non_vector_operands_rejects_without_panicking() {
+        use promql_parser::parser::BinaryExpr;
         use promql_parser::parser::token::{T_ADD, TokenType};
-        use promql_parser::parser::{BinaryExpr, parse};
 
         let b = BinaryExpr {
             op: TokenType::new(T_ADD),
-            lhs: Box::new(parse(r#""a""#).expect("parses")),
-            rhs: Box::new(parse(r#""b""#).expect("parses")),
+            lhs: Box::new(crate::complexity_guard::parse_guarded(r#""a""#).expect("parses")),
+            rhs: Box::new(crate::complexity_guard::parse_guarded(r#""b""#).expect("parses")),
             modifier: None,
         };
         let ctx = crate::eval::QueryWindow::for_test();
@@ -1040,13 +1040,13 @@ mod tests {
     /// will not produce one today.
     #[test]
     fn set_operator_on_two_scalars_rejects_without_panicking() {
+        use promql_parser::parser::BinaryExpr;
         use promql_parser::parser::token::{T_LAND, TokenType};
-        use promql_parser::parser::{BinaryExpr, parse};
 
         let b = BinaryExpr {
             op: TokenType::new(T_LAND),
-            lhs: Box::new(parse("1").expect("parses")),
-            rhs: Box::new(parse("2").expect("parses")),
+            lhs: Box::new(crate::complexity_guard::parse_guarded("1").expect("parses")),
+            rhs: Box::new(crate::complexity_guard::parse_guarded("2").expect("parses")),
             modifier: None,
         };
         let ctx = crate::eval::QueryWindow::for_test();
@@ -1066,13 +1066,13 @@ mod tests {
     /// which hands it to `apply_arith`'s fallback the same way.
     #[test]
     fn set_operator_on_scalar_and_vector_rejects_without_panicking() {
+        use promql_parser::parser::BinaryExpr;
         use promql_parser::parser::token::{T_LOR, TokenType};
-        use promql_parser::parser::{BinaryExpr, parse};
 
         let b = BinaryExpr {
             op: TokenType::new(T_LOR),
-            lhs: Box::new(parse("1").expect("parses")),
-            rhs: Box::new(parse("a").expect("parses")),
+            lhs: Box::new(crate::complexity_guard::parse_guarded("1").expect("parses")),
+            rhs: Box::new(crate::complexity_guard::parse_guarded("a").expect("parses")),
             modifier: None,
         };
         let ctx = crate::eval::QueryWindow::for_test();
@@ -1089,8 +1089,8 @@ mod tests {
         // and the other operand order.
         let b = BinaryExpr {
             op: TokenType::new(T_LOR),
-            lhs: Box::new(parse("a").expect("parses")),
-            rhs: Box::new(parse("1").expect("parses")),
+            lhs: Box::new(crate::complexity_guard::parse_guarded("a").expect("parses")),
+            rhs: Box::new(crate::complexity_guard::parse_guarded("1").expect("parses")),
             modifier: None,
         };
         let err = super::eval_binary(&Evaluator::new(), &source(), &b, 0, &ctx)
