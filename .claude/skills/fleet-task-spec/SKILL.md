@@ -104,8 +104,15 @@ default otherwise: read `nproc` and DERIVE the cap from it rather than
 matching a known machine shape, then prefix every cargo command and every
 script that runs cargo with `CARGO_BUILD_JOBS=<that number>`. Use
 `min(4, max(2, nproc / 4))`, and report the `uname -m`, the `nproc` and the
-value you used. `scripts/gates.sh` caps jobs on an 8 GB host by itself;
-nothing else does.
+value you used. `scripts/gates.sh` also caps jobs by itself, but by MEMORY rather than
+cores (`mem_gb -le 11` gives 2), and its own comment says an explicit
+`CARGO_BUILD_JOBS` in the environment WINS. So the value you export
+overrides that cap for every gate run through it. On the 8-core box this
+paragraph is about, roughly 15 GB, gates.sh would not have capped at all
+and the core-derived 2 is the safer of the two. On a box where memory does
+not track cores at the usual ratio the two rules can disagree the other
+way, so if `nproc` and the memory you see look mismatched, say so in your
+report rather than assuming the derived number is right.
 
 Derive it; do not enumerate. This paragraph used to name two shapes,
 x86_64-with-16-cores and aarch64-with-4-cores, and branch on them. At
