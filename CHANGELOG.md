@@ -8,6 +8,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Prometheus alert rules ship in `deploy/prometheus/ravel.rules.yaml`**
+  (issue #1730). `deploy/` previously held one dashboard graphing host CPU,
+  no rule file and no `PrometheusRule` manifest, so about twenty alert
+  conditions lived only as prose rows in the troubleshooting guide and four
+  complete rules inside fenced blocks in the observability guide. The shipped
+  file carries those conditions with the thresholds and durations the guides
+  state. A test parses it and asserts every metric it names appears in a
+  rendered `/metrics` body, so a metric rename fails the build instead of
+  leaving a rule that matches no series and pages nobody, and it compares the
+  observability guide's reprinted copies against the shipped file so the two
+  cannot drift.
+
 - **`GET /api/v1/rules` serves the loaded alert rules in the Prometheus rules
   shape** (issue #1711). A process running an alert evaluator (`all` or `query`
   mode) now answers the Prometheus rules API with the rule set it parsed at
