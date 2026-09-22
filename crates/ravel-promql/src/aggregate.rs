@@ -833,12 +833,12 @@ mod tests {
     #[test]
     fn unknown_aggregator_token_rejects_without_panicking() {
         use crate::eval::Error;
+        use promql_parser::parser::AggregateExpr;
         use promql_parser::parser::token::{T_ADD, TokenType};
-        use promql_parser::parser::{AggregateExpr, parse};
 
         let agg = AggregateExpr {
             op: TokenType::new(T_ADD),
-            expr: Box::new(parse("m").expect("parses")),
+            expr: Box::new(crate::complexity_guard::parse_guarded("m").expect("parses")),
             param: None,
             modifier: None,
         };
@@ -863,12 +863,12 @@ mod tests {
     #[test]
     fn aggregate_over_non_vector_inner_expr_rejects_without_panicking() {
         use crate::eval::Error;
+        use promql_parser::parser::AggregateExpr;
         use promql_parser::parser::token::{T_SUM, TokenType};
-        use promql_parser::parser::{AggregateExpr, parse};
 
         let agg = AggregateExpr {
             op: TokenType::new(T_SUM),
-            expr: Box::new(parse("1").expect("parses")),
+            expr: Box::new(crate::complexity_guard::parse_guarded("1").expect("parses")),
             param: None,
             modifier: None,
         };
@@ -892,12 +892,12 @@ mod tests {
     #[test]
     fn scalar_param_missing_rejects_without_panicking() {
         use crate::eval::Error;
+        use promql_parser::parser::AggregateExpr;
         use promql_parser::parser::token::{T_TOPK, TokenType};
-        use promql_parser::parser::{AggregateExpr, parse};
 
         let agg = AggregateExpr {
             op: TokenType::new(T_TOPK),
-            expr: Box::new(parse("m").expect("parses")),
+            expr: Box::new(crate::complexity_guard::parse_guarded("m").expect("parses")),
             param: None,
             modifier: None,
         };
@@ -918,13 +918,15 @@ mod tests {
     #[test]
     fn scalar_param_non_scalar_rejects_without_panicking() {
         use crate::eval::Error;
+        use promql_parser::parser::AggregateExpr;
         use promql_parser::parser::token::{T_TOPK, TokenType};
-        use promql_parser::parser::{AggregateExpr, parse};
 
         let agg = AggregateExpr {
             op: TokenType::new(T_TOPK),
-            expr: Box::new(parse("m").expect("parses")),
-            param: Some(Box::new(parse(r#""x""#).expect("parses"))),
+            expr: Box::new(crate::complexity_guard::parse_guarded("m").expect("parses")),
+            param: Some(Box::new(
+                crate::complexity_guard::parse_guarded(r#""x""#).expect("parses"),
+            )),
             modifier: None,
         };
         let ctx = crate::eval::QueryWindow::for_test();
@@ -953,12 +955,12 @@ mod tests {
     #[test]
     fn count_values_param_missing_rejects_without_panicking() {
         use crate::eval::Error;
+        use promql_parser::parser::AggregateExpr;
         use promql_parser::parser::token::{T_COUNT_VALUES, TokenType};
-        use promql_parser::parser::{AggregateExpr, parse};
 
         let agg = AggregateExpr {
             op: TokenType::new(T_COUNT_VALUES),
-            expr: Box::new(parse("m").expect("parses")),
+            expr: Box::new(crate::complexity_guard::parse_guarded("m").expect("parses")),
             param: None,
             modifier: None,
         };
@@ -982,13 +984,15 @@ mod tests {
     #[test]
     fn count_values_param_non_string_rejects_without_panicking() {
         use crate::eval::Error;
+        use promql_parser::parser::AggregateExpr;
         use promql_parser::parser::token::{T_COUNT_VALUES, TokenType};
-        use promql_parser::parser::{AggregateExpr, parse};
 
         let agg = AggregateExpr {
             op: TokenType::new(T_COUNT_VALUES),
-            expr: Box::new(parse("m").expect("parses")),
-            param: Some(Box::new(parse("1").expect("parses"))),
+            expr: Box::new(crate::complexity_guard::parse_guarded("m").expect("parses")),
+            param: Some(Box::new(
+                crate::complexity_guard::parse_guarded("1").expect("parses"),
+            )),
             modifier: None,
         };
         let input = Evaluator::new()

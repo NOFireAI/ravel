@@ -64,6 +64,25 @@
 //! [`MAX_QUERY_COMPLEXITY`] is sized to still comfortably fit a real
 //! query's non-string structure (function calls, `by`/`without` clauses,
 //! a few dozen matcher names/operators) even without that exclusion.
+//!
+//! # One parse of caller text
+//!
+//! [`parse_guarded`] runs [`check`] and then parses, and it is the only
+//! place in this crate (and in `ravel-query`'s PromQL path) that reaches
+//! `promql_parser`'s front end, so a caller cannot get to the parser with
+//! the guard skipped. `crate::eval`, `crate::plan`, `crate::redact` and
+//! `ravel_query::engine`'s selector pre-parse all go through it. Before
+//! that, each parse site carried its own [`check`] call by convention; the
+//! same convention on the SQL side had a parse site that never had the call
+//! at all, found only when it was made a property (issue #1760).
+//!
+//! `scripts/guards/check-guarded-promql-parse.sh` keeps it that way: it
+//! refuses any other mention of a PromQL parser front end under
+//! `crates/ravel-promql/src/` and `crates/ravel-query/src/`, so a new entry
+//! point that parses on its own fails the gate rather than a reader's
+//! attention. That guard refuses the shapes that reach the parser by naming
+//! or importing it; test code that needs the raw front end carries a
+//! `guarded-parse-allow:` marker with its reason (issue #1817).
 
 use std::fmt;
 
@@ -152,6 +171,33 @@ pub fn check(query: &str) -> Result<(), QueryTooComplex> {
     }
 
     Ok(())
+}
+
+/// A [`parse_guarded`] failure: the text was refused by [`check`], or the
+/// parser rejected it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GuardedParseError {
+    /// [`check`] refused the text before it was parsed.
+    #[error(transparent)]
+    TooComplex(#[from] QueryTooComplex),
+
+    /// The parser rejected the text. The message is the parser's own, so it
+    /// can quote a caller literal (an illegal regex message quotes the
+    /// pattern): a caller that stores or logs it must replace it with a
+    /// fixed label first, the way `crate::redact` does.
+    #[error("{0}")]
+    Parse(String),
+}
+
+/// Run [`check`] over `query` and then parse it.
+///
+/// This is the only parse of caller text in this crate and in
+/// `ravel-query`'s PromQL path. See the module documentation for why the
+/// guard is part of the parse rather than a call every parse site is
+/// expected to remember, and for the check that keeps it that way.
+pub fn parse_guarded(query: &str) -> Result<promql_parser::parser::Expr, GuardedParseError> {
+    check(query)?;
+    promql_parser::parser::parse(query).map_err(GuardedParseError::Parse)
 }
 
 #[cfg(test)]
@@ -244,5 +290,40 @@ mod tests {
         // as inside the string, not as the start of fresh structure.
         let query = format!(r#"up{{job="a\"{}"}}"#, "(".repeat(400));
         assert!(check(&query).is_ok());
+    }
+
+    #[test]
+    fn parse_guarded_returns_the_parsed_expression() {
+        let expr = parse_guarded(r#"up{job="api"}"#).expect("parses");
+        assert!(
+            matches!(expr, promql_parser::parser::Expr::VectorSelector(_)),
+            "{expr}"
+        );
+    }
+
+    #[test]
+    fn parse_guarded_rejects_before_it_parses() {
+        // Syntactically valid PromQL, refused for size alone: the rejection
+        // must be the guard's, not the parser's, and it must carry the
+        // measured count so a caller can report it.
+        let mut query = String::from("1");
+        for _ in 0..600 {
+            query.push_str("+1");
+        }
+        let err = parse_guarded(&query).expect_err("must be rejected");
+        let GuardedParseError::TooComplex(too_complex) = err else {
+            panic!("expected a guard rejection, got {err:?}");
+        };
+        assert_eq!(too_complex.max, MAX_QUERY_COMPLEXITY);
+        assert!(too_complex.count > MAX_QUERY_COMPLEXITY);
+    }
+
+    #[test]
+    fn parse_guarded_reports_a_parse_failure_as_the_parser_saw_it() {
+        let err = parse_guarded("up{").expect_err("malformed input");
+        assert!(
+            matches!(err, GuardedParseError::Parse(_)),
+            "expected a parser rejection, got {err:?}"
+        );
     }
 }

@@ -455,6 +455,15 @@ pub enum Error {
     TooComplex(#[from] crate::complexity_guard::QueryTooComplex),
 }
 
+impl From<crate::complexity_guard::GuardedParseError> for Error {
+    fn from(e: crate::complexity_guard::GuardedParseError) -> Self {
+        match e {
+            crate::complexity_guard::GuardedParseError::TooComplex(e) => Error::TooComplex(e),
+            crate::complexity_guard::GuardedParseError::Parse(message) => Error::Parse(message),
+        }
+    }
+}
+
 /// Default PromQL lookback: 5 minutes, in nanoseconds (ADR-0007). This is
 /// the single source of truth for the lookback delta. The evaluator uses it
 /// as its default lookback window ([`Evaluator::default`]) and `ravel-query`
@@ -723,8 +732,7 @@ impl Evaluator {
         query: &str,
         t_ms: i64,
     ) -> Result<(Value, Annotations), Error> {
-        crate::complexity_guard::check(query)?;
-        let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
+        let expr = crate::complexity_guard::parse_guarded(query)?;
         let t_ns = ms_to_ns(t_ms)?;
         let ctx = QueryWindow {
             start_ns: t_ns,
@@ -834,8 +842,7 @@ impl Evaluator {
             });
         }
 
-        crate::complexity_guard::check(query)?;
-        let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
+        let expr = crate::complexity_guard::parse_guarded(query)?;
         let ctx = QueryWindow {
             start_ns,
             end_ns,
@@ -3330,7 +3337,7 @@ mod tests {
             )
             .expect("valid series");
 
-        let expr = promql_parser::parser::parse("up[5m]").expect("parses");
+        let expr = crate::complexity_guard::parse_guarded("up[5m]").expect("parses");
         let promql_parser::parser::Expr::MatrixSelector(ms) = expr else {
             panic!("expected matrix selector");
         };
@@ -3364,7 +3371,7 @@ mod tests {
             )
             .expect("valid series");
 
-        let expr = promql_parser::parser::parse("up[5m]").expect("parses");
+        let expr = crate::complexity_guard::parse_guarded("up[5m]").expect("parses");
         let promql_parser::parser::Expr::MatrixSelector(ms) = expr else {
             panic!("expected matrix selector");
         };

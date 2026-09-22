@@ -46,7 +46,7 @@
 //! identical keyed-hash scheme.
 
 use promql_parser::label::Matchers;
-use promql_parser::parser::{self, Expr};
+use promql_parser::parser::Expr;
 
 /// The fixed prefix every token carries, so a redacted value is visually
 /// distinguishable from a real label value at a glance.
@@ -105,8 +105,7 @@ pub fn audit_token(token_key: &[u8; 32], value: &[u8]) -> String {
 /// operands change, and only into other valid values. See the module docs for
 /// the exact redaction rules (and why numeric literals stay readable).
 pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> {
-    crate::complexity_guard::check(query).map_err(|_| RedactError::Parse)?;
-    let mut expr = parser::parse(query).map_err(|_| RedactError::Parse)?;
+    let mut expr = crate::complexity_guard::parse_guarded(query).map_err(|_| RedactError::Parse)?;
     redact_expr(&mut expr, token_key);
     Ok(expr.to_string())
 }
@@ -199,7 +198,7 @@ mod tests {
         assert!(!out.contains("prod"), "raw value leaked: {out}");
 
         // The redacted output is valid PromQL again.
-        promql_parser::parser::parse(&out).expect("redacted output re-parses");
+        crate::complexity_guard::parse_guarded(&out).expect("redacted output re-parses");
     }
 
     #[test]
@@ -245,7 +244,7 @@ mod tests {
         );
         // Function name and structure stay readable.
         assert!(out.contains("label_replace("), "function preserved: {out}");
-        promql_parser::parser::parse(&out).expect("redacted output re-parses");
+        crate::complexity_guard::parse_guarded(&out).expect("redacted output re-parses");
     }
 
     #[test]
@@ -259,7 +258,7 @@ mod tests {
             "numeric threshold should stay readable: {out}"
         );
         assert!(!out.contains(TOKEN_PREFIX), "no token expected: {out}");
-        promql_parser::parser::parse(&out).expect("redacted output re-parses");
+        crate::complexity_guard::parse_guarded(&out).expect("redacted output re-parses");
     }
 
     #[test]
@@ -283,7 +282,7 @@ mod tests {
             !out.contains("api"),
             "label value should be tokenized: {out}"
         );
-        promql_parser::parser::parse(&out).expect("redacted output re-parses");
+        crate::complexity_guard::parse_guarded(&out).expect("redacted output re-parses");
     }
 
     #[test]
@@ -307,12 +306,12 @@ mod tests {
 
     #[test]
     fn error_display_never_leaks_input_literals() {
-        // The raw parser message DOES quote the offending literal verbatim:
-        // this documents the leak the fixed-label Parse error closes. An
-        // illegal regex in a `=~` matcher makes promql_parser echo the
-        // pattern text in its own error message.
+        // The raw parser message DOES quote the offending literal verbatim,
+        // and the funnel forwards it unchanged: this documents the leak the
+        // fixed-label Parse error closes. An illegal regex in a `=~` matcher
+        // makes promql_parser echo the pattern text in its own error message.
         let probe = r#"up{user=~"[alice@example.com"}"#;
-        let raw = parser::parse(probe)
+        let raw = crate::complexity_guard::parse_guarded(probe)
             .expect_err("malformed input")
             .to_string();
         assert!(
