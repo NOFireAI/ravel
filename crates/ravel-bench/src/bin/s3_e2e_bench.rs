@@ -48,6 +48,7 @@ async fn main() {
         ack_timeout_secs: args.ack_timeout_secs,
         query: args.query,
         query_count: args.query_count,
+        max_flush_lifetime: ravel_ingest::IngestConfig::default().max_flush_lifetime,
     };
     let report = run(&config).await;
 
@@ -84,10 +85,7 @@ fn print_human_table(report: &Report) {
         report.flushes_by_size, report.flushes_by_age, report.flushes_manual
     );
     println!("  put_retries       : {}", report.put_retries);
-    println!(
-        "  abandoned         : retry_exhausted={} input_rejected={}",
-        report.abandoned_retry_exhausted, report.abandoned_input_rejected
-    );
+    println!("{}", format_abandoned_line(report));
     println!(
         "  acks ok/err       : {}/{}",
         report.acks_ok, report.acks_err
@@ -123,4 +121,53 @@ fn print_human_table(report: &Report) {
         "  query requests    : get={} list={} bytes_read={}",
         report.query_get_count, report.query_list_count, report.query_bytes_read
     );
+}
+
+fn format_abandoned_line(report: &Report) -> String {
+    format!(
+        "  abandoned         : retry_exhausted={} queue_deadline={} input_rejected={}",
+        report.abandoned_retry_exhausted,
+        report.abandoned_queue_deadline,
+        report.abandoned_input_rejected
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_bench::e2e::E2eConfig;
+    use ravel_object_store::ObjectStoreBackend;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// `max_flush_lifetime: Duration::ZERO` deterministically abandons the
+    /// sole flush in the queue (same guard `ravel_bench::ingest`'s and
+    /// `ravel_bench::e2e`'s own tests of this name use), so the rendered
+    /// abandoned-reasons line must show it under `queue_deadline`, not folded
+    /// into `retry_exhausted` and not missing entirely.
+    #[tokio::test]
+    async fn abandoned_queue_deadline_appears_in_rendered_report() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let config = E2eConfig {
+            store,
+            store_label: "memory".to_string(),
+            shards: 1,
+            target_series: 1,
+            points_per_sec: 1,
+            duration_secs: 1,
+            batch_size: 1,
+            ack_timeout_secs: 5,
+            query: "bench_gauge".to_string(),
+            query_count: 0,
+            max_flush_lifetime: Duration::ZERO,
+        };
+
+        let report = run(&config).await;
+
+        assert_eq!(
+            format_abandoned_line(&report),
+            "  abandoned         : retry_exhausted=0 queue_deadline=1 input_rejected=0"
+        );
+    }
 }

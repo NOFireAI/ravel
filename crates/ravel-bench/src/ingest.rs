@@ -132,6 +132,7 @@ impl IngestBenchArgs {
             ack_timeout_secs: self.ack_timeout_secs,
             max_inflight_flushes: self.max_inflight_flushes,
             flush_delay_policy: self.flush_delay_policy,
+            max_flush_lifetime: IngestConfig::default().max_flush_lifetime,
         }
     }
 }
@@ -149,6 +150,12 @@ pub struct IngestBenchConfig {
     pub ack_timeout_secs: u64,
     pub max_inflight_flushes: u32,
     pub flush_delay_policy: FlushDelayPolicy,
+    /// Passed straight through to `IngestConfig::max_flush_lifetime`. Not a
+    /// CLI flag (`to_config` fills it with `IngestConfig::default()`'s
+    /// value): exists so a test can force the pre-acquire abandon guard
+    /// deterministically, without a real wait for the production 3600s
+    /// default.
+    pub max_flush_lifetime: Duration,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -221,6 +228,7 @@ pub struct Report {
     pub in_flight_depth: DepthReport,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
+    pub abandoned_queue_deadline: u64,
     pub abandoned_input_rejected: u64,
     pub acks_ok: u64,
     pub acks_err: u64,
@@ -398,6 +406,7 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         shard_count: config.shards,
         max_inflight_flushes: config.max_inflight_flushes,
         adaptive_flush_delay: config.flush_delay_policy.adaptive(),
+        max_flush_lifetime: config.max_flush_lifetime,
         ..IngestConfig::default()
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -715,6 +724,7 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         in_flight_depth: depth,
         put_retries: metrics.put_retries,
         abandoned_retry_exhausted: metrics.abandoned_retry_exhausted,
+        abandoned_queue_deadline: metrics.abandoned_queue_deadline,
         abandoned_input_rejected: metrics.abandoned_input_rejected,
         acks_ok: metrics.acks_ok,
         acks_err: metrics.acks_err,
@@ -751,5 +761,51 @@ mod tests {
         assert_eq!(report.samples, 0);
         assert_eq!(report.max_observed, 0);
         assert!(report.histogram.is_empty());
+    }
+
+    /// `max_flush_lifetime: Duration::ZERO` makes a flush's flush-open
+    /// deadline equal to its own open reading, so the pre-acquire guard
+    /// (`ravel_ingest::shard`, issue #1739 part 2) abandons it before it
+    /// takes a permit or attempts a store call, deterministically and with no
+    /// real wait for the production 3600s lifetime. One series, one sample,
+    /// one batch (`generate_batches` with `batch_size` fixed at 1 and a
+    /// single-sample workload yields exactly one batch of one point) means
+    /// exactly one flush and exactly one abandonment.
+    #[tokio::test]
+    async fn queue_deadline_abandonment_is_reported_under_its_own_reason() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let config = IngestBenchConfig {
+            store,
+            store_label: "memory".to_string(),
+            shards: 1,
+            target_series: 1,
+            points_per_sec: 1,
+            duration_secs: 1,
+            batch_size: 1,
+            ack_timeout_secs: 5,
+            max_inflight_flushes: 1,
+            flush_delay_policy: FlushDelayPolicy::Fixed,
+            max_flush_lifetime: Duration::ZERO,
+        };
+
+        let report = run(&config).await;
+
+        assert_eq!(
+            report.abandoned_queue_deadline, 1,
+            "the sole flush opened already past its zeroed lifetime deadline"
+        );
+        assert_eq!(
+            report.abandoned_retry_exhausted, 0,
+            "the guard fires before any store call, so no retry budget is spent"
+        );
+        assert_eq!(
+            report.abandoned_input_rejected, 0,
+            "the point was well-formed; nothing was rejected at admission"
+        );
+        assert_eq!(
+            report.accepted_points, 0,
+            "the sole write's flush was abandoned, never acked as accepted"
+        );
     }
 }

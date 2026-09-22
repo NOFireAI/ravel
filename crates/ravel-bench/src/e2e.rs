@@ -46,6 +46,11 @@ pub struct E2eConfig {
     pub query: String,
     /// Number of repeated instant queries run for the latency percentiles.
     pub query_count: usize,
+    /// Passed straight through to `IngestConfig::max_flush_lifetime`.
+    /// `s3_e2e_bench` fills it with `IngestConfig::default()`'s value: exists
+    /// so a test can force the pre-acquire abandon guard deterministically,
+    /// without a real wait for the production 3600s default.
+    pub max_flush_lifetime: Duration,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -86,6 +91,7 @@ pub struct Report {
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
+    pub abandoned_queue_deadline: u64,
     pub abandoned_input_rejected: u64,
     pub acks_ok: u64,
     pub acks_err: u64,
@@ -160,6 +166,7 @@ pub async fn run(config: &E2eConfig) -> Report {
 
     let ingest_config = IngestConfig {
         shard_count: config.shards,
+        max_flush_lifetime: config.max_flush_lifetime,
         ..IngestConfig::default()
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -437,6 +444,7 @@ pub async fn run(config: &E2eConfig) -> Report {
         flushes_manual: metrics.flushes_manual,
         put_retries: metrics.put_retries,
         abandoned_retry_exhausted: metrics.abandoned_retry_exhausted,
+        abandoned_queue_deadline: metrics.abandoned_queue_deadline,
         abandoned_input_rejected: metrics.abandoned_input_rejected,
         acks_ok: metrics.acks_ok,
         acks_err: metrics.acks_err,
@@ -450,5 +458,54 @@ pub async fn run(config: &E2eConfig) -> Report {
         query_get_count,
         query_list_count,
         query_bytes_read,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same guard as `ravel_bench::ingest`'s test of the same name:
+    /// `max_flush_lifetime: Duration::ZERO` makes the sole flush's deadline
+    /// equal to its own open reading, so it is abandoned in the queue
+    /// deterministically, with no real wait for the production 3600s
+    /// lifetime and no store call. `query_count: 0` skips the query phase
+    /// entirely, since nothing was ever written for it to match.
+    #[tokio::test]
+    async fn queue_deadline_abandonment_is_reported_under_its_own_reason() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let config = E2eConfig {
+            store,
+            store_label: "memory".to_string(),
+            shards: 1,
+            target_series: 1,
+            points_per_sec: 1,
+            duration_secs: 1,
+            batch_size: 1,
+            ack_timeout_secs: 5,
+            query: "bench_gauge".to_string(),
+            query_count: 0,
+            max_flush_lifetime: Duration::ZERO,
+        };
+
+        let report = run(&config).await;
+
+        assert_eq!(
+            report.abandoned_queue_deadline, 1,
+            "the sole flush opened already past its zeroed lifetime deadline"
+        );
+        assert_eq!(
+            report.abandoned_retry_exhausted, 0,
+            "the guard fires before any store call, so no retry budget is spent"
+        );
+        assert_eq!(
+            report.abandoned_input_rejected, 0,
+            "the point was well-formed; nothing was rejected at admission"
+        );
+        assert_eq!(
+            report.accepted_points, 0,
+            "the sole write's flush was abandoned, never acked as accepted"
+        );
     }
 }
