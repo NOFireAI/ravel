@@ -1227,9 +1227,16 @@ fn query_id_bytes(
 ///   elsewhere and does not raise or lower this cap.
 ///
 /// Both caps are PER SLICE. Each in-flight slice decodes through its own
-/// decoder carrying the full cap, so a coordinator fanning out to
-/// [`partition::DEFAULT_MAX_PARALLEL_SLICES`] slices holds up to that many
-/// times the per-slice byte cap in wire bytes, and more once decoded.
+/// decoder carrying the full cap, so what a coordinator can hold at once is the
+/// per-slice cap times the number of decoders in flight, and more once decoded.
+/// That multiplier is NOT
+/// [`partition::DEFAULT_MAX_PARALLEL_SLICES`] alone, on either path: a local
+/// fan-out runs `promql_fetch_fanout` selectors at once and each of those runs
+/// up to `max_parallel_slices` slices, so the count is their product (64 at the
+/// defaults), and a federated query is bounded by neither, since
+/// [`federation::Federation::fetch`] spawns one task per configured cluster.
+/// `codec::slice_cap_tests::the_documented_fan_out_worst_case_matches_the_constants`
+/// pins both figures against the constants.
 ///
 /// Both refusals are a typed [`DistribError::Codec`] naming the exact counts,
 /// and [`cap_refusal_error`] maps them to the budget class (HTTP 422), not to
