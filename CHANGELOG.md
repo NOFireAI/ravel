@@ -440,25 +440,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   out the exact condition it built, `True` or `False` with its Pending or Failed
   reason, and records it before it creates or deletes the qualify Job, so a
   failure in that API call cannot drop it either.
-- **`sum`/`avg` and `rate`/`increase`/`delta` over custom-bucket (NHCB)
-  native histograms now compare the bucket boundaries, not just the
-  custom-buckets schema sentinel** (issue #1851). Both reducers guarded a
-  mixed exponential/custom group by comparing `uses_custom_buckets()` alone.
-  Two custom-bucket histograms both carry the `-53` sentinel scale, so that
-  check passed them through whatever boundaries they held, and the fold then
-  merged bucket `i` of one boundary set into bucket `i` of another: a `sum`
-  over series with different bounds, or a `rate` window whose bounds changed
-  mid-window, produced a histogram whose buckets combined unrelated value
-  ranges, with nothing to say so. Both reducers now compare the boundaries
-  with `FloatHistogram::custom_bounds_match`, the same bit-pattern comparison
-  the `h + h`/`h - h` binary-operator path already aligns its operands with,
-  so bounds differing only in the sign of zero count as different. A group or
-  window that fails the comparison yields no sample. That drop is
+- **`sum`/`avg`, `rate`/`increase`/`delta`, `irate`/`idelta` and `resets` over
+  custom-bucket (NHCB) native histograms now compare the bucket boundaries,
+  not just the custom-buckets schema sentinel** (issue #1851). Three reducers
+  guarded a mixed exponential/custom group by comparing `uses_custom_buckets()`
+  alone: `histogram::sum_histograms` (behind `sum` and `avg`),
+  `histogram::histogram_rate` (behind `rate`, `increase` and `delta`) and
+  `functions::rate::instant_value_hist` (behind `irate` and `idelta`). Two
+  custom-bucket histograms both carry the `-53` sentinel scale, so that check
+  passed them through whatever boundaries they held, and the fold then merged
+  bucket `i` of one boundary set into bucket `i` of another: a `sum` over
+  series with different bounds, a `rate` window whose bounds changed
+  mid-window, or an `idelta` over two adjacent samples whose bounds differ,
+  each produced a histogram whose buckets combined unrelated value ranges,
+  with nothing to say so. All three now compare the boundaries with
+  `FloatHistogram::custom_bounds_match`, the same bit-pattern comparison the
+  `h + h`/`h - h` binary-operator path already aligns its operands with, so
+  bounds differing only in the sign of zero count as different. A group,
+  window or adjacent pair that fails the comparison yields no sample.
+  `irate`/`idelta` also raise a `vector contains histograms with mismatched
+  custom buckets` warning, since that path has an annotation channel; the
+  other two return a bare `Option` and drop silently. The drop is
   conservative rather than a match for Prometheus v3.13.1, which re-buckets
   differing bounds onto the intersection of the two boundary sets and raises
-  an info annotation; these two reducers return a bare `Option` and have no
-  annotation channel, so reconciling in them would combine the two silently.
-  Raising that annotation needs the reducers' callers and is not done here.
+  an info annotation, as `combine_custom_reconciled` already does for the
+  binary-operator path. Reconciling in the reducers instead would need their
+  callers in `aggregate.rs` and `over_time.rs` and is not done here.
+  `FloatHistogram::detect_reset` carried the same defect in comparison rather
+  than combination form: it compares per-bucket populations by absolute index,
+  so a boundary change read as "no reset" whenever no index happened to shrink.
+  It now reports a boundary change as a reset, the same answer it already gave
+  an exponential/custom mix. `resets` is the only caller whose answer changes:
+  the three reducers above drop a differing-bounds window before any reset
+  detection runs.
 
 ## [0.15.0] - 2026-09-08
 
