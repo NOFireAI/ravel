@@ -425,6 +425,21 @@ pub const MAX_SHARD_COUNT: u32 = 10_000;
 /// ADR-0052 section 3 formula (below) are each named and independently
 /// reviewable, rather than folded into one unexplained literal.
 ///
+/// A third term is now reachable and this constant does NOT cover it. Issue
+/// #1740 added a per-shard queued-flush cap to `ravel-ingest`: at the cap a
+/// size or age trigger is refused and the rows stay buffered, while the
+/// ingest-hour bucket is pinned from the clock reading taken after that
+/// refusal, so a deferred flush's records land in a later ingest hour than
+/// their routing. One deferral round waits for a queued flush to leave the
+/// shard's `JoinSet`, which under a stalled store takes up to
+/// `max_flush_lifetime`, and nothing makes the retry fair, so nothing bounds
+/// the number of rounds. At today's defaults one round alone gives
+/// `40s + 3600s + 3600s = 7240s`, past the 7200s this constant allows.
+/// `ravel_ingest::shard::tests::the_flush_bound_slack_covers_a_deferred_flush`
+/// computes both figures from the ingest terms. The constant is deliberately
+/// left alone here: closing the gap is a decision about ingest's deferral
+/// policy, not about this number, and it is open on issue #1740.
+///
 /// This is a manually-chosen constant local to `ravel-catalog`, deliberately
 /// not a cross-crate reference to `ravel-ingest`'s flush config:
 /// `ravel-catalog` must not depend on `ravel-ingest` (the dependency runs the

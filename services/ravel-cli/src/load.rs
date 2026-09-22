@@ -130,10 +130,15 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// windows compose as
 /// `shards * min(pipeline_depth, max_inflight_flushes, max_queued_flushes)`
 /// (ADR-0807, third term added by the ADR-1642 amendment and issue #1740: a
-/// shard refuses a trigger once it holds `max_queued_flushes` spawned and
-/// unreaped flush tasks, so it never spawns enough to use more permits than
-/// that; the loader takes the `IngestConfig` default of 8, which is above
-/// both other windows at their defaults of 4): an inner window below the
+/// shard refuses an ordinary trigger once it holds `max_queued_flushes`
+/// spawned and unreaped flush tasks, so it never spawns enough to use more
+/// permits than that; a drain and a buffer over its memory backstop are exempt
+/// and spawn past the cap, so the third term binds the steady state, not every
+/// instant). The loader leaves that cap at the `IngestConfig` default of 8 and
+/// does not carry `ravel-server`'s `Cli::resolve_flush_concurrency` raise, so
+/// a `--max-inflight-flushes` or `--pipeline-depth` above 8 is silently
+/// capped at 8 here rather than warned about; at their own defaults of 4 the
+/// cap is above both and never binds. An inner window below the
 /// outer one re-serialises each shard's
 /// PUT round trips and makes batches queue behind a semaphore they will still
 /// have to clear before [`write_ack_deadline`] elapses, and an inner window
