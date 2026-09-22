@@ -408,19 +408,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **The shipped Maintain IAM template now grants the delete the erasure-request
-  sweep needs** (issue #1849). ADR-0064 section 6 gives Maintain delete on
-  `del/*.dreq` only, but `deploy/iam/maintain.json`'s `MaintainDelete`
-  statement named no resource under `del/`. IAM is default-deny, so on a
-  deployment running the shipped template every attempt by the `.dreq` sweep to
-  retire a completed erasure request was refused: completed requests were never
+- **The shipped Maintain IAM template now grants all three permissions the
+  erasure-request sweep needs** (issue #1849). ADR-0064 section 6 gives
+  Maintain read on `del/**` and delete on `del/*.dreq`, but
+  `deploy/iam/maintain.json` named no resource and no `s3:prefix` under `del/`
+  at all. IAM is default-deny, so on a deployment running the shipped template
+  the `.dreq` sweep was refused outright: completed erasure requests were never
   retired, and the query-time exclusion filter that reads them grew without
-  bound for the life of the deployment. The statement now carries
-  `t/*/*/del/*.dreq`. Completion records (`del/*.done`) remain undeletable by
-  every role, including Maintain, as the ADR requires. An operator who already
+  bound for the life of the deployment. One pass of
+  `sweep_erasure_requests_inner` makes three calls on that prefix and each now
+  has its grant: `MaintainList` admits the `s3:prefix`
+  `t/*/*/del/*` the pass LISTs, `MaintainRead` reaches `t/*/*/del/*.done` for
+  the completion record whose timestamp anchors the protection horizon, and
+  `MaintainDelete` reaches `t/*/*/del/*.dreq` for the request object itself.
+  The delete grant alone was unreachable, since the pass fails on the
+  `ListBucket` before it sees a request object. Both reads are scoped tighter
+  than the ADR's `del/**`: the sweep parses request ids from `.dreq` keys and
+  never fetches a `.dreq` body. Completion records remain undeletable by every
+  role, including Maintain, as the ADR requires. An operator who already
   applied an earlier copy of `maintain.json` must re-apply it; the fix is in
   the template, not in any running binary, so upgrading Ravel alone changes
-  nothing.
+  nothing. Re-applying lets the sweep run again and the backlog drains over
+  subsequent passes as each request's protection horizon elapses, not at once.
 - **An `--s3-endpoint` written with no URL scheme is refused at startup**
   (issue #1911). `minio:9000` used to be accepted by the endpoint rule, which
   only decides whether plaintext is allowed, and then killed the process from
