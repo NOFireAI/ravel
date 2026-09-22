@@ -313,3 +313,69 @@ CRD has no field for the queue cap, so any cluster running more than eight
 permits would have crash-looped every gateway pod on upgrade with no
 custom-resource edit able to recover it. Lowering the permit count instead
 would have discarded configured concurrency silently.
+
+### The deferral moves the ingest hour, and stays that way (issue #1916)
+
+The cap has a consequence beyond the deadline slip above. The ingest-hour
+bucket a flush pins is read when the flush OPENS, so a deferred flush pins the
+hour it finally opened in rather than the hour its refused trigger fired in.
+The deferral's own length therefore lands in the span between a record's
+routing and its bucket, which is what `ravel_catalog::FLUSH_BOUND_SLACK_HOURS`
+(2h) bounds for the read side. A deferral is unbounded in both directions: one
+round waits for a queued flush to leave the `JoinSet`, up to
+`max_flush_lifetime` under a stalled store, and `flush_aged` retries in
+`HashMap` order with no fairness, so the number of rounds is not bounded
+either. At the shipped defaults one round alone is `40s + 3600s + 3600s =
+7240s` against 7200s. A straggler deferred at the cap during a shard-count
+decrease can land in an ingest hour the retiring generation's scan set no
+longer covers.
+
+This amendment does NOT close that, and the reason is the decision worth
+recording, because the closing move is not the one it looks like.
+
+Pinning the bucket before the cap check and carrying it across the deferral
+returns the routing-to-pin span to `max_flush_delay_idle` and needs no change
+to the frozen constant, which is why it is the obvious fix. It is the wrong
+one: it moves the same unbounded overrun to the other side of the flush, onto
+the catalog's sealed-hour watermark. The catalog seals an ingest hour `H` once
+`max_flush_lifetime + clock_skew_allowance + fold_safety_margin` have passed
+since `H` ended, 4800s at the shipped catalog defaults. That margin is the
+budget for the span between a flush pinning `H` and its commit record landing,
+and it is sized for one flush lifetime BECAUSE the pin is taken at flush open.
+A carried pin spends the deferral out of it instead. A trigger firing at the
+end of `H` leaves the whole 4800s and no more, while one deferral round costs
+up to `max_flush_lifetime` (3600s) and the flush it then opens gets its own
+3600s before abandonment: 7200s against 4800s, with a single round.
+
+The two failures are not comparable in severity, which is what decides it. A
+record past the scan slack is invisible to the retiring generation of a
+shard-count decrease, for the width of that window, and a commit token minted
+for it still resolves. A record in a sealed hour is never read again at all:
+resolution starts its listing at `watermark_hour + 1`, so the folded snapshot
+is all that represents `H` from then on and it was written without that record,
+and the fold watermark only moves forward, so nothing re-folds `H`. The
+seal-divergence check classifies it `missing`, and that check detects and
+reports; it never repairs.
+
+Raising `FLUSH_BOUND_SLACK_HOURS` is not available either. It is a frozen
+read-side contract (ADR-0052 section 3), and no fixed value bounds an unbounded
+number of deferral rounds in any case.
+
+So the gap stays open and documented rather than half-closed, and what closes
+it is bounding the deferral itself: a cap on rounds, a ceiling on total
+deferral age, or a policy that converts a long deferral into something other
+than a retry. That is a decision about the cap's own policy, not about either
+constant, and it is issue #1916.
+
+Three tests in `ravel_ingest::shard::tests` hold this in place rather than
+leaving it to the prose. `a_deferred_flush_takes_the_ingest_hour_it_opened_in`
+pins where the bucket comes from, driving a real refusal across an ingest-hour
+boundary. `a_deferred_flush_can_overrun_the_flush_bound_slack` defers three
+ingest hours against the two-hour constant on a live shard actor and asserts
+the overrun, naming this issue and the documents to update in its failure
+message. `carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour` holds the
+4800s arithmetic against `ravel-catalog`'s own margin constants, so raising one
+of them re-opens the question here rather than silently making the rejected fix
+look safe. The first two are behavioural on purpose: the arithmetic-only guard
+they replaced restated the terms someone believed the code produced and passed
+whether or not a deferral reached the pin, which is how this shipped green.
