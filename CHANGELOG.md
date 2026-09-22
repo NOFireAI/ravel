@@ -54,6 +54,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+
 - **Native histogram samples whose shape Prometheus itself rejects are now
   refused at ingest, on both the OTLP and Remote Write surfaces**
   (issue #1858). This is a behaviour change at the ingest boundary: a sender
