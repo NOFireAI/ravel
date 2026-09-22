@@ -199,8 +199,7 @@ worse.
 **Recording rules are out of scope for v1.** Ravel has no recording-rule
 concept. `ravel-alerting` models alerting rules with a threshold condition,
 not Prometheus `record:` semantics. (Since #1711, `GET /api/v1/rules` does
-serve the loaded alerting rule set in the Prometheus response shape; it
-carries no `record:` rules, so the scope decision below is unaffected.) The epic
+serve the loaded alerting rule set in the Prometheus response shape.) The epic
 lists them; this ADR removes them from v1 and names the gap rather than
 carrying an acceptance criterion nothing can satisfy.
 
