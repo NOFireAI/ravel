@@ -365,6 +365,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reason, and records it before it creates or deletes the qualify Job, so a
   failure in that API call cannot drop it either.
 
+- **`ravel-bench` passes `clippy -D warnings` under `--all-features`** (issue
+  #1925). The `read_path_accounting` binary's `Backend::Minio` variant carried
+  an unboxed `S3Config` (at least 224 bytes) next to a data-less `InProcess`
+  variant, so `clippy::large-enum-variant` failed the workspace under
+  `-D warnings` once `--all-features` was in play. The field is now boxed;
+  no call site's behavior changes.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added
