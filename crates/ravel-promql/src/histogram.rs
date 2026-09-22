@@ -1097,14 +1097,13 @@ fn fraction_rank(value: f64, h: &FloatHistogram) -> f64 {
 /// bit-pattern comparison [`crate::binop`] aligns its `h - h` operands with,
 /// so the two paths cannot drift apart on what "same bounds" means.
 ///
-/// Dropping is NOT Prometheus v3.13.1's answer for differing bounds: that
-/// version re-buckets both operands onto the intersection of their boundary
-/// sets and raises an info annotation (see
-/// [`FloatHistogram::combine_custom_reconciled`], which the binary-operator
-/// path uses). This reducer returns a bare `Option` and has no channel to
-/// raise that info on, so reconciling here would combine the two silently.
-/// The drop is the conservative choice for a case with no oracle fixture, not
-/// verified parity with upstream.
+/// Dropping is not upstream parity; see
+/// [`FloatHistogram::custom_bounds_match`] for what v3.13.1 does instead.
+/// It is the conservative choice for a case with no oracle fixture.
+/// Reconciling here would need an annotation: this function returns a bare
+/// `Option`, so raising one means changing its callers in `aggregate` and
+/// `functions::over_time`, both of which already hold an annotation context,
+/// rather than changing this signature.
 pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<FloatHistogram> {
     if samples.len() < 2 {
         return None;
@@ -1172,10 +1171,8 @@ pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<Fl
 /// keeps the first member's boundaries throughout a custom-buckets fold, so
 /// comparing each addend against it compares it against every member.
 ///
-/// This drop carries the same caveat as [`histogram_rate`]'s: Prometheus
-/// v3.13.1 reconciles differing bounds onto their intersection and annotates
-/// rather than dropping, and this function has no annotation channel to do
-/// that without hiding it from the caller.
+/// This drop carries the same caveat as [`histogram_rate`]'s, stated once on
+/// [`FloatHistogram::custom_bounds_match`].
 pub fn sum_histograms<'a>(
     mut group: impl Iterator<Item = &'a FloatHistogram>,
 ) -> Option<FloatHistogram> {
