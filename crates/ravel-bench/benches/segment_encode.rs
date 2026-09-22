@@ -94,9 +94,10 @@ fn axis_inputs(samples_per_series: usize, labels_per_series: usize) -> Vec<Serie
         .collect()
 }
 
-/// samples-per-series x labels-per-series sweep for encode, v1 and v2 each.
-/// Case ids are `s{samples}_l{labels}_v1` / `_v2`. Same untimed
-/// clone-in-setup pattern as `bench_segment_encode`: the deep
+/// samples-per-series x labels-per-series sweep for encode. Case ids are
+/// `s{samples}_l{labels}` with the writer's version suffix appended below
+/// (see the module doc above for the current RSEG writer version). Same
+/// untimed clone-in-setup pattern as `bench_segment_encode`: the deep
 /// fixture clone is charged to setup, only the write is timed.
 fn bench_segment_encode_axis_sweep(c: &mut Criterion) {
     let mut group = c.benchmark_group("segment_encode_axis_sweep");
