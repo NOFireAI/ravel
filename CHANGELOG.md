@@ -33,10 +33,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cancels the RPC. The byte ceiling is derived from the sample budget rather
   than picked as a round number: it is `DEFAULT_MAX_SAMPLES` (10000000) times
   the widest wire cost of one scalar sample (18 bytes), plus the frame cap
-  times 48 bytes of per-frame framing as headroom, so a slice carrying the
-  whole sample budget a worker is allowed to return still fits under it. The
-  ceiling is fixed: it applies with no configuration at all, and nothing raises
-  or lowers it. In particular it is independent of `max_bytes_scanned`, which
+  times 48 bytes of per-frame framing as headroom, so a slice of plain scalar
+  runs carrying the whole sample budget, every sample at its widest encoding,
+  encodes inside it. The ceiling is reachable and is meant to be: per-sample
+  provenance columns, long labels, and native-histogram frames all cost more
+  than that derivation counts, and only a federated (resolve-scope) slice is
+  bounded at `max_samples` by the worker itself, while an intra-cluster slice
+  has no per-slice sample limit at all. A slice that does cross it is refused
+  as a budget error naming both figures. The ceiling is fixed: it applies with
+  no configuration at all, and nothing raises or lowers it. In particular it is independent of `max_bytes_scanned`, which
   budgets the compressed store bytes a slice reads rather than the uncompressed
   bytes it sends back. Both caps are per slice, and what multiplies them
   depends on the path: a local fan-out runs up to `promql_fetch_fanout` times
@@ -48,13 +53,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the query and so carries no stats block; the wire bytes a slice made the
   coordinator accept are reported as `wireBytesConsumed` in `stats.fragments[]`
   on the slices that completed.
-  1048576 response frames and at the coordinator's own `max_bytes_scanned` in
-  wire bytes, both checked before a frame is decoded, and the client stops
-  pulling at the first breach, which cancels the RPC. A breach is a refusal
-  rather than an outage: HTTP 422 naming the observed count and the cap, in the
-  same class a local budget trip uses, not the redacted 503 other slice
-  failures become. The wire bytes a slice made the coordinator accept are
-  reported as `wireBytesConsumed` in `stats.fragments[]`.
 - **The published PromQL conformance figure now says what it measures**
   (issue #1698). The committed table read `132/132 = 100%` under a heading
   that invites it to be read as agreement with Prometheus, while the block is
