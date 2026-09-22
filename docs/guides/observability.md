@@ -770,19 +770,82 @@ is the signal that catches this: its AGE, not its value, is what a dead probe
 task changes, because a *failing* probe still completes a cycle and still
 advances this gauge every `--store-probe-interval`.
 
-Alert on `time() - ravel_store_probe_last_run_timestamp_seconds > 132`. The
-threshold is derived, not a round number: the probe's default interval
-(`store_probe::DEFAULT_STORE_PROBE_INTERVAL`) is 30s, and `store_probe::spawn`
-sleeps a jittered interval (`fold::jittered`) that adds up to 10%, so the
-worst-case gap between two live cycles is `30 * 1.1 = 33` seconds. `132` is
-`store_probe::K` (4) times that 33s ceiling: within that window, a probe that
-was merely failing (not dead) would already have flipped
-`ravel_store_reachable` to 0 and fired the existing `RavelStoreUnreachable`
-rule, since K consecutive real cycles complete well inside it. An alert that
-only fires after this much longer window therefore isolates the case
-`RavelStoreUnreachable` cannot see: the task stopped running probes at all.
-A `for: 5m` hold on top absorbs a single delayed scrape without adding a
-second interval-derived term.
+Alert on `time() - ravel_store_probe_last_run_timestamp_seconds > 132`, for:
+5m. `132` is `K * interval * 1.1`: the probe's default interval
+(`store_probe::DEFAULT_STORE_PROBE_INTERVAL`) is 30s, `store_probe::spawn`
+sleeps a jittered interval (`fold::jittered`) that adds up to 10%, and
+`store_probe::K` is 4, so `4 * 30 * 1.1 = 132`.
+
+That is the sleep-only ceiling between two *scheduled* probes, not the ceiling
+on the gap between two *completed* cycles. `run_probe_cycle` awaits
+`store.get` with no `tokio::time::timeout`, and `ObjectStoreBackend::get`
+itself takes no deadline, so one cycle can run as long as the backend's own
+retry budget allows. For the S3 backend that is `retry_timeout +
+request_timeout` ≈ 180s + 20s = 200s (`S3HttpConfig`'s doc comment in
+`crates/ravel-object-store/src/s3.rs`). So the worst-case gap between two live
+cycle *completions* is `interval * 1.1 + 200s = 33 + 200 = 233s` for the
+default interval — over the 132 threshold, so the raw comparison goes true on
+every cycle of a real outage, not only once the probe task has actually died.
+
+`for: 5m` is what keeps that from paging on an ordinary outage, not the 33s
+sleep ceiling: the comparison is true for only `233 - 132 = 101s` per cycle
+before the next completed cycle re-stamps the gauge and it goes false again,
+well under the 300s `for:` window. A probe that is merely failing (not dead)
+never holds the condition continuously long enough to cross `for: 5m` — and
+`RavelStoreUnreachable` already covers that case, since K consecutive real
+cycles complete well inside 233s. Only a probe that has stopped completing
+cycles altogether keeps the comparison true past `for: 5m`. Do not shrink
+`for:` on the strength of the 33s sleep-only ceiling: a `for: 1m` pages on
+every ordinary store outage, which is the wrong-cause page this alert exists
+to avoid.
+
+Both terms scale with `--store-probe-interval`, which is a flag
+(`ServerConfig::store_probe_interval`, parsed by `parse_store_probe_interval`
+in `services/ravel-server/src/config.rs`), not a fixed constant: `132` is `K *
+interval * 1.1` and must be recomputed for a non-default interval, and so must
+the margin `for: 5m` relies on, `200 - (K - 1) * interval * 1.1`, since a
+larger interval grows the sleep term inside both the threshold and the gap.
+Recompute both before tightening either the threshold or `for:` on a fleet
+that overrides the default, mirroring the caveat the catalog-fold alert above
+states for a non-default `fold_interval`.
+
+#### The store-probe liveness alert
+
+Shipped as part of the `ravel-storage-and-auth` group in
+[`deploy/prometheus/ravel.rules.yaml`](../../deploy/prometheus/ravel.rules.yaml);
+load that file rather than copying the block below. A `ravel-server`
+integration test compares this block against the shipped rule of the same
+name, expression, `for:` duration and severity alike.
+
+```yaml
+groups:
+  - name: ravel-storage-and-auth
+    rules:
+      - alert: RavelStoreProbeStalled
+        # ravel_store_reachable and ravel_store_probe_failures_total are both
+        # written only while the probe task is alive (issue #1728): if
+        # tokio::spawn's task dies, they freeze and RavelStoreUnreachable
+        # never fires. This gauge's age is the only signal that catches a
+        # dead task; a merely failing-but-alive probe already trips
+        # RavelStoreUnreachable well inside this window, so this rule is the
+        # complement, not a duplicate.
+        expr: |
+          time() - ravel_store_probe_last_run_timestamp_seconds > 132
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel process's background store probe has not completed a
+            cycle in over four probe intervals
+          description: >-
+            The probe task itself has likely died: tokio::spawn has no
+            restart path and nothing observes its JoinHandle. Check the
+            process logs for a panic in the probe task; a store outage alone
+            does not hold this condition true long enough to fire, since
+            RavelStoreUnreachable already covers a probe that is failing but
+            still running.
+```
 
 ### Durable auth refresh (`ravel_durable_auth_*`)
 

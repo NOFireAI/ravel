@@ -469,6 +469,31 @@ groups:
             The guide states this condition with no duration, so no for: is
             set.
           runbook: docs/guides/operations/troubleshooting.md#readiness-storage-and-authentication
+      - alert: RavelStoreProbeStalled
+        # ravel_store_reachable and ravel_store_probe_failures_total are both
+        # written only while the probe task is alive (issue #1728): if
+        # tokio::spawn's task dies, they freeze and RavelStoreUnreachable
+        # never fires. This gauge's age is the only signal that catches a
+        # dead task; a merely failing-but-alive probe already trips
+        # RavelStoreUnreachable well inside this window, so this rule is the
+        # complement, not a duplicate.
+        expr: |
+          time() - ravel_store_probe_last_run_timestamp_seconds > 132
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel process's background store probe has not completed a
+            cycle in over four probe intervals
+          description: >-
+            The probe task itself has likely died: tokio::spawn has no
+            restart path and nothing observes its JoinHandle. Check the
+            process logs for a panic in the probe task; a store outage alone
+            does not hold this condition true long enough to fire, since
+            RavelStoreUnreachable already covers a probe that is failing but
+            still running.
+          runbook: docs/guides/observability.md#the-store-probe-liveness-alert
       - alert: RavelBucketProtectionUnknown
         expr: |
           ravel_bucket_protection_unknown == 1
