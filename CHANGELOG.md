@@ -408,7 +408,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   coordinator to whole-query local execution. The removed items were public in
   `ravel_query::distrib::client`, so any out-of-tree caller of them has to move
   to `SliceStreamDecoder`. `RemoteSliceFetcher` gains `with_max_frames` and
-  `with_max_bytes` for lowering either cap.
+  `with_max_bytes`, `pub(crate)` test seams that replace either cap outright
+  (not lower it).
 - **Native histogram samples whose shape Prometheus itself rejects are now
   refused at ingest, on both the OTLP and Remote Write surfaces**
   (issue #1858). This is a behaviour change at the ingest boundary: a sender

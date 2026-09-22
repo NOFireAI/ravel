@@ -260,20 +260,25 @@ impl RemoteSliceFetcher {
         }
     }
 
-    /// Lower this fetcher's per-slice frame cap, the
+    /// Replace this fetcher's per-slice frame cap, the
     /// [`SliceStreamDecoder::with_max_frames`] seam one level up: the real
     /// constant is sized so no ordinary slice reaches it, which also makes it
     /// impractical to drive over a real stream. A fetcher that does not call
-    /// this is bounded by the constant.
-    pub fn with_max_frames(mut self, max_frames: usize) -> Self {
+    /// this is bounded by the constant. Test-only (`pub(crate)`): nothing
+    /// outside this crate's test modules calls it, and production code sets
+    /// caps on [`SliceStreamDecoder`] directly.
+    #[cfg(test)]
+    pub(crate) fn with_max_frames(mut self, max_frames: usize) -> Self {
         self.max_frames = Some(max_frames);
         self
     }
 
-    /// Lower this fetcher's per-slice wire-byte cap, the
+    /// Replace this fetcher's per-slice wire-byte cap, the
     /// [`SliceStreamDecoder::with_max_bytes`] seam one level up, for the same
-    /// reason.
-    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+    /// reason. Test-only (`pub(crate)`), for the same reason as
+    /// [`with_max_frames`](Self::with_max_frames).
+    #[cfg(test)]
+    pub(crate) fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = Some(max_bytes);
         self
     }
@@ -471,14 +476,26 @@ mod tests {
     /// A well-formed terminal summary carrying `code`, real accounting, and the
     /// given counts.
     fn summary_frame(code: pb::status::Code) -> pb::FetchResponse {
+        summary_frame_with_counts(code, 1, 3)
+    }
+
+    /// As [`summary_frame`], with `series_returned`/`samples_returned` set to
+    /// `series_returned`/`samples_returned` instead of the fixed 1/3: a caller
+    /// that streams a different number of series frames builds its summary from
+    /// what it actually sent, so the two cannot silently disagree.
+    fn summary_frame_with_counts(
+        code: pb::status::Code,
+        series_returned: u64,
+        samples_returned: u64,
+    ) -> pb::FetchResponse {
         let mut snap = QueryAccountingSnapshot::default();
         snap.s3_requests[AccountedOp::Get.index()] = 3;
         snap.s3_bytes[AccountedOp::Get.index()] = 99;
         pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
                 accounting: Some(codec::encode_accounting(&snap)),
-                series_returned: 1,
-                samples_returned: 3,
+                series_returned,
+                samples_returned,
                 status: Some(pb::Status {
                     code: code as i32,
                     message: String::new(),
@@ -861,7 +878,19 @@ mod tests {
             let soa = series_soa();
             let mut frames: Vec<_> = (0..self.count).map(|_| Ok(series_frame(&soa))).collect();
             if self.with_summary {
-                frames.push(Ok(summary_frame(pb::status::Code::Ok)));
+                // The declared counts must track what this worker actually put
+                // on the wire (`self.count` series frames, each carrying
+                // `soa.timestamps.len()` samples): a summary hardcoded to a
+                // fixed count would agree with a decode that silently dropped
+                // frames, which is exactly the gap issue #1912's fix round
+                // found in `remote_fetch_under_the_caps_decodes_the_slice`.
+                let series_returned = self.count as u64;
+                let samples_returned = (self.count * soa.timestamps.len()) as u64;
+                frames.push(Ok(summary_frame_with_counts(
+                    pb::status::Code::Ok,
+                    series_returned,
+                    samples_returned,
+                )));
             }
             Ok(tonic::Response::new(Box::pin(futures::stream::iter(
                 frames,
@@ -969,24 +998,50 @@ mod tests {
     /// all would satisfy the two refusal assertions above by accident.
     ///
     /// The worker sends a terminal summary here so the fetch can return `Ok`,
-    /// and the assertion is on the DECODED counts. Asserting `Err(NoSummary)`
-    /// instead -- which an earlier version of this test did -- proves only that
-    /// a stream reached its end: a fetch that accepted every frame and dropped
-    /// each one on the floor satisfies it, and so does the pre-#1912
-    /// collect-then-decode shape, so it could not tell the two apart.
+    /// and the assertions are on the DECODED payload (`response.scalar`), not
+    /// on the summary's counts: `series_returned`/`samples_returned` are
+    /// copied straight out of the terminal summary by `SliceStreamDecoder::
+    /// finish` and never touch what `push` actually decoded, so a fetch that
+    /// accepted every frame and dropped each one on the floor -- reaching the
+    /// same summary-carrying end of stream -- would satisfy a summary-only
+    /// assertion. `FloodWorker` now derives that summary from `self.count` and
+    /// `soa.timestamps.len()` (the frames it actually streamed), so a
+    /// summary-count check is asserted too, but only as a cross-check on top
+    /// of the decoded-payload assertions below, which are the ones a
+    /// frame-dropping decode fails.
     #[test]
     fn remote_fetch_under_the_caps_decodes_the_slice() {
+        let soa = series_soa();
         let response = fetch_from_worker_with_summary(3, |fetcher| {
             fetcher.with_max_frames(4).with_max_bytes(1 << 20)
         })
         .expect("a stream inside both caps decodes");
         assert_eq!(
-            response.series_returned, 1,
-            "the summary's series count must survive the decode"
+            response.scalar.len(),
+            3,
+            "all 3 streamed series frames must land in the decoded payload"
+        );
+        for (i, got) in response.scalar.iter().enumerate() {
+            assert_eq!(
+                got.series_id, soa.series_id,
+                "decoded series {i} must carry the worker's series id"
+            );
+            assert_eq!(
+                got.timestamps, soa.timestamps,
+                "decoded series {i} must carry the worker's timestamps"
+            );
+            assert_eq!(
+                got.values, soa.values,
+                "decoded series {i} must carry the worker's values"
+            );
+        }
+        assert_eq!(
+            response.series_returned, 3,
+            "the summary's series count must match what the worker actually streamed"
         );
         assert_eq!(
-            response.samples_returned, 3,
-            "the summary's sample count must survive the decode"
+            response.samples_returned, 9,
+            "the summary's sample count must match what the worker actually streamed"
         );
     }
 }
