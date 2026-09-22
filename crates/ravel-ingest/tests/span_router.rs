@@ -10,23 +10,12 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use common::{TestClock, tenant};
-use ravel_commit::record::{self, NewCommitRecord};
-use ravel_ingest::{IngestConfig, SpanIngestRouter, SpanWriteError, WriteMode, shard_for_span};
-use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{
-    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
-    PageToken, PutOptions, PutOutcome, StoreError,
-};
-use ravel_otlp::traces_normalize::NormalizedSpan;
-use ravel_rspan::StatusCode;
+use common::{SplitBrainOnFirstCommit, TestClock, span_on_shard, tenant};
+use ravel_ingest::{IngestConfig, SpanIngestRouter, SpanWriteError, WriteMode};
+use ravel_object_store::ObjectStoreBackend;
 use ravel_types::Signal;
-use uuid::Uuid;
 
 const BASE_NS: i64 = 1_700_000_000_000_000_000;
 
@@ -44,33 +33,13 @@ fn flush_on_first(shard_count: u32) -> IngestConfig {
     }
 }
 
-/// A span routed to `want_shard` by its `trace_id` (the span router shards on
-/// the trace id). Varies the first four bytes until the fixture lands.
-fn span_on_shard(want_shard: u32, shard_count: u32, start_ns: i64) -> NormalizedSpan {
-    for i in 0..100_000u32 {
-        let mut trace_id = [0u8; 16];
-        trace_id[..4].copy_from_slice(&i.to_be_bytes());
-        if shard_for_span(&trace_id, shard_count) == want_shard {
-            return NormalizedSpan {
-                trace_id,
-                span_id: [1u8; 8],
-                parent_span_id: None,
-                name: "handle".to_string(),
-                start_ts_ns: start_ns,
-                end_ts_ns: start_ns + 100,
-                status_code: StatusCode::Unset,
-                status_message: None,
-                attrs: vec![("service.name".to_string(), "checkout".to_string())],
-            };
-        }
-    }
-    panic!("no trace_id found for shard {want_shard} of {shard_count}");
-}
-
 #[tokio::test]
 async fn dead_shard_is_observable_and_condemns_on_first_death() {
     let shard_count = 4;
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(SplitBrainOnFirstCommit::new());
+    // `/s/c/` is the span commit keyspace, so only a span flush trips the
+    // poison; `Signal::Spans` stamps the conflicting record landed there.
+    let store: Arc<dyn ObjectStoreBackend> =
+        Arc::new(SplitBrainOnFirstCommit::new("/s/c/", Signal::Spans));
     let clock = TestClock::new(BASE_NS);
     let router = SpanIngestRouter::new(
         flush_on_first(shard_count),
@@ -153,95 +122,4 @@ async fn dead_shard_is_observable_and_condemns_on_first_death() {
     );
 
     router.shutdown().await;
-}
-
-/// Lands a different, structurally valid commit record at the exact key the
-/// first span flush targets and then reports `AlreadyExists`, the state
-/// `publish` classifies as split-brain. That drives the `SplitBrain` panic
-/// inside the span shard actor, killing that task. Keyed on the span commit
-/// keyspace (`/s/c/`) so only a span flush trips it. Mirrors
-/// `log_router.rs`'s `SplitBrainOnFirstCommit` for the log router.
-struct SplitBrainOnFirstCommit {
-    inner: MemoryStore,
-    poisoned: AtomicBool,
-}
-
-impl SplitBrainOnFirstCommit {
-    fn new() -> Self {
-        SplitBrainOnFirstCommit {
-            inner: MemoryStore::new(),
-            poisoned: AtomicBool::new(false),
-        }
-    }
-
-    fn conflicting_record(&self) -> Bytes {
-        let rec = record::build(NewCommitRecord {
-            tenant_hash: tenant("acme").hash(),
-            signal: Signal::Spans,
-            shard: 0,
-            writer_id: Uuid::nil(),
-            writer_epoch: 1,
-            writer_seq: 0,
-            object_size: 1,
-            content_hash: [0xAA; 32],
-            sample_count: 1,
-            series_count: 1,
-            min_event_ts_ns: 0,
-            max_event_ts_ns: 0,
-            min_ingest_ts_ns: 0,
-            max_ingest_ts_ns: 0,
-            segment_format_version: 1,
-            created_unix_ns: 0,
-            ingest_hour_bucket: 0,
-        })
-        .expect("valid conflicting record");
-        record::encode(&rec)
-    }
-}
-
-#[async_trait]
-impl ObjectStoreBackend for SplitBrainOnFirstCommit {
-    async fn put(
-        &self,
-        key: &str,
-        data: Bytes,
-        opts: PutOptions,
-    ) -> Result<PutOutcome, StoreError> {
-        if key.contains("/s/c/") && !self.poisoned.swap(true, Ordering::SeqCst) {
-            self.inner
-                .put(key, self.conflicting_record(), PutOptions::default())
-                .await?;
-            return Err(StoreError::AlreadyExists);
-        }
-        self.inner.put(key, data, opts).await
-    }
-
-    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        self.inner.get(key, range).await
-    }
-
-    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
-        self.inner.head(key).await
-    }
-
-    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        self.inner.list(prefix, page).await
-    }
-
-    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        self.inner.list_delimited(prefix).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.inner.delete(key).await
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        // multipart: false to match the refusing default `put_multipart` this
-        // double inherits.
-        Capabilities {
-            multipart: false,
-            ..self.inner.capabilities()
-        }
-    }
 }

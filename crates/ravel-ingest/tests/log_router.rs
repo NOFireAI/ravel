@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::{TestClock, tenant};
+use common::{SplitBrainOnFirstCommit, TestClock, tenant};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_ingest::{IngestConfig, LogIngestRouter, LogWriteError, WriteMode};
@@ -222,100 +222,13 @@ async fn buffered_write_returns_immediately_with_no_tokens() {
     router.shutdown().await;
 }
 
-/// Lands a different, structurally valid commit record at the exact key the
-/// first flush targets and then reports `AlreadyExists`, the state
-/// `publish` classifies as split-brain. That drives the `SplitBrain` panic
-/// inside the log shard actor, killing that task. Mirrors
-/// `shard_death_observable.rs`'s store for the metrics router.
-struct SplitBrainOnFirstCommit {
-    inner: MemoryStore,
-    poisoned: AtomicBool,
-}
-
-impl SplitBrainOnFirstCommit {
-    fn new() -> Self {
-        SplitBrainOnFirstCommit {
-            inner: MemoryStore::new(),
-            poisoned: AtomicBool::new(false),
-        }
-    }
-
-    fn conflicting_record(&self) -> Bytes {
-        let rec = record::build(NewCommitRecord {
-            tenant_hash: tenant("acme").hash(),
-            signal: Signal::Logs,
-            shard: 0,
-            writer_id: Uuid::nil(),
-            writer_epoch: 1,
-            writer_seq: 0,
-            object_size: 1,
-            content_hash: [0xAA; 32],
-            sample_count: 1,
-            series_count: 1,
-            min_event_ts_ns: 0,
-            max_event_ts_ns: 0,
-            min_ingest_ts_ns: 0,
-            max_ingest_ts_ns: 0,
-            segment_format_version: 1,
-            created_unix_ns: 0,
-            ingest_hour_bucket: 0,
-        })
-        .expect("valid conflicting record");
-        record::encode(&rec)
-    }
-}
-
-#[async_trait]
-impl ObjectStoreBackend for SplitBrainOnFirstCommit {
-    async fn put(
-        &self,
-        key: &str,
-        data: Bytes,
-        opts: PutOptions,
-    ) -> Result<PutOutcome, StoreError> {
-        if key.contains("/c/") && !self.poisoned.swap(true, Ordering::SeqCst) {
-            self.inner
-                .put(key, self.conflicting_record(), PutOptions::default())
-                .await?;
-            return Err(StoreError::AlreadyExists);
-        }
-        self.inner.put(key, data, opts).await
-    }
-
-    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        self.inner.get(key, range).await
-    }
-
-    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
-        self.inner.head(key).await
-    }
-
-    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        self.inner.list(prefix, page).await
-    }
-
-    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        self.inner.list_delimited(prefix).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.inner.delete(key).await
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        // multipart: false to match the refusing default `put_multipart` this
-        // double inherits.
-        Capabilities {
-            multipart: false,
-            ..self.inner.capabilities()
-        }
-    }
-}
-
 #[tokio::test]
 async fn dead_shard_is_observable_and_counted_once() {
     let shard_count = 4;
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(SplitBrainOnFirstCommit::new());
+    // `/c/` is the log commit keyspace; `Signal::Logs` stamps the conflicting
+    // record this double lands there.
+    let store: Arc<dyn ObjectStoreBackend> =
+        Arc::new(SplitBrainOnFirstCommit::new("/c/", Signal::Logs));
     let clock = TestClock::new(BASE_NS);
     let router = LogIngestRouter::new(
         flush_on_first(shard_count),
