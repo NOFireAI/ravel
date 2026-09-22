@@ -85,7 +85,9 @@ use ravel_commit::keys;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
-use ravel_maintain::worker_set::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, run_bounded};
+use ravel_maintain::worker_set::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, run_bounded,
+};
 use ravel_maintain::{
     Bucket, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureRewriteOutcome,
     LeaseCheck, LegalHoldCheck, MaintainError, OrphanPass, PendingErasureRequest,
