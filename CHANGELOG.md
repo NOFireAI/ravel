@@ -23,28 +23,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Native histogram samples whose shape Prometheus itself rejects are now
-  refused at ingest, on both the OTLP and Remote Write surfaces**
-  (issue #1858). This is a behaviour change at the ingest boundary: a sender
-  emitting either shape below had the sample accepted and stored before this
-  release and now has it refused, so check your senders before upgrading.
-  Refused: a `zero_threshold` that is NaN, positive or negative infinity, or
-  negative, on both surfaces; and, on Remote Write, a custom-buckets
-  histogram (`schema == -53`) carrying non-empty negative spans, which a
-  custom-bucket layout has no negative side to hold (OTLP rejects
-  `scale == -53` outright already, so the shape cannot reach that surface).
-  A `zero_threshold` of `+0.0`, `-0.0`, or a subnormal stays admitted:
-  Prometheus' `Histogram.Validate` reads the field only under the
-  custom-buckets schema and never screens an exponential-schema value for
-  magnitude. Both refusals are per-sample, not per-request, and behave like
-  every other structural ingest refusal on their surface: on OTLP the sample
-  is counted in `rejected_data_points` with the reason in the partial-success
-  `error_message` and under the `structural` normalize-reject counter; on
-  Remote Write the request still answers `204`, the sample is counted into
-  the surface's dropped-points counter, and the
-  `X-Prometheus-Remote-Write-Histograms-Written` header excludes it.
-  Refusing new samples does not clean up data already stored with a NaN
-  threshold, so the query-side zero-bucket guards remain in place.
 - **The catalog's per-tenant commit-record cache capacity is now derived from
   the shard count and the configured max flush delay, not a flat 10,000-entry
   constant** (issue #1735). The new `ravel_catalog::derive_cache_capacity_per_tenant`
@@ -266,6 +244,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the operator re-qualifies each existing cluster once against its unchanged
   store. The qualify Job is a one-shot that touches no Deployment, so no serving
   pod is restarted and there is no downtime. Subsequent reconciles are stable.
+- **Native histogram samples whose shape Prometheus itself rejects are now
+  refused at ingest, on both the OTLP and Remote Write surfaces**
+  (issue #1858). This is a behaviour change at the ingest boundary: a sender
+  emitting any shape below had the sample accepted and stored before this
+  release and now has it refused, so check your senders before upgrading.
+  Refused on both surfaces: a `zero_threshold` that is NaN, positive or
+  negative infinity, or negative. Refused on Remote Write for a custom-buckets
+  histogram (`schema == -53`), which has neither a negative side nor a zero
+  bucket: non-empty negative spans, a `zero_threshold` that is not zero, and a
+  `zero_count` that is not zero. Those three join the boundary-list rule
+  already enforced (`custom_values` non-empty and strictly ascending under
+  that schema, and absent under any other), so Remote Write now enforces four
+  rules for the sentinel schema; OTLP enforces them by refusing
+  `scale == -53` outright, since it has no field to carry bucket boundaries,
+  so no custom-buckets shape reaches its normalizer at all. Under the
+  exponential schemas the zero side is untouched: a populated zero bucket
+  stays admitted, as does a `zero_threshold` of `+0.0`, `-0.0`, or a
+  subnormal, because Prometheus' `Histogram.Validate` reads `ZeroThreshold`
+  only under the
+  custom-buckets schema and never screens an exponential-schema value for
+  magnitude. For the custom-buckets rules `+0.0` and `-0.0` both count as
+  zero, matching Prometheus writing that rule as `ZeroThreshold == 0` in Go;
+  every other pattern, a subnormal and a NaN included, does not. Each refusal
+  is per-sample, not per-request, and behaves like every other structural
+  ingest refusal on its surface: on OTLP the sample is counted in
+  `rejected_data_points` with the reason in the partial-success
+  `error_message` and under the `structural` normalize-reject counter; on
+  Remote Write the request still answers `204`, the sample is counted into the
+  surface's dropped-points counter, and the
+  `X-Prometheus-Remote-Write-Histograms-Written` header excludes it. Each of
+  the four Remote Write messages names the field it refused on. Refusing new
+  samples does not clean up data already stored with any of these shapes, so
+  the query-side zero-bucket guards remain in place.
 
 ### Fixed
 
