@@ -2139,9 +2139,11 @@ mod tests {
         };
         assert!(
             flush_bound_ns(&covered) <= slack_ns,
-            "a deferred flush is covered while its terms fit: 40s idle + one \
-             1800s deferral round + 1800s lifetime = {}ns must stay within \
+            "a deferred flush is covered while its terms fit: {:?} idle plus \
+             one deferral round plus {:?} lifetime = {}ns must stay within \
              FLUSH_BOUND_SLACK_HOURS ({}ns)",
+            covered.max_flush_delay_idle,
+            covered.max_flush_lifetime,
             flush_bound_ns(&covered),
             slack_ns
         );
