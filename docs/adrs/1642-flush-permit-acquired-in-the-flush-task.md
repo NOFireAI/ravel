@@ -123,15 +123,24 @@ flowchart LR
     with every other `0`-means-no-limit ceiling in ingest; operators who set it
     accept unbounded buffered flush memory under a long stall.
 
-    Amended by issue #1740: the spawned flush queue is now bounded by
-    `max_queued_flushes` under every budget setting, so "nothing bounds the
-    spawned-but-waiting flush queue except host memory" no longer holds. The
-    bound is `max_queued_flushes` plus one window per tenant buffer over its
-    memory backstop, since a crossing is exempt from the cap. What
-    `Unlimited` still opts out of is the process-wide bound on the sum of
-    buffered rows waiting in the tenant maps; each individual buffer is still
-    bounded by that backstop, which is why the exemption exists. See the
-    amendment below.
+    Amended by issue #1740: ORDINARY triggers (neither `Manual` nor fired on
+    a buffer over its memory backstop) are now bounded by
+    `max_queued_flushes` under every budget setting. The queue as a whole is
+    NOT bounded by any count. Every trigger on a buffer over its backstop is
+    exempt from the cap, each exempt spawn consumes that buffer so the tenant
+    can cross again and spawn again, and nothing caps how many buffers are
+    over the backstop at once or how many times each crosses. Under a
+    `Bounded` byte budget an exempt window stays charged until its PUTs
+    complete, so the accumulation drives the gauge to the ceiling and
+    admission sheds: the byte ceiling, not a count, is what bounds it. Under
+    `Unlimited` (`--max-ingest-buffer-bytes 0`) nothing sheds behind the
+    backstop, so with the store stalled the exempt path is bounded only by
+    how long the stall lasts, and "nothing bounds the spawned-but-waiting
+    flush queue except host memory" still holds for it. What `Unlimited`
+    opts out of is the process-wide bound on the sum of buffered rows
+    waiting in the tenant maps; each individual buffer is still bounded by
+    that backstop, which is why the exemption exists. See the amendment
+    below.
 
   `max_inflight_flushes` keeps its other meaning unchanged: it is the
   concurrency of flushes actually executing against the object store, and so

@@ -1450,7 +1450,10 @@ impl ShardActor {
     /// exceed `max_queued_flushes` under memory pressure, by one window per
     /// backstop's worth of buffered memory (PR #1903 review finding 1): a
     /// bounded buffer plus a queue that grows only as fast as memory fills,
-    /// rather than a bounded queue plus an unbounded buffer. The exempt path is
+    /// rather than a bounded queue plus an unbounded buffer. Slower is not
+    /// bounded: no count bounds the exempt windows, and under
+    /// [`crate::IngestByteBudgetLimit::Unlimited`] with the store stalled only
+    /// the length of the stall does. The exempt path is
     /// this early return, and it is the only way past the length check below;
     /// a refusal is always counted on `flush_trigger_deferred`, so a queue
     /// reading above the cap with no deferral behind it is the exemption at
@@ -2072,6 +2075,88 @@ mod inflight_guard_tests {
             metrics.in_flight_flushes_signed(0),
             0,
             "the guard's own Drop ran, so the pair balanced"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Duration, IngestConfig};
+    use ravel_catalog::FLUSH_BOUND_SLACK_HOURS;
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// The worst-case span `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` must cover
+    /// (ADR-0052 section 3, and the derivation recorded beside that constant),
+    /// recomputed from `config` so that growing any term moves this figure.
+    ///
+    /// Three terms:
+    /// - `max_flush_delay_idle`: the oldest a buffer with no strict waiter gets
+    ///   before its age trigger fires. The validated worst case, since
+    ///   `ravel-server` refuses an idle ceiling below `max_flush_delay`.
+    /// - one deferral round (issue #1740): at `max_queued_flushes` the trigger
+    ///   is refused, the rows stay buffered with `oldest_arrival_ns` unreset,
+    ///   and the flush's `ingest_hour_bucket` is pinned from the clock reading
+    ///   taken after the refusal. The retry re-fires one `flush_tick` later but
+    ///   spawns only once a queued flush leaves the `JoinSet`, and under a
+    ///   stalled store the task holding the permit stays until its store budget
+    ///   expires, `max_flush_lifetime` after its grant.
+    /// - `max_flush_lifetime`: the flush's own budget once it is open.
+    ///
+    /// One round is the floor, not the bound: `flush_aged` retries in `HashMap`
+    /// order with no fairness, so a buffer that keeps losing the race to
+    /// co-resident tenants is deferred again, and nothing counts the rounds.
+    fn flush_bound_ns(config: &IngestConfig) -> i64 {
+        let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
+        let lifetime_ns = config.max_flush_lifetime.as_nanos() as i64;
+        let deferral_round_ns = lifetime_ns + config.flush_tick.as_nanos() as i64;
+        idle_ns + deferral_round_ns + lifetime_ns
+    }
+
+    /// Whether the read-side scan slack covers a flush the queued-flush cap
+    /// deferred (issue #1740). It covers one exactly while the three terms of
+    /// [`flush_bound_ns`] fit inside the constant, and at the shipped ingest
+    /// defaults they do not: a single deferral round costs
+    /// `max_flush_lifetime`, while the constant leaves only
+    /// `2h - (40s + 3600s) = 3560s` over the two terms it was derived from.
+    ///
+    /// Both arms are asserted from the terms, never against the constant's own
+    /// value, so raising an ingest flush term fails the first arm and dropping
+    /// the deferral term from the computation fails the second. The second arm
+    /// pins an open gap rather than a settled property: bounding the deferral
+    /// in `queued_flush_cap_reached` is what would close it, and doing so must
+    /// flip this assertion in the same commit rather than leave it passing on a
+    /// stale reading. Adjusting `FLUSH_BOUND_SLACK_HOURS` to make it pass is
+    /// the one resolution that is not available: that constant is a frozen
+    /// read-side contract (`DEFAULT_SCAN_SLACK_HOURS`, ADR-0052 section 3).
+    #[test]
+    fn the_flush_bound_slack_covers_a_deferred_flush() {
+        let slack_ns = i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR;
+
+        let covered = IngestConfig {
+            max_flush_lifetime: Duration::from_secs(1800),
+            ..IngestConfig::default()
+        };
+        assert!(
+            flush_bound_ns(&covered) <= slack_ns,
+            "a deferred flush is covered while its terms fit: 40s idle + one \
+             1800s deferral round + 1800s lifetime = {}ns must stay within \
+             FLUSH_BOUND_SLACK_HOURS ({}ns)",
+            flush_bound_ns(&covered),
+            slack_ns
+        );
+
+        let shipped = IngestConfig::default();
+        assert!(
+            flush_bound_ns(&shipped) > slack_ns,
+            "at the shipped defaults one deferral round already overruns the \
+             slack ({}ns against {}ns), so a deferred flush can pin an \
+             ingest_hour_bucket outside the scan set a retiring shard-count \
+             generation is kept in. If this assertion fails, the deferral was \
+             bounded: state the new term in flush_bound_ns and flip this arm \
+             rather than relaxing FLUSH_BOUND_SLACK_HOURS (issue #1740)",
+            flush_bound_ns(&shipped),
+            slack_ns
         );
     }
 }

@@ -4850,6 +4850,17 @@ impl Cli {
         // the one that can age all the way to max_flush_delay_idle before a
         // forced flush, so that (not max_flush_delay, the fast-tier floor) is
         // the real worst-case age FLUSH_BOUND_SLACK_HOURS must cover.
+        //
+        // Issue #1740's queued-flush cap adds a third term this check does NOT
+        // carry: a deferred trigger leaves the rows buffered while the flush's
+        // ingest-hour bucket is pinned after the refusal, and one deferral
+        // round under a stalled store costs up to max_flush_lifetime. Adding it
+        // here would refuse the shipped defaults (40s + 3600s + 3600s against a
+        // 7200s slack), which is a decision about ingest's deferral policy and
+        // about a frozen read-side constant, not one to take in this check.
+        // Recorded beside ravel_catalog::FLUSH_BOUND_SLACK_HOURS and computed
+        // by ravel-ingest's the_flush_bound_slack_covers_a_deferred_flush;
+        // open on issue #1740.
         let flush_bound_ns = duration_nanos_saturating(flush_cadence.max_flush_delay_idle)
             .saturating_add(duration_nanos_saturating(
                 ravel_ingest::IngestConfig::default().max_flush_lifetime,
