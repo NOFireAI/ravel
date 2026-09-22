@@ -5,10 +5,12 @@
 //! `deploy/k8s/operator/crd.yaml` is regenerated. Otherwise it runs the
 //! reconcile controller against the ambient Kubernetes environment.
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use clap::Parser;
 use ravel_operator::controller;
+use ravel_operator::health::DEFAULT_HEALTH_ADDR;
 use ravel_operator::ravel_cluster_crd;
 use ravel_tracing_export::OtlpExportConfig;
 use tracing_subscriber::EnvFilter;
@@ -38,6 +40,12 @@ struct Cli {
     /// never blocking a reconcile (ADR-0060 decisions 3 and 6).
     #[arg(long = "otlp-trace-endpoint", value_name = "URL")]
     otlp_trace_endpoint: Option<String>,
+
+    /// Address the `/healthz`, `/readyz`, and `/metrics` listener binds
+    /// (ADR-1731 decision 2). Matches the `health` container port in
+    /// `deploy/k8s/operator/operator.yaml`.
+    #[arg(long = "listen-health", value_name = "ADDR", default_value = DEFAULT_HEALTH_ADDR)]
+    listen_health: SocketAddr,
 }
 
 impl Cli {
@@ -101,7 +109,7 @@ async fn main() -> ExitCode {
     // than propagating `?`, so there is no early return to route around; a
     // shared flush point after the match runs on both the success and error
     // exits without duplicating it in each arm.
-    let exit_code = match controller::run().await {
+    let exit_code = match controller::run(cli.listen_health).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("operator exited with error: {error}");
