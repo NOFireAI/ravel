@@ -101,9 +101,10 @@ fn representative_keys() -> Vec<String> {
             );
             keys.push(maint_cursor_key(&tenant, signal, shard).expect("maint_cursor_key"));
         }
-        // del/ erasure-request and erasure-completion keys are real
-        // ravel-commit shapes (ADR-0064), but no shipped IAM policy grants
-        // any action on del/ today -- see the crate-level doc comment.
+        // del/ erasure-request and erasure-completion keys (ADR-0064). The
+        // maintain template's delete grant reaches the request objects and
+        // must not reach the completion records; both witnesses are what
+        // maintain_template_grants_delete_on_erasure_requests reads.
         keys.push(del_prefix(&tenant, signal));
         keys.push(erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key"));
         keys.push(
@@ -1780,7 +1781,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     },
     // Maintain: the only role that deletes. Compaction and rewrite outputs,
     // maintenance cursors, and the GC/tenancy control objects; its deletes
-    // cover the inputs compaction supersedes plus the non-hold audit shard.
+    // cover the inputs compaction supersedes, the non-hold audit shard, and
+    // the erasure request objects the .dreq sweep retires (ADR-0064 section 6).
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1820,6 +1822,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/l1/*",
             "t/*/*/idem/*",
             "t/*/u/*/0001/*",
+            "t/*/*/del/*.dreq",
         ],
         // Both delete operations, and the same two the Deny names. Maintain is
         // the only role where that identity is load-bearing rather than
@@ -2400,6 +2403,84 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
                      the Deny, unlike the legal-hold shard). Either that ADR \
                      sentence is wrong or a template grants a delete it must not -- \
                      report it, do not weaken this assertion (#1346)"
+                );
+            }
+        }
+    }
+}
+
+/// ADR-0064 section 6: "Maintain gains delete on `del/*.dreq` **only**", and
+/// "`del/*.done` joins the deny-delete set for every role including Maintain".
+///
+/// The `.dreq` sweep in `crates/ravel-maintain/src/sweep.rs` retires a request
+/// object once its `.done` exists, its protection horizon has elapsed, and no
+/// legal hold or still-resolvable superseded input holds it; without this grant
+/// every such delete is refused and the query-time exclusion filter keeps the
+/// request forever. `every_role_grants_exactly_the_expected_pattern_set` pins
+/// the pattern STRING; this asserts what the pattern does to the two real key
+/// shapes `ravel-commit` builds under `del/`, which is the half that separates
+/// the ADR's narrow grant from a `del/*` one that would also reach the
+/// permanent completion records.
+#[test]
+fn maintain_template_grants_delete_on_erasure_requests() {
+    let tenant = test_tenant();
+    let request_id = Uuid::from_u128(2);
+    let maintain = load_policy("maintain");
+    let allows = delete_key_patterns(&maintain, "Allow");
+
+    for signal in ALL_SIGNALS {
+        let dreq = erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
+        assert!(
+            allows.iter().any(|p| glob_matches(p, &dreq)),
+            "maintain: no delete Allow reaches the erasure request {dreq:?}, so \
+             the .dreq sweep is refused on every request object (ADR-0064 §6). \
+             Grants: {allows:?}"
+        );
+
+        let done =
+            erasure_completion_key(&tenant, signal, request_id).expect("erasure_completion_key");
+        for allow in &allows {
+            assert!(
+                !glob_matches(allow, &done),
+                "maintain: delete Allow {allow:?} reaches the completion record \
+                 {done:?}. ADR-0064 §6 makes .done permanent erasure evidence and \
+                 grants delete on .dreq ONLY; widen neither the template nor this \
+                 assertion (#1849)"
+            );
+        }
+
+        let prefix = del_prefix(&tenant, signal);
+        for allow in &allows {
+            assert!(
+                !glob_matches(allow, &prefix),
+                "maintain: delete Allow {allow:?} reaches the del/ prefix object \
+                 {prefix:?}; the ADR grant covers request objects only (#1849)"
+            );
+        }
+    }
+
+    // "only" is a claim about the other three roles as well.
+    for role in ALL_ROLES {
+        if role == "maintain" {
+            continue;
+        }
+        let policy = load_policy(role);
+        for signal in ALL_SIGNALS {
+            let dreq =
+                erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
+            let done = erasure_completion_key(&tenant, signal, request_id)
+                .expect("erasure_completion_key");
+            for allow in &delete_key_patterns(&policy, "Allow") {
+                assert!(
+                    !glob_matches(allow, &dreq),
+                    "{role}: delete Allow {allow:?} reaches the erasure request \
+                     {dreq:?}; ADR-0064 §6 gives that grant to Maintain only (#1849)"
+                );
+                assert!(
+                    !glob_matches(allow, &done),
+                    "{role}: delete Allow {allow:?} reaches the completion record \
+                     {done:?}, which ADR-0064 §6 makes permanent for every role \
+                     (#1849)"
                 );
             }
         }
