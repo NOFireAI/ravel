@@ -155,7 +155,7 @@ pub enum RwRejection {
     /// NaN reaches here too, because the strictly-ascending check is vacuous
     /// over a one-element list.
     #[error(
-        "custom bucket bound with bit pattern {bound_bits:#018x} is not finite, which no custom-bucket layout defines"
+        "custom bucket bound with bit pattern {bound_bits:#018x} is not finite, which the -53 custom-buckets schema does not define"
     )]
     NativeHistogramCustomBucketsNonFinite { bound_bits: u64 },
 
@@ -165,7 +165,7 @@ pub enum RwRejection {
     /// bounds define at most `n + 1` buckets, the last being the implicit
     /// `+Inf` one.
     #[error(
-        "{buckets} positive bucket(s) need at least {} custom bound(s), but only {bounds} were sent",
+        "{buckets} positive bucket(s) under the -53 custom-buckets schema need at least {} custom bound(s), but only {bounds} were sent",
         buckets.saturating_sub(1)
     )]
     NativeHistogramCustomBucketsTooFew { buckets: u64, bounds: usize },
@@ -2139,6 +2139,21 @@ mod tests {
                 }
                 .to_string(),
                 "zero_count",
+            ),
+            (
+                RwRejection::NativeHistogramCustomBucketsNonFinite {
+                    bound_bits: f64::INFINITY.to_bits(),
+                }
+                .to_string(),
+                "not finite",
+            ),
+            (
+                RwRejection::NativeHistogramCustomBucketsTooFew {
+                    buckets: 3,
+                    bounds: 1,
+                }
+                .to_string(),
+                "custom bound",
             ),
         ] {
             assert!(rendered.contains(field), "{rendered}");
