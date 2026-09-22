@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn from_ast_matcher_reuses_anchored_regex() {
-        let expr = promql_parser::parser::parse(r#"up{job=~"api"}"#).expect("parses");
+        let expr = crate::complexity_guard::parse_guarded(r#"up{job=~"api"}"#).expect("parses");
         let promql_parser::parser::Expr::VectorSelector(vs) = expr else {
             panic!("expected vector selector");
         };

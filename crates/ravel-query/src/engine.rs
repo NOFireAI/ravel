@@ -3592,8 +3592,8 @@ fn log_not_federated_warning(name: &str) -> String {
 /// so the pre-fetch window this computes lines up with what the evaluator
 /// itself will later select.
 fn parse_selector(query: &str) -> Result<(Vec<LabelMatcher>, i64), QueryError> {
-    ravel_promql::complexity_guard::check(query).map_err(|e| QueryError::Parse(e.to_string()))?;
-    let expr = promql_parser::parser::parse(query).map_err(QueryError::Parse)?;
+    let expr = ravel_promql::complexity_guard::parse_guarded(query)
+        .map_err(|e| QueryError::Parse(e.to_string()))?;
     let vs = match expr {
         Expr::VectorSelector(vs) => vs,
         other => {
@@ -7888,7 +7888,7 @@ mod prefetch_tests {
                     .expect("an eligible single count_over_time is a target");
 
             // The real evaluator resolution for the identical query and instant.
-            let expr = promql_parser::parser::parse(query).expect("parse");
+            let expr = ravel_promql::complexity_guard::parse_guarded(query).expect("parse");
             let promql_parser::parser::Expr::Call(call) = &expr else {
                 panic!("count_over_time is a call");
             };

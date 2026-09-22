@@ -710,7 +710,7 @@ mod tests {
     }
 
     fn matchers_of(query: &str) -> promql_parser::parser::VectorSelector {
-        let expr = promql_parser::parser::parse(query).expect("valid query");
+        let expr = crate::complexity_guard::parse_guarded(query).expect("valid query");
         match expr {
             promql_parser::parser::Expr::MatrixSelector(ms) => ms.vs,
             promql_parser::parser::Expr::VectorSelector(vs) => vs,
@@ -796,7 +796,7 @@ mod tests {
     }
 
     fn matchers_of_subquery(query: &str) -> promql_parser::parser::SubqueryExpr {
-        let expr = promql_parser::parser::parse(query).expect("valid query");
+        let expr = crate::complexity_guard::parse_guarded(query).expect("valid query");
         match expr {
             promql_parser::parser::Expr::Subquery(sq) => sq,
             other => panic!("expected a subquery, got {other:?}"),

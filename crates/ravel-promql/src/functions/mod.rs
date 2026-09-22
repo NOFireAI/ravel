@@ -1913,7 +1913,7 @@ mod tests {
     fn matrix_arg_on_non_matrix_node_rejects_without_panicking() {
         use crate::eval::Error;
 
-        let expr = promql_parser::parser::parse("1").expect("parses");
+        let expr = crate::complexity_guard::parse_guarded("1").expect("parses");
         let err = match super::matrix_arg(&expr) {
             Ok(_) => panic!("must reject, not panic"),
             Err(e) => e,

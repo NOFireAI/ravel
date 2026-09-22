@@ -275,7 +275,7 @@ mod tests {
     }
 
     fn selector_labels(query: &str) -> LabelSet {
-        let expr = promql_parser::parser::parse(query).expect("parses");
+        let expr = crate::complexity_guard::parse_guarded(query).expect("parses");
         labels_for_absent(&expr)
     }
 
