@@ -1,7 +1,9 @@
 //! `deploy/prometheus/ravel.rules.yaml` ships alert rules an operator loads
-//! verbatim. Every Ravel metric name in that file must name a series Ravel
-//! really renders, or the rule matches nothing and the condition it covers
-//! pages nobody, with no error at scrape time.
+//! verbatim, and `deploy/grafana/dashboards/ravel.json` ships the dashboard
+//! the same operator imports. Every Ravel metric name in either must name a
+//! series Ravel really renders, or the rule matches nothing and the condition
+//! it covers pages nobody, and the panel draws an empty graph that reads as a
+//! quiet subsystem, both with no error at scrape time.
 //!
 //! The assertion is against a RENDERED `/metrics` body, obtained the way
 //! `metrics_endpoint.rs` obtains one (an in-process server on `MemoryStore`,
@@ -28,6 +30,15 @@
 //! compared field by field against the shipped file, which is what keeps a
 //! rename from updating one copy and leaving the other handing readers a dead
 //! rule.
+//!
+//! The dashboard is read by parsing its JSON and walking every object that
+//! carries a `targets` array, then extracting metric names from each target's
+//! PromQL with [`target_metric_names`]. A panel target is an expression, not
+//! a bare name, so the scan runs over that expression with its strings and
+//! its template variables blanked out. Everything below the extraction (the
+//! `ravel_*` token scanner, the rendered bodies, the `# TYPE` reading) is the
+//! same code the rule file goes through: two extractors is how two shipped
+//! files drift apart.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -79,6 +90,39 @@ const EXPECTED_ALERTS: usize = 31;
 /// duration, so they carry no `for:` and say so in an `as_documented`
 /// annotation. `deploy/README.md` states this figure too.
 const EXPECTED_ALERTS_WITHOUT_FOR: usize = 15;
+
+/// The shipped Grafana dashboard over Ravel's own families.
+///
+/// `deploy/grafana/dashboards/ravel-overview.json` is deliberately not read
+/// here: that one belongs to the quickstart and graphs the bundled
+/// collector's host CPU, which is not a Ravel family at all.
+const DASHBOARD_FILE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../deploy/grafana/dashboards/ravel.json"
+);
+
+/// The dashboard's shape, counted off the parsed JSON, and its distinct
+/// `ravel_*` metric names.
+///
+/// Pinned as literals for the same reason [`EXPECTED_METRIC_NAMES`] is: a
+/// walk that finds no panel (a renamed key, a path that stopped resolving, a
+/// nesting shape the walk does not descend into) would otherwise leave the
+/// per-name assertion below iterating an empty set and passing while checking
+/// nothing. `deploy/README.md` states the row and name figures.
+const EXPECTED_DASHBOARD_ROWS: usize = 6;
+const EXPECTED_DASHBOARD_PANELS: usize = 36;
+const EXPECTED_DASHBOARD_TARGETS: usize = 104;
+const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 107;
+
+/// Families the dashboard graphs that no shipped rule alerts on.
+///
+/// Expected, and the reason the dashboard is not just a picture of the rule
+/// file: most of what an operator reads during an incident (cache hit ratios,
+/// planner estimates against actuals, store bytes by operation) is context no
+/// threshold should page on. The complement is asserted in the other
+/// direction: every name the rule file alerts on is graphed somewhere here,
+/// so a page always has a panel to land on.
+const EXPECTED_DASHBOARD_ONLY_NAMES: usize = 70;
 
 /// Fenced `yaml` blocks in the guide, and the alert rules they hold between
 /// them. Pinned so that an extractor that matches no block, or a block that
@@ -555,18 +599,266 @@ fn metric_names(text: &str) -> BTreeSet<String> {
 }
 
 /// The families a rendered exposition really exposes, read off its `# TYPE`
-/// lines.
+/// lines, each mapped to the type that line declares.
 ///
 /// Not [`metric_names`] over the whole body: a family's HELP text names other
 /// families (`ravel_admission_admitted_bytes_total`'s names
 /// `ravel_ingest_wire_bytes_total`), so a substring scan would accept a rule
 /// whose metric only ever appears inside someone else's help string.
-fn exposed_families(body: &str) -> BTreeSet<String> {
+///
+/// The type is carried because a histogram's `# TYPE` line names the base
+/// family alone while its samples are `_bucket`, `_sum` and `_count`; see
+/// [`is_rendered`].
+fn exposed_families(body: &str) -> BTreeMap<String, String> {
     body.lines()
         .filter_map(|line| line.strip_prefix("# TYPE "))
-        .filter_map(|rest| rest.split_whitespace().next())
-        .map(str::to_string)
+        .filter_map(|rest| {
+            let mut fields = rest.split_whitespace();
+            Some((fields.next()?.to_string(), fields.next()?.to_string()))
+        })
         .collect()
+}
+
+/// Whether `name` selects a series the exposition really carries.
+///
+/// A histogram or summary declares one `# TYPE` line for the base family and
+/// renders `<family>_bucket`, `<family>_sum` and `<family>_count` samples
+/// under it, so a `histogram_quantile` over `..._bucket` names a real series
+/// that no `# TYPE` line spells. The suffix is only accepted when the base
+/// family is really one of those two types: `ravel_store_bytes_total_count`
+/// stays a miss.
+fn is_rendered(name: &str, rendered: &BTreeMap<String, String>) -> bool {
+    if rendered.contains_key(name) {
+        return true;
+    }
+    ["_bucket", "_sum", "_count"].iter().any(|suffix| {
+        name.strip_suffix(suffix)
+            .and_then(|base| rendered.get(base))
+            .is_some_and(|kind| kind == "histogram" || kind == "summary")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Reading metric names out of the shipped Grafana dashboard.
+// ---------------------------------------------------------------------------
+
+/// Blanks every quoted string in a PromQL expression, keeping its length.
+///
+/// A panel target is an EXPRESSION, not a bare metric name, and a label value
+/// is arbitrary text: `{job="ravel_server"}` names no metric, but a scan of
+/// the raw expression would put `ravel_server` in the set and then assert it
+/// against `/metrics`, where it fails for a dashboard that is perfectly
+/// correct. Blanking rather than deleting keeps the `:` check below honest
+/// about where in the expression a colon sits.
+///
+/// PromQL's three string forms are handled: `"..."` and `'...'` with
+/// backslash escapes, and raw backtick strings, which have none.
+fn blank_strings(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' && c != '\'' && c != '`' {
+            out.push(c);
+            continue;
+        }
+        out.push(' ');
+        let escapes = c != '`';
+        while let Some(inner) = chars.next() {
+            out.push(' ');
+            if escapes && inner == '\\' {
+                if chars.next().is_some() {
+                    out.push(' ');
+                }
+                continue;
+            }
+            if inner == c {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Blanks every Grafana template variable (`$name`, `${name}`), keeping the
+/// expression's length.
+///
+/// `$__rate_interval` is on nearly every target here, and `${ds}` selects the
+/// datasource. None of them can name a metric family, so removing them before
+/// the scan is what stops a variable that happened to be called `$ravel_x`
+/// from entering the set: the `$` is not an identifier character, so the
+/// scanner would otherwise read the name straight through it.
+fn blank_template_variables(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut at = 0usize;
+    while at < bytes.len() {
+        if bytes[at] != b'$' {
+            out.push(expr[at..].chars().next().expect("char boundary"));
+            at += expr[at..].chars().next().expect("char boundary").len_utf8();
+            continue;
+        }
+        let mut end = at + 1;
+        let braced = end < bytes.len() && bytes[end] == b'{';
+        if braced {
+            end += 1;
+        }
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if braced && end < bytes.len() && bytes[end] == b'}' {
+            end += 1;
+        }
+        out.push_str(&" ".repeat(end - at));
+        at = end;
+    }
+    out
+}
+
+/// The Ravel metric names one panel target's PromQL expression selects.
+///
+/// Strings and template variables are blanked first, then [`metric_names`]
+/// runs over what is left, so the only tokens that can enter the set are
+/// identifiers in the expression itself. PromQL function names cannot reach
+/// it either: every one of them (`rate`, `sum`, `histogram_quantile`,
+/// `clamp_min`, `time`) fails the `ravel_` prefix.
+///
+/// A colon in what is left is refused rather than scanned. A colon there can
+/// only be a recording rule name (`job:ravel_x:rate5m`), whose left and right
+/// segments would each be read as a metric, and whose real name never appears
+/// on a `/metrics` body at all because Prometheus, not Ravel, computes it.
+/// This dashboard uses no recording rules; adding one means deciding what
+/// this test should hold it to, not silently widening the scan.
+fn target_metric_names(expr: &str) -> BTreeSet<String> {
+    let scannable = blank_template_variables(&blank_strings(expr));
+    assert!(
+        !scannable.contains(':'),
+        "dashboard target {expr:?} holds a colon outside a string, which can only be a recording \
+         rule name; no recording rule name appears on a /metrics body"
+    );
+    metric_names(&scannable)
+}
+
+/// What one walk of the dashboard found.
+struct Dashboard {
+    rows: usize,
+    /// Objects carrying a `targets` array, wherever they sit.
+    panels: usize,
+    targets: usize,
+    names: BTreeSet<String>,
+}
+
+/// Collects every object in the dashboard JSON that carries a `targets`
+/// array, at any depth.
+///
+/// Grafana stores panels in two shapes and this dashboard emits both: an
+/// uncollapsed row is a marker panel in the top-level `panels` array with its
+/// content following it as siblings, while a collapsed row (the `Alerting`
+/// row here) holds its content nested in its own `panels` array. A walk that
+/// only read the top level would silently drop the whole collapsed row, which
+/// is the failure the pinned counts exist to catch. Recursing over every
+/// value covers both shapes and any third one a future Grafana export uses.
+fn collect_target_holders<'a>(node: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+    match node {
+        serde_json::Value::Object(fields) => {
+            if fields
+                .get("targets")
+                .is_some_and(serde_json::Value::is_array)
+            {
+                out.push(node);
+            }
+            for value in fields.values() {
+                collect_target_holders(value, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_target_holders(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parses the shipped dashboard and reads every metric name its panel targets
+/// select.
+///
+/// The three shapes the walk can meet, and what each does:
+///
+/// * A panel with no `targets` key at all (every row marker here, and any
+///   text panel a later edit adds) queries nothing, so it contributes no name
+///   and is not counted in [`EXPECTED_DASHBOARD_PANELS`]. An EMPTY `targets`
+///   array is a different thing and is refused: that is a graph panel that
+///   draws nothing, not a panel that was never meant to query.
+/// * A target with no `expr` key, or one holding only whitespace, is refused.
+///   Grafana saves such a target when a query was started and abandoned; it
+///   draws nothing, and accepting it would let a panel quietly stop covering
+///   what its title says it covers.
+/// * A template variable inside an expression is blanked before the scan (see
+///   [`blank_template_variables`]). A `templating.list` entry of type `query`
+///   is refused outright: its own query is PromQL that this walk does not
+///   read, so allowing one would put a metric reference in the dashboard that
+///   nothing here holds to the rendered body.
+fn shipped_dashboard() -> Dashboard {
+    let text = std::fs::read_to_string(DASHBOARD_FILE)
+        .unwrap_or_else(|e| panic!("shipped dashboard {DASHBOARD_FILE} must be readable: {e}"));
+    let dashboard: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("shipped dashboard {DASHBOARD_FILE} must be valid JSON: {e}"));
+
+    for variable in dashboard["templating"]["list"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{DASHBOARD_FILE} must carry a templating.list array"))
+    {
+        let kind = variable["type"].as_str().unwrap_or_else(|| {
+            panic!("every templating entry of {DASHBOARD_FILE} must declare a type")
+        });
+        assert_ne!(
+            kind, "query",
+            "templating variable {:?} is a query variable, whose own PromQL this test does not \
+             read; a metric named only there would never be held to a rendered body",
+            variable["name"]
+        );
+    }
+
+    let mut holders = Vec::new();
+    collect_target_holders(&dashboard, &mut holders);
+
+    let mut targets = 0usize;
+    let mut names = BTreeSet::new();
+    for panel in &holders {
+        let title = panel["title"].as_str().unwrap_or("<untitled>");
+        let panel_targets = panel["targets"].as_array().expect("checked above");
+        assert!(
+            !panel_targets.is_empty(),
+            "panel {title:?} of {DASHBOARD_FILE} carries an empty `targets` array, so it draws \
+             nothing; a panel that is not meant to query carries no `targets` key"
+        );
+        for target in panel_targets {
+            targets += 1;
+            let expr = target["expr"].as_str().unwrap_or_else(|| {
+                panic!("a target of panel {title:?} of {DASHBOARD_FILE} carries no `expr` string")
+            });
+            assert!(
+                !expr.trim().is_empty(),
+                "a target of panel {title:?} of {DASHBOARD_FILE} carries an empty `expr`, so it \
+                 draws nothing"
+            );
+            names.extend(target_metric_names(expr));
+        }
+    }
+
+    let rows = dashboard["panels"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{DASHBOARD_FILE} must carry a panels array"))
+        .iter()
+        .filter(|panel| panel["type"] == "row")
+        .count();
+
+    Dashboard {
+        rows,
+        panels: holders.len(),
+        targets,
+        names,
+    }
 }
 
 /// Mirrors `metrics_endpoint.rs`'s helper, with the three knobs this test
@@ -747,7 +1039,10 @@ async fn every_metric_named_by_a_shipped_rule_is_rendered() {
         rendered.len()
     );
 
-    let missing: Vec<&String> = names.iter().filter(|n| !rendered.contains(*n)).collect();
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|n| !is_rendered(n, &rendered))
+        .collect();
     assert!(
         missing.is_empty(),
         "shipped rules name metrics no /metrics body renders: {missing:?}"
@@ -826,4 +1121,118 @@ fn the_guide_and_the_shipped_rule_file_agree() {
             "alert {name:?} carries no severity label"
         );
     }
+}
+
+/// The shipped dashboard is held to the same standard as the shipped rule
+/// file: a panel whose target selects a family Ravel does not render draws a
+/// flat empty graph, and an operator reading it during an incident concludes
+/// the subsystem is idle rather than that the panel is broken.
+///
+/// The assertion is against the RENDERED exposition, not against the string
+/// literals in `services/ravel-server/src/metrics.rs`: a family declared in
+/// the source that nothing ever writes a sample for, or one behind an
+/// off-by-default feature, passes a source scan and still leaves the panel
+/// empty.
+#[tokio::test]
+async fn every_metric_named_by_the_dashboard_is_rendered() {
+    let dashboard = shipped_dashboard();
+    assert_eq!(
+        dashboard.rows, EXPECTED_DASHBOARD_ROWS,
+        "the dashboard must carry exactly {EXPECTED_DASHBOARD_ROWS} rows, found {}",
+        dashboard.rows
+    );
+    assert_eq!(
+        dashboard.panels, EXPECTED_DASHBOARD_PANELS,
+        "the dashboard must carry exactly {EXPECTED_DASHBOARD_PANELS} querying panels, found {}",
+        dashboard.panels
+    );
+    assert_eq!(
+        dashboard.targets, EXPECTED_DASHBOARD_TARGETS,
+        "the dashboard must carry exactly {EXPECTED_DASHBOARD_TARGETS} panel targets, found {}",
+        dashboard.targets
+    );
+    assert_eq!(
+        dashboard.names.len(),
+        EXPECTED_DASHBOARD_METRIC_NAMES,
+        "the dashboard must name exactly {EXPECTED_DASHBOARD_METRIC_NAMES} distinct Ravel \
+         metrics, found {}: {:?}",
+        dashboard.names.len(),
+        dashboard.names
+    );
+
+    let body = rendered_bodies().await;
+    let rendered = exposed_families(&body);
+    let missing: Vec<&String> = dashboard
+        .names
+        .iter()
+        .filter(|name| !is_rendered(name, &rendered))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the dashboard graphs metrics no /metrics body renders: {missing:?}"
+    );
+}
+
+/// What the dashboard covers beyond the rule file, and what it must not
+/// leave uncovered.
+///
+/// Every metric a shipped rule alerts on has to be graphed here, so a page
+/// has a panel to land on. The converse is not required and is not true: most
+/// of the dashboard is context no threshold should page on.
+#[test]
+fn the_dashboard_graphs_every_metric_a_shipped_rule_alerts_on() {
+    let groups = shipped_rule_groups();
+    let mut alerted = BTreeSet::new();
+    for alert in groups.iter().flat_map(|group| group.rules.iter()) {
+        alerted.extend(metric_names(&alert.expr));
+        for text in alert.annotations.values() {
+            alerted.extend(metric_names(text));
+        }
+    }
+    assert_eq!(
+        alerted.len(),
+        EXPECTED_METRIC_NAMES,
+        "shipped rule file must name exactly {EXPECTED_METRIC_NAMES} distinct Ravel metrics"
+    );
+
+    let dashboard = shipped_dashboard();
+    let ungraphed: Vec<&String> = alerted
+        .iter()
+        .filter(|name| !dashboard.names.contains(*name))
+        .collect();
+    assert!(
+        ungraphed.is_empty(),
+        "these metrics carry a shipped alert and no dashboard panel: {ungraphed:?}"
+    );
+
+    let dashboard_only = dashboard.names.difference(&alerted).count();
+    assert_eq!(
+        dashboard_only, EXPECTED_DASHBOARD_ONLY_NAMES,
+        "the dashboard must graph exactly {EXPECTED_DASHBOARD_ONLY_NAMES} metrics no shipped rule \
+         alerts on, found {dashboard_only}"
+    );
+}
+
+/// The extractor reads metric names out of an EXPRESSION, and the two things
+/// in a PromQL expression that look like identifiers and are not are a label
+/// value and a template variable.
+///
+/// Pinned here rather than left to the dashboard, which today contains no
+/// label value holding the `ravel_` substring: the guard is what keeps a
+/// later `{job="ravel_server"}` filter from putting a name that is not a
+/// metric into the set and failing a dashboard that is correct.
+#[test]
+fn the_extractor_reads_selectors_and_not_label_values_or_variables() {
+    let names = target_metric_names(
+        "sum by (op) (rate(ravel_store_calls_total{job=\"ravel_server\", pod=~\"$ravel_pod\"}\
+         [$__rate_interval])) / clamp_min(ravel_store_ok_total, 1)",
+    );
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "ravel_store_calls_total".to_string(),
+            "ravel_store_ok_total".to_string(),
+        ]),
+        "only the two selectors are metric names; the job label value and the pod variable are not"
+    );
 }
