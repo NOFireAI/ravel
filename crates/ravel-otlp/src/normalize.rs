@@ -26,7 +26,11 @@
 //! carries no custom-bucket boundaries, so `scale == -53` (the custom-buckets
 //! sentinel) is rejected ([`Rejection::NativeHistogramScaleUnsupported`])
 //! rather than stored unbacked; the Remote Write surface admits it, since
-//! that wire format carries the boundaries losslessly.
+//! that wire format carries the boundaries losslessly. A `zero_threshold`
+//! that is NaN, infinite, or negative is rejected
+//! ([`Rejection::NativeHistogramZeroThresholdInvalid`]) by the same
+//! [`zero_threshold_is_admissible`] predicate the Remote Write surface calls,
+//! so neither surface can store one.
 //!
 //! Label mapping follows the standard OTel-to-Prometheus convention:
 //! `resource.attributes["service.name"]` (namespaced by
@@ -1196,6 +1200,12 @@ fn build_histogram_value(dp: &ExponentialHistogramDataPoint) -> Result<Histogram
         return Err(Rejection::NativeHistogramScaleUnsupported { scale: dp.scale });
     }
 
+    if !zero_threshold_is_admissible(dp.zero_threshold) {
+        return Err(Rejection::NativeHistogramZeroThresholdInvalid {
+            zero_threshold_bits: dp.zero_threshold.to_bits(),
+        });
+    }
+
     let positive_spans = buckets_to_spans(dp.positive.as_ref());
     let negative_spans = buckets_to_spans(dp.negative.as_ref());
     let positive = dp
@@ -1227,6 +1237,27 @@ fn build_histogram_value(dp: &ExponentialHistogramDataPoint) -> Result<Histogram
         counts,
         reset_hint: ResetHint::Unknown,
     })
+}
+
+/// Whether a native histogram's `zero_threshold` describes a zero bucket at
+/// all. It is the half-width of the interval `[-t, +t]`, so a NaN, an
+/// infinity, or a negative value names no interval, and every query-side path
+/// that reconciles two histograms' zero buckets would have to carry a guard
+/// for it. `+0.0` and `-0.0` are admissible (an empty zero bucket, the
+/// default a sender that never sets the field sends) and so is a subnormal:
+/// Prometheus' `Histogram.Validate` inspects `ZeroThreshold` only under the
+/// custom-buckets schema, where it requires `ZeroThreshold == 0` (in Go,
+/// `-0.0 == 0` holds), and never screens the exponential-schema value for
+/// magnitude, so refusing either boundary here would refuse a payload
+/// Prometheus itself accepts.
+///
+/// Shared by both ingest surfaces: `ravel_remote_write::normalize` calls this
+/// same function, so the two cannot drift into admitting different shapes.
+pub fn zero_threshold_is_admissible(zero_threshold: f64) -> bool {
+    // Deliberately not `zero_threshold >= 0.0` alone: that is false for NaN,
+    // which would read as a rejection by accident rather than by decision,
+    // and true for `+inf`.
+    zero_threshold.is_finite() && zero_threshold >= 0.0
 }
 
 /// Map one OTLP bucket side to at most one contiguous [`HistogramSpan`]. An
@@ -3436,6 +3467,87 @@ mod tests {
             out.rejected,
             vec![Rejection::NativeHistogramScaleUnsupported { scale: -53 }]
         );
+    }
+
+    /// Helper for the `zero_threshold` cases: normalize one cumulative
+    /// exponential histogram data point carrying `zero_threshold` and
+    /// nothing else that could reject.
+    fn normalize_zero_threshold(zero_threshold: f64) -> NormalizeOutput {
+        let metric = exponential_histogram_metric(
+            "latency_exp",
+            vec![ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                zero_threshold,
+                ..Default::default()
+            }],
+            AggregationTemporality::Cumulative,
+        );
+        let rm = resource_metrics(vec![], vec![metric]);
+        normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        )
+    }
+
+    /// Issue #1858: a `zero_threshold` that names no interval is refused at
+    /// admission with a typed rejection rather than stored as raw `f64`
+    /// bytes the query-side zero-bucket arithmetic then has to survive. Two
+    /// NaN payloads are covered, so a check written as a bit-pattern
+    /// comparison against the canonical NaN would not pass this.
+    #[test]
+    fn exponential_histogram_malformed_zero_threshold_rejected() {
+        let stale_marker_nan = f64::from_bits(0x7ff0_0000_0000_0002);
+        for zero_threshold in [
+            f64::NAN,
+            -f64::NAN,
+            stale_marker_nan,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            f64::MIN,
+        ] {
+            let out = normalize_zero_threshold(zero_threshold);
+            assert!(out.histogram_points.is_empty(), "{zero_threshold:?}");
+            assert!(out.points.is_empty(), "{zero_threshold:?}");
+            assert_eq!(
+                out.rejected,
+                vec![Rejection::NativeHistogramZeroThresholdInvalid {
+                    zero_threshold_bits: zero_threshold.to_bits(),
+                }],
+                "{zero_threshold:?}"
+            );
+        }
+    }
+
+    /// The boundary cases left admitted deliberately, matched against
+    /// Prometheus' `Histogram.Validate`: it reads `ZeroThreshold` only under
+    /// the custom-buckets schema (where it must equal zero, and `-0.0 == 0`
+    /// holds) and never screens an exponential-schema value for magnitude,
+    /// so a subnormal is as valid there as `1e-9`. Zero is also what a
+    /// sender that never sets the field sends.
+    #[test]
+    fn exponential_histogram_zero_and_subnormal_zero_threshold_admitted() {
+        for zero_threshold in [0.0f64, -0.0f64, f64::MIN_POSITIVE, 5e-324f64] {
+            let out = normalize_zero_threshold(zero_threshold);
+            assert!(
+                out.rejected.is_empty(),
+                "{zero_threshold:?}: {:?}",
+                out.rejected
+            );
+            assert_eq!(out.histogram_points.len(), 1, "{zero_threshold:?}");
+            assert_eq!(
+                out.histogram_points[0]
+                    .sample
+                    .value
+                    .zero_threshold
+                    .to_bits(),
+                zero_threshold.to_bits(),
+                "{zero_threshold:?} round-trips by bit pattern"
+            );
+        }
     }
 
     #[test]
