@@ -244,10 +244,11 @@ async fn fold_human_report_prints_every_fold_report_field() {
         );
     }
 
-    // #1763 part (a): pin the exact rendered line for the new field, not just
-    // its presence as a key. The CLI has no flag yet that supplies a
-    // `RefoldRequest` (that wiring is part b / T11e), so every fold this
-    // binary runs reconciles zero requested hours.
+    // #1763: pin the exact rendered line for the new field, not just its
+    // presence as a key. This binary folds through `Catalog::fold`, which
+    // passes an empty `RefoldRequest`; the blocked-hour derivation runs only
+    // in the server's fold loop. So every fold here reconciles zero requested
+    // hours.
     assert!(
         printed.contains("refold_hours_reconciled: 0\n"),
         "expected the exact rendered line for a plain, RefoldRequest-less \

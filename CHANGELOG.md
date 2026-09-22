@@ -23,6 +23,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The catalog fold now derives the hours it needs to re-fold itself, instead
+  of waiting for a hand-off from the maintenance sweep** (issue #1763). A
+  compaction or selective-erasure rewrite record that lands in an already
+  folded hour leaves the snapshot naming the inputs it superseded, which holds
+  those objects in storage until retention drops the hour. The fix for that
+  was a bounded in-process queue from the sweep to the fold, and it could not
+  work: a Ravel process runs either the maintenance loop or the fold loop and
+  never both, so the queue had no producer in the process that folds. Before
+  folding a tenant, the fold loop now evaluates the sweep's own
+  `SnapshotBlock::Named` condition for that tenant and re-lists exactly the
+  hours it names. Both sides call one function,
+  `ravel_maintain::blocked_named_hours`, so what "blocked" means cannot drift
+  between them, and `SweepReport::blocked_named_hours` is now a reporting field
+  only. The derivation runs after the fold's HEAD freshness peek, so a tick
+  that skips folding pays nothing for it, and a derivation that fails logs and
+  folds without the targeted pass. A tenant that has stopped ingesting is
+  reconciled too: a non-empty derived set now carries the fold past an
+  unadvanced watermark, which previously returned early and left such a
+  tenant's blocked hour held forever.
 - **The published PromQL conformance figure now says what it measures**
   (issue #1698). The committed table read `132/132 = 100%` under a heading
   that invites it to be read as agreement with Prometheus, while the block is

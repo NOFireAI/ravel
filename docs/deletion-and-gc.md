@@ -173,55 +173,48 @@ frontier band is not left to wait indefinitely for one of those two passes to
 eventually cover its hour: `Catalog::fold_with_refold_request` (the
 ADR-0063 amendment) takes a caller-supplied set of ingest hours and re-lists
 them in the same fold call, closing the gap on demand instead of on a
-schedule. A request submitted to a fold call that turns out to be a
-**no-op** (nothing newly sealed beyond the previous watermark) reconciles
-**zero hours**, whatever hours it named: the targeted pass sits inside the
-same reconcile branch as the fixed window and the frontier band, and a
-no-op fold returns before that branch ever runs. `FoldReport`'s
-`refold_hours_reconciled` field reports the count, and is `0` on that path,
-on a plain `Catalog::fold` call, and on any request naming hours the pass
-did not reach (docs/adrs/0064-selective-subject-erasure.md, the no-op
-carve-out).
+schedule. `FoldReport`'s `refold_hours_reconciled` field reports how many of
+the requested hours the pass reconciled. It is `0` on a plain `Catalog::fold`
+call, on a fold of a tenant that has no sealed watermark hour at all, and on
+any request naming hours the pass did not reach
+(docs/adrs/0064-selective-subject-erasure.md, the no-op carve-out). A tenant
+that has stopped ingesting is not one of those cases: a non-empty
+request carries the fold past an unadvanced watermark into the reconcile
+branch, so its blocked hour is reconciled rather than deferred forever.
 
-**The sweep is what names those hours.** The pass that had to hold an input
-already knows which hour's snapshot entry is stale, so it reports it rather
-than leaving a later fold to rediscover it. `SweepReport::blocked_named_hours`
-carries the ingest hours in which rule 2 held at least one supersession chain
-this pass *because the live HEAD snapshot named its objects*, ascending. Only
-that one block contributes: a chain held because HEAD was unreadable adds
-nothing (a fold cannot reconcile what it cannot read), a chain skipped for a
-lease or legal hold adds nothing (a fold changes nothing about the hold), and
-a chain that cleared the gate adds nothing (there is nothing left to
-reconcile). An hour appears only if at least one of its chains hit that one
-arm, so the set is a subset of the hours the pass looked at, never all of
-them.
+**The condition that names those hours is shared.** The predicate a sweep pass
+evaluates to decide it must hold an input is the same predicate that decides
+the hour is worth re-folding, so it lives in one function,
+`ravel_maintain::blocked_named_hours`, with two callers.
+`SweepReport::blocked_named_hours` carries the ingest hours in which rule 2
+held at least one supersession chain this pass *because the live HEAD snapshot
+named its objects*, ascending. Only that one block contributes: a chain held
+because HEAD was unreadable adds nothing (a fold cannot reconcile what it
+cannot read), a chain skipped for a lease or legal hold adds nothing (a fold
+changes nothing about the hold), and a chain that cleared the gate adds
+nothing (there is nothing left to reconcile). An hour appears only if at least
+one of its chains hit that one arm, so the set is a subset of the hours the
+pass looked at, never all of them.
 
-`ravel-server`'s maintain tick unions that set across the shards it swept for
-one `(tenant, signal)` and hands it to the fold loop as a
-`ravel_catalog::RefoldRequest`. The union is over the shards this process
-**owns** under ADR-0065 rendezvous ownership, and one request covers the pair
-because the catalog is per `(tenant, signal)`: a shard a peer owns contributes
-on that peer's own tick, so an hour blocked only there is reconciled a fold
-later rather than not at all. Nothing in the hand-off depends on one process
-owning every shard of a tenant.
+**The fold derives its own set.** Nothing is handed over between the two
+loops. `ravel_server::fold::run_tenant_tick` calls `blocked_named_hours` for
+the `(tenant, signal)` it is about to fold and passes the result to
+`fold_with_refold_request` in the same tick. The derivation enumerates the
+signal's shards from one LIST of its commit prefix rather than from a
+configured shard count, so it covers every shard the store has, and it shares
+a single HEAD read across all of them. `SweepReport::blocked_named_hours`
+remains a reporting field on the sweep's own caller, not a work queue.
 
-Three carve-outs apply to the hand-off itself, and none of them loses an hour
-permanently, because the next sweep re-derives the whole set from durable
-state:
+The derivation is best effort and loses no hour permanently, because it runs
+again from durable state on the next tick:
 
-- **No-op fold.** A request delivered to a fold that seals nothing reconciles
-  zero hours, as above. The hour stays blocked and the next sweep sends it
-  again.
-- **Dropped request.** The queue between the sweep and the fold is bounded. A
-  send into a full queue evicts the **oldest** pending request and counts the
-  eviction, so the newest hand-off is never the one lost; the evicted tenant's
-  hour comes back on its next sweep.
-- **Process locality.** The queue is in-process. A deployment that runs the
-  maintain sweep and the fold loop in separate processes delivers no request
-  at all, and those hours are reconciled only when the fold's fixed window or
-  its retention-frontier band eventually covers them, exactly as before this
-  hand-off existed. Nothing is deleted early and nothing is lost; the gap
-  closes later.
+- **Nothing sealed at all.** A fold of a tenant with no sealed watermark hour
+  reconciles zero hours, as above. The hour stays blocked and the next tick
+  derives it again.
+- **Derivation failure.** A LIST or GET error in the derivation logs and
+  yields an empty set; the fold proceeds without a targeted pass, exactly as
+  before this pass existed. Nothing is deleted early and nothing is lost; the
+  gap closes on a later tick.
 
 HEAD read failures are explicit. An **absent** HEAD is NOT a block: with no
 snapshot naming anything, the sweep proceeds (ADR-0020: the catalog index is a

@@ -240,13 +240,14 @@ pub struct SweepReport {
     /// group this pass *because the live catalog HEAD snapshot still names
     /// its objects* ([`SnapshotBlock::Named`]), ascending.
     ///
-    /// This is the fold's work list, not a hold counter: an hour in here is an
-    /// hour whose snapshot entry is older than the compaction or rewrite
-    /// record that superseded its inputs, so a fold that reconciles that hour
-    /// re-reads the bucket, stops naming the pre-rewrite inputs, and the next
-    /// sweep collects them. `ravel-server`'s maintain tick unions this across
-    /// the shards it swept and hands the union to the fold loop as a
-    /// [`ravel_catalog::RefoldRequest`].
+    /// A reporting field, not a hold counter and not a hand-off: an hour in
+    /// here is an hour whose snapshot entry is older than the compaction or
+    /// rewrite record that superseded its inputs, so a fold that reconciles
+    /// that hour re-reads the bucket, stops naming the pre-rewrite inputs, and
+    /// the next sweep collects them. Nothing carries this set to a fold. The
+    /// fold derives the same hours itself at its own tick, by calling
+    /// [`blocked_named_hours`], which runs the same pass and the same
+    /// `SnapshotBlock::Named` gate arm that fills this field (issue #1763).
     ///
     /// Only the `Named` block contributes. An hour held by an unreadable HEAD
     /// ([`SnapshotBlock::Unreadable`]) is absent: a fold cannot reconcile what
@@ -1116,6 +1117,60 @@ pub async fn sweep_superseded(
         SweepMode::Delete,
     )
     .await
+}
+
+/// The ingest hours of one `(tenant, signal)` in which the live catalog HEAD
+/// snapshot still names a superseded input ([`SnapshotBlock::Named`]),
+/// ascending: the ADR-0020 delete blocker's one predicate a fold can clear.
+///
+/// This is the single definition of "blocked" that both sides of the mechanism
+/// read. A deleting sweep records the same hours into
+/// [`SweepReport::blocked_named_hours`] for reporting, and the fold calls this
+/// at its own tick to decide which hours its targeted re-fold pass re-lists
+/// (issue #526, issue #1763). Both answers come from the same
+/// `sweep_superseded_impl` pass and the same `SnapshotGate::Blocked(Named)`
+/// arm inside it, so the two cannot drift apart on what blocked means: the
+/// only difference is `SweepMode`, and an observing pass gathers a superset of
+/// what a deleting pass does (see [`SweepMode`]).
+///
+/// Shards are enumerated from the store, not from a configured count: one LIST
+/// of the signal's commit prefix, then one pass per shard that has a key, with
+/// a single [`SnapshotReachability`] cache across all of them so HEAD is read
+/// at most once for the whole derivation.
+///
+/// `lease` is the caller's own protection check. A group a lease or legal hold
+/// protects is skipped before the gate runs, so a caller passing
+/// [`NoLeases`] where the sweep passes a real check can derive an hour the
+/// sweep would not report. That difference only ever adds an hour, and
+/// re-folding an hour changes nothing about the hold, so it costs one extra
+/// targeted listing and never a wrong delete.
+pub async fn blocked_named_hours(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<BTreeSet<u32>> {
+    let mut reach = SnapshotReachability::new();
+    let mut hours = BTreeSet::new();
+    for shard in signal_shards(store, tenant, signal).await? {
+        let outcome = sweep_superseded_impl(
+            &mut reach,
+            store,
+            clock,
+            config,
+            lease,
+            tenant,
+            signal,
+            shard,
+            None,
+            SweepMode::GateOnly,
+        )
+        .await?;
+        hours.extend(outcome.blocked_named_hours.iter().copied());
+    }
+    Ok(hours)
 }
 
 /// Whether a [`sweep_superseded_impl`] pass deletes what it cleared, or only

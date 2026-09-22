@@ -100,27 +100,25 @@ pub struct Transaction {
 /// of the fold's own fixed reconcile window and retention-frontier band
 /// (ADR-0063 section 4). The receiving end of issue #526's re-fold half.
 ///
-/// The fold cannot derive this set itself. An hour that received a late
-/// compaction or rewrite record is indistinguishable, from the snapshot
-/// entries alone, from an hour that did not: proving the difference needs a
-/// LIST of that hour's commit buckets, and the hours that could have received
-/// one are every hour the snapshot names, so a self-derived version would cost
-/// a full-history LIST fan-out on every fold. The fixed window bounds that by
-/// recency and the frontier band bounds it by the retention frontier; neither
-/// reaches a late record in the middle of a tenant's history, which is exactly
-/// the hour that leaks (the sweep's HEAD-reachability gate holds the
-/// pre-rewrite inputs because the snapshot still names them).
+/// The hours that belong here are the ones whose snapshot entries still name
+/// inputs a published compaction or rewrite record superseded: the
+/// HEAD-reachability gate holds those inputs (`SnapshotBlock::Named`) and only
+/// a fold of that hour can release them. The fixed window bounds the fold's
+/// own re-listing by recency and the frontier band bounds it by the retention
+/// frontier; neither reaches a late record in the middle of a tenant's
+/// history, which is exactly the hour that leaks.
 ///
-/// The maintain tier's superseded-input sweep already pays for those LISTs and
-/// already computes the answer: a bucket it holds on
-/// `SnapshotBlock::Named` is an hour whose snapshot entries still name inputs a
-/// published compaction or rewrite record superseded. Those hours are what
-/// belongs here.
+/// `ravel-catalog` does not compute the set: it takes one. The caller derives
+/// it by running the sweep's gate over the tenant's commit buckets
+/// (`ravel_maintain::blocked_named_hours`), which is the same pass and the
+/// same gate arm a deleting sweep reports from, and pays its LISTs at its own
+/// tick. This crate cannot call that function itself (the dependency runs the
+/// other way).
 ///
 /// Requesting an hour is a hint, never a durability dependency: an unrequested
-/// or dropped hour degrades to today's behavior (the hour keeps naming its
-/// pre-rewrite inputs until retention drops it), and the sweep's gate remains
-/// the delete blocker either way.
+/// hour degrades to today's behavior (the hour keeps naming its pre-rewrite
+/// inputs until retention drops it), and the sweep's gate remains the delete
+/// blocker either way.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefoldRequest {
     /// Ascending and deduplicated, so a fold spends its cap oldest-first (the
@@ -268,13 +266,15 @@ pub struct FoldReport {
     /// band uses; a request naming more hours than the cap allows carries the
     /// remainder to whichever later fold the requester asks again, and this
     /// field counts only the hours this call actually re-listed. `0` on a
-    /// [`Catalog::fold`] call (an empty [`RefoldRequest`]) and on a request
-    /// submitted to a fold call that turns out to be a no-op: the pass sits
-    /// inside the same reconcile branch as the fixed window and the frontier
-    /// band, which never runs when nothing new is sealed, so a request
-    /// against an unchanged watermark reconciles nothing regardless of what
-    /// it names (docs/adrs/0064-selective-subject-erasure.md, the no-op
-    /// carve-out).
+    /// [`Catalog::fold`] call (an empty [`RefoldRequest`]).
+    ///
+    /// A non-empty request is NOT lost to an unchanged watermark. The pass
+    /// sits inside the reconcile branch that the fixed window and the frontier
+    /// band share, and that branch runs for a request even when nothing new
+    /// has sealed, against the watermark the trusted HEAD already carries: an
+    /// hour is stale because a record landed in it, which says nothing about
+    /// whether the tenant is still ingesting, so a tenant that stopped writing
+    /// still gets its blocked hour reconciled (issue #1763).
     pub refold_hours_reconciled: usize,
     /// Stamped carriers this fold read: L0 commit records whose
     /// `declared_column_stats` (field 20) was non-empty, plus L1 compaction
@@ -1021,9 +1021,9 @@ impl Catalog {
     /// later fold, so the snapshot keeps naming that hour's pre-rewrite
     /// inputs, the maintain tier's superseded-input sweep holds those objects
     /// on its HEAD-reachability gate (ADR-0020), and they occupy storage until
-    /// retention drops the hour. This entry point is how the holder tells the
-    /// fold which hours to re-list; see [`RefoldRequest`] for why the fold
-    /// cannot derive that set itself.
+    /// retention drops the hour. This entry point is how a caller that has
+    /// derived those hours tells the fold to re-list them; see
+    /// [`RefoldRequest`] for where the set comes from.
     ///
     /// The requested hours are reconciled through exactly the same per-bucket
     /// path as the other two passes, so a re-fold can only ever make the
@@ -1165,14 +1165,27 @@ impl Catalog {
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
 
-            let Some(watermark_hour) = sealed_watermark_hour(now_ns, self.config()) else {
+            let Some(sealed_hour) = sealed_watermark_hour(now_ns, self.config()) else {
                 return Ok(no_op_report(head_state.watermark_hour(), counters));
             };
-            if let Some(watermark_hour_old) = head_state.watermark_hour()
-                && watermark_hour_old >= watermark_hour
-            {
-                return Ok(no_op_report(Some(watermark_hour_old), counters));
-            }
+            // Nothing new sealed since the trusted HEAD was written. An empty
+            // request stops here, as it always has. A non-empty one does not:
+            // the hours it names are stale because a compaction or rewrite
+            // record landed in them, which is independent of whether this
+            // tenant is still ingesting, so a tenant that stopped writing
+            // would otherwise never reach the targeted pass below. The fold
+            // continues against the OLD watermark, which keeps the incremental
+            // range empty and republishes the same watermark rather than
+            // regressing it.
+            let watermark_hour = match head_state.watermark_hour() {
+                Some(watermark_hour_old) if watermark_hour_old >= sealed_hour => {
+                    if refold_request.is_empty() {
+                        return Ok(no_op_report(Some(watermark_hour_old), counters));
+                    }
+                    watermark_hour_old
+                }
+                _ => sealed_hour,
+            };
 
             let (mut entries, buckets, rebuilt, previous_entries_len) = match &head_state {
                 HeadState::Valid { head, .. } => match self
@@ -3023,9 +3036,11 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
-        // The carve-out this field documents: a no-op fold never reaches the
-        // reconcile branch that runs the targeted re-fold pass, so a request
-        // against it reconciles zero hours regardless of what it names.
+        // A no-op fold never reaches the reconcile branch that runs the
+        // targeted re-fold pass. A non-empty request no longer lands here: it
+        // is what keeps the fold going past an unadvanced watermark, so the
+        // only no-op reports it can reach are the ones nothing sealed for at
+        // all (no watermark hour exists yet).
         refold_hours_reconciled: 0,
         // A no-op fold reads no commit record and writes no entry, so it has
         // no coverage to report and contributes nothing to the process-global
@@ -7059,19 +7074,18 @@ mod tests {
         assert_eq!(first.entry_count, 2);
     }
 
-    /// #1763 part (a), the #1781 review item: a [`RefoldRequest`] submitted
-    /// to a fold call that turns out to be a no-op (nothing newly sealed
-    /// beyond the previous watermark) reconciles zero hours, not the count
-    /// of hours the request named. The targeted pass sits inside the same
-    /// reconcile branch as the fixed window and the frontier band, and that
-    /// branch never runs once the top-of-loop watermark check has already
-    /// returned a no-op report -- the request is never denied, it is never
-    /// reached.
+    /// Issue #1763: a non-empty [`RefoldRequest`] reaches the targeted pass
+    /// even when nothing has newly sealed beyond the previous watermark. An
+    /// hour is stale because a record landed in it, which is independent of
+    /// whether the tenant is still ingesting, so the top-of-loop watermark
+    /// check lets a request through and folds against the OLD watermark; the
+    /// published watermark does not move.
     ///
-    /// Prove-the-test: hardcode `no_op_report`'s `refold_hours_reconciled` to
-    /// `1` and the final assertion below fails.
+    /// Prove-the-test: restore the unconditional `return
+    /// Ok(no_op_report(...))` on `watermark_hour_old >= sealed_hour` and every
+    /// assertion below fails.
     #[tokio::test]
-    async fn refold_request_to_a_no_op_fold_reconciles_zero_hours_and_reports_it() {
+    async fn refold_request_runs_when_the_watermark_does_not_advance() {
         let store = Arc::new(MemoryStore::new());
         let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
 
@@ -7089,10 +7103,9 @@ mod tests {
             .await
             .expect("first fold");
 
-        // Same `now_ns` as the first fold: the watermark cannot advance, so
-        // this call is a no-op regardless of what the request names. Hour 5
-        // is a real, snapshot-named hour a reachable targeted pass would
-        // happily reconcile.
+        // Same `now_ns` as the first fold: nothing new has sealed. Hour 5 is a
+        // real, snapshot-named hour outside the fixed reconcile window
+        // (40 - 26 = 14), so only the targeted pass can reach it.
         let second = catalog
             .fold_with_refold_request(
                 &tenant(),
@@ -7105,11 +7118,35 @@ mod tests {
             )
             .await
             .expect("second fold");
-        assert!(second.no_op, "the watermark did not advance");
-        assert_eq!(
-            second.refold_hours_reconciled, 0,
-            "a request against a no-op fold reconciles nothing, however many hours it names"
+        assert!(
+            !second.no_op,
+            "a non-empty request folds even with an unchanged watermark"
         );
+        assert_eq!(
+            second.refold_hours_reconciled, 1,
+            "the targeted pass re-listed the one requested hour"
+        );
+        assert_eq!(
+            second.watermark_hour,
+            Some(40),
+            "the published watermark stays where the trusted HEAD put it"
+        );
+
+        // An EMPTY request against the same unchanged watermark still stops at
+        // the top of the loop: the carve-out narrowed, not deleted.
+        let third = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("third fold");
+        assert!(third.no_op, "an empty request still no-ops");
+        assert_eq!(third.refold_hours_reconciled, 0);
     }
 
     /// ADR-0063 section 4 carve-out 2: a REBUILD skips the reconcile pass (it
