@@ -871,17 +871,29 @@ adapter contract:
    for such a tenant is therefore "until the fold reconciles that hour,
    then `+R`", not `max(bound, R)` alone.
 
-   Under the shipped IAM templates it is worse than that bound.
-   `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement denies the
-   Maintain role every delete under `t/*/catalog/*/*`, so the unreferenced
-   `.cstat` is not deletable at all today, whatever the retention posture
-   is: the bound is open-ended rather than `+R` until that template
-   changes. An operator who wants the immutability guarantee without the
-   retention half scopes the mechanism to `catalog/<signal>/HEAD` alone,
-   which is the object the immutability argument above actually rests on.
-   That scoping is necessary but not sufficient while the IAM deny stands.
+   An older shipped template made this worse than that bound.
+   `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement used to deny
+   the Maintain role every delete under `t/*/catalog/*/*`, so the
+   unreferenced `.cstat` was not deletable at all, whatever the retention
+   posture was: the bound was open-ended rather than `+R`. The current
+   template's `DenyDeleteProtected` denies only `catalog/<signal>/HEAD`, and
+   `MaintainDelete` grants delete on `catalog/<signal>/snap/*` and
+   `catalog/<signal>/idx/*`, matching what
+   `sweep_unreferenced_catalog_objects` actually removes, so the `+R` bound
+   above is the one that applies under the current templates. An operator
+   running a copy of `maintain.json` shipped before this narrowing must
+   re-apply it: until then the sweep still refuses its first catalog delete
+   every pass, so catalog garbage, including any unreferenced `.cstat`
+   holding an erased subject's value, is never reclaimed. An operator who
+   wants the immutability guarantee without the retention half still scopes the
+   Object Lock mechanism to `catalog/<signal>/HEAD` alone, which is the
+   object the immutability argument above actually rests on; that scoping
+   was always independent of the IAM deny and remains sufficient now that
+   the deny is narrowed to match.
 
-   The refusal is not confined to the locked object either. The sweep's
+   The refusal is not confined to the locked object either, for an
+   operator who locks the whole catalog family rather than HEAD alone. The
+   sweep's
    delete loop propagates the first refusal, so one locked object aborts
    that `(tenant, signal)` pass and the unreferenced objects behind it in
    the same pass are left in place too. The production driver logs the
