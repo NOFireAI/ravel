@@ -35,6 +35,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+
 - **A shard now refuses a flush trigger once `--max-queued-flushes` (default
   8) flush tasks are spawned and unacked, leaving the rows buffered for the
   next tick** (issue #1740). Before this, every trigger spawned a task, so a
@@ -372,6 +373,41 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the operator re-qualifies each existing cluster once against its unchanged
   store. The qualify Job is a one-shot that touches no Deployment, so no serving
   pod is restarted and there is no downtime. Subsequent reconciles are stable.
+- **A shard now refuses a flush trigger once `--max-queued-flushes` (default
+  8) flush tasks are spawned and unacked, leaving the rows buffered for the
+  next tick** (issue #1740). Before this, every trigger spawned a task, so a
+  shard whose writes were slow kept spawning while each task held its built
+  batch resident, with the worst case set by how long the object store stayed
+  slow rather than by anything configured. `/metrics` reports it with two new
+  families, both by `{mode, signal}`: `ravel_ingest_queued_flushes`, the
+  spawned-and-unreaped depth summed across shards, and
+  `ravel_ingest_flush_trigger_deferred_total`, the refusals that bound it.
+  Two things to know: a
+  flush that crosses the per-tenant memory backstop is **exempt** and spawns
+  even at the cap, because a bounded queue of tasks is worth less than a
+  bounded buffer, so the queue can exceed the cap and under
+  `--max-ingest-buffer-bytes 0` only the length of a store stall bounds the
+  overshoot; and an `--max-inflight-flushes` above `--max-queued-flushes`
+  **raises the effective cap to match**, logging a warning that names both
+  numbers, rather than refusing to start. Only a spawned task can hold a
+  permit, so the cap has to be at least the permit count; raising it there
+  keeps a cluster running `spec.gateway.maxInflightFlushes` above 8 starting
+  on upgrade, which a refusal would have crash-looped with no field on the
+  `RavelCluster` CRD able to raise the cap in response.
+
+  A third thing to know: a deferred flush pins the ingest hour it eventually
+  opens in, not the one its refused trigger fired in, so a long deferral moves
+  which ingest hour the rows land in. Past two hours that is more than the
+  read side's scan slack covers, and a straggler deferred at the cap while a
+  `shard_count` decrease is activating can land in an hour the retiring
+  generation no longer scans. Watch
+  `ravel_ingest_flush_trigger_deferred_total`: a nonzero rate is the signal,
+  and it means the object store is the thing to look at. Pinning the hour
+  before the deferral instead was tried and reverted, because it moves the
+  same overrun onto the catalog's sealed-hour watermark, where a late record
+  is never read again rather than missed by one generation; `docs/ingest.md`
+  and ADR-1642 carry the arithmetic. Bounding the deferral itself is issue
+  #1916.
 
 ### Fixed
 
