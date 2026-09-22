@@ -435,10 +435,24 @@ pub const MAX_SHARD_COUNT: u32 = 10_000;
 /// `max_flush_lifetime`, and nothing makes the retry fair, so nothing bounds
 /// the number of rounds. At today's defaults one round alone gives
 /// `40s + 3600s + 3600s = 7240s`, past the 7200s this constant allows.
-/// `ravel_ingest::shard::tests::the_flush_bound_slack_covers_a_deferred_flush`
-/// computes both figures from the ingest terms. The constant is deliberately
-/// left alone here: closing the gap is a decision about ingest's deferral
-/// policy, not about this number, and it is open on issue #1740.
+/// `ravel_ingest::shard::tests::a_deferred_flush_can_overrun_the_flush_bound_slack`
+/// measures that overrun against a live shard actor, deferring three ingest
+/// hours against this two-hour constant.
+///
+/// The constant is deliberately left alone here, and so is the pin. Raising
+/// this number is not the fix: it is a frozen read-side contract, and no fixed
+/// value bounds an unbounded number of deferral rounds. Pinning the bucket
+/// before the cap check and carrying it across the deferral is not the fix
+/// either, and is worse, because it spends the deferral out of the sealed-hour
+/// watermark's margin instead (`max_flush_lifetime + clock_skew_allowance +
+/// fold_safety_margin`, sized for one flush lifetime because the pin is taken
+/// when the flush opens). A record past this slack is invisible to the
+/// retiring generation of a shard-count decrease; a record in a sealed hour is
+/// never read again at all, since resolution starts its listing above the
+/// watermark and the fold never revisits a sealed hour. What closes the gap is
+/// bounding the deferral itself, which is open on issue #1916;
+/// `ravel_ingest::shard::tests::carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour`
+/// holds that arithmetic against this crate's own margin constants.
 ///
 /// This is a manually-chosen constant local to `ravel-catalog`, deliberately
 /// not a cross-crate reference to `ravel-ingest`'s flush config:

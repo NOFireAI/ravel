@@ -157,11 +157,37 @@ store takes up to `max_flush_lifetime`, and `flush_aged` retries due tenants in
 `HashMap` order with no fairness, so nothing bounds the number of rounds. At
 today's defaults one round alone puts the worst case at `40s + 3600s + 3600s =
 7240s`, past the 7200s `FLUSH_BOUND_SLACK_HOURS` allows;
-`ravel_ingest::shard::tests::the_flush_bound_slack_covers_a_deferred_flush`
-computes both figures from the ingest terms. The constant is a frozen read-side
-contract and is left alone until the deferral policy is decided, so a
-straggler deferred at the cap during a shard-count decrease can land in an
-ingest hour the retiring generation's scan set no longer covers.
+`ravel_ingest::shard::tests::a_deferred_flush_can_overrun_the_flush_bound_slack`
+measures that on a live shard actor, deferring three ingest hours against the
+two-hour constant. So a straggler deferred at the cap during a shard-count
+decrease can land in an ingest hour the retiring generation's scan set no
+longer covers.
+
+Neither obvious fix is available, and the reason is worth stating so it is not
+re-tried. Raising `FLUSH_BOUND_SLACK_HOURS` does not work: it is a frozen
+read-side contract, and no fixed value bounds an unbounded number of rounds.
+Pinning the ingest-hour bucket *before* the cap check and carrying it across
+the deferral does not work either, and is the worse of the two, because it
+moves the same overrun onto the other side of the flush. The catalog seals an
+ingest hour `H` once `max_flush_lifetime + clock_skew_allowance +
+fold_safety_margin` have passed since `H` ended (4800s at the shipped catalog
+defaults). That margin is the budget for the span between a flush pinning `H`
+and its commit record landing, and it is sized for one flush lifetime precisely
+because the pin is taken when the flush opens. A carried pin spends the
+deferral out of it instead: a trigger firing at the end of `H` leaves the whole
+4800s and no more, while one deferral round costs up to `max_flush_lifetime`
+(3600s) and the flush it then opens gets its own 3600s before abandonment, so
+7200s against 4800s with a single round. The two outcomes are not comparable in
+severity. A record past `S` is invisible to the retiring generation of a
+shard-count decrease, for the width of that window; a record in a sealed hour
+is never read again at all, because resolution starts its listing at
+`watermark_hour + 1` and the folded snapshot that represents `H` from then on
+was written without it, and the fold watermark only moves forward. The
+seal-divergence check classifies it `missing`, and that check detects and
+reports, never repairs.
+`ravel_ingest::shard::tests::carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour`
+holds that arithmetic against the catalog's own margin constants. What closes
+the gap is bounding the deferral itself, which is open on issue #1916.
 
 Operationally: do **not** decrease `shard_count` and immediately assume every
 prior write is now under the new, narrower range. For `S` hours past the
