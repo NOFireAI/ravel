@@ -839,6 +839,14 @@ mod tests {
     #[derive(Clone)]
     struct FloodWorker {
         count: usize,
+        /// Append a well-formed terminal summary after the frames.
+        ///
+        /// The two cap tests leave this off: they refuse part way through and
+        /// never reach the end of the stream, so the summary is irrelevant to
+        /// them. The control turns it on, because only a summary lets the
+        /// fetch return `Ok` and so lets the control assert that frames
+        /// DECODED rather than merely that a stream ended.
+        with_summary: bool,
     }
 
     #[tonic::async_trait]
@@ -851,7 +859,10 @@ mod tests {
             _request: tonic::Request<pb::FetchRequest>,
         ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
             let soa = series_soa();
-            let frames: Vec<_> = (0..self.count).map(|_| Ok(series_frame(&soa))).collect();
+            let mut frames: Vec<_> = (0..self.count).map(|_| Ok(series_frame(&soa))).collect();
+            if self.with_summary {
+                frames.push(Ok(summary_frame(pb::status::Code::Ok)));
+            }
             Ok(tonic::Response::new(Box::pin(futures::stream::iter(
                 frames,
             ))))
@@ -864,6 +875,23 @@ mod tests {
         count: usize,
         caps: impl FnOnce(RemoteSliceFetcher) -> RemoteSliceFetcher,
     ) -> Result<SliceResponse, DistribError> {
+        fetch_from_worker(count, false, caps)
+    }
+
+    /// As [`fetch_from_flood_worker`], with the terminal summary a successful
+    /// fetch needs.
+    fn fetch_from_worker_with_summary(
+        count: usize,
+        caps: impl FnOnce(RemoteSliceFetcher) -> RemoteSliceFetcher,
+    ) -> Result<SliceResponse, DistribError> {
+        fetch_from_worker(count, true, caps)
+    }
+
+    fn fetch_from_worker(
+        count: usize,
+        with_summary: bool,
+        caps: impl FnOnce(RemoteSliceFetcher) -> RemoteSliceFetcher,
+    ) -> Result<SliceResponse, DistribError> {
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async move {
             let incoming =
@@ -871,7 +899,10 @@ mod tests {
             let addr = incoming.local_addr().expect("local addr");
             let server = tokio::spawn(async move {
                 Server::builder()
-                    .add_service(SeriesFetchServer::new(FloodWorker { count }))
+                    .add_service(SeriesFetchServer::new(FloodWorker {
+                        count,
+                        with_summary,
+                    }))
                     .serve_with_incoming(incoming)
                     .await
             });
@@ -891,12 +922,21 @@ mod tests {
     ///
     /// A worker streams 64 frames at a fetcher whose per-slice frame cap is 4.
     /// The fetch refuses with `SliceFrameCapExceeded { frames: 5, max: 4 }`: the
-    /// five is the proof, because it is the cap plus the one frame the decoder
-    /// must receive to notice the cap was passed. A `collect`-then-decode path
-    /// (the deleted `collect_frames` shape) would have had all 64 in memory
-    /// before any check ran, so `frames` would read 64 and this assertion would
-    /// fail. Deleting the caps entirely would decode all 64 to an `Err(NoSummary)`
-    /// instead, which also fails here.
+    /// five is the cap plus the one frame the decoder must receive to notice the
+    /// cap was passed.
+    ///
+    /// What that pins, precisely: the decoder REFUSED at the cap instead of
+    /// decoding all 64. `frames` is `SliceStreamDecoder::frames`, incremented
+    /// per `push`, so it counts pushes and NOT what the transport buffered --
+    /// a shape that drained the stream into a `Vec` and then pushed frame by
+    /// frame would still report 5 and still pass. This test therefore does not
+    /// by itself prove nothing upstream of the decoder buffers; what it proves
+    /// is that no caller decodes past the cap, and the deleted
+    /// `decode_slice_frames` shape (which had no cap at all) fails it with
+    /// `Err(NoSummary)` after decoding all 64. The absence of a collecting path
+    /// is held by the guard on the code itself: `collect_frames` and both
+    /// signal-specific decoders are gone, and `RemoteSliceFetcher::fetch` is
+    /// the only fetch here.
     #[test]
     fn no_unbounded_slice_decode_path_remains() {
         let result = fetch_from_flood_worker(64, |fetcher| fetcher.with_max_frames(4));
@@ -927,14 +967,26 @@ mod tests {
     /// The control for both cap tests: the same transport, under caps the stream
     /// fits inside, decodes normally. Without this, a fetch broken in any way at
     /// all would satisfy the two refusal assertions above by accident.
+    ///
+    /// The worker sends a terminal summary here so the fetch can return `Ok`,
+    /// and the assertion is on the DECODED counts. Asserting `Err(NoSummary)`
+    /// instead -- which an earlier version of this test did -- proves only that
+    /// a stream reached its end: a fetch that accepted every frame and dropped
+    /// each one on the floor satisfies it, and so does the pre-#1912
+    /// collect-then-decode shape, so it could not tell the two apart.
     #[test]
     fn remote_fetch_under_the_caps_decodes_the_slice() {
-        let response = fetch_from_flood_worker(3, |fetcher| {
+        let response = fetch_from_worker_with_summary(3, |fetcher| {
             fetcher.with_max_frames(4).with_max_bytes(1 << 20)
-        });
-        // The flood worker sends no summary, so a stream that was read to its end
-        // under the caps is `NoSummary`: the decode ran and reached the end of the
-        // stream, rather than refusing part way through it.
-        assert!(matches!(response, Err(DistribError::NoSummary)));
+        })
+        .expect("a stream inside both caps decodes");
+        assert_eq!(
+            response.series_returned, 1,
+            "the summary's series count must survive the decode"
+        );
+        assert_eq!(
+            response.samples_returned, 3,
+            "the summary's sample count must survive the decode"
+        );
     }
 }
