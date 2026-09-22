@@ -486,8 +486,20 @@ impl Default for IngestConfig {
             // healthy shard never reaches it (a flush that is not stalled is
             // reaped within one PUT round trip, and the default single permit
             // admits one at a time), and shallow enough that a stalled prefix
-            // holds bounded memory: at the 8 MiB `target_bytes` default it is
-            // 64 MiB per shard rather than an unbounded queue.
+            // holds a bounded number of windows rather than an unbounded queue.
+            // What a window holds is BUFFERED MEMORY, bounded per buffer by
+            // `buffer_memory_backstop_bytes` (64 MiB at the default 512 MiB
+            // ceiling, since a buffer that crosses it spawns exempt from this
+            // cap), so the ordinary queue holds at most eight of those. It does
+            // NOT bound the size of the objects those windows write:
+            // `target_bytes` gates `flush_est_bytes`, a deferred trigger keeps
+            // merging into the same buffer and spawns with whatever
+            // `flush_est_bytes` has reached by then, and on the native-histogram
+            // path a point charges a flat 16 bytes to `est_bytes` against up to
+            // `32 + 8 * (buckets + spans + custom_values)` object bytes (see
+            // `size_trigger_fires`), so such a buffer can stay under the
+            // backstop while its object grows past the 8 MiB `target_bytes`
+            // default.
             max_queued_flushes: 8,
             adaptive_flush_delay: false,
             // Must exceed max_flush_delay by STRICT_VISIBILITY_RESERVE_NS, not
