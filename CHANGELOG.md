@@ -44,10 +44,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keeps a cluster running `spec.gateway.maxInflightFlushes` above 8 starting
   on upgrade, which a refusal would have crash-looped with no field on the
   `RavelCluster` CRD able to raise the cap in response.
-  bounded buffer; and the server now **refuses to start** when
-  `--max-inflight-flushes` exceeds `--max-queued-flushes`, since only a
-  spawned task can hold a permit and the excess would silently reduce flush
-  concurrency.
 - **`ravel-cli load` reports a `--skip-rows` value past the end of the file
   instead of succeeding quietly** (issue #1713). The value was clamped to the
   file's row count and the run exited 0 having written nothing, and the
