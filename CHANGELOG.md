@@ -391,6 +391,46 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the operator re-qualifies each existing cluster once against its unchanged
   store. The qualify Job is a one-shot that touches no Deployment, so no serving
   pod is restarted and there is no downtime. Subsequent reconciles are stable.
+- **Native histogram samples whose shape Prometheus itself rejects are now
+  refused at ingest, on both the OTLP and Remote Write surfaces**
+  (issue #1858). This is a behaviour change at the ingest boundary: a sender
+  emitting any shape below had the sample accepted and stored before this
+  release and now has it refused, so check your senders before upgrading.
+  Refused on both surfaces: a `zero_threshold` that is NaN, positive or
+  negative infinity, or negative. Refused on Remote Write for a custom-buckets
+  histogram (`schema == -53`), which has neither a negative side nor a zero
+  bucket: non-empty negative spans, a `zero_threshold` that is not zero, and a
+  `zero_count` that is not zero. The boundary-list rule is tightened at the
+  same time: on top of non-empty and strictly ascending (and absent under any
+  other schema), every bound must be finite and the positive buckets sent must
+  not outnumber the bounds by more than one, since `n` bounds define at most
+  `n + 1` buckets and the last `+Inf` one is implicit. Those last two are
+  separate rules rather than consequences of ascendingness: a lone `NaN` has no
+  adjacent pair to compare, and a trailing `+Inf` is strictly greater than its
+  predecessor, so both passed before and reached the query side, where reading
+  past the boundary list yields `+Inf` and leaves the final bucket spanning the
+  degenerate interval `[+Inf, +Inf]` for `histogram_quantile` to interpolate
+  over. OTLP enforces all of these by refusing
+  `scale == -53` outright, since it has no field to carry bucket boundaries,
+  so no custom-buckets shape reaches its normalizer at all. Under the
+  exponential schemas the zero side is untouched: a populated zero bucket
+  stays admitted, as does a `zero_threshold` of `+0.0`, `-0.0`, or a
+  subnormal, because Prometheus' `Histogram.Validate` reads `ZeroThreshold`
+  only under the
+  custom-buckets schema and never screens an exponential-schema value for
+  magnitude. For the custom-buckets rules `+0.0` and `-0.0` both count as
+  zero, matching Prometheus writing that rule as `ZeroThreshold == 0` in Go;
+  every other pattern, a subnormal and a NaN included, does not. Each refusal
+  is per-sample, not per-request, and behaves like every other structural
+  ingest refusal on its surface: on OTLP the sample is counted in
+  `rejected_data_points` with the reason in the partial-success
+  `error_message` and under the `structural` normalize-reject counter; on
+  Remote Write the request still answers `204`, the sample is counted into the
+  surface's dropped-points counter, and the
+  `X-Prometheus-Remote-Write-Histograms-Written` header excludes it. Each of
+  the four Remote Write messages names the field it refused on. Refusing new
+  samples does not clean up data already stored with any of these shapes, so
+  the query-side zero-bucket guards remain in place.
 
 - **Every PromQL parse of caller text runs the pre-parse complexity guard,
   because one function now does both** (issue #1817). The guard that keeps an
