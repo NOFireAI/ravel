@@ -172,6 +172,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reason, and records it before it creates or deletes the qualify Job, so a
   failure in that API call cannot drop it either.
 
+### Security
+
+- **A query-worker registry record must carry a valid MAC to join the live
+  set** (issue #1918). Writing to `sys/query/workers/<uuid>` was previously
+  sufficient to be read as a live fragment worker: the shipped query role's
+  IAM grant (`deploy/iam/query.json`) puts `s3:PutObject` on the whole
+  `sys/query/workers/*` prefix, not scoped to a caller's own key, and the
+  live-set reader trusted any record whose body `process_id` matched its
+  key. Each record now carries a keyed-BLAKE3 MAC over its own fields,
+  minted at publish time from an operator-provisioned fragment key
+  (`QueryWorkers::with_fragment_keys`, the same primitive and rotation
+  convention as the ADR-0071 fragment capability) and verified on read
+  before a sibling record can enter the live set; a record whose MAC does
+  not verify is rejected and counted (`QueryWorkers::metrics().mac_rejects()`)
+  rather than silently trusted or silently dropped. A worker configured
+  with no fragment key mints an unsigned record and admits no sibling's
+  record, which is a fail-closed default, not a regression: no production
+  caller wires a fragment key in yet, matching the prefix's existing "no
+  production caller wires this yet" status.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added
