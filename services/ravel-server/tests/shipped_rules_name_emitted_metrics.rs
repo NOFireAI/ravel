@@ -17,6 +17,12 @@
 //! Prometheus refuses the whole file and every alert in it goes dead, so the
 //! count has to come off a parse to mean anything.
 //!
+//! The parse covers STRUCTURE, not the values inside `expr:` and `for:`. It
+//! refuses a line it cannot account for and a key it does not know, but it
+//! reads a plain scalar as text: `for: 10 minutes` and an unbalanced bracket
+//! inside an `expr` block scalar both parse here and are both refused by
+//! Prometheus on load. Issue #1928 covers validating those two fields.
+//!
 //! `docs/guides/observability.md` reprints 13 of these rules in fenced `yaml`
 //! blocks, to explain them in place. Those blocks are parsed the same way and
 //! compared field by field against the shipped file, which is what keeps a

@@ -15,7 +15,9 @@
 # body, so a metric rename cannot leave a rule here matching nothing. It
 # builds the groups and rules below by parsing, refusing any line it cannot
 # account for, so a corruption that leaves the `- alert:` lines intact fails
-# there instead of passing a count. It also compares every rule the
+# there instead of passing a count. That parse checks structure, not the
+# values inside `expr:` and `for:`: a malformed duration or expression is
+# still refused by Prometheus on load and not by the test (issue #1928). It also compares every rule the
 # observability guide reprints against the one here, expression, `for:` and
 # severity, which is what holds the "character for character" above true.
 #
