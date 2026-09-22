@@ -287,16 +287,16 @@ impl SliceFetcher for RemoteSliceFetcher {
 /// Decode a slice's full frame sequence into a [`SliceResponse`].
 ///
 /// This is the whole-sequence decode: it takes every frame at once, so its
-/// caller already holds the whole slice. Two callers remain, and neither reads
-/// a remote's stream unbounded on a shipped coordinator. [`RemoteSliceFetcher`]
-/// drains its gRPC stream into a `Vec` and calls this; it is the fetcher the
-/// in-process test and bench harnesses build, not one a `ravel-server` process
-/// constructs. `ravel-server`'s local no-hop fetch (`FragmentService::run_local`
-/// in `services/ravel-server/src/distrib.rs`) calls it on frames this same
-/// process just produced in-process, where there is no remote deciding how much
-/// it holds.
+/// caller already holds the whole slice. Exactly two callers remain.
+/// [`RemoteSliceFetcher`] drains its gRPC stream into a `Vec` and calls this,
+/// with no cap on what it buffers; it is the fetcher the in-process test and
+/// bench harnesses build (`distrib/tests.rs`, `engine.rs`, `ravel-bench`), and
+/// no `ravel-server` process constructs one. `ravel-server`'s local no-hop fetch
+/// (`FragmentService::run_local` in `services/ravel-server/src/distrib.rs`)
+/// calls it on frames this same process just produced in-process, where there
+/// is no remote deciding how much it holds.
 ///
-/// The two paths that DO read a remote's stream no longer call this: an
+/// The two shipped paths that DO read a remote's stream no longer call this: an
 /// intra-cluster remote dispatch (`RoutingSliceFetcher::remote_fetch`) and
 /// cross-cluster federation (`FederationSliceFetcher::fetch`), both in the same
 /// file, decode incrementally through
@@ -308,8 +308,8 @@ impl SliceFetcher for RemoteSliceFetcher {
 /// structural holds them together:
 /// [`SliceStreamDecoder::push`](crate::distrib::SliceStreamDecoder::push)
 /// repeats the match below rather than calling into it, and a change to the
-/// frames a slice
-/// may carry has to be made in both. What keeps them from drifting is a test,
+/// frames a slice may carry has to be made in both. What keeps them from
+/// drifting is a test,
 /// `tests::the_incremental_decoder_agrees_with_the_whole_sequence_decode`, which
 /// feeds the same frame sequences to both and asserts they produce the same
 /// response and the same typed errors.

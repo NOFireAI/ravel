@@ -910,20 +910,40 @@ mod tests {
     async fn a_federated_cap_breach_keeps_the_budget_class() {
         use crate::http::QueryErrorResponse;
 
-        const OVER_BYTES: u64 = codec::MAX_SLICE_RESPONSE_BYTES + 4_096;
-        const OVER_FRAMES: usize = codec::MAX_SLICE_RESPONSE_FRAMES + 1;
+        // Two rows per cap kind. One carries the shipped constant, the figures a
+        // stock coordinator reports. The other carries a LOWERED cap, the shape
+        // `FederationSliceFetcher::with_max_slice_bytes` produces, and it is the
+        // row that catches a federated arm re-deriving `max` from the constant
+        // instead of carrying the decoder's own: no constant in this crate
+        // equals it.
+        const LOWERED_BYTE_CAP: u64 = 32 * 1024;
+        const LOWERED_FRAME_CAP: usize = 3;
 
-        let breaches: Vec<(&str, fn() -> DistribError)> = vec![
-            ("the byte cap", || {
+        type MakeBreach = fn() -> DistribError;
+
+        let breaches: Vec<(&str, MakeBreach)> = vec![
+            ("the byte cap at the shipped ceiling", || {
                 DistribError::Codec(codec::CodecError::SliceByteCapExceeded {
-                    bytes: OVER_BYTES,
+                    bytes: codec::MAX_SLICE_RESPONSE_BYTES + 4_096,
                     max: codec::MAX_SLICE_RESPONSE_BYTES,
                 })
             }),
-            ("the frame cap", || {
+            ("the byte cap lowered below the ceiling", || {
+                DistribError::Codec(codec::CodecError::SliceByteCapExceeded {
+                    bytes: LOWERED_BYTE_CAP + 9,
+                    max: LOWERED_BYTE_CAP,
+                })
+            }),
+            ("the frame cap at the shipped ceiling", || {
                 DistribError::Codec(codec::CodecError::SliceFrameCapExceeded {
-                    frames: OVER_FRAMES,
+                    frames: codec::MAX_SLICE_RESPONSE_FRAMES + 1,
                     max: codec::MAX_SLICE_RESPONSE_FRAMES,
+                })
+            }),
+            ("the frame cap lowered below the ceiling", || {
+                DistribError::Codec(codec::CodecError::SliceFrameCapExceeded {
+                    frames: LOWERED_FRAME_CAP + 1,
+                    max: LOWERED_FRAME_CAP,
                 })
             }),
         ];
