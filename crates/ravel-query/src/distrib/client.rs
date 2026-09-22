@@ -2,16 +2,26 @@
 //! `tonic`-backed [`RemoteSliceFetcher`] (ADR-0071).
 //!
 //! [`SliceFetcher`] is the one seam the merge layer holds. A [`RemoteSliceFetcher`]
-//! drives a real gRPC worker; a test double can implement the same trait to
-//! return crafted frames. Either way the coordinator receives the identical
-//! [`SliceResponse`] shape, so the merge cannot tell a remote slice from a
-//! local one.
+//! drives a real gRPC worker for the METRICS signal; a test double can implement
+//! the same trait to return crafted frames. Either way the coordinator receives
+//! the identical [`SliceResponse`] shape, so the merge cannot tell a remote slice
+//! from a local one.
+//!
+//! No transport in this crate decodes a remote's log or span slice. The
+//! log and span fetches are the [`SliceFetcher`] trait defaults, which report
+//! [`pb::status::Code::Unsupported`] and send the coordinator to whole-query
+//! local execution; whoever wires those signals across the slice boundary writes
+//! a bounded incremental decoder for them, the shape
+//! [`SliceStreamDecoder`](crate::distrib::SliceStreamDecoder) establishes (issue
+//! #1912).
 
 use ravel_logseg::LogRecord;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_types::accounting::QueryAccountingSnapshot;
 use tonic::transport::Channel;
 
+use crate::config::EngineConfig;
+use crate::distrib::SliceStreamDecoder;
 use crate::distrib::codec::{self, CodecError};
 use crate::distrib::proto::series_fetch_client::SeriesFetchClient;
 use crate::fetcher::{FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
@@ -187,11 +197,15 @@ pub trait SliceFetcher: Send + Sync {
     ///
     /// The default implementation reports [`pb::status::Code::Unsupported`], so
     /// a `SliceFetcher` that has not wired the log fetch path degrades to
-    /// whole-query local execution rather than erroring. A real transport
-    /// (`RemoteSliceFetcher`) overrides it to drain the worker's stream and
-    /// decode its [`pb::LogRecordFrame`]s. This mirrors the base ADR's silent
-    /// version-skew fallback: an unimplemented log fetch is a coverage gap the
-    /// coordinator fills locally, never a hard failure.
+    /// whole-query local execution rather than erroring. This mirrors the base
+    /// ADR's silent version-skew fallback: an unimplemented log fetch is a
+    /// coverage gap the coordinator fills locally, never a hard failure.
+    ///
+    /// Nothing overrides it today, [`RemoteSliceFetcher`] included (issue
+    /// #1912): an override has to decode the worker's [`pb::LogRecordFrame`]s
+    /// incrementally under a per-slice frame and wire-byte cap, the way
+    /// [`SliceStreamDecoder`](crate::distrib::SliceStreamDecoder) does for
+    /// metrics, so that a remote cannot decide how much the coordinator buffers.
     async fn fetch_logs(
         &self,
         _request: pb::FetchRequest,
@@ -205,10 +219,9 @@ pub trait SliceFetcher: Send + Sync {
     ///
     /// The default implementation reports [`pb::status::Code::Unsupported`], so
     /// a `SliceFetcher` that has not wired the span fetch path degrades to
-    /// whole-query local execution rather than erroring. A real transport
-    /// (`RemoteSliceFetcher`) overrides it to drain the worker's stream and
-    /// decode its [`pb::SpanFrame`]s. Mirrors [`fetch_logs`](Self::fetch_logs)
-    /// exactly.
+    /// whole-query local execution rather than erroring. Nothing overrides it
+    /// today, and an override carries the same bounded-decode obligation.
+    /// Mirrors [`fetch_logs`](Self::fetch_logs) exactly.
     async fn fetch_spans(
         &self,
         _request: pb::FetchRequest,
@@ -221,88 +234,108 @@ pub trait SliceFetcher: Send + Sync {
 
 /// A [`SliceFetcher`] backed by a real gRPC worker over a `tonic` channel. The
 /// channel is cheap to clone, so one fetcher serves many concurrent slices.
+///
+/// Metrics only. It reads the worker's stream one frame at a time through a
+/// [`SliceStreamDecoder`], so the per-slice frame and wire-byte caps are checked
+/// before each frame is decoded and the first breach stops the read (issue
+/// #1912). It does not override [`SliceFetcher::fetch_logs`] or
+/// [`SliceFetcher::fetch_spans`]: those report `Unsupported` and the coordinator
+/// falls back to whole-query local execution.
 pub struct RemoteSliceFetcher {
     channel: Channel,
+    /// `None` leaves the decoder's own frame cap
+    /// ([`codec::MAX_SLICE_RESPONSE_FRAMES`]) in force.
+    max_frames: Option<usize>,
+    /// `None` leaves the decoder's own byte cap ([`codec::slice_byte_cap`]) in
+    /// force.
+    max_bytes: Option<u64>,
 }
 
 impl RemoteSliceFetcher {
     pub fn new(channel: Channel) -> Self {
-        RemoteSliceFetcher { channel }
+        RemoteSliceFetcher {
+            channel,
+            max_frames: None,
+            max_bytes: None,
+        }
     }
 
-    /// Dispatches one slice request and drains the worker's response stream into
-    /// a flat `Vec` of frames. The signal-agnostic transport half shared by
-    /// [`fetch`](SliceFetcher::fetch),
-    /// [`fetch_logs`](SliceFetcher::fetch_logs), and
-    /// [`fetch_spans`](SliceFetcher::fetch_spans): each of those calls this, then
-    /// applies its own per-signal decode to the frames. Any transport failure (the
-    /// call itself or a mid-stream `message()`) is mapped to
-    /// [`DistribError::Transport`]; framing/decode is the caller's concern.
-    async fn collect_frames(
-        &self,
-        request: pb::FetchRequest,
-    ) -> Result<Vec<pb::FetchResponse>, DistribError> {
-        let mut client = SeriesFetchClient::new(self.channel.clone());
-        let response = client
-            .fetch(request)
-            .await
-            .map_err(|s| DistribError::Transport(s.to_string()))?;
-        let mut stream = response.into_inner();
-        let mut frames = Vec::new();
-        while let Some(frame) = stream
-            .message()
-            .await
-            .map_err(|s| DistribError::Transport(s.to_string()))?
-        {
-            frames.push(frame);
+    /// Lower this fetcher's per-slice frame cap, the
+    /// [`SliceStreamDecoder::with_max_frames`] seam one level up: the real
+    /// constant is sized so no ordinary slice reaches it, which also makes it
+    /// impractical to drive over a real stream. A fetcher that does not call
+    /// this is bounded by the constant.
+    pub fn with_max_frames(mut self, max_frames: usize) -> Self {
+        self.max_frames = Some(max_frames);
+        self
+    }
+
+    /// Lower this fetcher's per-slice wire-byte cap, the
+    /// [`SliceStreamDecoder::with_max_bytes`] seam one level up, for the same
+    /// reason.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    /// A decoder carrying this fetcher's caps. The config it is built from only
+    /// selects the byte cap through [`codec::slice_byte_cap`], which is the
+    /// fixed [`codec::MAX_SLICE_RESPONSE_BYTES`] ceiling for every config, so a
+    /// default one is the same cap a coordinator's own config would give.
+    fn decoder(&self) -> SliceStreamDecoder {
+        let mut decoder = SliceStreamDecoder::new(&EngineConfig::default());
+        if let Some(max_frames) = self.max_frames {
+            decoder = decoder.with_max_frames(max_frames);
         }
-        Ok(frames)
+        if let Some(max_bytes) = self.max_bytes {
+            decoder = decoder.with_max_bytes(max_bytes);
+        }
+        decoder
     }
 }
 
 #[async_trait::async_trait]
 impl SliceFetcher for RemoteSliceFetcher {
     async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
-        let frames = self.collect_frames(request).await?;
-        decode_slice_frames(frames)
-    }
-
-    async fn fetch_logs(
-        &self,
-        request: pb::FetchRequest,
-    ) -> Result<SliceLogResponse, DistribError> {
-        let frames = self.collect_frames(request).await?;
-        decode_log_slice_frames(frames)
-    }
-
-    async fn fetch_spans(
-        &self,
-        request: pb::FetchRequest,
-    ) -> Result<SliceSpanResponse, DistribError> {
-        let frames = self.collect_frames(request).await?;
-        decode_span_slice_frames(frames)
+        let mut client = SeriesFetchClient::new(self.channel.clone());
+        let response = client
+            .fetch(request)
+            .await
+            .map_err(|s| DistribError::Transport(s.to_string()))?;
+        let mut decoder = self.decoder();
+        let mut stream = response.into_inner();
+        loop {
+            // A cap breach returns here rather than pulling another message:
+            // the caps bound what this coordinator holds only if the read stops.
+            match stream
+                .message()
+                .await
+                .map_err(|s| DistribError::Transport(s.to_string()))?
+            {
+                Some(frame) => decoder.push(frame)?,
+                None => break,
+            }
+        }
+        decoder.finish()
     }
 }
 
 /// Decode a slice's full frame sequence into a [`SliceResponse`].
 ///
 /// This is the whole-sequence decode: it takes every frame at once, so its
-/// caller already holds the whole slice. Exactly two callers remain.
-/// [`RemoteSliceFetcher`] drains its gRPC stream into a `Vec` and calls this,
-/// with no cap on what it buffers; it is the fetcher the in-process test and
-/// bench harnesses build (`distrib/tests.rs`, `engine.rs`, `ravel-bench`), and
-/// no `ravel-server` process constructs one. `ravel-server`'s local no-hop fetch
-/// (`FragmentService::run_local` in `services/ravel-server/src/distrib.rs`)
-/// calls it on frames this same process just produced in-process, where there
-/// is no remote deciding how much it holds.
+/// caller already holds the whole slice. One caller remains, and it holds the
+/// frames for a reason that is not a remote's to decide: `ravel-server`'s local
+/// no-hop fetch (`FragmentService::run_local` in
+/// `services/ravel-server/src/distrib.rs`) calls it on frames this same process
+/// just produced in-process.
 ///
-/// The two shipped paths that DO read a remote's stream no longer call this: an
-/// intra-cluster remote dispatch (`RoutingSliceFetcher::remote_fetch`) and
-/// cross-cluster federation (`FederationSliceFetcher::fetch`), both in the same
-/// file, decode incrementally through
+/// No path that reads a REMOTE's stream calls this. An intra-cluster remote
+/// dispatch (`RoutingSliceFetcher::remote_fetch`), cross-cluster federation
+/// (`FederationSliceFetcher::fetch`), and [`RemoteSliceFetcher`] all decode
+/// incrementally through
 /// [`SliceStreamDecoder`](crate::distrib::SliceStreamDecoder), which applies the
 /// per-slice frame and wire-byte caps before each frame is decoded (issue #1687
-/// part B).
+/// part B, extended to `RemoteSliceFetcher` by #1912).
 ///
 /// So there are now two per-frame decode implementations, not one. Nothing
 /// structural holds them together:
@@ -388,134 +421,6 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
         },
         series_returned: summary.series_returned,
         samples_returned: summary.samples_returned,
-        status: code,
-        status_message: status.message,
-    })
-}
-
-/// Decode an RLOG-family slice's full frame sequence into a [`SliceLogResponse`]
-/// (#284). The log sibling of [`decode_slice_frames`]: it accepts
-/// [`pb::LogRecordFrame`]s and exactly one terminal [`pb::Summary`], and rejects
-/// any metric/histogram/span frame as [`DistribError::FrameSignalUnsupported`]
-/// (a log slice must not carry them). Every malformation is a typed error, never
-/// a panic: a malformed record ([`DistribError::Codec`]), a mixed-signal frame,
-/// an empty frame, a second summary, a missing summary, a summary with no
-/// status, or an unknown status code.
-pub fn decode_log_slice_frames(
-    frames: Vec<pb::FetchResponse>,
-) -> Result<SliceLogResponse, DistribError> {
-    let mut records = Vec::new();
-    let mut summary: Option<pb::Summary> = None;
-    for frame in frames {
-        match frame.frame {
-            Some(pb::fetch_response::Frame::LogRecord(lr)) => {
-                records.push(codec::decode_log_record(lr)?);
-            }
-            Some(pb::fetch_response::Frame::Series(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("series"));
-            }
-            Some(pb::fetch_response::Frame::Hist(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("histogram"));
-            }
-            Some(pb::fetch_response::Frame::Span(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("span"));
-            }
-            Some(pb::fetch_response::Frame::PartialAggregate(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("partial-aggregate"));
-            }
-            Some(pb::fetch_response::Frame::Summary(s)) => {
-                if summary.is_some() {
-                    return Err(DistribError::MultipleSummaries);
-                }
-                summary = Some(s);
-            }
-            None => return Err(DistribError::EmptyFrame),
-        }
-    }
-
-    let summary = summary.ok_or(DistribError::NoSummary)?;
-    let status = summary
-        .status
-        .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
-    let code = codec::decode_status_code(status.code)?;
-    let accounting = summary
-        .accounting
-        .map(codec::decode_accounting)
-        .unwrap_or_default();
-    Ok(SliceLogResponse {
-        records,
-        accounting,
-        stats: FetchStats {
-            raw_f64_pages: summary.raw_f64_pages,
-            raw_f64_bytes: summary.raw_f64_bytes,
-            // The log signal has no histogram-kind series to skip.
-            histogram_series_skipped: 0,
-        },
-        records_returned: summary.series_returned,
-        status: code,
-        status_message: status.message,
-    })
-}
-
-/// Decode a Spans slice's full frame sequence into a [`SliceSpanResponse`]
-/// (#285). The span sibling of [`decode_log_slice_frames`]: it accepts
-/// [`pb::SpanFrame`]s and exactly one terminal [`pb::Summary`], and rejects any
-/// metric/histogram/log frame as [`DistribError::FrameSignalUnsupported`] (a
-/// span slice must not carry them). Every malformation is a typed error, never a
-/// panic: a malformed span ([`DistribError::Codec`]), a mixed-signal frame, an
-/// empty frame, a second summary, a missing summary, a summary with no status,
-/// or an unknown status code.
-pub fn decode_span_slice_frames(
-    frames: Vec<pb::FetchResponse>,
-) -> Result<SliceSpanResponse, DistribError> {
-    let mut spans = Vec::new();
-    let mut summary: Option<pb::Summary> = None;
-    for frame in frames {
-        match frame.frame {
-            Some(pb::fetch_response::Frame::Span(sf)) => {
-                spans.push(codec::decode_span_frame(sf)?);
-            }
-            Some(pb::fetch_response::Frame::Series(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("series"));
-            }
-            Some(pb::fetch_response::Frame::Hist(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("histogram"));
-            }
-            Some(pb::fetch_response::Frame::LogRecord(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("log-record"));
-            }
-            Some(pb::fetch_response::Frame::PartialAggregate(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("partial-aggregate"));
-            }
-            Some(pb::fetch_response::Frame::Summary(s)) => {
-                if summary.is_some() {
-                    return Err(DistribError::MultipleSummaries);
-                }
-                summary = Some(s);
-            }
-            None => return Err(DistribError::EmptyFrame),
-        }
-    }
-
-    let summary = summary.ok_or(DistribError::NoSummary)?;
-    let status = summary
-        .status
-        .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
-    let code = codec::decode_status_code(status.code)?;
-    let accounting = summary
-        .accounting
-        .map(codec::decode_accounting)
-        .unwrap_or_default();
-    Ok(SliceSpanResponse {
-        spans,
-        accounting,
-        stats: FetchStats {
-            raw_f64_pages: summary.raw_f64_pages,
-            raw_f64_bytes: summary.raw_f64_bytes,
-            // The span signal has no histogram-kind series to skip.
-            histogram_series_skipped: 0,
-        },
-        spans_returned: summary.series_returned,
         status: code,
         status_message: status.message,
     })
@@ -852,175 +757,6 @@ mod tests {
         ));
     }
 
-    // --- decode_span_slice_frames (#307) -----------------------------------
-    //
-    // The span decoder mirrors `decode_slice_frames`' terminal paths (missing
-    // summary, duplicate summary, empty frame, missing status, unknown status)
-    // and adds its own: a series, histogram, or log-record frame in a span
-    // stream is rejected as `FrameSignalUnsupported`, never silently skipped.
-
-    /// A well-formed span frame (root span, `Unset` status, no attributes). Its
-    /// contents never reach a reject arm, so only the shape matters.
-    fn span_frame() -> pb::FetchResponse {
-        pb::FetchResponse {
-            frame: Some(pb::fetch_response::Frame::Span(pb::SpanFrame {
-                trace_id: vec![0xAAu8; 16],
-                span_id: vec![1u8; 8],
-                parent_span_id: Vec::new(),
-                name: "op".to_string(),
-                start_ts_ns: 10,
-                end_ts_ns: 11,
-                status_code: 0,
-                status_message: None,
-                attrs: Vec::new(),
-                service_name: None,
-            })),
-        }
-    }
-
-    /// The happy path: a span frame plus one terminal summary decodes to a
-    /// `SliceSpanResponse` carrying the decoded span and the summary fields.
-    #[test]
-    fn span_then_summary_decodes() {
-        let response =
-            decode_span_slice_frames(vec![span_frame(), summary_frame(pb::status::Code::Ok)])
-                .expect("valid span frame sequence decodes");
-        assert_eq!(response.spans.len(), 1);
-        assert_eq!(response.spans[0].record.trace_id, [0xAAu8; 16]);
-        assert_eq!(response.status, pb::status::Code::Ok);
-        // The summary's `series_returned` field is reused as the span count.
-        assert_eq!(response.spans_returned, 1);
-        assert_eq!(response.stats.raw_f64_pages, 5);
-        assert_eq!(response.accounting.s3_requests(AccountedOp::Get), 3);
-    }
-
-    /// A span stream that never sent its mandatory terminal summary is
-    /// `NoSummary`.
-    #[test]
-    fn span_missing_summary_is_typed_error() {
-        assert!(matches!(
-            decode_span_slice_frames(vec![span_frame()]),
-            Err(DistribError::NoSummary)
-        ));
-    }
-
-    /// Two summary frames violate the exactly-one-summary rule.
-    #[test]
-    fn span_duplicate_summary_is_typed_error() {
-        assert!(matches!(
-            decode_span_slice_frames(vec![
-                summary_frame(pb::status::Code::Ok),
-                summary_frame(pb::status::Code::Ok),
-            ]),
-            Err(DistribError::MultipleSummaries)
-        ));
-    }
-
-    /// A frame carrying no `frame` oneof variant is `EmptyFrame`.
-    #[test]
-    fn span_empty_frame_is_typed_error() {
-        assert!(matches!(
-            decode_span_slice_frames(vec![pb::FetchResponse { frame: None }]),
-            Err(DistribError::EmptyFrame)
-        ));
-    }
-
-    /// A summary that carries no status is a typed `MissingStatus` codec error.
-    #[test]
-    fn span_summary_without_status_is_typed_error() {
-        let no_status = pb::FetchResponse {
-            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
-                accounting: None,
-                series_returned: 0,
-                samples_returned: 0,
-                status: None,
-                raw_f64_pages: 0,
-                raw_f64_bytes: 0,
-            })),
-        };
-        assert!(matches!(
-            decode_span_slice_frames(vec![no_status]),
-            Err(DistribError::Codec(CodecError::MissingStatus))
-        ));
-    }
-
-    /// A summary naming a status code discriminant this build does not model is a
-    /// typed error, never a silent success.
-    #[test]
-    fn span_unknown_status_code_is_typed_error() {
-        let bad_code = pb::FetchResponse {
-            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
-                accounting: None,
-                series_returned: 0,
-                samples_returned: 0,
-                status: Some(pb::Status {
-                    code: -1,
-                    message: String::new(),
-                }),
-                raw_f64_pages: 0,
-                raw_f64_bytes: 0,
-            })),
-        };
-        assert!(matches!(
-            decode_span_slice_frames(vec![bad_code]),
-            Err(DistribError::Codec(CodecError::UnknownStatusCode(-1)))
-        ));
-    }
-
-    /// A series frame in a span stream is rejected as `FrameSignalUnsupported`,
-    /// never decoded as a span and never skipped. If the explicit
-    /// `Frame::Series(_)` reject arm in `decode_span_slice_frames` were relaxed
-    /// to a permissive wildcard (`_ => continue`), the frame would be dropped and
-    /// the trailing summary would decode to an empty `Ok` response, so this
-    /// `expect_err`-style match would fail.
-    #[test]
-    fn span_decoder_rejects_series_frame_as_unsupported() {
-        let soa = series_soa();
-        assert!(matches!(
-            decode_span_slice_frames(vec![
-                series_frame(&soa),
-                summary_frame(pb::status::Code::Ok),
-            ]),
-            Err(DistribError::FrameSignalUnsupported("series"))
-        ));
-    }
-
-    /// A native-histogram frame in a span stream is rejected as
-    /// `FrameSignalUnsupported`. As with the series case, relaxing the explicit
-    /// `Frame::Hist(_)` reject arm to a wildcard would drop the frame and decode
-    /// to an empty `Ok`, failing this assertion.
-    #[test]
-    fn span_decoder_rejects_histogram_frame_as_unsupported() {
-        let hist = pb::FetchResponse {
-            frame: Some(pb::fetch_response::Frame::Hist(pb::HistogramFrame {
-                series_id: vec![0u8; 16],
-                labels: Vec::new(),
-                runs: Vec::new(),
-            })),
-        };
-        assert!(matches!(
-            decode_span_slice_frames(vec![hist, summary_frame(pb::status::Code::Ok)]),
-            Err(DistribError::FrameSignalUnsupported("histogram"))
-        ));
-    }
-
-    /// A log-record frame in a span stream is rejected as
-    /// `FrameSignalUnsupported`. Relaxing the explicit `Frame::LogRecord(_)`
-    /// reject arm to a wildcard would drop the frame and decode to an empty `Ok`,
-    /// failing this assertion.
-    #[test]
-    fn span_decoder_rejects_log_record_frame_as_unsupported() {
-        let log = pb::FetchResponse {
-            frame: Some(pb::fetch_response::Frame::LogRecord(
-                pb::LogRecordFrame::default(),
-            )),
-        };
-        assert!(matches!(
-            decode_span_slice_frames(vec![log, summary_frame(pb::status::Code::Ok)]),
-            Err(DistribError::FrameSignalUnsupported("log-record"))
-        ));
-    }
-
     /// A well-formed `PartialAggregate` frame (ADR-0103 decision 2). Its bounds
     /// are `-0.0` and a NaN payload so a decode that round-tripped them through
     /// a proto double instead of the bit pattern would be visible.
@@ -1084,20 +820,4 @@ mod tests {
         ));
     }
 
-    /// The log and span decoders keep rejecting a `PartialAggregate` as
-    /// `FrameSignalUnsupported`: a worker-computed scalar aggregate is never
-    /// expected on those slices (ADR-0103 is metrics-only). Relaxing either
-    /// explicit reject arm to a wildcard would drop the frame and decode to an
-    /// empty `Ok`, failing these assertions.
-    #[test]
-    fn log_and_span_decoders_reject_partial_aggregate_as_unsupported() {
-        assert!(matches!(
-            decode_log_slice_frames(vec![partial_frame(), summary_frame(pb::status::Code::Ok)]),
-            Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
-        ));
-        assert!(matches!(
-            decode_span_slice_frames(vec![partial_frame(), summary_frame(pb::status::Code::Ok)]),
-            Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
-        ));
-    }
 }
