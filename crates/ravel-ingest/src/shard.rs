@@ -195,21 +195,6 @@ struct TenantBuf {
     /// corridor floor in `adaptive_age_threshold_ns` with no special case.
     last_arrival_ns: Option<i64>,
     avg_gap_ns: i64,
-    /// The ingest-hour bucket the first trigger this buffer lost to the
-    /// queued-flush cap would have pinned, carried across every later deferral
-    /// round and used when the flush finally opens (issue #1740).
-    ///
-    /// Set before the cap check refuses a trigger, never overwritten while it
-    /// is `Some`, and consumed with the buffer at flush open. It keeps the
-    /// routing-to-pin gap at `max_flush_delay_idle` (plus one `flush_tick`),
-    /// the two-term worst case `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is
-    /// derived from, whatever the deferral costs: deferral then delays the
-    /// write without moving which ingest hour the records land in. Pinning
-    /// after the refusal instead would add the deferral's own length to that
-    /// gap, and nothing bounds the number of rounds (`flush_aged` retries in
-    /// `HashMap` order with no fairness), so records could land in an ingest
-    /// hour past what the read-side scan slack covers.
-    pinned_ingest_hour_bucket: Option<u32>,
 }
 
 impl TenantBuf {
@@ -1522,10 +1507,6 @@ impl ShardActor {
             debug_assert!(buf.waiters.is_empty());
             return;
         }
-        // Read once, before the cap check, so a refused trigger pins its
-        // ingest-hour bucket from the reading it fired on rather than from one
-        // taken a deferral later.
-        let raw_ns = self.clock.now_ns();
         if self.queued_flush_cap_reached(trigger, &buf) {
             // Issue #1740: this shard is already holding `max_queued_flushes`
             // flush windows, and this buffer is still under its memory
@@ -1538,18 +1519,22 @@ impl ShardActor {
             // is acked and nothing is dropped, so this is a deferral, not a
             // shed (ADR-1642 amendment).
             //
-            // The ingest-hour bucket rides back too, pinned here from this
-            // trigger's own clock reading and kept across every later round
-            // (`get_or_insert`, so round two does not overwrite round one).
-            // An implausible reading pins nothing and is left to the flush-open
-            // path to reject fail-loud, which is where that check belongs.
-            if let Ok(bucket) = checked_ingest_hour_bucket(raw_ns) {
-                buf.pinned_ingest_hour_bucket.get_or_insert(bucket);
-            }
+            // The rows carry no ingest-hour bucket across the deferral. The
+            // bucket is pinned below, from the reading taken by the flush that
+            // finally opens, so a deferral adds its own length to the gap
+            // between a record's routing and its bucket, and can overrun the
+            // `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` the read side allows
+            // for that gap. Pinning before this check instead would move the
+            // overrun to the other side of the flush, past the catalog's
+            // sealed-hour watermark, where it is unrecoverable rather than
+            // bounded; both overruns are measured in this module's tests.
+            // Issue #1916 owns the redesign that bounds the deferral itself,
+            // which is what closes either one.
             self.metrics.record_shard_flush_trigger_deferred(self.shard);
             self.tenants.insert(tenant, buf);
             return;
         }
+        let raw_ns = self.clock.now_ns();
         // The flush-open stamp is decided before the buffer is consumed and
         // before `record_flush`: a refused flush never touched the store, so it
         // must not be counted as a flush that happened, and (on the retryable
@@ -1614,28 +1599,10 @@ impl ShardActor {
             max_ingest_ts_ns,
             waiters,
             charges,
-            pinned_ingest_hour_bucket,
             ..
         } = buf;
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
-            Ok(bucket) => match pinned_ingest_hour_bucket {
-                // A deferred flush keeps the bucket its first trigger pinned,
-                // so the gap between a record's routing and its bucket stays
-                // bounded by `max_flush_delay_idle` however many rounds the
-                // cap costs (issue #1740).
-                //
-                // `min`, not the carried value outright: `created_unix_ns` is
-                // stamped from `flush_open_ns`, and a commit record whose
-                // `ingest_hour_bucket` is after its `created_unix_ns`'s hour is
-                // rejected by `ravel_commit::record` ("a flush cannot open
-                // after it was recorded as created"). A backwards clock step
-                // absorbed between the deferral and this flush can leave
-                // `flush_open_ns` in an earlier hour than the carried pin, and
-                // the earlier of the two is both valid there and the one this
-                // fix is for.
-                Some(pinned) => pinned.min(bucket),
-                None => bucket,
-            },
+            Ok(bucket) => bucket,
             Err(msg) => {
                 // Defensive: `flush_open_ns` was already hour-bucket-validated (it
                 // is either `raw_ns`, checked at the helper entry, or the floor,
@@ -2125,85 +2092,462 @@ mod inflight_guard_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{Duration, IngestConfig};
-    use ravel_catalog::FLUSH_BOUND_SLACK_HOURS;
+    use std::pin::Pin;
 
-    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    use ravel_commit::record;
+    use ravel_object_store::GetRange;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_otlp::normalize::NormalizedPoint;
+    use ravel_types::METRIC_NAME_LABEL;
+    use tokio::sync::watch;
 
-    /// The worst-case span `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` must cover
-    /// (ADR-0052 section 3, and the derivation recorded beside that constant),
-    /// recomputed from `config` so that growing any term moves this figure.
-    ///
-    /// Three terms:
-    /// - `max_flush_delay_idle`: the oldest a buffer with no strict waiter gets
-    ///   before its age trigger fires. The validated worst case, since
-    ///   `ravel-server` refuses an idle ceiling below `max_flush_delay`.
-    /// - one deferral round (issue #1740): at `max_queued_flushes` the trigger
-    ///   is refused, the rows stay buffered with `oldest_arrival_ns` unreset,
-    ///   and the flush's `ingest_hour_bucket` is pinned from the clock reading
-    ///   taken after the refusal. The retry re-fires one `flush_tick` later but
-    ///   spawns only once a queued flush leaves the `JoinSet`, and under a
-    ///   stalled store the task holding the permit stays until its store budget
-    ///   expires, `max_flush_lifetime` after its grant.
-    /// - `max_flush_lifetime`: the flush's own budget once it is open.
-    ///
-    /// One round is the floor, not the bound: `flush_aged` retries in `HashMap`
-    /// order with no fairness, so a buffer that keeps losing the race to
-    /// co-resident tenants is deferred again, and nothing counts the rounds.
-    fn flush_bound_ns(config: &IngestConfig) -> i64 {
-        let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
-        let lifetime_ns = config.max_flush_lifetime.as_nanos() as i64;
-        let deferral_round_ns = lifetime_ns + config.flush_tick.as_nanos() as i64;
-        idle_ns + deferral_round_ns + lifetime_ns
+    use super::*;
+    use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
+    use crate::config::NS_PER_HOUR;
+    use crate::router::{IngestRouter, WriteMode};
+    use ravel_catalog::{
+        DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
+        DEFAULT_MAX_FLUSH_LIFETIME_NS, FLUSH_BOUND_SLACK_HOURS,
+    };
+
+    /// An exact ingest-hour boundary (unix hour 472223), and a base one second
+    /// before it. Every fixture below routes its records in the hour that ends
+    /// at `BOUNDARY_NS` and then crosses it during the deferral, so "the bucket
+    /// the trigger fired in" and "the bucket the flush opened in" are different
+    /// numbers rather than the same one read twice.
+    const BOUNDARY_NS: i64 = 472_223 * NS_PER_HOUR;
+    const BASE_NS: i64 = BOUNDARY_NS - 1_000_000_000;
+
+    /// Past `max_flush_delay` (50 ms) on every tick.
+    const TICK_ADVANCE_NS: i64 = 100_000_000;
+
+    /// Deterministic injected clock; the shard actor's flush tick sleeps on it.
+    /// Restated here because a unit test cannot import the integration-test
+    /// harness (mirrors `log_shard`'s and `tests/common`'s).
+    struct TestClock {
+        now_ns: AtomicI64,
+        wake_tx: watch::Sender<()>,
     }
 
-    /// Whether the read-side scan slack covers a flush the queued-flush cap
-    /// deferred (issue #1740). It covers one exactly while the three terms of
-    /// [`flush_bound_ns`] fit inside the constant, and at the shipped ingest
-    /// defaults they do not: a single deferral round costs
-    /// `max_flush_lifetime`, while the constant leaves only
-    /// `2h - (40s + 3600s) = 3560s` over the two terms it was derived from.
-    ///
-    /// Both arms are asserted from the terms, never against the constant's own
-    /// value, so raising an ingest flush term fails the first arm and dropping
-    /// the deferral term from the computation fails the second. The second arm
-    /// pins an open gap rather than a settled property: bounding the deferral
-    /// in `queued_flush_cap_reached` is what would close it, and doing so must
-    /// flip this assertion in the same commit rather than leave it passing on a
-    /// stale reading. Adjusting `FLUSH_BOUND_SLACK_HOURS` to make it pass is
-    /// the one resolution that is not available: that constant is a frozen
-    /// read-side contract (`DEFAULT_SCAN_SLACK_HOURS`, ADR-0052 section 3).
-    #[test]
-    fn the_flush_bound_slack_covers_a_deferred_flush() {
-        let slack_ns = i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR;
+    impl TestClock {
+        fn new(start_ns: i64) -> Arc<Self> {
+            let (wake_tx, _rx) = watch::channel(());
+            Arc::new(TestClock {
+                now_ns: AtomicI64::new(start_ns),
+                wake_tx,
+            })
+        }
 
-        let covered = IngestConfig {
-            max_flush_lifetime: Duration::from_secs(1800),
+        fn advance_ns(&self, delta_ns: i64) {
+            self.now_ns.fetch_add(delta_ns, Ordering::SeqCst);
+            let _ = self.wake_tx.send(());
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_ns(&self) -> i64 {
+            self.now_ns.load(Ordering::SeqCst)
+        }
+
+        fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            let deadline = self
+                .now_ns()
+                .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+            let mut rx = self.wake_tx.subscribe();
+            Box::pin(async move {
+                loop {
+                    if self.now_ns() >= deadline {
+                        return;
+                    }
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    /// Yields until `probe` is true. Every caller's `probe` reads a metric the
+    /// shard actor publishes, so this is a cooperative wait rather than a timed
+    /// one; a probe that never becomes true hangs, which the runner reports
+    /// under this test's own name.
+    async fn until(mut probe: impl FnMut() -> bool) {
+        while !probe() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn one_permit_one_queue(max_flush_lifetime: Duration) -> IngestConfig {
+        IngestConfig {
+            shard_count: 1,
+            // Only the age trigger can ever fire.
+            target_bytes: 8 * 1024 * 1024,
+            max_flush_delay: Duration::from_millis(50),
+            flush_tick: Duration::from_millis(10),
+            // One permit and one queue slot: the first flush parks at the held
+            // PUT, and the very next trigger is at the cap.
+            max_inflight_flushes: 1,
+            max_queued_flushes: 1,
+            // Long enough that the injected deferral below never reaches the
+            // parked flush's own deadline: this fixture is about the pin, and
+            // the abandonment path must not compete for the evidence.
+            max_flush_lifetime,
+            put_retry_base_delay: Duration::from_millis(1),
+            put_retry_max_delay: Duration::from_millis(5),
             ..IngestConfig::default()
+        }
+    }
+
+    fn point(tenant: &TenantId, host: &str) -> NormalizedPoint {
+        let labels = LabelSet::new(vec![
+            Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: "cpu_usage".to_string(),
+            },
+            Label {
+                name: "host".to_string(),
+                value: host.to_string(),
+            },
+        ])
+        .expect("distinct label names");
+        let series_id = SeriesId::compute(tenant, "cpu_usage", &labels).expect("series id");
+        NormalizedPoint {
+            series_id,
+            labels: Arc::new(labels),
+            sample: Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            },
+            is_monotonic_sum: false,
+        }
+    }
+
+    /// What one deferred flush produced: when its record was routed, and the
+    /// commit record the flush eventually wrote.
+    struct DeferredFlush {
+        routed_ns: i64,
+        record: CommitRecord,
+    }
+
+    /// Drives exactly one deferred flush and returns its evidence.
+    ///
+    /// One tenant, one shard, one permit, one queue slot. The first write's
+    /// flush parks at a held data PUT and occupies both; the second write's
+    /// trigger is therefore refused. The clock then jumps `deferral_ns`,
+    /// crossing at least one hour boundary, and the refusal repeats on the
+    /// tick that jump fires, so the buffer is deferred across more than one
+    /// round. Releasing the gate drains the parked flush and the next tick
+    /// finally opens the deferred one, in a later ingest hour than the trigger
+    /// fired in.
+    async fn drive_one_deferred_flush(deferral_ns: i64) -> DeferredFlush {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let lifetime = Duration::from_nanos(
+            u64::try_from(deferral_ns.saturating_mul(4)).unwrap_or(u64::MAX),
+        );
+        let router = Arc::new(
+            IngestRouter::new(
+                one_permit_one_queue(lifetime),
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let acme = TenantId::new("acme");
+
+        // `Nth(1)` so releasing this one call lets the parked flush drain
+        // rather than re-holding its retry.
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+        let write = |host: &'static str| {
+            let router = Arc::clone(&router);
+            let tenant = acme.clone();
+            tokio::spawn(async move {
+                let points = vec![point(&tenant, host)];
+                router
+                    .write(tenant, points, WriteMode::Strict, Duration::from_secs(60))
+                    .await
+            })
         };
-        assert!(
-            flush_bound_ns(&covered) <= slack_ns,
-            "a deferred flush is covered while its terms fit: {:?} idle plus \
-             one deferral round plus {:?} lifetime = {}ns must stay within \
-             FLUSH_BOUND_SLACK_HOURS ({}ns)",
-            covered.max_flush_delay_idle,
-            covered.max_flush_lifetime,
-            flush_bound_ns(&covered),
-            slack_ns
+
+        // The first flush takes the permit and parks in the store.
+        let parked = write("h0");
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| in_flight(&router) == 1).await;
+        gate.wait_until_held(1).await;
+
+        // The second write is routed here, and nothing advances the clock
+        // between this reading and the row reaching the buffer.
+        let routed_ns = clock.now_ns();
+        let deferred = write("h1");
+        until(|| router.metrics().snapshot().buffered_points_total >= 2).await;
+
+        // Round one: the trigger fires and is refused. This is where the fix
+        // pins the bucket.
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| deferred_triggers(&router) >= 1 || in_flight(&router) > 1).await;
+        assert_eq!(
+            in_flight(&router),
+            1,
+            "the trigger past the cap must be deferred, not spawned"
         );
 
-        let shipped = IngestConfig::default();
-        assert!(
-            flush_bound_ns(&shipped) > slack_ns,
-            "at the shipped defaults one deferral round already overruns the \
-             slack ({}ns against {}ns), so a deferred flush can pin an \
-             ingest_hour_bucket outside the scan set a retiring shard-count \
-             generation is kept in. If this assertion fails, the deferral was \
-             bounded: state the new term in flush_bound_ns and flip this arm \
-             rather than relaxing FLUSH_BOUND_SLACK_HOURS (issue #1740)",
-            flush_bound_ns(&shipped),
-            slack_ns
+        // The deferral itself, crossing at least one ingest-hour boundary.
+        // Round two: the tick this jump fires finds the shard still at its cap
+        // and refuses again, so the pin from round one has to survive a second
+        // refusal rather than be re-taken.
+        clock.advance_ns(deferral_ns);
+        until(|| deferred_triggers(&router) >= 2 || in_flight(&router) > 1).await;
+        assert_eq!(
+            in_flight(&router),
+            1,
+            "the second round is deferred too, so the carried pin is what the \
+             flush below opens with"
         );
+
+        // Drain the parked flush, freeing both the permit and the queue slot.
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        parked
+            .await
+            .expect("parked write task")
+            .expect("parked write acks once the gate is released");
+        until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+
+        // One more tick: the deferred buffer kept `oldest_arrival_ns` through
+        // every refusal, so it is still due, and it opens now.
+        clock.advance_ns(TICK_ADVANCE_NS);
+        let receipt = deferred
+            .await
+            .expect("deferred write task")
+            .expect("deferred write acks once the cap clears");
+        assert_eq!(receipt.tokens.len(), 1);
+        let token = receipt.tokens[0].clone();
+
+        let commit_key =
+            keys::commit_key_for_token(&acme.hash(), Signal::Metrics, &token).expect("commit key");
+        let bytes = store
+            .get(&commit_key, GetRange::Full)
+            .await
+            .expect("get commit record")
+            .data;
+        let decoded = record::decode(&bytes).expect("decode commit record");
+        assert_eq!(
+            decoded.ingest_hour_bucket, token.ingest_hour_bucket,
+            "the token and the object it points at must name one ingest hour"
+        );
+
+        router.flush_all().await;
+        DeferredFlush {
+            routed_ns,
+            record: decoded,
+        }
+    }
+
+    fn in_flight(router: &IngestRouter) -> u64 {
+        router
+            .metrics()
+            .in_flight_flushes_by_shard()
+            .into_iter()
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    fn queued_gauge(router: &IngestRouter) -> u64 {
+        router
+            .metrics()
+            .shard_skew_by_shard()
+            .into_iter()
+            .map(|(_, s)| s.flushes_queued)
+            .sum()
+    }
+
+    fn deferred_triggers(router: &IngestRouter) -> u64 {
+        router
+            .metrics()
+            .shard_skew_by_shard()
+            .into_iter()
+            .map(|(_, s)| s.flush_trigger_deferred)
+            .sum()
+    }
+
+    fn hour_of(ns: i64) -> u32 {
+        u32::try_from(ns / NS_PER_HOUR).expect("plausible ingest clock fits a u32 hour")
+    }
+
+    /// Where a deferred flush's ingest-hour bucket comes from: the reading
+    /// taken by the flush that finally opens, not the one the refused trigger
+    /// fired on.
+    ///
+    /// The deferral here runs from one second before an ingest-hour boundary
+    /// to well past it, so those are two different hours rather than the same
+    /// one read twice, and the assertion can tell them apart. This pins an
+    /// open defect, not a desired property: the deferral's own length lands in
+    /// the gap `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` bounds, which is what
+    /// the next test measures. When issue #1916 bounds the deferral, this
+    /// assertion is the one to flip.
+    #[tokio::test]
+    async fn a_deferred_flush_takes_the_ingest_hour_it_opened_in() {
+        // Two seconds spans the boundary one second ahead of `BASE_NS`.
+        let flush = drive_one_deferred_flush(2_000_000_000).await;
+
+        let fired_hour = hour_of(flush.routed_ns);
+        let created_hour = hour_of(flush.record.created_unix_ns);
+        assert_eq!(
+            fired_hour,
+            hour_of(BASE_NS),
+            "the trigger fired in the hour that ends at BOUNDARY_NS"
+        );
+        assert_eq!(
+            created_hour,
+            fired_hour + 1,
+            "the deferral crossed an ingest-hour boundary, so the flush opened \
+             in the next hour: without this the assertion below would hold for \
+             a run that never left one hour and would prove nothing"
+        );
+        assert_eq!(
+            flush.record.ingest_hour_bucket, created_hour,
+            "a deferred flush pins the ingest hour it opened in \
+             ({created_hour}), not the one its trigger fired in ({fired_hour})"
+        );
+    }
+
+    /// The read-side scan slack (`ravel_catalog::FLUSH_BOUND_SLACK_HOURS`,
+    /// ADR-0052 section 3) is meant to cover the whole span between a record
+    /// being routed and the ingest hour its flush pins. The queued-flush cap's
+    /// deferral is not covered by it, and this measures the overrun on a live
+    /// shard actor: a real refusal, a deferral longer than the constant
+    /// allows, and the distance in whole ingest hours between the record's
+    /// arrival and the bucket the flush actually wrote.
+    ///
+    /// Behavioural on purpose. An arithmetic-only guard restates the terms
+    /// someone believed the code produces (`max_flush_delay_idle` plus one
+    /// `flush_tick`) and passes whether or not a deferral moved the pin, which
+    /// is how this gap shipped under a green test in the first place.
+    ///
+    /// Neither available one-line fix closes it.
+    /// `FLUSH_BOUND_SLACK_HOURS` is a frozen read-side contract
+    /// (`DEFAULT_SCAN_SLACK_HOURS`, ADR-0052 section 3), and raising it does
+    /// not bound an unbounded number of rounds anyway; pinning the bucket
+    /// before the cap check moves the overrun past the catalog's sealed-hour
+    /// watermark instead, which
+    /// `carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour` shows is
+    /// the worse of the two. Issue #1916 owns bounding the deferral itself.
+    #[tokio::test]
+    async fn a_deferred_flush_can_overrun_the_flush_bound_slack() {
+        // Three hours of deferral against a two-hour slack.
+        let deferral_ns = 3 * NS_PER_HOUR;
+        assert!(
+            deferral_ns > i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR,
+            "the fixture must out-run the slack, or it cannot measure a pin \
+             that carries the deferral's own length"
+        );
+        let flush = drive_one_deferred_flush(deferral_ns).await;
+
+        let routed_hour = hour_of(flush.routed_ns);
+        let created_hour = hour_of(flush.record.created_unix_ns);
+        assert!(
+            created_hour >= routed_hour + 3,
+            "the fixture deferred across at least three ingest hours \
+             (routed in {routed_hour}, opened in {created_hour})"
+        );
+        let hours_late = flush.record.ingest_hour_bucket.saturating_sub(routed_hour);
+        assert!(
+            hours_late > FLUSH_BOUND_SLACK_HOURS,
+            "a record routed in hour {routed_hour} landed in ingest hour {} \
+             ({hours_late} hours later), inside the {FLUSH_BOUND_SLACK_HOURS} \
+             hours FLUSH_BOUND_SLACK_HOURS covers. If a deferral no longer \
+             reaches the pin, issue #1916 has been resolved: assert the \
+             covering property here instead of this overrun, and update \
+             docs/ingest.md and FLUSH_BOUND_SLACK_HOURS's own documentation, \
+             which both record the gap as open",
+            flush.record.ingest_hour_bucket
+        );
+
+        // The two terms the constant is actually derived from, restated from
+        // the config. They fit; the deferral is the term that does not, and it
+        // is absent here because no configured value bounds it.
+        let shipped = IngestConfig::default();
+        let bound_ns = routing_to_pin_bound_ns(&shipped);
+        assert!(
+            bound_ns <= i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR,
+            "{:?} idle plus one {:?} tick = {bound_ns}ns must fit inside \
+             FLUSH_BOUND_SLACK_HOURS ({}ns)",
+            shipped.max_flush_delay_idle,
+            shipped.flush_tick,
+            i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
+        );
+    }
+
+    /// Why the overrun above is not closed by pinning the bucket before the
+    /// cap check and carrying it across the deferral, which is the obvious
+    /// fix and a worse one.
+    ///
+    /// The catalog seals an ingest hour `H` once `max_flush_lifetime +
+    /// clock_skew_allowance + fold_safety_margin` have passed since `H` ended
+    /// (`ravel_catalog` fold, ADR-0020). That margin is the budget for the
+    /// span between a flush pinning `H` and its commit record landing, and it
+    /// is sized for one flush lifetime, because today the pin is taken when
+    /// the flush opens. A pre-deferral pin would spend the deferral out of
+    /// that budget instead of out of the read-side scan slack, and a record
+    /// that lands past it is worse than one that lands past the slack: it is
+    /// not read again at all. Resolution starts its listing at
+    /// `watermark_hour + 1`, so the folded snapshot is all that represents
+    /// `H` from then on, and it was written without that record. The fold
+    /// watermark only moves forward, so nothing re-folds `H`.
+    ///
+    /// The arithmetic below is the worst case, a trigger firing at the very
+    /// end of `H`, and one deferral round is already enough to overrun it.
+    /// `flush_aged` retries in `HashMap` order with no fairness, so the number
+    /// of rounds is not bounded either.
+    #[test]
+    fn carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour() {
+        // A trigger firing at the very end of `H` has spent all of `H`
+        // already, so the seal margin is the whole of what is left.
+        let budget_ns = DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+        // What a carried pin would have to fit into it: the deferral, then
+        // the flush it finally opens. A queued flush leaves the `JoinSet`
+        // only when it finishes or reaches its deadline, so one round costs
+        // up to `max_flush_lifetime`, and the flush that then opens gets its
+        // own before it is abandoned.
+        let shipped = IngestConfig::default();
+        let one_round_ns = shipped.max_flush_lifetime.as_nanos() as i64;
+        let spend_ns = one_round_ns + one_round_ns;
+
+        assert!(
+            spend_ns > budget_ns,
+            "one deferral round ({one_round_ns}ns) plus the flush it opens \
+             ({one_round_ns}ns) is {spend_ns}ns, which must out-run the \
+             {budget_ns}ns a sealed-hour watermark allows after an hour ends, \
+             or a pre-deferral pin would be a safe fix and this test is \
+             recording a constraint that no longer exists"
+        );
+    }
+
+    /// The worst-case span between a record being routed and its flush pinning
+    /// an ingest hour, recomputed from `config`, as
+    /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` was derived.
+    /// - `max_flush_delay_idle`: the oldest a buffer with no strict waiter
+    ///   gets before its age trigger fires. The validated worst case, since
+    ///   `ravel-server` refuses an idle ceiling below `max_flush_delay`.
+    /// - one `flush_tick`: the trigger is evaluated on a tick, not at the
+    ///   instant the threshold is crossed.
+    ///
+    /// The queued-flush cap's deferral is a third term this does not include
+    /// and no configured value bounds (issue #1916);
+    /// `a_deferred_flush_can_overrun_the_flush_bound_slack` measures it.
+    fn routing_to_pin_bound_ns(config: &IngestConfig) -> i64 {
+        config.max_flush_delay_idle.as_nanos() as i64 + config.flush_tick.as_nanos() as i64
     }
 }
+
