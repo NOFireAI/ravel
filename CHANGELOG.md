@@ -162,6 +162,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`absent_field_list_indexes_nothing_and_flags_round_trip` no longer asserts
+  on bloom counters** (issue #1926). The test compared a whole `WriteStats`
+  against a mostly-default value, and `WriteStats` also carries
+  `bloom_total_ns` and `bloom_blocks`, which bloom construction populates
+  unconditionally per block and have nothing to do with the postings field
+  list the test is about. Those two fields exist only when `ravel-logseg`
+  compiles with its `stage-timing` feature, which a package-scoped
+  `-p ravel-server` build never reaches but `--workspace --all-features`
+  does, so the test passed normally and failed only under the latter. It now
+  asserts the POSTINGS and dynamic-column counters by field instead of
+  comparing the whole struct. No production behavior changed.
+
 - **A `RavelCluster` held at the store-qualification gate keeps its
   `StoreQualified` condition when the reconcile then fails** (issue #36). The
   degraded status write replaces the whole `conditions` array and previously
