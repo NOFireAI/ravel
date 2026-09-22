@@ -2900,9 +2900,16 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
 // The client half of both fan-outs is gone: `RemoteSliceFetcher` no longer
 // overrides `fetch_logs`/`fetch_spans`, so nothing in this crate decodes a
 // remote's log or span slice, and the differential suites that drove those
-// decoders over a loopback worker went with them (their subject no longer
-// exists). What survives here is the span TOTAL-ORDER pinning below, which is
-// coordinator-side and independent of any transport.
+// decoders over a loopback worker went with them (their subject, the removed
+// `decode_log_slice_frames`/`decode_span_slice_frames`, no longer exists).
+// `SliceStreamDecoder::push` (mod.rs) refuses a `LogRecord` or `Span` frame
+// with `FrameSignalUnsupported`, but that only explains the removal of the
+// subset of those suites whose slices actually carried such a frame; any
+// suite whose slices carried none (an empty-result or all-metrics case, say)
+// could in principle have kept running through `SliceStreamDecoder` -- it was
+// removed only because its decoder was, not because the decoder would have
+// refused it. What survives here is the span TOTAL-ORDER pinning below, which
+// is coordinator-side and independent of any transport.
 // The span total order the coordinator sorts by. `span_order_key` and
 // `span_cmp` are coordinator-side and reachable without any transport, so they
 // are pinned here directly rather than through a fan-out.
@@ -4363,12 +4370,20 @@ fn log_record_order_key_discriminates_every_field() {
         );
     };
 
-    // One case per key field, in the key's own field order.
+    // One case per key field, in the key's own field order. `stream_id` and
+    // `stream_attrs` are two separate tuple elements in `LogOrderKey`
+    // (mod.rs), so each needs its own case that varies it alone; going
+    // through `log_stream`, which derives both from the same resource, would
+    // move them together and let either field cover for a dropped other one.
+    // `LogRecord`'s fields are independently settable (ravel-logseg's
+    // `stream_attrs`-consistency invariant is enforced by the writer, not by
+    // this struct), so each case is built directly against the record.
     check("ts_ns", &|r| r.ts_ns = 20);
     check("stream_id", &|r| {
-        let (id, blob) = log_stream("beta");
-        r.stream_id = id;
-        r.stream_attrs = blob;
+        r.stream_id = LogStreamId([9u8; 16]);
+    });
+    check("stream_attrs", &|r| {
+        r.stream_attrs = vec![0xffu8, 0xee, 0xdd];
     });
     check("observed_ts_ns", &|r| r.observed_ts_ns = 99);
     check("severity_num", &|r| r.severity_num = 17);
