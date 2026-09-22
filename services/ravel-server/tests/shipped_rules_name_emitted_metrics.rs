@@ -1256,8 +1256,11 @@ fn the_operator_dashboard_is_not_auto_provisioned_into_the_quickstart() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../deploy/grafana/dashboards"
     );
+    // Path::starts_with is COMPONENT-wise; str::starts_with is not, and
+    // "dashboards-standalone" has "dashboards" as a string prefix, so the str
+    // form fires on exactly the move this test exists to protect.
     assert!(
-        !DASHBOARD_FILE.starts_with(provisioned),
+        !std::path::Path::new(DASHBOARD_FILE).starts_with(provisioned),
         "the operator dashboard {DASHBOARD_FILE} sits under {provisioned}, which \
          deploy/docker-compose/ravel.yml mounts and \
          deploy/grafana/provisioning/dashboards/ravel.yaml provisions as a \
