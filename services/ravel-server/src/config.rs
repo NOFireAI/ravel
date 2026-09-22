@@ -1256,7 +1256,7 @@ pub struct Cli {
     /// below. `0` is rejected. A `--max-inflight-flushes` above this value is
     /// accepted and raises the effective cap to match, since effective
     /// per-shard flush concurrency is the lower of the two. Matches
-    /// [`ravel_ingest::IngestConfig::max_queued_flushes`]'s own default of 8
+    /// [`ravel_ingest::IngestConfig::max_queued_flushes`]'s own default of 8.
     ///
     /// The memory backstop has no flag of its own, and its value depends on
     /// which arm `--max-ingest-buffer-bytes` selects. With a nonzero budget it
