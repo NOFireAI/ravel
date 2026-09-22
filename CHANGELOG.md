@@ -247,6 +247,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The shipped Maintain IAM template now grants the delete the erasure-request
+  sweep needs** (issue #1849). ADR-0064 section 6 gives Maintain delete on
+  `del/*.dreq` only, but `deploy/iam/maintain.json`'s `MaintainDelete`
+  statement named no resource under `del/`. IAM is default-deny, so on a
+  deployment running the shipped template every attempt by the `.dreq` sweep to
+  retire a completed erasure request was refused: completed requests were never
+  retired, and the query-time exclusion filter that reads them grew without
+  bound for the life of the deployment. The statement now carries
+  `t/*/*/del/*.dreq`. Completion records (`del/*.done`) remain undeletable by
+  every role, including Maintain, as the ADR requires. An operator who already
+  applied an earlier copy of `maintain.json` must re-apply it; the fix is in
+  the template, not in any running binary, so upgrading Ravel alone changes
+  nothing.
 - **An `--s3-endpoint` written with no URL scheme is refused at startup**
   (issue #1911). `minio:9000` used to be accepted by the endpoint rule, which
   only decides whether plaintext is allowed, and then killed the process from
