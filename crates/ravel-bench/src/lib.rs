@@ -1,6 +1,23 @@
 //! Benchmark harness for Ravel. Report-only: this crate never changes library
 //! behavior, it only measures it.
 
+/// The console line reporting the three-way split of abandoned flushes.
+///
+/// Shared by every bench binary that prints one. It lived as a verbatim copy
+/// per binary, which is the drift this split exists to remove: a fourth
+/// abandonment reason added to one copy and not the other makes two bench
+/// reports print different splits of the same counter set.
+pub fn format_abandoned_line(
+    retry_exhausted: u64,
+    queue_deadline: u64,
+    input_rejected: u64,
+) -> String {
+    format!(
+        "  abandoned         : retry_exhausted={retry_exhausted} \
+queue_deadline={queue_deadline} input_rejected={input_rejected}"
+    )
+}
+
 pub mod allocator;
 pub mod bench_env;
 pub mod codecs;

@@ -124,6 +124,11 @@ pub struct ReportConfig {
     pub batch_size: usize,
     pub query: String,
     pub query_count: usize,
+    /// Seconds of `IngestConfig::max_flush_lifetime` the run applied. It
+    /// changes what the run measures -- it is the deadline whose expiry
+    /// produces `abandoned_queue_deadline` -- so a report that omits it cannot
+    /// explain its own abandonment counts.
+    pub max_flush_lifetime_secs: f64,
 }
 
 #[derive(Serialize)]
@@ -435,6 +440,7 @@ pub async fn run(config: &E2eConfig) -> Report {
             batch_size: config.batch_size,
             query: config.query.clone(),
             query_count: config.query_count,
+            max_flush_lifetime_secs: config.max_flush_lifetime.as_secs_f64(),
         },
         accepted_points_per_sec: accepted_points as f64 / elapsed_secs,
         accepted_points,
