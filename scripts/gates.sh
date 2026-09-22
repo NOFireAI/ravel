@@ -194,6 +194,13 @@ python3 "$(dirname "$0")/check_format_version_docs.py"
 echo "==> scripts/guards/check-guarded-sql-parse.sh"
 "$(dirname "$0")/guards/check-guarded-sql-parse.sh"
 
+# The same rule on the PromQL side, where an over-bound query aborts the
+# process inside the parser itself (issue #529). Its funnel has a caller in
+# another crate, so this one scans both crates/ravel-promql/src and
+# crates/ravel-query/src (issue #1817). A source scan, no build.
+echo "==> scripts/guards/check-guarded-promql-parse.sh"
+"$(dirname "$0")/guards/check-guarded-promql-parse.sh"
+
 # A parsed tenant query could reach an evaluator unreachable!() arm and abort
 # the process instead of rejecting the query (issue #1701). That round
 # converted every reachable arm to Error::Unsupported and left only the arms

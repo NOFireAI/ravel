@@ -295,6 +295,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the operator re-qualifies each existing cluster once against its unchanged
   store. The qualify Job is a one-shot that touches no Deployment, so no serving
   pod is restarted and there is no downtime. Subsequent reconciles are stable.
+- **Every PromQL parse of caller text runs the pre-parse complexity guard,
+  because one function now does both** (issue #1817). The guard that keeps an
+  over-bound query from overflowing the stack inside promql-parser, which
+  aborts the process and takes every tenant on the node with it, used to be a
+  separate call each parse site was expected to make first. The five sites that
+  parse PromQL, including one in the query coordinator's federated path, now
+  call `complexity_guard::parse_guarded`, which checks and then parses. No
+  query that was accepted before is rejected now and no error message changes:
+  each caller maps the funnel's two failure modes onto the error it already
+  reported. A new gate check refuses a parse that reaches promql-parser by
+  naming or importing it anywhere else in either crate, so a future entry point
+  cannot skip the guard by not knowing about it.
 
 ### Fixed
 
