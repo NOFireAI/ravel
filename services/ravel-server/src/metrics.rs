@@ -877,6 +877,13 @@ pub struct IngestPipelineSnapshot {
     /// back untouched and the next tick re-fires, so a rise means flush
     /// latency slipped past `--max-flush-delay`, not that anything was shed.
     pub flush_trigger_deferred_total: u64,
+    /// Tenants a `DrainIntent::Teardown` flush left with buffered rows still
+    /// unflushed, summed across shards (issue #1742). Those rows were already
+    /// acknowledged in buffered mode (docs/consistency-model.md), so a
+    /// nonzero count is data loss, not backpressure. Carried for every
+    /// signal for the same reason `flushes_queued_total` is: all three
+    /// pipelines run the same teardown path.
+    pub flush_all_residue_tenants: u64,
 }
 
 /// Exemplar admission counters, mirroring
@@ -977,6 +984,7 @@ impl IngestPipelineSnapshot {
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
+            flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
         }
     }
 
@@ -1017,6 +1025,7 @@ impl IngestPipelineSnapshot {
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
+            flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
         }
     }
 
@@ -1048,6 +1057,7 @@ impl IngestPipelineSnapshot {
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
+            flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
         }
     }
 }
@@ -1571,6 +1581,26 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_flush_trigger_deferred_total",
             &labels(mode, pipeline.signal),
             pipeline.flush_trigger_deferred_total,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_flush_all_residue_tenants_total",
+        "Tenants a teardown drain (DrainIntent::Teardown) left with buffered rows still \
+         unflushed, summed across shards, by signal (issue #1742). In buffered mode those rows \
+         were already acknowledged (docs/consistency-model.md), so a nonzero count is data \
+         loss, not backpressure; the same drain also logs an ERROR per residual tenant. \
+         Cumulative across the process lifetime, so a rise always means a new teardown lost \
+         rows, never that an old loss is still outstanding.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_flush_all_residue_tenants_total",
+            &labels(mode, pipeline.signal),
+            pipeline.flush_all_residue_tenants,
         );
     }
 }
@@ -2365,6 +2395,32 @@ fn render_store_probe_family(out: &mut String, mode: Mode, reachable: bool, fail
         "ravel_store_probe_failures_total",
         &[Label::Mode(mode)],
         failures_total,
+    );
+}
+
+/// The `ravel_shutdown_drain_overrun_total` counter (issue #1742): graceful
+/// shutdowns this process ran past `--shutdown-timeout`, single source, no
+/// labels, the same shape as [`render_store_probe_family`]. See
+/// `Running::shutdown`'s reachability note: the client-facing listener stops
+/// accepting new connections at the top of that function, before the drain
+/// this counter measures even starts, so a scrape landing after that point
+/// cannot open a new connection to observe a value this counter changes to.
+/// Exported anyway because it is still genuinely rendered on `/metrics` (a
+/// scrape already in flight, or one landing before shutdown begins, reads it
+/// correctly) and it is the only machine-readable form of the fact the
+/// accompanying log line also carries.
+fn render_shutdown_family(out: &mut String, mode: Mode, drain_overrun_total: u64) {
+    write_header(
+        out,
+        "ravel_shutdown_drain_overrun_total",
+        "Graceful shutdowns this process ran past --shutdown-timeout (issue #1742), monotonic. Set only on the branch where the drain's outer timeout elapsed, never unconditionally after it.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_shutdown_drain_overrun_total",
+        &[Label::Mode(mode)],
+        drain_overrun_total,
     );
 }
 
@@ -4966,6 +5022,7 @@ pub fn render(
         crate::store_probe::store_reachable(),
         crate::store_probe::probe_failures_total(),
     );
+    render_shutdown_family(&mut out, mode, crate::drain_overrun_total());
     render_bucket_protection_family(
         &mut out,
         mode,
