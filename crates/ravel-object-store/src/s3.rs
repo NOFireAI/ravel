@@ -419,6 +419,80 @@ impl std::fmt::Display for PlaintextS3Endpoint {
 
 impl std::error::Error for PlaintextS3Endpoint {}
 
+/// An `--s3-endpoint` that begins with neither `https://` nor `http://`,
+/// refused by [`resolve_s3_allow_http`] (issue #1911).
+///
+/// Such a value is not a usable URL. It was accepted at startup until this
+/// refusal landed, and the process died later, inside `object_store`'s request
+/// signing, on a message naming neither the endpoint nor the flag it came from
+/// --- for a server pod, a crashloop whose cause is only in the pod log. Typed
+/// and carried beside [`PlaintextS3Endpoint`] for the same reason that one is:
+/// every binary that builds an [`S3Config`] renders one message from one
+/// decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemelessS3Endpoint {
+    /// The refused endpoint, verbatim as the operator wrote it.
+    pub endpoint: String,
+}
+
+impl std::fmt::Display for SchemelessS3Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "--s3-endpoint '{}' is missing its URL scheme: an endpoint must begin with https:// \
+             or http://. Write the scheme in: https:// for a TLS endpoint, or http:// for a \
+             plaintext one, which is accepted unflagged only for a loopback host and otherwise \
+             needs --s3-allow-http (RAVEL_S3_ALLOW_HTTP).",
+            self.endpoint
+        )
+    }
+}
+
+impl std::error::Error for SchemelessS3Endpoint {}
+
+/// Every way [`resolve_s3_allow_http`] refuses an endpoint.
+///
+/// One error type rather than two call sites' worth of `anyhow`, because each
+/// case needs a *different* remedy in the message and the operator maps each to
+/// its own `Degraded` reason: a schemeless endpoint is not a plaintext-exposure
+/// problem at all, and [`PlaintextS3Endpoint`]'s wording would misdescribe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3EndpointRefusal {
+    /// Plaintext `http://` to a host that is not loopback, without the flag.
+    Plaintext(PlaintextS3Endpoint),
+    /// Neither `https://` nor `http://` at the front of the endpoint.
+    Schemeless(SchemelessS3Endpoint),
+}
+
+impl S3EndpointRefusal {
+    /// The refused endpoint, verbatim as the operator wrote it, whichever rule
+    /// refused it.
+    pub fn endpoint(&self) -> &str {
+        match self {
+            S3EndpointRefusal::Plaintext(refused) => &refused.endpoint,
+            S3EndpointRefusal::Schemeless(refused) => &refused.endpoint,
+        }
+    }
+}
+
+impl std::fmt::Display for S3EndpointRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            S3EndpointRefusal::Plaintext(refused) => refused.fmt(f),
+            S3EndpointRefusal::Schemeless(refused) => refused.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for S3EndpointRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            S3EndpointRefusal::Plaintext(refused) => Some(refused),
+            S3EndpointRefusal::Schemeless(refused) => Some(refused),
+        }
+    }
+}
+
 /// Whether the S3 client may speak plaintext HTTP, decided by the endpoint's
 /// own URL scheme rather than by whether an endpoint was set at all.
 ///
@@ -430,32 +504,40 @@ impl std::error::Error for PlaintextS3Endpoint {}
 /// a plaintext connection that never leaves the host has no on-path attacker,
 /// and every local-development launcher in this repo depends on it.
 ///
-/// An endpoint carrying neither scheme yields `false`, so the client stays
-/// HTTPS-only and nothing it signs goes out in the clear. This rule does not
-/// refuse it: such an endpoint is not a usable URL, and `object_store` rejects
-/// it when it signs the first request, on a message that names neither the
-/// endpoint nor this flag. Issue #1911 is the follow-up that refuses it here.
+/// An endpoint carrying neither scheme is refused outright (issue #1911), with
+/// [`S3EndpointRefusal::Schemeless`] naming it and asking for a scheme. It is
+/// not a usable URL: it used to be accepted here and kill the process later,
+/// inside `object_store`'s request signing, on a message naming neither the
+/// endpoint nor the flag.
 ///
 /// The scheme is matched without regard to case (RFC 3986 section 3.1) and so
-/// is the `localhost` host name, while the refusal still quotes the endpoint
-/// exactly as it was written.
+/// is the `localhost` host name, while either refusal still quotes the endpoint
+/// exactly as it was written. Matching is anchored at the front rather than
+/// anywhere in the string: a host named `my-http-proxy` carries no scheme, and
+/// `HTTPS://` carries a perfectly good one.
 pub fn resolve_s3_allow_http(
     endpoint: Option<&str>,
     allow_http_flag: bool,
-) -> Result<bool, PlaintextS3Endpoint> {
+) -> Result<bool, S3EndpointRefusal> {
     let Some(endpoint) = endpoint else {
         return Ok(false);
     };
-    if !endpoint.to_ascii_lowercase().starts_with("http://") {
+    let lowercased = endpoint.to_ascii_lowercase();
+    if lowercased.starts_with("https://") {
         return Ok(false);
+    }
+    if !lowercased.starts_with("http://") {
+        return Err(S3EndpointRefusal::Schemeless(SchemelessS3Endpoint {
+            endpoint: endpoint.to_string(),
+        }));
     }
     let rest = &endpoint["http://".len()..];
     if allow_http_flag || is_loopback_authority(rest) {
         return Ok(true);
     }
-    Err(PlaintextS3Endpoint {
+    Err(S3EndpointRefusal::Plaintext(PlaintextS3Endpoint {
         endpoint: endpoint.to_string(),
-    })
+    }))
 }
 
 /// Whether the authority beginning `rest` (everything after `http://`) names
@@ -2119,6 +2201,109 @@ mod tests {
             counter.load(Ordering::Relaxed),
             1,
             "a disarmed guard must not count on drop"
+        );
+    }
+
+    /// Issue #1911, at the one decision every binary routes through. An
+    /// endpoint written with no scheme (`minio:9000`) was accepted here and
+    /// killed the process later, inside `object_store`'s request signing, on a
+    /// message naming neither the endpoint nor the flag. It is refused here
+    /// now, and the refusal quotes the endpoint and asks for a scheme.
+    ///
+    /// The cases are chosen to fail two wrong implementations:
+    ///
+    /// - a substring test for `"http"` rather than a prefix match accepts
+    ///   `my-http-proxy:9000` (schemeless, and its host merely contains the
+    ///   word) and refuses `HTTPS://minio:9000` (a perfectly good URL);
+    /// - a refusal written in one binary's own startup path instead of here
+    ///   leaves this test failing outright, which is what makes the other
+    ///   binaries' tables meaningful rather than three copies of one rule.
+    ///
+    /// The `http://` rows are the #1707 behaviour, asserted here so the new
+    /// scheme check cannot regress them.
+    #[test]
+    fn an_endpoint_without_a_scheme_is_refused() {
+        for endpoint in [
+            "minio:9000",
+            // WRONG-1: a substring test for "http" passes this one, whose host
+            // name merely contains the word and which still has no scheme.
+            "my-http-proxy:9000",
+            "s3.example.com",
+            // A scheme that is neither of the two, and the empty endpoint: both
+            // are as unusable as a bare host:port.
+            "ftp://minio:9000",
+            "",
+        ] {
+            let refusal = resolve_s3_allow_http(Some(endpoint), false).expect_err(
+                "an endpoint beginning with neither https:// nor http:// must be refused",
+            );
+            assert_eq!(
+                refusal,
+                S3EndpointRefusal::Schemeless(SchemelessS3Endpoint {
+                    endpoint: endpoint.to_string(),
+                }),
+                "{endpoint} must be refused as schemeless, not as plaintext"
+            );
+            assert_eq!(refusal.endpoint(), endpoint);
+            let rendered = refusal.to_string();
+            assert!(
+                rendered.contains(&format!("'{endpoint}'")),
+                "the refusal must quote the endpoint verbatim, got: {rendered}"
+            );
+            assert!(
+                rendered.contains("https://") && rendered.contains("http://"),
+                "the refusal must state the fix (write a scheme), got: {rendered}"
+            );
+            // The flag accepts deliberate plaintext, never a missing scheme:
+            // there is no usable URL to accept.
+            assert!(
+                resolve_s3_allow_http(Some(endpoint), true).is_err(),
+                "{endpoint} must stay refused even with --s3-allow-http"
+            );
+        }
+
+        // WRONG-1, the other half: an upper-case scheme is a scheme. RFC 3986
+        // section 3.1 makes it case-insensitive, and refusing it would break a
+        // working deployment.
+        for endpoint in ["HTTPS://minio:9000", "Https://minio:9000"] {
+            assert_eq!(
+                resolve_s3_allow_http(Some(endpoint), false),
+                Ok(false),
+                "{endpoint} carries a scheme and must be accepted without plaintext"
+            );
+        }
+
+        // Unchanged from #1707: https and real AWS accept, loopback plaintext
+        // accepts unflagged, and plaintext to a host on the network is refused
+        // as plaintext rather than as schemeless.
+        assert_eq!(
+            resolve_s3_allow_http(Some("https://s3.us-east-1.amazonaws.com"), false),
+            Ok(false)
+        );
+        assert_eq!(resolve_s3_allow_http(None, false), Ok(false));
+        for endpoint in [
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "http://[::1]:9000",
+            "HTTP://localhost:9000",
+        ] {
+            assert_eq!(
+                resolve_s3_allow_http(Some(endpoint), false),
+                Ok(true),
+                "{endpoint} is loopback plaintext and must enable allow_http unflagged"
+            );
+        }
+        assert_eq!(
+            resolve_s3_allow_http(Some("http://minio:9000"), false),
+            Err(S3EndpointRefusal::Plaintext(PlaintextS3Endpoint {
+                endpoint: "http://minio:9000".to_string(),
+            })),
+            "plaintext to a host on the network must keep its own refusal"
+        );
+        assert_eq!(
+            resolve_s3_allow_http(Some("http://minio:9000"), true),
+            Ok(true),
+            "--s3-allow-http must still accept deliberate plaintext"
         );
     }
 

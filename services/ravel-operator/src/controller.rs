@@ -2550,6 +2550,14 @@ fn degraded_reason(err: &Error) -> (String, String) {
         Error::Render(RenderError::PlaintextS3Endpoint { .. }) => {
             ("PlaintextS3Endpoint".to_string(), err.to_string())
         }
+        // Its own reason, not the plaintext one (issue #1911): an endpoint with
+        // no scheme exposes nothing in the clear, and an operator who reads
+        // `PlaintextS3Endpoint` on `kubectl describe ravelcluster` would go
+        // looking for a security problem that is not there instead of for the
+        // missing `https://`.
+        Error::Render(RenderError::SchemelessS3Endpoint { .. }) => {
+            ("SchemelessS3Endpoint".to_string(), err.to_string())
+        }
         other => ("ReconcileError".to_string(), other.to_string()),
     }
 }
@@ -2971,6 +2979,58 @@ mod tests {
                 "the condition message must name {needle}, got: {message}"
             );
         }
+    }
+
+    /// Issue #1911, the observability half: the schemeless-endpoint refusal has
+    /// to arrive on the `RavelCluster` as a reason an operator can act on, not
+    /// merely as a reconcile error. This runs the real path end to end --
+    /// [`s3_allow_http`] on a spec, the `Error::Render` it produces,
+    /// [`degraded_reason`], and the status [`build_degraded_status`] writes --
+    /// and asserts the condition an operator reads with `kubectl describe`.
+    /// Its own reason, distinct from `PlaintextS3Endpoint`, is the point: that
+    /// one sends the reader looking for a plaintext exposure that is not there.
+    #[test]
+    fn a_schemeless_endpoint_degrades_the_cluster_with_its_own_reason() {
+        let mut spec = spec_with_affinity(None);
+        spec.storage.s3.endpoint = Some("minio:9000".to_string());
+        spec.storage.s3.allow_http = false;
+
+        let err = Error::Render(
+            s3_allow_http(&spec).expect_err("a schemeless endpoint must refuse the reconcile"),
+        );
+        let (reason, message) = degraded_reason(&err);
+        assert_eq!(reason, "SchemelessS3Endpoint");
+
+        let status = build_degraded_status(
+            Some(7),
+            &reason,
+            &message,
+            PersistedStatus::default(),
+            Vec::new(),
+        );
+        let degraded = find(&status.conditions, "Degraded");
+        assert_eq!(degraded.status, "True");
+        assert_eq!(degraded.reason, "SchemelessS3Endpoint");
+        for needle in ["spec.storage.s3.endpoint", "minio:9000", "https://"] {
+            assert!(
+                degraded.message.contains(needle),
+                "the Degraded condition must name {needle}, got: {}",
+                degraded.message
+            );
+        }
+        // The same reason lands on `Available=False`, which is the condition a
+        // rollout gate watches.
+        let available = find(&status.conditions, "Available");
+        assert_eq!(available.status, "False");
+        assert_eq!(available.reason, "SchemelessS3Endpoint");
+
+        // A plaintext non-loopback endpoint keeps its own, different reason, so
+        // the two misconfigurations are never reported as one.
+        spec.storage.s3.endpoint = Some("http://minio:9000".to_string());
+        let (plaintext_reason, _) = degraded_reason(&Error::Render(
+            s3_allow_http(&spec).expect_err("plaintext to a non-loopback host must refuse"),
+        ));
+        assert_eq!(plaintext_reason, "PlaintextS3Endpoint");
     }
 
     /// Issue #1707 finding 1: the operator's OWN S3 client -- the one holding

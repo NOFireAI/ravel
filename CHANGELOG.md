@@ -44,9 +44,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pointing at an `https` endpoint still permitted a downgrade, and a plaintext
   endpoint naming a host on the network moved credentials and telemetry in
   clear with nothing refusing it. The flag now follows the URL scheme. An
-  endpoint carrying no scheme at all enables no plaintext, and this rule does
-  not refuse it either: it fails later, inside the S3 client, on a message
-  that names neither the endpoint nor the flag (issue #1911). A non-loopback
+  endpoint carrying no scheme at all enables no plaintext, and issue #1911
+  below refuses it at startup rather than letting it reach the S3 client. A
+  non-loopback
   `http://` endpoint needs `--s3-allow-http` (env `RAVEL_S3_ALLOW_HTTP`), and
   the refusal names the flag; loopback `http` is unchanged, which is what the
   dev compose stack, kind, and the tests use. `ravel-cli` applies the same rule
@@ -162,6 +162,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An `--s3-endpoint` written with no URL scheme is refused at startup**
+  (issue #1911). `minio:9000` used to be accepted by the endpoint rule, which
+  only decides whether plaintext is allowed, and then killed the process from
+  inside the S3 client the first time it signed a request, on
+  `request valid: InvalidUri(InvalidUri(InvalidFormat))` and exit code 101: a
+  message naming neither the endpoint, nor the flag, nor the fix. The one
+  decision every binary routes through now refuses an endpoint that begins
+  with neither `https://` nor `http://`, quoting it as it was written and
+  asking for the scheme, so `ravel-server`, `ravel-cli`, and the operator all
+  fail in their own pre-flight pass instead of at first request.
+  `--s3-allow-http` does not accept such an endpoint: the flag chooses between
+  TLS and plaintext, and an endpoint with no scheme has asked for neither. The
+  scheme is matched at the front of the endpoint and without regard to case,
+  so `HTTPS://minio:9000` is an `https` endpoint and a host named
+  `my-http-proxy:9000` still carries no scheme. Under the operator the
+  refusal is its own render error rather than the plaintext one: a
+  `RavelCluster` whose `spec.storage.s3.endpoint` has no scheme goes
+  `Degraded=True` with reason `SchemelessS3Endpoint` and a message naming the
+  field and the endpoint, and no Deployment, Service, or store-qualification
+  Job is created.
 - **A `RavelCluster` held at the store-qualification gate keeps its
   `StoreQualified` condition when the reconcile then fails** (issue #36). The
   degraded status write replaces the whole `conditions` array and previously

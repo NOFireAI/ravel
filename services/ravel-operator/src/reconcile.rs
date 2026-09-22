@@ -32,7 +32,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
-use ravel_object_store::s3::resolve_s3_allow_http;
+use ravel_object_store::s3::{S3EndpointRefusal, resolve_s3_allow_http};
 
 use crate::crd::{
     AffinityBackend, AffinityKeySource, GATEWAY_DEFAULT_CPU_REQUEST,
@@ -113,6 +113,25 @@ pub enum RenderError {
          endpoint"
     )]
     PlaintextS3Endpoint {
+        /// The refused endpoint, verbatim as the spec wrote it.
+        endpoint: String,
+    },
+
+    /// `spec.storage.s3.endpoint` begins with neither `https://` nor `http://`
+    /// (issue #1911). Not a plaintext-exposure problem, so it is not
+    /// [`RenderError::PlaintextS3Endpoint`]: nothing goes out in the clear,
+    /// the value is simply not a usable URL. Every container the operator would
+    /// render refuses it at startup, and so does the `ravel-cli store qualify`
+    /// Job, so the render fails here and the controller degrades the cluster
+    /// with the field and the remedy in its status.
+    #[error(
+        "spec.storage.s3.endpoint {endpoint:?} is missing its URL scheme: an endpoint must begin \
+         with https:// or http://, which every ravel-server container, the store-qualification \
+         Job, and the operator's own S3 client require. Write the scheme in: https:// for a TLS \
+         endpoint, or http:// for a plaintext one, which also needs \
+         spec.storage.s3.allowHttp: true unless its host is loopback"
+    )]
+    SchemelessS3Endpoint {
         /// The refused endpoint, verbatim as the spec wrote it.
         endpoint: String,
     },
@@ -526,9 +545,14 @@ pub fn audit_token_key_missing(spec: &RavelClusterSpec) -> bool {
 
 /// Whether an S3 client configured from this spec may speak plaintext HTTP,
 /// by the one rule every binary in this repo applies
-/// ([`ravel_object_store::s3::resolve_s3_allow_http`], issue #1707): decided
-/// by the endpoint's URL scheme, and refused for a plaintext non-loopback host
-/// unless `spec.storage.s3.allowHttp` accepts it deliberately.
+/// ([`ravel_object_store::s3::resolve_s3_allow_http`], issues #1707 and #1911):
+/// decided by the endpoint's URL scheme, refused for a plaintext non-loopback
+/// host unless `spec.storage.s3.allowHttp` accepts it deliberately, and refused
+/// outright for an endpoint that carries no scheme at all.
+///
+/// Each refusal keeps its own [`RenderError`] variant, because each names a
+/// different field and a different remedy: `allowHttp` for the plaintext case,
+/// the endpoint's own spelling for the schemeless one.
 ///
 /// Two callers, so the operator cannot disagree with itself: the render, which
 /// refuses a spec whose server containers would refuse their own endpoint at
@@ -539,8 +563,13 @@ pub fn s3_allow_http(spec: &RavelClusterSpec) -> Result<bool, RenderError> {
         spec.storage.s3.endpoint.as_deref(),
         spec.storage.s3.allow_http,
     )
-    .map_err(|refused| RenderError::PlaintextS3Endpoint {
-        endpoint: refused.endpoint,
+    .map_err(|refused| match refused {
+        S3EndpointRefusal::Plaintext(refused) => RenderError::PlaintextS3Endpoint {
+            endpoint: refused.endpoint,
+        },
+        S3EndpointRefusal::Schemeless(refused) => RenderError::SchemelessS3Endpoint {
+            endpoint: refused.endpoint,
+        },
     })
 }
 
@@ -4186,6 +4215,53 @@ mod tests {
         // Real AWS S3 (no endpoint at all) never reaches the rule.
         spec.storage.s3.endpoint = None;
         desired_objects(&spec, "prod", "default", &ctx()).expect("no endpoint renders unflagged");
+    }
+
+    /// Issue #1911: an endpoint with no URL scheme (`minio:9000`) rendered
+    /// cleanly and every container it produced died at its first S3 request,
+    /// inside `object_store`'s signing, on a message naming neither the
+    /// endpoint nor the field. The render refuses it instead, with its OWN
+    /// variant: [`RenderError::PlaintextS3Endpoint`] talks about plaintext to a
+    /// non-loopback host, which this is not, and nothing goes out in the clear
+    /// here at all.
+    ///
+    /// `desired_objects` is the render for every Deployment and Service, and
+    /// `controller::reconcile_inner` applies the same [`s3_allow_http`] before
+    /// it creates the qualify Job, so a refusal here means none of the three is
+    /// created.
+    #[test]
+    fn a_schemeless_endpoint_is_refused_at_render_time() {
+        let mut spec = base_spec();
+        // A host name containing "http" is still schemeless: the check is a
+        // prefix match on the scheme, not a substring search.
+        for endpoint in ["minio:9000", "my-http-proxy:9000"] {
+            for allow_http in [false, true] {
+                spec.storage.s3.endpoint = Some(endpoint.to_string());
+                spec.storage.s3.allow_http = allow_http;
+                let err = desired_objects(&spec, "prod", "default", &ctx())
+                    .expect_err("an endpoint with no scheme must refuse the render");
+                assert_eq!(
+                    err,
+                    RenderError::SchemelessS3Endpoint {
+                        endpoint: endpoint.to_string(),
+                    },
+                    "{endpoint} must refuse as schemeless whatever allowHttp says"
+                );
+                let message = err.to_string();
+                for needle in ["spec.storage.s3.endpoint", endpoint, "https://"] {
+                    assert!(
+                        message.contains(needle),
+                        "the refusal must name {needle}, got: {message}"
+                    );
+                }
+            }
+        }
+
+        // An upper-case scheme is a scheme (RFC 3986 section 3.1) and renders.
+        spec.storage.s3.endpoint = Some("HTTPS://minio.example:9000".to_string());
+        spec.storage.s3.allow_http = false;
+        desired_objects(&spec, "prod", "default", &ctx())
+            .expect("an upper-case https scheme is valid and must render");
     }
 
     #[test]
