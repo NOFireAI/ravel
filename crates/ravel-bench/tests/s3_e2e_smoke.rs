@@ -27,6 +27,7 @@ fn small_config(store: Arc<dyn ravel_object_store::ObjectStoreBackend>, label: &
         ack_timeout_secs: 5,
         query: "bench_gauge".to_string(),
         query_count: 3,
+        max_flush_lifetime: ravel_ingest::IngestConfig::default().max_flush_lifetime,
     }
 }
 
