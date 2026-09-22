@@ -362,6 +362,15 @@ impl FloatHistogram {
     /// iterates `prev`'s buckets at `self`'s schema), so the per-bucket
     /// comparison runs on aligned bounds and a still-growing counter is not a
     /// reset.
+    ///
+    /// Custom buckets have no scale to compare, so the same
+    /// not-comparable-at-all rule the exponential/custom mix takes applies to
+    /// two custom-bucket values whose boundaries differ: report a reset rather
+    /// than compare bucket `i` of one boundary set against bucket `i` of
+    /// another ([`Self::custom_bounds_match`], issue #1851). Only `resets`
+    /// reaches this today: [`histogram_rate`] and
+    /// `functions::rate::instant_value_hist` drop a differing-bounds window
+    /// before any reset detection runs.
     pub fn detect_reset(&self, prev: &FloatHistogram) -> bool {
         match self.counter_reset_hint {
             ResetHint::Gauge => false,
@@ -377,6 +386,14 @@ impl FloatHistogram {
                 // side can be rescaled onto the other's bounds (issue #678).
                 // Report a reset rather than rescale across the sentinel.
                 if self.uses_custom_buckets() != prev.uses_custom_buckets() {
+                    return true;
+                }
+                // Two custom-bucket values with different boundaries are not
+                // comparable either: both carry the sentinel scale, so the
+                // per-bucket comparison below would read bucket `i` of one
+                // boundary set against bucket `i` of another (issue #1851).
+                // Report a reset for the same reason as the case above.
+                if self.uses_custom_buckets() && !self.custom_bounds_match(prev) {
                     return true;
                 }
                 if self.scale > prev.scale {
@@ -1861,6 +1878,40 @@ mod tests {
         let minus_zero = custom(&[-0.0, 1.0], &[2.0, 4.0]);
         assert!(
             histogram_rate(&[(0, plus_zero), (1_000_000_000, minus_zero)], true).is_none(),
+            "bounds differing only in the sign of zero are different bounds"
+        );
+    }
+
+    /// Issue #1851, the fourth site of the same class: `detect_reset` compares
+    /// per-bucket populations by ABSOLUTE INDEX, so two custom-buckets values
+    /// with different boundaries were compared bucket-for-bucket across two
+    /// unrelated value ranges. `resets` is the only caller that still reaches
+    /// this shape (`histogram_rate` and `instant_value_hist` drop a
+    /// differing-bounds window before any reset detection), and it read the
+    /// boundary change as "no reset" whenever the raw counts happened not to
+    /// shrink at any index. Differing bounds are now a reset, the same answer
+    /// the exponential/custom mix one line above gets. The flipped assertion
+    /// is the `rebounded` case: without the bounds check it is `false`.
+    #[test]
+    fn detect_reset_treats_a_custom_bucket_boundary_change_as_a_reset() {
+        let prev = custom(&[1.0, 2.0, 4.0], &[1.0, 2.0, 3.0]);
+        let grown = custom(&[1.0, 2.0, 4.0], &[2.0, 4.0, 6.0]);
+        assert!(
+            !grown.detect_reset(&prev),
+            "matching bounds with every bucket grown is not a reset"
+        );
+
+        let rebounded = custom(&[1.0, 3.0, 5.0], &[2.0, 4.0, 6.0]);
+        assert!(
+            rebounded.detect_reset(&prev),
+            "a boundary change makes the per-index comparison meaningless, so \
+             it is reported as a reset rather than compared"
+        );
+
+        let minus_zero = custom(&[-0.0, 1.0], &[2.0, 4.0]);
+        let plus_zero = custom(&[0.0, 1.0], &[1.0, 2.0]);
+        assert!(
+            minus_zero.detect_reset(&plus_zero),
             "bounds differing only in the sign of zero are different bounds"
         );
     }

@@ -384,6 +384,32 @@ fn instant_value(samples: &[Sample], is_rate: bool) -> Option<f64> {
 /// `min_scale`/`copy_to_scale` are ever computed, not by hardening
 /// `copy_to_scale`'s shift arithmetic: even a bounded shift would silently
 /// combine bucket layouts Prometheus does not consider comparable.
+///
+/// A pair whose samples both use custom buckets but carry different boundaries
+/// is a case that schema-type check cannot see: both sides hold
+/// [`crate::histogram::CUSTOM_BUCKETS_SCALE`], so `min_scale` is that sentinel,
+/// `copy_to_scale` has nothing to convert, and [`FloatHistogram::sub_assign`]
+/// would difference bucket `i` of one boundary set against bucket `i` of
+/// another (issue #1851).
+/// The pair drops on [`FloatHistogram::custom_bounds_match`], the same
+/// bit-pattern comparison [`crate::histogram::histogram_rate`],
+/// [`crate::histogram::sum_histograms`] and [`crate::binop`] align their
+/// operands with, so the four paths cannot drift apart on what "same bounds"
+/// means. The check sits ahead of the `is_rate` branch because both branches
+/// reach `sub_assign`, and it drops for `irate` too rather than reusing the
+/// schema-type mismatch's treat-as-reset escape: a reset would return the
+/// later histogram alone as if the boundary change were a counter restart,
+/// which is a guess about data this function cannot make. Unlike the two
+/// reducers in [`crate::histogram`], this drop is visible: it raises
+/// [`mismatched_custom_buckets_warning`] through
+/// [`instant_value_hist_type_warning`].
+///
+/// Dropping is NOT Prometheus v3.13.1's answer for differing bounds either
+/// (that version re-buckets both operands onto the intersection of their
+/// boundary sets, see [`FloatHistogram::combine_custom_reconciled`], which the
+/// binary-operator path uses). It is the conservative choice for a case with
+/// no oracle fixture, consistent with the other two reducers, not verified
+/// parity with upstream.
 pub(crate) fn instant_value_hist(
     samples: &[TimedHistogram],
     is_rate: bool,
@@ -403,6 +429,14 @@ pub(crate) fn instant_value_hist(
         // idelta cannot combine an exponential-schema histogram with a
         // custom-buckets one and has no reset escape hatch; the warning is
         // raised by instant_value_hist_type_warning's caller.
+        return None;
+    }
+    if !schema_type_mismatch && last.uses_custom_buckets() && !last.custom_bounds_match(previous) {
+        // Two custom-bucket histograms whose boundaries differ: the sentinel
+        // scale is equal on both sides, so nothing below would align them and
+        // both branches would difference by bucket index across two boundary
+        // sets. The warning is raised by instant_value_hist_type_warning's
+        // caller.
         return None;
     }
 
@@ -442,7 +476,10 @@ pub(crate) fn instant_value_hist(
 /// gauge-typed warns the metric is not a gauge; either function over a pair
 /// mixing an exponential-schema histogram with a custom-buckets one warns
 /// the schemas don't match (only reachable for `idelta` -- `irate` treats
-/// that mismatch as a silent reset, see [`instant_value_hist`]).
+/// that mismatch as a silent reset, see [`instant_value_hist`]); either
+/// function over two custom-buckets histograms with different boundaries
+/// warns the buckets don't match (reachable for both, since that pair drops
+/// for both).
 pub(crate) enum InstantHistTypeWarning {
     /// `irate` was asked to treat a gauge-typed native histogram as a counter.
     NotCounter,
@@ -450,6 +487,8 @@ pub(crate) enum InstantHistTypeWarning {
     NotGauge,
     /// One operand is custom-buckets and the other exponential-schema.
     MixedSchemas,
+    /// Both operands are custom-buckets but carry different boundaries.
+    MismatchedCustomBounds,
 }
 
 /// Whether `irate`/`idelta` over the last two histograms in `samples` should
@@ -457,11 +496,17 @@ pub(crate) enum InstantHistTypeWarning {
 /// branch: [`InstantHistTypeWarning::MixedSchemas`] for an exponential/
 /// custom-buckets pair, `NativeHistogramNotCounter` for `irate` over a
 /// gauge-hinted pair, `NativeHistogramNotGauge` for `idelta` over a pair that
-/// is not both gauge-hinted). The schema-type check runs first since it is
-/// unrelated to counter/gauge hints and `irate` never warns on it (the
-/// mismatch is a silent reset there, not a value-suppressing warning). The
-/// counter/gauge check reads each histogram's own `counter_reset_hint` on
-/// entry, before [`instant_value_hist`] overwrites the result's hint with
+/// is not both gauge-hinted, [`InstantHistTypeWarning::MismatchedCustomBounds`]
+/// for two custom-buckets histograms with different boundaries). The
+/// schema-type check runs first since it is unrelated to counter/gauge hints
+/// and `irate` never warns on it (the mismatch is a silent reset there, not a
+/// value-suppressing warning). The custom-bounds check runs next, ahead of the
+/// counter/gauge hints, because [`instant_value_hist`] produces no value for
+/// that pair whatever the hints say and the boundary mismatch is the reason
+/// there is nothing to report; unlike the schema-type check it warns for both
+/// functions, since both drop. The counter/gauge check reads each histogram's
+/// own `counter_reset_hint` on entry,
+/// before [`instant_value_hist`] overwrites the result's hint with
 /// [`ResetHint::Gauge`]. Returns `None` when no warning applies, or when no
 /// result is produced (fewer than two samples, or a zero sampled interval),
 /// so a warning fires only alongside a value or alongside `idelta`'s
@@ -485,6 +530,9 @@ pub(crate) fn instant_value_hist_type_warning(
         } else {
             Some(InstantHistTypeWarning::MixedSchemas)
         };
+    }
+    if last.uses_custom_buckets() && !last.custom_bounds_match(previous) {
+        return Some(InstantHistTypeWarning::MismatchedCustomBounds);
     }
     let last_gauge = last.counter_reset_hint == ResetHint::Gauge;
     let prev_gauge = previous.counter_reset_hint == ResetHint::Gauge;
@@ -518,6 +566,18 @@ pub(crate) fn native_histogram_not_gauge_warning() -> String {
 /// convention as [`native_histogram_not_counter_warning`].
 pub(crate) fn mixed_exponential_custom_schemas_warning() -> String {
     "vector contains a mix of histograms with exponential and custom buckets schemas".to_string()
+}
+
+/// The warning `irate`/`idelta` raises when the last two samples of one
+/// series both use custom buckets but carry different boundaries, so
+/// [`instant_value_hist`] drops the pair rather than differencing by bucket
+/// index across two boundary sets (issue #1851). This has no Prometheus
+/// counterpart: v3.13.1 reconciles differing bounds onto their intersection
+/// and raises an info instead of dropping, so the text says what Ravel did
+/// rather than porting an upstream message. Same text convention as
+/// [`native_histogram_not_counter_warning`].
+pub(crate) fn mismatched_custom_buckets_warning() -> String {
+    "vector contains histograms with mismatched custom buckets".to_string()
 }
 
 /// `resets` over a native-histogram window (Prometheus' `funcResets` histogram
@@ -947,6 +1007,29 @@ mod tests {
         }
     }
 
+    /// A custom-buckets (NHCB) histogram over `bounds`, with `count` spread
+    /// into the first bucket. Every boundary set produces the same sentinel
+    /// scale, which is exactly what makes a bounds comparison necessary.
+    fn nhcb(count: f64, sum: f64, bounds: &[f64]) -> FloatHistogram {
+        use crate::histogram::{CUSTOM_BUCKETS_SCALE, ResetHint, Span};
+        FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: CUSTOM_BUCKETS_SCALE,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![count],
+            negative_buckets: Vec::new(),
+            custom_values: bounds.to_vec(),
+        }
+    }
+
     #[test]
     fn range_rate_over_native_histogram_matches_the_instant_arm() {
         use crate::eval::{RangeValue, Value};
@@ -1031,6 +1114,93 @@ mod tests {
         let got = instant_value_hist(&samples, false).expect("2 samples");
         assert_eq!(got.count.to_bits(), (2.0_f64 - 8.0).to_bits());
         assert_eq!(got.sum.to_bits(), (10.0_f64 - 40.0).to_bits());
+    }
+
+    #[test]
+    fn idelta_drops_custom_buckets_samples_with_different_bounds() {
+        // The idelta branch of instant_value_hist (no reset escape at all):
+        // both samples are custom-buckets, so the uses_custom_buckets()
+        // schema-type check passes, min_scale is the shared sentinel and
+        // copy_to_scale is a clone. Without a bounds comparison this reaches
+        // sub_assign and differences the (1,2] bucket of one boundary set
+        // against the (1,3] bucket of the other, answering count 6 as if the
+        // two counted the same value range. The flipped assertion is
+        // `is_none()`: with the guard removed this returns Some(count 6).
+        let samples = [
+            (ms(0), nhcb(2.0, 10.0, &[1.0, 2.0, 4.0])),
+            (ms(30_000), nhcb(8.0, 40.0, &[1.0, 3.0, 5.0])),
+        ];
+        assert!(
+            instant_value_hist(&samples, false).is_none(),
+            "idelta over custom buckets with different bounds has no defined \
+             difference and must drop, not merge by bucket index"
+        );
+        // Same bounds still combine: the guard rejects differing boundaries,
+        // not custom buckets as such.
+        let matched = [
+            (ms(0), nhcb(2.0, 10.0, &[1.0, 2.0, 4.0])),
+            (ms(30_000), nhcb(8.0, 40.0, &[1.0, 2.0, 4.0])),
+        ];
+        let got = instant_value_hist(&matched, false).expect("matching bounds combine");
+        assert_eq!(got.count.to_bits(), 6.0_f64.to_bits());
+    }
+
+    #[test]
+    fn irate_drops_custom_buckets_samples_with_different_bounds() {
+        // The irate branch is the OTHER of the two subtraction sites, and a
+        // fix applied to idelta's branch alone leaves it answering a value
+        // here. Counts and buckets only grow and the hint is Unknown, so the
+        // same shape with MATCHING bounds is not a reset and does reach the
+        // `if !is_reset` sub_assign (asserted below). With the bounds
+        // differing, `instant_value_hist`'s guard fires ahead of the reset
+        // check, and `detect_reset` would call the pair a reset in any case
+        // (the same not-comparable rule, in `FloatHistogram::detect_reset`),
+        // which without the guard makes irate report the later histogram
+        // alone as the instantaneous rate -- a boundary change read as a
+        // counter restart. The flipped assertion is `is_none()`: with the
+        // guard removed this returns Some(count 9/30).
+        let samples = [
+            (ms(0), nhcb(2.0, 10.0, &[1.0, 2.0, 4.0])),
+            (ms(30_000), nhcb(8.0, 40.0, &[1.0, 3.0, 5.0])),
+        ];
+        assert!(
+            instant_value_hist(&samples, true).is_none(),
+            "irate over custom buckets with different bounds must drop rather \
+             than treat the boundary change as a counter reset"
+        );
+        let matched = [
+            (ms(0), nhcb(2.0, 10.0, &[1.0, 2.0, 4.0])),
+            (ms(30_000), nhcb(8.0, 40.0, &[1.0, 2.0, 4.0])),
+        ];
+        assert!(
+            !matched[1].1.detect_reset(&matched[0].1),
+            "the matching-bounds shape must NOT be a reset, or irate would \
+             never reach the sub_assign this test covers"
+        );
+        let got = instant_value_hist(&matched, true).expect("matching bounds combine");
+        assert_eq!(got.count.to_bits(), (6.0_f64 / 30.0).to_bits());
+    }
+
+    #[test]
+    fn mismatched_custom_bounds_warn_for_both_irate_and_idelta() {
+        // The drop is not silent: both functions report the boundary mismatch
+        // on the annotation channel instant_value_hist_type_warning feeds,
+        // ahead of the counter/gauge hint checks (this pair is hint Unknown,
+        // which would otherwise make idelta answer NotGauge and irate answer
+        // nothing at all).
+        let samples = [
+            (ms(0), nhcb(2.0, 10.0, &[1.0, 2.0, 4.0])),
+            (ms(30_000), nhcb(8.0, 40.0, &[1.0, 3.0, 5.0])),
+        ];
+        for is_rate in [true, false] {
+            assert!(
+                matches!(
+                    instant_value_hist_type_warning(&samples, is_rate),
+                    Some(InstantHistTypeWarning::MismatchedCustomBounds)
+                ),
+                "is_rate={is_rate} must report the boundary mismatch"
+            );
+        }
     }
 
     #[test]

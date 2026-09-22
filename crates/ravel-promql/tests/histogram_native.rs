@@ -610,6 +610,102 @@ fn custom_buckets_hist(count: f64, sum: f64) -> FloatHistogram {
     }
 }
 
+/// The same NHCB shape with the boundary set spelled out, so a test can put
+/// two custom-bucket samples with DIFFERENT bounds in one window.
+fn custom_buckets_hist_bounds(count: f64, sum: f64, bounds: &[f64]) -> FloatHistogram {
+    FloatHistogram {
+        custom_values: bounds.to_vec(),
+        ..custom_buckets_hist(count, sum)
+    }
+}
+
+#[test]
+fn idelta_over_custom_buckets_with_different_bounds_warns_and_drops() {
+    // Both samples are custom-buckets, so the schema-type check passes and
+    // nothing downstream rescales (the sentinel scale is equal on both
+    // sides): before this fix idelta differenced the (1,2] bucket of one
+    // boundary set against the (1,3] bucket of the other and answered a
+    // histogram combining unrelated value ranges. The user-visible surface
+    // must show the drop AND say why, which is what this asserts: an empty
+    // vector plus the mismatched-custom-buckets warning. The flipped
+    // assertions are `out.len() == 0` and the warning's presence (pre-fix the
+    // vector held one element and no warning was raised).
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (
+                    sec_ns(270),
+                    custom_buckets_hist_bounds(3.0, 6.0, &[1.0, 2.0, 4.0]),
+                ),
+                (
+                    sec_ns(300),
+                    custom_buckets_hist_bounds(9.0, 24.0, &[1.0, 3.0, 5.0]),
+                ),
+            ],
+        )
+        .expect("valid series");
+    let (value, annos) = Evaluator::new()
+        .eval_instant_annotated(&src, "idelta(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    let Value::Vector(out) = value else {
+        panic!("idelta is a vector");
+    };
+    assert_eq!(
+        out.len(),
+        0,
+        "differing custom bounds have no defined difference, so idelta drops \
+         rather than emitting a wrong value"
+    );
+    assert!(
+        annos
+            .warnings()
+            .iter()
+            .any(|w| w.contains("mismatched custom buckets")),
+        "the drop must be visible to the caller: {:?}",
+        annos.warnings()
+    );
+}
+
+#[test]
+fn irate_over_custom_buckets_with_different_bounds_warns_and_drops() {
+    // Same window, through irate: the counts only grow and the hint is
+    // Unknown, so this pair is not a counter reset and irate would otherwise
+    // reach its own `sub_assign` (the second of the two subtraction sites).
+    // Unlike the exponential/custom schema mismatch, which irate treats as a
+    // silent reset, a boundary change drops and warns here too.
+    let src = TestSource::new()
+        .with_histogram_series(
+            &[("__name__", "h")],
+            &[
+                (
+                    sec_ns(270),
+                    custom_buckets_hist_bounds(3.0, 6.0, &[1.0, 2.0, 4.0]),
+                ),
+                (
+                    sec_ns(300),
+                    custom_buckets_hist_bounds(9.0, 24.0, &[1.0, 3.0, 5.0]),
+                ),
+            ],
+        )
+        .expect("valid series");
+    let (value, annos) = Evaluator::new()
+        .eval_instant_annotated(&src, "irate(h[5m])", 5 * 60_000)
+        .expect("evaluates");
+    let Value::Vector(out) = value else {
+        panic!("irate is a vector");
+    };
+    assert_eq!(out.len(), 0, "irate drops the pair as well");
+    assert!(
+        annos
+            .warnings()
+            .iter()
+            .any(|w| w.contains("mismatched custom buckets")),
+        "irate must report the boundary mismatch too: {:?}",
+        annos.warnings()
+    );
+}
+
 #[test]
 fn irate_treats_a_schema_increase_as_a_reset_even_without_bucket_shrink() {
     // prev at scale 0 (count 3), last at scale 2 (count 10): every aligned
