@@ -30,11 +30,16 @@
 //! arrive as deltas and are accumulated to the absolute counts storage
 //! holds, and every structural rule the RSEG v5 writer or reader enforces is
 //! re-checked here so an accepted point can never fail either (see
-//! [`build_histogram_value`]).
+//! [`build_histogram_value`]). Two shapes the writer would store but
+//! Prometheus refuses to build are rejected on top of those: a
+//! `zero_threshold` that is NaN, infinite, or negative, and a custom-buckets
+//! histogram (`schema == -53`) carrying negative spans.
 
 use std::sync::Arc;
 
-use ravel_otlp::normalize::{NormalizedExemplar, NormalizedHistogramPoint, NormalizedPoint};
+use ravel_otlp::normalize::{
+    NormalizedExemplar, NormalizedHistogramPoint, NormalizedPoint, zero_threshold_is_admissible,
+};
 use ravel_otlp::{IngestLimits, Rejection};
 use ravel_segment::{
     HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint as SegResetHint,
@@ -110,6 +115,20 @@ pub enum RwRejection {
     )]
     NativeHistogramCustomValuesMismatch,
 
+    /// Carries the bit pattern rather than the `f64` so this enum keeps its
+    /// `Eq`, and so a NaN rejection compares equal to itself in a test (NaN
+    /// is not `==` NaN).
+    #[error(
+        "native histogram zero_threshold is {}, which is not a finite value at or above zero",
+        f64::from_bits(*.zero_threshold_bits)
+    )]
+    NativeHistogramZeroThresholdInvalid { zero_threshold_bits: u64 },
+
+    #[error(
+        "native histogram with the -53 custom-buckets schema carries {count} negative span(s); a custom-bucket histogram has no negative side"
+    )]
+    NativeHistogramCustomBucketsNegativeSpans { count: usize },
+
     #[error(
         "native histogram count is smaller than its zero_count or than the sum of its bucket counts, which the segment format's reader would reject as corrupted"
     )]
@@ -133,6 +152,8 @@ impl RwRejection {
             | RwRejection::NativeHistogramBucketCountLenMismatch { .. }
             | RwRejection::NativeHistogramDeltaOutOfRange
             | RwRejection::NativeHistogramCustomValuesMismatch
+            | RwRejection::NativeHistogramZeroThresholdInvalid { .. }
+            | RwRejection::NativeHistogramCustomBucketsNegativeSpans { .. }
             | RwRejection::NativeHistogramCountInconsistent
             | RwRejection::TimestampOverflow => 1,
         }
@@ -696,14 +717,35 @@ fn build_histogram_sample(
 /// schema is the sentinel). The OTLP surface keeps rejecting `scale == -53`,
 /// which is not an inconsistency: OTLP has no field to carry boundaries at
 /// all, so there the sentinel can only ever arrive unbacked.
+///
+/// Two checks here answer to Prometheus rather than to the RSEG writer,
+/// because the writer accepts shapes Prometheus itself refuses to build and
+/// Ravel's query-side arithmetic would then have to reconcile them. Both are
+/// value validation, not structure: a `zero_threshold` that is not a finite
+/// value at or above zero (see [`zero_threshold_is_admissible`], which the
+/// OTLP surface calls too), and a custom-buckets histogram carrying negative
+/// spans, which `Histogram.Validate` rejects with
+/// `ErrHistogramCustomBucketsNegSpans` since a custom-bucket layout has no
+/// negative side to place them on.
 fn build_histogram_value(h: &ResolvedHistogram) -> Result<HistogramValue, RwRejection> {
     if h.schema < -53 {
         return Err(RwRejection::NativeHistogramSchemaUnsupported { schema: h.schema });
     }
 
+    if !zero_threshold_is_admissible(h.zero_threshold) {
+        return Err(RwRejection::NativeHistogramZeroThresholdInvalid {
+            zero_threshold_bits: h.zero_threshold.to_bits(),
+        });
+    }
+
     let custom_values = if h.schema == -53 {
         if h.custom_values.is_empty() || !h.custom_values.windows(2).all(|w| w[0] < w[1]) {
             return Err(RwRejection::NativeHistogramCustomValuesMismatch);
+        }
+        if !h.negative_spans.is_empty() {
+            return Err(RwRejection::NativeHistogramCustomBucketsNegativeSpans {
+                count: h.negative_spans.len(),
+            });
         }
         Some(h.custom_values.clone())
     } else {
@@ -1672,6 +1714,242 @@ mod tests {
         let mut h = histogram(1_000);
         h.schema = -53;
         assert_histogram_rejected(h, RwRejection::NativeHistogramCustomValuesMismatch);
+    }
+
+    /// A custom-bucket layout has no negative side, so Prometheus'
+    /// `Histogram.Validate` refuses negative spans under `schema == -53`
+    /// (`ErrHistogramCustomBucketsNegSpans`). Ravel's arithmetic would merge
+    /// the shape rather than drop it, so a value Prometheus never emits
+    /// would be stored as valid data.
+    #[test]
+    fn custom_buckets_with_negative_spans_is_rejected() {
+        let mut h = histogram(1_000);
+        h.schema = -53;
+        h.custom_values = vec![0.5, 1.0, 2.5];
+        h.negative_spans = vec![ResolvedSpan {
+            offset: 0,
+            length: 2,
+        }];
+        h.negative_deltas = vec![1, 1];
+        assert_histogram_rejected(
+            h,
+            RwRejection::NativeHistogramCustomBucketsNegativeSpans { count: 1 },
+        );
+    }
+
+    /// The exponential schemas keep their negative side: the rejection above
+    /// is specific to the custom-buckets sentinel, not a new blanket rule.
+    #[test]
+    fn exponential_schema_keeps_admitting_negative_spans() {
+        let mut h = histogram(1_000);
+        h.negative_spans = vec![ResolvedSpan {
+            offset: 0,
+            length: 2,
+        }];
+        h.negative_deltas = vec![1, 1];
+        // The negative side adds 1 + 2 to the bucket total the reader's
+        // count rule checks `count` against.
+        h.count = Some(ResolvedCount::Int(17));
+        let out = normalize_histograms(vec![h]);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.histograms_written, 1);
+    }
+
+    // --- zero_threshold admission (issue #1858) ---
+
+    #[test]
+    fn negative_zero_threshold_is_refused() {
+        let mut h = histogram(1_000);
+        h.zero_threshold = -1.0;
+        assert_histogram_rejected(
+            h,
+            RwRejection::NativeHistogramZeroThresholdInvalid {
+                zero_threshold_bits: (-1.0f64).to_bits(),
+            },
+        );
+    }
+
+    #[test]
+    fn infinite_zero_threshold_is_refused() {
+        for threshold in [f64::INFINITY, f64::NEG_INFINITY] {
+            let mut h = histogram(1_000);
+            h.zero_threshold = threshold;
+            assert_histogram_rejected(
+                h,
+                RwRejection::NativeHistogramZeroThresholdInvalid {
+                    zero_threshold_bits: threshold.to_bits(),
+                },
+            );
+        }
+    }
+
+    /// The boundary cases this change deliberately leaves admitted, matched
+    /// against Prometheus' `Histogram.Validate`, which inspects
+    /// `ZeroThreshold` only under the custom-buckets schema and requires it
+    /// to equal zero there: it never screens an exponential-schema value for
+    /// magnitude, so a subnormal is as valid to Prometheus as `1e-9` is, and
+    /// `-0.0` compares equal to zero. Refusing either would refuse a payload
+    /// Prometheus itself accepts.
+    #[test]
+    fn zero_and_subnormal_zero_thresholds_stay_admitted() {
+        for threshold in [0.0f64, -0.0f64, f64::MIN_POSITIVE, 5e-324f64] {
+            let mut h = histogram(1_000);
+            h.zero_threshold = threshold;
+            let out = normalize_histograms(vec![h]);
+            assert!(out.rejected.is_empty(), "{threshold:?}: {:?}", out.rejected);
+            let sample = expect_histogram(&out);
+            assert_eq!(
+                sample.value.zero_threshold.to_bits(),
+                threshold.to_bits(),
+                "{threshold:?} round-trips by bit pattern"
+            );
+        }
+    }
+
+    /// Nothing about a rejected histogram panics, and nothing about it is
+    /// admitted: every malformed `zero_threshold` produces a typed
+    /// [`RwRejection`] and an empty admitted set.
+    #[test]
+    fn corrupt_zero_thresholds_all_produce_typed_rejections() {
+        // Two NaN payloads, including the Prometheus stale marker's, so a
+        // check written as a bit-pattern comparison against the canonical
+        // NaN would not pass this.
+        let stale_marker_nan = f64::from_bits(0x7ff0_0000_0000_0002);
+        for threshold in [
+            f64::NAN,
+            -f64::NAN,
+            stale_marker_nan,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            f64::MIN,
+        ] {
+            let mut h = histogram(1_000);
+            h.zero_threshold = threshold;
+            let out = normalize_histograms(vec![h]);
+            assert!(out.histogram_points.is_empty(), "{threshold:?}");
+            assert_eq!(
+                out.rejected,
+                vec![RwRejection::NativeHistogramZeroThresholdInvalid {
+                    zero_threshold_bits: threshold.to_bits(),
+                }],
+                "{threshold:?}"
+            );
+        }
+    }
+
+    /// The acceptance test for issue #1858, and the reason it lives here
+    /// rather than once per crate: the defect existed on both ingest
+    /// surfaces, so a fix applied to one of them has to fail.
+    ///
+    /// It also pins the predicate rather than the outcome of one comparison.
+    /// A check spelled `if zero_threshold < 0.0 { reject }` is false for
+    /// NaN (every comparison with NaN is false), so it passes the negative
+    /// case above and admits the NaN this asserts on.
+    #[test]
+    fn a_nan_zero_threshold_is_refused_on_both_ingest_surfaces() {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            AggregationTemporality, ExponentialHistogram, ExponentialHistogramDataPoint, Metric,
+            ResourceMetrics, ScopeMetrics, metric::Data as MetricData,
+        };
+
+        // Surface 1: Remote Write (RW1 and RW2 share this normalizer).
+        let mut h = histogram(1_000);
+        h.zero_threshold = f64::NAN;
+        let rw = normalize_histograms(vec![h]);
+        assert!(rw.histogram_points.is_empty(), "{:?}", rw.histogram_points);
+        assert_eq!(rw.histograms_written, 0);
+        assert_eq!(rw.histograms_dropped, 1);
+        assert_eq!(
+            rw.rejected,
+            vec![RwRejection::NativeHistogramZeroThresholdInvalid {
+                zero_threshold_bits: f64::NAN.to_bits(),
+            }]
+        );
+
+        // Surface 2: OTLP, driven with the same shape through its own
+        // normalizer and its own typed rejection.
+        let otlp = ravel_otlp::normalize::normalize_metrics(
+            &tenant(),
+            ExportMetricsServiceRequest {
+                resource_metrics: vec![ResourceMetrics {
+                    scope_metrics: vec![ScopeMetrics {
+                        metrics: vec![Metric {
+                            name: "req_latency".to_string(),
+                            data: Some(MetricData::ExponentialHistogram(ExponentialHistogram {
+                                data_points: vec![ExponentialHistogramDataPoint {
+                                    time_unix_nano: 1_000,
+                                    zero_threshold: f64::NAN,
+                                    ..Default::default()
+                                }],
+                                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            },
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(
+            otlp.histogram_points.is_empty(),
+            "{:?}",
+            otlp.histogram_points
+        );
+        assert!(otlp.points.is_empty(), "{:?}", otlp.points);
+        assert_eq!(
+            otlp.rejected,
+            vec![Rejection::NativeHistogramZeroThresholdInvalid {
+                zero_threshold_bits: f64::NAN.to_bits(),
+            }]
+        );
+
+        // The sender-facing count both surfaces report a refusal through.
+        assert_eq!(
+            rw.rejected
+                .iter()
+                .map(RwRejection::rejected_count)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            otlp.rejected
+                .iter()
+                .map(Rejection::rejected_count)
+                .sum::<usize>(),
+            1
+        );
+        // The OTLP counter reason an operator reads the refusal under: the
+        // server's normalize-reject counter is fed by
+        // `NormalizeRejectCounts::from_metric_rejections` over exactly this
+        // list, so a refusal landing in the wrong class (or in none) is
+        // visible here without a server in the loop.
+        assert_eq!(
+            otlp.rejected[0].admission_class(),
+            Some(ravel_otlp::AdmissionClass::Structural)
+        );
+        assert_eq!(
+            ravel_otlp::NormalizeRejectCounts::from_metric_rejections(&otlp.rejected),
+            ravel_otlp::NormalizeRejectCounts {
+                skew: 0,
+                structural: 1,
+            }
+        );
+
+        // The text an operator reads: the server renders the OTLP
+        // partial-success `error_message` from each rejection's `Display`,
+        // so the field name has to be in it. Both surfaces name the field,
+        // since a message that only said "invalid histogram" would not tell
+        // a sender which field to fix.
+        for rendered in [rw.rejected[0].to_string(), otlp.rejected[0].to_string()] {
+            assert!(rendered.contains("zero_threshold"), "{rendered}");
+            assert!(rendered.contains("NaN"), "{rendered}");
+        }
     }
 
     /// The RSEG v5 reader rejects a record whose `count` is below its

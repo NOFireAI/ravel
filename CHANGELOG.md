@@ -23,6 +23,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Native histogram samples whose shape Prometheus itself rejects are now
+  refused at ingest, on both the OTLP and Remote Write surfaces**
+  (issue #1858). This is a behaviour change at the ingest boundary: a sender
+  emitting either shape below had the sample accepted and stored before this
+  release and now has it refused, so check your senders before upgrading.
+  Refused: a `zero_threshold` that is NaN, positive or negative infinity, or
+  negative, on both surfaces; and, on Remote Write, a custom-buckets
+  histogram (`schema == -53`) carrying non-empty negative spans, which a
+  custom-bucket layout has no negative side to hold (OTLP rejects
+  `scale == -53` outright already, so the shape cannot reach that surface).
+  A `zero_threshold` of `+0.0`, `-0.0`, or a subnormal stays admitted:
+  Prometheus' `Histogram.Validate` reads the field only under the
+  custom-buckets schema and never screens an exponential-schema value for
+  magnitude. Both refusals are per-sample, not per-request, and behave like
+  every other structural ingest refusal on their surface: on OTLP the sample
+  is counted in `rejected_data_points` with the reason in the partial-success
+  `error_message` and under the `structural` normalize-reject counter; on
+  Remote Write the request still answers `204`, the sample is counted into
+  the surface's dropped-points counter, and the
+  `X-Prometheus-Remote-Write-Histograms-Written` header excludes it.
+  Refusing new samples does not clean up data already stored with a NaN
+  threshold, so the query-side zero-bucket guards remain in place.
 - **The published PromQL conformance figure now says what it measures**
   (issue #1698). The committed table read `132/132 = 100%` under a heading
   that invites it to be read as agreement with Prometheus, while the block is
