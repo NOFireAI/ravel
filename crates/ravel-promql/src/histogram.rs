@@ -1069,15 +1069,38 @@ fn fraction_rank(value: f64, h: &FloatHistogram) -> f64 {
 /// approximation of its exact annotation for this window shape (unverified:
 /// the difftest generator cannot emit `custom_values`, so this case has no
 /// oracle-checkable fixture).
+///
+/// A second guard covers a shape the first one cannot see: a window whose
+/// samples all use custom buckets but do not all carry the same boundaries.
+/// Both sides then hold [`CUSTOM_BUCKETS_SCALE`], so the schema-family check
+/// above passes and `copy_to_scale` has nothing to convert, and
+/// [`FloatHistogram::sub_assign`] would difference bucket `i` of one boundary
+/// set against bucket `i` of another (issue #1851). The window is dropped
+/// instead, on [`FloatHistogram::custom_bounds_match`] -- the same
+/// bit-pattern comparison [`crate::binop`] aligns its `h - h` operands with,
+/// so the two paths cannot drift apart on what "same bounds" means.
+///
+/// Dropping is NOT Prometheus v3.13.1's answer for differing bounds: that
+/// version re-buckets both operands onto the intersection of their boundary
+/// sets and raises an info annotation (see
+/// [`FloatHistogram::combine_custom_reconciled`], which the binary-operator
+/// path uses). This reducer returns a bare `Option` and has no channel to
+/// raise that info on, so reconciling here would combine the two silently.
+/// The drop is the conservative choice for a case with no oracle fixture, not
+/// verified parity with upstream.
 pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<FloatHistogram> {
     if samples.len() < 2 {
         return None;
     }
-    let uses_custom = samples[0].1.uses_custom_buckets();
+    let first = &samples[0].1;
+    let uses_custom = first.uses_custom_buckets();
     if samples
         .iter()
         .any(|(_, h)| h.uses_custom_buckets() != uses_custom)
     {
+        return None;
+    }
+    if uses_custom && samples.iter().any(|(_, h)| !first.custom_bounds_match(h)) {
         return None;
     }
     let prev0 = &samples[0].1;
@@ -1122,6 +1145,21 @@ pub fn histogram_rate(samples: &[TimedHistogram], is_counter: bool) -> Option<Fl
 /// unrescalable-schema-sentinel overflow [`histogram_rate`] guards against
 /// (issue #678), unverified here for the same reason (no generator support
 /// for `custom_values` fixtures).
+///
+/// That schema-family check is not a bounds check. A group whose members all
+/// use custom buckets passes it whatever boundaries they carry, because they
+/// all hold [`CUSTOM_BUCKETS_SCALE`], and [`FloatHistogram::add_assign`] would
+/// then merge bucket `i` of one boundary set into bucket `i` of another
+/// (issue #1851). A second guard rejects the group on
+/// [`FloatHistogram::custom_bounds_match`], the bit-pattern comparison
+/// [`crate::binop`] already aligns its `h + h` operands with. The accumulator
+/// keeps the first member's boundaries throughout a custom-buckets fold, so
+/// comparing each addend against it compares it against every member.
+///
+/// This drop carries the same caveat as [`histogram_rate`]'s: Prometheus
+/// v3.13.1 reconciles differing bounds onto their intersection and annotates
+/// rather than dropping, and this function has no annotation channel to do
+/// that without hiding it from the caller.
 pub fn sum_histograms<'a>(
     mut group: impl Iterator<Item = &'a FloatHistogram>,
 ) -> Option<FloatHistogram> {
@@ -1130,6 +1168,9 @@ pub fn sum_histograms<'a>(
     let mut acc = first.clone();
     for h in group {
         if h.uses_custom_buckets() != uses_custom {
+            return None;
+        }
+        if uses_custom && !acc.custom_bounds_match(h) {
             return None;
         }
         let scale = acc.scale.min(h.scale);
@@ -1735,6 +1776,93 @@ mod tests {
         );
         assert_eq!(a.count, 55.0, "35 + 20");
         assert_eq!(a.observation_sum(), 100.0, "60 + 40");
+    }
+
+    /// A custom-buckets (NHCB) histogram: `bounds` ascending, one populated
+    /// positive bucket per bound starting at absolute index 1, nothing in the
+    /// `+Inf` overflow bucket.
+    fn custom(bounds: &[f64], counts: &[f64]) -> FloatHistogram {
+        let total: f64 = counts.iter().sum();
+        FloatHistogram {
+            counter_reset_hint: ResetHint::Unknown,
+            scale: CUSTOM_BUCKETS_SCALE,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: total,
+            sum: total,
+            positive_spans: vec![Span {
+                offset: 1,
+                length: counts.len() as u32,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: counts.to_vec(),
+            negative_buckets: Vec::new(),
+            custom_values: bounds.to_vec(),
+        }
+    }
+
+    /// Issue #1851: `sum` over custom-buckets members compares their BOUNDS,
+    /// not just the custom-buckets schema sentinel. Three cases, each ruling
+    /// out one wrong implementation:
+    ///
+    /// - identical bounds still merge, so a guard that rejected every
+    ///   custom-buckets group would fail here;
+    /// - bounds differing in an ordinary value drop, so a guard comparing only
+    ///   `uses_custom_buckets`/`CUSTOM_BUCKETS_SCALE` would fail here: both
+    ///   members carry `CUSTOM_BUCKETS_SCALE`, so such a guard passes them to
+    ///   `add_assign`, which merges bucket 1 of `[1,2,4]` into bucket 1 of
+    ///   `[1,3,5]` -- two different value ranges;
+    /// - bounds differing only in the sign of zero drop, so a guard comparing
+    ///   the boundary slices with float `==` would fail here, since
+    ///   `-0.0 == 0.0`. `custom_bounds_match` compares by `f64::to_bits`.
+    #[test]
+    fn sum_drops_custom_buckets_series_with_different_bounds() {
+        let a = custom(&[1.0, 2.0, 4.0], &[1.0, 2.0, 3.0]);
+
+        let same_bounds = custom(&[1.0, 2.0, 4.0], &[4.0, 5.0, 6.0]);
+        let merged =
+            sum_histograms([&a, &same_bounds].into_iter()).expect("matching bounds must merge");
+        assert_eq!(merged.custom_values, vec![1.0, 2.0, 4.0]);
+        assert_eq!(merged.positive_buckets, vec![5.0, 7.0, 9.0]);
+
+        let different_bounds = custom(&[1.0, 3.0, 5.0], &[1.0, 2.0, 3.0]);
+        assert!(
+            sum_histograms([&a, &different_bounds].into_iter()).is_none(),
+            "custom-buckets members with different bounds must not merge by index"
+        );
+
+        let plus_zero = custom(&[0.0, 1.0], &[1.0, 2.0]);
+        let minus_zero = custom(&[-0.0, 1.0], &[1.0, 2.0]);
+        assert!(
+            sum_histograms([&plus_zero, &minus_zero].into_iter()).is_none(),
+            "bounds differing only in the sign of zero are different bounds"
+        );
+    }
+
+    /// Issue #1851: the same bounds comparison on the `rate`/`increase`/`delta`
+    /// window reducer, where the bounds can change mid-window. The signed-zero
+    /// pair pins the bit-pattern comparison here too, and the matching-bounds
+    /// case pins that an ordinary counter window still reduces.
+    #[test]
+    fn rate_drops_custom_buckets_window_with_different_bounds() {
+        let first = custom(&[1.0, 2.0, 4.0], &[1.0, 2.0, 3.0]);
+        let second = custom(&[1.0, 2.0, 4.0], &[2.0, 4.0, 6.0]);
+        let reduced = histogram_rate(&[(0, first.clone()), (1_000_000_000, second)], true)
+            .expect("matching bounds must reduce");
+        assert_eq!(reduced.positive_buckets, vec![1.0, 2.0, 3.0]);
+
+        let rebounded = custom(&[1.0, 3.0, 5.0], &[2.0, 4.0, 6.0]);
+        assert!(
+            histogram_rate(&[(0, first), (1_000_000_000, rebounded)], true).is_none(),
+            "a window whose custom bounds change must not difference by index"
+        );
+
+        let plus_zero = custom(&[0.0, 1.0], &[1.0, 2.0]);
+        let minus_zero = custom(&[-0.0, 1.0], &[2.0, 4.0]);
+        assert!(
+            histogram_rate(&[(0, plus_zero), (1_000_000_000, minus_zero)], true).is_none(),
+            "bounds differing only in the sign of zero are different bounds"
+        );
     }
 
     #[test]

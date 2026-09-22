@@ -440,6 +440,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   out the exact condition it built, `True` or `False` with its Pending or Failed
   reason, and records it before it creates or deletes the qualify Job, so a
   failure in that API call cannot drop it either.
+- **`sum`/`avg` and `rate`/`increase`/`delta` over custom-bucket (NHCB)
+  native histograms now compare the bucket boundaries, not just the
+  custom-buckets schema sentinel** (issue #1851). Both reducers guarded a
+  mixed exponential/custom group by comparing `uses_custom_buckets()` alone.
+  Two custom-bucket histograms both carry the `-53` sentinel scale, so that
+  check passed them through whatever boundaries they held, and the fold then
+  merged bucket `i` of one boundary set into bucket `i` of another: a `sum`
+  over series with different bounds, or a `rate` window whose bounds changed
+  mid-window, produced a histogram whose buckets combined unrelated value
+  ranges, with nothing to say so. Both reducers now compare the boundaries
+  with `FloatHistogram::custom_bounds_match`, the same bit-pattern comparison
+  the `h + h`/`h - h` binary-operator path already aligns its operands with,
+  so bounds differing only in the sign of zero count as different. A group or
+  window that fails the comparison yields no sample. That drop is
+  conservative rather than a match for Prometheus v3.13.1, which re-buckets
+  differing bounds onto the intersection of the two boundary sets and raises
+  an info annotation; these two reducers return a bare `Option` and have no
+  annotation channel, so reconciling in them would combine the two silently.
+  Raising that annotation needs the reducers' callers and is not done here.
 
 ## [0.15.0] - 2026-09-08
 
