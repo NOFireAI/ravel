@@ -485,10 +485,13 @@ pub const MAX_RESOLVE_GET_CONCURRENCY: usize = 4_096;
 /// number of resolves the process expects to run at once (issue #1733).
 ///
 /// The result is `per_resolve * process_query_concurrency`, clamped into
-/// `per_resolve ..= MAX_RESOLVE_GET_CONCURRENCY`: never below one resolve's
-/// own width (a zero or one query concurrency must not throttle the single
-/// resolve the measured width was chosen for), never above the ceiling whose
-/// arithmetic [`MAX_RESOLVE_GET_CONCURRENCY`] states.
+/// `min(per_resolve, MAX_RESOLVE_GET_CONCURRENCY) ..= MAX_RESOLVE_GET_CONCURRENCY`:
+/// never below one resolve's own width (a zero or one query concurrency must
+/// not throttle the single resolve the measured width was chosen for), never
+/// above the ceiling whose arithmetic [`MAX_RESOLVE_GET_CONCURRENCY`] states.
+/// The ceiling wins over the floor, so a `per_resolve` past the ceiling (which
+/// [`crate::Catalog::new`] rejects before this is ever reached in production)
+/// still returns the ceiling rather than the caller's value.
 ///
 /// # Implied per-process request rate
 ///
@@ -508,9 +511,10 @@ pub fn derive_resolve_request_concurrency(
     per_resolve: usize,
     process_query_concurrency: usize,
 ) -> usize {
+    let floor = per_resolve.min(MAX_RESOLVE_GET_CONCURRENCY);
     per_resolve
         .saturating_mul(process_query_concurrency)
-        .clamp(per_resolve, MAX_RESOLVE_GET_CONCURRENCY)
+        .clamp(floor, MAX_RESOLVE_GET_CONCURRENCY)
 }
 
 /// Bytes reserved from [`CatalogConfig::resolve_inflight_bytes`] by one
@@ -784,7 +788,10 @@ impl CatalogConfig {
     /// number N concurrent resolves share; each one of them is separately
     /// held to `resolve_get_concurrency` by its own fan-out width.
     pub fn resolve_request_concurrency(&self) -> usize {
-        derive_resolve_request_concurrency(self.resolve_get_concurrency, self.process_query_concurrency)
+        derive_resolve_request_concurrency(
+            self.resolve_get_concurrency,
+            self.process_query_concurrency,
+        )
     }
 
     /// Bytes one in-flight request of unknown response size charges against
@@ -1050,7 +1057,7 @@ mod tests {
                     DEFAULT_PROCESS_QUERY_CONCURRENCY
                 ) as u64
         );
-        assert!(DEFAULT_RESOLVE_INFLIGHT_BYTES <= MAX_RESOLVE_INFLIGHT_BYTES);
-        assert!(DEFAULT_RESOLVE_INFLIGHT_BYTES >= RESOLVE_UNSIZED_REQUEST_BYTES);
+        const { assert!(DEFAULT_RESOLVE_INFLIGHT_BYTES <= MAX_RESOLVE_INFLIGHT_BYTES) };
+        const { assert!(DEFAULT_RESOLVE_INFLIGHT_BYTES >= RESOLVE_UNSIZED_REQUEST_BYTES) };
     }
 }

@@ -251,7 +251,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at `resolve_get_concurrency` itself, so N concurrent queries divided 128
   in-flight object-store requests between them rather than each getting 128.
   The semaphore is now sized by the new
-  `ravel_catalog::derive_resolve_request_concurrency`, one resolve's fan-out
+  `CatalogConfig::resolve_request_concurrency`, one resolve's fan-out
   width times the process's assumed query concurrency (the new
   `CatalogConfig::process_query_concurrency`, default 8), which is 1,024 at
   the shipped defaults; each individual resolve is still held to

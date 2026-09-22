@@ -877,16 +877,19 @@ impl Catalog {
     /// have paid the memory it exists to refuse.
     ///
     /// A single request asking for more than the whole budget is clamped to
-    /// the whole budget: it then runs alone, which is the most any bound can
-    /// do for a response larger than the budget, and it can never park
-    /// forever on permits the semaphore does not have.
+    /// the budget, so it can never park forever on permits the semaphore does
+    /// not have; it then runs alone, which is the most any bound can do for a
+    /// response larger than the budget. `acquire_many` takes a `u32`, so a
+    /// budget above 4 GiB charges at most 4 GiB for one request and such a
+    /// request does not run alone.
     async fn acquire_request_permits(
         &self,
         expected_bytes: u64,
     ) -> Result<RequestPermits<'_>, StoreError> {
-        let count = self.request_semaphore.acquire().await.map_err(|_| {
-            StoreError::Transient("catalog request semaphore closed".to_string())
-        })?;
+        let count =
+            self.request_semaphore.acquire().await.map_err(|_| {
+                StoreError::Transient("catalog request semaphore closed".to_string())
+            })?;
         let budget = self.config.resolve_inflight_bytes;
         let charged = u32::try_from(expected_bytes.clamp(1, budget)).unwrap_or(u32::MAX);
         let bytes = self
@@ -2548,9 +2551,7 @@ impl Catalog {
                         // before it is issued, so it charges the unsized
                         // reservation.
                         let _permits = self
-                            .acquire_request_permits(
-                                crate::config::RESOLVE_UNSIZED_REQUEST_BYTES,
-                            )
+                            .acquire_request_permits(crate::config::RESOLVE_UNSIZED_REQUEST_BYTES)
                             .await?;
                         let page = self
                             .store
@@ -3191,9 +3192,7 @@ impl Catalog {
                         // before it is issued, so it charges the unsized
                         // reservation.
                         let _permits = self
-                            .acquire_request_permits(
-                                crate::config::RESOLVE_UNSIZED_REQUEST_BYTES,
-                            )
+                            .acquire_request_permits(crate::config::RESOLVE_UNSIZED_REQUEST_BYTES)
                             .await?;
                         let page = self
                             .store
@@ -5750,8 +5749,7 @@ mod tests {
     /// raw `validate_or_adopt(self.store.as_ref(), .., CheckOnly)` call (and
     /// `read_scan_generations` to `read_generations_from_store`). The held
     /// provisioning GET then holds no resolve permit, so `available_permits()`
-    /// stays at `DEFAULT_RESOLVE_GET_CONCURRENCY` and the
-    /// `== DEFAULT_RESOLVE_GET_CONCURRENCY - 1` assertion fails.
+    /// stays at the pool size and the `== pool - 1` assertion fails.
     #[tokio::test]
     async fn provisioning_read_holds_a_resolve_semaphore_permit() {
         let mem = MemoryStore::new();
@@ -5778,7 +5776,7 @@ mod tests {
 
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY,
+            catalog.config.resolve_request_concurrency(),
             "no permit is held before the resolve starts"
         );
 
@@ -5799,7 +5797,7 @@ mod tests {
         );
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY - 1,
+            catalog.config.resolve_request_concurrency() - 1,
             "the held provisioning GET holds a resolve semaphore permit: it routed through \
              guarded_get, not a raw store.get"
         );
@@ -6105,14 +6103,100 @@ mod tests {
     }
 
     /// Issue #1238: `CatalogConfig::resolve_get_concurrency` defaults to 128,
-    /// not the old fixed `MAX_CONCURRENT_REQUESTS = 16`. Measured against
-    /// real S3 on a 10,000-record unsealed tail (one cold resolve each,
-    /// 10,001 GETs and 13 LISTs at every level -- concurrency-bound, not
-    /// request-count-bound): 23.157s at 16, 4.374s at 64, 2.341s at 128. A
-    /// silent revert of the default fails this assertion.
+    /// not the old fixed `MAX_CONCURRENT_REQUESTS = 16`. That value came from
+    /// a measurement taken under #1238 against real S3 on a 10,000-record
+    /// unsealed tail, one cold resolve at a time (10,001 GETs and 13 LISTs at
+    /// every level -- concurrency-bound, not request-count-bound): 23.157s at
+    /// 16, 4.374s at 64, 2.341s at 128. Since issue #1733 the constant means
+    /// one resolve's fan-out width, which is what that measurement drove; the
+    /// process-wide ceiling is `resolve_request_concurrency()` below. A silent
+    /// revert of the default fails this assertion.
     #[test]
     fn resolve_get_concurrency_defaults_to_128() {
         assert_eq!(CatalogConfig::default().resolve_get_concurrency, 128);
+    }
+
+    /// Issue #1733: the instance-wide request pool is sized from the
+    /// derivation, not from the per-resolve width, so one `Catalog` shared by
+    /// `Arc` clone across a server's requests admits more than one resolve's
+    /// worth of in-flight requests. At the shipped defaults that is 1,024
+    /// permits against a 128-wide resolve.
+    ///
+    /// FLIP: sizing `request_semaphore` with `config.resolve_get_concurrency`
+    /// (the pre-#1733 line) leaves 128 available permits here.
+    #[test]
+    fn request_pool_is_sized_for_the_process_not_one_resolve() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, CatalogConfig::default()).expect("catalog");
+        assert_eq!(catalog.request_semaphore.available_permits(), 1_024);
+        assert_eq!(
+            catalog.request_semaphore.available_permits(),
+            8 * CatalogConfig::default().resolve_get_concurrency,
+            "the pool is the per-resolve width times the assumed query concurrency"
+        );
+    }
+
+    /// Issue #1733: the in-flight byte budget is a real permit pool sized in
+    /// bytes, so a resolve cannot buffer more response bytes than the config
+    /// allows however many requests the count pool admits.
+    #[test]
+    fn inflight_byte_budget_is_sized_in_bytes() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, CatalogConfig::default()).expect("catalog");
+        assert_eq!(
+            catalog.request_bytes_semaphore.available_permits() as u64,
+            crate::config::DEFAULT_RESOLVE_INFLIGHT_BYTES
+        );
+    }
+
+    /// Issue #1733: a byte budget smaller than one unsized request's own
+    /// reservation would serialize the whole resolve path on a bound that
+    /// looks like a tight limit, so it is refused at construction with a typed
+    /// error rather than accepted and silently paid for on every query.
+    #[test]
+    fn resolve_inflight_bytes_below_one_reservation_is_rejected() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_inflight_bytes: crate::config::RESOLVE_UNSIZED_REQUEST_BYTES - 1,
+                ..config(1)
+            },
+        );
+        match result {
+            Err(CatalogError::InvalidConfig(msg)) => {
+                assert_eq!(
+                    msg,
+                    "resolve_inflight_bytes is below RESOLVE_UNSIZED_REQUEST_BYTES"
+                );
+            }
+            Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
+    }
+
+    /// Issue #1733: and a budget past `MAX_RESOLVE_INFLIGHT_BYTES` is a typo,
+    /// refused the same way.
+    #[test]
+    fn resolve_inflight_bytes_above_max_is_rejected() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_inflight_bytes: crate::config::MAX_RESOLVE_INFLIGHT_BYTES + 1,
+                ..config(1)
+            },
+        );
+        match result {
+            Err(CatalogError::InvalidConfig(msg)) => {
+                assert_eq!(
+                    msg,
+                    "resolve_inflight_bytes exceeds MAX_RESOLVE_INFLIGHT_BYTES"
+                );
+            }
+            Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
     }
 
     /// Issue #1238: a zero `resolve_get_concurrency` is rejected at
@@ -7733,7 +7817,7 @@ mod tests {
         );
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY,
+            catalog.config.resolve_request_concurrency(),
             "every acquired permit was released"
         );
     }
