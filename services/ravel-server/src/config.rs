@@ -3236,7 +3236,10 @@ pub struct FlushConcurrency {
 /// then land outside the window the read side still scans, an invisibility
 /// hazard. `ravel_ingest::IngestConfig::max_flush_lifetime` is not itself an
 /// operator-facing flag in this ADR's scope, so [`Cli::validate`] uses its
-/// compiled-in default (1h) as the fixed half of the sum.
+/// compiled-in default (1h) as the fixed half of the sum. That two-term sum is
+/// not the whole worst case: issue #1740's queued-flush cap adds a deferral
+/// term to it, which [`Cli::validate`] explains it does not carry and
+/// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` records against the constant.
 pub const FLUSH_BOUND_SLACK_HOURS_NS: i64 =
     ravel_catalog::FLUSH_BOUND_SLACK_HOURS as i64 * 3_600_000_000_000;
 
