@@ -646,6 +646,9 @@ fn maybe_hist_type_warning(name: &str, hists: &[TimedHistogram]) -> Option<Strin
         rate::InstantHistTypeWarning::MixedSchemas => {
             Some(rate::mixed_exponential_custom_schemas_warning())
         }
+        rate::InstantHistTypeWarning::MismatchedCustomBounds => {
+            Some(rate::mismatched_custom_buckets_warning())
+        }
     }
 }
 
