@@ -137,9 +137,11 @@ covered this rotation, for operator visibility into cadence). No
 following the established default every other family already follows.
 
 Issue #1686 amends the checksum-mismatch family: the corpus covers the
-live generation's compaction and rewrite output parts as well as L0
-segments, and `level` (`l0`, `l1`, `rewrite`) names the tier the corrupt
-object came from, so a mismatch is no longer attributed to L0 by default.
+compaction and rewrite output parts the catalog still serves (not a
+superseded generation's, not an overlap loser's, and none in a tombstoned
+bucket) as well as L0 segments, and `level` (`l0`, `l1`, `rewrite`) names
+the tier the corrupt object came from, so a mismatch is no longer
+attributed to L0 by default.
 Both are the issue's work, not ADR-1686's: that ADR decides the cursor's
 enumeration only, leaves the widening to "issue #1686's other half,
 landing separately" (its decision 5), and states in decision 6 that it
