@@ -21,6 +21,7 @@ use proptest::prelude::*;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_logseg::{AttrValue, LogRecord, stream_attrs_bytes};
 use ravel_promql::SeriesData;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::{
@@ -28,6 +29,7 @@ use ravel_segment::{
     SeriesInput, SeriesInputV7, SeriesValues, encode_run_v4,
 };
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::logstream::{LogStreamId, log_stream_id};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -42,7 +44,8 @@ use crate::distrib::federation::{Federation, RemoteCluster};
 use crate::distrib::partition::DistribThresholds;
 use crate::distrib::proto::series_fetch_server::SeriesFetch;
 use crate::distrib::{
-    service::SeriesFetchService, service::SnapshotSegmentResolver, span_cmp, span_order_key,
+    log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver,
+    span_cmp, span_order_key,
 };
 use crate::engine::merge_soa_runs;
 use crate::erasure::ErasurePredicate;
@@ -4301,4 +4304,80 @@ fn budget_exceeded_fold_renders_memory_refusal_typed() {
         matches!(err, crate::error::QueryError::TooManyBytesScanned { .. }),
         "a folded total over the bytes cap must fold to TooManyBytesScanned, got {err:?}"
     );
+}
+
+/// `log_stream_id` and its attribute blob for `service`, the shape a log fan-out
+/// row carries.
+fn log_stream(service: &str) -> (LogStreamId, Vec<u8>) {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str(service.to_string()),
+    )];
+    let id = log_stream_id(&resource, "scope", "1.0", &[]);
+    let blob = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+    (id, blob)
+}
+
+/// One log record on `service`'s stream at event time `ts`.
+fn log_record(service: &str, ts: i64, body: &str, attrs: &[(&str, &str)]) -> LogRecord {
+    let (stream_id, stream_attrs) = log_stream(service);
+    LogRecord {
+        stream_id,
+        stream_attrs,
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: body.to_string(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: attrs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), AttrValue::Str((*v).to_string())))
+            .collect(),
+    }
+}
+
+/// Every field of the log total order participates in the key.
+///
+/// The counterpart of [`span_order_key_discriminates_every_field`] for the log
+/// side. It exists because #1912 deleted the differential suites that were the
+/// only exercise of the coordinator-side log fan-out, and unlike the span side
+/// nothing else pinned the log order at all: a field silently dropped from
+/// `log_record_order_key` reorders a distributed log read against a local one
+/// with no test anywhere failing. This pin is transport-independent, so it
+/// survives whatever shape the log slice boundary eventually takes.
+#[test]
+fn log_record_order_key_discriminates_every_field() {
+    let base = log_record("alpha", 10, "body", &[("k", "v")]);
+
+    let check = |field: &str, mutate: &dyn Fn(&mut LogRecord)| {
+        let mut other = base.clone();
+        mutate(&mut other);
+        assert_ne!(
+            log_record_order_key(&base),
+            log_record_order_key(&other),
+            "log_record_order_key must distinguish records differing only in \
+             {field}; if it does not, that field has been dropped from the key"
+        );
+    };
+
+    // One case per key field, in the key's own field order.
+    check("ts_ns", &|r| r.ts_ns = 20);
+    check("stream_id", &|r| {
+        let (id, blob) = log_stream("beta");
+        r.stream_id = id;
+        r.stream_attrs = blob;
+    });
+    check("observed_ts_ns", &|r| r.observed_ts_ns = 99);
+    check("severity_num", &|r| r.severity_num = 17);
+    check("severity_text", &|r| r.severity_text = "WARN".to_string());
+    check("body", &|r| r.body = "other".to_string());
+    check("trace_id", &|r| r.trace_id = Some([1u8; 16]));
+    check("span_id", &|r| r.span_id = Some([2u8; 8]));
+    check("flags", &|r| r.flags = 1);
+    check("attrs", &|r| {
+        r.attrs = vec![("k".to_string(), AttrValue::Str("other".to_string()))]
+    });
 }
