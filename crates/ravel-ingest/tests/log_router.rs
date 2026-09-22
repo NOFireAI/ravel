@@ -225,8 +225,9 @@ async fn buffered_write_returns_immediately_with_no_tokens() {
 #[tokio::test]
 async fn dead_shard_is_observable_and_counted_once() {
     let shard_count = 4;
-    // `/c/` is the log commit keyspace; `Signal::Logs` stamps the conflicting
-    // record this double lands there.
+    // `/c/` matches every signal's commit keyspace, not just the log one; it
+    // is enough here because this test writes logs only. `Signal::Logs`
+    // stamps the conflicting record this double lands there.
     let store: Arc<dyn ObjectStoreBackend> =
         Arc::new(SplitBrainOnFirstCommit::new("/c/", Signal::Logs));
     let clock = TestClock::new(BASE_NS);
