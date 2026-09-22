@@ -187,7 +187,7 @@ seal-divergence check classifies it `missing`, and that check detects and
 reports, never repairs.
 `ravel_ingest::shard::tests::carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour`
 holds that arithmetic against the catalog's own margin constants. What closes
-the gap is bounding the deferral itself, which is open on issue #1916.
+the gap is bounding the deferral itself, which is open.
 
 Operationally: do **not** decrease `shard_count` and immediately assume every
 prior write is now under the new, narrower range. For `S` hours past the
