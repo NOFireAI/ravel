@@ -1579,16 +1579,7 @@ mod tests {
         // Flip a byte in the L1 part's page region, the same proven
         // GET/flip/Overwrite pattern `corrupted_object_surfaces_as_checksum_mismatch`
         // uses for an L0 object.
-        let existing = store
-            .get(&part_key, GetRange::Full)
-            .await
-            .expect("get l1 part");
-        let mut corrupted = existing.data.to_vec();
-        corrupted[0] ^= 0x01;
-        store
-            .put(&part_key, Bytes::from(corrupted), PutOptions::default())
-            .await
-            .expect("overwrite corrupted l1 part");
+        corrupt_first_byte(&store, &part_key).await;
 
         let metrics = ScrubMetrics::default();
         run_cycle(
@@ -1753,16 +1744,7 @@ mod tests {
         );
 
         // Flip a byte in the rewrite part object.
-        let existing = store
-            .get(&part_key, GetRange::Full)
-            .await
-            .expect("get rewrite part");
-        let mut corrupted = existing.data.to_vec();
-        corrupted[0] ^= 0x01;
-        store
-            .put(&part_key, Bytes::from(corrupted), PutOptions::default())
-            .await
-            .expect("overwrite corrupted rewrite part");
+        corrupt_first_byte(&store, &part_key).await;
 
         let metrics = ScrubMetrics::default();
         run_cycle(
@@ -1972,15 +1954,8 @@ mod tests {
             0
         );
 
-        for key in [&l1_part_key, &rewrite_part_key] {
-            let existing = store.get(key, GetRange::Full).await.expect("get part");
-            let mut corrupted = existing.data.to_vec();
-            corrupted[0] ^= 0x01;
-            store
-                .put(key, Bytes::from(corrupted), PutOptions::default())
-                .await
-                .expect("overwrite corrupted part");
-        }
+        corrupt_first_byte(&store, &l1_part_key).await;
+        corrupt_first_byte(&store, &rewrite_part_key).await;
 
         let metrics = ScrubMetrics::default();
         run_cycle(
@@ -2242,6 +2217,268 @@ mod tests {
             metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
             0,
             "this bucket holds no rewrite record"
+        );
+    }
+
+    /// A tombstoned bucket's compaction parts stay out of the corpus (issue
+    /// #1686, the third exclusion after supersession and overlap). Retention's
+    /// sweep may delete a tombstoned bucket's parts at any moment after the
+    /// tombstone lands and no query reads them meanwhile, so rot in them must
+    /// not page an operator. Two buckets in two ingest hours: the compactor's
+    /// own bucket, tombstoned after it compacts exactly as retention would
+    /// tombstone it, and a hand-built compaction record in the next hour with
+    /// a real RSEG part, alone in its bucket so it is nobody's overlap loser.
+    ///
+    /// Two ticks, because one cannot say both things. The first corrupts only
+    /// the tombstoned bucket's part: `l1 == 0` says it is excluded, but on its
+    /// own that also holds on an empty corpus. The second corrupts the live
+    /// bucket's part as well, leaving both corrupt in one tick: `l1 == 1` says
+    /// the untombstoned part is still scrubbed and that the tombstone took
+    /// exactly its own bucket's parts out, not every part on the shard.
+    #[tokio::test]
+    async fn a_tombstoned_buckets_parts_are_left_out_of_the_corpus() {
+        use ravel_commit::erasure;
+        use ravel_proto::commit::v1::{
+            CompactionInputIdentity, CompactionPart, CompactionRecord, RetentionTombstone,
+        };
+
+        let store = MemoryStore::new();
+        let tenant_id = tenant();
+        let tenant_hash = tenant_id.hash();
+        let shard = 0u32;
+        let tombstoned_hour = 500_000u32;
+        let live_hour = 500_001u32;
+        let live_created_unix_ns = 500_001 * NS_PER_HOUR;
+
+        publish_segment(&store, 1, &["cpu"]).await;
+        publish_segment(&store, 2, &["mem"]).await;
+
+        let bucket =
+            ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, shard, tombstoned_hour);
+        let compact_clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let outcome = ravel_maintain::compact_bucket(
+            &store,
+            &compact_clock,
+            &ravel_maintain::CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+            "two sealed L0 inputs must compact, got {outcome:?}"
+        );
+
+        let prefix =
+            keys::commit_shard_hour_prefix(&tenant_hash, Signal::Metrics, shard, tombstoned_hour)
+                .expect("prefix");
+        let metas = list_all(&store, &prefix).await.expect("list bucket");
+        let tombstoned_record_key = metas
+            .iter()
+            .map(|m| m.key.clone())
+            .find(|k| {
+                matches!(
+                    keys::partition_bucket_entry(k),
+                    Ok(keys::BucketEntry::CompactionRecord(_))
+                )
+            })
+            .expect("a compaction record was published");
+        let tombstoned_record_bytes = store
+            .get(&tombstoned_record_key, GetRange::Full)
+            .await
+            .expect("get compaction record")
+            .data;
+        let tombstoned_record = ravel_commit::record::decode_compaction(&tombstoned_record_bytes)
+            .expect("decode compaction record");
+        let tombstoned_part_key =
+            keys::reconstruct_l1_part_key(&tombstoned_record, &tombstoned_record.parts[0])
+                .expect("tombstoned l1 part key");
+
+        // Retire the compacted bucket the way retention does: a real
+        // `RetentionTombstone` at the bucket's fixed `retire.tmb` key. The
+        // scrubber classifies it by filename alone and never reads the body.
+        let tombstone = RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket: tombstoned_hour,
+            retired_at_ns: 500_004 * NS_PER_HOUR,
+            retention_window_ns: NS_PER_HOUR as u64,
+            record_count_observed: 3,
+        };
+        let tombstone_key =
+            keys::retention_tombstone_key_for(&tombstone).expect("retention tombstone key");
+        store
+            .put(
+                &tombstone_key,
+                record::encode_tombstone(&tombstone),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put retention tombstone");
+
+        // The live bucket: a compaction record in the next ingest hour whose
+        // single part is a real RSEG segment, so the content tier can rehash
+        // it, with one input of its own so the record has the shape the
+        // compactor writes.
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "cpu".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant_id, "cpu", &labels).expect("series id");
+        let series = vec![SeriesInput {
+            series_id,
+            labels,
+            samples: vec![Sample {
+                ts_ns: live_created_unix_ns,
+                value: 1.0,
+            }],
+        }];
+        let live_writer_id = Uuid::from_u128(5_000).to_string();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: live_writer_id.clone(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: live_created_unix_ns - 1_000,
+            max_ingest_ts_ns: live_created_unix_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let live_part_bytes = written.bytes;
+        let live_part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: written.summary.blake3.to_vec(),
+            object_size: live_part_bytes.len() as u64,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            run_count: 1,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            declared_column_stats: Vec::new(),
+        };
+        let live_inputs = vec![CompactionInputIdentity {
+            writer_id: live_writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let live = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket: live_hour,
+            level: 1,
+            input_set_hash: erasure::compute_compaction_input_set_hash(&live_inputs).to_vec(),
+            inputs: live_inputs,
+            parts: vec![live_part.clone()],
+            created_unix_ns: live_created_unix_ns,
+        };
+        let live_record_key = keys::compaction_record_key_for(&live).expect("live record key");
+        let live_part_key =
+            keys::reconstruct_l1_part_key(&live, &live_part).expect("live l1 part key");
+        assert_ne!(
+            live_part_key, tombstoned_part_key,
+            "the two records' parts must be distinct objects"
+        );
+        store
+            .put(&live_part_key, live_part_bytes, PutOptions::default())
+            .await
+            .expect("put live l1 part object");
+        store
+            .put(
+                &live_record_key,
+                ravel_commit::record::encode_compaction(&live),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put live compaction record");
+
+        let worker = solo_worker();
+
+        // Pre-corruption: both buckets' parts are byte-correct, so a full
+        // tick is clean at every level whatever the filter admits.
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
+            0
+        );
+
+        corrupt_first_byte(&store, &tombstoned_part_key).await;
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0,
+            "the tombstoned bucket's compaction part must be left out of the corpus"
+        );
+
+        corrupt_first_byte(&store, &live_part_key).await;
+
+        let metrics = ScrubMetrics::default();
+        run_cycle(
+            &store,
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            1,
+            "with both buckets' parts corrupt in one tick, exactly one is counted: the live \
+             bucket's part is still scrubbed and the tombstoned bucket's is not"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0,
+            "the two L0 segments are untouched"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::Rewrite),
+            0,
+            "neither bucket holds a rewrite record"
         );
     }
 
