@@ -534,21 +534,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an exponential/custom mix. `resets` is the only caller whose answer changes:
   the three reducers above drop a differing-bounds window before any reset
   detection runs.
-- **`--gc-max-flush-lifetime` now refuses a value below the ingest pipeline's
-  own compiled-in flush lifetime, instead of accepting one** (issue #1744).
-  The flag had no lower floor: a value below ravel-ingest's fixed (and
-  currently unconfigurable) `max_flush_lifetime` let the compactor call a
-  bucket sealed before a real writer's flush interlock had actually elapsed,
-  which could void the erasure completion gate
-  (`bucket_erasure_completion` reporting a pending erasure request complete
-  while a flush that can still publish into that bucket was still in
-  flight) and undercut the retention floor derived from the same value. Both
-  the `--gc-max-flush-lifetime` startup check and the durable `sys/gc`
-  mutation path (`gc-config set`) now enforce the same floor, read fresh from
+- **`--gc-max-flush-lifetime`, and its compiled-in default when the flag is
+  absent, now refuse a resolved value below the ingest pipeline's own
+  compiled-in flush lifetime, instead of accepting one** (issue #1744). The
+  flag had no lower floor, and neither did the default it falls back to when
+  unset: a resolved value below ravel-ingest's fixed (and currently
+  unconfigurable) `max_flush_lifetime` let the compactor call a bucket sealed
+  before a real writer's flush interlock had actually elapsed, which could
+  void the erasure completion gate (`bucket_erasure_completion` reporting a
+  pending erasure request complete while a flush that can still publish into
+  that bucket was still in flight) and undercut the retention floor derived
+  from the same value. `--gc-max-flush-lifetime`'s startup check
+  (`Cli::validate` and `resolve_gc_runtime`, the latter being the single
+  point the real compactor is built from) now floor-checks the resolved
+  value whether it came from the flag or the default, read fresh from
   `ravel_ingest::IngestConfig::default().max_flush_lifetime` rather than a
-  duplicated constant. A `ravel-server` invocation, or a `gc-config set`
-  proposal, that used to start with a below-floor value now refuses at
-  startup or at write time instead.
+  duplicated constant, so a `ravel-server` invocation with no flag at all is
+  held to the same floor as one that names a value explicitly. A new test
+  pins `DEFAULT_MAX_FLUSH_LIFETIME_NS` equal to that same ingest default, so
+  the two compiled-in constants cannot drift apart silently.
+  The durable `sys/gc` mutation path (`gc-config set`) and bootstrap path
+  (a fresh bucket's first touch) also enforce the same floor read from the
+  same function, so `sys/gc` -- the durable, operator-facing record of the
+  deployment's intended GC values -- can never hold a value the process
+  itself would refuse to run with. `sys/gc`'s own `max_flush_lifetime_ns`
+  field is not currently read into any compactor config (that floor is
+  defence in depth on the record, not a mechanism that itself prevents an
+  early seal); the compactor's actual value comes only from
+  `--gc-max-flush-lifetime`/its default, floor-checked as described above.
 
 ## [0.15.0] - 2026-09-08
 

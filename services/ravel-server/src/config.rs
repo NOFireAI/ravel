@@ -1590,10 +1590,12 @@ pub struct Cli {
     /// complete while a flush that can still publish into the bucket is in
     /// flight) and undercutting the retention floor
     /// (`CompactorConfig::retention_floor_ns`) it also derives.
-    /// `Cli::validate` refuses to start with this flag set below the ingest
-    /// pipeline's own compiled-in `max_flush_lifetime`
+    /// `Cli::validate` refuses to start with a resolved value below the
+    /// ingest pipeline's own compiled-in `max_flush_lifetime`
     /// (`ravel_ingest::IngestConfig`; there is no flag to change it) for
-    /// exactly this reason -- unlike the `ravel-cli` maintenance commands'
+    /// exactly this reason, whether that resolved value came from this flag
+    /// or from its own default above -- unlike the `ravel-cli` maintenance
+    /// commands'
     /// own `--max-flush-lifetime`, which run once against a single named
     /// tenant an operator has confirmed quiescent, this flag governs a live
     /// process's compactor for every tenant it serves, so there is no
@@ -4936,10 +4938,11 @@ impl Cli {
             );
         }
 
-        // Issue #1744: `--gc-max-flush-lifetime` feeds
-        // `CompactorConfig::max_flush_lifetime_ns`, which is the writer-
-        // interlock term in `seal_margin_ns`, `orphan_age_gate_ns`, and
-        // `retention_floor_ns`. The ingest pipeline's own `max_flush_lifetime`
+        // Issue #1744: `--gc-max-flush-lifetime`, or its compiled-in default
+        // when the flag is absent, feeds `CompactorConfig::max_flush_lifetime_ns`,
+        // which is the writer-interlock term in `seal_margin_ns`,
+        // `orphan_age_gate_ns`, and `retention_floor_ns`. The ingest pipeline's
+        // own `max_flush_lifetime`
         // (ravel-ingest's real, fixed writer interlock; there is no flag to
         // change it) is the true bound a writer is held to. A compactor value
         // below that bound lets `Bucket::is_sealed` decide a bucket is sealed
@@ -4954,9 +4957,15 @@ impl Cli {
         // `GcConfigValues::validate` (the durable `sys/gc` write path, which
         // this flag does not pass through) call, so the floor cannot drift
         // between the two validators.
-        if let Some(s) = self.gc_max_flush_lifetime.as_deref() {
-            let configured_ns = parse_gc_duration_ns("--gc-max-flush-lifetime", s)?;
-            check_gc_max_flush_lifetime_floor(s, configured_ns)?;
+        {
+            let configured_ns = match self.gc_max_flush_lifetime.as_deref() {
+                Some(s) => parse_gc_duration_ns("--gc-max-flush-lifetime", s)?,
+                None => ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            };
+            check_gc_max_flush_lifetime_floor(
+                self.gc_max_flush_lifetime.as_deref(),
+                configured_ns,
+            )?;
         }
 
         // The dev header resolver trusts an unauthenticated `x-ravel-tenant`
@@ -5481,13 +5490,13 @@ impl Cli {
             None => DEFAULT_GRACE_NS,
         };
         let max_flush_lifetime_ns = match self.gc_max_flush_lifetime.as_deref() {
-            Some(s) => {
-                let ns = parse_gc_duration_ns("--gc-max-flush-lifetime", s)?;
-                check_gc_max_flush_lifetime_floor(s, ns)?;
-                ns
-            }
+            Some(s) => parse_gc_duration_ns("--gc-max-flush-lifetime", s)?,
             None => DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
+        check_gc_max_flush_lifetime_floor(
+            self.gc_max_flush_lifetime.as_deref(),
+            max_flush_lifetime_ns,
+        )?;
         Ok(GcRuntimeConfig {
             protection_horizon_ns,
             grace_ns,
@@ -5588,19 +5597,31 @@ fn parse_gc_duration_ns(flag: &str, s: &str) -> anyhow::Result<i64> {
     Ok(ns)
 }
 
-/// Refuse a `--gc-max-flush-lifetime` value (already parsed to nanoseconds)
-/// below `ravel_maintain::ingest_max_flush_lifetime_floor_ns` (issue #1744).
-/// Called from both `Cli::validate` and `resolve_gc_runtime`, the latter
-/// being the single point `main` builds the real `CompactorConfig` from: a
-/// caller that resolved the runtime config without validating first (a test,
-/// a future embedder of `Cli`) would otherwise be able to construct one below
-/// the floor. `s` is the raw flag text, kept only so the error can quote what
-/// was typed.
-fn check_gc_max_flush_lifetime_floor(s: &str, configured_ns: i64) -> anyhow::Result<()> {
+/// Refuse a resolved `max_flush_lifetime_ns` (already parsed to nanoseconds,
+/// whether it came from `--gc-max-flush-lifetime` or from the compiled-in
+/// default) below `ravel_maintain::ingest_max_flush_lifetime_floor_ns` (issue
+/// #1744). Called from both `Cli::validate` and `resolve_gc_runtime`, the
+/// latter being the single point `main` builds the real `CompactorConfig`
+/// from: a caller that resolved the runtime config without validating first
+/// (a test, a future embedder of `Cli`) would otherwise be able to construct
+/// one below the floor. Checked against the RESOLVED value regardless of
+/// origin, so an operator who passes no flag at all is held to the same
+/// floor as one who types a value explicitly: the compactor is built from
+/// this resolved value either way, and a `None => DEFAULT_MAX_FLUSH_LIFETIME_NS`
+/// with no floor check would let the default silently drift below the floor
+/// the moment `DEFAULT_MAX_FLUSH_LIFETIME_NS` and the ingest pipeline's own
+/// default diverge, with the flag path still refusing. `s` is the raw flag
+/// text when one was given, kept only so the error can quote what was typed;
+/// `None` means the value came from the compiled-in default.
+fn check_gc_max_flush_lifetime_floor(s: Option<&str>, configured_ns: i64) -> anyhow::Result<()> {
     let floor_ns = ravel_maintain::ingest_max_flush_lifetime_floor_ns();
     if configured_ns < floor_ns {
+        let described = match s {
+            Some(s) => format!("--gc-max-flush-lifetime {s}"),
+            None => "the compiled-in --gc-max-flush-lifetime default".to_string(),
+        };
         anyhow::bail!(
-            "--gc-max-flush-lifetime {s} ({configured_ns} ns) is below the ingest \
+            "{described} ({configured_ns} ns) is below the ingest \
              pipeline's own max_flush_lifetime floor of {floor_ns} ns (ravel-ingest's \
              fixed writer interlock; there is no flag to change it): a compactor running \
              below this floor can decide a bucket is sealed while a real writer is still \
@@ -9319,6 +9340,31 @@ mod tests {
             .expect("flag parses at the CLI layer");
         cli.validate()
             .expect("the ingest floor itself must be accepted, not refused");
+    }
+
+    /// Issue #1744 fix-round regression: the floor check must run on the
+    /// `None` arm too, not only when `--gc-max-flush-lifetime` is given. A
+    /// no-flag `ravel-server` resolves `max_flush_lifetime_ns` to
+    /// `ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS`
+    /// (`resolve_gc_runtime`'s `None` arm), which
+    /// `default_max_flush_lifetime_matches_the_ingest_floor` (in
+    /// `ravel_maintain::gc_config`) pins equal to the ingest floor: today
+    /// that means both `Cli::validate` and `resolve_gc_runtime` accept a
+    /// no-flag startup. Both call sites must resolve and floor-check the
+    /// SAME default, so this exercises both rather than assuming the
+    /// constant.
+    #[test]
+    fn gc_max_flush_lifetime_default_is_accepted_with_no_flag() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("no flags parse");
+        cli.validate()
+            .expect("the compiled-in default must be accepted, not refused, with no flag given");
+        let runtime = cli
+            .resolve_gc_runtime(resolved_from(&cli).query_deadline)
+            .expect("resolve_gc_runtime must accept the compiled-in default");
+        assert_eq!(
+            runtime.max_flush_lifetime_ns,
+            ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS
+        );
     }
 
     /// ADR-0076 decision 4: the three flush-cadence knobs move as a set.
