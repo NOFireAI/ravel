@@ -147,6 +147,22 @@ disagreement with the fleet's shared notion of "now", so it cannot clamp or
 reject on skew it cannot observe. On an increase no slack is needed: the old,
 smaller range is a subset of the new one.
 
+The queued-flush cap adds a term `S` does not include. A shard at
+`max_queued_flushes` refuses its size and age triggers and leaves the rows
+buffered, while the ingest-hour bucket is pinned from a clock reading taken
+after that refusal, so a deferred flush's records land in a later ingest hour
+than their routing by the length of the deferral as well. One deferral round
+waits for a queued flush to leave the shard's `JoinSet`, which under a stalled
+store takes up to `max_flush_lifetime`, and `flush_aged` retries due tenants in
+`HashMap` order with no fairness, so nothing bounds the number of rounds. At
+today's defaults one round alone puts the worst case at `40s + 3600s + 3600s =
+7240s`, past the 7200s `FLUSH_BOUND_SLACK_HOURS` allows;
+`ravel_ingest::shard::tests::the_flush_bound_slack_covers_a_deferred_flush`
+computes both figures from the ingest terms. The constant is a frozen read-side
+contract and is left alone until the deferral policy is decided, so a
+straggler deferred at the cap during a shard-count decrease can land in an
+ingest hour the retiring generation's scan set no longer covers.
+
 Operationally: do **not** decrease `shard_count` and immediately assume every
 prior write is now under the new, narrower range. For `S` hours past the
 activation, queries still fan out over the wider retiring range for the affected
