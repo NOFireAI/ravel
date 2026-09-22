@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
+use ravel_logseg::{AttrValue, LogRecord, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_logseg::{AttrValue, LogRecord, stream_attrs_bytes};
 use ravel_promql::SeriesData;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::{
@@ -44,8 +44,8 @@ use crate::distrib::federation::{Federation, RemoteCluster};
 use crate::distrib::partition::DistribThresholds;
 use crate::distrib::proto::series_fetch_server::SeriesFetch;
 use crate::distrib::{
-    log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver,
-    span_cmp, span_order_key,
+    log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver, span_cmp,
+    span_order_key,
 };
 use crate::engine::merge_soa_runs;
 use crate::erasure::ErasurePredicate;
