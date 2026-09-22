@@ -66,14 +66,14 @@ const GUIDE_FILE: &str = concat!(
 /// no longer resolves) would otherwise leave every assertion below passing
 /// vacuously over an empty set. Adding a rule that names a new metric fails
 /// here until this number is updated.
-const EXPECTED_METRIC_NAMES: usize = 37;
+const EXPECTED_METRIC_NAMES: usize = 38;
 
 /// Groups and alert rules in the shipped file, counted off the parsed
 /// structure. Pinned for the same reason as the name count: a file that lost
 /// a group, or a group that lost a rule, must fail rather than shrink the
 /// scan. `deploy/README.md` states both figures.
 const EXPECTED_GROUPS: usize = 8;
-const EXPECTED_ALERTS: usize = 31;
+const EXPECTED_ALERTS: usize = 32;
 
 /// Rules transcribed from a troubleshooting-table row that states no
 /// duration, so they carry no `for:` and say so in an `as_documented`
@@ -84,8 +84,8 @@ const EXPECTED_ALERTS_WITHOUT_FOR: usize = 15;
 /// them. Pinned so that an extractor that matches no block, or a block that
 /// stops holding rules, fails here rather than leaving the per-alert
 /// comparison below iterating an empty set.
-const EXPECTED_GUIDE_BLOCKS: usize = 5;
-const EXPECTED_GUIDE_ALERTS: usize = 13;
+const EXPECTED_GUIDE_BLOCKS: usize = 6;
+const EXPECTED_GUIDE_ALERTS: usize = 14;
 
 /// One tenant, one trivially valid PromQL rule. Enough for `alerting::spawn`
 /// to build an evaluator, which is what puts the whole `ravel_alert_*` family

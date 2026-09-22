@@ -363,3 +363,44 @@ async fn store_probe_last_run_gauge_goes_stale_while_readyz_stays_green() {
     store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &clock).await;
     assert!(store_probe::store_reachable(), "a single success recovers");
 }
+
+/// Issue #1728: the nanoseconds-to-seconds conversion in
+/// `render_store_probe_family` is what the gauge's name and every alert
+/// threshold in docs/guides/observability.md rest on, and nothing pinned its
+/// exact rendered value. `metrics_endpoint.rs`'s gauge test only asserts the
+/// metric name is present on the scrape, never the value, and
+/// `store_probe_last_run_gauge_goes_stale_while_readyz_stays_green` above only
+/// asserts the raw nanosecond atomic, which never goes through that
+/// conversion. This drives one cycle with a pinned `TestClock`, scrapes a
+/// real `/metrics` response, and asserts the exact rendered seconds string.
+#[tokio::test]
+async fn metrics_store_probe_last_run_gauge_renders_exact_seconds_for_pinned_clock() {
+    let _guard = PROBE_TEST_LOCK.lock().await;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone()).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let mut hysteresis = ProbeHysteresis::new();
+    let clock = TestClock::at(1_700_000_000_500_000_000);
+    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &clock).await;
+
+    let body = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+
+    assert!(
+        body.contains("ravel_store_probe_last_run_timestamp_seconds{mode=\"all\"} 1700000000.5\n"),
+        "gauge must render the injected clock's exact seconds value (1700000000.5) for the \
+         pinned ns value 1_700_000_000_500_000_000; a wrong divisor would render a value off by \
+         a factor of 1000 instead:\n{body}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
