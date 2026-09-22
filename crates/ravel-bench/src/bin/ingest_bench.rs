@@ -74,10 +74,7 @@ fn print_human_table(report: &Report) {
     }
     println!("]");
     println!("  put_retries       : {}", report.put_retries);
-    println!(
-        "  abandoned         : retry_exhausted={} input_rejected={}",
-        report.abandoned_retry_exhausted, report.abandoned_input_rejected
-    );
+    println!("{}", format_abandoned_line(report));
     println!(
         "  acks ok/err       : {}/{}",
         report.acks_ok, report.acks_err
@@ -106,6 +103,55 @@ fn print_human_table(report: &Report) {
             b.seam_stages.route.total_ns,
             b.seam_stages.merge.total_ns,
             b.seam_stages.encode.total_ns
+        );
+    }
+}
+
+fn format_abandoned_line(report: &Report) -> String {
+    format!(
+        "  abandoned         : retry_exhausted={} queue_deadline={} input_rejected={}",
+        report.abandoned_retry_exhausted,
+        report.abandoned_queue_deadline,
+        report.abandoned_input_rejected
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_bench::ingest::{FlushDelayPolicy, IngestBenchConfig};
+    use ravel_object_store::ObjectStoreBackend;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// `max_flush_lifetime: Duration::ZERO` deterministically abandons the
+    /// sole flush in the queue (same guard `ravel_bench::ingest`'s and
+    /// `ravel_bench::e2e`'s own tests of this name use), so the rendered
+    /// abandoned-reasons line must show it under `queue_deadline`, not folded
+    /// into `retry_exhausted` and not missing entirely.
+    #[tokio::test]
+    async fn abandoned_queue_deadline_appears_in_rendered_report() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let config = IngestBenchConfig {
+            store,
+            store_label: "memory".to_string(),
+            shards: 1,
+            target_series: 1,
+            points_per_sec: 1,
+            duration_secs: 1,
+            batch_size: 1,
+            ack_timeout_secs: 5,
+            max_inflight_flushes: 1,
+            flush_delay_policy: FlushDelayPolicy::Fixed,
+            max_flush_lifetime: Duration::ZERO,
+        };
+
+        let report = run(&config).await;
+
+        assert_eq!(
+            format_abandoned_line(&report),
+            "  abandoned         : retry_exhausted=0 queue_deadline=1 input_rejected=0"
         );
     }
 }

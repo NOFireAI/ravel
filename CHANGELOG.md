@@ -33,6 +33,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint serves the loaded configuration and reads no evaluation outcome;
   `/api/v1/alerts` is not served.
 
+- **`ravel-bench`'s ingest and end-to-end reports break out queue-deadline
+  abandonment as its own `abandoned_queue_deadline` counter instead of
+  leaving it unreported** (issue #1823). `ingest_bench` and `s3_e2e_bench`
+  already reported `abandoned_retry_exhausted` and `abandoned_input_rejected`
+  on the `abandoned` line of their human-readable and JSON report output, but
+  a flush `ravel-ingest`'s pre-acquire queue-deadline guard abandons before
+  any store call had no field in either `Report` type and was silently
+  absent from bench output. Both `Report` types
+  (`ravel_bench::ingest::Report`, `ravel_bench::e2e::Report`) now carry the
+  field, both `run()` implementations copy it from the router's
+  `IngestMetricsSnapshot`, and both bins render it on the `abandoned` line,
+  pinned by `ingest_bench::tests::abandoned_queue_deadline_appears_in_rendered_report`
+  and `s3_e2e_bench::tests::abandoned_queue_deadline_appears_in_rendered_report`.
+  `ravel_bench::ingest::tests::queue_deadline_abandonment_is_reported_under_its_own_reason`
+  and the equivalent test in `ravel_bench::e2e` assert the exact counter
+  split (`abandoned_queue_deadline == 1`, `abandoned_retry_exhausted == 0`,
+  `abandoned_input_rejected == 0`) for a flush whose deadline has already
+  elapsed while queued for a permit.
+
 ### Changed
 
 
