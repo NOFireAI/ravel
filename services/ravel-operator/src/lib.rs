@@ -15,6 +15,8 @@
 
 pub mod controller;
 pub mod crd;
+pub mod health;
+pub mod metrics;
 pub mod reconcile;
 
 pub use crd::{RavelCluster, RavelClusterSpec, RavelClusterStatus, ravel_cluster_crd};
