@@ -54,7 +54,9 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0001/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.dreq"
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.dreq",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*"
       ]
     },
     {
@@ -72,7 +74,7 @@
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
-        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*"
       ]
     }

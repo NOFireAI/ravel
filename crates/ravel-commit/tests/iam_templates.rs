@@ -1637,17 +1637,40 @@ fn assert_role_routed_writes_have_kms_grant(policy: &Policy) {
 const TENANT_KMS_KEY_ARN: &str =
     "arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID";
 
-/// The `DenyDeleteProtected` resource set, identical in all four templates:
+/// The `DenyDeleteProtected` resource set shared by gateway, query, and admin:
 /// the three singleton control objects, the per-tenant provenance record, the
 /// whole catalog keyspace, and the legal-hold audit shard (ADR-0055 section 3).
-/// Shared by every row below, so a template that drifts out of step with the
-/// others fails on this axis rather than passing with its own variant.
+/// Maintain's own `DenyDeleteProtected` differs (see
+/// `MAINTAIN_PROTECTED_DELETE_KEYS`): its catalog entry is narrowed to the
+/// HEAD pointer alone, because `MaintainDelete` grants it delete on the
+/// `snap/`/`idx/` objects the catalog sweep removes (issue #1847), and a Deny
+/// naming the whole family would make every sweep pass fail on its first
+/// delete. This constant is shared by gateway/query/admin's rows below, so
+/// one of those three drifting out of step with the others fails on this
+/// axis rather than passing with its own variant.
 const PROTECTED_DELETE_KEYS: &[&str] = &[
     "sys/tenancy",
     "sys/qualification",
     "sys/gc",
     "t/*/*/prov",
     "t/*/catalog/*/*",
+    "t/*/u/*/0000/*",
+];
+
+/// Maintain's `DenyDeleteProtected` resource set: same as `PROTECTED_DELETE_KEYS`
+/// except the catalog entry is `t/*/catalog/*/HEAD` rather than the whole
+/// `t/*/catalog/*/*` family, since Maintain alone is granted delete on the
+/// `snap/`/`idx/` objects under that family (`MaintainDelete`, issue #1847).
+/// The catalog sweep (`crates/ravel-maintain/src/sweep.rs`,
+/// `sweep_unreferenced_catalog_objects`) never deletes HEAD itself, only
+/// snapshot and index objects once they are unreferenced, so HEAD stays
+/// denied while the rest of the family becomes deletable.
+const MAINTAIN_PROTECTED_DELETE_KEYS: &[&str] = &[
+    "sys/tenancy",
+    "sys/qualification",
+    "sys/gc",
+    "t/*/*/prov",
+    "t/*/catalog/*/HEAD",
     "t/*/u/*/0000/*",
 ];
 
@@ -1781,8 +1804,12 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     },
     // Maintain: the only role that deletes. Compaction and rewrite outputs,
     // maintenance cursors, and the GC/tenancy control objects; its deletes
-    // cover the inputs compaction supersedes, the non-hold audit shard, and
-    // the erasure request objects the .dreq sweep retires (ADR-0064 section 6).
+    // cover the inputs compaction supersedes, the non-hold audit shard, the
+    // erasure request objects the .dreq sweep retires (ADR-0064 section 6),
+    // and the unreferenced catalog snapshot/index objects
+    // sweep_unreferenced_catalog_objects removes (issue #1847) -- the Deny
+    // below protects only the catalog HEAD pointer, not the whole family, so
+    // that sweep is not the one that deletes it.
     // The del/ list prefix and the del/* read are that sweep's other two
     // object-store calls, asserted against their call sites by
     // maintain_template_covers_every_erasure_request_sweep_call. The read is
@@ -1833,6 +1860,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/idem/*",
             "t/*/u/*/0001/*",
             "t/*/*/del/*.dreq",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/idx/*",
         ],
         // Both delete operations, and the same two the Deny names. Maintain is
         // the only role where that identity is load-bearing rather than
@@ -1840,7 +1869,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
         // shard is protected only as far as this list is covered by
         // PROTECTED_DELETE_ACTIONS.
         delete_actions: &["s3:DeleteObject", "s3:DeleteObjectVersion"],
-        protected_deletes: PROTECTED_DELETE_KEYS,
+        protected_deletes: MAINTAIN_PROTECTED_DELETE_KEYS,
         protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
         kms_resources: &[("MaintainTenantKms", &[TENANT_KMS_KEY_ARN])],
@@ -2323,10 +2352,14 @@ fn all_signals_is_exhaustive_and_witnessed() {
 /// "hold for a different reason than" the legal-hold shard: they are disjoint
 /// from every delete grant, so their `Deny` is belt-and-suspenders, while the
 /// legal-hold shard `t/*/u/*/0000/*` IS reached by maintain's level-based delete
-/// grants and holds only because the explicit `Deny` overrides them. This backs
-/// that ADR sentence now that the domain carries catalog and prov witnesses
-/// (`constructor_free_tenant_witness_keys`): no delete `Allow` pattern in any
-/// template matches a witness key of those three keyspaces.
+/// grants and holds only because the explicit `Deny` overrides them. As of
+/// issue #1847 that is no longer true of the whole `catalog/` family: Maintain's
+/// `MaintainDelete` now reaches the `snap/` and `idx/` objects under it too (the
+/// catalog sweep, `sweep_unreferenced_catalog_objects`, removes them once
+/// unreferenced), so only the HEAD pointer within `catalog/` still holds by
+/// disjointness -- the rest of the family joins the legal-hold shard's category.
+/// This test now backs the narrower claim: no delete `Allow` pattern in any
+/// template matches a witness key of `sys/`, `prov`, or `catalog/<sig>/HEAD`.
 ///
 /// Scoped to DELETE on purpose. The ADR sentence is about delete capability;
 /// get and put legitimately reach catalog and prov (fold reads and writes catalog
@@ -2336,50 +2369,72 @@ fn all_signals_is_exhaustive_and_witnessed() {
 /// than the three protected ones, so the disjoint set is defined from the
 /// protected patterns, not from the `sys/` prefix.
 ///
-/// If this fails, a delete grant reaches one of the three disjoint keyspaces:
-/// that is a template finding to report, not an assertion to weaken.
+/// If this fails, a delete grant reaches one of the disjoint keyspaces: that is
+/// a template finding to report, not an assertion to weaken.
 #[test]
 fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
     // The protected keyspaces that hold by pattern disjointness: every
-    // PROTECTED_DELETE_KEYS entry EXCEPT the legal-hold shard, which instead
-    // holds by the Deny overriding the level-based grants that do reach it.
+    // PROTECTED_DELETE_KEYS entry EXCEPT the legal-hold shard (held by the
+    // Deny overriding level-based grants that reach it) and EXCEPT the
+    // catalog family, narrowed here to the HEAD pointer alone. Maintain's own
+    // delete Allow now reaches the snap/ and idx/ objects under that family
+    // (`MaintainDelete`, issue #1847), so the family joins the legal-hold
+    // shard's category -- held only where the Deny overrides an Allow, not by
+    // disjointness -- except HEAD itself, which no Allow in any template
+    // reaches, so it stays in the disjoint set under its narrower pattern.
     const DISJOINT_PROTECTED: &[&str] = &[
         "sys/tenancy",
         "sys/qualification",
         "sys/gc",
         "t/*/*/prov",
-        "t/*/catalog/*/*",
+        "t/*/catalog/*/HEAD",
     ];
     // Pin DISJOINT_PROTECTED to its own definition so it cannot drift from the
     // protected list it is carved out of. It must be exactly
-    // PROTECTED_DELETE_KEYS minus the one entry that does NOT hold by
-    // disjointness: the legal-hold shard, reached by maintain's level-based
-    // delete grants and held only by the Deny. The expected value is derived
-    // from PROTECTED_DELETE_KEYS, so a keyspace added there forces a matching
-    // entry here (or this fails loudly and names it), emptying this list fails,
-    // and dropping an entry fails. Nothing else asserts this relationship, so a
-    // new protected keyspace could otherwise be added with every other assertion
-    // green and its disjointness from delete grants never checked.
+    // PROTECTED_DELETE_KEYS minus the legal-hold shard, with the catalog
+    // family pattern narrowed to HEAD alone (the same narrowing
+    // MAINTAIN_PROTECTED_DELETE_KEYS carries on the Deny side; this derives
+    // it from the shared PROTECTED_DELETE_KEYS instead so either constant
+    // drifting, or a new protected keyspace being added, is caught here too).
+    // Nothing else asserts this relationship, so a new protected keyspace
+    // could otherwise be added with every other assertion green and its
+    // disjointness from delete grants never checked.
     const LEGAL_HOLD_SHARD: &str = "t/*/u/*/0000/*";
+    const CATALOG_FAMILY: &str = "t/*/catalog/*/*";
+    const CATALOG_HEAD_ONLY: &str = "t/*/catalog/*/HEAD";
     assert!(
         PROTECTED_DELETE_KEYS.contains(&LEGAL_HOLD_SHARD),
         "legal-hold shard {LEGAL_HOLD_SHARD:?} is not in PROTECTED_DELETE_KEYS; \
          the disjoint set is defined as PROTECTED_DELETE_KEYS minus that shard \
          and must track a rename (#1346)"
     );
+    assert!(
+        PROTECTED_DELETE_KEYS.contains(&CATALOG_FAMILY),
+        "catalog family {CATALOG_FAMILY:?} is not in PROTECTED_DELETE_KEYS; the \
+         disjoint set narrows it to {CATALOG_HEAD_ONLY:?} and must track a \
+         rename (#1847)"
+    );
     let expected_disjoint: Vec<&str> = PROTECTED_DELETE_KEYS
         .iter()
         .copied()
         .filter(|p| *p != LEGAL_HOLD_SHARD)
+        .map(|p| {
+            if p == CATALOG_FAMILY {
+                CATALOG_HEAD_ONLY
+            } else {
+                p
+            }
+        })
         .collect();
     assert_eq!(
         DISJOINT_PROTECTED,
         expected_disjoint.as_slice(),
         "DISJOINT_PROTECTED must equal PROTECTED_DELETE_KEYS minus the legal-hold \
-         shard {LEGAL_HOLD_SHARD:?}. If a protected keyspace was added to \
+         shard {LEGAL_HOLD_SHARD:?}, with the catalog family narrowed to \
+         {CATALOG_HEAD_ONLY:?}. If a protected keyspace was added to \
          PROTECTED_DELETE_KEYS, add it here so its disjointness from delete \
-         grants is checked; if one must be excluded for a reason other than the \
-         legal-hold shard, exclude it explicitly and justify it (#1346)"
+         grants is checked; if one must be excluded or narrowed for a reason \
+         other than the two above, do so explicitly and justify it (#1346, #1847)"
     );
     let disjoint_witnesses: Vec<&String> = key_domain()
         .iter()
@@ -2418,6 +2473,105 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
             }
         }
     }
+}
+
+/// Issue #1847 pinning test. `DenyDeleteProtected` in `maintain.json`
+/// protects only the catalog HEAD pointer, and `MaintainDelete` grants
+/// delete on the `snap/` and `idx/` objects
+/// `sweep_unreferenced_catalog_objects` (`crates/ravel-maintain/src/sweep.rs`)
+/// actually removes. Before this issue `DenyDeleteProtected` named the whole
+/// `t/*/catalog/*/*` family, so the sweep's own delete was refused on its
+/// first attempt every pass and catalog garbage was never reclaimed.
+///
+/// Both directions are asserted for both object families, so a regression to
+/// either prior defect shape fails here: dropping the catalog entry from
+/// `DenyDeleteProtected` entirely leaves HEAD deletable (caught by the
+/// `head_key` Allow assertion below), and re-widening the Deny back to the
+/// whole family, or to any pattern that still reaches HEAD, makes the
+/// `head_key` Deny assertion pass but the `snap_key`/`idx_key` Deny
+/// assertions fail (a Deny reaching a key the sweep must delete is exactly
+/// the original bug). A narrowing that widens `MaintainDelete` no further
+/// than `snap/`/`idx/` is checked by the closing tightness assertion, against
+/// a key directly under `catalog/<signal>/` that is neither HEAD nor under
+/// `snap/` or `idx/`.
+///
+/// The key shapes are mirrored from the crate's own constructors rather than
+/// imported, following the precedent `constructor_free_tenant_witness_keys`
+/// above establishes: `ravel-commit` cannot depend on `ravel-catalog` or
+/// `ravel-maintain` without circularity, and the builders are not exported
+/// (`pub(crate)`/private). The shapes come from
+/// `crates/ravel-catalog/src/fold.rs`'s `head_object_key` (duplicated as
+/// `catalog_head_key` in `crates/ravel-maintain/src/reachability.rs`) and
+/// `crates/ravel-maintain/src/sweep.rs`'s `catalog_snap_prefix` /
+/// `catalog_idx_prefix`, all of which build
+/// `t/<tenant_hash_hex>/catalog/<signal>/...`.
+#[test]
+fn maintain_deletes_catalog_snap_and_idx_but_not_head() {
+    let hash = hash16();
+    let policy = load_policy("maintain");
+    let allow = delete_key_patterns(&policy, "Allow");
+    let deny = delete_key_patterns(&policy, "Deny");
+
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        let head_key = format!("t/{hash}/catalog/{prefix}/HEAD");
+        let snap_key = format!("t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap");
+        let idx_key = format!("t/{hash}/catalog/{prefix}/idx/name-postings");
+
+        assert!(
+            deny.iter().any(|p| glob_matches(p, &head_key)),
+            "{signal:?}: maintain's DenyDeleteProtected must still deny \
+             {head_key:?} -- the catalog HEAD pointer, the object the sweep \
+             never deletes"
+        );
+        assert!(
+            !allow.iter().any(|p| glob_matches(p, &head_key)),
+            "{signal:?}: maintain's MaintainDelete must not grant delete on \
+             {head_key:?} -- the sweep never deletes HEAD, so no Allow \
+             pattern should reach it"
+        );
+
+        assert!(
+            allow.iter().any(|p| glob_matches(p, &snap_key)),
+            "{signal:?}: maintain's MaintainDelete must grant delete on \
+             {snap_key:?} -- sweep_unreferenced_catalog_objects deletes \
+             unreferenced snap/ objects and needs this to succeed"
+        );
+        assert!(
+            !deny.iter().any(|p| glob_matches(p, &snap_key)),
+            "{signal:?}: maintain's DenyDeleteProtected must not deny \
+             {snap_key:?} -- a Deny reaching it would refuse the sweep's own \
+             delete, issue #1847's exact defect"
+        );
+
+        assert!(
+            allow.iter().any(|p| glob_matches(p, &idx_key)),
+            "{signal:?}: maintain's MaintainDelete must grant delete on \
+             {idx_key:?} -- sweep_unreferenced_catalog_objects deletes \
+             unreferenced idx/ objects (including .cstat) and needs this to \
+             succeed"
+        );
+        assert!(
+            !deny.iter().any(|p| glob_matches(p, &idx_key)),
+            "{signal:?}: maintain's DenyDeleteProtected must not deny \
+             {idx_key:?} -- a Deny reaching it would refuse the sweep's own \
+             delete, issue #1847's exact defect"
+        );
+    }
+
+    // Tightness: MaintainDelete's new grant must not reach anything directly
+    // under catalog/<signal>/ other than HEAD (already checked above), snap/,
+    // and idx/. A witness that is none of those three would only be reached
+    // by an over-broad narrowing, e.g. one that (re)used t/*/catalog/*/* for
+    // the Allow side instead of the two scoped patterns.
+    let prefix = Signal::Metrics.key_prefix();
+    let other_catalog_object = format!("t/{hash}/catalog/{prefix}/other-object");
+    assert!(
+        !allow.iter().any(|p| glob_matches(p, &other_catalog_object)),
+        "maintain's delete Allow set reaches {other_catalog_object:?}, a key \
+         directly under catalog/<signal>/ that is neither HEAD, snap/, nor \
+         idx/ -- MaintainDelete's catalog grant is wider than the sweep needs"
+    );
 }
 
 /// ADR-0064 section 6: "Maintain gains delete on `del/*.dreq` **only**", and

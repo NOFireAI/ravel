@@ -535,6 +535,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the three reducers above drop a differing-bounds window before any reset
   detection runs.
 
+- **The shipped IAM templates now let the unreferenced-catalog sweep delete
+  what it finds** (issue #1847). `deploy/iam/maintain.json`'s
+  `DenyDeleteProtected` statement denied `s3:DeleteObject` and
+  `s3:DeleteObjectVersion` on the whole catalog family, `t/*/catalog/*/*`,
+  which also covers the snapshot and index objects
+  (`t/*/catalog/<signal>/snap/*`, `t/*/catalog/<signal>/idx/*`) that the
+  unreferenced-catalog sweep physically removes once they are unreferenced,
+  aged past the protection horizon, and unleased. IAM's explicit Deny
+  overrides any Allow for the actions it names, so on a deployment running
+  the shipped template every sweep pass was refused on its first delete:
+  catalog garbage, including any unreferenced snapshot or index object
+  holding an erased subject's value, was never reclaimed. The deny is now
+  narrowed to the catalog HEAD pointer alone (`t/*/catalog/*/HEAD`), the one
+  catalog object the sweep never deletes, and `MaintainDelete` now grants
+  delete on `snap/` and `idx/` keys to match what the sweep already does. A
+  new pinning test asserts both directions: HEAD stays denied, and a snap
+  key and an idx key built from the same key constructors the sweep uses are
+  deletable. This changes a shipped IAM template: an operator running
+  `maintain.json` from before this change must re-apply it. Until they do,
+  the sweep keeps failing its first delete every pass, exactly as before.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added
