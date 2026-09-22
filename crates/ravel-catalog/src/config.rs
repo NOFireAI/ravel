@@ -414,31 +414,62 @@ pub const DEFAULT_FRONTIER_RECONCILE_MAX_HOURS: u32 = 168;
 /// so any value is correct.
 pub const DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS: u64 = 720;
 /// Default `resolve_get_concurrency`: the number of in-flight object-store
-/// requests (LISTs and record GETs) `Catalog::resolve_impl` and its helpers
-/// keep in flight at once, via a per-`Catalog`-instance semaphore
-/// (`Catalog::request_semaphore`). 128, derived from a measured S3 GET round
-/// trip of about 30ms: 128 requests in flight sustain roughly 128 / 0.030s ~=
-/// 4,300 GET/s, under S3's published guidance of about 5,500 GET/s per
-/// prefix, and every request this bounds lands under one
-/// `m/c/<shard>/<hour>/` prefix per shard-hour. Measured end to end on a
-/// 10,000-record unsealed tail (one cold resolve each, 10,001 GETs and 13
-/// LISTs at every concurrency level -- request count does not move, only the
-/// number of concurrency-bound rounds does): 23.157s at 16 (the prior fixed
-/// constant), 4.374s at 64, 2.341s at 128.
+/// requests (LISTs and record GETs) ONE resolve keeps in flight at once,
+/// enforced by the `.buffered`/`.buffer_unordered` width at every fan-out
+/// site in `Catalog::resolve_impl` and its helpers. 128, derived from a
+/// measured S3 GET round trip of about 30ms: 128 requests in flight sustain
+/// roughly 128 / 0.030s ~= 4,300 GET/s, under S3's published guidance of
+/// about 5,500 GET/s per prefix, and every request one resolve's fan-out
+/// bounds lands under one `m/c/<shard>/<hour>/` prefix per shard-hour.
 ///
-/// This bounds one `Catalog` instance, not the process: `ravel-server`
-/// builds exactly one `Catalog` and shares it (via `Arc` clone, so one
-/// underlying `request_semaphore`) across every request, so N concurrent
-/// queries against that instance are capped at 128 in flight TOTAL, not N *
-/// 128. N * 128 in flight holds only across N distinct `Catalog` instances
-/// (e.g. separate CLI invocations or tests), never within one running
-/// server. A process-wide cap across instances is not implemented here and
-/// is tracked as a follow-up.
+/// The three end-to-end figures below are a MEASUREMENT TAKEN UNDER ISSUE
+/// #1238, not a property of the current tree: real S3, a 10,000-record
+/// unsealed tail, one cold resolve at a time and nothing else running against
+/// the catalog (10,001 GETs and 13 LISTs at every concurrency level --
+/// request count does not move, only the number of concurrency-bound rounds
+/// does): 23.157s at 16 (the fixed constant before #1238), 4.374s at 64,
+/// 2.341s at 128. Because that measurement drove a single resolve, it
+/// measures exactly what this constant now means (per-resolve fan-out) and
+/// says nothing about what a process running several resolves at once
+/// achieves; [`DEFAULT_PROCESS_QUERY_CONCURRENCY`] is the unmeasured
+/// assumption that covers that case.
+///
+/// This is a PER-RESOLVE width. The process-wide ceiling is a separate,
+/// larger number: `Catalog::request_semaphore` is sized by
+/// [`derive_resolve_request_concurrency`] from this value and
+/// [`CatalogConfig::process_query_concurrency`], so N concurrent resolves
+/// against the one `Catalog` that `ravel-server` builds and shares by `Arc`
+/// clone reach N * this in flight, up to that ceiling. Before issue #1733
+/// that semaphore was sized at this value itself, which capped a whole
+/// server process at 128 requests in flight however many queries it was
+/// serving.
 pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
 
-/// Upper bound on `resolve_get_concurrency`, enforced by both
+/// Default `process_query_concurrency`: how many resolves this process is
+/// assumed to run at once when sizing the process-wide in-flight request
+/// ceiling ([`derive_resolve_request_concurrency`]).
+///
+/// It stands in for `ravel-server`'s `--max-concurrent-queries`, which is
+/// unset (`QueryConcurrencyLimit::Unlimited`) by default, so there is no
+/// configured number to read in the common deployment and an assumption is
+/// unavoidable. 8 is that assumption: a query node serving 8 cold resolves
+/// concurrently is an ordinary load, and the resulting ceiling (8 * 128 =
+/// 1,024 in flight, see [`derive_resolve_request_concurrency`] for the
+/// implied request rate) is a quarter of [`MAX_RESOLVE_GET_CONCURRENCY`].
+/// A deployment that does configure a limit can set this field to it, which
+/// makes the ceiling exactly what that limit can demand.
+///
+/// This number is an assumption, not a measurement: nothing in this repository
+/// has measured a multi-resolve process against real S3. It is also not a
+/// limit on anything by itself -- it only sizes the ceiling below, and
+/// exceeding it costs queueing on that ceiling, never an error.
+pub const DEFAULT_PROCESS_QUERY_CONCURRENCY: usize = 8;
+
+/// Upper bound on `resolve_get_concurrency` and on the process-wide ceiling
+/// [`derive_resolve_request_concurrency`] returns. Enforced by both
 /// [`crate::Catalog::new`] (typed [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig))
-/// and `ravel-server`'s `Cli::validate`. At the ~30ms per-round GET latency
+/// and `ravel-server`'s `Cli::validate` for the configured field, and by the
+/// derivation's own clamp for the ceiling. At the ~30ms per-round GET latency
 /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`]'s doc comment measures against, 4,096
 /// in flight sustains roughly 4,096 / 0.030s ~= 136,000 GET/s, about
 /// twenty-five times S3's published per-prefix guidance of ~5,500 GET/s.
@@ -448,6 +479,89 @@ pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
 /// only a value past that would panic in `Semaphore::new`; with a bound, both
 /// the typo and that extreme fail with a typed error at startup.
 pub const MAX_RESOLVE_GET_CONCURRENCY: usize = 4_096;
+
+/// Size the process-wide in-flight request ceiling
+/// (`Catalog::request_semaphore`) from the per-resolve fan-out width and the
+/// number of resolves the process expects to run at once (issue #1733).
+///
+/// The result is `per_resolve * process_query_concurrency`, clamped into
+/// `per_resolve ..= MAX_RESOLVE_GET_CONCURRENCY`: never below one resolve's
+/// own width (a zero or one query concurrency must not throttle the single
+/// resolve the measured width was chosen for), never above the ceiling whose
+/// arithmetic [`MAX_RESOLVE_GET_CONCURRENCY`] states.
+///
+/// # Implied per-process request rate
+///
+/// Derived from the same ~30ms GET round trip as
+/// [`DEFAULT_RESOLVE_GET_CONCURRENCY`], since a permit is held for exactly
+/// one round trip: a ceiling of `C` permits sustains at most `C / 0.030s`
+/// requests per second across the whole process. At the shipped defaults
+/// (`C = 8 * 128 = 1_024`) that is about 34,000 requests/s, up from the
+/// 4,300/s the pre-#1733 sizing allowed a process however many queries it
+/// served. That figure is the ceiling's arithmetic, not a measurement: it
+/// says what the limit permits, not what a store delivers. S3's ~5,500
+/// GET/s per-prefix guidance still applies per prefix, and it is one
+/// resolve's 128 (about 4,300/s) that lands under a single
+/// `m/c/<shard>/<hour>/` prefix; 34,000/s is the sum across the distinct
+/// prefixes of concurrently resolving tenants, shards and hours.
+pub fn derive_resolve_request_concurrency(
+    per_resolve: usize,
+    process_query_concurrency: usize,
+) -> usize {
+    per_resolve
+        .saturating_mul(process_query_concurrency)
+        .clamp(per_resolve, MAX_RESOLVE_GET_CONCURRENCY)
+}
+
+/// Bytes reserved from [`CatalogConfig::resolve_inflight_bytes`] by one
+/// in-flight request whose response size is not known before it is issued:
+/// every LIST page, and every GET of a whole object that carries no declared
+/// size (commit, compaction and provisioning records, the catalog HEAD).
+/// 256 KiB covers a full 1,000-key LIST page with room to spare, and is two
+/// orders of magnitude above the ~900-byte live-heap estimate the record
+/// caches charge per commit record ([`RECORD_CACHE_ENTRY_BYTES`]).
+///
+/// It is an estimate, and the bound it feeds is therefore an estimate too: a
+/// single record larger than this (`declared_column_stats` is a repeated
+/// field with no cap in the format, see
+/// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`]) is under-charged, and an ordinary
+/// small record is over-charged. Requests whose size IS known in advance --
+/// a ranged GET, and the content-addressed snapshot part and postings
+/// fetches, which carry a declared size in the ref -- reserve that exact
+/// number instead, which is where the large responses live.
+pub const RESOLVE_UNSIZED_REQUEST_BYTES: u64 = 256 << 10;
+
+/// Default `resolve_inflight_bytes`: the response bytes a `Catalog`'s resolve
+/// path may have in flight at once, across every concurrent resolve sharing
+/// that instance (issue #1733). 512 MiB.
+///
+/// This is the bound that makes the raised request ceiling
+/// ([`derive_resolve_request_concurrency`]) safe. A permit count alone bounds
+/// how many responses are being buffered, not how large they are, and the
+/// large responses on this path are unbounded by the count: a snapshot part
+/// or a postings block may declare up to
+/// [`snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES`] and
+/// [`snapshot_format::DEFAULT_MAX_POSTINGS_BYTES`] (256 MiB each), so 1,024
+/// of those in flight is 256 GiB of resident response bodies. Under this
+/// budget the same fan-out admits two of them at a time and queues the rest.
+///
+/// Sized so it does not bind on the ordinary path and does bind on the
+/// pathological one: at [`RESOLVE_UNSIZED_REQUEST_BYTES`] per unsized
+/// request, 512 MiB admits 2,048 of them, above the 1,024-permit ceiling the
+/// shipped defaults derive, so a resolve fanning out over records and LIST
+/// pages queues on the request ceiling and never on this. Raising this raises
+/// resident memory one-for-one; lowering it throttles the fan-out instead.
+pub const DEFAULT_RESOLVE_INFLIGHT_BYTES: u64 = 512 << 20;
+
+/// Upper bound on `resolve_inflight_bytes`, enforced by
+/// [`crate::Catalog::new`] with a typed
+/// [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig). 64
+/// GiB is past any host this runs on, so a value above it is a typo (a byte
+/// count entered as something else) rather than an operator decision; the
+/// bound also keeps the permit count well inside tokio's
+/// `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`), which the semaphore is sized
+/// in bytes against.
+pub const MAX_RESOLVE_INFLIGHT_BYTES: u64 = 64 << 30;
 
 /// Catalog configuration.
 ///
@@ -631,18 +745,57 @@ pub struct CatalogConfig {
     /// [`crate::FoldReport::frontier_hours_deferred`], never silently skipped.
     /// Default [`DEFAULT_FRONTIER_RECONCILE_MAX_HOURS`].
     pub frontier_reconcile_max_hours: u32,
-    /// Number of in-flight object-store requests (LISTs and record GETs)
-    /// the resolve path keeps in flight at once, via a per-instance
-    /// semaphore (`Catalog::request_semaphore`). Must be greater than zero;
-    /// [`crate::Catalog::new`] rejects `0` with
+    /// Number of in-flight object-store requests (LISTs and record GETs) ONE
+    /// resolve keeps in flight at once: the width of every
+    /// `.buffered`/`.buffer_unordered` fan-out on the resolve path. Must be
+    /// greater than zero; [`crate::Catalog::new`] rejects `0` with
     /// [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig)
     /// rather than silently clamping it to 1. See
     /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`] for the measured basis. Default
     /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`].
     pub resolve_get_concurrency: usize,
+    /// How many resolves this process is assumed to run at once. Read only to
+    /// size the process-wide in-flight request ceiling
+    /// (`Catalog::request_semaphore`) through
+    /// [`derive_resolve_request_concurrency`]; it limits nothing on its own,
+    /// and a process that exceeds it queues on that ceiling rather than
+    /// failing. `0` is accepted and derives the same ceiling as `1` (the
+    /// derivation's lower clamp), so a caller that has no number to pass is
+    /// never worse off than one resolve's own width. Default
+    /// [`DEFAULT_PROCESS_QUERY_CONCURRENCY`].
+    pub process_query_concurrency: usize,
+    /// Response bytes the resolve path may have in flight at once across
+    /// every resolve sharing this `Catalog`, charged before each request is
+    /// issued and released when it completes. Must be at least
+    /// [`RESOLVE_UNSIZED_REQUEST_BYTES`] and at most
+    /// [`MAX_RESOLVE_INFLIGHT_BYTES`]; [`crate::Catalog::new`] rejects
+    /// anything outside that with
+    /// [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig).
+    /// Default [`DEFAULT_RESOLVE_INFLIGHT_BYTES`].
+    pub resolve_inflight_bytes: u64,
 }
 
 impl CatalogConfig {
+    /// The process-wide in-flight request ceiling this config derives
+    /// (issue #1733): [`derive_resolve_request_concurrency`] over
+    /// [`resolve_get_concurrency`](Self::resolve_get_concurrency) and
+    /// [`process_query_concurrency`](Self::process_query_concurrency). This
+    /// is the size `Catalog::new` gives `Catalog::request_semaphore`, and the
+    /// number N concurrent resolves share; each one of them is separately
+    /// held to `resolve_get_concurrency` by its own fan-out width.
+    pub fn resolve_request_concurrency(&self) -> usize {
+        derive_resolve_request_concurrency(self.resolve_get_concurrency, self.process_query_concurrency)
+    }
+
+    /// Bytes one in-flight request of unknown response size charges against
+    /// [`resolve_inflight_bytes`](Self::resolve_inflight_bytes):
+    /// [`RESOLVE_UNSIZED_REQUEST_BYTES`]. An accessor rather than only a
+    /// constant so the unit of that budget is reachable from the config type
+    /// itself, including from callers outside this crate that size it.
+    pub fn unsized_request_reservation_bytes(&self) -> u64 {
+        RESOLVE_UNSIZED_REQUEST_BYTES
+    }
+
     /// One record cache's equal share of the per-tenant byte budget:
     /// [`cache_capacity_per_tenant`](Self::cache_capacity_per_tenant) times
     /// [`RECORD_CACHE_ENTRY_BYTES`]. 22.5 MB at the 25,000-entry cap, 9 MB at
@@ -719,6 +872,8 @@ impl Default for CatalogConfig {
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
             frontier_reconcile_max_hours: DEFAULT_FRONTIER_RECONCILE_MAX_HOURS,
             resolve_get_concurrency: DEFAULT_RESOLVE_GET_CONCURRENCY,
+            process_query_concurrency: DEFAULT_PROCESS_QUERY_CONCURRENCY,
+            resolve_inflight_bytes: DEFAULT_RESOLVE_INFLIGHT_BYTES,
         }
     }
 }
@@ -838,5 +993,64 @@ mod tests {
             }
         }
         assert_eq!(all.len() as u64, SIGNAL_STREAMS);
+    }
+
+    /// Issue #1733: the process-wide ceiling is the per-resolve width times
+    /// the assumed query concurrency, so the shipped defaults derive 1,024
+    /// rather than the 128 the pre-#1733 sizing gave a whole process.
+    #[test]
+    fn process_ceiling_is_the_per_resolve_width_times_query_concurrency() {
+        assert_eq!(
+            derive_resolve_request_concurrency(
+                DEFAULT_RESOLVE_GET_CONCURRENCY,
+                DEFAULT_PROCESS_QUERY_CONCURRENCY
+            ),
+            1_024
+        );
+        assert_eq!(DEFAULT_RESOLVE_GET_CONCURRENCY * 8, 1_024);
+    }
+
+    /// The lower clamp: a process that declares no concurrency (or one query)
+    /// still gets a full resolve's own measured width, never less.
+    #[test]
+    fn process_ceiling_never_falls_below_one_resolve() {
+        assert_eq!(derive_resolve_request_concurrency(128, 0), 128);
+        assert_eq!(derive_resolve_request_concurrency(128, 1), 128);
+    }
+
+    /// The upper clamp: the derivation can never hand `Semaphore::new` a
+    /// value past the ceiling whose rate arithmetic
+    /// `MAX_RESOLVE_GET_CONCURRENCY` states, whatever a caller declares, and
+    /// the multiplication saturates rather than overflowing.
+    #[test]
+    fn process_ceiling_is_capped_and_saturates() {
+        assert_eq!(
+            derive_resolve_request_concurrency(128, 1_000),
+            MAX_RESOLVE_GET_CONCURRENCY
+        );
+        assert_eq!(
+            derive_resolve_request_concurrency(usize::MAX, usize::MAX),
+            MAX_RESOLVE_GET_CONCURRENCY
+        );
+    }
+
+    /// The byte budget is sized not to bind on the ordinary path: at one
+    /// unsized reservation per request it admits more concurrent requests
+    /// than the shipped ceiling allows, so a record/LIST fan-out queues on
+    /// the request ceiling and this budget only binds on the large declared
+    /// sizes it exists for.
+    #[test]
+    fn the_byte_budget_does_not_bind_on_unsized_requests() {
+        let unsized_capacity = DEFAULT_RESOLVE_INFLIGHT_BYTES / RESOLVE_UNSIZED_REQUEST_BYTES;
+        assert_eq!(unsized_capacity, 2_048);
+        assert!(
+            unsized_capacity
+                > derive_resolve_request_concurrency(
+                    DEFAULT_RESOLVE_GET_CONCURRENCY,
+                    DEFAULT_PROCESS_QUERY_CONCURRENCY
+                ) as u64
+        );
+        assert!(DEFAULT_RESOLVE_INFLIGHT_BYTES <= MAX_RESOLVE_INFLIGHT_BYTES);
+        assert!(DEFAULT_RESOLVE_INFLIGHT_BYTES >= RESOLVE_UNSIZED_REQUEST_BYTES);
     }
 }

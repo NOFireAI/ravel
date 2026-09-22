@@ -486,9 +486,24 @@ pub struct Catalog {
     /// a liveness signal a bounded false positive is the safe side; an
     /// unbounded false negative is not.
     fold_last_success_unix_ns: [AtomicI64; SIGNAL_SLOTS],
-    /// Bounds the object-store requests one resolve keeps in flight. Ephemeral, process-local, correctness-free: it changes only
-    /// how many round trips overlap, never which segments a resolve returns.
+    /// Bounds the object-store requests every resolve sharing this instance
+    /// keeps in flight, together. Sized by
+    /// [`CatalogConfig::resolve_request_concurrency`], which is one resolve's
+    /// fan-out width times the process's assumed query concurrency, so N
+    /// concurrent resolves reach N times that width rather than dividing one
+    /// width between them (issue #1733). Ephemeral, process-local,
+    /// correctness-free: it changes only how many round trips overlap, never
+    /// which segments a resolve returns.
     request_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds the response BYTES those requests have in flight, together:
+    /// permits are bytes, sized by `CatalogConfig::resolve_inflight_bytes`,
+    /// and each request charges its expected response size before it is
+    /// issued (issue #1733). The count semaphore above bounds how many
+    /// responses are being buffered; this bounds how large they may be, which
+    /// a count cannot: a snapshot part or postings block declares its own size
+    /// and may be hundreds of megabytes. Both are acquired in this order at
+    /// every request site, so neither can deadlock behind the other.
+    request_bytes_semaphore: Arc<tokio::sync::Semaphore>,
     /// Whether resolve validates the configured `shard_count` against each
     /// (tenant, signal)'s durable provisioning record (ADR-0050 section 5). Off for the many in-crate and `ravel-query`/`ravel-sql` callers
     /// that build a `Catalog` directly; the server turns it on
@@ -575,6 +590,16 @@ struct GuardedRecordGet<'a> {
     accounting: &'a QueryAccounting,
 }
 
+/// The two instance-wide admissions one in-flight object-store request holds
+/// (issue #1733): its slot in the request-count semaphore and its charge
+/// against the in-flight byte budget. Held together for exactly the duration
+/// of the store call, and released together when this drops, so a request
+/// that fails or is cancelled returns both.
+struct RequestPermits<'a> {
+    _count: tokio::sync::SemaphorePermit<'a>,
+    _bytes: tokio::sync::SemaphorePermit<'a>,
+}
+
 impl crate::provisioning::AccountedRecordGet for GuardedRecordGet<'_> {
     async fn accounted_get_full(&self, key: &str) -> Result<GetOutcome, StoreError> {
         self.catalog
@@ -587,10 +612,15 @@ impl Catalog {
     /// Errors if `config.shard_count == 0` (a resolvable catalog needs at
     /// least one shard), `config.resolve_get_concurrency == 0` (a
     /// zero-permit semaphore would deadlock every resolve, never silently
-    /// clamped to 1), or `config.resolve_get_concurrency >
+    /// clamped to 1), `config.resolve_get_concurrency >
     /// crate::config::MAX_RESOLVE_GET_CONCURRENCY` (past that ceiling,
     /// `tokio::sync::Semaphore::new` panics instead of failing typed --
-    /// see that constant's doc comment for the basis).
+    /// see that constant's doc comment for the basis), or
+    /// `config.resolve_inflight_bytes` outside
+    /// `RESOLVE_UNSIZED_REQUEST_BYTES ..= MAX_RESOLVE_INFLIGHT_BYTES` (a
+    /// budget below one unsized request's own reservation would serialize
+    /// every request on the resolve path, which is a misconfiguration rather
+    /// than a tight bound, and one above the ceiling is a typo).
     pub fn new(
         store: Arc<dyn ObjectStoreBackend>,
         config: CatalogConfig,
@@ -606,6 +636,16 @@ impl Catalog {
         if config.resolve_get_concurrency > crate::config::MAX_RESOLVE_GET_CONCURRENCY {
             return Err(CatalogError::InvalidConfig(
                 "resolve_get_concurrency exceeds MAX_RESOLVE_GET_CONCURRENCY",
+            ));
+        }
+        if config.resolve_inflight_bytes < crate::config::RESOLVE_UNSIZED_REQUEST_BYTES {
+            return Err(CatalogError::InvalidConfig(
+                "resolve_inflight_bytes is below RESOLVE_UNSIZED_REQUEST_BYTES",
+            ));
+        }
+        if config.resolve_inflight_bytes > crate::config::MAX_RESOLVE_INFLIGHT_BYTES {
+            return Err(CatalogError::InvalidConfig(
+                "resolve_inflight_bytes exceeds MAX_RESOLVE_INFLIGHT_BYTES",
             ));
         }
         // `byte_cache_max_bytes == 0` is the disabled sentinel:
@@ -625,6 +665,13 @@ impl Catalog {
         // eligible load re-fetches the stats object with no reuse.
         let column_stats_cache = (config.column_stats_cache_max_bytes != 0)
             .then(|| ColumnStatsCache::new(config.column_stats_cache_max_bytes));
+        // Both semaphore sizes are read before `config` moves into the struct.
+        let request_concurrency = config.resolve_request_concurrency();
+        // Permits are bytes. `resolve_inflight_bytes` is bounded above by
+        // MAX_RESOLVE_INFLIGHT_BYTES (64 GiB), well inside both usize on every
+        // supported target and tokio's own MAX_PERMITS, so this conversion
+        // cannot lose a byte of the configured budget.
+        let inflight_bytes = usize::try_from(config.resolve_inflight_bytes).unwrap_or(usize::MAX);
         Ok(Catalog {
             store,
             config,
@@ -641,9 +688,8 @@ impl Catalog {
             fold_cycles: std::array::from_fn(|_| AtomicU64::new(0)),
             fold_failures: std::array::from_fn(|_| AtomicU64::new(0)),
             fold_last_success_unix_ns: std::array::from_fn(|_| AtomicI64::new(0)),
-            request_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                config.resolve_get_concurrency,
-            )),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(request_concurrency)),
+            request_bytes_semaphore: Arc::new(tokio::sync::Semaphore::new(inflight_bytes)),
             enforce_provisioning: false,
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
@@ -815,9 +861,57 @@ impl Catalog {
         }
     }
 
-    /// One store GET bounded by the resolve-wide in-flight semaphore. The permit is released the moment the GET resolves and is
+    /// Admit one object-store request against BOTH instance-wide bounds
+    /// (issue #1733): one permit from the request-count semaphore, then
+    /// `expected_bytes` permits from the in-flight byte budget. Held for the
+    /// duration of the store call and released when the returned guard drops,
+    /// which is the moment the response is no longer in flight.
+    ///
+    /// `expected_bytes` is the best estimate available at the call site
+    /// BEFORE the request is issued: a ranged GET's own length, a
+    /// content-addressed fetch's declared size, or
+    /// [`crate::config::RESOLVE_UNSIZED_REQUEST_BYTES`] for a response whose
+    /// size is not known until it arrives. Charging it here, before
+    /// `store.get`/`store.list`, is what makes the budget a bound rather than
+    /// a measurement: a check after the response is resident would already
+    /// have paid the memory it exists to refuse.
+    ///
+    /// A single request asking for more than the whole budget is clamped to
+    /// the whole budget: it then runs alone, which is the most any bound can
+    /// do for a response larger than the budget, and it can never park
+    /// forever on permits the semaphore does not have.
+    async fn acquire_request_permits(
+        &self,
+        expected_bytes: u64,
+    ) -> Result<RequestPermits<'_>, StoreError> {
+        let count = self.request_semaphore.acquire().await.map_err(|_| {
+            StoreError::Transient("catalog request semaphore closed".to_string())
+        })?;
+        let budget = self.config.resolve_inflight_bytes;
+        let charged = u32::try_from(expected_bytes.clamp(1, budget)).unwrap_or(u32::MAX);
+        let bytes = self
+            .request_bytes_semaphore
+            .acquire_many(charged)
+            .await
+            .map_err(|_| {
+                StoreError::Transient("catalog request byte semaphore closed".to_string())
+            })?;
+        Ok(RequestPermits {
+            _count: count,
+            _bytes: bytes,
+        })
+    }
+
+    /// One store GET bounded by the resolve-wide in-flight semaphore and the
+    /// in-flight byte budget. Both permits are released the moment the GET
+    /// resolves and are
     /// never held across another guarded request, so a resolve fanning out
     /// many records cannot wait on permits it already holds.
+    ///
+    /// The byte charge is the request's own range length when it has one, and
+    /// [`crate::config::RESOLVE_UNSIZED_REQUEST_BYTES`] for a whole-object GET
+    /// whose size this call cannot know. [`Catalog::guarded_get_sized`] is the
+    /// entry point for a whole-object GET whose size IS known in advance.
     ///
     /// The sole funnel for every GET a query issues (ADR-0044 decision 2): `accounting` is credited one [`AccountedOp::Get`] request
     /// unconditionally, and its bytes only on success (`got.data.len()`,
@@ -829,10 +923,29 @@ impl Catalog {
         range: GetRange,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, StoreError> {
-        let _permit =
-            self.request_semaphore.acquire().await.map_err(|_| {
-                StoreError::Transient("catalog request semaphore closed".to_string())
-            })?;
+        let expected_bytes = match range {
+            GetRange::Full => crate::config::RESOLVE_UNSIZED_REQUEST_BYTES,
+            GetRange::Range(start, end) => end.saturating_sub(start),
+            GetRange::Suffix(n) => n,
+        };
+        self.guarded_get_sized(key, range, expected_bytes, accounting)
+            .await
+    }
+
+    /// [`Catalog::guarded_get`] for a request whose response size is declared
+    /// before it is issued, so the in-flight byte budget charges the true size
+    /// instead of an estimate. The content-addressed fetches
+    /// ([`Catalog::fetch_content_addressed`]) are the callers: a snapshot part
+    /// or postings ref carries its own size, and those are the responses large
+    /// enough for the budget to bind on.
+    pub(crate) async fn guarded_get_sized(
+        &self,
+        key: &str,
+        range: GetRange,
+        expected_bytes: u64,
+        accounting: &QueryAccounting,
+    ) -> Result<GetOutcome, StoreError> {
+        let _permits = self.acquire_request_permits(expected_bytes).await?;
         let result = self.store.get(key, range).await;
         accounting.record_s3_request(AccountedOp::Get);
         if let Ok(got) = &result {
@@ -843,16 +956,21 @@ impl Catalog {
 
     /// One store GET for an object named by a content-addressed ref
     /// (`SnapshotPartRef`/`SnapshotPostingsRef`), consulted through the byte
-    /// cache before falling through to [`Catalog::guarded_get`] (ADR-0046
+    /// cache before falling through to [`Catalog::guarded_get_sized`] (ADR-0046
     /// decisions 1-2). `content_hash` and `size` are the ref's own blake3 and
     /// declared size, both known before the fetch is planned; a hit records
-    /// one cache hit and skips the GET (so `guarded_get`'s own accounting,
+    /// one cache hit and skips the GET (so the GET path's own accounting,
     /// which credits an S3 request unconditionally, never runs), a miss
     /// records one cache miss and falls through, admitting the bytes on
     /// success.
     ///
+    /// Every GET this issues charges `size` against the in-flight byte budget
+    /// (issue #1733), not the unsized estimate: the ref declares what the
+    /// response will hold, and these are the largest responses on the resolve
+    /// path (a part or postings block may declare hundreds of megabytes).
+    ///
     /// When `content_hash` is not exactly 32 bytes the ref is malformed; this
-    /// bypasses the cache entirely and calls `guarded_get` directly, exactly
+    /// bypasses the cache entirely and calls the sized GET directly, exactly
     /// as an uncached GET would, leaving the existing hash-mismatch handling
     /// at the call site (which re-derives the same malformed comparison) to
     /// catch it. This never happens for a well-formed ref.
@@ -872,7 +990,7 @@ impl Catalog {
     ) -> Result<Bytes, StoreError> {
         let Ok(content_hash) = <[u8; 32]>::try_from(content_hash) else {
             return Ok(self
-                .guarded_get(key, GetRange::Full, accounting)
+                .guarded_get_sized(key, GetRange::Full, size, accounting)
                 .await?
                 .data);
         };
@@ -881,7 +999,7 @@ impl Catalog {
         // an uncached GET would.
         let Some(byte_cache) = &self.byte_cache else {
             return Ok(self
-                .guarded_get(key, GetRange::Full, accounting)
+                .guarded_get_sized(key, GetRange::Full, size, accounting)
                 .await?
                 .data);
         };
@@ -896,7 +1014,9 @@ impl Catalog {
                     return Ok(bytes);
                 }
                 accounting.record_cache_miss();
-                let got = self.guarded_get(key, GetRange::Full, accounting).await?;
+                let got = self
+                    .guarded_get_sized(key, GetRange::Full, size, accounting)
+                    .await?;
                 ram.insert(cache_key, got.data.clone());
                 Ok(got.data)
             }
@@ -917,7 +1037,7 @@ impl Catalog {
                 let (bytes, source) = tiered
                     .get_or_fetch(cache_key, move || async move {
                         let got = self
-                            .guarded_get(key, GetRange::Full, accounting)
+                            .guarded_get_sized(key, GetRange::Full, size, accounting)
                             .await
                             .map_err(Arc::new)?;
                         Ok(got.data)
@@ -975,9 +1095,12 @@ impl Catalog {
             None,
             MAX_LIST_PAGES,
             |_start_after, page_token| async move {
-                let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                    StoreError::Transient("catalog request semaphore closed".to_string())
-                })?;
+                // One LIST page, admitted against both instance-wide bounds
+                // (issue #1733): a page's size is not known before it is
+                // issued, so it charges the unsized reservation.
+                let _permits = self
+                    .acquire_request_permits(crate::config::RESOLVE_UNSIZED_REQUEST_BYTES)
+                    .await?;
                 let page = self.store.list(prefix, page_token).await;
                 accounting.record_s3_request(AccountedOp::List);
                 Ok(page?)
@@ -2420,9 +2543,15 @@ impl Catalog {
                                 limit: cap,
                             });
                         }
-                        let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                            StoreError::Transient("catalog request semaphore closed".to_string())
-                        })?;
+                        // One LIST page, admitted against both instance-wide
+                        // bounds (issue #1733): a page's size is not known
+                        // before it is issued, so it charges the unsized
+                        // reservation.
+                        let _permits = self
+                            .acquire_request_permits(
+                                crate::config::RESOLVE_UNSIZED_REQUEST_BYTES,
+                            )
+                            .await?;
                         let page = self
                             .store
                             .list_after(prefix_ref, start_after.as_deref(), page_token)
@@ -2638,9 +2767,12 @@ impl Catalog {
             Some(&start_after),
             MAX_LIST_PAGES,
             |start_after: Option<String>, page_token| async move {
-                let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                    StoreError::Transient("catalog request semaphore closed".to_string())
-                })?;
+                // One LIST page, admitted against both instance-wide bounds
+                // (issue #1733): a page's size is not known before it is
+                // issued, so it charges the unsized reservation.
+                let _permits = self
+                    .acquire_request_permits(crate::config::RESOLVE_UNSIZED_REQUEST_BYTES)
+                    .await?;
                 let page = self
                     .store
                     .list_after(prefix_ref, start_after.as_deref(), page_token)
@@ -3054,9 +3186,15 @@ impl Catalog {
                                 limit: cap,
                             });
                         }
-                        let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                            StoreError::Transient("catalog request semaphore closed".to_string())
-                        })?;
+                        // One LIST page, admitted against both instance-wide
+                        // bounds (issue #1733): a page's size is not known
+                        // before it is issued, so it charges the unsized
+                        // reservation.
+                        let _permits = self
+                            .acquire_request_permits(
+                                crate::config::RESOLVE_UNSIZED_REQUEST_BYTES,
+                            )
+                            .await?;
                         let page = self
                             .store
                             .list_after(prefix_ref, start_after.as_deref(), page_token)

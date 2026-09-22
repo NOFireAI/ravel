@@ -244,6 +244,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the operator re-qualifies each existing cluster once against its unchanged
   store. The qualify Job is a one-shot that touches no Deployment, so no serving
   pod is restarted and there is no downtime. Subsequent reconciles are stable.
+- **Catalog cold-resolve throughput now scales with the number of concurrent
+  queries instead of being capped process-wide at 128 in-flight requests**
+  (issue #1733). `ravel-server` builds one `Catalog` and shares it by `Arc`
+  clone across every request, and that instance's request semaphore was sized
+  at `resolve_get_concurrency` itself, so N concurrent queries divided 128
+  in-flight object-store requests between them rather than each getting 128.
+  The semaphore is now sized by the new
+  `ravel_catalog::derive_resolve_request_concurrency`, one resolve's fan-out
+  width times the process's assumed query concurrency (the new
+  `CatalogConfig::process_query_concurrency`, default 8), which is 1,024 at
+  the shipped defaults; each individual resolve is still held to
+  `resolve_get_concurrency` by its own fan-out width, which is unchanged at
+  128. Because a request count bounds how many responses are buffered and not
+  how large they are, the same change adds `CatalogConfig::resolve_inflight_bytes`
+  (default 512 MiB), an instance-wide budget every LIST page and every GET
+  charges before it is issued: the content-addressed snapshot part and
+  postings fetches charge their ref's declared size, which is what a raised
+  request ceiling could otherwise have turned into hundreds of gigabytes of
+  resident response bodies. No new CLI flag; `--catalog-resolve-concurrency`
+  still sets the per-resolve width, and the permit pools' saturation is not
+  exported to `/metrics`.
 
 ### Fixed
 
