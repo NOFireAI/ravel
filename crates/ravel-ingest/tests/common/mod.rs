@@ -279,13 +279,32 @@ impl ObjectStoreBackend for SlowStore {
 /// matches EVERY signal's commits; `/s/c/` is the span-specific form. A
 /// caller that wants one signal must pass the signal-qualified prefix. The
 /// log router passes `/c/` only because it writes one signal in that test.
-/// `signal` is stamped into the conflicting record
-/// so what lands decodes as a record of the signal being written. The record
-/// is built for tenant `acme`, shard 0, which is what every caller writes as.
+///
+/// `signal` is stamped into the conflicting record only so that what lands
+/// decodes as a record of the signal being written; it does not affect
+/// classification. `publish` decides split brain purely on a `content_hash`
+/// mismatch after the `AlreadyExists` GET
+/// (`crates/ravel-commit/src/publish.rs`), and never reads the stored
+/// record's signal, so `key_contains` alone decides what this double
+/// poisons. The record is built for tenant `acme`, shard 0, which is what
+/// every caller writes as.
 ///
 /// The poison fires at most once: the first matching put lands the
-/// conflicting record and errors, every later put (including the shard's own
-/// retry of the same key) delegates to the inner `MemoryStore` unchanged.
+/// conflicting record and errors, and every later put delegates to the inner
+/// `MemoryStore` unchanged. No second put of the poisoned key follows in
+/// practice: on `AlreadyExists` the publish loop goes to
+/// `resolve_already_exists`, which GETs the key and compares, and re-puts
+/// only for store errors that are retryable, which `AlreadyExists` is not.
+///
+/// Mirrors `shard_death_observable.rs`'s `SplitBrainNTimes`, which is the
+/// same shape with a skip count; a change to how `publish` classifies split
+/// brain has to be made in both until that one folds onto this.
+///
+/// A byte-identical `span_on_shard` and an equivalent double also live in
+/// `crates/ravel-failure-tests/tests/partial_multi_shard_commit.rs` and in
+/// `services/ravel-server/src/lib.rs`. Both are in other crates, and this
+/// module is a dev-only `tests/common`, so neither can reach it without a
+/// shared dev-dependency crate. Tracked on #1867.
 pub struct SplitBrainOnFirstCommit {
     inner: MemoryStore,
     poisoned: AtomicBool,
