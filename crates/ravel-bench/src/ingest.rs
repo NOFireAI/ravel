@@ -346,6 +346,11 @@ pub struct ReportConfig {
     pub batch_size: usize,
     pub max_inflight_flushes: u32,
     pub flush_delay_policy: String,
+    /// Seconds of `IngestConfig::max_flush_lifetime` the run applied. It
+    /// changes what the run measures -- it is the deadline whose expiry
+    /// produces `abandoned_queue_deadline` -- so a report that omits it cannot
+    /// explain its own abandonment counts.
+    pub max_flush_lifetime_secs: f64,
 }
 
 #[derive(Serialize)]
@@ -713,6 +718,7 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
             batch_size: config.batch_size,
             max_inflight_flushes: config.max_inflight_flushes,
             flush_delay_policy: config.flush_delay_policy.to_string(),
+            max_flush_lifetime_secs: config.max_flush_lifetime.as_secs_f64(),
         },
         accepted_points_per_sec: accepted_points as f64 / elapsed_secs,
         accepted_points,

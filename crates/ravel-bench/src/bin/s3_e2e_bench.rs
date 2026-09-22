@@ -85,7 +85,14 @@ fn print_human_table(report: &Report) {
         report.flushes_by_size, report.flushes_by_age, report.flushes_manual
     );
     println!("  put_retries       : {}", report.put_retries);
-    println!("{}", format_abandoned_line(report));
+    println!(
+        "{}",
+        ravel_bench::format_abandoned_line(
+            report.abandoned_retry_exhausted,
+            report.abandoned_queue_deadline,
+            report.abandoned_input_rejected,
+        )
+    );
     println!(
         "  acks ok/err       : {}/{}",
         report.acks_ok, report.acks_err
@@ -123,15 +130,6 @@ fn print_human_table(report: &Report) {
     );
 }
 
-fn format_abandoned_line(report: &Report) -> String {
-    format!(
-        "  abandoned         : retry_exhausted={} queue_deadline={} input_rejected={}",
-        report.abandoned_retry_exhausted,
-        report.abandoned_queue_deadline,
-        report.abandoned_input_rejected
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,7 +164,11 @@ mod tests {
         let report = run(&config).await;
 
         assert_eq!(
-            format_abandoned_line(&report),
+            ravel_bench::format_abandoned_line(
+                report.abandoned_retry_exhausted,
+                report.abandoned_queue_deadline,
+                report.abandoned_input_rejected
+            ),
             "  abandoned         : retry_exhausted=0 queue_deadline=1 input_rejected=0"
         );
     }
