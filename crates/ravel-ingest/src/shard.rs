@@ -2246,9 +2246,8 @@ mod tests {
         let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
         let clock = TestClock::new(BASE_NS);
-        let lifetime = Duration::from_nanos(
-            u64::try_from(deferral_ns.saturating_mul(4)).unwrap_or(u64::MAX),
-        );
+        let lifetime =
+            Duration::from_nanos(u64::try_from(deferral_ns.saturating_mul(4)).unwrap_or(u64::MAX));
         let router = Arc::new(
             IngestRouter::new(
                 one_permit_one_queue(lifetime),
@@ -2550,4 +2549,3 @@ mod tests {
         config.max_flush_delay_idle.as_nanos() as i64 + config.flush_tick.as_nanos() as i64
     }
 }
-
