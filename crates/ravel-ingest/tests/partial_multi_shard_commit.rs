@@ -14,19 +14,15 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestClock, make_point, tenant};
+use common::{TestClock, make_point, span_on_shard, tenant};
 use ravel_commit::keys;
-use ravel_ingest::{
-    IngestConfig, IngestRouter, SpanIngestRouter, WriteError, WriteMode, shard_for_span,
-};
+use ravel_ingest::{IngestConfig, IngestRouter, SpanIngestRouter, WriteError, WriteMode};
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_otlp::NormalizedPoint;
-use ravel_otlp::traces_normalize::NormalizedSpan;
-use ravel_rspan::StatusCode;
 use ravel_types::{Signal, TenantHash, shard_for};
 
 const BASE_NS: i64 = 1_700_000_000_000_000_000;
@@ -59,30 +55,6 @@ fn point_on_shard(
         }
     }
     panic!("no series found for shard {want_shard} of {shard_count}");
-}
-
-/// A span whose `trace_id` (an incrementing little-endian counter) routes to
-/// `want_shard`. `shard_for_span` hashes the whole id, so scanning counter
-/// values finds a representative for every shard.
-fn span_on_shard(want_shard: u32, shard_count: u32, start_ns: i64) -> NormalizedSpan {
-    for i in 0..100_000u64 {
-        let mut trace_id = [0u8; 16];
-        trace_id[..8].copy_from_slice(&i.to_le_bytes());
-        if shard_for_span(&trace_id, shard_count) == want_shard {
-            return NormalizedSpan {
-                trace_id,
-                span_id: [1u8; 8],
-                parent_span_id: None,
-                name: "handle".to_string(),
-                start_ts_ns: start_ns,
-                end_ts_ns: start_ns + 100,
-                status_code: StatusCode::Unset,
-                status_message: None,
-                attrs: vec![("service.name".to_string(), "checkout".to_string())],
-            };
-        }
-    }
-    panic!("no trace routes to shard {want_shard} of {shard_count}");
 }
 
 /// Asserts the store holds exactly one commit record for `token`, proving the

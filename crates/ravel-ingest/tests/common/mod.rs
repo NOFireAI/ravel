@@ -1,6 +1,7 @@
-//! Shared test support: a deterministic injected clock, point/label builders,
-//! and a stalling store wrapper for backpressure tests. Not part of the
-//! crate's public API; used only by integration tests under `tests/`.
+//! Shared test support: a deterministic injected clock, point/label/span
+//! builders, a stalling store wrapper for backpressure tests, and a
+//! split-brain store double for shard-death tests. Not part of the crate's
+//! public API; used only by integration tests under `tests/`.
 #![allow(clippy::expect_used, dead_code)]
 
 use std::future::Future;
@@ -15,14 +16,16 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
-use ravel_ingest::{Clock, SEGMENT_FORMAT_VERSION};
+use ravel_ingest::{Clock, SEGMENT_FORMAT_VERSION, shard_for_span};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_otlp::NormalizedPoint;
+use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_query::{EngineConfig, QueryEngine};
+use ravel_rspan::StatusCode;
 use ravel_segment::{IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_types::{
     CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId,
@@ -264,6 +267,134 @@ impl ObjectStoreBackend for SlowStore {
             ..self.inner.capabilities()
         }
     }
+}
+
+/// Lands a different, structurally valid commit record at the exact key the
+/// first flush targets and then reports `AlreadyExists`, the state `publish`
+/// classifies as split brain. That drives the `SplitBrain` panic inside the
+/// shard actor that owns the flush, killing that task.
+///
+/// `key_contains` picks which commit keyspace the poison fires on, so a
+/// caller aims it at one signal's commits (`/c/` for the log router, `/s/c/`
+/// for the span router), and `signal` is stamped into the conflicting record
+/// so what lands decodes as a record of the signal being written. The record
+/// is built for tenant `acme`, shard 0, which is what every caller writes as.
+///
+/// The poison fires at most once: the first matching put lands the
+/// conflicting record and errors, every later put (including the shard's own
+/// retry of the same key) delegates to the inner `MemoryStore` unchanged.
+pub struct SplitBrainOnFirstCommit {
+    inner: MemoryStore,
+    poisoned: AtomicBool,
+    key_contains: String,
+    signal: Signal,
+}
+
+impl SplitBrainOnFirstCommit {
+    pub fn new(key_contains: impl Into<String>, signal: Signal) -> Self {
+        SplitBrainOnFirstCommit {
+            inner: MemoryStore::new(),
+            poisoned: AtomicBool::new(false),
+            key_contains: key_contains.into(),
+            signal,
+        }
+    }
+
+    fn conflicting_record(&self) -> Bytes {
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: tenant("acme").hash(),
+            signal: self.signal,
+            shard: 0,
+            writer_id: Uuid::nil(),
+            writer_epoch: 1,
+            writer_seq: 0,
+            object_size: 1,
+            content_hash: [0xAA; 32],
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid conflicting record");
+        record::encode(&rec)
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for SplitBrainOnFirstCommit {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        if key.contains(self.key_contains.as_str()) && !self.poisoned.swap(true, Ordering::SeqCst) {
+            self.inner
+                .put(key, self.conflicting_record(), PutOptions::default())
+                .await?;
+            return Err(StoreError::AlreadyExists);
+        }
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        // multipart: false to match the refusing default `put_multipart` this
+        // double inherits.
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+/// A span whose `trace_id` routes to `want_shard`. `shard_for_span` hashes the
+/// whole id, so scanning an incrementing counter in the leading bytes finds a
+/// representative for every shard; the concrete id is an artifact of that
+/// scan and no caller asserts on it.
+pub fn span_on_shard(want_shard: u32, shard_count: u32, start_ns: i64) -> NormalizedSpan {
+    for i in 0..100_000u64 {
+        let mut trace_id = [0u8; 16];
+        trace_id[..8].copy_from_slice(&i.to_le_bytes());
+        if shard_for_span(&trace_id, shard_count) == want_shard {
+            return NormalizedSpan {
+                trace_id,
+                span_id: [1u8; 8],
+                parent_span_id: None,
+                name: "handle".to_string(),
+                start_ts_ns: start_ns,
+                end_ts_ns: start_ns + 100,
+                status_code: StatusCode::Unset,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), "checkout".to_string())],
+            };
+        }
+    }
+    panic!("no trace routes to shard {want_shard} of {shard_count}");
 }
 
 pub fn tenant(id: &str) -> TenantId {
