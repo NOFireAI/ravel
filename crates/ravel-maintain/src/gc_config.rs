@@ -147,17 +147,22 @@ impl GcConfigValues {
     /// field.
     ///
     /// Also refuses a `max_flush_lifetime_ns` below `ingest_max_flush_lifetime_ns`
-    /// (issue #1744): that value is the ingest pipeline's own real, fixed writer
-    /// interlock (ravel-ingest has no flag to change it), and every one of
-    /// [`crate::CompactorConfig::seal_margin_ns`],
-    /// [`crate::CompactorConfig::orphan_age_gate_ns`], and
-    /// [`crate::CompactorConfig::retention_floor_ns`] derives from this same
-    /// field. A `sys/gc` written below that floor lets
-    /// [`Bucket::is_sealed`](crate::Bucket::is_sealed) decide a bucket is sealed
-    /// while a real writer, bound only by the true (longer) interlock, is still
-    /// allowed to flush into it, voiding the erasure completion gate
-    /// ([`crate::bucket_erasure_completion`]) it is meant to hold closed. The
-    /// caller supplies `ingest_max_flush_lifetime_ns` (see
+    /// (issue #1744). Unlike `protection_horizon_ns` and `grace_ns`, `sys/gc`'s
+    /// own `max_flush_lifetime_ns` field is not read into any
+    /// [`crate::CompactorConfig`]: the real compactor's `max_flush_lifetime_ns`
+    /// comes from `--gc-max-flush-lifetime` (or its compiled-in default),
+    /// resolved and floor-checked independently in
+    /// `services/ravel-server/src/config.rs`'s `resolve_gc_runtime`, which is
+    /// the actual choke point standing between an operator and
+    /// [`Bucket::is_sealed`](crate::Bucket::is_sealed) sealing early. This
+    /// check exists so `sys/gc` -- the durable, operator-facing record of the
+    /// deployment's intended GC values (`ravel-cli gc-config show`) -- can
+    /// never hold a value the process itself would refuse to run with: a
+    /// below-floor durable record would be a standing lie about what is
+    /// actually enforced, confusing for an operator even though nothing reads
+    /// it back into the compactor today. Kept as defence in depth rather than
+    /// dropped, in case a future caller does wire this field into a real
+    /// config. The caller supplies `ingest_max_flush_lifetime_ns` (see
     /// [`ingest_max_flush_lifetime_floor_ns`]) rather than this function reading
     /// it itself, so a test can drive the boundary against an arbitrary floor and
     /// prove the check actually uses the passed-in value rather than a
@@ -247,10 +252,9 @@ pub enum GcConfigError {
     #[error(
         "proposed GC config has max_flush_lifetime_ns={got} ns, below the ingest pipeline's own \
          max_flush_lifetime floor of {floor} ns (ravel-ingest's fixed writer interlock, ADR-0010 \
-         §11 -- there is no flag to change it): a compactor running below this floor can decide a \
-         bucket is sealed while a real writer is still allowed to flush into it, voiding the \
-         erasure completion gate and the retention floor this value also feeds; refusing to write \
-         sys/gc"
+         §11 -- there is no flag to change it): sys/gc is the durable, operator-facing record of \
+         this deployment's intended GC values, and it must not hold one this process would refuse \
+         to run with; refusing to write sys/gc"
     )]
     MaxFlushLifetimeBelowIngestFloor { got: i64, floor: i64 },
     #[error(
@@ -354,6 +358,18 @@ pub async fn read_gc_config(
 /// trivially matches. A concurrent bootstrap that wins the race is handled by
 /// re-reading and returning the winner's object, so a loser never errors and
 /// never proceeds with its own unwritten values.
+///
+/// `defaults` is validated (issue #1744 fix round) before it is ever written:
+/// the production caller passes `GcConfigValues::maintain_defaults()`, a
+/// compiled-in constant, not something a flag or `set_gc_config`'s own
+/// [`GcConfigValues::validate`] call has already checked, so this is the only
+/// choke point standing between a bootstrap and a durable non-positive or
+/// below-the-ingest-floor `sys/gc`. Positive-value and constraint violations
+/// are already impossible for `maintain_defaults()` by construction; the
+/// floor is the one term nothing else ties to the ingest pipeline's own
+/// default, so a future divergence between them fails a fresh bootstrap
+/// loudly instead of writing an object every mode would then refuse to
+/// validate against anyway.
 pub async fn bootstrap_gc_config(
     store: &dyn ObjectStoreBackend,
     defaults: GcConfigValues,
@@ -363,6 +379,7 @@ pub async fn bootstrap_gc_config(
         return Ok(values);
     }
 
+    defaults.validate(ingest_max_flush_lifetime_floor_ns())?;
     let bytes = defaults.to_proto(now_ns).encode_to_vec();
     match store
         .put(GC_CONFIG_KEY, bytes.into(), PutOptions::create_if_absent())
@@ -574,6 +591,31 @@ mod tests {
         assert_eq!(
             d.protection_horizon_ns,
             d.max_query_duration_ns + d.grace_ns + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+        );
+    }
+
+    /// `DEFAULT_MAX_FLUSH_LIFETIME_NS` must equal the ingest pipeline's own
+    /// `max_flush_lifetime` floor (issue #1744). The two are declared
+    /// independently -- one a compiled-in constant here, the other
+    /// `ravel_ingest::IngestConfig::default().max_flush_lifetime` -- and
+    /// nothing else in the build ties them together:
+    /// `maintain_defaults_satisfy_the_constraint_and_match_compactor_default`
+    /// above only compares the maintain default against
+    /// `CompactorConfig::default()`, which is derived from this SAME
+    /// constant, so it passes even if both drift from ravel-ingest together.
+    /// A no-flag `ravel-server` startup resolves `max_flush_lifetime_ns` to
+    /// this constant (`services/ravel-server/src/config.rs`'s
+    /// `resolve_gc_runtime`), and `bootstrap_gc_config` writes it into a
+    /// fresh bucket's `sys/gc` unvalidated (see
+    /// `fresh_bucket_bootstraps_from_defaults` below): if this constant ever
+    /// falls below the real ingest floor, both paths ship the exact defect
+    /// issue #1744 closed, with no explicit flag involved. This test is the
+    /// tripwire: a move in either default fails it at gate time.
+    #[test]
+    fn default_max_flush_lifetime_matches_the_ingest_floor() {
+        assert_eq!(
+            crate::config::DEFAULT_MAX_FLUSH_LIFETIME_NS,
+            ingest_max_flush_lifetime_floor_ns()
         );
     }
 
