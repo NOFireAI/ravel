@@ -2927,12 +2927,19 @@ pub async fn start(
         // configured only by --retention-default/--retention-tenant still gets
         // frontier-reconciled even with no durable TenantConfig.retention_ns.
         let fold_retention = Arc::new(config.maintain.retention.clone());
+        // The fold derives its own targeted re-fold set at each tick, which
+        // evaluates the sweep's `SnapshotBlock::Named` condition and therefore
+        // needs the same CompactorConfig the Maintain-mode sweep is configured
+        // with (issue #1763). Nothing is handed over between the two loops:
+        // this branch never spawns a maintain loop at all.
+        let fold_compactor = Arc::new(config.maintain.compactor.clone());
         let fold_tasks = fold::spawn(
             catalog,
             store_background.clone(),
             &config.fold_tenants,
             config.fold,
             fold_retention,
+            fold_compactor,
         );
         (fold_tasks, maintain::MaintenanceTasks::none())
     };
