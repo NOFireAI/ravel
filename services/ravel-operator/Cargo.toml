@@ -65,6 +65,29 @@ blake3 = { workspace = true }
 # between them. Pinned to `ring` here, matching kube's existing selection, so
 # this is the only crate whose Cargo.toml needs to change.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# The operator's own `/healthz` `/readyz` `/metrics` listener (ADR-1731
+# decision 2). `hyper` is the workspace pin; `hyper-util` and
+# `http-body-util` are new direct dependencies (not yet in
+# [workspace.dependencies], since this task's scope excludes the workspace
+# root Cargo.toml), pinned to the versions Cargo.lock already resolves them
+# to via other crates' transitive graphs. Three fixed paths need no router
+# (axum/tower are rejected in the ADR), so only the low-level server pieces
+# are pulled in: `http1` (kubelet and Prometheus scrapers are HTTP/1.1) and
+# `tokio` (for `TokioIo`), not `server`, `client`, or `http2`.
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+http-body-util = { version = "0.1.4", default-features = false }
+bytes = "1"
+
+[dev-dependencies]
+# Parses `deploy/k8s/operator/operator.yaml` in the render-parity test
+# (`shipped_deployment_security_context_matches_rendered`) so the test
+# compares the checked-in manifest against the render functions rather than
+# comparing the render functions against themselves. Test-only: never links
+# into the shipped binary. Not a workspace dependency because no other crate
+# needs a YAML parser and this task's scope excludes the workspace root
+# Cargo.toml.
+serde_yaml = "0.9"
 
 [lints]
 workspace = true
