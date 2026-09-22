@@ -41,15 +41,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bounded at `max_samples` by the worker itself, while an intra-cluster slice
   has no per-slice sample limit at all. A slice that does cross it is refused
   as a budget error naming both figures. The ceiling is fixed: it applies with
-  no configuration at all, and nothing raises or lowers it. In particular it is independent of `max_bytes_scanned`, which
-  budgets the compressed store bytes a slice reads rather than the uncompressed
-  bytes it sends back. Both caps are per slice, and what multiplies them
-  depends on the path: a local fan-out runs up to `promql_fetch_fanout` times
-  `max_parallel_slices` decoders at once (64 at the defaults), while a
-  federated query runs one per remote cluster and `max_parallel_slices` does
-  not bound it. A breach is a refusal rather than an outage: HTTP
-  422 naming the observed figure and the cap, in the same class a local budget
-  trip uses, not the redacted 503 other slice failures become. A refusal fails
+  no configuration at all, and nothing raises or lowers it. In particular it
+  is independent of `max_bytes_scanned`, which budgets the compressed store
+  bytes a slice reads rather than the uncompressed bytes it sends back. Both
+  caps are per slice, and what multiplies them depends on the path: a local
+  fan-out runs up to `promql_fetch_fanout` times `max_parallel_slices`
+  decoders at once (64 at the defaults), while a federated query runs one per
+  remote cluster and `max_parallel_slices` does not bound it. A breach is a
+  refusal rather than an outage: HTTP 422 naming the observed figure and the
+  cap, in the same class a local budget trip uses, not the redacted 503 other
+  slice failures become. A refusal fails
   the query and so carries no stats block; the wire bytes a slice made the
   coordinator accept are reported as `wireBytesConsumed` in `stats.fragments[]`
   on the slices that completed.
