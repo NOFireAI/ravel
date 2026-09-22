@@ -391,6 +391,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the operator re-qualifies each existing cluster once against its unchanged
   store. The qualify Job is a one-shot that touches no Deployment, so no serving
   pod is restarted and there is no downtime. Subsequent reconciles are stable.
+- **The distributed query client no longer carries an unbounded slice decode
+  path** (issue #1912). `ravel-query`'s `RemoteSliceFetcher` drained every
+  frame a remote sent into a `Vec` and decoded it afterwards, so the remote
+  decided how much the coordinator held. Issue #1687 replaced that with an
+  incremental capped decode for the metrics signal only, leaving the log and
+  span helpers (`decode_log_slice_frames`, `decode_span_slice_frames`) and the
+  collect-then-decode fetch that fed them as the last unbounded path. Both
+  helpers and that fetch are removed, and `RemoteSliceFetcher::fetch` now
+  decodes through the same `SliceStreamDecoder` the rest of the coordinator
+  uses, under the per-slice caps #1687 introduced (1048576 response frames and
+  230331648 wire bytes, refused as HTTP 422 naming both figures). No deployed
+  query changes behavior: nothing served a log or span slice through
+  `RemoteSliceFetcher`, and the log and span fetches on the `SliceFetcher`
+  trait were, and remain, the defaults that report `Unsupported` and send the
+  coordinator to whole-query local execution. The removed items were public in
+  `ravel_query::distrib::client`, so any out-of-tree caller of them has to move
+  to `SliceStreamDecoder`. `RemoteSliceFetcher` gains `with_max_frames` and
+  `with_max_bytes` for lowering either cap.
 - **Native histogram samples whose shape Prometheus itself rejects are now
   refused at ingest, on both the OTLP and Remote Write surfaces**
   (issue #1858). This is a behaviour change at the ingest boundary: a sender
