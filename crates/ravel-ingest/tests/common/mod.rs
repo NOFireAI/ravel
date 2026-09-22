@@ -300,11 +300,17 @@ impl ObjectStoreBackend for SlowStore {
 /// same shape with a skip count; a change to how `publish` classifies split
 /// brain has to be made in both until that one folds onto this.
 ///
-/// A byte-identical `span_on_shard` and an equivalent double also live in
-/// `crates/ravel-failure-tests/tests/partial_multi_shard_commit.rs` and in
-/// `services/ravel-server/src/lib.rs`. Both are in other crates, and this
-/// module is a dev-only `tests/common`, so neither can reach it without a
-/// shared dev-dependency crate. Tracked on #1867.
+/// Two other crates carry related code, and they carry different things.
+/// `crates/ravel-failure-tests/tests/partial_multi_shard_commit.rs:95-113`
+/// has a byte-identical `span_on_shard` and NO split-brain double.
+/// `services/ravel-server/src/lib.rs` has an equivalent double (4128-4200,
+/// parameterized the same way) and a `span_on_shard` (4256-4275) that is NOT
+/// identical: it scans a u32 big-endian counter over the leading four bytes
+/// where this one scans a u64 little-endian counter over eight, so for the
+/// same `want_shard` it yields different trace ids. Do not copy a change to
+/// this scan into that one without re-deriving it. Both crates are outside
+/// ravel-ingest and this is a dev-only `tests/common`, so neither can reach
+/// it without a shared dev-dependency crate. Tracked on #1867.
 pub struct SplitBrainOnFirstCommit {
     inner: MemoryStore,
     poisoned: AtomicBool,
