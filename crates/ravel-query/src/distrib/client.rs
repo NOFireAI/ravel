@@ -730,8 +730,12 @@ mod tests {
     /// `SliceStreamDecoder`, `push`/`finish` repeat this function's match rather
     /// than calling into it, so the frames a slice may carry are decoded in two
     /// places. This feeds identical sequences to both and asserts they agree, on
-    /// the accepted response and on the typed error for every terminal
-    /// malformation this function names.
+    /// the accepted response and on the typed error, over the SERIES and
+    /// SUMMARY frames only. The sequences below do not cover a malformed
+    /// `Hist` or `PartialAggregate` frame, the two `FrameSignalUnsupported`
+    /// arms (`LogRecord` and `Span`), or an unknown status code, so drift on
+    /// those arms is not caught here. Widening the pin to the arms this
+    /// function names is issue #1933.
     ///
     /// `SliceResponse` and `DistribError` are `Debug` but neither is `PartialEq`,
     /// so the comparison is over their `Debug` rendering, which covers every
