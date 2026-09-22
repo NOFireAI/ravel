@@ -385,6 +385,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reported. A new gate check refuses a parse that reaches promql-parser by
   naming or importing it anywhere else in either crate, so a future entry point
   cannot skip the guard by not knowing about it.
+
 ### Fixed
 
 - **An `--s3-endpoint` written with no URL scheme is refused at startup**
