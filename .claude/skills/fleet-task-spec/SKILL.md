@@ -100,12 +100,39 @@ Gates: format and lint IN PLACE before the commit you will gate -- run
 scripts/affected-tests.sh -p <crate> [-p <crate2>]. Cap cargo's build
 parallelism through the environment, not a flag, because
 `scripts/affected-tests.sh` accepts no `--jobs` and runs cargo at the
-default otherwise: find your executor class with `uname -m` and `nproc`
-(x86_64 with 16 cores is the amd64 class, aarch64 with 4 cores is the
-arm64 Pi class), then prefix every cargo command and every script that
-runs cargo with `CARGO_BUILD_JOBS=4` on amd64 or `CARGO_BUILD_JOBS=2` on
-arm64. `scripts/gates.sh` caps jobs on an 8 GB host by itself; nothing
-else does. Do NOT run
+default otherwise: read `nproc` and DERIVE the cap from it rather than
+matching a known machine shape, then prefix every cargo command and every
+script that runs cargo with `CARGO_BUILD_JOBS=<that number>`. Use
+`min(4, max(2, nproc / 4))`, and report the `uname -m`, the `nproc` and the
+value you used. `scripts/gates.sh` caps jobs on an 8 GB host by itself;
+nothing else does.
+
+Derive it; do not enumerate. This paragraph used to name two shapes,
+x86_64-with-16-cores and aarch64-with-4-cores, and branch on them. At
+least three shapes are in the pool: those two and an 8-core x86_64 with
+about 15 GB of RAM. An executor reading an enumeration that does not
+cover its box has no instruction, and the failure is worse than a missing
+one. On the 8-core box `CARGO_BUILD_JOBS=4` gets `ld` KILLED WITH SIGNAL
+9 during a cold `--all-targets` link, and a SIGKILLed linker reads as a
+compiler error, so the next reader debugs a code problem that is a memory
+problem. That is the same false diagnosis ENOSPC produces when it
+surfaces as `linking with cc failed`. On 2026-09-13 an executor on that
+box read the enumeration, judged it did not apply, and chose 2 on its own
+initiative; the spec earned none of that.
+
+A spec must survive whatever hardware it lands on, because it does not
+choose. `label_selector {"arch":"amd64"}` is a PREFERENCE, not a
+constraint: after a grace period the scheduler falls back to other
+hardware. So do NOT write a stanza that stops the task on an unexpected
+architecture. One that did cost a whole dispatch on 2026-09-22 -- the task
+landed on a healthy Pi, the timing tripwire cleared it at 0.001s, and an
+arch stanza in the same spec killed it 24 seconds in, turning a slow build
+into a lost one and a redispatch.
+
+Keep the DEGRADED-BOX tripwire, which tests a different proposition: it
+fires on a box where `git config` takes 30 seconds or more, the one that
+burns four hours and produces nothing. A healthy Pi is slow, not broken,
+and that is the distinction the tripwire exists to draw. Do NOT run
 `cargo test --workspace`: full-workspace tests are verified at merge
 time (verify-dispatch cold gate and PR CI); your job is the blast
 radius of your own change, and affected-tests.sh computes it (the
