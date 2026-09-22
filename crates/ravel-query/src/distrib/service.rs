@@ -763,8 +763,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             });
         }
         // The record count rides the summary's `series_returned` field (reused
-        // per signal); `decode_log_slice_frames` reads it back as
-        // `records_returned`.
+        // per signal). No coordinator reads it back today: the client half of
+        // the log fan-out was deleted with the unbounded decoder it used
+        // (issue #1912), so this is the wire contract a bounded log decoder
+        // would have to honour, not something a live path consumes.
         frames.push(summary_frame(
             &accounting.snapshot(),
             records_returned,
@@ -908,7 +910,8 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             });
         }
         // The span count rides the summary's `series_returned` field (reused per
-        // signal); `decode_span_slice_frames` reads it back as `spans_returned`.
+        // signal). As on the log path above, no coordinator reads it back today
+        // (issue #1912).
         frames.push(summary_frame(
             &accounting.snapshot(),
             spans_returned,

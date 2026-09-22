@@ -55,9 +55,9 @@ pub enum DistribError {
     /// `PartialAggregate` (ADR-0103 decision 2) on a log or span slice, where a
     /// worker-computed scalar aggregate is never expected (the metrics decoder
     /// does consume it).
-    /// Unreachable from a real query today: the metrics coordinator only ever
-    /// dispatches `Signal::Metrics`, and the log/span coordinators that would
-    /// receive these frames are built by #284/#285. The `frame` oneof is
+    /// Unreachable from a real query today: this crate only ever dispatches
+    /// `Signal::Metrics` across the slice boundary, and nothing here decodes a
+    /// remote's log or span slice (issue #1912). The `frame` oneof is
     /// exhaustive, so every decoder must still name the variants: this is a
     /// well-formed frame this build does not consume, not corruption.
     #[error(
@@ -304,17 +304,14 @@ impl SliceFetcher for RemoteSliceFetcher {
             .map_err(|s| DistribError::Transport(s.to_string()))?;
         let mut decoder = self.decoder();
         let mut stream = response.into_inner();
-        loop {
-            // A cap breach returns here rather than pulling another message:
-            // the caps bound what this coordinator holds only if the read stops.
-            match stream
-                .message()
-                .await
-                .map_err(|s| DistribError::Transport(s.to_string()))?
-            {
-                Some(frame) => decoder.push(frame)?,
-                None => break,
-            }
+        // A cap breach returns from here rather than pulling another message:
+        // the caps bound what this coordinator holds only if the read stops.
+        while let Some(frame) = stream
+            .message()
+            .await
+            .map_err(|s| DistribError::Transport(s.to_string()))?
+        {
+            decoder.push(frame)?;
         }
         decoder.finish()
     }
@@ -429,11 +426,18 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::pin::Pin;
+
+    use futures::Stream;
     use ravel_types::accounting::{AccountedOp, QueryAccountingSnapshot};
     use ravel_types::{Label, LabelSet, SeriesId};
+    use tokio::runtime::Runtime;
+    use tonic::transport::Server;
+    use tonic::transport::server::TcpIncoming;
 
     use super::*;
     use crate::distrib::codec::{self, CodecError};
+    use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 
     fn label_set() -> LabelSet {
         LabelSet::new(vec![Label {
@@ -820,4 +824,117 @@ mod tests {
         ));
     }
 
+    // --- The remote read path is bounded (#1912) ---------------------------
+    //
+    // `RemoteSliceFetcher::fetch` is the only code in this crate that reads a
+    // remote worker's stream. It decodes through `SliceStreamDecoder`, so a
+    // worker that streams without end is refused at the cap instead of being
+    // drained into the coordinator's memory. The tests below drive it over a
+    // real loopback gRPC worker to prove that on the live path, not on the
+    // decoder in isolation (`crate::distrib::slice_cap_tests` covers that).
+
+    /// A worker that answers every fetch with `count` well-formed series frames
+    /// and never sends the terminal summary. Nothing in the sequence is
+    /// malformed, so a fetch that refuses it refused it for its SIZE.
+    #[derive(Clone)]
+    struct FloodWorker {
+        count: usize,
+    }
+
+    #[tonic::async_trait]
+    impl SeriesFetch for FloodWorker {
+        type FetchStream =
+            Pin<Box<dyn Stream<Item = Result<pb::FetchResponse, tonic::Status>> + Send + 'static>>;
+
+        async fn fetch(
+            &self,
+            _request: tonic::Request<pb::FetchRequest>,
+        ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
+            let soa = series_soa();
+            let frames: Vec<_> = (0..self.count).map(|_| Ok(series_frame(&soa))).collect();
+            Ok(tonic::Response::new(Box::pin(futures::stream::iter(
+                frames,
+            ))))
+        }
+    }
+
+    /// Serve `count` frames from a loopback worker and run one `RemoteSliceFetcher`
+    /// fetch against it, with the caps `caps` installs.
+    fn fetch_from_flood_worker(
+        count: usize,
+        caps: impl FnOnce(RemoteSliceFetcher) -> RemoteSliceFetcher,
+    ) -> Result<SliceResponse, DistribError> {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async move {
+            let incoming =
+                TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind loopback");
+            let addr = incoming.local_addr().expect("local addr");
+            let server = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(SeriesFetchServer::new(FloodWorker { count }))
+                    .serve_with_incoming(incoming)
+                    .await
+            });
+            let channel = Channel::from_shared(format!("http://{addr}"))
+                .expect("endpoint")
+                .connect_lazy();
+            let result = caps(RemoteSliceFetcher::new(channel))
+                .fetch(pb::FetchRequest::default())
+                .await;
+            server.abort();
+            result
+        })
+    }
+
+    /// The acceptance test for issue #1912: no path in this crate collects a
+    /// remote's frames before deciding whether it may hold them.
+    ///
+    /// A worker streams 64 frames at a fetcher whose per-slice frame cap is 4.
+    /// The fetch refuses with `SliceFrameCapExceeded { frames: 5, max: 4 }`: the
+    /// five is the proof, because it is the cap plus the one frame the decoder
+    /// must receive to notice the cap was passed. A `collect`-then-decode path
+    /// (the deleted `collect_frames` shape) would have had all 64 in memory
+    /// before any check ran, so `frames` would read 64 and this assertion would
+    /// fail. Deleting the caps entirely would decode all 64 to an `Err(NoSummary)`
+    /// instead, which also fails here.
+    #[test]
+    fn no_unbounded_slice_decode_path_remains() {
+        let result = fetch_from_flood_worker(64, |fetcher| fetcher.with_max_frames(4));
+        match result {
+            Err(DistribError::Codec(CodecError::SliceFrameCapExceeded { frames, max })) => {
+                assert_eq!(max, 4);
+                assert_eq!(frames, 5, "the read must stop one frame past the cap");
+            }
+            other => panic!("expected a frame-cap refusal, got {other:?}"),
+        }
+    }
+
+    /// The same live path under the absolute wire-byte ceiling, which is the cap
+    /// that binds when a worker sends few but enormous frames. One series frame
+    /// is larger than this one-byte cap, so the first frame refuses the slice.
+    #[test]
+    fn remote_fetch_refuses_a_slice_past_the_byte_cap() {
+        let result = fetch_from_flood_worker(64, |fetcher| fetcher.with_max_bytes(1));
+        match result {
+            Err(DistribError::Codec(CodecError::SliceByteCapExceeded { bytes, max })) => {
+                assert_eq!(max, 1);
+                assert!(bytes > 1, "the refusal counts the frame that tripped it");
+            }
+            other => panic!("expected a byte-cap refusal, got {other:?}"),
+        }
+    }
+
+    /// The control for both cap tests: the same transport, under caps the stream
+    /// fits inside, decodes normally. Without this, a fetch broken in any way at
+    /// all would satisfy the two refusal assertions above by accident.
+    #[test]
+    fn remote_fetch_under_the_caps_decodes_the_slice() {
+        let response = fetch_from_flood_worker(3, |fetcher| {
+            fetcher.with_max_frames(4).with_max_bytes(1 << 20)
+        });
+        // The flood worker sends no summary, so a stream that was read to its end
+        // under the caps is `NoSummary`: the decode ran and reached the end of the
+        // stream, rather than refusing part way through it.
+        assert!(matches!(response, Err(DistribError::NoSummary)));
+    }
 }

@@ -18,11 +18,7 @@
 use std::sync::Arc;
 
 use proptest::prelude::*;
-use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
-use ravel_object_store::fault::{
-    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
-};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::SeriesData;
@@ -39,24 +35,19 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Server};
 use uuid::Uuid;
 
-use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
-use ravel_types::logstream::{LogStreamId, log_stream_id};
-
 use crate::config::EngineConfig;
 use crate::distrib::Distributed;
 use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, SliceResponse};
 use crate::distrib::federation::{Federation, RemoteCluster};
-use crate::distrib::partition::{DistribThresholds, partition_snapshot};
-use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
+use crate::distrib::partition::DistribThresholds;
+use crate::distrib::proto::series_fetch_server::SeriesFetch;
 use crate::distrib::{
-    log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver, span_cmp,
-    span_order_key,
+    service::SeriesFetchService, service::SnapshotSegmentResolver, span_cmp, span_order_key,
 };
 use crate::engine::merge_soa_runs;
-use crate::erasure::{ErasurePredicate, is_erased_span};
+use crate::erasure::ErasurePredicate;
 use crate::fetcher::SegmentFetcher;
-use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
+use crate::log_fetcher::{LogFetchError, LogSegmentFetcher};
 use crate::span_fetcher::{SpanFetchError, SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
