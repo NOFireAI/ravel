@@ -33,6 +33,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint serves the loaded configuration and reads no evaluation outcome;
   `/api/v1/alerts` is not served.
 
+- **`ravel_store_probe_last_run_timestamp_seconds` gauge for the store-probe
+  task's own liveness** (issue #1728). The background store-reachability
+  probe (`store_probe::spawn`) runs as a single `tokio::spawn` with no restart
+  path and no `JoinHandle` observation; if it dies, `ravel_store_reachable`
+  and `ravel_store_probe_failures_total` freeze at their last values and
+  `/readyz` reads that stale state as healthy forever. The new gauge is set
+  from an injected clock at the end of every completed probe cycle, whatever
+  its outcome, so its AGE (not its value) is the signal that the task itself
+  has stopped: a failing-but-alive probe keeps advancing it every cycle.
+  `docs/guides/observability.md` documents the alert and derives its
+  threshold from the probe interval.
 - **`ravel-bench`'s ingest and end-to-end reports break out queue-deadline
   abandonment as its own `abandoned_queue_deadline` counter instead of
   leaving it unreported** (issue #1823). `ingest_bench` and `s3_e2e_bench`
