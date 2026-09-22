@@ -373,6 +373,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the operator re-qualifies each existing cluster once against its unchanged
   store. The qualify Job is a one-shot that touches no Deployment, so no serving
   pod is restarted and there is no downtime. Subsequent reconciles are stable.
+
 - **Every PromQL parse of caller text runs the pre-parse complexity guard,
   because one function now does both** (issue #1817). The guard that keeps an
   over-bound query from overflowing the stack inside promql-parser, which

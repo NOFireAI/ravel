@@ -69,7 +69,7 @@ The erasure-request sweep is `sweep_erasure_requests_inner` in
 retires a request object at
 `t/<tenant_hash>/<signal>/del/<request_id>.dreq` once its erasure is complete,
 past the post-completion protection horizon, and no longer held by a legal
-hold or a still-resolvable superseded input. The lifecycle makes five
+hold or a still-resolvable superseded input. The lifecycle makes six
 object-store calls on the `del/` prefix, across two roles, and each needs its
 own grant. The set is derived from every call site that touches the prefix,
 not from the sweep alone: scoping it to one function is how an earlier draft
@@ -90,9 +90,13 @@ request object, which makes the delete grant unreachable; and without the
 `.done` write the sweep's completion lookup always misses, so every request
 counts as still pending and none is ever deleted.
 
-One scope is narrower than the ADR's `del/**`: the delete is `*.dreq` and not
-`del/*`, because completion records are permanent erasure evidence and no role
-may delete them. The read is `del/*` as the ADR writes it, because both object
+Two scopes are deliberately narrower than the ADR writes them. The delete is
+`*.dreq` and not `del/*`, because completion records are permanent erasure
+evidence and no role may delete them. `AdminWrite` is `t/*/*/del/*.dreq` where
+ADR-0055's role table writes `t/*/*/del/*` (docs/adrs/0055-storage-credential-scoping.md:639-640),
+because `ravel-cli erase submit` writes only the `.dreq`; the `.done` is
+written by Maintain. Both are tightenings, recorded here so neither reads as
+drift against the ADR. The read is `del/*` as the ADR writes it, because both object
 shapes under the prefix are fetched — the `.done` by the sweep, the `.dreq` by
 the rewrite pass.
 
