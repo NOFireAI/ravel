@@ -943,13 +943,14 @@ retention drops the hour. Queries keep resolving throughout and no delete is
 ever wrongly permitted: this is a liveness and storage gap, not a
 durability or availability one.
 
-The fold cannot close it alone. Which already-folded hour received a late
-record is not derivable from the snapshot entries; proving it requires
-listing that hour's commit buckets, and the candidate set is every hour the
-snapshot names, so a self-derived pass would cost a full-history LIST
-fan-out on every fold. The sweep already pays for those LISTs and already
-computes the answer: a bucket it holds on `SnapshotBlock::Named` is exactly
-an hour whose snapshot entries still name superseded inputs.
+The fold closes it by deriving the affected hours itself. Which already-folded
+hour received a late record is not readable off the snapshot entries, but it is
+exactly the condition the superseded-input sweep already evaluates: a bucket
+that sweep holds on `SnapshotBlock::Named` is an hour whose snapshot entries
+still name inputs that a compaction or rewrite record superseded. That
+condition is one function, `ravel_maintain::blocked_named_hours`, and both
+sides call it, so the sweep's reporting field and the fold's work list cannot
+drift apart on what "blocked" means.
 
 `Catalog::fold_with_refold_request` is the receiving end. It takes a
 `RefoldRequest` (a set of ingest hours) and runs a third reconcile pass over
@@ -964,8 +965,8 @@ those hours, after the fixed window and the frontier band:
 - **Bounded per fold.** What survives those filters is capped oldest-first at
   `frontier_reconcile_max_hours`, the same runtime value the frontier band
   reads (default 168), so lowering that bound lowers both. The remainder needs
-  no deferral bookkeeping in the snapshot: the requester re-derives its
-  blocked set on each pass, so a still-blocked hour is requested again.
+  no deferral bookkeeping in the snapshot: the fold re-derives its blocked set
+  at every tick, so a still-blocked hour is picked up again.
 - **Same diff-and-apply, same CAS.** Requested buckets go through the
   identical `Catalog::classify_bucket` diff, mark their covering parts dirty
   the same way, and land in the same single HEAD CAS. A re-fold can
@@ -973,42 +974,44 @@ those hours, after the fixed window and the frontier band:
 - **Skipped when redundant.** The pass sits inside the same reconcile block
   as the other two, so a first fold and a rebuilt fold ignore a request
   entirely: a rebuild already re-derives every hour from the commit layout.
-- **A hint, never a durability dependency.** An hour nobody requests
+- **A hint, never a durability dependency.** An hour the derivation misses
   degrades to the behaviour above (it keeps naming its pre-rewrite inputs
   until the frontier band reaches it), and the sweep's HEAD-reachability
   gate remains the delete blocker in every case.
 
-### Who sends the request
+### Who derives the request
 
-The producing side is the maintain tier. A sweep pass returns the ingest
-hours it held on `SnapshotBlock::Named` in `SweepReport::blocked_named_hours`,
-the maintain tick unions that set over the shards it owns under ADR-0065
-rendezvous, and it hands the union to the fold as one `RefoldRequest` per
-`(tenant, signal)` pair, which is the granularity a catalog covers. The fold
-loop drains the queue once per cycle, right after tenant discovery, and passes
-each tenant's drained hours to `fold_with_refold_request`. A request for a
-tenant that cycle does not maintain is taken off the queue and discarded
-rather than held, since holding it would evict fresher requests; the next
-sweep of that unit re-derives it. See
+The fold derives its own set, at its own tick, in its own process. Before
+folding a `(tenant, signal)`, `ravel_server::fold::run_tenant_tick` calls
+`ravel_maintain::blocked_named_hours` for that pair and passes the result
+straight to `fold_with_refold_request`. Nothing is handed over from the
+maintenance sweep: a Ravel process runs either the maintenance loop or the
+fold loop and never both (`services/ravel-server/src/lib.rs` branches on
+`Mode::Maintain`), so a queue between the two would have no producer in the
+process that folds.
+
+`SweepReport::blocked_named_hours` still carries the same hours back to the
+sweep's caller, where it is a reporting field on the sweep-complete log line.
+It is not a hand-off, and nothing reads it to schedule work. See
 docs/deletion-and-gc.md for the sweep-side rules that decide which hours
 enter the set.
 
-The hand-off is a hint on an in-process queue (`ravel_server::fold::RefoldQueue`,
-default capacity `DEFAULT_REFOLD_QUEUE_CAPACITY`, 256 pending requests), so
-three carve-outs apply on top of the per-pass rules above:
+Cost, per tenant per fold tick: one LIST of the signal's commit prefix to
+enumerate shards, then one LIST plus the record GETs per shard, sharing a
+single HEAD read across all of them. It is paid only after the HEAD freshness
+peek has decided that this tick folds at all.
 
-- **No-op fold.** The re-fold pass sits inside the reconcile block, so a fold
-  that finds nothing to seal reconciles nothing and reports
-  `refold_hours_reconciled == 0` even though a request was delivered. The next
-  sweep re-derives the same hours and sends them again.
-- **Dropped request.** A full queue evicts the oldest pending request and
-  counts the eviction in `RefoldQueue::dropped_requests`. Nothing is lost
-  durably: the dropped pair's next sweep recomputes its blocked set from the
-  live snapshot and sends it again.
-- **Process locality.** The queue lives in one process. A deployment that
-  runs the sweep and the fold in separate processes delivers no request at
-  all, and every fold there behaves exactly as the two preceding sections
-  describe.
+Two carve-outs apply on top of the per-pass rules above:
+
+- **Nothing sealed at all.** The re-fold pass sits inside the reconcile block,
+  so a fold of a tenant with no sealed watermark hour yet reconciles nothing
+  and reports `refold_hours_reconciled == 0`. A tenant that has merely stopped
+  ingesting is not such a case: a non-empty derived set carries the fold past
+  an unadvanced watermark, folds against the old watermark, and republishes it
+  unchanged, so a quiet tenant's blocked hour is still reconciled.
+- **Best effort.** A derivation that fails (a LIST or GET error) logs and
+  yields an empty set, and the fold proceeds without a targeted pass. The
+  hours stay blocked in the store and the next tick derives them again.
 
 ## Commit sequence (strict mode)
 

@@ -481,3 +481,735 @@ pub(crate) fn head_is_fresh(created_unix_ns: i64, now_ns: i64, interval: Duratio
 pub(crate) fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_maintain::FixedClock;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+
+    use super::*;
+    use crate::maintain::MaintenanceSafetyMetrics;
+    use crate::metrics::{
+        AdmissionCountersSnapshot, CatalogCountersSnapshot, IngestBufferBudgetSnapshot,
+        MaintenanceSafetySnapshot, MemoryBudgetSnapshot, render,
+    };
+
+    /// Real wall-clock nanoseconds per hour, the unit every ingest-hour-bucket
+    /// computation in this crate shares.
+    const TEST_NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// The ingest hour whose superseded inputs the live snapshot still names,
+    /// because its compaction record is published after the fold that built
+    /// that snapshot. Rule 2 holds it on
+    /// [`ravel_maintain::SnapshotBlock::Named`], and it is the only hour the
+    /// derivation may report.
+    const REFOLD_BLOCKED_HOUR: u32 = 5;
+    /// An ingest hour the same pass also looks at and builds a
+    /// superseded-input group in, whose compaction record was published BEFORE
+    /// the fold: the snapshot names the L1 output, the gate clears, and the
+    /// inputs are collectable. It must never appear in the derived set.
+    const REFOLD_CLEARED_HOUR: u32 = 6;
+    /// A later ingest hour with a single L0 input and no compaction, which is
+    /// what the first fold's watermark lands on.
+    const REFOLD_RECENT_HOUR: u32 = 40;
+
+    /// `now_ns` at which ingest hour `hour` has just sealed under the default
+    /// catalog margins, matching `ravel_catalog`'s own `now_at_seal` test
+    /// helper.
+    fn refold_now_at_seal(hour: u32) -> i64 {
+        (i64::from(hour) + 1) * TEST_NS_PER_HOUR
+            + ravel_catalog::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS
+    }
+
+    fn subject_labels() -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "http_requests".to_string(),
+            },
+            Label {
+                name: "user_id".to_string(),
+                value: "u999".to_string(),
+            },
+        ])
+        .expect("valid labels")
+    }
+
+    /// Publish one single-series L0 segment and its commit record into
+    /// `(shard 0, ingest_hour_bucket)`, timestamped inside that hour.
+    async fn publish_refold_segment(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        writer_id: Uuid,
+        ingest_hour_bucket: u32,
+    ) -> ravel_proto::commit::v1::CommitRecord {
+        let tenant_hash = tenant.hash();
+        let ts_ns = i64::from(ingest_hour_bucket) * TEST_NS_PER_HOUR + 1_000;
+        let labels = subject_labels();
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, "http_requests", &labels).expect("series id"),
+            labels,
+            samples: vec![Sample { ts_ns, value: 1.0 }],
+        }];
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: ts_ns,
+                max_ingest_ts_ns: ts_ns,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: ts_ns,
+            max_ingest_ts_ns: ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: ts_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        rec
+    }
+
+    /// Publish a level-1 compaction record over `inputs` into
+    /// `(shard 0, ingest_hour_bucket)`, plus its single output part object.
+    /// The part object is written because rule 3 keeps every part a live
+    /// compaction record references, so its presence is what a later fold's
+    /// snapshot entry points at.
+    async fn publish_refold_compaction(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        ingest_hour_bucket: u32,
+        inputs: &[&ravel_proto::commit::v1::CommitRecord],
+    ) -> ravel_proto::commit::v1::CompactionRecord {
+        use prost::Message as _;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
+
+        let created_unix_ns = i64::from(ingest_hour_bucket) * TEST_NS_PER_HOUR + 2_000;
+        let input_ids: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|r| CompactionInputIdentity {
+                writer_id: r.writer_id.clone(),
+                writer_epoch: r.writer_epoch,
+                writer_seq: r.writer_seq,
+            })
+            .collect();
+        let mut hasher = blake3::Hasher::new();
+        for id in &input_ids {
+            hasher.update(id.writer_id.as_bytes());
+            hasher.update(&id.writer_epoch.to_le_bytes());
+            hasher.update(&id.writer_seq.to_le_bytes());
+        }
+        let input_set_hash = *hasher.finalize().as_bytes();
+        let part_payload = format!("l1-{ingest_hour_bucket}").into_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: blake3::hash(&part_payload).as_bytes().to_vec(),
+            object_size: part_payload.len() as u64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            segment_format_version: 3,
+            declared_column_stats: Vec::new(),
+        };
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant.hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics).into(),
+            shard: 0,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: input_ids,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            created_unix_ns,
+        };
+
+        let part_key =
+            keys::reconstruct_l1_part_key(&record, &record.parts[0]).expect("l1 part key");
+        store
+            .put(
+                &part_key,
+                bytes::Bytes::from(part_payload),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put l1 part object");
+        store
+            .put(
+                &keys::compaction_record_key_for(&record).expect("compaction record key"),
+                bytes::Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        record
+    }
+
+    /// The exact set of data-object keys the live catalog HEAD snapshot names,
+    /// reconstructed from each snapshot entry's own identity fields.
+    async fn refold_head_object_keys(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+    ) -> BTreeSet<String> {
+        let got = store
+            .get(&head_key(tenant, Signal::Metrics), GetRange::Full)
+            .await
+            .expect("head present");
+        let head = ravel_catalog::decode_head(&got.data).expect("head decodes");
+        let mut out = BTreeSet::new();
+        for part_ref in &head.parts {
+            let got = store
+                .get(&part_ref.key, GetRange::Full)
+                .await
+                .expect("snapshot part present");
+            let decoded =
+                ravel_catalog::decode_part(&got.data, &ravel_catalog::PartLimits::default())
+                    .expect("snapshot part decodes");
+            for entry in decoded.entries {
+                out.insert(if entry.level == 0 {
+                    let writer_id: [u8; 16] = entry
+                        .writer_id
+                        .as_slice()
+                        .try_into()
+                        .expect("a level-0 entry carries a 16-byte writer id");
+                    let content_hash: [u8; 32] = entry
+                        .content_hash
+                        .as_slice()
+                        .try_into()
+                        .expect("an entry carries a 32-byte content hash");
+                    keys::data_key(
+                        tenant,
+                        Signal::Metrics,
+                        entry.shard,
+                        Uuid::from_bytes(writer_id),
+                        entry.writer_epoch,
+                        entry.writer_seq,
+                        &content_hash,
+                    )
+                    .expect("data key")
+                } else {
+                    keys::l1_part_key(
+                        tenant,
+                        Signal::Metrics,
+                        entry.shard,
+                        entry.ingest_hour_bucket,
+                        &hex::encode(&entry.writer_id[..8]),
+                        u32::try_from(entry.writer_epoch).expect("part index fits u32"),
+                        &hex::encode(&entry.content_hash[..8]),
+                    )
+                    .expect("l1 part key")
+                });
+            }
+        }
+        out
+    }
+
+    /// What every test below starts from: one folded catalog HEAD, one hour
+    /// whose compaction landed after that fold (so the snapshot still names
+    /// its raw inputs) and one hour whose compaction landed before it (so the
+    /// snapshot names the L1 output instead).
+    ///
+    /// The tenant is quiet after the first fold: nothing is ingested past
+    /// [`REFOLD_RECENT_HOUR`], which is what the acceptance test needs.
+    struct RefoldFixture {
+        store: Arc<MemoryStore>,
+        tenant: TenantHash,
+        catalog: Catalog,
+        /// The L0 input of [`REFOLD_BLOCKED_HOUR`], still named by the
+        /// snapshot the derivation gates against.
+        blocked_input: ravel_proto::commit::v1::CommitRecord,
+        /// The late compaction over `blocked_input`, published after the fold.
+        blocked_compaction: ravel_proto::commit::v1::CompactionRecord,
+        /// The compaction of [`REFOLD_CLEARED_HOUR`], published before the
+        /// fold, whose L1 output the snapshot already names.
+        cleared_compaction: ravel_proto::commit::v1::CompactionRecord,
+        /// The lone uncompacted L0 input of [`REFOLD_RECENT_HOUR`].
+        recent_input: ravel_proto::commit::v1::CommitRecord,
+    }
+
+    impl RefoldFixture {
+        /// The snapshot key set a correct targeted re-fold leaves behind: the
+        /// late compaction's L1 part in place of the input it superseded, and
+        /// the two hours the re-fold does not touch, unchanged.
+        fn expected_keys_after_refold(&self) -> BTreeSet<String> {
+            BTreeSet::from([
+                keys::reconstruct_l1_part_key(
+                    &self.blocked_compaction,
+                    &self.blocked_compaction.parts[0],
+                )
+                .expect("blocked hour l1 part key"),
+                keys::reconstruct_l1_part_key(
+                    &self.cleared_compaction,
+                    &self.cleared_compaction.parts[0],
+                )
+                .expect("cleared hour l1 part key"),
+                keys::reconstruct_data_key(&self.recent_input).expect("recent data key"),
+            ])
+        }
+    }
+
+    async fn refold_fixture() -> RefoldFixture {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let blocked_input = publish_refold_segment(
+            store.as_ref(),
+            &tenant_id,
+            Uuid::from_u128(0x5100),
+            REFOLD_BLOCKED_HOUR,
+        )
+        .await;
+        let cleared_input = publish_refold_segment(
+            store.as_ref(),
+            &tenant_id,
+            Uuid::from_u128(0x5200),
+            REFOLD_CLEARED_HOUR,
+        )
+        .await;
+        let cleared_compaction = publish_refold_compaction(
+            store.as_ref(),
+            &tenant_id,
+            REFOLD_CLEARED_HOUR,
+            &[&cleared_input],
+        )
+        .await;
+        let recent_input = publish_refold_segment(
+            store.as_ref(),
+            &tenant_id,
+            Uuid::from_u128(0x5300),
+            REFOLD_RECENT_HOUR,
+        )
+        .await;
+
+        let catalog = Catalog::new(
+            store.clone(),
+            ravel_catalog::CatalogConfig {
+                shard_count: 1,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+        let first = catalog
+            .fold(
+                &tenant,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                refold_now_at_seal(REFOLD_RECENT_HOUR),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(
+            first.entry_count, 3,
+            "the first fold names the blocked hour's raw L0 input, the cleared hour's \
+             L1 part, and the recent hour's raw L0 input"
+        );
+        assert_eq!(
+            first.watermark_hour,
+            Some(REFOLD_RECENT_HOUR),
+            "the first fold's watermark is the last hour that had sealed by then"
+        );
+
+        // Published only now: the snapshot above cannot name its output, so
+        // rule 2 must hold this hour's inputs on `SnapshotBlock::Named`.
+        let blocked_compaction = publish_refold_compaction(
+            store.as_ref(),
+            &tenant_id,
+            REFOLD_BLOCKED_HOUR,
+            &[&blocked_input],
+        )
+        .await;
+
+        RefoldFixture {
+            store,
+            tenant,
+            catalog,
+            blocked_input,
+            blocked_compaction,
+            cleared_compaction,
+            recent_input,
+        }
+    }
+
+    /// The acceptance test for issue #1763: a tenant whose last write is in
+    /// [`REFOLD_RECENT_HOUR`] and which ingests nothing afterwards still gets
+    /// the hour a late compaction record staled reconciled.
+    ///
+    /// The second fold runs at the SAME instant as the fixture's first one, so
+    /// `sealed_watermark_hour` returns the watermark already on HEAD and the
+    /// fold's incremental range is empty. That is the quiet-tenant trap: the
+    /// fold used to take the `no_op` early return on an unadvanced watermark
+    /// before ever reaching the targeted re-fold pass, and reported
+    /// `refold_hours_reconciled == 0` on every tick forever.
+    ///
+    /// This is the distinguishing test for "the fold derives the set but the
+    /// early return still wins": restoring the unconditional
+    /// `return Ok(no_op_report(...))` on `watermark_hour_old >= sealed_hour`
+    /// in `crates/ravel-catalog/src/fold.rs` fails every assertion below.
+    /// Both the count and the exact key set are asserted, because either alone
+    /// passes a near neighbour: the count alone would pass a fold that counted
+    /// the hour without rewriting anything, and the key set alone would pass a
+    /// fold that rewrote hour 5 for some other reason. Nothing else can:
+    /// hour 5 is outside the 26-hour reconcile window below watermark 40.
+    #[tokio::test]
+    async fn a_quiet_tenants_blocked_hour_is_refolded_without_a_watermark_advance() {
+        let fixture = refold_fixture().await;
+        let compactor = CompactorConfig::default();
+        let before = refold_head_object_keys(fixture.store.as_ref(), &fixture.tenant).await;
+        assert!(
+            before.contains(&keys::reconstruct_data_key(&fixture.blocked_input).expect("key")),
+            "the pre-fold snapshot names the input the late compaction superseded"
+        );
+
+        // The same instant the fixture folded at: nothing has sealed since,
+        // and nothing has been ingested since either.
+        let now_ns = refold_now_at_seal(REFOLD_RECENT_HOUR);
+        let report = run_tenant_tick(
+            &fixture.catalog,
+            fixture.store.as_ref(),
+            &compactor,
+            &fixture.tenant,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            // A zero interval opts out of the HEAD freshness peek, which would
+            // otherwise skip a tick this close behind the fixture's own fold.
+            Duration::ZERO,
+            now_ns,
+            None,
+        )
+        .await
+        .expect("the fold runs and returns a report");
+
+        assert!(
+            !report.no_op,
+            "a derived non-empty blocked set keeps the fold going past an unadvanced watermark"
+        );
+        assert_eq!(
+            report.refold_hours_reconciled, 1,
+            "the targeted pass reconciled the one derived hour"
+        );
+        assert_eq!(
+            (report.previous_watermark_hour, report.watermark_hour),
+            (Some(REFOLD_RECENT_HOUR), Some(REFOLD_RECENT_HOUR)),
+            "the watermark is republished unchanged, never regressed and never advanced"
+        );
+        assert_eq!(
+            refold_head_object_keys(fixture.store.as_ref(), &fixture.tenant).await,
+            fixture.expected_keys_after_refold(),
+            "after the re-fold the snapshot names the late compaction's output and no \
+             longer names the input it superseded"
+        );
+    }
+
+    /// The derivation is the sweep's condition, not "every hour in the
+    /// unsealed region": [`derive_refold_request`] returns EXACTLY the hours
+    /// whose live snapshot entry still names a superseded input.
+    ///
+    /// This is the distinguishing test for "the derivation is not the sweep's
+    /// condition". The fixture holds two other hours the same pass reaches:
+    /// [`REFOLD_CLEARED_HOUR`], whose compaction predates the fold so its gate
+    /// clears, and [`REFOLD_RECENT_HOUR`], which has no compaction at all.
+    /// Re-folding every hour below the watermark, or every hour the pass
+    /// touched, puts one of them in the set and fails the exact-set assertion.
+    ///
+    /// A real deleting `sweep_shard` is asserted to report the same set, which
+    /// is the anti-drift claim `ravel_maintain::blocked_named_hours` exists to
+    /// make. Its deletes are asserted too, so "hour 6 is absent" cannot pass by
+    /// the pass never reaching hour 6 at all.
+    #[tokio::test]
+    async fn the_derived_set_is_exactly_the_hours_the_live_snapshot_still_names() {
+        let fixture = refold_fixture().await;
+        let compactor = CompactorConfig::default();
+        let now_ns = refold_now_at_seal(REFOLD_RECENT_HOUR + 1);
+
+        let derived = derive_refold_request(
+            fixture.store.as_ref(),
+            &compactor,
+            &fixture.tenant,
+            Signal::Metrics,
+            now_ns,
+        )
+        .await;
+
+        assert_eq!(
+            derived.hours().collect::<BTreeSet<u32>>(),
+            BTreeSet::from([REFOLD_BLOCKED_HOUR]),
+            "only the hour whose snapshot entry still names its superseded inputs is the \
+             fold's work"
+        );
+        assert!(
+            !derived.hours().any(|h| h == REFOLD_CLEARED_HOUR),
+            "the hour whose compaction predates the fold cleared the gate, so a re-fold of \
+             it would change nothing"
+        );
+        assert!(
+            !derived.hours().any(|h| h == REFOLD_RECENT_HOUR),
+            "an hour with no compaction record at all has no superseded input to name"
+        );
+
+        // The same condition, from the other caller.
+        let report = ravel_maintain::sweep_shard(
+            fixture.store.as_ref(),
+            &FixedClock::new(now_ns),
+            &compactor,
+            &NoLeases,
+            &fixture.tenant,
+            Signal::Metrics,
+            0,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            report.blocked_named_hours,
+            derived.hours().collect::<BTreeSet<u32>>(),
+            "the sweep's reporting field and the fold's work list come from one function"
+        );
+        assert_eq!(
+            (
+                report.superseded_records_deleted,
+                report.superseded_data_deleted
+            ),
+            (1, 1),
+            "the cleared hour's one superseded input record and its one data object went \
+             this pass; the blocked hour's did not"
+        );
+    }
+
+    /// The same reconciliation on the ordinary path, where the tenant is still
+    /// ingesting and the watermark does advance, closing the loop: the hour the
+    /// first sweep had to hold is collectable by the next one.
+    #[tokio::test]
+    async fn a_late_compaction_record_is_refolded_when_the_watermark_advances() {
+        let fixture = refold_fixture().await;
+        let compactor = CompactorConfig::default();
+        let now_ns = refold_now_at_seal(REFOLD_RECENT_HOUR + 1);
+
+        let report = run_tenant_tick(
+            &fixture.catalog,
+            fixture.store.as_ref(),
+            &compactor,
+            &fixture.tenant,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            DEFAULT_FOLD_INTERVAL,
+            now_ns,
+            None,
+        )
+        .await
+        .expect("the HEAD is older than the fold interval, so the fold runs");
+
+        assert_eq!(
+            report.refold_hours_reconciled, 1,
+            "the targeted pass reconciled the one derived hour"
+        );
+        assert_eq!(
+            report.watermark_hour,
+            Some(REFOLD_RECENT_HOUR + 1),
+            "an hour sealed since the last fold advances the watermark"
+        );
+        assert_eq!(
+            refold_head_object_keys(fixture.store.as_ref(), &fixture.tenant).await,
+            fixture.expected_keys_after_refold(),
+            "after the re-fold the snapshot names the late compaction's output"
+        );
+
+        let second = ravel_maintain::sweep_shard(
+            fixture.store.as_ref(),
+            &FixedClock::new(now_ns),
+            &compactor,
+            &NoLeases,
+            &fixture.tenant,
+            Signal::Metrics,
+            0,
+        )
+        .await
+        .expect("second sweep");
+        assert!(
+            second.blocked_named_hours.is_empty(),
+            "nothing is held on a named snapshot once the fold has reconciled the hour"
+        );
+        assert_eq!(
+            (
+                second.superseded_records_deleted,
+                second.superseded_data_deleted
+            ),
+            (2, 2),
+            "no sweep ran before the fold in this test, so this one collects both hours: \
+             the cleared hour's input and the re-folded hour's"
+        );
+        assert!(
+            fixture
+                .store
+                .get(
+                    &keys::reconstruct_data_key(&fixture.blocked_input).expect("data key"),
+                    GetRange::Full
+                )
+                .await
+                .is_err(),
+            "the input the late compaction superseded is gone once the fold stopped naming it"
+        );
+    }
+
+    /// `SweepReport::blocked_named_hours` is a reporting field with no
+    /// Prometheus family of its own; what an operator watches is the sweep's
+    /// deleted-object counter, and a reconciled blocked hour is exactly what
+    /// makes it move. This pins that family on the rendered `/metrics` body
+    /// with both values: one delete before the re-fold (the cleared hour's
+    /// input) and two after it (the previously blocked hour's as well).
+    #[tokio::test]
+    async fn the_reconciled_blocked_hour_moves_the_rendered_delete_counter() {
+        let fixture = refold_fixture().await;
+        let compactor = CompactorConfig::default();
+        let now_ns = refold_now_at_seal(REFOLD_RECENT_HOUR + 1);
+        let clock = FixedClock::new(now_ns);
+        let safety = MaintenanceSafetyMetrics::default();
+
+        let first = ravel_maintain::sweep_shard(
+            fixture.store.as_ref(),
+            &clock,
+            &compactor,
+            &NoLeases,
+            &fixture.tenant,
+            Signal::Metrics,
+            0,
+        )
+        .await
+        .expect("first sweep");
+        assert_eq!(
+            first.blocked_named_hours,
+            BTreeSet::from([REFOLD_BLOCKED_HOUR]),
+            "the first sweep holds the blocked hour's data object back"
+        );
+        safety.record_sweep(Signal::Metrics, &first);
+        assert!(
+            render_body(&safety).contains(
+                "ravel_maintain_objects_deleted_total{mode=\"maintain\",\
+                 kind=\"superseded_data_deleted\"} 1"
+            ),
+            "only the cleared hour's data object has gone while the fold has not run"
+        );
+
+        run_tenant_tick(
+            &fixture.catalog,
+            fixture.store.as_ref(),
+            &compactor,
+            &fixture.tenant,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            DEFAULT_FOLD_INTERVAL,
+            now_ns,
+            None,
+        )
+        .await
+        .expect("the fold runs");
+
+        let second = ravel_maintain::sweep_shard(
+            fixture.store.as_ref(),
+            &clock,
+            &compactor,
+            &NoLeases,
+            &fixture.tenant,
+            Signal::Metrics,
+            0,
+        )
+        .await
+        .expect("second sweep");
+        safety.record_sweep(Signal::Metrics, &second);
+
+        let body = render_body(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_objects_deleted_total{mode=\"maintain\",\
+                 kind=\"superseded_data_deleted\"} 2"
+            ),
+            "the re-folded hour's data object is collected and counted:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_maintain_objects_deleted_total counter"),
+            "the family still carries its counter TYPE header:\n{body}"
+        );
+    }
+
+    /// The `/metrics` body a maintain-mode process renders with nothing set but
+    /// the maintenance safety counters.
+    fn render_body(safety: &MaintenanceSafetyMetrics) -> String {
+        let snapshot = MaintenanceSafetySnapshot::from_metrics(safety);
+        render(
+            crate::config::Mode::Maintain,
+            &ravel_object_store::instrument::StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            Some(&snapshot),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            false,
+        )
+    }
+}
