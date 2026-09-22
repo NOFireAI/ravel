@@ -2,8 +2,12 @@
 #
 # Apply order: namespace, then crd.yaml, then rbac.yaml, then this file. The
 # image tag is a placeholder the kind scripts override with the
-# locally built tag. For a real (non-kind) cluster, set this to a published
-# tag instead, e.g. ghcr.io/nofireai/ravel-operator:latest (ADR-0037).
+# locally built tag. For a real (non-kind) cluster, pin the image to a
+# digest rather than a moving tag, e.g.
+# ghcr.io/nofireai/ravel-operator@sha256:<digest> (ADR-0037): a tag like
+# `:latest` can point at a different image after this manifest is reviewed,
+# so a digest is what makes the reviewed manifest and the deployed image the
+# same thing.
 ---
 apiVersion: v1
 kind: Namespace
@@ -34,15 +38,49 @@ spec:
       labels:
         app.kubernetes.io/name: ravel-operator
         app.kubernetes.io/managed-by: ravel-operator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: ravel-operator
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: ravel-operator
           image: ravel-operator:latest
           imagePullPolicy: IfNotPresent
+          ports:
+            - name: health
+              containerPort: 8080
           env:
             - name: RUST_LOG
               value: info
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m
