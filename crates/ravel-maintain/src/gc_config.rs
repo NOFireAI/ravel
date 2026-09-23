@@ -146,27 +146,11 @@ impl GcConfigValues {
     /// ([`set_gc_config`]), so a durable object can never hold a non-positive
     /// field.
     ///
-    /// Also refuses a `max_flush_lifetime_ns` below `ingest_max_flush_lifetime_ns`
-    /// (issue #1744). Unlike `protection_horizon_ns` and `grace_ns`, `sys/gc`'s
-    /// own `max_flush_lifetime_ns` field is not read into any
-    /// [`crate::CompactorConfig`]: the real compactor's `max_flush_lifetime_ns`
-    /// comes from `--gc-max-flush-lifetime` (or its compiled-in default),
-    /// resolved and floor-checked independently in
-    /// `services/ravel-server/src/config.rs`'s `resolve_gc_runtime`, which is
-    /// the actual choke point standing between an operator and
-    /// [`Bucket::is_sealed`](crate::Bucket::is_sealed) sealing early. This
-    /// check exists so `sys/gc` -- the durable, operator-facing record of the
-    /// deployment's intended GC values (`ravel-cli gc-config show`) -- can
-    /// never hold a value the process itself would refuse to run with: a
-    /// below-floor durable record would be a standing lie about what is
-    /// actually enforced, confusing for an operator even though nothing reads
-    /// it back into the compactor today. Kept as defence in depth rather than
-    /// dropped, in case a future caller does wire this field into a real
-    /// config. The caller supplies `ingest_max_flush_lifetime_ns` (see
-    /// [`ingest_max_flush_lifetime_floor_ns`]) rather than this function reading
-    /// it itself, so a test can drive the boundary against an arbitrary floor and
-    /// prove the check actually uses the passed-in value rather than a
-    /// hardcoded one.
+    /// Also refuses a `max_flush_lifetime_ns` below the caller-supplied
+    /// `ingest_max_flush_lifetime_ns` floor (issue #1744), kept here as
+    /// defence in depth even though nothing reads this field back into a live
+    /// `CompactorConfig` today; see [`ingest_max_flush_lifetime_floor_ns`] for
+    /// why the floor exists.
     pub fn validate(&self, ingest_max_flush_lifetime_ns: i64) -> Result<(), GcConfigError> {
         for (field, got) in [
             ("protection_horizon_ns", self.protection_horizon_ns),
