@@ -111,8 +111,8 @@ const DASHBOARD_FILE: &str = concat!(
 /// nothing. `deploy/README.md` states the row and name figures.
 const EXPECTED_DASHBOARD_ROWS: usize = 6;
 const EXPECTED_DASHBOARD_PANELS: usize = 36;
-const EXPECTED_DASHBOARD_TARGETS: usize = 104;
-const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 107;
+const EXPECTED_DASHBOARD_TARGETS: usize = 105;
+const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 108;
 
 /// Families the dashboard graphs that no shipped rule alerts on.
 ///
