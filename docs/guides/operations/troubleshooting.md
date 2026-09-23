@@ -311,8 +311,13 @@ to route on.
 
 ## Data integrity and correctness alarms
 
-Page on any nonzero increase for all three of these. None is a rate to
-threshold.
+Page on any nonzero increase for the four counter rows below. None is a rate
+to threshold.
+
+The last row is different in kind and is read differently: a drain that loses
+acknowledged rows is a data-loss event on a process that is exiting, so its
+counters may never be scraped. Its ERROR log line is the reliable signal, and
+the row says which counters corroborate it.
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
