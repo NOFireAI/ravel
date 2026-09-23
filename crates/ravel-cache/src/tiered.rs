@@ -46,6 +46,16 @@
 //! [`TieredCache::get`]'s own docstring for the double-counting pitfall this
 //! crate has already shipped and fixed once on the closure-based path.
 //!
+//! **No disk operation runs on a runtime worker thread** (issue #1891). Every
+//! `std::fs` call this handle makes -- `get_or_fetch`'s and
+//! `resolve_peeked_miss`'s disk consult and admission, and the fetch-free path's
+//! [`TieredCache::get_off_worker`] / [`TieredCache::insert_off_worker`] -- runs
+//! under `spawn_blocking`. `get` and `insert` remain synchronous for a caller
+//! that is not on a runtime worker; an async caller uses the `_off_worker`
+//! pair, which is the same read-through and the same dual-tier admission with
+//! only the file operation dispatched. The RAM tier is always consulted inline:
+//! it is not I/O, and a RAM hit is the fast path.
+//!
 //! **A third path resolves a peek-then-defer miss under single-flight.**
 //! [`TieredCache::resolve_peeked_miss`] is for a caller that already peeked
 //! both tiers with `get`, saw a confirmed miss, and now wants to resolve it --
@@ -406,11 +416,11 @@ where
     /// # Blocking
     ///
     /// This is synchronous: a RAM miss reads the disk tier on the calling
-    /// thread. `get_or_fetch` runs its disk calls under `spawn_blocking`, this
-    /// path does not, so an async caller parks a runtime worker for the length
-    /// of a file read. `BlockRangeFetcher` calls it per extent from an async
-    /// function today. Call it from `spawn_blocking` in async context until
-    /// that is resolved; issue #1891 tracks it.
+    /// thread, so an async caller would park a runtime worker for the length of
+    /// a file read. It stays synchronous for a caller that is already on a
+    /// blocking thread or has no runtime at all; an async caller uses
+    /// [`get_off_worker`](Self::get_off_worker), which is this same read-through
+    /// with the disk consult dispatched to the blocking pool (issue #1891).
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
         // Fast path: a RAM hit is served verbatim (already corrupted, in
         // corruption mode, by `Cache::get`) and never consults disk, exactly
@@ -423,8 +433,38 @@ where
         // same order `get_or_fetch`'s disk-hit branch uses, so the gate reaches
         // a disk-served hit here identically.
         let bytes = self.disk.get(key)?;
-        self.ram.insert(*key, bytes.clone());
-        Some(self.maybe_corrupt(bytes, true))
+        Some(self.admit_disk_hit(*key, bytes))
+    }
+
+    /// [`get`](Self::get) for an async caller: the identical RAM-then-disk
+    /// read-through, with the disk consult run under `spawn_blocking` instead of
+    /// on the calling runtime worker (issue #1891, the pattern
+    /// [`get_or_fetch`](Self::get_or_fetch) already uses for its own disk
+    /// calls).
+    ///
+    /// The RAM tier is still consulted inline: it is a lock and a refcount bump,
+    /// not I/O, and a RAM hit is the fast path this handle exists to keep fast.
+    /// Only a RAM miss -- the case that actually opens a file -- pays a
+    /// blocking-pool dispatch. Hit/miss accounting is therefore identical to
+    /// `get`'s: exactly one RAM lookup, and at most one disk lookup, each
+    /// recorded once on its own tier's [`CacheMetrics`]. Every caveat in
+    /// [`get`](Self::get)'s docstring -- the peek-then-defer double-count
+    /// pitfall above all -- applies here unchanged.
+    ///
+    /// A `JoinError` (the blocking task panicked or was cancelled) is reported
+    /// as a plain disk miss, the same total-miss tolerance
+    /// [`get_or_fetch`](Self::get_or_fetch) gives its own `spawn_blocking` disk
+    /// read: `DiskCache::get` has no error variant to begin with, so this adds
+    /// no new failure mode the caller must handle.
+    pub async fn get_off_worker(&self, key: CacheKey) -> Option<Bytes> {
+        if let Some(bytes) = self.ram.get(&key) {
+            return Some(bytes);
+        }
+        let disk = self.disk.clone();
+        let bytes = tokio::task::spawn_blocking(move || disk.get(&key))
+            .await
+            .unwrap_or(None)?;
+        Some(self.admit_disk_hit(key, bytes))
     }
 
     /// Admit `value` under `key` into **both** tiers with no upstream fetch,
@@ -442,11 +482,35 @@ where
     ///
     /// Synchronous, like [`TieredCache::get`]: the disk admission runs on the
     /// calling thread rather than under `spawn_blocking`, so an async caller
-    /// parks a runtime worker for the length of a file write. Issue #1891
-    /// tracks moving this path off the worker.
+    /// would park a runtime worker for the length of a file write. An async
+    /// caller uses [`insert_off_worker`](Self::insert_off_worker) instead
+    /// (issue #1891).
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         self.ram.insert(key, value.clone());
         self.disk.insert(key, &value);
+    }
+
+    /// [`insert`](Self::insert) for an async caller: the identical dual-tier
+    /// admission, with the disk write run under `spawn_blocking` instead of on
+    /// the calling runtime worker (issue #1891).
+    ///
+    /// The RAM admission stays inline, for the reason
+    /// [`get_off_worker`](Self::get_off_worker) keeps the RAM lookup inline: it
+    /// is not I/O. It also keeps the RAM tier populated the moment this call is
+    /// made rather than one blocking-pool round trip later, so a concurrent
+    /// reader sees the entry exactly as early as it did before.
+    ///
+    /// A `JoinError` drops the disk admission silently, the same tolerance
+    /// [`get_or_fetch`](Self::get_or_fetch) gives its own disk write: the RAM
+    /// tier is already populated, so a lost disk write costs a future disk miss,
+    /// never a wrong result.
+    pub async fn insert_off_worker(&self, key: CacheKey, value: Bytes) {
+        self.ram.insert(key, value.clone());
+        // The blocking closure must own its bytes: `DiskCache::insert` borrows a
+        // slice, and a `spawn_blocking` closure has to be `'static`. `Bytes` is
+        // refcounted, so this clone copies no payload.
+        let disk = self.disk.clone();
+        let _ = tokio::task::spawn_blocking(move || disk.insert(key, &value)).await;
     }
 
     /// Current number of resident entries in the **RAM tier**.
@@ -494,6 +558,16 @@ where
     /// [`DiskCache::is_empty`] for a single-tier check when a caller needs one.
     pub fn is_empty(&self) -> bool {
         self.ram.is_empty()
+    }
+
+    /// Completes a disk-served hit: repopulate RAM read-through with the clean
+    /// bytes, then corrupt per-caller at serve time. Shared by [`get`](Self::get)
+    /// and [`get_off_worker`](Self::get_off_worker) so the two cannot drift in
+    /// admission order or corruption gating; the only difference between them is
+    /// which thread ran `DiskCache::get`.
+    fn admit_disk_hit(&self, key: CacheKey, bytes: Bytes) -> Bytes {
+        self.ram.insert(key, bytes.clone());
+        self.maybe_corrupt(bytes, true)
     }
 
     /// Corrupts `bytes` iff they came from a cache tier and the RAM tier is in
@@ -1558,6 +1632,245 @@ mod tests {
                     "test hung for {WATCHDOG_BOUND:?}: the leader's disk insert \
                      likely ran on the runtime's async thread and wedged it \
                      parked, instead of running on the blocking pool (see #1702)"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+                Ok(()) => panic!("worker thread exited without a result"),
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
+        }
+    }
+
+    /// A [`Clock`] that parks the thread inside the FIRST call made after it is
+    /// armed, announcing beforehand that the call has begun.
+    ///
+    /// The announcement is a tokio channel, so the waiting async task yields the
+    /// runtime instead of blocking it: on a `current_thread` runtime the awaited
+    /// `recv` is what lets the task under test be polled at all. The release is a
+    /// rendezvous `SyncSender`, so the parked thread resumes only when the test
+    /// says so -- no duration is ever measured or compared. Arming is separate
+    /// from construction because `DiskCache::new_with_clock` and a test's own
+    /// setup `insert` both call the clock before the operation under test does.
+    struct ParkOnFirstArmedCall {
+        armed: AtomicBool,
+        parked: AtomicBool,
+        began_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Clock for ParkOnFirstArmedCall {
+        fn now_ns(&self) -> u64 {
+            if self.armed.load(Ordering::SeqCst) && !self.parked.swap(true, Ordering::SeqCst) {
+                self.began_tx.send(()).unwrap();
+                self.release_rx.lock().recv().unwrap();
+            }
+            0
+        }
+    }
+
+    /// Bounds how long the watchdog waits before calling a hang a hang. Nothing
+    /// is asserted about elapsed time; this only stops a wedged runtime from
+    /// hanging the test binary forever.
+    const OFF_WORKER_WATCHDOG: Duration = Duration::from_secs(10);
+
+    /// #1891: the peek-then-defer READ path runs its disk consult on the
+    /// blocking pool, not on the runtime worker.
+    ///
+    /// `BlockRangeFetcher::fetch_blocks` peeks every candidate extent through
+    /// `ReadCache::get`, which is [`TieredCache::get_off_worker`] on the tiered
+    /// tier. This proves the claim by ordering, not by duration, exactly as the
+    /// #1702 test above does: the disk tier's injected [`Clock`] -- called on a
+    /// disk hit for the age check -- announces that the read has begun and then
+    /// parks. On a `current_thread` runtime there is one async thread and
+    /// nothing else, so if that read runs on the blocking pool the parked call
+    /// cannot stop the async thread from serving a concurrent RAM-resident peek
+    /// to completion; if it runs on the async thread it wedges the only thread
+    /// that could ever unpark it, and no duration exists at which the concurrent
+    /// peek "would" have run.
+    ///
+    /// FLIP (demonstrate failing): in [`TieredCache::get_off_worker`], replace
+    /// the `spawn_blocking` dispatch with the direct `self.disk.get(&key)` call
+    /// `get` makes. The reader task's first poll then parks inside the disk read
+    /// and never returns, so the `began_rx.recv().await` below resolves onto a
+    /// thread that can never run again, the concurrent peek is never reached,
+    /// and the watchdog fires with the message below instead of the test
+    /// passing.
+    #[test]
+    fn peeked_get_runs_the_disk_read_off_the_worker() {
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async {
+                let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                let tmp = TempDir::new().unwrap();
+                let clock = Arc::new(ParkOnFirstArmedCall {
+                    armed: AtomicBool::new(false),
+                    parked: AtomicBool::new(false),
+                    began_tx,
+                    release_rx: Mutex::new(release_rx),
+                });
+                let disk = DiskCache::new_with_clock(
+                    tmp.path().to_path_buf(),
+                    generous_limits(),
+                    clock.clone(),
+                );
+
+                // Disk-resident, RAM-empty: the state a peek must fall through
+                // RAM into disk to serve. Inserted before arming, so the stamp
+                // this setup write takes is not the call that parks.
+                let disk_key = test_key(1, 4);
+                disk.insert(disk_key, b"aaaa");
+
+                let ram: Cache<&'static str> = Cache::new(generous_limits());
+                let tiered = Arc::new(TieredCache::new(ram, disk));
+
+                // The concurrent probe's key, resident in RAM only: it is served
+                // without consulting disk at all, so its completion says the
+                // async thread is free rather than that a second disk read got
+                // through.
+                let probe_key = test_key(2, 4);
+                tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+
+                clock.armed.store(true, Ordering::SeqCst);
+
+                let tiered_reader = tiered.clone();
+                let reader =
+                    tokio::spawn(async move { tiered_reader.get_off_worker(disk_key).await });
+
+                // Awaiting (not blocking on) the announcement is what lets the
+                // reader task be polled on this single-threaded runtime, and it
+                // resolves only once the disk read has actually begun.
+                began_rx.recv().await.unwrap();
+
+                let served = tiered.get_off_worker(probe_key).await;
+                assert_eq!(
+                    served,
+                    Some(Bytes::from_static(b"bbbb")),
+                    "a RAM-resident peek must complete while a disk read is parked"
+                );
+
+                // The peek above completed only because the parked disk read is
+                // not holding this thread. Releasing it here is the
+                // deterministic stand-in for "the wait ends": the reader can
+                // only observe the assertion above as already made.
+                release_tx.send(()).unwrap();
+
+                let read = reader.await.unwrap();
+                assert_eq!(
+                    read,
+                    Some(Bytes::from_static(b"aaaa")),
+                    "the parked read still serves the disk-resident bytes"
+                );
+            });
+
+            let _ = done_tx.send(());
+        });
+
+        match done_rx.recv_timeout(OFF_WORKER_WATCHDOG) {
+            Ok(()) => worker.join().unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!(
+                    "test hung for {OFF_WORKER_WATCHDOG:?}: the peeked disk read \
+                     likely ran on the runtime's async thread and wedged it \
+                     parked, instead of running on the blocking pool (see #1891)"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+                Ok(()) => panic!("worker thread exited without a result"),
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
+        }
+    }
+
+    /// #1891: the peek-then-defer ADMISSION path runs its disk write on the
+    /// blocking pool, not on the runtime worker. The companion to
+    /// `peeked_get_runs_the_disk_read_off_the_worker` above, with the same
+    /// ordering argument and the same clock: here the parked call is
+    /// `DiskCache::insert`'s `written_at_ns` stamp, reached through
+    /// [`TieredCache::insert_off_worker`] -- what `ReadCache::insert`, and so
+    /// `BlockRangeFetcher`'s per-block admission, calls on the tiered tier.
+    ///
+    /// FLIP (demonstrate failing): in [`TieredCache::insert_off_worker`],
+    /// replace the `spawn_blocking` dispatch with the direct
+    /// `self.disk.insert(key, &value)` call `insert` makes. The admitting task's
+    /// first poll then parks inside the disk write and never returns, the
+    /// concurrent peek below is never reached, and the watchdog fires.
+    #[test]
+    fn peeked_insert_runs_the_disk_write_off_the_worker() {
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async {
+                let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                let tmp = TempDir::new().unwrap();
+                let clock = Arc::new(ParkOnFirstArmedCall {
+                    armed: AtomicBool::new(false),
+                    parked: AtomicBool::new(false),
+                    began_tx,
+                    release_rx: Mutex::new(release_rx),
+                });
+                let disk = DiskCache::new_with_clock(
+                    tmp.path().to_path_buf(),
+                    generous_limits(),
+                    clock.clone(),
+                );
+                let ram: Cache<&'static str> = Cache::new(generous_limits());
+                let tiered = Arc::new(TieredCache::new(ram, disk));
+
+                let probe_key = test_key(2, 4);
+                tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+
+                clock.armed.store(true, Ordering::SeqCst);
+
+                let admit_key = test_key(1, 4);
+                let tiered_admit = tiered.clone();
+                let admitter = tokio::spawn(async move {
+                    tiered_admit
+                        .insert_off_worker(admit_key, Bytes::from_static(b"aaaa"))
+                        .await;
+                });
+
+                began_rx.recv().await.unwrap();
+
+                let served = tiered.get_off_worker(probe_key).await;
+                assert_eq!(
+                    served,
+                    Some(Bytes::from_static(b"bbbb")),
+                    "a RAM-resident peek must complete while a disk write is parked"
+                );
+
+                release_tx.send(()).unwrap();
+                admitter.await.unwrap();
+
+                assert_eq!(
+                    tiered.disk.get(&admit_key).as_deref(),
+                    Some(b"aaaa".as_slice()),
+                    "the released write still admits the bytes to the disk tier"
+                );
+            });
+
+            let _ = done_tx.send(());
+        });
+
+        match done_rx.recv_timeout(OFF_WORKER_WATCHDOG) {
+            Ok(()) => worker.join().unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!(
+                    "test hung for {OFF_WORKER_WATCHDOG:?}: the peeked disk write \
+                     likely ran on the runtime's async thread and wedged it \
+                     parked, instead of running on the blocking pool (see #1891)"
                 );
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {

@@ -5038,7 +5038,8 @@ impl BlockRangeFetcher {
             stats.whole_object = true;
             // Still admit per-block cache entries so a later partition's fetch of
             // a subset composes with this one (ADR-0107 decision 3).
-            self.admit_blocks_from_whole(seg_ref, tenant_hash, &bytes, &extents);
+            self.admit_blocks_from_whole(seg_ref, tenant_hash, &bytes, &extents)
+                .await;
             return Ok((bytes, stats));
         }
 
@@ -5803,14 +5804,14 @@ impl BlockRangeFetcher {
                 if let Some(cache) = &self.cache {
                     let cache_key =
                         CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-                    cache.insert(cache_key, Bytes::copy_from_slice(block));
+                    cache.insert(cache_key, Bytes::copy_from_slice(block)).await;
                 }
                 continue;
             }
             let cache_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
             if let Some(cache) = &self.cache
-                && let Some(bytes) = cache.get(&cache_key)
+                && let Some(bytes) = cache.get(&cache_key).await
             {
                 // Corrupt-hit gate (ADR-0046 §4 / ADR-0107 decision 3): a cached
                 // block is re-verified against its stored crc before use, exactly
@@ -5941,15 +5942,17 @@ impl BlockRangeFetcher {
                 // admission is `get_or_fetch`'s, under the key it was called
                 // with, so it is admitted exactly once.
                 for (start, bytes) in split.iter().skip(1) {
-                    cache.insert(
-                        CacheKey::new(
-                            tenant_hash.0,
-                            seg_ref.content_hash,
-                            *start,
-                            bytes.len() as u64,
-                        ),
-                        bytes.clone(),
-                    );
+                    cache
+                        .insert(
+                            CacheKey::new(
+                                tenant_hash.0,
+                                seg_ref.content_hash,
+                                *start,
+                                bytes.len() as u64,
+                            ),
+                            bytes.clone(),
+                        )
+                        .await;
                 }
                 let _ = led.set((split, got.data.len() as u64));
                 Ok(lead_bytes)
@@ -5972,7 +5975,7 @@ impl BlockRangeFetcher {
         for ext in blocks.iter().skip(1) {
             let block_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-            if let Some(bytes) = cache.get(&block_key) {
+            if let Some(bytes) = cache.get(&block_key).await {
                 verify_block_crc(key, &bytes, ext)?;
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
@@ -6015,7 +6018,11 @@ impl BlockRangeFetcher {
     /// (ADR-0107 decision 3). A block whose crc does not verify is simply not
     /// admitted; the reader's own decode still gates correctness of what is
     /// returned.
-    fn admit_blocks_from_whole(
+    ///
+    /// Async because each admission may write a file on the disk tier, and
+    /// [`ReadCache::insert`] moves that write to the blocking pool (issue
+    /// #1891). Its only caller is already async.
+    async fn admit_blocks_from_whole(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -6041,7 +6048,7 @@ impl BlockRangeFetcher {
             }
             let cache_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-            cache.insert(cache_key, Bytes::copy_from_slice(block));
+            cache.insert(cache_key, Bytes::copy_from_slice(block)).await;
         }
     }
 }
