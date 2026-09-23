@@ -6539,6 +6539,78 @@ mod tests {
         );
     }
 
+    /// `--disable-cache`'s long help is a fourth operator-facing restatement
+    /// of the record-cache figures, and `ravel-server --help` is where an
+    /// operator sizing a memory-constrained container reads them.
+    ///
+    /// `operator_docs_record_cache_figures.rs` in `ravel-catalog` pins the
+    /// three guides; it cannot see this string, because clap help lives in
+    /// this crate. Without this test, raising `RECORD_CACHE_ENTRY_BYTES`
+    /// fails there, the author fixes the guides, and `--help` keeps stating
+    /// the old budget -- the partial-update drift of issue #1904, on the
+    /// surface with the least indirection between it and the operator.
+    ///
+    /// Prove-the-test: change any of the three figures in the help prose and
+    /// the matching assertion fails; change a constant and all three do.
+    #[test]
+    fn disable_cache_help_states_the_record_cache_figures_the_constants_derive() {
+        use clap::CommandFactory;
+
+        let cmd = Cli::command();
+        let help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "disable_cache")
+            .expect("--disable-cache is defined on the command")
+            .get_long_help()
+            .expect("--disable-cache carries long help")
+            .to_string();
+        // The prose wraps mid-phrase, and where it wraps is a formatting
+        // choice rather than a claim, so match on collapsed whitespace the way
+        // operator_docs_record_cache_figures.rs matches the guides.
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let floor = u64::try_from(ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT)
+            .expect("the floor fits u64");
+        let entry_bytes = ravel_catalog::RECORD_CACHE_ENTRY_BYTES;
+        let caches = ravel_catalog::RECORD_CACHES_PER_TENANT;
+
+        // Thousands separated by commas, the way the help writes a count.
+        let floor_str = {
+            let digits = floor.to_string();
+            let mut out = String::new();
+            for (i, c) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i) % 3 == 0 {
+                    out.push(',');
+                }
+                out.push(c);
+            }
+            out
+        };
+        let share_mb = floor * entry_bytes / 1_000_000;
+        let total_mb = share_mb * caches;
+
+        assert!(
+            help.contains(&format!("{floor_str} entries")),
+            "--disable-cache help must state the capacity floor as \
+             \"{floor_str} entries\", computed from \
+             ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT: {help}"
+        );
+        assert!(
+            help.contains(&format!(
+                "{share_mb} MB byte budget in each of the two caches"
+            )),
+            "--disable-cache help must state the per-cache byte budget as \
+             \"{share_mb} MB byte budget in each of the two caches\", computed from \
+             DEFAULT_CACHE_CAPACITY_PER_TENANT * RECORD_CACHE_ENTRY_BYTES: {help}"
+        );
+        assert!(
+            help.contains(&format!("about {total_mb} MB per actively-queried tenant")),
+            "--disable-cache help must state the combined budget as \
+             \"about {total_mb} MB per actively-queried tenant\", computed from that \
+             share times RECORD_CACHES_PER_TENANT: {help}"
+        );
+    }
+
     /// Records every event at `level` as one combined string (`" name=value"`
     /// per field, with the message itself under `message=`), so a test can
     /// count how many times a given figure appears across a call -- the
