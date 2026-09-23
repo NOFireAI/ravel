@@ -171,6 +171,15 @@ bash "$(dirname "$0")/guards/check-workflow-permissions.test.sh"
 echo "==> scripts/guards/check-workflow-permissions.sh"
 "$(dirname "$0")/guards/check-workflow-permissions.sh"
 
+# Operator-facing figures derived from the record-cache constants. The
+# cargo tests that pin these run in CI only, and this repository's
+# sessions do not run cargo locally, so four review rounds on issue #1927
+# went to defects a one-second scan finds. A file scan, no build.
+echo "==> scripts/guards/check-doc-figures.test.sh"
+bash "$(dirname "$0")/guards/check-doc-figures.test.sh"
+echo "==> scripts/guards/check-doc-figures.sh"
+"$(dirname "$0")/guards/check-doc-figures.sh"
+
 # "No wall-clock wait in an injected-clock test helper" cost two gate reruns
 # (issue #1260: the flaky pair test, then its rewrite under #1235). Another
 # check rather than another paragraph, same reasoning as the hygiene guard

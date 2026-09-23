@@ -280,6 +280,10 @@ jobs:
         run: bash scripts/guards/check-workflow-permissions.test.sh
       - name: Workflow-permissions guard (issue #1717)
         run: scripts/guards/check-workflow-permissions.sh
+      - name: Doc-figure guard cases
+        run: bash scripts/guards/check-doc-figures.test.sh
+      - name: Operator-facing figures match the record-cache constants
+        run: scripts/guards/check-doc-figures.sh
       # A pull request whose feat/fix commits touch crates/ or services/ must
       # also touch CHANGELOG.md, or carry a `Changelog: none` trailer (issue
       # #1719). The rule is defined over a pull request's base..head commit
