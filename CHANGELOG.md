@@ -99,6 +99,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   [Reachability during shutdown](docs/guides/observability.md#reachability-during-shutdown).
   The accompanying log line remains the reliable single-event signal.
 
+- **The operator-facing record-cache figures in `docs/guides/caching.md`,
+  `docs/guides/operations.md` and `docs/catalog-and-mvcc.md` are checked
+  against the `ravel-catalog` constants they are derived from** (issue
+  #1927). Issue #1904 let the derived per-tenant capacity change while five
+  prose restatements of the capacity, the per-entry byte rate, the memory
+  budget and the derived entry cap drifted out of sync with each other and
+  with the shipped constants, which would have led an operator sizing a host
+  from the docs to under-provision. A new test,
+  `ravel-catalog`'s `operator_docs_record_cache_figures.rs`, computes each
+  figure from `RECORD_CACHE_ENTRY_BYTES`, `MAX_RECORD_CACHE_BYTES_PER_TENANT`,
+  `DEFAULT_CACHE_CAPACITY_PER_TENANT` and `MAX_CACHE_CAPACITY_PER_TENANT` and
+  asserts the three guides state exactly that value, so the next constant
+  change fails in this file instead of shipping stale prose.
+
 ### Changed
 
 - **A shard now refuses a flush trigger once `--max-queued-flushes` (default
