@@ -49,6 +49,38 @@ page because they are where each rule is explained, and the comparison is
 what stops them drifting into rules a reader can copy but nothing else
 ships.
 
+## Grafana dashboard (`grafana/dashboards/ravel.json`)
+
+`grafana/dashboards/ravel.json` is the shipped dashboard over Ravel's own
+`ravel_` families: 36 panels in 6 rows, named Ingest, Query, Catalog fold,
+Maintenance, Object store and probe, and Alerting. Between them the panels
+reference 107 distinct `ravel_` metric names. Import it into Grafana and pick
+the Prometheus data source that scrapes your Ravel processes; the dashboard
+carries a single `ds` data-source variable and no hardcoded data-source uid.
+
+`grafana/dashboards/ravel-overview.json` is a different thing and stays as it
+is: it belongs to the quickstart compose stack and graphs the bundled
+collector's host CPU, not any Ravel family.
+
+The same test that pins the rule file's names,
+`services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs`, pins the
+dashboard's. It parses the JSON, walks every object carrying a `targets`
+array, extracts the metric names from each target's PromQL expression, and
+asserts each one appears on a `# TYPE` line of a `/metrics` body rendered by a
+running server, through the same scanner and the same rendered bodies the rule
+file goes through. It also asserts that every one of the 37 metric names the
+shipped rules alert on is graphed by some panel here, so a page always has a
+panel to land on. The 6 rows, 36 panels, 104 targets and 107 names are pinned
+as literals, so a walk that stops finding panels fails rather than checking an
+empty set.
+
+What that check covers is the metric NAMES. It does not validate the PromQL
+around them, the label matchers inside a selector, the panel layout, or the
+dashboard against Grafana's own schema, and it cannot tell that a panel will
+draw data in your deployment: a name that renders here may still carry no
+series for a label combination a panel splits on, or for a family behind a
+setting your processes leave off.
+
 ## Why MinIO and the OpenTelemetry Collector are not pulled from Docker Hub
 
 Docker Hub's anonymous pull allowance is per source IP and shared across
