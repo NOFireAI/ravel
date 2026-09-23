@@ -254,14 +254,19 @@ independently), but it cannot make any durable object disappear. Only a
 compromised Maintain credential retains delete capability over durable data,
 and only over
 `l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**`
-(amendment below) — never `sys/`, `prov`, `catalog/`, or the legal-hold
-shard `u/0000/**` of the audit prefix. The last of those holds for a
+(amendment below) — never `sys/`, `prov`, `catalog/` (narrowed to
+`catalog/*/HEAD` for `maintain.json` by the 2026-09-23 amendment below), or
+the legal-hold shard `u/0000/**` of the audit prefix. The last of those holds for a
 different reason than the other three. Take the delete `Allow` patterns of
 all four templates together: they match no key of the form `sys/tenancy`,
 `sys/qualification`, `sys/gc`, `t/<hash>/<signal>/prov`, or
 `t/<hash>/catalog/<signal>/...`, for any `<signal>` the object layout
 defines. So the `Deny` covering those five keyspaces withholds nothing that
-an `Allow` grants, and it is belt-and-suspenders. That disjointness is about
+an `Allow` grants, and it is belt-and-suspenders. The 2026-09-23 amendment
+below ends that disjointness for one template: `MaintainDelete` now reaches
+`t/*/catalog/*/snap/*` and `t/*/catalog/*/idx/*`, and `maintain.json`'s deny
+is narrowed to `catalog/*/HEAD` so it does not withhold them. The other
+three templates are unchanged and the paragraph above still holds for them. That disjointness is about
 the delete axis and only the delete axis: `get` and `put` grants do reach
 `prov` and `catalog/` (fold reads and writes catalog objects, the
 log-segment writer writes `prov`), and the same claim over all axes would be
@@ -269,7 +274,9 @@ false.
 `no_delete_allow_reaches_the_disjoint_protected_keyspaces` in
 `crates/ravel-commit/tests/iam_templates.rs` enforces this: it asserts that
 no delete `Allow` pattern in any template matches a witness key of those
-five protected patterns. The set is those three named `sys/` control
+five protected patterns, with the catalog entry narrowed to
+`t/*/catalog/*/HEAD` by the 2026-09-23 amendment below, since Maintain is
+now granted delete on the `snap/` and `idx/` objects beneath it. The set is those three named `sys/` control
 objects, not the whole `sys/` prefix, because Admin's `sys/qualify/*`
 scratch-delete grant does reach a key under `sys/` (a
 `sys/qualify/<run-id>/…` object) and is deliberately excluded. An audit
@@ -292,7 +299,10 @@ where the backend distinguishes it, `s3:DeleteObjectVersion`) on:
 
 - `sys/tenancy`, `sys/qualification`, `sys/gc`
 - `t/<hash>/<sig>/prov`
-- `t/<hash>/catalog/<sig>/**` (snap parts, HEAD, name postings)
+- `t/<hash>/catalog/<sig>/**` (snap parts, HEAD, name postings). For
+  `maintain.json` the 2026-09-23 amendment below narrows this to
+  `t/<hash>/catalog/<sig>/HEAD`; the other three templates deny the whole
+  family.
 - `t/<hash>/u/<AUDIT_HOLD_SHARD>/**` (legal-hold records only — the query-audit
   shard was removed from this deny by the amendment below, so it can
   be age-swept; legal-hold shard 0 stays deny-delete-forever)
@@ -806,8 +816,9 @@ Before/after, expressed as the operations.md IAM wildcards:
 
 Recorded as an appended amendment rather than rewritten into §1's role table,
 §2 and §3, none of which was touched. What carries an inline pointer to this
-section is each of the three places that asserts `catalog/*` is undeletable:
-the Decision bullet, and the recaps in the 2026-09-06 and 2026-09-13
+section is each of the five places that asserts `catalog/*` is undeletable:
+the Decision bullet, §2's "never ... `catalog/`" clause and its disjointness
+paragraph, §3's deny list, and the recaps in the 2026-09-06 and 2026-09-13
 amendments that repeat the claim. A reader meets the qualification where the
 claim is made, and the decision text keeps its original wording.
 ADR-0064's statements that catalog objects are deny-deleted carry the same
