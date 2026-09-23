@@ -5,13 +5,13 @@ the IAM policy documents the operator renders into Secrets.
 
 ## Prometheus alerting rules (`prometheus/ravel.rules.yaml`)
 
-`prometheus/ravel.rules.yaml` is the shipped alert rule file: 32 alerts in 8
+`prometheus/ravel.rules.yaml` is the shipped alert rule file: 33 alerts in 8
 groups. Each carries the threshold its source document states, and the
 duration that document states where it states one. The sources are
 [the observability guide](../docs/guides/observability.md), which explains the
 groups it states durations for, and
 [the troubleshooting guide](../docs/guides/operations/troubleshooting.md),
-whose symptom table states the rest. 15 of the 32 carry no `for:` because the
+whose symptom table states the rest. 15 of the 33 carry no `for:` because the
 row they come from states no duration; each of those says so in an
 `as_documented` annotation, and every rule carries a `runbook` annotation
 naming the section to read when it fires.
@@ -29,13 +29,13 @@ scrape configuration: point your own Prometheus at the Ravel processes you
 run.
 
 `services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs` pins the
-names. It parses this file into its 8 groups and 32 rules, extracts the 38
+names. It parses this file into its 8 groups and 33 rules, extracts the 38
 distinct `ravel_` metric names their expressions and annotations reference,
 and asserts each one appears on a `# TYPE` line of a `/metrics` body rendered
 by a running server, so renaming a metric in the code fails the test instead
 of leaving a rule here matching no series. Parsing rather than scanning is
 what makes the rule count mean something: a corruption that leaves the
-`- alert:` lines intact keeps a string count at 32 while Prometheus refuses
+`- alert:` lines intact keeps a string count at 33 while Prometheus refuses
 the whole file, and the reader the test uses refuses any line it cannot
 account for, so that corruption fails there instead. It checks structure
 only: a malformed `for:` duration or a broken `expr` is caught by Prometheus
@@ -43,7 +43,7 @@ on load rather than by the test (issue #1928).
 
 The same test parses the six fenced `yaml` blocks the
 [observability guide](../docs/guides/observability.md) prints, and asserts
-that each of the 14 rules they hold carries the same expression, `for:`
+that each of the 15 rules they hold carries the same expression, `for:`
 duration and severity as the rule of that name here. The blocks stay on the
 page because they are where each rule is explained, and the comparison is
 what stops them drifting into rules a reader can copy but nothing else

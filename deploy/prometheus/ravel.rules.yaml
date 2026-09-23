@@ -487,7 +487,9 @@ groups:
         # that backend's own retry budget allows, with no compile-time or
         # config-time bound to size a margin against. The second term keeps
         # the rule silent until a real timestamp has been stamped at least
-        # once, whatever that first cycle costs.
+        # once, whatever that first cycle costs. RavelStoreProbeNeverRan
+        # below is what covers that excluded state: a probe that dies, or
+        # never starts, before its first cycle ever completes.
         expr: |
           (
             time() - ravel_store_probe_last_run_timestamp_seconds > 132
@@ -508,6 +510,51 @@ groups:
             does not hold this condition true long enough to fire, since
             RavelStoreUnreachable already covers a probe that is failing but
             still running.
+          runbook: docs/guides/observability.md#the-store-probe-liveness-alert
+      - alert: RavelStoreProbeNeverRan
+        # Complement to RavelStoreProbeStalled above. That rule requires a
+        # real timestamp to have been stamped at least once, so it cannot
+        # fire on a probe task that dies, panics, or is never spawned before
+        # its first cycle ever completes: the gauge then holds its zero
+        # sentinel forever and the `> 0` guard stays false forever with it.
+        # RavelStoreUnreachable does not cover this state either:
+        # set_store_reachable is only ever called from inside
+        # run_probe_cycle, so store_reachable() stays true and /readyz
+        # answers 200 indefinitely. The sentinel itself, sustained, is the
+        # only signal for this state, which is exactly the case issue #1728
+        # exists to catch: nothing has ever run.
+        #
+        # for: is sized from the same two terms the 132 threshold above
+        # uses. The jittered sleep spawn() runs before its first cycle:
+        # interval * 1.1 = 30 * 1.1 = 33s. The worst-case single cycle
+        # against the S3 backend: retry_timeout + request_timeout = 180 +
+        # 20 = 200s (S3HttpConfig's doc comment in the object-store crate).
+        # Sum: 33 + 200 = 233s worst-case gap between process start and the
+        # first stamp. retry_timeout and request_timeout are that crate's
+        # documented defaults, not constants this codebase controls, so this
+        # window applies the same 1.1 safety factor once more over the whole
+        # sum as margin against that figure drifting: 233 * 1.1 = 256.3s,
+        # rounded up to 257s. Both terms scale with --store-probe-interval,
+        # same as the sibling rule: recompute this window before tightening
+        # it on a fleet with a non-default interval.
+        expr: |
+          ravel_store_probe_last_run_timestamp_seconds == 0
+        for: 257s
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel process's background store probe has never completed a
+            single cycle since startup
+          description: >-
+            The probe task died, panicked, or was never spawned, before ever
+            reading sys/tenancy once. RavelStoreProbeStalled cannot cover
+            this: it requires a real timestamp to compare against, which a
+            probe that has never run once never produces, and
+            RavelStoreUnreachable does not either, since store_reachable()
+            is only ever written from inside a completed probe cycle. Check
+            the process logs for a panic at startup or in the probe task's
+            first cycle.
           runbook: docs/guides/observability.md#the-store-probe-liveness-alert
       - alert: RavelBucketProtectionUnknown
         expr: |
