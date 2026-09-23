@@ -1827,10 +1827,19 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // the ListBucket; without the HEAD get it cannot resolve what is
     // referenced; and without t/*/catalog/*/snap/* the part GET returns
     // AccessDenied, which ensure_part turns into MaintainError::Store and so
-    // aborts the whole pass for that signal rather than one object. Each is
-    // exactly the defect this role's del/* grants were added to fix, and the
-    // shape that shipped again here twice (issue #1847, rounds two and
-    // three). Asserted by maintain_template_covers_every_catalog_sweep_call.
+    // aborts the whole pass for that signal rather than one object.
+    //
+    // Maintain-mode processes also GET t/*/catalog/*/idx/* from three call
+    // sites outside the sweep: load_covering_postings for the scrub tick,
+    // and fold_inner's .cstat and .npost reuse baseline. All three swallow
+    // the error, so a missing grant there is not an outage but a silent
+    // downgrade -- the postings scrub tier never runs and every fold
+    // rebuilds from scratch.
+    //
+    // Each is exactly the defect this role's del/* grants were added to fix,
+    // and the shape that shipped again here three times (issue #1847, rounds
+    // two through four). Asserted by
+    // maintain_template_covers_every_catalog_sweep_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1855,6 +1864,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/del/*",
             "t/*/catalog/*/HEAD",
             "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/idx/*",
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
@@ -2758,13 +2768,27 @@ fn maintain_template_covers_every_catalog_sweep_call() {
         }
     }
 
-    // Reachability (read): the sweep reads TWO catalog shapes, not one.
-    // `read_head_reference` GETs HEAD, and `SnapshotReachability::ensure_part`
-    // (crates/ravel-maintain/src/reachability.rs) GETs each covering snapshot
-    // part named by that HEAD. The part GET's error arm returns
-    // `MaintainError::Store` on anything that is not `NotFound`, so an
-    // AccessDenied there aborts the whole pass for that signal rather than
-    // failing one object -- which is what a HEAD-only read grant produced.
+    // Reachability (read): Maintain-mode processes read THREE catalog shapes.
+    //
+    // - HEAD, by `read_head_reference`.
+    // - `snap/` parts, by `SnapshotReachability::ensure_part`
+    //   (crates/ravel-maintain/src/reachability.rs). Its error arm returns
+    //   `MaintainError::Store` on anything that is not `NotFound`, so an
+    //   AccessDenied there aborts the whole pass for that signal rather than
+    //   failing one object -- which is what a HEAD-only read grant produced.
+    // - `idx/` objects, by three call sites, every one of which SWALLOWS the
+    //   failure: `load_covering_postings` returns `Ok(None)` on any error
+    //   (crates/ravel-catalog/src/covering_postings.rs), which the scrub tick
+    //   cannot tell from "no postings ref yet", so the postings scrub tier
+    //   silently never runs; and `fold_inner` GETs the prior `.cstat` and
+    //   `.npost` for reuse (crates/ravel-catalog/src/fold.rs), warns, and
+    //   degrades to a full rebuild every fold.
+    //
+    // The third shape is why this assertion covers reads that fail SILENTLY as
+    // well as loudly. A missing grant on the first two announces itself; a
+    // missing grant on `idx/` looks exactly like an empty catalog and a
+    // permanent cost regression, and nothing in the running system says
+    // otherwise.
     let head_witnesses: Vec<String> = ALL_SIGNALS
         .iter()
         .map(|signal| format!("t/{hash}/catalog/{}/HEAD", signal.key_prefix()))
@@ -2778,20 +2802,32 @@ fn maintain_template_covers_every_catalog_sweep_call() {
             )
         })
         .collect();
-    for witness in head_witnesses.iter().chain(part_witnesses.iter()) {
+    let idx_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{hash}/catalog/{}/idx/name-postings", signal.key_prefix()))
+        .collect();
+    for witness in head_witnesses
+        .iter()
+        .chain(part_witnesses.iter())
+        .chain(idx_witnesses.iter())
+    {
         assert!(
             gets.iter().any(|p| glob_matches(p, witness)),
-            "maintain: no GetObject Allow reaches {witness:?}. The sweep's \
-             reachability pass GETs the HEAD and then every snapshot part it \
-             names; a read grant covering only one of the two aborts the pass \
-             at the first part (#1847)"
+            "maintain: no GetObject Allow reaches {witness:?}. Maintain-mode \
+             processes GET the HEAD, every snapshot part it names, and the \
+             idx/ objects the scrub tick and the fold's reuse baseline read. \
+             A grant covering only some of the three either aborts the pass \
+             or, for idx/, degrades silently (#1847)"
         );
     }
 
-    // Tightness (read): a catalog read pattern may reach HEAD and snapshot
-    // parts, and nothing else. `idx/` objects are listed and deleted but
-    // never read, so a read pattern reaching one is over-granted.
-    let readable: Vec<&String> = head_witnesses.iter().chain(part_witnesses.iter()).collect();
+    // Tightness (read): a catalog read pattern may reach HEAD, snapshot parts
+    // and idx/ objects, and nothing else.
+    let readable: Vec<&String> = head_witnesses
+        .iter()
+        .chain(part_witnesses.iter())
+        .chain(idx_witnesses.iter())
+        .collect();
     let outside_head: Vec<&String> = key_domain()
         .iter()
         .filter(|k| !readable.contains(k))
