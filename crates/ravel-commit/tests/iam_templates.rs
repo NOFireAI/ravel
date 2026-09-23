@@ -1817,6 +1817,16 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // .dreq body itself; the put reaches del/*.done because that pass writes
     // the completion. Both are asserted by
     // erasure_lifecycle_calls_outside_the_sweep_are_reachable.
+    // The catalog sweep needs the same two-call shape the erasure sweep does:
+    // sweep_unreferenced_catalog_objects lists t/*/catalog/*/snap/* and
+    // t/*/catalog/*/idx/* (list_all, twice) and GETs t/*/catalog/*/HEAD
+    // (read_head_reference, twice: the first read and the pre-delete
+    // re-verify) before it ever reaches the delete grant above. Without the
+    // list and the get the delete is unreachable -- the pass is refused with
+    // AccessDenied at the ListBucket, exactly the defect this role's del/*
+    // grants were added to fix, and exactly the shape that shipped again here
+    // (issue #1847, round two). Asserted by
+    // maintain_template_covers_every_catalog_sweep_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1826,6 +1836,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/l1/*",
             "t/*/*/idem/*",
             "t/*/*/del/*",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/idx/*",
             "sys/maintain/workers/*",
         ],
         list_actions: &["s3:ListBucket"],
@@ -1837,6 +1849,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/u/*",
             "t/*/*/prov",
             "t/*/*/del/*",
+            "t/*/catalog/*/HEAD",
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
@@ -2572,6 +2585,192 @@ fn maintain_deletes_catalog_snap_and_idx_but_not_head() {
          directly under catalog/<signal>/ that is neither HEAD, snap/, nor \
          idx/ -- MaintainDelete's catalog grant is wider than the sweep needs"
     );
+}
+
+/// Every object-store call `sweep_unreferenced_catalog_objects`
+/// (`crates/ravel-maintain/src/sweep.rs`) makes must be reachable under the
+/// shipped Maintain template, and nothing wider than those calls need may
+/// reach it.
+///
+/// This is the same failure shape `maintain_template_covers_every_erasure_request_sweep_call`
+/// exists for, and it shipped here regardless: `MaintainDelete` grants delete
+/// on `snap/` and `idx/` keys (`maintain_deletes_catalog_snap_and_idx_but_not_head`
+/// pins that), but neither `MaintainList` nor `MaintainRead` named anything
+/// under `catalog/` before this test existed, so the pass was refused with
+/// `AccessDenied` on its first `ListBucket` before it ever reached a delete
+/// (issue #1847, round two).
+///
+/// The sweep makes four object-store calls:
+///
+/// - `list_all(store, &catalog_snap_prefix(tenant, signal))` (one
+///   `s3:ListBucket` whose `prefix` parameter is
+///   `t/<tenant_hash>/catalog/<signal>/snap/`),
+/// - `list_all(store, &catalog_idx_prefix(tenant, signal))` (the same, for
+///   `t/<tenant_hash>/catalog/<signal>/idx/`),
+/// - `store.get(&catalog_head_key(tenant, signal), GetRange::Full)`, inside
+///   `read_head_reference`, called twice per pass (the reference read before
+///   the candidate scan, and the pre-delete re-verify) -- one `s3:GetObject`
+///   pattern covers both call sites,
+/// - `store.delete(&meta.key)` on each surviving candidate under `snap/` or
+///   `idx/`, already asserted in full by
+///   `maintain_deletes_catalog_snap_and_idx_but_not_head` and restated here so
+///   this test fails as a whole if the delete grant regresses alongside the
+///   list or read grants.
+#[test]
+fn maintain_template_covers_every_catalog_sweep_call() {
+    let hash = hash16();
+    let maintain = load_policy("maintain");
+
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let allow_deletes = delete_key_patterns(&maintain, "Allow");
+    let deny_deletes = delete_key_patterns(&maintain, "Deny");
+
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        let head_key = format!("t/{hash}/catalog/{prefix}/HEAD");
+
+        // Call 1: list_all(store, &catalog_snap_prefix(tenant, signal)).
+        let snap_prefix = format!("t/{hash}/catalog/{prefix}/snap/");
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &snap_prefix)),
+            "maintain: no ListBucket s3:prefix admits {snap_prefix:?}, the \
+             prefix sweep_unreferenced_catalog_objects passes to list_all for \
+             the snap/ family. The pass is refused with AccessDenied before it \
+             ever lists a snapshot part, so the snap/ delete grant is \
+             unreachable. s3:prefix values: {list_prefixes:?}"
+        );
+
+        // Call 2: list_all(store, &catalog_idx_prefix(tenant, signal)).
+        let idx_prefix = format!("t/{hash}/catalog/{prefix}/idx/");
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &idx_prefix)),
+            "maintain: no ListBucket s3:prefix admits {idx_prefix:?}, the \
+             prefix sweep_unreferenced_catalog_objects passes to list_all for \
+             the idx/ family. The pass is refused with AccessDenied before it \
+             ever lists a name-postings or column-stats object, so the idx/ \
+             delete grant is unreachable. s3:prefix values: {list_prefixes:?}"
+        );
+
+        // Call 3: store.get(&catalog_head_key(...)) in read_head_reference,
+        // called twice per pass.
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &head_key)),
+            "maintain: no GetObject Allow reaches {head_key:?}, which \
+             read_head_reference GETs to build the reference set every listed \
+             snap/idx object is checked against. Without it the sweep fails \
+             closed (or, before that fix, panics on a decode of nothing) on \
+             every (tenant, signal) before it can tell a live part from an \
+             orphan. Grants: {gets:?}"
+        );
+
+        // Call 4: store.delete on each surviving snap/ or idx/ candidate.
+        let snap_key = format!("t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap");
+        let idx_key = format!("t/{hash}/catalog/{prefix}/idx/name-postings");
+        assert!(
+            allow_deletes.iter().any(|p| glob_matches(p, &snap_key)),
+            "maintain: no delete Allow reaches {snap_key:?} -- \
+             sweep_unreferenced_catalog_objects deletes unreferenced snap/ \
+             objects and needs this to succeed"
+        );
+        assert!(
+            allow_deletes.iter().any(|p| glob_matches(p, &idx_key)),
+            "maintain: no delete Allow reaches {idx_key:?} -- \
+             sweep_unreferenced_catalog_objects deletes unreferenced idx/ \
+             objects and needs this to succeed"
+        );
+
+        // The HEAD pointer itself must stay undeletable: the sweep never
+        // deletes it, and the list/read grants above must not have disturbed
+        // that safety property.
+        assert!(
+            deny_deletes.iter().any(|p| glob_matches(p, &head_key)),
+            "maintain: DenyDeleteProtected no longer denies {head_key:?}, the \
+             catalog HEAD pointer"
+        );
+        assert!(
+            !allow_deletes.iter().any(|p| glob_matches(p, &head_key)),
+            "maintain: a delete Allow reaches {head_key:?}, the catalog HEAD \
+             pointer the sweep never deletes"
+        );
+    }
+
+    // Tightness (list and delete): every pattern that reaches the catalog
+    // snap/idx keyspace must reach no key outside
+    // t/*/catalog/<signal>/{snap,idx}/. A pattern such as t/*/catalog/*/*
+    // would pass every functional assertion above while granting far more
+    // than the four calls need.
+    let snap_idx_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .flat_map(|signal| {
+            let prefix = signal.key_prefix();
+            [
+                format!("t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap"),
+                format!("t/{hash}/catalog/{prefix}/idx/name-postings"),
+            ]
+        })
+        .collect();
+    let outside_snap_idx: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| !snap_idx_witnesses.contains(k))
+        .collect();
+    assert!(
+        !outside_snap_idx.is_empty(),
+        "the key domain models no key outside the catalog snap/idx keyspace, \
+         so the tightness assertion below examines nothing"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("delete Allow", &allow_deletes),
+    ] {
+        for pattern in patterns {
+            let reaches_catalog = snap_idx_witnesses.iter().any(|w| glob_matches(pattern, w));
+            if !reaches_catalog {
+                continue;
+            }
+            for key in &outside_snap_idx {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the catalog \
+                     snap/idx keyspace AND {key:?}, which lies outside it. The \
+                     sweep's list and delete calls need snap/ and idx/ and \
+                     nothing else -- a pattern spanning both is over-granted \
+                     (#1847)"
+                );
+            }
+        }
+    }
+
+    // Tightness (read): every pattern that reaches a catalog HEAD key must
+    // reach no key outside the catalog HEAD keyspace. read_head_reference
+    // GETs HEAD only; it never reads a snap/ or idx/ object's contents.
+    let head_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{hash}/catalog/{}/HEAD", signal.key_prefix()))
+        .collect();
+    let outside_head: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| !head_witnesses.contains(k))
+        .collect();
+    assert!(
+        !outside_head.is_empty(),
+        "the key domain models no key outside the catalog HEAD keyspace, so \
+         the tightness assertion below examines nothing"
+    );
+    for pattern in &gets {
+        let reaches_head = head_witnesses.iter().any(|w| glob_matches(pattern, w));
+        if !reaches_head {
+            continue;
+        }
+        for key in &outside_head {
+            assert!(
+                !glob_matches(pattern, key),
+                "maintain: GetObject Allow pattern {pattern:?} reaches a \
+                 catalog HEAD key AND {key:?}. read_head_reference GETs HEAD \
+                 only; a pattern reaching more is over-granted (#1847)"
+            );
+        }
+    }
 }
 
 /// ADR-0064 section 6: "Maintain gains delete on `del/*.dreq` **only**", and
