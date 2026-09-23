@@ -721,6 +721,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deletable. This changes a shipped IAM template: an operator running
   `maintain.json` from before this change must re-apply it. Until they do,
   the sweep keeps failing its first delete every pass, exactly as before.
+- **Four axis and description issues in the standalone Grafana dashboard are
+  fixed** (issue #1962). "Workers and units" and "Declared-stat stamp
+  coverage" carried `"fieldConfig": {"defaults": {}, "overrides": []}`, so
+  every series on each panel shared one unitless auto-scaled axis: the L0
+  records pending backlog crowded out the three small worker/unit counts on
+  the first, and the drop counter sat flat at the bottom of the same axis as
+  two hourly volume counters on the second. Both now carry overrides that
+  move the outlier series to its own axis. The drop counter's override uses
+  `byRegexp` against `^drops .*$`, not `byName`, because its legend format is
+  `drops {{carrier}}`, which a `byName` match on `"drops"` never matches.
+  "Cache residency and disk tier" rendered four axes over seven series
+  because the unit overrides for `resident entries`, `bytes (served|admitted)`
+  and the disk-tier rates all set `axisPlacement: right`, so the disk-error
+  rates, the panel's alarm signal, shared a side with the byte-rate series
+  instead of standing alone. The disk-tier rates keep the right-hand axis to
+  themselves; `resident entries` and `bytes (served|admitted)` move to
+  `hidden`, so they still scale on their own units without drawing an axis.
+  Two visible axes remain: the default byte axis for resident/max bytes, and
+  the disk-tier ops axis on the right. "Log block pruning"'s description
+  named the pruned-share metric's `clamp_min(..., 1e-9)` denominator guard
+  but never said what an idle system renders as, so an idle fleet showed the
+  same falling-to-zero shape the description calls the alarm; it now carries
+  the same idle clause as its sibling panel, "Query result cache hit ratio".
 
 ## [0.15.0] - 2026-09-08
 
