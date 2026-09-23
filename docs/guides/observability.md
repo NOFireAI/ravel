@@ -808,7 +808,29 @@ is about `4 * 33 = 132s` after the outage starts, and at worst
 `4 * 233 = 932s` if every one of those cycles runs its full retry budget
 before failing. Either way it is the alert that pages for an outage, and it
 does not depend on this rule's window. Only a probe that has stopped completing
-cycles altogether keeps the comparison true past `for: 5m`. Do not shrink
+cycles altogether keeps the comparison true past `for: 5m`.
+
+That derivation has two terms, the jittered sleep and the S3 retry and
+request budget, and it is complete only WITHOUT `--store-scheduling`. With
+that flag the probe's GET goes through the foreground request class
+(`build_store` hands `start` the foreground handle, and that is the handle
+`store_probe::spawn` receives), and `RequestScheduler::acquire` waits on the
+global semaphore with no timeout and no deadline argument. During a store
+outage every in-flight foreground operation can itself run for the full 200s
+derived above, so the permits stay saturated and the probe's own GET can sit
+queued for minutes before its cycle starts. The gap between completions then
+exceeds `132 + 300 = 432s` on the shipped thresholds, and
+`RavelStoreProbeStalled` fires with a description telling the on-call
+engineer the task has likely died while it is alive and queued -- the
+wrong-cause page this section exists to avoid.
+
+There is no bound to add as a third term: the queue wait is unbounded by
+construction. A fleet running `--store-scheduling` must size `for:` against
+its own foreground saturation window, measured rather than derived, or
+accept that a long enough outage pages under this alert as well as under
+`RavelStoreUnreachable`.
+
+Do not shrink
 `for:` on the strength of the 33s sleep-only ceiling: a `for: 1m` pages on
 every ordinary store outage, which is the wrong-cause page this alert exists
 to avoid.

@@ -1628,8 +1628,8 @@
     {
       "id": 26,
       "type": "timeseries",
-      "title": "Probe failures and bucket protection",
-      "description": "Probe failures, and whether Ravel could establish that the bucket is versioned and protected. An unknown protection state is not a safe state.",
+      "title": "Probe failures, cycle age and bucket protection",
+      "description": "Probe failures, how long ago the probe last completed a cycle, and whether Ravel could establish that the bucket is versioned and protected. The cycle age is the liveness signal: the failure counter and the protection gauge both move only while the probe task is alive, so a dead task freezes them at a healthy-looking value while the age keeps climbing. An unknown protection state is not a safe state.",
       "gridPos": {
         "h": 8,
         "w": 8,
