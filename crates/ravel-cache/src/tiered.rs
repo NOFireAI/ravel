@@ -681,7 +681,7 @@ async fn corrupted_disk_hit_is_corrupted_through_ram_readthrough() {
 mod tests {
     use std::future::Future;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Poll;
     use std::time::Duration;
 
@@ -692,6 +692,7 @@ mod tests {
 
     use super::fixtures::{generous_limits, test_key};
     use super::*;
+    use crate::test_support::{ParkOnFirstArmedCall, run_with_watchdog};
     use crate::{CacheLimits, Clock};
 
     /// A RAM hit is the fast path: it returns the RAM bytes and never consults
@@ -1502,30 +1503,6 @@ mod tests {
     /// version afterward.
     #[test]
     fn disk_tier_get_and_insert_run_on_the_blocking_pool() {
-        // `DiskCache::new_with_clock` itself calls `clock.now_ns()` once, from
-        // `scan_existing`, to timestamp the startup scan -- before this
-        // test's own handshake begins. An unconditional "park on the first
-        // call" clock would wedge on the startup scan instead of the insert
-        // this test means to catch. `armed` is set only after construction
-        // returns, so the startup call is a no-op and the park lands on the
-        // first call after that: `resolve_peeked_miss`'s `written_at_ns`
-        // stamp.
-        struct ParkingFirstCallClock {
-            armed: AtomicBool,
-            parked: AtomicBool,
-            began_tx: std::sync::mpsc::SyncSender<()>,
-            release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
-        }
-        impl Clock for ParkingFirstCallClock {
-            fn now_ns(&self) -> u64 {
-                if self.armed.load(Ordering::SeqCst) && !self.parked.swap(true, Ordering::SeqCst) {
-                    self.began_tx.send(()).unwrap();
-                    self.release_rx.lock().recv().unwrap();
-                }
-                0
-            }
-        }
-
         // Generous bound for the watchdog only: how long the whole handshake
         // (leader starts, insert begins, probe runs, insert releases, leader
         // finishes) may take before the test declares a hang rather than
@@ -1536,136 +1513,105 @@ mod tests {
 
         let (began_tx, began_rx) = std::sync::mpsc::sync_channel::<()>(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
-        let worker = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let tmp = TempDir::new().unwrap();
-                let clock = Arc::new(ParkingFirstCallClock {
-                    armed: AtomicBool::new(false),
-                    parked: AtomicBool::new(false),
-                    began_tx,
-                    release_rx: Mutex::new(release_rx),
-                });
-                let disk = DiskCache::new_with_clock(
-                    tmp.path().to_path_buf(),
-                    generous_limits(),
-                    clock.clone(),
-                );
-                let ram: Cache<&'static str> = Cache::new(generous_limits());
-                let tiered = Arc::new(TieredCache::new(ram, disk));
-                clock.armed.store(true, Ordering::SeqCst);
-
-                let leader_key = test_key(1, 4);
-                let tiered_leader = tiered.clone();
-                let (fetch_entered_tx, fetch_entered_rx) = oneshot::channel::<()>();
-                let leader = tokio::spawn(async move {
-                    tiered_leader
-                        .resolve_peeked_miss(leader_key, move || async move {
-                            let _ = fetch_entered_tx.send(());
-                            Ok::<Bytes, &'static str>(Bytes::from_static(b"aaaa"))
-                        })
-                        .await
-                });
-
-                // Wait for confirmation that the leader's fetch ran, which
-                // requires the leader's first poll to have returned control
-                // to the executor (a single-threaded runtime cannot
-                // reschedule this task while the leader's poll is still on
-                // the stack). On the reverted (pre-#1702) tree, that first
-                // poll runs fetch, the RAM insert, AND the synchronous,
-                // un-instrumented disk insert (including the clock's park)
-                // before returning, so this wait never resolves and the test
-                // hangs here. On the fixed tree the poll returns as soon as
-                // the disk insert is dispatched to the blocking pool, before
-                // the clock is ever called, so this wait is near-instant. A
-                // plain `tokio::task::yield_now().await` was tried first and
-                // does not give this guarantee: it only requires the leader
-                // to be *scheduled* by the time this task resumes, not to
-                // have been *polled*, so it let the probe below run before
-                // the leader's synchronous insert ever started and passed
-                // even on the reverted tree.
-                fetch_entered_rx.await.unwrap();
-
-                // Wait for the disk tier's clock to signal that the insert
-                // has begun. On the fixed tree this call runs on a tokio
-                // blocking-pool thread, a real second OS thread, so blocking
-                // this async thread on `recv()` here does not depend on
-                // anything this thread itself would otherwise need to do.
-                began_rx.recv().unwrap();
-
-                let probe_key = test_key(2, 4);
-                tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
-                let (served, source) = tiered
-                    .get_or_fetch(probe_key, || async {
-                        unreachable!("a RAM-resident key must never fetch")
-                    })
-                    .await
-                    .unwrap();
-
-                assert_eq!(source, Source::Cache, "the probe key is a RAM hit");
-                assert_eq!(served, Bytes::from_static(b"bbbb"));
-
-                // The probe above only completed because the parked insert
-                // is not holding this thread. Release it now, which is the
-                // deterministic version of "the sleep finishes": the
-                // leader's disk insert can only observe the probe's result
-                // as already asserted, never race it.
-                release_tx.send(()).unwrap();
-
-                let leader_bytes = leader.await.unwrap().unwrap();
-                assert_eq!(leader_bytes, Bytes::from_static(b"aaaa"));
-            });
-
-            let _ = done_tx.send(());
-        });
-
-        match done_rx.recv_timeout(WATCHDOG_BOUND) {
-            Ok(()) => worker.join().unwrap(),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!(
+        run_with_watchdog(
+            WATCHDOG_BOUND,
+            || {
+                format!(
                     "test hung for {WATCHDOG_BOUND:?}: the leader's disk insert \
                      likely ran on the runtime's async thread and wedged it \
                      parked, instead of running on the blocking pool (see #1702)"
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
-                Ok(()) => panic!("worker thread exited without a result"),
-                Err(panic) => std::panic::resume_unwind(panic),
+                )
             },
-        }
-    }
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
 
-    /// A [`Clock`] that parks the thread inside the FIRST call made after it is
-    /// armed, announcing beforehand that the call has begun.
-    ///
-    /// The announcement is a tokio channel, so the waiting async task yields the
-    /// runtime instead of blocking it: on a `current_thread` runtime the awaited
-    /// `recv` is what lets the task under test be polled at all. The release is a
-    /// rendezvous `SyncSender`, so the parked thread resumes only when the test
-    /// says so -- no duration is ever measured or compared. Arming is separate
-    /// from construction because `DiskCache::new_with_clock` and a test's own
-    /// setup `insert` both call the clock before the operation under test does.
-    struct ParkOnFirstArmedCall {
-        armed: AtomicBool,
-        parked: AtomicBool,
-        began_tx: tokio::sync::mpsc::UnboundedSender<()>,
-        release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
-    }
+                rt.block_on(async {
+                    let tmp = TempDir::new().unwrap();
+                    // `DiskCache::new_with_clock` itself calls `clock.now_ns()`
+                    // once, from `scan_existing`, to timestamp the startup scan --
+                    // before this test's own handshake begins. `arm()` is called
+                    // only after construction returns, so that startup call is a
+                    // no-op and the park lands on the first call after that:
+                    // `resolve_peeked_miss`'s `written_at_ns` stamp.
+                    let clock = Arc::new(ParkOnFirstArmedCall::new(
+                        move || began_tx.send(()).unwrap(),
+                        release_rx,
+                    ));
+                    let disk = DiskCache::new_with_clock(
+                        tmp.path().to_path_buf(),
+                        generous_limits(),
+                        clock.clone(),
+                    );
+                    let ram: Cache<&'static str> = Cache::new(generous_limits());
+                    let tiered = Arc::new(TieredCache::new(ram, disk));
+                    clock.arm();
 
-    impl Clock for ParkOnFirstArmedCall {
-        fn now_ns(&self) -> u64 {
-            if self.armed.load(Ordering::SeqCst) && !self.parked.swap(true, Ordering::SeqCst) {
-                self.began_tx.send(()).unwrap();
-                self.release_rx.lock().recv().unwrap();
-            }
-            0
-        }
+                    let leader_key = test_key(1, 4);
+                    let tiered_leader = tiered.clone();
+                    let (fetch_entered_tx, fetch_entered_rx) = oneshot::channel::<()>();
+                    let leader = tokio::spawn(async move {
+                        tiered_leader
+                            .resolve_peeked_miss(leader_key, move || async move {
+                                let _ = fetch_entered_tx.send(());
+                                Ok::<Bytes, &'static str>(Bytes::from_static(b"aaaa"))
+                            })
+                            .await
+                    });
+
+                    // Wait for confirmation that the leader's fetch ran, which
+                    // requires the leader's first poll to have returned control
+                    // to the executor (a single-threaded runtime cannot
+                    // reschedule this task while the leader's poll is still on
+                    // the stack). On the reverted (pre-#1702) tree, that first
+                    // poll runs fetch, the RAM insert, AND the synchronous,
+                    // un-instrumented disk insert (including the clock's park)
+                    // before returning, so this wait never resolves and the test
+                    // hangs here. On the fixed tree the poll returns as soon as
+                    // the disk insert is dispatched to the blocking pool, before
+                    // the clock is ever called, so this wait is near-instant. A
+                    // plain `tokio::task::yield_now().await` was tried first and
+                    // does not give this guarantee: it only requires the leader
+                    // to be *scheduled* by the time this task resumes, not to
+                    // have been *polled*, so it let the probe below run before
+                    // the leader's synchronous insert ever started and passed
+                    // even on the reverted tree.
+                    fetch_entered_rx.await.unwrap();
+
+                    // Wait for the disk tier's clock to signal that the insert
+                    // has begun. On the fixed tree this call runs on a tokio
+                    // blocking-pool thread, a real second OS thread, so blocking
+                    // this async thread on `recv()` here does not depend on
+                    // anything this thread itself would otherwise need to do.
+                    began_rx.recv().unwrap();
+
+                    let probe_key = test_key(2, 4);
+                    tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+                    let (served, source) = tiered
+                        .get_or_fetch(probe_key, || async {
+                            unreachable!("a RAM-resident key must never fetch")
+                        })
+                        .await
+                        .unwrap();
+
+                    assert_eq!(source, Source::Cache, "the probe key is a RAM hit");
+                    assert_eq!(served, Bytes::from_static(b"bbbb"));
+
+                    // The probe above only completed because the parked insert
+                    // is not holding this thread. Release it now, which is the
+                    // deterministic version of "the sleep finishes": the
+                    // leader's disk insert can only observe the probe's result
+                    // as already asserted, never race it.
+                    release_tx.send(()).unwrap();
+
+                    let leader_bytes = leader.await.unwrap().unwrap();
+                    assert_eq!(leader_bytes, Bytes::from_static(b"aaaa"));
+                });
+            },
+        );
     }
 
     /// Bounds how long the watchdog waits before calling a hang a hang. Nothing
@@ -1698,94 +1644,84 @@ mod tests {
     #[test]
     fn peeked_get_runs_the_disk_read_off_the_worker() {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
-        let worker = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-                let tmp = TempDir::new().unwrap();
-                let clock = Arc::new(ParkOnFirstArmedCall {
-                    armed: AtomicBool::new(false),
-                    parked: AtomicBool::new(false),
-                    began_tx,
-                    release_rx: Mutex::new(release_rx),
-                });
-                let disk = DiskCache::new_with_clock(
-                    tmp.path().to_path_buf(),
-                    generous_limits(),
-                    clock.clone(),
-                );
-
-                // Disk-resident, RAM-empty: the state a peek must fall through
-                // RAM into disk to serve. Inserted before arming, so the stamp
-                // this setup write takes is not the call that parks.
-                let disk_key = test_key(1, 4);
-                disk.insert(disk_key, b"aaaa");
-
-                let ram: Cache<&'static str> = Cache::new(generous_limits());
-                let tiered = Arc::new(TieredCache::new(ram, disk));
-
-                // The concurrent probe's key, resident in RAM only: it is served
-                // without consulting disk at all, so its completion says the
-                // async thread is free rather than that a second disk read got
-                // through.
-                let probe_key = test_key(2, 4);
-                tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
-
-                clock.armed.store(true, Ordering::SeqCst);
-
-                let tiered_reader = tiered.clone();
-                let reader =
-                    tokio::spawn(async move { tiered_reader.get_off_worker(disk_key).await });
-
-                // Awaiting (not blocking on) the announcement is what lets the
-                // reader task be polled on this single-threaded runtime, and it
-                // resolves only once the disk read has actually begun.
-                began_rx.recv().await.unwrap();
-
-                let served = tiered.get_off_worker(probe_key).await;
-                assert_eq!(
-                    served,
-                    Some(Bytes::from_static(b"bbbb")),
-                    "a RAM-resident peek must complete while a disk read is parked"
-                );
-
-                // The peek above completed only because the parked disk read is
-                // not holding this thread. Releasing it here is the
-                // deterministic stand-in for "the wait ends": the reader can
-                // only observe the assertion above as already made.
-                release_tx.send(()).unwrap();
-
-                let read = reader.await.unwrap();
-                assert_eq!(
-                    read,
-                    Some(Bytes::from_static(b"aaaa")),
-                    "the parked read still serves the disk-resident bytes"
-                );
-            });
-
-            let _ = done_tx.send(());
-        });
-
-        match done_rx.recv_timeout(OFF_WORKER_WATCHDOG) {
-            Ok(()) => worker.join().unwrap(),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!(
+        run_with_watchdog(
+            OFF_WORKER_WATCHDOG,
+            || {
+                format!(
                     "test hung for {OFF_WORKER_WATCHDOG:?}: the peeked disk read \
                      likely ran on the runtime's async thread and wedged it \
                      parked, instead of running on the blocking pool (see #1891)"
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
-                Ok(()) => panic!("worker thread exited without a result"),
-                Err(panic) => std::panic::resume_unwind(panic),
+                )
             },
-        }
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    let tmp = TempDir::new().unwrap();
+                    let clock = Arc::new(ParkOnFirstArmedCall::new(
+                        move || began_tx.send(()).unwrap(),
+                        release_rx,
+                    ));
+                    let disk = DiskCache::new_with_clock(
+                        tmp.path().to_path_buf(),
+                        generous_limits(),
+                        clock.clone(),
+                    );
+
+                    // Disk-resident, RAM-empty: the state a peek must fall through
+                    // RAM into disk to serve. Inserted before arming, so the stamp
+                    // this setup write takes is not the call that parks.
+                    let disk_key = test_key(1, 4);
+                    disk.insert(disk_key, b"aaaa");
+
+                    let ram: Cache<&'static str> = Cache::new(generous_limits());
+                    let tiered = Arc::new(TieredCache::new(ram, disk));
+
+                    // The concurrent probe's key, resident in RAM only: it is served
+                    // without consulting disk at all, so its completion says the
+                    // async thread is free rather than that a second disk read got
+                    // through.
+                    let probe_key = test_key(2, 4);
+                    tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+
+                    clock.arm();
+
+                    let tiered_reader = tiered.clone();
+                    let reader =
+                        tokio::spawn(async move { tiered_reader.get_off_worker(disk_key).await });
+
+                    // Awaiting (not blocking on) the announcement is what lets the
+                    // reader task be polled on this single-threaded runtime, and it
+                    // resolves only once the disk read has actually begun.
+                    began_rx.recv().await.unwrap();
+
+                    let served = tiered.get_off_worker(probe_key).await;
+                    assert_eq!(
+                        served,
+                        Some(Bytes::from_static(b"bbbb")),
+                        "a RAM-resident peek must complete while a disk read is parked"
+                    );
+
+                    // The peek above completed only because the parked disk read is
+                    // not holding this thread. Releasing it here is the
+                    // deterministic stand-in for "the wait ends": the reader can
+                    // only observe the assertion above as already made.
+                    release_tx.send(()).unwrap();
+
+                    let read = reader.await.unwrap();
+                    assert_eq!(
+                        read,
+                        Some(Bytes::from_static(b"aaaa")),
+                        "the parked read still serves the disk-resident bytes"
+                    );
+                });
+            },
+        );
     }
 
     /// #1891: the peek-then-defer ADMISSION path runs its disk write on the
@@ -1804,79 +1740,69 @@ mod tests {
     #[test]
     fn peeked_insert_runs_the_disk_write_off_the_worker() {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
-        let worker = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-                let tmp = TempDir::new().unwrap();
-                let clock = Arc::new(ParkOnFirstArmedCall {
-                    armed: AtomicBool::new(false),
-                    parked: AtomicBool::new(false),
-                    began_tx,
-                    release_rx: Mutex::new(release_rx),
-                });
-                let disk = DiskCache::new_with_clock(
-                    tmp.path().to_path_buf(),
-                    generous_limits(),
-                    clock.clone(),
-                );
-                let ram: Cache<&'static str> = Cache::new(generous_limits());
-                let tiered = Arc::new(TieredCache::new(ram, disk));
-
-                let probe_key = test_key(2, 4);
-                tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
-
-                clock.armed.store(true, Ordering::SeqCst);
-
-                let admit_key = test_key(1, 4);
-                let tiered_admit = tiered.clone();
-                let admitter = tokio::spawn(async move {
-                    tiered_admit
-                        .insert_off_worker(admit_key, Bytes::from_static(b"aaaa"))
-                        .await;
-                });
-
-                began_rx.recv().await.unwrap();
-
-                let served = tiered.get_off_worker(probe_key).await;
-                assert_eq!(
-                    served,
-                    Some(Bytes::from_static(b"bbbb")),
-                    "a RAM-resident peek must complete while a disk write is parked"
-                );
-
-                release_tx.send(()).unwrap();
-                admitter.await.unwrap();
-
-                assert_eq!(
-                    tiered.disk.get(&admit_key).as_deref(),
-                    Some(b"aaaa".as_slice()),
-                    "the released write still admits the bytes to the disk tier"
-                );
-            });
-
-            let _ = done_tx.send(());
-        });
-
-        match done_rx.recv_timeout(OFF_WORKER_WATCHDOG) {
-            Ok(()) => worker.join().unwrap(),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!(
+        run_with_watchdog(
+            OFF_WORKER_WATCHDOG,
+            || {
+                format!(
                     "test hung for {OFF_WORKER_WATCHDOG:?}: the peeked disk write \
                      likely ran on the runtime's async thread and wedged it \
                      parked, instead of running on the blocking pool (see #1891)"
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
-                Ok(()) => panic!("worker thread exited without a result"),
-                Err(panic) => std::panic::resume_unwind(panic),
+                )
             },
-        }
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    let tmp = TempDir::new().unwrap();
+                    let clock = Arc::new(ParkOnFirstArmedCall::new(
+                        move || began_tx.send(()).unwrap(),
+                        release_rx,
+                    ));
+                    let disk = DiskCache::new_with_clock(
+                        tmp.path().to_path_buf(),
+                        generous_limits(),
+                        clock.clone(),
+                    );
+                    let ram: Cache<&'static str> = Cache::new(generous_limits());
+                    let tiered = Arc::new(TieredCache::new(ram, disk));
+
+                    let probe_key = test_key(2, 4);
+                    tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+
+                    clock.arm();
+
+                    let admit_key = test_key(1, 4);
+                    let tiered_admit = tiered.clone();
+                    let admitter = tokio::spawn(async move {
+                        tiered_admit
+                            .insert_off_worker(admit_key, Bytes::from_static(b"aaaa"))
+                            .await;
+                    });
+
+                    began_rx.recv().await.unwrap();
+
+                    let served = tiered.get_off_worker(probe_key).await;
+                    assert_eq!(
+                        served,
+                        Some(Bytes::from_static(b"bbbb")),
+                        "a RAM-resident peek must complete while a disk write is parked"
+                    );
+
+                    release_tx.send(()).unwrap();
+                    admitter.await.unwrap();
+
+                    assert_eq!(
+                        tiered.disk.get(&admit_key).as_deref(),
+                        Some(b"aaaa".as_slice()),
+                        "the released write still admits the bytes to the disk tier"
+                    );
+                });
+            },
+        );
     }
 }

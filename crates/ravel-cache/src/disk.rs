@@ -2405,102 +2405,70 @@ mod tests {
     /// watchdog fires instead of the test passing.
     #[test]
     fn sweeper_tick_runs_the_directory_walk_off_the_worker() {
-        /// Parks the thread inside the first clock call made after arming,
-        /// announcing beforehand that it has begun. The announcement is a tokio
-        /// channel so the waiting task yields the runtime rather than blocking
-        /// it; the release is a rendezvous `SyncSender`, so nothing here waits
-        /// on, measures, or compares a duration.
-        struct ParkOnFirstArmedCall {
-            armed: std::sync::atomic::AtomicBool,
-            parked: std::sync::atomic::AtomicBool,
-            began_tx: tokio::sync::mpsc::UnboundedSender<()>,
-            release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
-        }
-
-        impl Clock for ParkOnFirstArmedCall {
-            fn now_ns(&self) -> u64 {
-                if self.armed.load(Ordering::SeqCst) && !self.parked.swap(true, Ordering::SeqCst) {
-                    self.began_tx.send(()).unwrap();
-                    self.release_rx.lock().recv().unwrap();
-                }
-                0
-            }
-        }
-
         // Bounds the watchdog only. Nothing is asserted about elapsed time.
         const WATCHDOG_BOUND: Duration = Duration::from_secs(10);
 
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
-        let worker = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-                let tmp = TempDir::new().unwrap();
-                let clock = Arc::new(ParkOnFirstArmedCall {
-                    armed: std::sync::atomic::AtomicBool::new(false),
-                    parked: std::sync::atomic::AtomicBool::new(false),
-                    began_tx,
-                    release_rx: Mutex::new(release_rx),
-                });
-                // A short interval so the first real tick lands promptly; the
-                // test waits on the tick's own announcement, never on a bound.
-                let limits = generous_limits().with_sweep_interval_ns(1_000_000); // 1 ms
-                let cache =
-                    DiskCache::new_with_clock(tmp.path().to_path_buf(), limits, clock.clone());
-
-                // One entry, so the walk has a header to open rather than an
-                // empty directory to skip. Written before arming, so this
-                // setup stamp is not the call that parks.
-                let key = test_key_with_len(1, 5);
-                cache.insert(key, b"hello");
-                clock.armed.store(true, Ordering::SeqCst);
-
-                // The sweep's own first clock call announces the tick and parks.
-                // Awaiting (not blocking on) it is what lets the sweeper task be
-                // polled at all on this single-threaded runtime.
-                began_rx.recv().await.unwrap();
-
-                let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<u32>();
-                tokio::spawn(async move {
-                    let _ = probe_tx.send(7);
-                });
-                assert_eq!(
-                    probe_rx.await.unwrap(),
-                    7,
-                    "a concurrent task must run to completion while a sweep tick \
-                     is parked mid-walk"
-                );
-
-                // Release only after the assertion above, so the sweep can never
-                // race it. `cache` is held to here: dropping it earlier would
-                // abort the sweeper and change what is being proven.
-                release_tx.send(()).unwrap();
-                drop(cache);
-            });
-
-            let _ = done_tx.send(());
-        });
-
-        match done_rx.recv_timeout(WATCHDOG_BOUND) {
-            Ok(()) => worker.join().unwrap(),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!(
+        crate::test_support::run_with_watchdog(
+            WATCHDOG_BOUND,
+            || {
+                format!(
                     "test hung for {WATCHDOG_BOUND:?}: the age sweep likely ran on \
                      the runtime's async thread and wedged it parked, instead of \
                      running on the blocking pool (see #1891)"
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
-                Ok(()) => panic!("worker thread exited without a result"),
-                Err(panic) => std::panic::resume_unwind(panic),
+                )
             },
-        }
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    let tmp = TempDir::new().unwrap();
+                    let clock = Arc::new(crate::test_support::ParkOnFirstArmedCall::new(
+                        move || began_tx.send(()).unwrap(),
+                        release_rx,
+                    ));
+                    // A short interval so the first real tick lands promptly; the
+                    // test waits on the tick's own announcement, never on a bound.
+                    let limits = generous_limits().with_sweep_interval_ns(1_000_000); // 1 ms
+                    let cache =
+                        DiskCache::new_with_clock(tmp.path().to_path_buf(), limits, clock.clone());
+
+                    // One entry, so the walk has a header to open rather than an
+                    // empty directory to skip. Written before arming, so this
+                    // setup stamp is not the call that parks.
+                    let key = test_key_with_len(1, 5);
+                    cache.insert(key, b"hello");
+                    clock.arm();
+
+                    // The sweep's own first clock call announces the tick and parks.
+                    // Awaiting (not blocking on) it is what lets the sweeper task be
+                    // polled at all on this single-threaded runtime.
+                    began_rx.recv().await.unwrap();
+
+                    let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<u32>();
+                    tokio::spawn(async move {
+                        let _ = probe_tx.send(7);
+                    });
+                    assert_eq!(
+                        probe_rx.await.unwrap(),
+                        7,
+                        "a concurrent task must run to completion while a sweep tick \
+                         is parked mid-walk"
+                    );
+
+                    // Release only after the assertion above, so the sweep can never
+                    // race it. `cache` is held to here: dropping it earlier would
+                    // abort the sweeper and change what is being proven.
+                    release_tx.send(()).unwrap();
+                    drop(cache);
+                });
+            },
+        );
     }
 
     /// Wiring proof: the background task spawned at construction
