@@ -116,6 +116,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pinned by an occurrence count, so a restatement in different words cannot
   drift unpinned.
 
+- **A cargo-free guard checks that every operator-facing record-cache figure
+  matches the constants it is derived from** (issue #1927).
+  `scripts/guards/check-doc-figures.sh` re-derives each figure from
+  `RECORD_CACHE_ENTRY_BYTES`, `RECORD_CACHES_PER_TENANT`,
+  `MAX_RECORD_CACHE_BYTES_PER_TENANT` and
+  `DEFAULT_CACHE_CAPACITY_PER_TENANT`, then counts every occurrence in the
+  three guides and in `--disable-cache`'s long help, so a restatement that
+  drifts, or one nobody accounted for, fails in under a second rather than in
+  CI. The cargo tests that pin the same figures still run in CI; this is the
+  half that runs where cargo does not.
+
 ### Changed
 
 - **A shard now refuses a flush trigger once `--max-queued-flushes` (default
