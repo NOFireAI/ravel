@@ -2757,7 +2757,37 @@ fn maintain_template_covers_every_catalog_sweep_call() {
         "the key domain models no key outside the catalog HEAD keyspace, so \
          the tightness assertion below examines nothing"
     );
-    for pattern in &gets {
+    // One pre-existing grant reaches a HEAD witness incidentally rather than
+    // by naming the catalog keyspace: `Signal::Audit::key_prefix()` is "u", so
+    // `t/<hash>/catalog/u/HEAD` matches the audit read grant `t/*/u/*`,
+    // because IAM's `*` spans `/`. That grant exists to read the audit
+    // keyspace and must keep reaching it, so demanding it reach nothing else
+    // is unsatisfiable. The tightness rule below is about the grant this
+    // change adds, so it applies to patterns that name the catalog keyspace
+    // literally -- and the incidental set is pinned immediately after, so a
+    // NEW over-broad pattern cannot hide in the same exemption.
+    let catalog_gets: Vec<String> = gets
+        .iter()
+        .filter(|p| p.contains("catalog/"))
+        .cloned()
+        .collect();
+    let incidental: Vec<String> = gets
+        .iter()
+        .filter(|p| !p.contains("catalog/"))
+        .filter(|p| head_witnesses.iter().any(|w| glob_matches(p.as_str(), w)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        incidental,
+        vec!["t/*/u/*".to_string()],
+        "exactly one non-catalog Maintain read pattern may reach a catalog \
+         HEAD witness, the audit keyspace grant t/*/u/* that collides with \
+         Signal::Audit's \"u\" prefix. Another one appearing here means a \
+         pattern reaches catalog HEAD keys without naming the catalog \
+         keyspace, which the tightness loop below would then not examine \
+         (#1847)"
+    );
+    for pattern in &catalog_gets {
         let reaches_head = head_witnesses.iter().any(|w| glob_matches(pattern, w));
         if !reaches_head {
             continue;
