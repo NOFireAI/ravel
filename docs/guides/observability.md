@@ -777,8 +777,9 @@ is the signal that catches this: its AGE, not its value, is what a dead probe
 task changes, because a *failing* probe still completes a cycle and still
 advances this gauge every `--store-probe-interval`.
 
-Alert on `time() - ravel_store_probe_last_run_timestamp_seconds > 132`, for:
-5m. `132` is `K * interval * 1.1`: the probe's default interval
+Alert on `(time() - ravel_store_probe_last_run_timestamp_seconds > 132) and
+ravel_store_probe_last_run_timestamp_seconds > 0`, for: 5m. `132` is `K *
+interval * 1.1`: the probe's default interval
 (`store_probe::DEFAULT_STORE_PROBE_INTERVAL`) is 30s, `store_probe::spawn`
 sleeps a jittered interval (`fold::jittered`) that adds up to 10%, and
 `store_probe::K` is 4, so `4 * 30 * 1.1 = 132`.
@@ -805,6 +806,20 @@ cycles altogether keeps the comparison true past `for: 5m`. Do not shrink
 `for:` on the strength of the 33s sleep-only ceiling: a `for: 1m` pages on
 every ordinary store outage, which is the wrong-cause page this alert exists
 to avoid.
+
+The gauge also reads `0` (`store_probe::PROBE_LAST_RUN_UNIX_NS`'s sentinel)
+from process start until the first cycle completes, which makes `time() - 0`
+evaluate to roughly the current Unix time, always over the threshold. The
+fold and maintenance liveness rules below carry the same sentinel and cover
+it purely by sizing `for:` above the interval that bounds a healthy first
+cycle; this rule cannot use that trick, because a first cycle's duration is
+not bounded by an interval, it is bounded by whatever the backend's own
+retry budget allows, with no config-time value to size a `for:` margin
+against. The `and ravel_store_probe_last_run_timestamp_seconds > 0` term
+keeps the rule silent until a real timestamp has been stamped at least once,
+regardless of how long that first cycle takes; it does not change when the
+rule fires once the gauge is real, since `x > 0` is true for every value the
+gauge takes after that first stamp.
 
 Both terms scale with `--store-probe-interval`, which is a flag
 (`ServerConfig::store_probe_interval`, parsed by `parse_store_probe_interval`
@@ -836,8 +851,23 @@ groups:
         # dead task; a merely failing-but-alive probe already trips
         # RavelStoreUnreachable well inside this window, so this rule is the
         # complement, not a duplicate.
+        #
+        # The gauge reads 0 (store_probe::PROBE_LAST_RUN_UNIX_NS's sentinel)
+        # from process start until the first probe cycle completes, which
+        # makes the bare comparison true instantly on every start. Unlike the
+        # fold and maintenance liveness rules, `for:` alone cannot be sized to
+        # cover this: run_probe_cycle's store.get has no deadline, so a first
+        # cycle against a slow or unreachable backend can run for as long as
+        # that backend's own retry budget allows, with no compile-time or
+        # config-time bound to size a margin against. The second term keeps
+        # the rule silent until a real timestamp has been stamped at least
+        # once, whatever that first cycle costs.
         expr: |
-          time() - ravel_store_probe_last_run_timestamp_seconds > 132
+          (
+            time() - ravel_store_probe_last_run_timestamp_seconds > 132
+          )
+          and
+          ravel_store_probe_last_run_timestamp_seconds > 0
         for: 5m
         labels:
           severity: critical

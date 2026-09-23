@@ -1126,6 +1126,32 @@ fn the_guide_and_the_shipped_rule_file_agree() {
     }
 }
 
+/// `ravel_store_probe_last_run_timestamp_seconds` reads its zero sentinel
+/// (`store_probe::PROBE_LAST_RUN_UNIX_NS`'s initial value) from process start
+/// until the first probe cycle completes, which makes a bare
+/// `time() - <gauge> > 132` comparison true on every process start,
+/// independent of the threshold: `time() - 0` is roughly the current Unix
+/// time, always over 132. Pinning the exact expression, rather than only
+/// asserting the metric name appears, is what catches a future edit that
+/// drops the guard while leaving the rest of the rule looking unchanged.
+#[test]
+fn store_probe_stalled_rule_guards_the_zero_sentinel() {
+    let groups = shipped_rule_groups();
+    let rule = groups
+        .iter()
+        .flat_map(|group| group.rules.iter())
+        .find(|rule| rule.name == "RavelStoreProbeStalled")
+        .expect("shipped rule file must carry RavelStoreProbeStalled");
+
+    const EXPECTED_EXPR: &str = "(\n  time() - ravel_store_probe_last_run_timestamp_seconds > 132\n)\nand\nravel_store_probe_last_run_timestamp_seconds > 0";
+    assert_eq!(
+        rule.expr, EXPECTED_EXPR,
+        "RavelStoreProbeStalled must compare the gauge to 0 as well as to the \
+         staleness threshold, or a fresh process pages on its own zero sentinel \
+         before the first probe cycle ever completes"
+    );
+}
+
 /// The shipped dashboard is held to the same standard as the shipped rule
 /// file: a panel whose target selects a family Ravel does not render draws a
 /// flat empty graph, and an operator reading it during an incident concludes
