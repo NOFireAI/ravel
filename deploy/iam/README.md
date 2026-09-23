@@ -66,6 +66,16 @@ grants below are what remains deletable after that deny applies.
   `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, and `t/*/catalog/*/idx/*`.
   These are the objects the compaction, supersession, retention,
   erasure-request, and unreferenced-catalog sweeps physically remove.
+  The catalog half of that list also needs reads, which are easy to miss
+  because two of the three fail silently rather than refusing the pass:
+  `MaintainRead` carries `t/*/catalog/*/HEAD` (the sweep resolves what is
+  referenced), `t/*/catalog/*/snap/*` (the reachability pass GETs every
+  part HEAD names, and an AccessDenied there aborts the whole pass for
+  that signal), and `t/*/catalog/*/idx/*` (the scrub tick's covering-
+  postings read, which returns "no postings" on a denial and so disables
+  the postings scrub tier without an error). `MaintainList` carries the
+  two catalog prefixes, without which the sweep is refused at its first
+  `ListBucket`.
 
 ### Erasure-request objects: the three grants the `.dreq` sweep needs
 

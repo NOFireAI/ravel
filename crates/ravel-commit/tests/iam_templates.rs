@@ -1829,12 +1829,15 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // AccessDenied, which ensure_part turns into MaintainError::Store and so
     // aborts the whole pass for that signal rather than one object.
     //
-    // Maintain-mode processes also GET t/*/catalog/*/idx/* from three call
-    // sites outside the sweep: load_covering_postings for the scrub tick,
-    // and fold_inner's .cstat and .npost reuse baseline. All three swallow
-    // the error, so a missing grant there is not an outage but a silent
-    // downgrade -- the postings scrub tier never runs and every fold
-    // rebuilds from scratch.
+    // Maintain-mode processes also GET t/*/catalog/*/idx/*, from the scrub
+    // tick's load_covering_postings. It returns Ok(None) on ANY error, which
+    // the tick cannot tell from "no postings ref yet", so a missing grant
+    // there is not an outage but a silent downgrade: the postings scrub tier
+    // never runs and nothing says so. (fold_inner also GETs idx/ objects for
+    // its .cstat and .npost reuse baseline, but the fold never runs under
+    // Mode::Maintain -- folds_in_process excludes it and the maintain arm
+    // returns FoldTasks::none -- so those reads are why gateway.json and
+    // query.json carry catalog reads, not why maintain.json does.)
     //
     // Each is exactly the defect this role's del/* grants were added to fix,
     // and the shape that shipped again here three times (issue #1847, rounds
@@ -2776,13 +2779,13 @@ fn maintain_template_covers_every_catalog_sweep_call() {
     //   `MaintainError::Store` on anything that is not `NotFound`, so an
     //   AccessDenied there aborts the whole pass for that signal rather than
     //   failing one object -- which is what a HEAD-only read grant produced.
-    // - `idx/` objects, by three call sites, every one of which SWALLOWS the
-    //   failure: `load_covering_postings` returns `Ok(None)` on any error
-    //   (crates/ravel-catalog/src/covering_postings.rs), which the scrub tick
+    // - `idx/` objects, by the scrub tick's `load_covering_postings`, which
+    //   SWALLOWS the failure: it returns `Ok(None)` on any error
+    //   (crates/ravel-catalog/src/covering_postings.rs), which the tick
     //   cannot tell from "no postings ref yet", so the postings scrub tier
-    //   silently never runs; and `fold_inner` GETs the prior `.cstat` and
-    //   `.npost` for reuse (crates/ravel-catalog/src/fold.rs), warns, and
-    //   degrades to a full rebuild every fold.
+    //   silently never runs. `fold_inner`'s `.cstat`/`.npost` reuse GETs
+    //   read the same keyspace but never under this credential: the fold
+    //   does not run in `Mode::Maintain`.
     //
     // The third shape is why this assertion covers reads that fail SILENTLY as
     // well as loudly. A missing grant on the first two announces itself; a
@@ -2815,7 +2818,7 @@ fn maintain_template_covers_every_catalog_sweep_call() {
             gets.iter().any(|p| glob_matches(p, witness)),
             "maintain: no GetObject Allow reaches {witness:?}. Maintain-mode \
              processes GET the HEAD, every snapshot part it names, and the \
-             idx/ objects the scrub tick and the fold's reuse baseline read. \
+             idx/ objects the scrub tick's load_covering_postings reads. \
              A grant covering only some of the three either aborts the pass \
              or, for idx/, degrades silently (#1847)"
         );
