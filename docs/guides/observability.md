@@ -831,6 +831,46 @@ Recompute both before tightening either the threshold or `for:` on a fleet
 that overrides the default, mirroring the caveat the catalog-fold alert above
 states for a non-default `fold_interval`.
 
+`RavelStoreProbeStalled`'s `> 0` guard buys correctness by giving up
+coverage of one state: a probe task that dies, panics, or is never spawned
+before its first cycle ever completes. The gauge then holds its zero
+sentinel forever, so `> 0` stays false forever with it, and
+`RavelStoreUnreachable` does not cover that state either, since
+`set_store_reachable` is written only from inside a completed
+`run_probe_cycle`; `store_reachable()` stays `true` and `/readyz` answers
+200 indefinitely. `RavelStoreProbeNeverRan` below is the companion rule for
+exactly that state: the sentinel held continuously, for long enough that no
+legitimate first cycle could still be in flight, is itself the "nothing has
+ever run" signal.
+
+Its `for:` window reuses the same two terms as the `132` threshold above:
+the jittered sleep `spawn()` runs before its first cycle (`interval * 1.1 =
+30 * 1.1 = 33s`) plus the worst-case single cycle against the S3 backend
+(`retry_timeout + request_timeout = 180 + 20 = 200s`), giving a `233s`
+worst-case gap between process start and the first stamp, the same figure
+derived above for the gap between two live completions, since both are
+bounded by one probe cycle's worst case. `retry_timeout` and
+`request_timeout` are the object-store crate's own documented defaults, not
+constants this codebase controls, so the window applies the same `1.1`
+safety factor once more over the whole sum as margin against that figure
+drifting: `233 * 1.1 = 256.3s`, rounded up to `257s`. Both terms scale with
+`--store-probe-interval`, same as the sibling rule: recompute this window
+before tightening it on a fleet with a non-default interval.
+
+An alternative considered and rejected: rendering no sample for
+`ravel_store_probe_last_run_timestamp_seconds` until the first cycle
+completes, so the series is absent rather than zero, and alerting with
+`absent(...)` the way `RavelCatalogFoldStalled` does above. That would
+remove the sentinel from every consumer at once instead of adding a rule
+next to it, but `render_store_probe_family` in `metrics.rs` exports this
+whole gauge family unconditionally by design, specifically so a metrics-only
+monitoring setup with nothing reading `/readyz` still sees a store outage or
+a dead probe task; suppressing the first sample would reverse that
+documented decision and would change
+`metrics_store_probe_last_run_gauge_renders_exact_seconds_for_pinned_clock`
+and the other tests asserting the `{mode="all"} 0` startup rendering. The
+companion rule below gets the same coverage without touching that contract.
+
 #### The store-probe liveness alert
 
 Shipped as part of the `ravel-storage-and-auth` group in
@@ -861,7 +901,9 @@ groups:
         # that backend's own retry budget allows, with no compile-time or
         # config-time bound to size a margin against. The second term keeps
         # the rule silent until a real timestamp has been stamped at least
-        # once, whatever that first cycle costs.
+        # once, whatever that first cycle costs. RavelStoreProbeNeverRan
+        # below is what covers that excluded state: a probe that dies, or
+        # never starts, before its first cycle ever completes.
         expr: |
           (
             time() - ravel_store_probe_last_run_timestamp_seconds > 132
@@ -882,6 +924,50 @@ groups:
             does not hold this condition true long enough to fire, since
             RavelStoreUnreachable already covers a probe that is failing but
             still running.
+      - alert: RavelStoreProbeNeverRan
+        # Complement to RavelStoreProbeStalled above. That rule requires a
+        # real timestamp to have been stamped at least once, so it cannot
+        # fire on a probe task that dies, panics, or is never spawned before
+        # its first cycle ever completes: the gauge then holds its zero
+        # sentinel forever and the `> 0` guard stays false forever with it.
+        # RavelStoreUnreachable does not cover this state either:
+        # set_store_reachable is only ever called from inside
+        # run_probe_cycle, so store_reachable() stays true and /readyz
+        # answers 200 indefinitely. The sentinel itself, sustained, is the
+        # only signal for this state, which is exactly the case issue #1728
+        # exists to catch: nothing has ever run.
+        #
+        # for: is sized from the same two terms the 132 threshold above
+        # uses. The jittered sleep spawn() runs before its first cycle:
+        # interval * 1.1 = 30 * 1.1 = 33s. The worst-case single cycle
+        # against the S3 backend: retry_timeout + request_timeout = 180 +
+        # 20 = 200s (S3HttpConfig's doc comment in the object-store crate).
+        # Sum: 33 + 200 = 233s worst-case gap between process start and the
+        # first stamp. retry_timeout and request_timeout are that crate's
+        # documented defaults, not constants this codebase controls, so this
+        # window applies the same 1.1 safety factor once more over the whole
+        # sum as margin against that figure drifting: 233 * 1.1 = 256.3s,
+        # rounded up to 257s. Both terms scale with --store-probe-interval,
+        # same as the sibling rule: recompute this window before tightening
+        # it on a fleet with a non-default interval.
+        expr: |
+          ravel_store_probe_last_run_timestamp_seconds == 0
+        for: 257s
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            A Ravel process's background store probe has never completed a
+            single cycle since startup
+          description: >-
+            The probe task died, panicked, or was never spawned, before ever
+            reading sys/tenancy once. RavelStoreProbeStalled cannot cover
+            this: it requires a real timestamp to compare against, which a
+            probe that has never run once never produces, and
+            RavelStoreUnreachable does not either, since store_reachable()
+            is only ever written from inside a completed probe cycle. Check
+            the process logs for a panic at startup or in the probe task's
+            first cycle.
 ```
 
 ### Graceful shutdown (`ravel_shutdown_drain_overrun_total`)

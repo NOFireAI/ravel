@@ -84,7 +84,7 @@ const EXPECTED_METRIC_NAMES: usize = 38;
 /// a group, or a group that lost a rule, must fail rather than shrink the
 /// scan. `deploy/README.md` states both figures.
 const EXPECTED_GROUPS: usize = 8;
-const EXPECTED_ALERTS: usize = 32;
+const EXPECTED_ALERTS: usize = 33;
 
 /// Rules transcribed from a troubleshooting-table row that states no
 /// duration, so they carry no `for:` and say so in an `as_documented`
@@ -129,7 +129,7 @@ const EXPECTED_DASHBOARD_ONLY_NAMES: usize = 70;
 /// stops holding rules, fails here rather than leaving the per-alert
 /// comparison below iterating an empty set.
 const EXPECTED_GUIDE_BLOCKS: usize = 6;
-const EXPECTED_GUIDE_ALERTS: usize = 14;
+const EXPECTED_GUIDE_ALERTS: usize = 15;
 
 /// One tenant, one trivially valid PromQL rule. Enough for `alerting::spawn`
 /// to build an evaluator, which is what puts the whole `ravel_alert_*` family
