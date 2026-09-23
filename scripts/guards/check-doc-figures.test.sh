@@ -189,6 +189,33 @@ t="$(new_tree help-duplicate)"
 sed -i.bak 's|/// two caches, about 18 MB per actively-queried tenant.|/// two caches, about 18 MB per actively-queried tenant, so about 18 MB per actively-queried tenant in all.|' "${t}/services/ravel-server/src/config.rs"
 check "a duplicated figure in the help is a finding" "${t}" 1 "2 time(s)"
 
+# A marker at offset 0 of the normalized text. `"" in ".,"` is True, so the
+# string spelling of the preceding-character test never counted one, and a
+# figure that opened a doc went unscanned however wrong it was.
+t="$(new_tree marker-at-offset-zero)"
+printf '%s\n' '18 MB across both caches, which this doc states nowhere else.' \
+  >"${t}/docs/catalog-and-mvcc.md.head"
+cat "${t}/docs/catalog-and-mvcc.md.head" "${t}/docs/catalog-and-mvcc.md" \
+  >"${t}/docs/catalog-and-mvcc.md.new"
+mv "${t}/docs/catalog-and-mvcc.md.new" "${t}/docs/catalog-and-mvcc.md"
+rm "${t}/docs/catalog-and-mvcc.md.head"
+check "a marker at offset 0 is counted" "${t}" 1 "expected 0"
+
+# A longer number that merely opens with a marker is not that marker. Both
+# separators continue a number only when a digit follows them, which is what
+# separates "10,000,000" from "capped at 25,000. Neither cache".
+t="$(new_tree longer-numbers)"
+printf '%s\n' 'A retention limit of 10,000,000 samples and 25,000.5 average rows.' \
+  >>"${t}/docs/guides/caching.md"
+check "a longer number containing a marker is not counted" "${t}" 0 "clean"
+
+# The trailing-digit half of that rule, which no prose in the scanned docs
+# can produce today. Synthetic on purpose: the rule is cheap and the
+# convention is a case before a rule, not a case only where prose reaches.
+t="$(new_tree trailing-digit)"
+sed -i.bak 's/Capacity is floored at 10,000 entries/Capacity is floored at 10,0001 entries/' "${t}/docs/guides/caching.md"
+check "a marker continued by a trailing digit is not counted" "${t}" 1 "expected 3"
+
 t="$(new_tree bad-usage)"
 out="$(cd "${t}" && bash scripts/guards/check-doc-figures.sh extra-arg 2>&1)"; rc=$?
 if [[ "${rc}" == 64 ]]; then
