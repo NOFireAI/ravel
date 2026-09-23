@@ -25,6 +25,7 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",

@@ -707,9 +707,11 @@ into them. An operator with erasure obligations must budget them deliberately.
   names, and for a tenant with a `STR` or `BYTES` typed attribute column a
   per-part `.cstat` index object among them holds that subject's own column
   value; a lock over the keyspace delays that delete, and the erased value
-  persists until the fold reconciles the hour and then a further `R`. Under
-  the shipped Maintain IAM policy the delete is denied outright, so the
-  bound is open-ended until that policy changes. The four-step mechanism,
+  persists until the fold reconciles the hour and then a further `R`. The
+  shipped Maintain IAM policy permits that delete, with its catalog deny
+  scoped to `catalog/<signal>/HEAD`; a copy of that template predating the
+  narrowing denies it outright and leaves the bound open-ended until it is
+  re-applied. The four-step mechanism,
   the exact bound, the IAM ceiling, and the HEAD-scoping advice are in
   docs/object-store-contract.md's "Required bucket configuration" section,
   "A lock on the catalog family".

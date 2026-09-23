@@ -106,8 +106,8 @@ concrete failure rows:
   (proto/ravel/catalog.proto) carry identities, hashes, counts, and
   timestamps — no label or attribute values. Name postings carry metric
   names only. So catalog objects (delete-denied on HEAD under ADR-0055, as
-amended 2026-09-23) hold no
-  subject identifiers, *provided* subject identifiers appear only as label/
+  amended 2026-09-23) hold no subject identifiers, *provided* subject
+  identifiers appear only as label/
   attribute values, never inside metric names. That proviso becomes a
   documented requirement (§7).
 

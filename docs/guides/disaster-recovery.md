@@ -67,8 +67,9 @@ permits that delete: its catalog delete-deny is scoped to
 `catalog/<signal>/snap/*` and `catalog/<signal>/idx/*`. An operator still
 running a copy of `deploy/iam/maintain.json` from before that narrowing has
 the old, open-ended bound until they re-apply it, because the sweep is
-refused at its first catalog delete every pass. The four-step mechanism, the exact bound, the IAM ceiling and
-the HEAD-scoping advice are in the object store contract's "Required bucket
+refused at its first catalog delete every pass. The four-step mechanism, the
+exact bound, the IAM ceiling and the HEAD-scoping advice are in the object
+store contract's "Required bucket
 configuration" section, "A lock on the catalog family". The scoped posture is
 therefore still not a disaster-recovery choice; it is the baseline the commit
 and catalog layers already assume, with the commit-record family carrying the
