@@ -125,7 +125,8 @@ A process with no active state for a (tenant, signal) writes nothing (or
 lets a prior snapshot expire, see §5) rather than writing an empty
 snapshot for every tenant it has never seen -- most processes see most
 tenants never, and this avoids an all-processes-times-all-tenants object
-count.
+count. (ADR-0069 reversed the premise this rests on; see the 2026-09-23
+amendment at the end of this ADR.)
 
 ### 2. Reconciliation read and the local soft threshold
 
@@ -271,7 +272,9 @@ smaller overshoot window, a knob this ADR exposes rather than hard-codes.
 ### 5. Snapshot lifecycle: no new sweep needed
 
 A process's own snapshot for a (tenant, signal) it stops tracking (the
-tenant goes idle, or the process is draining) is left in place rather
+tenant goes idle, or the process is draining -- but see the 2026-09-23
+amendment: a process does NOT stop tracking an idle tenant) is left in
+place rather
 than actively deleted -- deleting it would require the same delete-grant
 reasoning ADR-0055 just narrowed, for no real benefit, since a stale
 snapshot is already excluded by staleness (§3) after `2 * R`, at most 20
@@ -384,3 +387,45 @@ quantity (see section 2's "Rate caps" subsection for the failure mode and
 the corrected equal-fleet-share formula). No deployment ever ran the
 original formula -- the implementation was blocked on this finding
 before landing.
+
+## Amendment (2026-09-23): the cost argument's premise was reversed by ADR-0069
+
+§1's cost argument rests on "most processes see most tenants never", and §5
+assumes a process stops tracking a `(tenant, signal)` when the tenant goes
+idle. **ADR-0069 decided the opposite**, and the code implements ADR-0069.
+
+ADR-0069 excludes admission-controller state from its eviction scheme, on the
+grounds that its active-series and stream counts are correctness-bearing caps
+that cannot be silently reset, and says in as many words that "that map grows
+with tenant count and is documented as doing so", leaving the question of
+whether this ADR's reconciliation records make eviction safe as a separate
+follow-up. That follow-up has not been decided.
+
+So the justification for this loop's shape no longer holds, and this
+amendment records that rather than restating it as though it did.
+
+What the loop actually costs, on the code as it stands: a floor of `2 * T * S`
+sequential object-store round trips per cycle -- one LIST plus one PUT per
+tracked `(tenant, signal)` -- where `T` grows with the number of tenants the
+process has ever served rather than the number it currently serves. Every
+escape in the design fails to bound it:
+
+- the only pre-LIST skip is an empty-usage test, and usage gains an entry even
+  for a REJECTED request, so a tenant that was refused once is tracked
+  thereafter;
+- the LIST precedes the first staleness test, so the listing is always paid
+  before any skip can apply;
+- the PUT per `(tenant, signal)` is unconditional, with no staleness check
+  before it;
+- there is no cached listing, no deadline, no per-cycle budget and no
+  concurrency.
+
+The tenant map is in-memory, so `T` resets on restart. The degraded state is
+therefore a sawtooth across process lifetimes rather than a permanent
+condition, which is why it has not shown up as an outage.
+
+This amendment changes no decision and no code. It removes a stale
+justification, so the next person to size this loop starts from what it costs
+rather than from an argument that has not been true since ADR-0069 landed.
+Bounding the loop is issue #1922's remaining half and belongs with the
+ADR-0069 follow-up, not here.
