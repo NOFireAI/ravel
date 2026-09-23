@@ -23,7 +23,7 @@
 //! inside an `expr` block scalar both parse here and are both refused by
 //! Prometheus on load. Issue #1928 covers validating those two fields.
 //!
-//! `docs/guides/observability.md` reprints 13 of these rules in fenced `yaml`
+//! `docs/guides/observability.md` reprints 14 of these rules in fenced `yaml`
 //! blocks, to explain them in place. Those blocks are parsed the same way and
 //! compared field by field against the shipped file, which is what keeps a
 //! rename from updating one copy and leaving the other handing readers a dead
@@ -73,7 +73,7 @@ const EXPECTED_METRIC_NAMES: usize = 38;
 /// a group, or a group that lost a rule, must fail rather than shrink the
 /// scan. `deploy/README.md` states both figures.
 const EXPECTED_GROUPS: usize = 8;
-const EXPECTED_ALERTS: usize = 33;
+const EXPECTED_ALERTS: usize = 32;
 
 /// Rules transcribed from a troubleshooting-table row that states no
 /// duration, so they carry no `for:` and say so in an `as_documented`
@@ -85,7 +85,7 @@ const EXPECTED_ALERTS_WITHOUT_FOR: usize = 15;
 /// stops holding rules, fails here rather than leaving the per-alert
 /// comparison below iterating an empty set.
 const EXPECTED_GUIDE_BLOCKS: usize = 6;
-const EXPECTED_GUIDE_ALERTS: usize = 15;
+const EXPECTED_GUIDE_ALERTS: usize = 14;
 
 /// One tenant, one trivially valid PromQL rule. Enough for `alerting::spawn`
 /// to build an evaluator, which is what puts the whole `ravel_alert_*` family
@@ -828,28 +828,41 @@ fn the_guide_and_the_shipped_rule_file_agree() {
     }
 }
 
-/// `ravel_store_probe_last_run_timestamp_seconds` reads its zero sentinel
-/// (`store_probe::PROBE_LAST_RUN_UNIX_NS`'s initial value) from process start
-/// until the first probe cycle completes, which makes a bare
-/// `time() - <gauge> > 132` comparison true on every process start,
-/// independent of the threshold: `time() - 0` is roughly the current Unix
-/// time, always over 132. Pinning the exact expression, rather than only
-/// asserting the metric name appears, is what catches a future edit that
-/// drops the guard while leaving the rest of the rule looking unchanged.
+/// `store_probe::spawn` stamps `ravel_store_probe_last_run_timestamp_seconds`
+/// before the loop's first sleep, so the gauge carries no ambiguous sentinel:
+/// an ageing timestamp is a stopped probe and `0` is a probe that was never
+/// spawned, and one bare staleness comparison covers both. Pinning the exact
+/// expression, rather than only asserting the metric name appears, is what
+/// catches a future edit that reintroduces the `> 0` guard term (which would
+/// reopen the hole: a probe that died before its first cycle would then never
+/// fire any rule) or that adds a second rule on the sentinel (whose window can
+/// only be derived from the DEFAULT interval, so it pages on every rollout of
+/// a fleet running a longer `--store-probe-interval`).
 #[test]
-fn store_probe_stalled_rule_guards_the_zero_sentinel() {
+fn store_probe_stalled_rule_is_one_unguarded_staleness_comparison() {
     let groups = shipped_rule_groups();
-    let rule = groups
+    let probe_rules: Vec<_> = groups
         .iter()
         .flat_map(|group| group.rules.iter())
-        .find(|rule| rule.name == "RavelStoreProbeStalled")
-        .expect("shipped rule file must carry RavelStoreProbeStalled");
-
-    const EXPECTED_EXPR: &str = "(\n  time() - ravel_store_probe_last_run_timestamp_seconds > 132\n)\nand\nravel_store_probe_last_run_timestamp_seconds > 0";
+        .filter(|rule| {
+            rule.expr
+                .contains("ravel_store_probe_last_run_timestamp_seconds")
+        })
+        .collect();
+    let names: Vec<&str> = probe_rules.iter().map(|rule| rule.name.as_str()).collect();
     assert_eq!(
-        rule.expr, EXPECTED_EXPR,
-        "RavelStoreProbeStalled must compare the gauge to 0 as well as to the \
-         staleness threshold, or a fresh process pages on its own zero sentinel \
-         before the first probe cycle ever completes"
+        names,
+        vec!["RavelStoreProbeStalled"],
+        "exactly one shipped rule may read the liveness gauge; a companion \
+         sentinel rule is what the spawn stamp removed the need for"
+    );
+
+    const EXPECTED_EXPR: &str = "time() - ravel_store_probe_last_run_timestamp_seconds > 132";
+    assert_eq!(
+        probe_rules[0].expr, EXPECTED_EXPR,
+        "RavelStoreProbeStalled must be the bare staleness comparison: the \
+         spawn stamp makes 0 mean only never-spawned, which this expression \
+         already fires on, so a `> 0` guard term would exclude coverage \
+         instead of buying any"
     );
 }
