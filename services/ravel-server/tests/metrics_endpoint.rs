@@ -900,3 +900,67 @@ async fn attribution_family_folds_unconfigured_tenant_to_other() {
          PUTs never rendered at all, got {hashes:?}:\n{body}"
     );
 }
+
+/// Issue #1742: both new families must actually reach a live `GET /metrics`
+/// scrape, not just the in-process `render()` unit tests in
+/// `services/ravel-server/src/metrics.rs`. `ravel_ingest_flush_all_residue_tenants_total`
+/// is checked once per ingest signal, `ravel_shutdown_drain_overrun_total`
+/// once with no `signal` label (it is process-wide, not per pipeline). Counted
+/// exactly, not merely `contains`, for the same reason as the queued-flush
+/// test above: a family or sample emitted twice is a duplicate series a
+/// scrape rejects, and `contains` cannot tell a duplicate from a single line.
+///
+/// This test does not drive a real residue or overrun value (that is pinned,
+/// with exact distinct-per-signal numbers, by
+/// `flush_all_residue_renders_distinctly_for_every_signal` in `metrics.rs`
+/// and by `drain_overrun_counter_increments_exactly_once_on_a_real_overrun`
+/// in `graceful_shutdown_e2e.rs`); it only proves the rendering path a real
+/// scrape actually uses exposes both families at all, over HTTP, in the mode
+/// where the ingest families exist.
+#[tokio::test]
+async fn drain_overrun_and_residue_families_render() {
+    let running = start_test_server(Mode::All, u64::MAX, false).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let body = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+
+    assert_eq!(
+        body.matches("# TYPE ravel_ingest_flush_all_residue_tenants_total counter")
+            .count(),
+        1,
+        "residue family must be declared exactly once:\n{body}"
+    );
+    for signal in ["metrics", "logs", "spans"] {
+        assert_eq!(
+            body.matches(&format!(
+                "ravel_ingest_flush_all_residue_tenants_total{{mode=\"all\",signal=\"{signal}\"}} "
+            ))
+            .count(),
+            1,
+            "residue family must render exactly one sample for signal {signal}:\n{body}"
+        );
+    }
+
+    assert_eq!(
+        body.matches("# TYPE ravel_shutdown_drain_overrun_total counter")
+            .count(),
+        1,
+        "overrun family must be declared exactly once:\n{body}"
+    );
+    assert_eq!(
+        body.matches("ravel_shutdown_drain_overrun_total{mode=\"all\"} ")
+            .count(),
+        1,
+        "overrun family must render exactly one sample, with no signal label:\n{body}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}

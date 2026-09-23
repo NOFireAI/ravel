@@ -48,6 +48,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metric names; it does not validate the PromQL around them or the dashboard
   against Grafana's schema.
 
+- **A teardown drain that loses acknowledged buffered rows, or overruns
+  `--shutdown-timeout`, is now visible on `/metrics`** (issue #1742).
+  `ravel_ingest_flush_all_residue_tenants_total` renders the residual tenant
+  count a `DrainIntent::Teardown` flush already logged at ERROR, for all
+  three ingest signals; `ravel_shutdown_drain_overrun_total` renders whether
+  the last graceful drain ran past its timeout, set only on that branch. The
+  client-facing listener (which also serves `/metrics`) stops accepting new
+  connections before either value can change during the shutdown that sets
+  it, so a live scrape is unlikely to observe the exact event; see
+  [Reachability during shutdown](docs/guides/observability.md#reachability-during-shutdown).
+  The accompanying log line remains the reliable single-event signal.
+
 - **`ravel-bench`'s ingest and end-to-end reports break out queue-deadline
   abandonment as its own `abandoned_queue_deadline` counter instead of
   leaving it unreported** (issue #1823). `ingest_bench` and `s3_e2e_bench`
@@ -66,8 +78,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   split (`abandoned_queue_deadline == 1`, `abandoned_retry_exhausted == 0`,
   `abandoned_input_rejected == 0`) for a flush whose deadline has already
   elapsed while queued for a permit.
-
-### Changed
 
 - **A shard now refuses a flush trigger once `--max-queued-flushes` (default
   8) flush tasks are spawned and unacked, leaving the rows buffered for the
@@ -90,7 +100,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keeps a cluster running `spec.gateway.maxInflightFlushes` above 8 starting
   on upgrade, which a refusal would have crash-looped with no field on the
   `RavelCluster` CRD able to raise the cap in response.
-
   A third thing to know: a deferred flush pins the ingest hour it eventually
   opens in, not the one its refused trigger fired in, so a long deferral moves
   which ingest hour the rows land in. Past two hours that is more than the
@@ -104,7 +113,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is never read again rather than missed by one generation; `docs/ingest.md`
   and ADR-1642 carry the arithmetic. Bounding the deferral itself is issue
   #1916.
-
   bounded buffer; and the server now **refuses to start** when
   `--max-inflight-flushes` exceeds `--max-queued-flushes`, since only a
   spawned task can hold a permit and the excess would silently reduce flush
@@ -141,7 +149,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which are still listed alongside them, that is close to a doubling of scrub
   GET bytes per tick. Size scrub read bandwidth against the corpus with parts
   included, not against the L0 total.
-
   of one. The scrub tick cadence is unchanged: an operator should expect the
   first tick after upgrading to cover a larger corpus within the same
   per-tick byte budget, which can extend how long a full rotation takes on a
@@ -177,7 +184,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the query and so carries no stats block; the wire bytes a slice made the
   coordinator accept are reported as `wireBytesConsumed` in `stats.fragments[]`
   on the slices that completed.
-
   1048576 response frames and at the coordinator's own `max_bytes_scanned` in
   wire bytes, both checked before a frame is decoded, and the client stops
   pulling at the first breach, which cancels the RPC. A breach is a refusal
@@ -356,7 +362,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   letting every outbound dial fail at the handshake and fall back to local
   execution. Regenerate the fragment certificate with both usages before
   upgrading.
-
 - **The physical retention sweep is now all-or-nothing under a legal
   hold** (issue #1697). A hold on any key the pass would delete (a commit,
   compaction or rewrite record, an L0 data object, an L1 object, or the
@@ -465,7 +470,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the four Remote Write messages names the field it refused on. Refusing new
   samples does not clean up data already stored with any of these shapes, so
   the query-side zero-bucket guards remain in place.
-
 - **Every PromQL parse of caller text runs the pre-parse complexity guard,
   because one function now does both** (issue #1817). The guard that keeps an
   over-bound query from overflowing the stack inside promql-parser, which
