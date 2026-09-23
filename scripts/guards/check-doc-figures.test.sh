@@ -158,6 +158,37 @@ t="$(new_tree help-gone)"
 sed -i.bak 's/pub disable_cache: bool,/pub disable_cache_renamed: bool,/' "${t}/services/ravel-server/src/config.rs"
 check "a missing --disable-cache arm refuses" "${t}" 70 "doc comment was not found"
 
+# docs/catalog-and-mvcc.md restates the same byte figures as the guides and
+# was scanned only for bare counts until #1966: a drift there went unpinned.
+t="$(new_tree catalog-mvcc-drift)"
+sed -i.bak 's/10,000-entry floor it is 9 MB./10,000-entry floor it is 10 MB./' "${t}/docs/catalog-and-mvcc.md"
+check "a drifted byte figure in catalog-and-mvcc.md is a finding" "${t}" 1 "docs/catalog-and-mvcc.md"
+
+# The explicit 0: that doc states the both-caches figure nowhere today, and
+# an unannounced new copy of it must fail rather than go unpinned.
+t="$(new_tree catalog-mvcc-new-copy)"
+sed -i.bak 's/10,000-entry floor it is 9 MB./10,000-entry floor it is 9 MB, or 18 MB across both./' "${t}/docs/catalog-and-mvcc.md"
+check "a new unpinned copy in catalog-and-mvcc.md is a finding" "${t}" 1 "18 MB"
+
+# A doc that moved must refuse: a scan over three of four files that reports
+# clean is the failure this guard exists to prevent one level up.
+t="$(new_tree doc-gone)"
+rm "${t}/docs/catalog-and-mvcc.md"
+check "a missing guide refuses" "${t}" 70 "not readable"
+
+# Two derivations that render identically would overwrite each other and drop
+# one doc's expectations silently. Halving the budget makes the per-cache
+# share equal the floor's share, both "9 MB".
+t="$(new_tree colliding-markers)"
+sed -i.bak 's/MAX_RECORD_CACHE_BYTES_PER_TENANT: u64 = 45_000_000;/MAX_RECORD_CACHE_BYTES_PER_TENANT: u64 = 18_000_000;/' "${t}/crates/ravel-catalog/src/config.rs"
+check "two derived figures rendering alike refuse" "${t}" 70 "both render as"
+
+# The help block is counted too: a duplicated figure there is as unpinned as
+# a duplicated one in a guide, and `contains` reports it clean.
+t="$(new_tree help-duplicate)"
+sed -i.bak 's|/// two caches, about 18 MB per actively-queried tenant.|/// two caches, about 18 MB per actively-queried tenant, so about 18 MB per actively-queried tenant in all.|' "${t}/services/ravel-server/src/config.rs"
+check "a duplicated figure in the help is a finding" "${t}" 1 "2 time(s)"
+
 t="$(new_tree bad-usage)"
 out="$(cd "${t}" && bash scripts/guards/check-doc-figures.sh extra-arg 2>&1)"; rc=$?
 if [[ "${rc}" == 64 ]]; then

@@ -112,8 +112,11 @@ def scaled(byte_count: int, scale: int) -> str:
 def count_figure(haystack: str, marker: str) -> int:
     """Occurrences of `marker` that do not continue a longer number.
 
-    `.` and `,` are rejected alongside a digit because both are digit context
-    in these docs: a thousands separator and a decimal point.
+    Before the marker, `.` and `,` are rejected alongside a digit because
+    both are digit context in these docs: a thousands separator and a decimal
+    point. After it, only a digit is: a marker ends in either `MB`/`GB` or a
+    thousands group, and a following `.` or `,` is the sentence's punctuation
+    ("it is 9 MB."), not a longer number.
     """
     total = 0
     i = 0
@@ -122,7 +125,8 @@ def count_figure(haystack: str, marker: str) -> int:
         if j < 0:
             return total
         prev = haystack[j - 1] if j > 0 else ""
-        if not (prev.isdigit() or prev in ".,"):
+        nxt = haystack[j + len(marker)] if j + len(marker) < len(haystack) else ""
+        if not (prev.isdigit() or prev in ".," or nxt.isdigit()):
             total += 1
         i = j + max(len(marker), 1)
 
@@ -136,21 +140,38 @@ MB, GB = 1_000_000, 1_000_000_000
 derived_cap = budget // (entry_bytes * caches)
 floor_share = floor * entry_bytes
 
-# marker -> how many times each doc is expected to state it. A doc absent
-# from a marker's map is not scanned for that marker.
-EXPECTED = {
-    f"{scaled(budget, MB)} MB": {"docs/guides/caching.md": 2, "docs/guides/operations.md": 1},
-    f"{scaled(budget // caches, MB)} MB": {"docs/guides/caching.md": 1, "docs/guides/operations.md": 1},
-    f"{scaled(floor_share, MB)} MB": {"docs/guides/caching.md": 1},
-    f"{scaled(floor_share * caches, MB)} MB": {"docs/guides/caching.md": 3},
-    f"{scaled(budget * 100, GB)} GB": {"docs/guides/caching.md": 1},
+# (marker, how many times each doc is expected to state it). A doc absent from
+# a marker's map is not scanned for that marker; an explicit 0 says the doc was
+# considered and states the figure nowhere, which is the only way a later
+# addition of that figure to that doc fails here instead of going unpinned.
+EXPECTED_PAIRS = [
+    (f"{scaled(budget, MB)} MB", {"docs/guides/caching.md": 2, "docs/guides/operations.md": 1, "docs/catalog-and-mvcc.md": 1}),
+    (f"{scaled(budget // caches, MB)} MB", {"docs/guides/caching.md": 1, "docs/guides/operations.md": 1, "docs/catalog-and-mvcc.md": 2}),
+    (f"{scaled(floor_share, MB)} MB", {"docs/guides/caching.md": 1, "docs/catalog-and-mvcc.md": 1}),
+    (f"{scaled(floor_share * caches, MB)} MB", {"docs/guides/caching.md": 3, "docs/catalog-and-mvcc.md": 0}),
+    (f"{scaled(budget * 100, GB)} GB", {"docs/guides/caching.md": 1}),
     # The uncapped per-tenant figure. Its entry count derives from `--shards
     # 64` rather than from these constants, so the count stays a literal here
     # exactly as it does in the Rust test; the BYTE figure does not.
-    f"{scaled(2_073_600 * entry_bytes * caches, GB)} GB": {"docs/guides/caching.md": 1},
-    commas(floor): {"docs/guides/caching.md": 3, "docs/catalog-and-mvcc.md": 1},
-    commas(derived_cap): {"docs/guides/caching.md": 1, "docs/catalog-and-mvcc.md": 2},
-}
+    (f"{scaled(2_073_600 * entry_bytes * caches, GB)} GB", {"docs/guides/caching.md": 1}),
+    (commas(floor), {"docs/guides/caching.md": 3, "docs/catalog-and-mvcc.md": 1}),
+    (commas(derived_cap), {"docs/guides/caching.md": 1, "docs/catalog-and-mvcc.md": 2}),
+]
+
+# Two derivations that collapse to the same string would silently overwrite
+# each other in a dict, dropping one doc's expectations with the scan still
+# reporting clean. A constant change is exactly what can make them collide.
+_seen: dict[str, int] = {}
+for _i, (_marker, _) in enumerate(EXPECTED_PAIRS):
+    if _marker in _seen:
+        die(
+            f"two derived figures both render as {_marker!r} (entries "
+            f"{_seen[_marker]} and {_i}), so one doc's expectations would be "
+            "dropped; separate them before trusting this scan"
+        )
+    _seen[_marker] = _i
+
+EXPECTED = EXPECTED_PAIRS
 
 findings: list[str] = []
 scanned = 0
@@ -166,7 +187,7 @@ for rel, path in GUIDES.items():
                 "nothing and every count below silently changed meaning"
             )
         text = text.replace(phrase, "")
-    for marker, per_doc in EXPECTED.items():
+    for marker, per_doc in EXPECTED:
         if rel not in per_doc:
             continue
         scanned += 1
@@ -202,12 +223,16 @@ for needle in (
     f"about {scaled(floor_share * caches, MB)} MB per actively-queried tenant",
 ):
     scanned += 1
-    if needle not in help_text:
+    # Counted, not `in`: a second copy of a figure inside one help block is
+    # the same unpinned restatement this scan refuses in the guides, and a
+    # `contains` test reports it clean.
+    got = help_text.count(needle)
+    if got != 1:
         findings.append(
             f"services/ravel-server/src/config.rs: the --disable-cache long help "
-            f"does not state {needle!r}, which the ravel-catalog constants derive. "
-            f"`ravel-server --help` states these figures to an operator sizing a "
-            f"memory-constrained container."
+            f"states {needle!r} {got} time(s), expected 1. The ravel-catalog "
+            f"constants derive it, and `ravel-server --help` states these figures "
+            f"to an operator sizing a memory-constrained container."
         )
 
 if findings:
