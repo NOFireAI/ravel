@@ -2498,8 +2498,11 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
 ///
 /// Both directions are asserted for both object families, so a regression to
 /// either prior defect shape fails here: dropping the catalog entry from
-/// `DenyDeleteProtected` entirely leaves HEAD deletable (caught by the
-/// `head_key` Allow assertion below), and re-widening the Deny back to the
+/// `DenyDeleteProtected` entirely fails the `head_key` DENY assertion below,
+/// not the Allow one. HEAD does not actually become deletable in that state,
+/// because no `MaintainDelete` pattern reaches a `.../HEAD` key and IAM is
+/// default-deny; what is lost is the explicit protection, which is what the
+/// Deny assertion exists to hold. Re-widening the Deny back to the
 /// whole family, or to any pattern that still reaches HEAD, makes the
 /// `head_key` Deny assertion pass but the `snap_key`/`idx_key` Deny
 /// assertions fail (a Deny reaching a key the sweep must delete is exactly
@@ -2518,6 +2521,15 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
 /// `crates/ravel-maintain/src/sweep.rs`'s `catalog_snap_prefix` /
 /// `catalog_idx_prefix`, all of which build
 /// `t/<tenant_hash_hex>/catalog/<signal>/...`.
+///
+/// The PREFIX is mirrored; the two witness filenames are not. Real keys are
+/// `snap/<hour>.<hash16>.csnap` and `idx/<hour>.<hash16>.{npost,cstat}`
+/// (`crates/ravel-catalog/src/fold.rs`), while the witnesses are
+/// `snap/0000000000000000.csnap` and `idx/name-postings`. That is
+/// immaterial to every pattern here, which all end in `snap/*` or `idx/*`,
+/// but a future tightening to something like `idx/*.cstat` would read as
+/// unreachable against a witness no constructor can produce. Tighten the
+/// witnesses first if that day comes.
 #[test]
 fn maintain_deletes_catalog_snap_and_idx_but_not_head() {
     let hash = hash16();

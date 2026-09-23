@@ -61,9 +61,14 @@ index objects the current HEAD no longer names, and for a tenant that declares
 a typed string or bytes attribute column a per-part column-statistics object
 among them holds that subject's own column value; a lock over the keyspace
 delays that delete, and the value persists until the fold reconciles that hour
-and then a further retention period. Under the maintenance IAM policy Ravel
-ships the delete is denied outright, so the bound stays open-ended until that
-policy changes. The four-step mechanism, the exact bound, the IAM ceiling and
+and then a further retention period. The maintenance IAM policy Ravel ships
+permits that delete: its catalog delete-deny is scoped to
+`catalog/<signal>/HEAD`, and the maintenance role holds delete on
+`catalog/<signal>/snap/*` and `catalog/<signal>/idx/*` (ADR-0055's
+2026-09-23 amendment). An operator still running a copy of
+`deploy/iam/maintain.json` from before that change has the old,
+open-ended bound until they re-apply it, because the sweep is refused at
+its first catalog delete every pass. The four-step mechanism, the exact bound, the IAM ceiling and
 the HEAD-scoping advice are in the object store contract's "Required bucket
 configuration" section, "A lock on the catalog family". The scoped posture is
 therefore still not a disaster-recovery choice; it is the baseline the commit
@@ -489,7 +494,7 @@ record: a real end-to-end run against MinIO is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, so it is "until the fold reconciles, then plus `R`", and under the maintenance IAM policy Ravel ships, which denies the maintenance role every delete under the catalog keyspace, it is open-ended until that policy changes. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound, R)` where `R` is the chosen retention period, until it elapses. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim. That bound is not `max(bound, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, so it is "until the fold reconciles, then plus `R`". The maintenance IAM policy Ravel ships permits that delete (its catalog deny is scoped to `catalog/<signal>/HEAD`); a copy of that template predating ADR-0055's 2026-09-23 amendment denies it outright and leaves the bound open-ended until it is re-applied. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
 | **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |
