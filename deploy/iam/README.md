@@ -9,17 +9,27 @@ from the pinned shape fails that suite.
 ## Commit records (`t/*/*/c/*`) are deletable by design
 
 `DenyDeleteProtected` in `maintain.json` denies delete on `sys/tenancy`,
-`sys/qualification`, `sys/gc`, `t/*/*/prov`, `t/*/catalog/*/*`, and the
+`sys/qualification`, `sys/gc`, `t/*/*/prov`, `t/*/catalog/*/HEAD`, and the
 legal-hold audit shard (`t/*/u/*/0000/*`). Commit records are absent from
 that list on purpose: `MaintainDelete` grants delete on `t/*/*/c/*`
 because the maintenance sweep physically removes a commit record once
 it is superseded, and an IAM deny there would make every sweep pass fail.
 
-The `t/*/catalog/*/*` entry in that deny list is in tension with the same
-argument: the unreferenced-catalog sweep runs under the Maintain role and
-deletes the superseded snapshot and index objects the pattern covers, so the
-shipped templates refuse those deletes outright rather than merely delaying
-them. That tension is real and is tracked separately.
+The other three templates (`gateway.json`, `query.json`, `admin.json`) deny
+the whole catalog family, `t/*/catalog/*/*`, instead: none of those roles
+deletes a catalog object, so nothing narrower is needed there. Maintain is
+the one role where narrowing to `HEAD` alone is load-bearing.
+
+Catalog snapshot and index objects (`t/*/catalog/*/snap/*`,
+`t/*/catalog/*/idx/*`) used to be caught by the same `t/*/catalog/*/*`
+pattern that also covers `HEAD`, which put them behind this deny too. That
+was a bug (issue #1847): the unreferenced-catalog sweep runs under the
+Maintain role and deletes exactly those superseded snapshot and index
+objects, so the shipped templates refused every sweep delete outright
+rather than merely delaying it, and catalog garbage was never reclaimed.
+The deny above is narrowed to the `HEAD` pointer alone -- the object the
+sweep never deletes -- and `MaintainDelete` below now grants delete on
+`snap/` and `idx/` to match what the sweep already does.
 
 This is a separate list from the Object Lock compliance-mode prefixes in
 `docs/object-store-contract.md`'s "Required bucket configuration" section,
@@ -53,8 +63,9 @@ grants below are what remains deletable after that deny applies.
   `sys/qualify/*` only.
 - **Maintain** (`maintain.json`): `MaintainDelete` grants delete on
   `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/u/*/0001/*`,
-  and `t/*/*/del/*.dreq`. These are the objects the compaction, supersession,
-  retention, and erasure-request sweeps physically remove.
+  `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, and `t/*/catalog/*/idx/*`.
+  These are the objects the compaction, supersession, retention,
+  erasure-request, and unreferenced-catalog sweeps physically remove.
 
 ### Erasure-request objects: the three grants the `.dreq` sweep needs
 
