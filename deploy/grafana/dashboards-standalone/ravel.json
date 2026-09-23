@@ -786,7 +786,7 @@
               },
               {
                 "id": "custom.axisPlacement",
-                "value": "right"
+                "value": "hidden"
               },
               {
                 "id": "custom.axisLabel",
@@ -806,7 +806,7 @@
               },
               {
                 "id": "custom.axisPlacement",
-                "value": "right"
+                "value": "hidden"
               },
               {
                 "id": "custom.axisLabel",
@@ -886,7 +886,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Log block pruning",
-      "description": "The share of log blocks the postings index pruned before decode, and the blocks that survived to be scanned. A pruned share falling towards zero is the postings index stopping to pay for itself.",
+      "description": "The share of log blocks the postings index pruned before decode, and the blocks that survived to be scanned. A pruned share falling towards zero is the postings index stopping to pay for itself. The denominator is floored at 1e-9, below any real rate, so an idle fleet reads 0 without understating a real ratio rather than dropping the series.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1056,7 +1056,24 @@
       },
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^drops .*$"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "drops"
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
@@ -1200,7 +1217,24 @@
       },
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "l0 records pending"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "l0 records pending"
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
