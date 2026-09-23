@@ -490,6 +490,12 @@ groups:
         # fold::jittered adds up to 10%). Both terms scale with
         # --store-probe-interval, which is an unbounded flag: recompute this
         # threshold before running a fleet on a non-default interval.
+        #
+        # Under --store-scheduling the probe's GET goes through the
+        # foreground request class, whose acquire has no timeout, so a
+        # saturated foreground queue can delay a cycle without bound and
+        # page here while the task is alive. Size for: against that fleet's
+        # own saturation window; see the observability guide.
         expr: |
           time() - ravel_store_probe_last_run_timestamp_seconds > 132
         for: 5m
