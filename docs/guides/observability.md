@@ -760,7 +760,7 @@ Labels: `mode`.
 ### Store reachability (`ravel_store_reachable`, `ravel_store_probe_failures_total`, `ravel_store_probe_last_run_timestamp_seconds`)
 
 Labels: `mode`. All three samples come from the background store-reachability
-probe (`store_probe::spawn`, ADR-0050 section 7).
+probe (`store_probe::spawn`).
 
 | Metric | Meaning |
 |---|---|
@@ -769,7 +769,7 @@ probe (`store_probe::spawn`, ADR-0050 section 7).
 | `ravel_store_probe_last_run_timestamp_seconds` | Gauge. Unix time the probe task last completed a cycle, set whether that cycle succeeded or failed, 0 if none has run yet in this process. |
 
 The first two gauges are written only while the probe task is running: the
-task is a single `tokio::spawn` (issue #1728) with no restart path and no
+task is a single `tokio::spawn` with no restart path and no
 `JoinHandle` observation, so if it dies silently, both freeze at their last
 values, `ravel_store_reachable` most often frozen at 1, and `/readyz` reads
 that stale value as healthy forever. `ravel_store_probe_last_run_timestamp_seconds`
@@ -788,17 +788,17 @@ on the gap between two *completed* cycles. `run_probe_cycle` awaits
 `store.get` with no `tokio::time::timeout`, and `ObjectStoreBackend::get`
 itself takes no deadline, so one cycle can run as long as the backend's own
 retry budget allows. For the S3 backend that is `retry_timeout +
-request_timeout` ≈ 180s + 20s = 200s (`S3HttpConfig`'s doc comment in
-`crates/ravel-object-store/src/s3.rs`). So the worst-case gap between two live
-cycle *completions* is `interval * 1.1 + 200s = 33 + 200 = 233s` for the
-default interval — over the 132 threshold, so the raw comparison goes true on
-every cycle of a real outage, not only once the probe task has actually died.
+request_timeout` ≈ 180s + 20s = 200s (`S3HttpConfig`'s doc comment in the
+object-store crate). So the worst-case gap between two live cycle
+*completions* is `interval * 1.1 + 200s = 33 + 200 = 233s` for the default
+interval, over the 132 threshold, so the raw comparison goes true on every
+cycle of a real outage, not only once the probe task has actually died.
 
 `for: 5m` is what keeps that from paging on an ordinary outage, not the 33s
 sleep ceiling: the comparison is true for only `233 - 132 = 101s` per cycle
 before the next completed cycle re-stamps the gauge and it goes false again,
 well under the 300s `for:` window. A probe that is merely failing (not dead)
-never holds the condition continuously long enough to cross `for: 5m` — and
+never holds the condition continuously long enough to cross `for: 5m`, and
 `RavelStoreUnreachable` already covers that case, since K consecutive real
 cycles complete well inside 233s. Only a probe that has stopped completing
 cycles altogether keeps the comparison true past `for: 5m`. Do not shrink
@@ -808,7 +808,7 @@ to avoid.
 
 Both terms scale with `--store-probe-interval`, which is a flag
 (`ServerConfig::store_probe_interval`, parsed by `parse_store_probe_interval`
-in `services/ravel-server/src/config.rs`), not a fixed constant: `132` is `K *
+in this service's config module), not a fixed constant: `132` is `K *
 interval * 1.1` and must be recomputed for a non-default interval, and so must
 the margin `for: 5m` relies on, `200 - (K - 1) * interval * 1.1`, since a
 larger interval grows the sleep term inside both the threshold and the gap.
