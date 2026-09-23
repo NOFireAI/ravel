@@ -176,7 +176,6 @@ fn validate_list(tenant: &str, list: Vec<String>) -> Result<Vec<String>, Indexed
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use ravel_logseg::writer::WriteStats;
     use ravel_logseg::{
         AttrValue, FieldSel, LogRecord, ObjectIdentity, Predicate, RlogConfig, RlogReader,
         RlogWriter, ScanStats, stream_attrs_bytes,
@@ -354,15 +353,18 @@ mod tests {
         // values, no capped fields, no bytes. The dynamic-column counters are
         // not POSTINGS counters (ADR-0100): the per-record `http.status_code`
         // draws one dynamic column, so `dynamic_columns_used` is 1 and nothing
-        // overflows.
-        assert_eq!(
-            stats,
-            WriteStats {
-                dynamic_columns_used: 1,
-                ..WriteStats::default()
-            },
-            "an absent field list must leave every POSTINGS counter at its default"
-        );
+        // overflows. Asserted field-by-field rather than on the whole
+        // `WriteStats`, deliberately excluding `bloom_total_ns` and
+        // `bloom_blocks` (issue #1926): those come from bloom construction,
+        // which runs unconditionally per block and has nothing to do with
+        // the field list this test is about.
+        assert_eq!(stats.postings_capped_fields, 0);
+        assert_eq!(stats.postings_bytes, 0);
+        assert_eq!(stats.postings_indexed_fields, 0);
+        assert_eq!(stats.postings_distinct_total, 0);
+        assert_eq!(stats.postings_distinct_max, 0);
+        assert_eq!(stats.dynamic_columns_used, 1);
+        assert_eq!(stats.dynamic_columns_overflowed, 0);
         // And the object still scans: probing an unindexed field prunes nothing
         // (the postings channel has no entry), so every block survives.
         let scanned = scan_for(&obj, "http.status_code", "200");
