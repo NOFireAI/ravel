@@ -654,7 +654,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Query result cache hit ratio",
-      "description": "Hits over hits plus misses. The denominator is clamped at 1 floored at 1e-9, below any real rate, so an idle fleet reads 0 without understating a real ratio rather than dropping the series.",
+      "description": "Hits over hits plus misses. The denominator is floored at 1e-9, below any real rate, so an idle fleet reads 0 without understating a real ratio rather than dropping the series.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -771,6 +771,46 @@
               {
                 "id": "custom.axisLabel",
                 "value": "disk-tier degradations"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "resident entries"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "resident entries"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^bytes (served|admitted)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "Bps"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "cache traffic"
               }
             ]
           }
@@ -1611,6 +1651,10 @@
               "options": "protection unknown"
             },
             "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
               {
                 "id": "min",
                 "value": 0

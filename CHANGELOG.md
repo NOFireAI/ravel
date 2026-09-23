@@ -47,6 +47,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   name the shipped rules alert on is graphed by some panel. The check covers
   metric names; it does not validate the PromQL around them or the dashboard
   against Grafana's schema.
+
 - **`ravel-bench`'s ingest and end-to-end reports break out queue-deadline
   abandonment as its own `abandoned_queue_deadline` counter instead of
   leaving it unreported** (issue #1823). `ingest_bench` and `s3_e2e_bench`
