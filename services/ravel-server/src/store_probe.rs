@@ -68,18 +68,24 @@ static STORE_REACHABLE: AtomicBool = AtomicBool::new(true);
 /// readiness green.
 static PROBE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Unix time (nanoseconds) at which the last probe cycle COMPLETED, whatever
-/// its outcome. Set unconditionally at the end of every [`run_probe_cycle`],
-/// on both the success and the failure path: this is the one signal in this
-/// module that answers "is the probe task still running at all" rather than
-/// "was the store reachable last time it ran". `STORE_REACHABLE` and
+/// Unix time (nanoseconds) of the last completed probe cycle OR of the
+/// probe task's spawn, whichever is later. Set unconditionally at the end of
+/// every [`run_probe_cycle`], on both the success and the failure path, and
+/// once by [`spawn`] before the loop's first sleep: this is the one signal in
+/// this module that answers "is the probe task still running at all" rather
+/// than "was the store reachable last time it ran". `STORE_REACHABLE` and
 /// `PROBE_FAILURES_TOTAL` are both written only while the task is alive, so if
 /// the task dies (issue #1728: `spawn`'s `tokio::spawn` has no restart path
 /// and nothing observes its `JoinHandle`), they freeze at their last values
 /// and `/readyz` keeps reading a stale-but-plausible answer forever. Rendered
 /// at `/metrics` as `ravel_store_probe_last_run_timestamp_seconds`; its AGE is
-/// the probe-liveness signal (see docs/guides/observability.md). Starts `0`
-/// (no cycle has run yet in this process).
+/// the probe-liveness signal (see docs/guides/observability.md).
+///
+/// `0` means exactly one thing: the probe task was never spawned in this
+/// process. The spawn stamp is what makes that unambiguous, so a task that
+/// dies, panics, or has its channel dropped before its first cycle leaves an
+/// AGEING timestamp that the staleness alert catches on its own, rather than
+/// a frozen sentinel that every consumer has to special-case.
 static PROBE_LAST_RUN_UNIX_NS: AtomicI64 = AtomicI64::new(0);
 
 /// Whether the store is currently reachable (the `ravel_store_reachable` gauge
@@ -94,11 +100,19 @@ pub fn probe_failures_total() -> u64 {
     PROBE_FAILURES_TOTAL.load(Ordering::Relaxed)
 }
 
-/// Unix time (nanoseconds) the last probe cycle completed, 0 if none has run
-/// yet in this process (the `ravel_store_probe_last_run_timestamp_seconds`
-/// gauge source).
+/// Unix time (nanoseconds) of the last completed probe cycle or of the probe
+/// task's spawn, whichever is later; 0 only if no probe task was ever spawned
+/// in this process (the `ravel_store_probe_last_run_timestamp_seconds` gauge
+/// source).
 pub fn probe_last_run_unix_ns() -> i64 {
     PROBE_LAST_RUN_UNIX_NS.load(Ordering::Relaxed)
+}
+
+/// Stamp the liveness gauge from `clock`. The one writer of
+/// [`PROBE_LAST_RUN_UNIX_NS`], used by both the spawn stamp and the end of
+/// every cycle, so the two can never drift to different clocks.
+fn stamp_last_run(clock: &dyn Clock) {
+    PROBE_LAST_RUN_UNIX_NS.store(clock.now_ns(), Ordering::Relaxed);
 }
 
 fn set_store_reachable(reachable: bool) {
@@ -171,7 +185,7 @@ pub async fn run_probe_cycle(
     }
     let reachable = hysteresis.observe(ok);
     set_store_reachable(reachable);
-    PROBE_LAST_RUN_UNIX_NS.store(clock.now_ns(), Ordering::Relaxed);
+    stamp_last_run(clock);
     reachable
 }
 
@@ -209,6 +223,25 @@ impl StoreProbeTask {
 /// maintaining the process-global reachability atomic [`crate::health::Readiness`]
 /// reads. Returns immediately; the task runs until [`StoreProbeTask::shutdown`].
 pub fn spawn(store: Arc<dyn ObjectStoreBackend>, interval: Duration) -> StoreProbeTask {
+    spawn_with_clock(store, interval, Arc::new(SystemClock))
+}
+
+/// [`spawn`] with the clock injected, so a test can assert the exact value the
+/// spawn stamp takes rather than a wall-clock band.
+pub fn spawn_with_clock(
+    store: Arc<dyn ObjectStoreBackend>,
+    interval: Duration,
+    clock: Arc<dyn Clock>,
+) -> StoreProbeTask {
+    // The spawn stamp (issue #1728). Written here, synchronously, before the
+    // task exists and therefore before its first jittered sleep, so the gauge
+    // is real from the instant a probe exists and `0` means only "no probe was
+    // ever spawned in this process". Without it the gauge would hold its zero
+    // value for a whole jittered interval plus one cycle after every start,
+    // and a task that died in that window would hold it forever, which no
+    // amount of alert-side arithmetic can distinguish from a process that
+    // never spawned one.
+    stamp_last_run(clock.as_ref());
     let (tx, mut rx) = oneshot::channel();
     // Production OS-entropy jitter source (ADR-0068 decision 2), the same
     // default the fold and maintenance loops use; only the simulation harness
@@ -221,7 +254,7 @@ pub fn spawn(store: Arc<dyn ObjectStoreBackend>, interval: Duration) -> StorePro
                 _ = tokio::time::sleep(crate::fold::jittered(interval, rng.as_ref())) => {}
                 _ = &mut rx => return,
             }
-            let reachable = run_probe_cycle(store.as_ref(), &mut hysteresis, &SystemClock).await;
+            let reachable = run_probe_cycle(store.as_ref(), &mut hysteresis, clock.as_ref()).await;
             if !reachable {
                 tracing::warn!(
                     key = TENANCY_MARKER_KEY,

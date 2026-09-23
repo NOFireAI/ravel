@@ -55,17 +55,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `ravel_store_probe_failures_total` freeze at their last values and
   `/readyz` reads that stale state as healthy forever. The new gauge is set
   from an injected clock at the end of every completed probe cycle, whatever
-  its outcome, so its AGE (not its value) is the signal that the task itself
-  has stopped: a failing-but-alive probe keeps advancing it every cycle.
+  its outcome, and once by `store_probe::spawn` before the loop's first sleep,
+  so its AGE (not its value) is the signal that the task itself has stopped: a
+  failing-but-alive probe keeps advancing it every cycle, and a task that dies
+  before its first cycle ages out from its spawn stamp. That spawn stamp
+  leaves `0` meaning exactly one thing, that no probe task was ever spawned in
+  this process, so a single shipped alert covers every dead-probe state:
+  `RavelStoreProbeStalled` in `deploy/prometheus/ravel.rules.yaml` fires on
+  `time() - ravel_store_probe_last_run_timestamp_seconds > 132` held for
+  `5m`, with no sentinel guard term and no companion never-ran rule.
   `docs/guides/observability.md` documents the alert and derives its
-  threshold from the probe interval and the store backend's own worst-case
-  cycle time, and it ships as `RavelStoreProbeStalled` in
-  `deploy/prometheus/ravel.rules.yaml`. `RavelStoreProbeStalled` guards
-  against its own zero sentinel by requiring a real timestamp to have been
-  stamped at least once, which excludes a probe that dies, panics, or is
-  never spawned before its first cycle ever completes; the companion
-  `RavelStoreProbeNeverRan` rule covers exactly that excluded state, sized
-  from the same probe-interval-plus-worst-case-cycle-time arithmetic.
+  threshold from the probe interval, noting that it must be recomputed for a
+  non-default `--store-probe-interval`.
 
 - **`ravel-bench`'s ingest and end-to-end reports break out queue-deadline
   abandonment as its own `abandoned_queue_deadline` counter instead of
