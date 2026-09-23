@@ -57,7 +57,9 @@ per-role grants below. Two facts from that inventory drive this ADR's shape:
 2. **Nothing in the current codebase ever deletes `sys/*`, `prov`,
    `catalog/*`, or the audit prefix `t/<hash>/u/*`.** Deletion is confined
    to `l0/`, `l1/`, `c/` (records and tombstones), and `idem/`, all from
-   `crates/ravel-maintain/src/{sweep,retention}.rs`. This means a
+   `crates/ravel-maintain/src/{sweep,retention}.rs`. (No longer true of
+   `catalog/*`: the unreferenced-catalog sweep deletes `snap/` and `idx/`
+   objects; see the 2026-09-23 amendment below.) This means a
    deny-delete policy on the first four prefixes costs no legitimate
    operation anything today — it is a precise fit to what the code already
    guarantees it never needs, not a speculative restriction.
@@ -81,7 +83,9 @@ question of *who* can delete `c/`, not *whether* `c/` is ever deleted. That
 is a role-scoping question, which this ADR answers directly (§2, sweep
 grants), not a WORM question. WORM applies to the four prefixes nothing
 legitimately deletes at all: `sys/tenancy`, `sys/qualification`, `sys/gc`,
-`prov`, `catalog/*`, and the audit prefix. See §3.
+`prov`, `catalog/*` (except the `snap/` and `idx/` objects the
+unreferenced-catalog sweep deletes; see the 2026-09-23 amendment below), and the audit prefix.
+See §3.
 
 ADR-0042 decision 3 already evaluated true per-object S3 Object Lock and
 rejected implementing it now: `object_store` 0.14.1 has no per-PUT
@@ -816,15 +820,36 @@ Before/after, expressed as the operations.md IAM wildcards:
   credential: the fold does not run in `Mode::Maintain`. Those reads are
   why `gateway.json` and `query.json` carry catalog reads.)
 
-Recorded as an appended amendment rather than rewritten into §1's role table,
-§2 and §3, into which only an inline pointer was added. What carries that
-pointer to this
-section is each of the six places that asserts `catalog/*` is undeletable:
-the Decision bullet, §2's "never ... `catalog/`" clause, §2's disjointness
-paragraph, §3's deny list, and the recaps in the 2026-09-06 and 2026-09-13
-amendments that repeat the claim. The diagram's deny node carries the same
-qualifier, since a reader deriving the deny list from a picture is the one
-most likely to re-widen it. A reader meets the qualification where the claim
+Net effect on §1's role table (Maintain row): the Read column gains
+`catalog/<sig>/HEAD`, `catalog/<sig>/snap/**` and `catalog/<sig>/idx/**`;
+the Delete column gains `catalog/<sig>/snap/**` and `catalog/<sig>/idx/**`;
+and the List column gains the `catalog/<sig>/snap/` and `catalog/<sig>/idx/`
+prefixes. That sentence is here rather than in the table for the same reason
+the 2026-09-13 amendment states its own net effect: §1 stays derivable
+without the table having to carry every amendment's wording.
+
+Recorded as an appended amendment rather than rewritten into §2 and §3, into
+which only an inline pointer was added. What carries that pointer to this
+section is each of the nine places that asserts, in one phrasing or another,
+that `catalog/*` is undeletable:
+
+1. the Decision bullet;
+2. §1's "nothing in the current codebase ever deletes ... `catalog/*`";
+3. §1's WORM list of prefixes nothing legitimately deletes;
+4. §2's "never ... `catalog/`" clause;
+5. §2's disjointness paragraph;
+6. §2's description of what
+   `no_delete_allow_reaches_the_disjoint_protected_keyspaces` asserts;
+7. §3's deny list;
+8. the deny subgraph in the §2 diagram, which a reader deriving a deny list
+   from a picture is the most likely to re-widen;
+9. the recaps in the 2026-09-06 and 2026-09-13 amendments that repeat the
+   claim.
+
+The count is written as a list rather than a number because it was wrong
+three times while it was a number: the claim is phrased as a property, a
+disjointness argument, a deny list and a diagram node, so a search for the
+wording just corrected finds none of the others. A reader meets the qualification where the claim
 is made, and the decision text keeps its original wording.
 ADR-0064's statements that catalog objects are deny-deleted carry the same
 pointer, since its erasure argument depends on `.cstat` objects being
