@@ -528,6 +528,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   naming or importing it anywhere else in either crate, so a future entry point
   cannot skip the guard by not knowing about it.
 
+- **ADR-0057's cost argument for the fleet admission reconciliation loop is
+  marked as resting on a premise ADR-0069 reversed** (issue #1922). ADR-0057
+  sizes the loop on "most processes see most tenants never" and on a process
+  dropping a `(tenant, signal)` once the tenant goes idle; ADR-0069 decided
+  that the admission map grows with tenant count instead, and the code
+  implements ADR-0069. The ADR now records what the loop costs on the code as
+  it stands -- a floor of `2 * T * S` sequential object-store round trips per
+  cycle, with `T` counting every tenant the process has served, including one
+  whose only request was rejected -- rather than a justification that has not
+  held since ADR-0069 landed. No decision and no code changed; bounding the
+  loop belongs with the ADR-0069 follow-up.
+
 ### Fixed
 
 - **The shipped IAM templates now grant every permission the selective-erasure
