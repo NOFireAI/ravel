@@ -74,6 +74,7 @@ pub mod wire_byte_count;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -784,6 +785,24 @@ impl ServerConfig {
 /// issue #1291 configures.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// Total graceful-shutdown drains this process ran past `--shutdown-timeout`
+/// (issue #1742), monotonic. Rendered at `/metrics` as
+/// `ravel_shutdown_drain_overrun_total`. Process-global rather than threaded
+/// through `Running`/`MetricsState`, following [`store_probe::store_reachable`]'s
+/// precedent: a process calls [`Running::shutdown`] at most once before
+/// exiting, so there is nothing per-instance to share.
+static DRAIN_OVERRUN_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total drains that overran `--shutdown-timeout` (the
+/// `ravel_shutdown_drain_overrun_total` counter source).
+pub fn drain_overrun_total() -> u64 {
+    DRAIN_OVERRUN_TOTAL.load(Ordering::Relaxed)
+}
+
+fn record_drain_overrun() {
+    DRAIN_OVERRUN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Default `--max-ingest-lag`: how far behind ingest time a data point's event
 /// time may fall before admission rejects it as [`ravel_otlp::Rejection::TooOld`]
 /// (2h, ADR-0051 section 4). Sourced from [`ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS`]
@@ -1451,6 +1470,9 @@ impl Running {
         let outcome: Result<anyhow::Result<()>, tokio::time::error::Elapsed> =
             tokio::time::timeout(shutdown_timeout, drain).await;
         let timed_out = outcome.is_err();
+        if timed_out {
+            record_drain_overrun();
+        }
         let drain_err = outcome.ok().and_then(anyhow::Result::err);
         let captured = listener_err_cell
             .lock()
