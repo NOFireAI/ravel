@@ -93,8 +93,10 @@ for a tenant that declares a typed string or bytes attribute column a per-part
 column-statistics object among them holds that subject's own column value; a
 lock over the keyspace delays that delete, and the value persists until the
 fold reconciles that hour and then a further retention period. The maintenance
-IAM policy Ravel ships denies that delete outright, so the bound is open-ended
-until the policy changes. The four-step mechanism, the exact bound, the IAM
+IAM policy Ravel ships permits that delete, with its catalog deny scoped to
+`catalog/<signal>/HEAD` (ADR-0055's 2026-09-23 amendment); a copy of that
+template predating the amendment denies it outright and leaves the bound
+open-ended until it is re-applied. The four-step mechanism, the exact bound, the IAM
 ceiling and the HEAD-scoping advice are in the contract page's "Required
 bucket configuration" section, "A lock on the catalog family".
 
