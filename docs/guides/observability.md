@@ -801,8 +801,13 @@ sleep ceiling: the comparison is true for only `233 - 132 = 101s` per cycle
 before the next completed cycle re-stamps the gauge and it goes false again,
 well under the 300s `for:` window. A probe that is merely failing (not dead)
 never holds the condition continuously long enough to cross `for: 5m`, and
-`RavelStoreUnreachable` already covers that case, since K consecutive real
-cycles complete well inside 233s. Only a probe that has stopped completing
+`RavelStoreUnreachable` already covers that case: it carries no `for:` at
+all, so it fires as soon as `ravel_store_reachable` flips to 0, which the
+`K`th consecutive failed cycle does (`K` is 4). At the default interval that
+is about `4 * 33 = 132s` after the outage starts, and at worst
+`4 * 233 = 932s` if every one of those cycles runs its full retry budget
+before failing. Either way it is the alert that pages for an outage, and it
+does not depend on this rule's window. Only a probe that has stopped completing
 cycles altogether keeps the comparison true past `for: 5m`. Do not shrink
 `for:` on the strength of the 33s sleep-only ceiling: a `for: 1m` pages on
 every ordinary store outage, which is the wrong-cause page this alert exists
