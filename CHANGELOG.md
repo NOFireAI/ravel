@@ -108,10 +108,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the shipped constants, which would have led an operator sizing a host
   from the docs to under-provision. A new test,
   `ravel-catalog`'s `operator_docs_record_cache_figures.rs`, computes each
-  figure from `RECORD_CACHE_ENTRY_BYTES`, `MAX_RECORD_CACHE_BYTES_PER_TENANT`,
-  `DEFAULT_CACHE_CAPACITY_PER_TENANT` and `MAX_CACHE_CAPACITY_PER_TENANT` and
-  asserts the three guides state exactly that value, so the next constant
-  change fails in this file instead of shipping stale prose.
+  figure from `RECORD_CACHE_ENTRY_BYTES`, `RECORD_CACHES_PER_TENANT`,
+  `MAX_RECORD_CACHE_BYTES_PER_TENANT`, `DEFAULT_CACHE_CAPACITY_PER_TENANT`
+  and `MAX_CACHE_CAPACITY_PER_TENANT` and asserts the three guides state
+  exactly that value, so the next constant change fails in this file instead
+  of shipping stale prose. Figures the guides state more than once are
+  pinned by an occurrence count, so a restatement in different words cannot
+  drift unpinned.
 
 ### Changed
 
