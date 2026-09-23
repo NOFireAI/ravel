@@ -92,22 +92,48 @@ fn format_gb(bytes: u64) -> String {
     format_scaled(bytes, 1_000_000_000.0)
 }
 
-/// Counts non-overlapping occurrences of `marker` in `haystack` that are not
-/// immediately preceded by an ASCII digit, so a marker like "45 MB" does not
-/// also match inside "145 MB".
+/// Counts non-overlapping occurrences of `marker` in `haystack` that do not
+/// continue a longer number, so "45 MB" does not also match inside "145 MB"
+/// and "10,000" does not match inside "110,000" or "1.10,000".
+///
+/// `.` and `,` are rejected alongside a digit because both are digit context
+/// in these docs: a thousands separator and a decimal point. No current
+/// marker collides that way, so this is a guard against the next one.
 fn count_figure(haystack: &str, marker: &str) -> usize {
     let bytes = haystack.as_bytes();
     let mut count = 0;
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(marker) {
         let idx = start + pos;
-        let preceded_by_digit = idx > 0 && bytes[idx - 1].is_ascii_digit();
-        if !preceded_by_digit {
+        let continues_a_number = idx > 0
+            && (bytes[idx - 1].is_ascii_digit()
+                || bytes[idx - 1] == b'.'
+                || bytes[idx - 1] == b',');
+        if !continues_a_number {
             count += 1;
         }
         start = idx + marker.len().max(1);
     }
     count
+}
+
+/// [`count_figure`] over a haystack with `exclusions` removed first, for a
+/// figure a doc also states in a sentence that must NOT track the constant.
+/// `docs/guides/caching.md` has exactly one: "the old cache held a flat
+/// 10,000 records", a historical value describing the cache this one
+/// replaced. Counting it would make the entry-count assertion demand that
+/// history change whenever the constant does.
+fn count_figure_excluding(haystack: &str, marker: &str, exclusions: &[&str]) -> usize {
+    let mut scanned = haystack.to_string();
+    for phrase in exclusions {
+        assert!(
+            scanned.contains(phrase),
+            "the exclusion {phrase:?} is not in the doc, so it excludes nothing and \
+             the count below silently changed meaning; update or drop it"
+        );
+        scanned = scanned.replace(phrase, "");
+    }
+    count_figure(&scanned, marker)
 }
 
 /// Asserts that `needle` (an exact restatement of a figure) is present in
@@ -184,6 +210,32 @@ fn record_cache_figures_match_the_constants_they_are_derived_from() {
 
     // ---- docs/guides/caching.md ----
     let caching = normalize(&read(CACHING_GUIDE));
+
+    // The entry counts get the same occurrence protection as the MB and GB
+    // markers. Without it a restatement in different words is unpinned: the
+    // whole-sentence needles below matched three of the four places this guide
+    // states the floor, and the fourth could drift to a different number with
+    // this test still green -- the partial-update drift #1904 produced.
+    //
+    // "the old cache held a flat 10,000 records" is excluded: it describes the
+    // cache this one replaced, so it must NOT track the constant.
+    const HISTORICAL_FLOOR_SENTENCE: &str = "the old cache held a flat 10,000 records";
+    let floor_mentions = count_figure_excluding(&caching, &floor_str, &[HISTORICAL_FLOOR_SENTENCE]);
+    assert_eq!(
+        floor_mentions, 3,
+        "docs/guides/caching.md states the capacity floor {floor_mentions} time(s) \
+         (excluding the historical sentence), but this test accounts for 3 with \
+         needles; add or remove a needle so every live restatement stays pinned \
+         to DEFAULT_CACHE_CAPACITY_PER_TENANT"
+    );
+    let cap_mentions = count_figure(&caching, &cap_str);
+    assert_eq!(
+        cap_mentions, 1,
+        "docs/guides/caching.md states the capacity cap {cap_mentions} time(s), but \
+         this test accounts for 1 with a needle; add or remove a needle so every \
+         restatement stays pinned to the derived cap"
+    );
+
     assert_doc_states(
         CACHING_GUIDE,
         &caching,
@@ -191,6 +243,15 @@ fn record_cache_figures_match_the_constants_they_are_derived_from() {
         &format!("floored at {floor_str} entries and capped at {cap_str}."),
         1,
         "the record-cache capacity floor and cap",
+    );
+    assert!(
+        caching.contains(&format!(
+            "at the {floor_str}-entry floor rather than the derived value"
+        )),
+        "docs/guides/caching.md must state the disabled-cache floor as \
+         \"at the {floor_str}-entry floor rather than the derived value\", computed \
+         from DEFAULT_CACHE_CAPACITY_PER_TENANT; this is the third live restatement \
+         of the floor and the one the whole-sentence needles missed"
     );
     assert_doc_states(
         CACHING_GUIDE,
