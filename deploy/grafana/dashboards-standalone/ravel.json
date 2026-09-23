@@ -1672,6 +1672,26 @@
                 "value": "protection unknown"
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "probe cycle age"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "probe cycle age"
+              }
+            ]
           }
         ]
       },
@@ -1693,6 +1713,15 @@
           },
           "legendFormat": "protection unknown",
           "expr": "max(ravel_bucket_protection_unknown)"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "legendFormat": "probe cycle age",
+          "expr": "max(time() - ravel_store_probe_last_run_timestamp_seconds)"
         }
       ]
     },
