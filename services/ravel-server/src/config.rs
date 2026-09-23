@@ -6586,8 +6586,24 @@ mod tests {
             }
             out
         };
-        let share_mb = floor * entry_bytes / 1_000_000;
-        let total_mb = share_mb * caches;
+        // Format from the byte count with one decimal place, trimming a
+        // trailing ".0", the way operator_docs_record_cache_figures.rs does.
+        // Dividing into an integer truncates, and multiplying an
+        // already-truncated share compounds it: at
+        // RECORD_CACHE_ENTRY_BYTES = 950 the help should read 9.5 MB and
+        // 19 MB, and a truncating test would accept the old 9 MB and 18 MB.
+        let mb = |bytes: u64| {
+            let value = bytes as f64 / 1_000_000.0;
+            let rounded = (value * 10.0).round() / 10.0;
+            if (rounded - rounded.trunc()).abs() < 1e-9 {
+                format!("{rounded:.0}")
+            } else {
+                format!("{rounded:.1}")
+            }
+        };
+        let share_bytes = floor * entry_bytes;
+        let share_mb = mb(share_bytes);
+        let total_mb = mb(share_bytes * caches);
 
         assert!(
             help.contains(&format!("{floor_str} entries")),
