@@ -75,7 +75,11 @@ concrete failure rows:
 - **ADR-0055 (landed)**: per-role credentials. Only the Maintain role
   holds any `s3:DeleteObject` grant, and only over `l0/`, `l1/`, `c/`,
   `idem/`. Every role is denied delete on `sys/*`, `prov`, `catalog/*`, and
-  the audit prefix `t/<th>/u/**`. ADR-0055's consequences call this out by
+  the audit prefix `t/<th>/u/**`. (ADR-0055's 2026-09-23 amendment narrows
+  the catalog deny to `catalog/*/HEAD` and grants Maintain delete on
+  `catalog/*/snap/*` and `catalog/*/idx/*`, which is what makes an
+  unreferenced `.cstat` holding an erased subject's own column value
+  reclaimable; see issue #1847.) ADR-0055's consequences call this out by
   name: this ADR's role placement is most naturally an extension of
   Maintain's existing delete-capable role rather than a fifth role. The
   obligation is binding on whichever ADR lands second; this ADR is second,
@@ -101,7 +105,8 @@ concrete failure rows:
 - **Catalog contents**: `SnapshotEntry` and `SnapshotPartHeader`
   (proto/ravel/catalog.proto) carry identities, hashes, counts, and
   timestamps — no label or attribute values. Name postings carry metric
-  names only. So catalog objects (deny-deleted under ADR-0055) hold no
+  names only. So catalog objects (delete-denied on HEAD under ADR-0055, as
+amended 2026-09-23) hold no
   subject identifiers, *provided* subject identifiers appear only as label/
   attribute values, never inside metric names. That proviso becomes a
   documented requirement (§7).
@@ -644,7 +649,8 @@ contract:
    erasure bound per §6; scoped legal holds (ADR-0042) are the recommended
    compliance mechanism when erasure obligations coexist.
 5. **Subject identifiers live in label/attribute values, not metric
-   names.** Name postings under the deny-deleted `catalog/` prefix retain
+   names.** Name postings under the `catalog/` prefix (whose HEAD is
+   delete-denied; see ADR-0055's 2026-09-23 amendment) retain
    metric names; a deployment that embeds subject IDs in metric names is
    outside the erasure guarantee, and the doc says so.
 
