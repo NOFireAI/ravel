@@ -34,7 +34,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/api/v1/alerts` is not served.
 
 - **A Grafana dashboard over Ravel's own metrics ships in
-  `deploy/grafana/dashboards/ravel.json`** (issue #1730). `deploy/` shipped a
+  `deploy/grafana/dashboards-standalone/ravel.json`** (issue #1730). `deploy/` shipped a
   rule file that pages on 37 metric names and one quickstart dashboard that
   graphs host CPU, so an operator who got paged had nothing to open. The new
   dashboard carries 36 panels in 6 rows (ingest, query, catalog fold,
