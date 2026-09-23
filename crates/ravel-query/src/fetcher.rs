@@ -269,10 +269,18 @@ impl ReadCache {
     /// `CacheMetrics`). The fetch-free half a caller uses when its miss handling
     /// cannot be expressed as one upstream-fetch closure: `BlockRangeFetcher`'s
     /// per-block peek, which defers a miss to a later coalesced GET.
-    pub(crate) fn get(&self, key: &CacheKey) -> Option<Bytes> {
+    ///
+    /// Async because the tiered variant's disk consult must not run on the
+    /// runtime worker that polls this call (issue #1891): it reads a file, once
+    /// per peeked extent, and every caller of this method is an async funnel.
+    /// [`TieredCache::get_off_worker`] dispatches that read to the blocking pool
+    /// and is otherwise byte-for-byte [`TieredCache::get`]. The RAM variant has
+    /// no disk tier and no I/O to move, so it is served inline and pays nothing
+    /// for the `async`.
+    pub(crate) async fn get(&self, key: &CacheKey) -> Option<Bytes> {
         match self {
             ReadCache::Ram(ram) => ram.get(key),
-            ReadCache::Tiered(tiered) => tiered.get(key),
+            ReadCache::Tiered(tiered) => tiered.get_off_worker(*key).await,
         }
     }
 
@@ -281,10 +289,15 @@ impl ReadCache {
     /// admission, ADR-0107 decision 3). Records no miss, so it never layers a
     /// second miss on top of one a prior [`get`](Self::get) peek already
     /// recorded for the same key.
-    pub(crate) fn insert(&self, key: CacheKey, value: Bytes) {
+    ///
+    /// Async for the same reason [`get`](Self::get) is: the tiered variant's
+    /// disk write goes to the blocking pool through
+    /// [`TieredCache::insert_off_worker`], while the RAM variant is served
+    /// inline.
+    pub(crate) async fn insert(&self, key: CacheKey, value: Bytes) {
         match self {
             ReadCache::Ram(ram) => ram.insert(key, value),
-            ReadCache::Tiered(tiered) => tiered.insert(key, value),
+            ReadCache::Tiered(tiered) => tiered.insert_off_worker(key, value).await,
         }
     }
 

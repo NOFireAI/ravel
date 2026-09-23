@@ -597,6 +597,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   early seal); the compactor's actual value comes only from
   `--gc-max-flush-lifetime`/its default, floor-checked as described above.
 
+- **No disk-tier file operation runs on a runtime worker thread any more**
+  (issue #1891). A process configured with a disk cache tier read and wrote
+  cache files on the async runtime's worker threads in two remaining places:
+  the block-range read path, which peeks both tiers per extent and admits the
+  bytes it fetched, and the ADR-0064 background age sweeper, whose periodic
+  tick walks the whole cache directory. A slow or contended disk parked a
+  worker for the length of that file operation, so unrelated queries and
+  ingest work sharing the runtime stalled behind it, the same starvation
+  `get_or_fetch` was moved off the worker for. Both now run under
+  `spawn_blocking`: async callers reach the tiered cache through
+  `TieredCache::get_off_worker` / `insert_off_worker`, which keep the RAM tier
+  inline (it is not I/O, and a RAM hit stays the fast path) and dispatch only
+  the file operation, and each sweeper tick dispatches its directory walk.
+  Cache semantics are unchanged: the same read-through, the same dual-tier
+  admission, the same max-age bound in sweep intervals. A RAM-only cache
+  (no `--cache-dir`) is unaffected, since it never touched the disk tier.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added
