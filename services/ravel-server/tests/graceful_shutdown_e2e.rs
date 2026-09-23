@@ -375,9 +375,16 @@ async fn shutdown_timeout_during_ingest_flush_warns_records_may_not_be_durable()
 /// more than 1 (a bug that increments per drain step rather than once per
 /// `shutdown()` call). Reuses the same `FaultStore` hold as
 /// `shutdown_timeout_during_ingest_flush_warns_records_may_not_be_durable` to
-/// force a real, deterministic overrun with no wall-clock wait in the test
-/// itself: the gate parks the flush PUT forever, so the outer
-/// `--shutdown-timeout` is the only thing that can resolve `shutdown()`.
+/// force the overrun deterministically rather than by racing a sleep against
+/// a drain: the gate parks the flush PUT forever, so the outer
+/// `--shutdown-timeout` is the only thing that can resolve `shutdown()`, and
+/// the branch under test is reached on every run rather than when the drain
+/// happens to be slow. The test body issues no sleep of its own, but this is
+/// not a paused-clock test: `#[tokio::test]` here runs the real timer, so the
+/// run does spend the 2-second `SHUTDOWN_TIMEOUT` below waiting for that
+/// bound to elapse. That wait is the behavior under test, not a settling
+/// delay, and it cannot be shortened away without removing what the
+/// assertion rests on.
 ///
 /// `DRAIN_OVERRUN_TOTAL` is a process-global static
 /// (`services/ravel-server/src/lib.rs`'s `store_probe`-style counter), so

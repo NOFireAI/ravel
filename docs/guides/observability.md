@@ -166,7 +166,7 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_flush_permit_wait_seconds_total` | Total seconds every flush has spent waiting for a `max_inflight_flushes` permit, summed across shards. Zero unless a shard is actually asked for a second concurrent flush; a rising figure means `max_inflight_flushes` is the binding window. |
 | `ravel_ingest_queued_flushes` | Flush tasks spawned and not yet reaped, summed across shards (a gauge): the per-shard queue `--max-queued-flushes` caps. It can exceed the shard count times that cap, because a tenant buffer over its memory backstop spawns whatever the queue depth; this gauge rising while `ravel_ingest_flush_trigger_deferred_total` stays flat is that exemption, not a queue that lost its bound. |
 | `ravel_ingest_flush_trigger_deferred_total` | Size and age flush triggers refused because their shard was already holding `--max-queued-flushes` spawned flush tasks, summed across shards. A refusal is a deferral, not a shed: the buffer rides back untouched and the next tick re-fires once a flush has been reaped, so a rising figure means flush latency slipped past `--max-flush-delay` while nothing was dropped. |
-| `ravel_ingest_flush_all_residue_tenants_total` | Tenants a teardown drain left with buffered rows still unflushed, summed across shards. In buffered mode those rows were already acknowledged ([Consistency model](../consistency-model.md)), so a nonzero increase is data loss, not backpressure; the same drain also logs an ERROR per residual tenant. See [Reachability during shutdown](#reachability-during-shutdown) below for when a scrape can actually see this change. |
+| `ravel_ingest_flush_all_residue_tenants_total` | Tenants a teardown drain left with buffered rows still unflushed, summed across shards. In buffered mode those rows were already acknowledged ([Consistency model](../consistency-model.md)), so a nonzero increase is data loss, not backpressure; the same drain also logs an ERROR per residual shard, carrying that shard's tenant count. See [Reachability during shutdown](#reachability-during-shutdown) below for when a scrape can actually see this change. |
 
 The collisions family carries no `signal="spans"` series. Spans derive no
 identity that can collide, so that sample is structurally absent, not zero.
@@ -786,8 +786,9 @@ that has not already opened a connection to `/metrics` by that point cannot
 open a new one, so it cannot observe either counter change during that
 specific shutdown. A scrape already in flight when the drain starts, or one
 that lands before shutdown begins, reads correctly; a scrape timed to catch
-the moment of loss does not. The ERROR log lines (one per residual tenant
-from `ravel-ingest`, one from `main.rs` on an overrun) are the only channel
+the moment of loss does not. The ERROR log lines (one per residual shard
+from `ravel-ingest`, each naming that shard's tenant count, and one from
+`main.rs` on an overrun) are the only channel
 guaranteed to carry a single event to an operator today. Making a live
 scrape reliable would mean deferring the
 listener-close signal until after the drain's outcome is known, which
