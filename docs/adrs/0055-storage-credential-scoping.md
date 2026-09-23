@@ -788,19 +788,28 @@ Before/after, expressed as the operations.md IAM wildcards:
 - Maintain delete grant (`MaintainDelete` only): add `t/*/catalog/*/snap/*`
   and `t/*/catalog/*/idx/*`.
 - `MaintainList` gains the two catalog prefixes as `s3:prefix` values;
-  `MaintainRead` gains `t/*/catalog/*/HEAD` and `t/*/catalog/*/snap/*`.
+  `MaintainRead` gains `t/*/catalog/*/HEAD`, `t/*/catalog/*/snap/*` and
+  `t/*/catalog/*/idx/*`.
   Without the list prefixes the sweep is refused at its `ListBucket`
   before it reaches a delete at all, and without the snapshot-part read
   the reachability pass that decides which objects are unreferenced
   aborts on its first part GET: `SnapshotReachability::ensure_part`
   returns `MaintainError::Store` on anything that is not `NotFound`, so
   an AccessDenied there fails the whole pass for that signal rather than
-  one object.
+  one object. The `idx/` read is for three call sites outside the sweep
+  that all SWALLOW their error: `load_covering_postings` returns
+  `Ok(None)` on any failure, which the scrub tick cannot distinguish
+  from "no postings ref yet", so the postings scrub tier silently never
+  runs; and the fold's `.cstat` and `.npost` reuse baseline degrade to a
+  full rebuild on every fold. Those are not outages, which is precisely
+  why the grant has to be derived rather than observed.
 
 Recorded as an appended amendment rather than rewritten into §1's role table,
-§2 and §3: the three statements above that assert `catalog/*` is undeletable
-carry an inline pointer to this section, so a reader meets the qualification
-where the claim is made, and the decision text keeps its original wording.
+§2 and §3, none of which was touched. What carries an inline pointer to this
+section is each of the three places that asserts `catalog/*` is undeletable:
+the Decision bullet, and the recaps in the 2026-09-06 and 2026-09-13
+amendments that repeat the claim. A reader meets the qualification where the
+claim is made, and the decision text keeps its original wording.
 ADR-0064's statements that catalog objects are deny-deleted carry the same
 pointer, since its erasure argument depends on `.cstat` objects being
 reachable for deletion, which this narrowing is what provides.
