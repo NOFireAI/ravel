@@ -209,7 +209,7 @@ flowchart TB
     subgraph deny["Deny s3:DeleteObject for every role"]
         SYS["sys/tenancy\nsys/qualification\nsys/gc"]
         PROVD["prov"]
-        CATD["catalog/*"]
+        CATD["catalog/*\n(maintain.json: catalog/*/HEAD only,\n2026-09-23 amendment)"]
         AUDD["u/&lt;legal-hold shard 0&gt;/* (holds only)"]
     end
 
@@ -806,21 +806,26 @@ Before/after, expressed as the operations.md IAM wildcards:
   aborts on its first part GET: `SnapshotReachability::ensure_part`
   returns `MaintainError::Store` on anything that is not `NotFound`, so
   an AccessDenied there fails the whole pass for that signal rather than
-  one object. The `idx/` read is for three call sites outside the sweep
-  that all SWALLOW their error: `load_covering_postings` returns
-  `Ok(None)` on any failure, which the scrub tick cannot distinguish
-  from "no postings ref yet", so the postings scrub tier silently never
-  runs; and the fold's `.cstat` and `.npost` reuse baseline degrade to a
-  full rebuild on every fold. Those are not outages, which is precisely
-  why the grant has to be derived rather than observed.
+  one object. The `idx/` read is for the scrub tick's
+  `load_covering_postings`, which SWALLOWS its error: it returns
+  `Ok(None)` on any failure, which the tick cannot distinguish from "no
+  postings ref yet", so the postings scrub tier silently never runs.
+  That is not an outage, which is precisely why the grant has to be
+  derived rather than observed. (The fold reads the same keyspace for
+  its `.cstat` and `.npost` reuse baseline, but never under this
+  credential: the fold does not run in `Mode::Maintain`. Those reads are
+  why `gateway.json` and `query.json` carry catalog reads.)
 
 Recorded as an appended amendment rather than rewritten into §1's role table,
-§2 and §3, none of which was touched. What carries an inline pointer to this
-section is each of the five places that asserts `catalog/*` is undeletable:
-the Decision bullet, §2's "never ... `catalog/`" clause and its disjointness
+§2 and §3, into which only an inline pointer was added. What carries that
+pointer to this
+section is each of the six places that asserts `catalog/*` is undeletable:
+the Decision bullet, §2's "never ... `catalog/`" clause, §2's disjointness
 paragraph, §3's deny list, and the recaps in the 2026-09-06 and 2026-09-13
-amendments that repeat the claim. A reader meets the qualification where the
-claim is made, and the decision text keeps its original wording.
+amendments that repeat the claim. The diagram's deny node carries the same
+qualifier, since a reader deriving the deny list from a picture is the one
+most likely to re-widen it. A reader meets the qualification where the claim
+is made, and the decision text keeps its original wording.
 ADR-0064's statements that catalog objects are deny-deleted carry the same
 pointer, since its erasure argument depends on `.cstat` objects being
 reachable for deletion, which this narrowing is what provides.
