@@ -641,7 +641,14 @@ shipped value:
   `max_query_duration` (default 1h). A value above it is rejected at startup,
   never clamped down.
 - `--gc-max-flush-lifetime` sets the compactor's flush lifetime, which is the
-  seal margin and the orphan age gate. It is not part of the must-match set.
+  seal margin, the orphan age gate, and the retention floor. It is not part of
+  the must-match set, but it has its own floor: the process refuses to start,
+  and `gc-config set` refuses to write, a value below the ingest pipeline's
+  own compiled-in `max_flush_lifetime` (fixed at 1h; there is no flag to
+  change it). A lower value would call a bucket sealed before a real writer's
+  flush interlock has actually elapsed, letting the erasure completion gate
+  report a pending erasure request complete while a flush that can still
+  publish into that bucket is in flight.
 
 Each flag feeds both the startup validation and the real compactor or query
 engine, so a value that passes validation is the value actually enforced. The
