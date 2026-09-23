@@ -53,6 +53,29 @@ use crate::config::{
 /// never under a tenant prefix.
 pub const GC_CONFIG_KEY: &str = "sys/gc";
 
+/// The ingest pipeline's own compiled-in `max_flush_lifetime` (ravel-ingest's
+/// writer interlock, ADR-0010 §11/§1), read fresh from
+/// [`ravel_ingest::IngestConfig::default`] rather than duplicated as a
+/// constant. A writer abandons any flush older than this and never publishes
+/// it afterward; that is what makes [`Bucket::is_sealed`](crate::Bucket::is_sealed)
+/// safe to treat as "nothing more will ever be published here" once
+/// `now_ns >= end_ns + seal_margin_ns`. A compactor `max_flush_lifetime_ns`
+/// configured BELOW this floor can seal, and this crate's erasure completion
+/// gate ([`crate::bucket_erasure_completion`]) can then report a bucket's
+/// pending erasure request complete, before the real writer's flush window
+/// has elapsed: a record from that still-in-flight flush can land afterward
+/// and resurface in every later snapshot for a subject already marked erased.
+/// This is the single point every validator of that bound calls, so "the same
+/// floor" is one function, not two independently copied expressions.
+pub fn ingest_max_flush_lifetime_floor_ns() -> i64 {
+    i64::try_from(
+        ravel_ingest::IngestConfig::default()
+            .max_flush_lifetime
+            .as_nanos(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
 /// Format version written into every `sys/gc` object this module emits, and the
 /// only version it reads. A future version is refused rather than misread under
 /// the v1 layout.
@@ -122,7 +145,24 @@ impl GcConfigValues {
     /// permanently bricked. Enforced at the single mutation choke point
     /// ([`set_gc_config`]), so a durable object can never hold a non-positive
     /// field.
-    pub fn validate(&self) -> Result<(), GcConfigError> {
+    ///
+    /// Also refuses a `max_flush_lifetime_ns` below `ingest_max_flush_lifetime_ns`
+    /// (issue #1744): that value is the ingest pipeline's own real, fixed writer
+    /// interlock (ravel-ingest has no flag to change it), and every one of
+    /// [`crate::CompactorConfig::seal_margin_ns`],
+    /// [`crate::CompactorConfig::orphan_age_gate_ns`], and
+    /// [`crate::CompactorConfig::retention_floor_ns`] derives from this same
+    /// field. A `sys/gc` written below that floor lets
+    /// [`Bucket::is_sealed`](crate::Bucket::is_sealed) decide a bucket is sealed
+    /// while a real writer, bound only by the true (longer) interlock, is still
+    /// allowed to flush into it, voiding the erasure completion gate
+    /// ([`crate::bucket_erasure_completion`]) it is meant to hold closed. The
+    /// caller supplies `ingest_max_flush_lifetime_ns` (see
+    /// [`ingest_max_flush_lifetime_floor_ns`]) rather than this function reading
+    /// it itself, so a test can drive the boundary against an arbitrary floor and
+    /// prove the check actually uses the passed-in value rather than a
+    /// hardcoded one.
+    pub fn validate(&self, ingest_max_flush_lifetime_ns: i64) -> Result<(), GcConfigError> {
         for (field, got) in [
             ("protection_horizon_ns", self.protection_horizon_ns),
             ("grace_ns", self.grace_ns),
@@ -132,6 +172,12 @@ impl GcConfigValues {
             if got <= 0 {
                 return Err(GcConfigError::NonPositiveValue { field, got });
             }
+        }
+        if self.max_flush_lifetime_ns < ingest_max_flush_lifetime_ns {
+            return Err(GcConfigError::MaxFlushLifetimeBelowIngestFloor {
+                got: self.max_flush_lifetime_ns,
+                floor: ingest_max_flush_lifetime_ns,
+            });
         }
         Ok(())
     }
@@ -198,6 +244,15 @@ pub enum GcConfigError {
          brick every mode's startup validation; refusing to write sys/gc"
     )]
     NonPositiveValue { field: &'static str, got: i64 },
+    #[error(
+        "proposed GC config has max_flush_lifetime_ns={got} ns, below the ingest pipeline's own \
+         max_flush_lifetime floor of {floor} ns (ravel-ingest's fixed writer interlock, ADR-0010 \
+         §11 -- there is no flag to change it): a compactor running below this floor can decide a \
+         bucket is sealed while a real writer is still allowed to flush into it, voiding the \
+         erasure completion gate and the retention floor this value also feeds; refusing to write \
+         sys/gc"
+    )]
+    MaxFlushLifetimeBelowIngestFloor { got: i64, floor: i64 },
     #[error(
         "proposed GC config violates protection_horizon >= max_query_duration + grace + \
          clock_skew_allowance: protection_horizon={protection_horizon_ns} ns, \
@@ -360,7 +415,7 @@ pub async fn set_gc_config(
     clock_skew_allowance_ns: i64,
     now_ns: i64,
 ) -> Result<SetOutcome, GcConfigError> {
-    proposed.validate()?;
+    proposed.validate(ingest_max_flush_lifetime_floor_ns())?;
     if !proposed.satisfies_constraint(clock_skew_allowance_ns) {
         return Err(GcConfigError::ConstraintViolation {
             protection_horizon_ns: proposed.protection_horizon_ns,
@@ -1055,6 +1110,105 @@ mod tests {
             .await
             .expect_err("garbage must be a typed decode error, not a panic");
         assert!(matches!(err, GcConfigError::Decode(_)), "got: {err}");
+    }
+
+    /// Issue #1744: `GcConfigValues::validate` refuses a `max_flush_lifetime_ns`
+    /// below the caller-supplied ingest floor, pinned exactly at the boundary
+    /// (one nanosecond below refused, the floor itself accepted) -- never
+    /// "some low value is refused". Uses an arbitrary floor, not
+    /// `DEFAULT_MAX_FLUSH_LIFETIME_NS` or the real ingest default: `validate`
+    /// takes the floor as a parameter rather than deriving it internally
+    /// (see [`ingest_max_flush_lifetime_floor_ns`]), and a deliberately
+    /// unusual floor value is what proves the check actually uses the
+    /// argument. Watch this fail: replace the `ingest_max_flush_lifetime_ns`
+    /// parameter inside `validate`'s comparison with a hardcoded
+    /// `DEFAULT_MAX_FLUSH_LIFETIME_NS` (or any other fixed constant) --
+    /// `below_floor` here (an arbitrary 999_000_000_000 ns) would then pass
+    /// validation instead of being refused, and the `expect_err` below panics.
+    #[test]
+    fn validate_refuses_max_flush_lifetime_below_an_arbitrary_caller_supplied_floor() {
+        let arbitrary_floor_ns: i64 = 999_000_000_000; // deliberately not 3600s
+        let below_floor = GcConfigValues {
+            max_flush_lifetime_ns: arbitrary_floor_ns - 1,
+            ..GcConfigValues::maintain_defaults()
+        };
+        let err = below_floor
+            .validate(arbitrary_floor_ns)
+            .expect_err("one nanosecond below the supplied floor must be refused");
+        assert!(
+            matches!(
+                err,
+                GcConfigError::MaxFlushLifetimeBelowIngestFloor {
+                    got,
+                    floor
+                } if got == arbitrary_floor_ns - 1 && floor == arbitrary_floor_ns
+            ),
+            "got: {err}"
+        );
+
+        let at_floor = GcConfigValues {
+            max_flush_lifetime_ns: arbitrary_floor_ns,
+            ..GcConfigValues::maintain_defaults()
+        };
+        at_floor
+            .validate(arbitrary_floor_ns)
+            .expect("the supplied floor itself must be accepted, not refused");
+    }
+
+    /// The production choke point ([`set_gc_config`]) derives the floor from
+    /// [`ingest_max_flush_lifetime_floor_ns`], the same function
+    /// `ravel-server`'s `Cli::validate` calls (issue #1744): a proposal one
+    /// nanosecond below the real ingest floor is refused on the durable
+    /// `sys/gc` write path even though it never passes through the CLI at
+    /// all, and writes nothing.
+    #[tokio::test]
+    async fn set_gc_config_refuses_max_flush_lifetime_below_the_real_ingest_floor() {
+        let store = store();
+        let floor_ns = ingest_max_flush_lifetime_floor_ns();
+        let below_floor = GcConfigValues {
+            max_flush_lifetime_ns: floor_ns - 1,
+            ..GcConfigValues::maintain_defaults()
+        };
+        let err = set_gc_config(
+            store.as_ref(),
+            below_floor,
+            DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            1_000,
+        )
+        .await
+        .expect_err(
+            "a max_flush_lifetime one nanosecond below the real ingest floor must be refused \
+             on the durable sys/gc write path",
+        );
+        assert!(
+            matches!(
+                err,
+                GcConfigError::MaxFlushLifetimeBelowIngestFloor { floor, .. } if floor == floor_ns
+            ),
+            "got: {err}"
+        );
+        assert!(
+            read_gc_config(store.as_ref())
+                .await
+                .expect("read")
+                .is_none(),
+            "a refused set writes no object"
+        );
+
+        // The floor itself passes (mirrors the maintain defaults, which equal
+        // it today).
+        let at_floor = GcConfigValues {
+            max_flush_lifetime_ns: floor_ns,
+            ..GcConfigValues::maintain_defaults()
+        };
+        set_gc_config(
+            store.as_ref(),
+            at_floor,
+            DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            2_000,
+        )
+        .await
+        .expect("max_flush_lifetime exactly at the real ingest floor must be accepted");
     }
 
     /// A store error on the bootstrap read surfaces as a typed `Store` error
