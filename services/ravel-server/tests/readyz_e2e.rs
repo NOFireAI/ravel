@@ -10,8 +10,9 @@
 //! process-global reachability flag written only by the cycles these tests
 //! drive explicitly.
 //!
-//! The two tests both mutate that one process-global flag, so they serialize on
-//! a shared async lock to keep their windows from interleaving.
+//! These tests all mutate that one process-global flag (and the probe's
+//! process-global liveness gauge), so they serialize on a shared async lock to
+//! keep their windows from interleaving.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -33,8 +34,8 @@ use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 use tokio::sync::Mutex;
 
-/// Serializes the two tests: both drive the one process-global reachability
-/// flag, so their outage windows must not interleave.
+/// Serializes the probe tests: they all drive the one process-global
+/// reachability flag and liveness gauge, so their windows must not interleave.
 static PROBE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// A `MemoryStore` whose GETs can be flipped to a hard error at runtime, to
@@ -362,6 +363,52 @@ async fn store_probe_last_run_gauge_goes_stale_while_readyz_stays_green() {
     fail_gets.store(false, Ordering::SeqCst);
     store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &clock).await;
     assert!(store_probe::store_reachable(), "a single success recovers");
+}
+
+/// Issue #1728: `store_probe::spawn` stamps the liveness gauge before the
+/// loop's first sleep, so `0` means only "no probe task was ever spawned in
+/// this process". Without that stamp the gauge holds `0` for a whole jittered
+/// interval plus one cycle after every start, and a task that dies inside that
+/// window holds it forever, which no alert expression can tell apart from a
+/// process that never spawned a probe. The interval here is long enough that
+/// no cycle can complete during the test, so the value asserted can only have
+/// come from the spawn stamp itself, and the clock is injected so the
+/// assertion is an exact value rather than a wall-clock band.
+#[tokio::test]
+async fn store_probe_spawn_stamps_the_liveness_gauge_before_any_cycle_runs() {
+    let _guard = PROBE_TEST_LOCK.lock().await;
+
+    // A value no other test in this binary stamps, so a stale global cannot
+    // pass this assertion for it.
+    const SPAWN_NS: i64 = 1_600_000_000_123_456_789;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::at(SPAWN_NS);
+    let task = store_probe::spawn_with_clock(
+        store,
+        Duration::from_secs(86_400),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+    );
+
+    assert_eq!(
+        store_probe::probe_last_run_unix_ns(),
+        SPAWN_NS,
+        "spawn must stamp the liveness gauge from the injected clock before the \
+         task's first sleep, so the gauge is never left at its never-spawned 0 \
+         by a process that did spawn a probe"
+    );
+
+    // The stamp is not a cycle: nothing ran, so reachability is untouched and
+    // the gauge does not move on its own while the clock advances.
+    clock.advance(Duration::from_secs(3_600));
+    assert_eq!(
+        store_probe::probe_last_run_unix_ns(),
+        SPAWN_NS,
+        "only a completed cycle (or a spawn) advances the gauge; a probe that \
+         dies before its first cycle must age out from its spawn stamp"
+    );
+
+    task.shutdown().await;
 }
 
 /// Issue #1728: the nanoseconds-to-seconds conversion in

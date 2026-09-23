@@ -219,12 +219,18 @@ outage must never make liveness fail and get healthy processes killed.
 Plan for one consequence at rollout time. A deployment gated on readiness will,
 correctly, halt while the store is unreachable.
 
-The probe exports two samples at `/metrics`, so the outage is visible even where
-nothing consumes `/readyz`:
+The probe exports three samples at `/metrics`, so the outage is visible even
+where nothing consumes `/readyz`:
 
 - `ravel_store_reachable`, a gauge labeled by mode: 1 healthy, 0 unhealthy.
 - `ravel_store_probe_failures_total`, a counter labeled by mode, incremented on
   every failed probe cycle even below the readiness threshold.
+- `ravel_store_probe_last_run_timestamp_seconds`, a gauge labeled by mode: Unix
+  time of the probe's last completed cycle or of its spawn, whichever is later.
+  Its AGE, not its value, is the signal: the other two move only while the probe
+  task is alive, so a task that dies freezes them at a healthy-looking value
+  while this one stops advancing. Alert on the age, not on the value; see
+  [the store-probe liveness alert](../observability.md#the-store-probe-liveness-alert).
 
 ## Graceful shutdown and the pod grace period
 
