@@ -302,6 +302,25 @@ fn record_cache_figures_match_the_constants_they_are_derived_from() {
         1,
         "the 100-tenant sizing product",
     );
+    // The uncapped figure sits BETWEEN two pinned lines, which is what makes it
+    // dangerous: a constant change fails on both neighbours, the author fixes
+    // those, and this one drifts silently. `--shards 64` derives its entry
+    // count from the shard count rather than from these constants, so the entry
+    // count is a literal here; the byte figure is not.
+    const UNCAPPED_ENTRIES: u64 = 2_073_600;
+    let uncapped_gb = format_gb(UNCAPPED_ENTRIES * entry_bytes * caches_per_tenant);
+    let marker_uncapped_gb = format!("{uncapped_gb} GB");
+    assert_doc_states(
+        CACHING_GUIDE,
+        &caching,
+        &format!(
+            "derives {} entries and {uncapped_gb} GB per tenant uncapped",
+            with_commas(UNCAPPED_ENTRIES)
+        ),
+        &marker_uncapped_gb,
+        1,
+        "the uncapped per-tenant sizing figure",
+    );
     assert_doc_states(
         CACHING_GUIDE,
         &caching,
