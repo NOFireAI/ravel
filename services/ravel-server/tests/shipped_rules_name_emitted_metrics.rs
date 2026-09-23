@@ -1273,3 +1273,39 @@ fn the_operator_dashboard_is_not_auto_provisioned_into_the_quickstart() {
          while shipping no dashboard at all"
     );
 }
+
+/// [`is_rendered`]'s suffix acceptance is narrowed to histogram and summary
+/// bases; a counter whose own name happens to end in `_count` must not slip
+/// through the same way.
+#[test]
+fn is_rendered_accepts_a_suffix_only_on_a_histogram_or_summary_base() {
+    let rendered = BTreeMap::from([
+        (
+            "ravel_store_latency_seconds".to_string(),
+            "histogram".to_string(),
+        ),
+        (
+            "ravel_query_duration_seconds".to_string(),
+            "summary".to_string(),
+        ),
+        ("ravel_store_bytes_total".to_string(), "counter".to_string()),
+    ]);
+
+    assert!(
+        is_rendered("ravel_store_latency_seconds_bucket", &rendered),
+        "a histogram base must accept its _bucket suffix"
+    );
+    assert!(
+        is_rendered("ravel_store_latency_seconds_sum", &rendered),
+        "a histogram base must accept its _sum suffix"
+    );
+    assert!(
+        is_rendered("ravel_query_duration_seconds_count", &rendered),
+        "a summary base must accept its _count suffix"
+    );
+    assert!(
+        !is_rendered("ravel_store_bytes_total_count", &rendered),
+        "a counter base must not accept a _count suffix it never declared: \
+         ravel_store_bytes_total is a counter, not a histogram or summary"
+    );
+}
