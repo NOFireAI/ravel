@@ -73,6 +73,15 @@
 //! on success, but consults neither tier and records no miss of its own,
 //! because the caller's earlier `get` already accounted the one miss.
 //!
+//! No disk operation reached through [`tiered::TieredCache`] runs on a runtime
+//! worker thread (issue #1891): every `std::fs` call it makes is dispatched to
+//! `spawn_blocking`. The fetch-free pair stays synchronous for callers off a
+//! runtime, and an async caller uses
+//! [`tiered::TieredCache::get_off_worker`] / [`tiered::TieredCache::insert_off_worker`].
+//! The disk tier's background age sweep (ADR-0064) is dispatched the same way,
+//! so a tick walks the namespace directory on the blocking pool rather than
+//! parking a worker for the length of the walk.
+//!
 //! Both tiers' counters are readable independently:
 //! [`tiered::TieredCache::ram_metrics`] (which also carries the cross-tier
 //! single-flight collapses) and [`tiered::TieredCache::disk_metrics`], so a
