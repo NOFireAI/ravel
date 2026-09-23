@@ -58,7 +58,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its outcome, so its AGE (not its value) is the signal that the task itself
   has stopped: a failing-but-alive probe keeps advancing it every cycle.
   `docs/guides/observability.md` documents the alert and derives its
-  threshold from the probe interval.
+  threshold from the probe interval and the store backend's own worst-case
+  cycle time, and it ships as `RavelStoreProbeStalled` in
+  `deploy/prometheus/ravel.rules.yaml`.
 
 - **`ravel-bench`'s ingest and end-to-end reports break out queue-deadline
   abandonment as its own `abandoned_queue_deadline` counter instead of
