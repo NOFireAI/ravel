@@ -2420,7 +2420,7 @@ fn render_store_probe_family(
     write_header(
         out,
         "ravel_store_probe_last_run_timestamp_seconds",
-        "Unix time the background store probe last completed a cycle in this process, 0 if none has run yet, set whether that cycle succeeded or failed. Its age is the probe-liveness signal: unlike ravel_store_reachable and ravel_store_probe_failures_total, which only move while the probe task is alive, this stops advancing the moment the task itself dies.",
+        "Unix time of the background store probe's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed, and 0 means no probe task was ever spawned in this process. Its age is the probe-liveness signal: unlike ravel_store_reachable and ravel_store_probe_failures_total, which only move while the probe task is alive, this stops advancing the moment the task itself dies.",
         "gauge",
     );
     write_sample_f64(
@@ -7791,8 +7791,10 @@ mod tests {
             body.contains("ravel_store_probe_failures_total{mode=\"all\"} 0"),
             "missing store-probe failure counter:\n{body}"
         );
-        // No probe cycle has run in this process, so the liveness gauge
-        // reads its zero default (issue #1728).
+        // No probe task was spawned in this process, which is the one state
+        // the liveness gauge's 0 now means (issue #1728): a spawned task
+        // stamps it before its first sleep, so a real process only reads 0
+        // here when it runs no probe at all.
         assert!(
             body.contains("ravel_store_probe_last_run_timestamp_seconds{mode=\"all\"} 0"),
             "missing store-probe last-run gauge:\n{body}"
