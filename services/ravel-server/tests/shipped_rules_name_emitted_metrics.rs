@@ -648,8 +648,10 @@ fn is_rendered(name: &str, rendered: &BTreeMap<String, String>) -> bool {
 /// is arbitrary text: `{job="ravel_server"}` names no metric, but a scan of
 /// the raw expression would put `ravel_server` in the set and then assert it
 /// against `/metrics`, where it fails for a dashboard that is perfectly
-/// correct. Blanking rather than deleting keeps the `:` check below honest
-/// about where in the expression a colon sits.
+/// correct. Blanking rather than deleting matters because deletion can
+/// splice two neighbouring identifiers into one: `ravel_a"x"ravel_b` would
+/// read as the single token `ravel_aravel_b` if the quoted text vanished
+/// instead of leaving a space in its place.
 ///
 /// PromQL's three string forms are handled: `"..."` and `'...'` with
 /// backslash escapes, and raw backtick strings, which have none.
@@ -722,18 +724,19 @@ fn blank_template_variables(expr: &str) -> String {
 /// it either: every one of them (`rate`, `sum`, `histogram_quantile`,
 /// `clamp_min`, `time`) fails the `ravel_` prefix.
 ///
-/// A colon in what is left is refused rather than scanned. A colon there can
-/// only be a recording rule name (`job:ravel_x:rate5m`), whose left and right
-/// segments would each be read as a metric, and whose real name never appears
-/// on a `/metrics` body at all because Prometheus, not Ravel, computes it.
-/// This dashboard uses no recording rules; adding one means deciding what
-/// this test should hold it to, not silently widening the scan.
+/// A colon in what is left is refused rather than scanned. Outside a string,
+/// a colon can only open a recording rule name (`job:ravel_x:rate5m`), whose
+/// left and right segments would each be read as a metric and whose real
+/// name never appears on a `/metrics` body at all because Prometheus, not
+/// Ravel, computes it, or a subquery range (`rate(ravel_x[1h:5m])`). This
+/// dashboard uses neither; adding one means deciding what this test should
+/// hold it to, not silently widening the scan.
 fn target_metric_names(expr: &str) -> BTreeSet<String> {
     let scannable = blank_template_variables(&blank_strings(expr));
     assert!(
         !scannable.contains(':'),
-        "dashboard target {expr:?} holds a colon outside a string, which can only be a recording \
-         rule name; no recording rule name appears on a /metrics body"
+        "dashboard target {expr:?} holds a colon outside a string, which can only open a \
+         recording rule name or a subquery range; no shipped panel uses either"
     );
     metric_names(&scannable)
 }
@@ -1240,16 +1243,11 @@ fn the_extractor_reads_selectors_and_not_label_values_or_variables() {
 /// The operator dashboard must not sit in the directory the quickstart
 /// auto-provisions.
 ///
-/// `deploy/docker-compose/ravel.yml` mounts the whole
-/// `deploy/grafana/dashboards` directory into the quickstart's Grafana, and
-/// `deploy/grafana/provisioning/dashboards/ravel.yaml` is a `type: file`
-/// provider over that path, so every JSON there is loaded. The quickstart
-/// scrapes no Ravel process -- `deploy/otel/collector-config.yaml` declares
-/// only the `hostmetrics` receiver -- so the only datasource that dashboard
-/// can reach holds no `ravel_` series and all of its panels draw nothing.
-///
-/// A blank dashboard is the silent failure this file's other tests exist to
-/// prevent, so the placement is pinned rather than left to a README sentence.
+/// See `deploy/README.md`'s "Grafana dashboard" section for why: the
+/// compose mount, the `type: file` provider, the `hostmetrics`-only
+/// collector, and the blank-dashboard consequence. The placement is pinned
+/// here too rather than left to that README sentence alone, since a rename
+/// or move would otherwise pass silently.
 #[test]
 fn the_operator_dashboard_is_not_auto_provisioned_into_the_quickstart() {
     let provisioned = concat!(
@@ -1258,15 +1256,15 @@ fn the_operator_dashboard_is_not_auto_provisioned_into_the_quickstart() {
     );
     // Path::starts_with is COMPONENT-wise; str::starts_with is not, and
     // "dashboards-standalone" has "dashboards" as a string prefix, so the str
-    // form fires on exactly the move this test exists to protect.
+    // form would fire on the current, correct placement -- a file that has
+    // never moved -- rather than on the move into the provisioned directory
+    // this test exists to catch.
     assert!(
         !std::path::Path::new(DASHBOARD_FILE).starts_with(provisioned),
-        "the operator dashboard {DASHBOARD_FILE} sits under {provisioned}, which \
-         deploy/docker-compose/ravel.yml mounts and \
-         deploy/grafana/provisioning/dashboards/ravel.yaml provisions as a \
-         `type: file` provider. The quickstart scrapes no ravel_ series, so every \
-         panel would draw nothing there. Keep it outside that directory, or give \
-         the quickstart a scrape path for ravel-server's /metrics first"
+        "the operator dashboard {DASHBOARD_FILE} sits under {provisioned}; see \
+         deploy/README.md's \"Grafana dashboard\" section for why that auto-provisions a blank \
+         dashboard into the quickstart. Keep it outside that directory, or give the quickstart a \
+         scrape path for ravel-server's /metrics first"
     );
     assert!(
         std::path::Path::new(DASHBOARD_FILE).exists(),
