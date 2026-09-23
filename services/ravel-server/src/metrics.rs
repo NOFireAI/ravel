@@ -2365,16 +2365,32 @@ fn render_provisioning_family(
     );
 }
 
-/// Store-reachability probe family (ADR-0050 section 7, EC7): the
-/// `ravel_store_reachable` gauge (1 = the background probe currently reports the
-/// store reachable, 0 = unhealthy after `store_probe::K` consecutive failures)
-/// and the `ravel_store_probe_failures_total` counter (every failed probe
-/// cycle, monotonic). Both are process-global atomic reads from
-/// [`crate::store_probe`], single source and no labels, the same shape as the
-/// tenancy and provisioning families above. Exported unconditionally so an
-/// operator sees a store outage on a metrics-only monitoring setup, even where
-/// nothing consumes `/readyz`.
-fn render_store_probe_family(out: &mut String, mode: Mode, reachable: bool, failures_total: u64) {
+/// Store-reachability probe family (ADR-0050 section 7, EC7; issue #1728):
+/// the `ravel_store_reachable` gauge (1 = the background probe currently
+/// reports the store reachable, 0 = unhealthy after `store_probe::K`
+/// consecutive failures), the `ravel_store_probe_failures_total` counter
+/// (every failed probe cycle, monotonic), and the
+/// `ravel_store_probe_last_run_timestamp_seconds` liveness gauge (unix time
+/// the probe task last completed a cycle, whatever its outcome). All three
+/// are process-global atomic reads from [`crate::store_probe`], single source
+/// and no labels, the same shape as the tenancy and provisioning families
+/// above. Exported unconditionally so an operator sees a store outage, or a
+/// dead probe task, on a metrics-only monitoring setup, even where nothing
+/// consumes `/readyz`.
+///
+/// The first two gauges are only written while the probe task is alive: if
+/// `tokio::spawn`'s task in [`crate::store_probe::spawn`] dies, they freeze at
+/// their last values and `/readyz` keeps reading a stale-but-plausible
+/// answer. The last-run gauge is the one signal here that answers "is the
+/// probe still running", by its AGE rather than its value; see the alert in
+/// docs/guides/observability.md.
+fn render_store_probe_family(
+    out: &mut String,
+    mode: Mode,
+    reachable: bool,
+    failures_total: u64,
+    last_run_unix_ns: i64,
+) {
     write_header(
         out,
         "ravel_store_reachable",
@@ -2399,6 +2415,19 @@ fn render_store_probe_family(out: &mut String, mode: Mode, reachable: bool, fail
         "ravel_store_probe_failures_total",
         &[Label::Mode(mode)],
         failures_total,
+    );
+
+    write_header(
+        out,
+        "ravel_store_probe_last_run_timestamp_seconds",
+        "Unix time the background store probe last completed a cycle in this process, 0 if none has run yet, set whether that cycle succeeded or failed. Its age is the probe-liveness signal: unlike ravel_store_reachable and ravel_store_probe_failures_total, which only move while the probe task is alive, this stops advancing the moment the task itself dies.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_store_probe_last_run_timestamp_seconds",
+        &[Label::Mode(mode)],
+        last_run_unix_ns as f64 / 1e9,
     );
 }
 
@@ -5025,6 +5054,7 @@ pub fn render(
         mode,
         crate::store_probe::store_reachable(),
         crate::store_probe::probe_failures_total(),
+        crate::store_probe::probe_last_run_unix_ns(),
     );
     render_shutdown_family(&mut out, mode, crate::drain_overrun_total());
     render_bucket_protection_family(
@@ -7761,9 +7791,16 @@ mod tests {
             body.contains("ravel_store_probe_failures_total{mode=\"all\"} 0"),
             "missing store-probe failure counter:\n{body}"
         );
-        // Both carry the standard TYPE headers.
+        // No probe cycle has run in this process, so the liveness gauge
+        // reads its zero default (issue #1728).
+        assert!(
+            body.contains("ravel_store_probe_last_run_timestamp_seconds{mode=\"all\"} 0"),
+            "missing store-probe last-run gauge:\n{body}"
+        );
+        // All three carry the standard TYPE headers.
         assert!(body.contains("# TYPE ravel_store_reachable gauge"));
         assert!(body.contains("# TYPE ravel_store_probe_failures_total counter"));
+        assert!(body.contains("# TYPE ravel_store_probe_last_run_timestamp_seconds gauge"));
     }
 
     /// Proves all three durable-auth refresh-loop counters reach `/metrics`

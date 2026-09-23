@@ -17,11 +17,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use ravel_ingest::Clock;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -208,7 +209,8 @@ async fn readyz_goes_unready_when_store_unreachable() {
     // The first K-1 failures must NOT flip readiness (asymmetric hysteresis:
     // flips only AT K, not after a single blip).
     for i in 1..K {
-        store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis).await;
+        store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &ravel_ingest::SystemClock)
+            .await;
         assert_eq!(
             status(&client, &base, "/readyz").await,
             200,
@@ -217,7 +219,7 @@ async fn readyz_goes_unready_when_store_unreachable() {
     }
 
     // The K-th consecutive failure flips readiness to 503.
-    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis).await;
+    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &ravel_ingest::SystemClock).await;
     assert_eq!(
         status(&client, &base, "/readyz").await,
         503,
@@ -226,7 +228,7 @@ async fn readyz_goes_unready_when_store_unreachable() {
 
     // A single successful probe recovers readiness immediately.
     fail_gets.store(false, Ordering::SeqCst);
-    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis).await;
+    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &ravel_ingest::SystemClock).await;
     assert_eq!(
         status(&client, &base, "/readyz").await,
         200,
@@ -256,7 +258,8 @@ async fn healthz_stays_200_during_store_outage() {
     fail_gets.store(true, Ordering::SeqCst);
     let mut hysteresis = ProbeHysteresis::new();
     for _ in 0..=K {
-        store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis).await;
+        store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &ravel_ingest::SystemClock)
+            .await;
         assert_eq!(
             status(&client, &base, "/healthz").await,
             200,
@@ -269,8 +272,94 @@ async fn healthz_stays_200_during_store_outage() {
 
     // Recover, and reset the global for any later test in this process.
     fail_gets.store(false, Ordering::SeqCst);
-    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis).await;
+    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &ravel_ingest::SystemClock).await;
     assert_eq!(status(&client, &base, "/readyz").await, 200);
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A clock a test advances by hand, so the probe's liveness gauge can be
+/// pinned to an exact value and driven stale deterministically, with no
+/// wall-clock sleep.
+#[derive(Clone)]
+struct TestClock(Arc<AtomicI64>);
+
+impl TestClock {
+    fn at(now_ns: i64) -> TestClock {
+        TestClock(Arc::new(AtomicI64::new(now_ns)))
+    }
+
+    fn advance(&self, by: Duration) {
+        let by_ns = i64::try_from(by.as_nanos()).expect("test duration fits i64");
+        self.0.fetch_add(by_ns, Ordering::SeqCst);
+    }
+}
+
+impl Clock for TestClock {
+    fn now_ns(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Issue #1728: `ravel_store_reachable` alone reads healthy forever once
+/// nothing updates it, because it (like `ravel_store_probe_failures_total`)
+/// is written only while the probe task is alive. This is the exact
+/// false-healthy state a dead probe task produces, and the one signal that
+/// exposes it: `ravel_store_probe_last_run_timestamp_seconds` going stale
+/// while `store_reachable()` still answers `true`.
+#[tokio::test]
+async fn store_probe_last_run_gauge_goes_stale_while_readyz_stays_green() {
+    let _guard = PROBE_TEST_LOCK.lock().await;
+
+    let (toggle, fail_gets) = ToggleFailStore::new();
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(toggle);
+    let mut hysteresis = ProbeHysteresis::new();
+    let clock = TestClock::at(1_700_000_000_000_000_000);
+
+    // One successful cycle: the gauge must equal the injected clock's exact
+    // value, not merely a non-zero or SystemTime::now() value (WRONG-2).
+    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &clock).await;
+    assert_eq!(
+        store_probe::probe_last_run_unix_ns(),
+        1_700_000_000_000_000_000,
+        "gauge must equal the injected clock's exact value after one cycle"
+    );
+    assert!(store_probe::store_reachable(), "starts reachable");
+
+    // Advance the clock with NO new cycle driven. This is the exact
+    // false-healthy state: store_reachable() still says true, but the
+    // liveness gauge is now stale, which is what a dead probe task looks like
+    // from outside.
+    clock.advance(Duration::from_secs(600));
+    assert_eq!(
+        store_probe::probe_last_run_unix_ns(),
+        1_700_000_000_000_000_000,
+        "gauge must not move on its own; only a completed cycle advances it"
+    );
+    assert!(
+        store_probe::store_reachable(),
+        "store_reachable() must still read true here: that is the false-healthy \
+         state readable only through the liveness gauge's age, not its value"
+    );
+
+    // A FAILING cycle still advances the gauge (WRONG-1 sets it only on the
+    // success branch, which would leave it stuck at the earlier value here).
+    fail_gets.store(true, Ordering::SeqCst);
+    for _ in 0..K {
+        store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &clock).await;
+    }
+    assert!(
+        !store_probe::store_reachable(),
+        "K consecutive failures must flip reachability"
+    );
+    assert_eq!(
+        store_probe::probe_last_run_unix_ns(),
+        clock.now_ns(),
+        "a failing cycle must still advance the liveness gauge to the clock's current value"
+    );
+
+    // Recover, and reset the global for any later test in this process.
+    fail_gets.store(false, Ordering::SeqCst);
+    store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &clock).await;
+    assert!(store_probe::store_reachable(), "a single success recovers");
 }
