@@ -465,7 +465,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   samples does not clean up data already stored with any of these shapes, so
   the query-side zero-bucket guards remain in place.
 
-
 - **Every PromQL parse of caller text runs the pre-parse complexity guard,
   because one function now does both** (issue #1817). The guard that keeps an
   over-bound query from overflowing the stack inside promql-parser, which
