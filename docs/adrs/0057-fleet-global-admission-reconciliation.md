@@ -431,10 +431,10 @@ escape in the design fails to bound it:
   deployment. The #1679 reap (`crates/ravel-ingest/src/reconcile.rs`)
   bounds the LIST by deleting stale sibling snapshots, but this loop runs
   in `Mode::All | Mode::Gateway`, and Gateway holds no delete grant:
-  §1's role table gives it `Delete: none` and `deploy/iam/gateway.json`
-  carries no `s3:DeleteObject` Allow. Every reap delete therefore returns
-  AccessDenied and is logged rather than reaped. That grant gap is
-  reported separately; it is not fixed here.
+  ADR-0055 §1's role table gives it `Delete: none` and
+  `deploy/iam/gateway.json` carries no `s3:DeleteObject` Allow. Every reap
+  delete therefore returns AccessDenied and is logged rather than reaped.
+  That grant gap is reported separately; it is not fixed here.
 
 The tenant map is in-memory, so `T` resets on restart. The degraded state is
 therefore a sawtooth across process lifetimes rather than a permanent
