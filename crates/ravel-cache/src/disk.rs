@@ -2435,11 +2435,8 @@ mod tests {
                     // A short interval so the first real tick lands promptly; the
                     // test waits on the tick's own announcement, never on a bound.
                     let limits = generous_limits().with_sweep_interval_ns(1_000_000); // 1 ms
-                    let cache = DiskCache::new_with_clock(
-                        tmp.path().to_path_buf(),
-                        limits,
-                        clock.clone(),
-                    );
+                    let cache =
+                        DiskCache::new_with_clock(tmp.path().to_path_buf(), limits, clock.clone());
 
                     // One entry, so the walk has a header to open rather than an
                     // empty directory to skip. Written before arming, so this

@@ -1524,92 +1524,92 @@ mod tests {
                 )
             },
             move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let tmp = TempDir::new().unwrap();
-                // `DiskCache::new_with_clock` itself calls `clock.now_ns()`
-                // once, from `scan_existing`, to timestamp the startup scan --
-                // before this test's own handshake begins. `arm()` is called
-                // only after construction returns, so that startup call is a
-                // no-op and the park lands on the first call after that:
-                // `resolve_peeked_miss`'s `written_at_ns` stamp.
-                let clock = Arc::new(ParkOnFirstArmedCall::new(
-                    move || began_tx.send(()).unwrap(),
-                    release_rx,
-                ));
-                let disk = DiskCache::new_with_clock(
-                    tmp.path().to_path_buf(),
-                    generous_limits(),
-                    clock.clone(),
-                );
-                let ram: Cache<&'static str> = Cache::new(generous_limits());
-                let tiered = Arc::new(TieredCache::new(ram, disk));
-                clock.arm();
-
-                let leader_key = test_key(1, 4);
-                let tiered_leader = tiered.clone();
-                let (fetch_entered_tx, fetch_entered_rx) = oneshot::channel::<()>();
-                let leader = tokio::spawn(async move {
-                    tiered_leader
-                        .resolve_peeked_miss(leader_key, move || async move {
-                            let _ = fetch_entered_tx.send(());
-                            Ok::<Bytes, &'static str>(Bytes::from_static(b"aaaa"))
-                        })
-                        .await
-                });
-
-                // Wait for confirmation that the leader's fetch ran, which
-                // requires the leader's first poll to have returned control
-                // to the executor (a single-threaded runtime cannot
-                // reschedule this task while the leader's poll is still on
-                // the stack). On the reverted (pre-#1702) tree, that first
-                // poll runs fetch, the RAM insert, AND the synchronous,
-                // un-instrumented disk insert (including the clock's park)
-                // before returning, so this wait never resolves and the test
-                // hangs here. On the fixed tree the poll returns as soon as
-                // the disk insert is dispatched to the blocking pool, before
-                // the clock is ever called, so this wait is near-instant. A
-                // plain `tokio::task::yield_now().await` was tried first and
-                // does not give this guarantee: it only requires the leader
-                // to be *scheduled* by the time this task resumes, not to
-                // have been *polled*, so it let the probe below run before
-                // the leader's synchronous insert ever started and passed
-                // even on the reverted tree.
-                fetch_entered_rx.await.unwrap();
-
-                // Wait for the disk tier's clock to signal that the insert
-                // has begun. On the fixed tree this call runs on a tokio
-                // blocking-pool thread, a real second OS thread, so blocking
-                // this async thread on `recv()` here does not depend on
-                // anything this thread itself would otherwise need to do.
-                began_rx.recv().unwrap();
-
-                let probe_key = test_key(2, 4);
-                tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
-                let (served, source) = tiered
-                    .get_or_fetch(probe_key, || async {
-                        unreachable!("a RAM-resident key must never fetch")
-                    })
-                    .await
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
                     .unwrap();
 
-                assert_eq!(source, Source::Cache, "the probe key is a RAM hit");
-                assert_eq!(served, Bytes::from_static(b"bbbb"));
+                rt.block_on(async {
+                    let tmp = TempDir::new().unwrap();
+                    // `DiskCache::new_with_clock` itself calls `clock.now_ns()`
+                    // once, from `scan_existing`, to timestamp the startup scan --
+                    // before this test's own handshake begins. `arm()` is called
+                    // only after construction returns, so that startup call is a
+                    // no-op and the park lands on the first call after that:
+                    // `resolve_peeked_miss`'s `written_at_ns` stamp.
+                    let clock = Arc::new(ParkOnFirstArmedCall::new(
+                        move || began_tx.send(()).unwrap(),
+                        release_rx,
+                    ));
+                    let disk = DiskCache::new_with_clock(
+                        tmp.path().to_path_buf(),
+                        generous_limits(),
+                        clock.clone(),
+                    );
+                    let ram: Cache<&'static str> = Cache::new(generous_limits());
+                    let tiered = Arc::new(TieredCache::new(ram, disk));
+                    clock.arm();
 
-                // The probe above only completed because the parked insert
-                // is not holding this thread. Release it now, which is the
-                // deterministic version of "the sleep finishes": the
-                // leader's disk insert can only observe the probe's result
-                // as already asserted, never race it.
-                release_tx.send(()).unwrap();
+                    let leader_key = test_key(1, 4);
+                    let tiered_leader = tiered.clone();
+                    let (fetch_entered_tx, fetch_entered_rx) = oneshot::channel::<()>();
+                    let leader = tokio::spawn(async move {
+                        tiered_leader
+                            .resolve_peeked_miss(leader_key, move || async move {
+                                let _ = fetch_entered_tx.send(());
+                                Ok::<Bytes, &'static str>(Bytes::from_static(b"aaaa"))
+                            })
+                            .await
+                    });
 
-                let leader_bytes = leader.await.unwrap().unwrap();
-                assert_eq!(leader_bytes, Bytes::from_static(b"aaaa"));
-            });
+                    // Wait for confirmation that the leader's fetch ran, which
+                    // requires the leader's first poll to have returned control
+                    // to the executor (a single-threaded runtime cannot
+                    // reschedule this task while the leader's poll is still on
+                    // the stack). On the reverted (pre-#1702) tree, that first
+                    // poll runs fetch, the RAM insert, AND the synchronous,
+                    // un-instrumented disk insert (including the clock's park)
+                    // before returning, so this wait never resolves and the test
+                    // hangs here. On the fixed tree the poll returns as soon as
+                    // the disk insert is dispatched to the blocking pool, before
+                    // the clock is ever called, so this wait is near-instant. A
+                    // plain `tokio::task::yield_now().await` was tried first and
+                    // does not give this guarantee: it only requires the leader
+                    // to be *scheduled* by the time this task resumes, not to
+                    // have been *polled*, so it let the probe below run before
+                    // the leader's synchronous insert ever started and passed
+                    // even on the reverted tree.
+                    fetch_entered_rx.await.unwrap();
+
+                    // Wait for the disk tier's clock to signal that the insert
+                    // has begun. On the fixed tree this call runs on a tokio
+                    // blocking-pool thread, a real second OS thread, so blocking
+                    // this async thread on `recv()` here does not depend on
+                    // anything this thread itself would otherwise need to do.
+                    began_rx.recv().unwrap();
+
+                    let probe_key = test_key(2, 4);
+                    tiered.ram.insert(probe_key, Bytes::from_static(b"bbbb"));
+                    let (served, source) = tiered
+                        .get_or_fetch(probe_key, || async {
+                            unreachable!("a RAM-resident key must never fetch")
+                        })
+                        .await
+                        .unwrap();
+
+                    assert_eq!(source, Source::Cache, "the probe key is a RAM hit");
+                    assert_eq!(served, Bytes::from_static(b"bbbb"));
+
+                    // The probe above only completed because the parked insert
+                    // is not holding this thread. Release it now, which is the
+                    // deterministic version of "the sleep finishes": the
+                    // leader's disk insert can only observe the probe's result
+                    // as already asserted, never race it.
+                    release_tx.send(()).unwrap();
+
+                    let leader_bytes = leader.await.unwrap().unwrap();
+                    assert_eq!(leader_bytes, Bytes::from_static(b"aaaa"));
+                });
             },
         );
     }

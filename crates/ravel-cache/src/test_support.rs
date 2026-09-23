@@ -4,10 +4,13 @@
 //! and a watchdog that turns a wedged runtime into a deterministic panic
 //! instead of an indefinitely hung test binary.
 
-use std::sync::Mutex;
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use crate::clock::Clock;
 
@@ -60,7 +63,7 @@ impl Clock for ParkOnFirstArmedCall {
     fn now_ns(&self) -> u64 {
         if self.armed.load(Ordering::SeqCst) && !self.parked.swap(true, Ordering::SeqCst) {
             (self.announce)();
-            self.release_rx.lock().unwrap().recv().unwrap();
+            self.release_rx.lock().recv().unwrap();
         }
         0
     }
@@ -77,8 +80,11 @@ impl Clock for ParkOnFirstArmedCall {
 /// caller's thread via `std::panic::resume_unwind`, so a genuine assertion
 /// failure inside the body still fails the test with its own message, not
 /// the watchdog's.
-pub(crate) fn run_with_watchdog<F>(bound: Duration, timeout_message: impl FnOnce() -> String, body: F)
-where
+pub(crate) fn run_with_watchdog<F>(
+    bound: Duration,
+    timeout_message: impl FnOnce() -> String,
+    body: F,
+) where
     F: FnOnce() + Send + 'static,
 {
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
