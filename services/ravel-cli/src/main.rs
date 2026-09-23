@@ -700,7 +700,10 @@ enum GcConfigCommand {
         /// Longest a single query may run (e.g. `1h`).
         #[arg(long, value_name = "DURATION")]
         max_query_duration: String,
-        /// Longest a flush may stay open (e.g. `1h`).
+        /// Longest a flush may stay open (e.g. `1h`). Refused below the
+        /// ingest pipeline's own default `max_flush_lifetime` (currently
+        /// `1h`): a lower value here lets GC seal a bucket before an
+        /// in-flight flush's writer interlock expires.
         #[arg(long, value_name = "DURATION")]
         max_flush_lifetime: String,
         /// Cross-host clock-skew allowance the horizon must cover (e.g. `5m`).
