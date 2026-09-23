@@ -418,7 +418,7 @@ Write a full new `sys/gc`, enforcing `protection_horizon >= max_query_duration +
 | --- | --- | --- | --- |
 | `--clock-skew-allowance` |  |  | Cross-host clock-skew allowance the horizon must cover (e.g. `5m`). The constraint input that closes S1-02; must match the sweepers' `clock_skew_allowance`. Not stored in `sys/gc`. Defaults to 5m when omitted |
 | `--grace` |  |  | Shared grace period for the GC age gates (e.g. `24h`) |
-| `--max-flush-lifetime` |  |  | Longest a flush may stay open (e.g. `1h`) |
+| `--max-flush-lifetime` |  |  | Longest a flush may stay open (e.g. `1h`). Refused below the ingest pipeline's own compiled-in `max_flush_lifetime` (`ravel_ingest::IngestConfig`; there is no flag to change it): the compactor must not decide a bucket is sealed while a writer can still flush into it, or a record from that still-in-flight flush can land after the bucket is reported erased |
 | `--max-query-duration` |  |  | Longest a single query may run (e.g. `1h`) |
 | `--protection-horizon` |  |  | Horizon between a deletion anchor and physical deletion (e.g. `25h5m`) |
 

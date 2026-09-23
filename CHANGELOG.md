@@ -645,6 +645,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Cache semantics are unchanged: the same read-through, the same dual-tier
   admission, the same max-age bound in sweep intervals. A RAM-only cache
   (no `--cache-dir`) is unaffected, since it never touched the disk tier.
+- **`ravel-cli gc-config set --max-flush-lifetime`'s help text now states the
+  ingest-floor refusal it already enforced** (issue #1961). The flag has
+  refused a value below the ingest pipeline's own compiled-in
+  `max_flush_lifetime` since issue #1744, but its clap doc comment (and so
+  `ravel-cli gc-config set --help` and the generated
+  `docs/reference/ravel-cli-flags.md`) still read only "Longest a flush may
+  stay open (e.g. 1h)", with no mention of the constraint or why it exists.
+  The help text and the generated reference page now match the wording
+  `--gc-max-flush-lifetime` already carries in `ravel-server`.
 
 ## [0.15.0] - 2026-09-08
 

@@ -700,7 +700,12 @@ enum GcConfigCommand {
         /// Longest a single query may run (e.g. `1h`).
         #[arg(long, value_name = "DURATION")]
         max_query_duration: String,
-        /// Longest a flush may stay open (e.g. `1h`).
+        /// Longest a flush may stay open (e.g. `1h`). Refused below the ingest
+        /// pipeline's own compiled-in `max_flush_lifetime`
+        /// (`ravel_ingest::IngestConfig`; there is no flag to change it): the
+        /// compactor must not decide a bucket is sealed while a writer can
+        /// still flush into it, or a record from that still-in-flight flush
+        /// can land after the bucket is reported erased.
         #[arg(long, value_name = "DURATION")]
         max_flush_lifetime: String,
         /// Cross-host clock-skew allowance the horizon must cover (e.g. `5m`).
