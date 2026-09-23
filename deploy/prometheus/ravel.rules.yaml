@@ -477,8 +477,23 @@ groups:
         # dead task; a merely failing-but-alive probe already trips
         # RavelStoreUnreachable well inside this window, so this rule is the
         # complement, not a duplicate.
+        #
+        # The gauge reads 0 (store_probe::PROBE_LAST_RUN_UNIX_NS's sentinel)
+        # from process start until the first probe cycle completes, which
+        # makes the bare comparison true instantly on every start. Unlike the
+        # fold and maintenance liveness rules, `for:` alone cannot be sized to
+        # cover this: run_probe_cycle's store.get has no deadline, so a first
+        # cycle against a slow or unreachable backend can run for as long as
+        # that backend's own retry budget allows, with no compile-time or
+        # config-time bound to size a margin against. The second term keeps
+        # the rule silent until a real timestamp has been stamped at least
+        # once, whatever that first cycle costs.
         expr: |
-          time() - ravel_store_probe_last_run_timestamp_seconds > 132
+          (
+            time() - ravel_store_probe_last_run_timestamp_seconds > 132
+          )
+          and
+          ravel_store_probe_last_run_timestamp_seconds > 0
         for: 5m
         labels:
           severity: critical
