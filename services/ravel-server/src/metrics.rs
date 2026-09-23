@@ -1590,9 +1590,10 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         "Tenants a teardown drain (DrainIntent::Teardown) left with buffered rows still \
          unflushed, summed across shards, by signal (issue #1742). In buffered mode those rows \
          were already acknowledged (docs/consistency-model.md), so a nonzero count is data \
-         loss, not backpressure; the same drain also logs an ERROR per residual tenant. \
-         Cumulative across the process lifetime, so a rise always means a new teardown lost \
-         rows, never that an old loss is still outstanding.",
+         loss, not backpressure; the same drain also logs an ERROR per residual shard, \
+         carrying that shard's tenant count. Cumulative across the process lifetime, so a \
+         rise always means a new teardown lost rows, never that an old loss is still \
+         outstanding.",
         "counter",
     );
     for pipeline in pipelines {
