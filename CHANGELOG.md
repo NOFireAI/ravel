@@ -48,18 +48,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metric names; it does not validate the PromQL around them or the dashboard
   against Grafana's schema.
 
-- **A teardown drain that loses acknowledged buffered rows, or overruns
-  `--shutdown-timeout`, is now visible on `/metrics`** (issue #1742).
-  `ravel_ingest_flush_all_residue_tenants_total` renders the residual tenant
-  count a `DrainIntent::Teardown` flush already logged at ERROR, for all
-  three ingest signals; `ravel_shutdown_drain_overrun_total` renders whether
-  the last graceful drain ran past its timeout, set only on that branch. The
-  client-facing listener (which also serves `/metrics`) stops accepting new
-  connections before either value can change during the shutdown that sets
-  it, so a live scrape is unlikely to observe the exact event; see
-  [Reachability during shutdown](docs/guides/observability.md#reachability-during-shutdown).
-  The accompanying log line remains the reliable single-event signal.
-
 - **`ravel-bench`'s ingest and end-to-end reports break out queue-deadline
   abandonment as its own `abandoned_queue_deadline` counter instead of
   leaving it unreported** (issue #1823). `ingest_bench` and `s3_e2e_bench`
@@ -83,8 +71,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--shutdown-timeout`, is now visible on `/metrics`** (issue #1742).
   `ravel_ingest_flush_all_residue_tenants_total` renders the residual tenant
   count a `DrainIntent::Teardown` flush already logged at ERROR, for all
-  three ingest signals; `ravel_shutdown_drain_overrun_total` renders whether
-  the last graceful drain ran past its timeout, set only on that branch. The
+  three ingest signals; `ravel_shutdown_drain_overrun_total` counts graceful
+  shutdowns that ran past their timeout, incremented only on that branch. The
   client-facing listener (which also serves `/metrics`) stops accepting new
   connections before either value can change during the shutdown that sets
   it, so a live scrape is unlikely to observe the exact event; see
