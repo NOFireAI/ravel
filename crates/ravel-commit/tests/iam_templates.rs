@@ -1819,14 +1819,18 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // erasure_lifecycle_calls_outside_the_sweep_are_reachable.
     // The catalog sweep needs the same two-call shape the erasure sweep does:
     // sweep_unreferenced_catalog_objects lists t/*/catalog/*/snap/* and
-    // t/*/catalog/*/idx/* (list_all, twice) and GETs t/*/catalog/*/HEAD
+    // t/*/catalog/*/idx/* (list_all, twice), GETs t/*/catalog/*/HEAD
     // (read_head_reference, twice: the first read and the pre-delete
-    // re-verify) before it ever reaches the delete grant above. Without the
-    // list and the get the delete is unreachable -- the pass is refused with
-    // AccessDenied at the ListBucket, exactly the defect this role's del/*
-    // grants were added to fix, and exactly the shape that shipped again here
-    // (issue #1847, round two). Asserted by
-    // maintain_template_covers_every_catalog_sweep_call.
+    // re-verify), and GETs each snapshot part that HEAD names
+    // (SnapshotReachability::ensure_part) before it ever reaches the delete
+    // grant above. Without the list the pass is refused with AccessDenied at
+    // the ListBucket; without the HEAD get it cannot resolve what is
+    // referenced; and without t/*/catalog/*/snap/* the part GET returns
+    // AccessDenied, which ensure_part turns into MaintainError::Store and so
+    // aborts the whole pass for that signal rather than one object. Each is
+    // exactly the defect this role's del/* grants were added to fix, and the
+    // shape that shipped again here twice (issue #1847, rounds two and
+    // three). Asserted by maintain_template_covers_every_catalog_sweep_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1850,6 +1854,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/prov",
             "t/*/*/del/*",
             "t/*/catalog/*/HEAD",
+            "t/*/catalog/*/snap/*",
             "sys/tenancy",
             "sys/qualification",
             "sys/gc",
