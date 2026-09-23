@@ -112,11 +112,17 @@ def scaled(byte_count: int, scale: int) -> str:
 def count_figure(haystack: str, marker: str) -> int:
     """Occurrences of `marker` that do not continue a longer number.
 
-    Before the marker, `.` and `,` are rejected alongside a digit because
-    both are digit context in these docs: a thousands separator and a decimal
-    point. After it, only a digit is: a marker ends in either `MB`/`GB` or a
-    thousands group, and a following `.` or `,` is the sentence's punctuation
-    ("it is 9 MB."), not a longer number.
+    Before the marker, `.` and `,` are digit context in these docs (a decimal
+    point and a thousands separator) and are rejected alongside a digit. The
+    membership test is spelled against a tuple, not a string: `"" in ".,"` is
+    True, so a string spelling never counted a marker sitting at offset 0.
+
+    After the marker, a digit continues the number. So does a `.` or a `,`
+    that is ITSELF followed by a digit -- "10,000,000" and "10,000.5" both
+    open with the floor's marker and are neither the floor. A `.` or `,`
+    followed by anything else is the sentence's punctuation ("capped at
+    25,000. Neither cache", "it is 9 MB."), which is how these figures
+    ordinarily end a clause.
     """
     total = 0
     i = 0
@@ -125,8 +131,12 @@ def count_figure(haystack: str, marker: str) -> int:
         if j < 0:
             return total
         prev = haystack[j - 1] if j > 0 else ""
-        nxt = haystack[j + len(marker)] if j + len(marker) < len(haystack) else ""
-        if not (prev.isdigit() or prev in ".," or nxt.isdigit()):
+        tail = haystack[j + len(marker) : j + len(marker) + 2]
+        nxt = tail[:1]
+        after = tail[1:2]
+        head_ok = not (prev.isdigit() or prev in (".", ","))
+        tail_ok = not (nxt.isdigit() or (nxt in (".", ",") and after.isdigit()))
+        if head_ok and tail_ok:
             total += 1
         i = j + max(len(marker), 1)
 
