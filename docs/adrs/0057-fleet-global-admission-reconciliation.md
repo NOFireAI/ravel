@@ -279,8 +279,8 @@ section never states.)
 A process's own snapshot for a (tenant, signal) it stops tracking (the
 tenant goes idle, or the process is draining -- but see the 2026-09-23
 amendment: a process does NOT stop tracking an idle tenant) is left in
-place rather
-than actively deleted -- deleting it would require the same delete-grant
+place rather than
+actively deleted -- deleting it would require the same delete-grant
 reasoning ADR-0055 just narrowed, for no real benefit, since a stale
 snapshot is already excluded by staleness (§3) after `2 * R`, at most 20
 seconds by default. `crates/ravel-maintain`'s existing sweep machinery
@@ -366,7 +366,10 @@ note in the eventual docs, not a redesign of this ADR.
   future cleanup sweep, and Gateway's existing write grant for the
   snapshot writes themselves (an additive grant ADR-0055's landed policy
   templates will need updating to include -- filed as a follow-up on
-  landing, not blocking this ADR's approval).
+  landing, not blocking this ADR's approval). "Small" describes each
+  object, not the count: see the 2026-09-23 amendment at the end of this
+  ADR, which establishes that the count grows and that a shipped Gateway
+  deployment cannot reap any of it.
 - **Count-cap enforcement becomes a safe overestimate, stated as such**,
   rather than an exact fleet-wide cardinality -- consistent with this
   program's "exact semantics by default, approximation opt-in and
