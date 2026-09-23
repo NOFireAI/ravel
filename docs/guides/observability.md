@@ -757,14 +757,39 @@ Labels: `mode`.
 | `ravel_provisioning_shard_count_mismatch_total` | Provisioning checks that failed hard: an unreadable record, a decodable record whose generation history fails structural validation, or pre-ADR data a lower `shard_count` would hide. Alert on any increase; [Troubleshooting](operations/troubleshooting.md) gives its rule. |
 | `ravel_provisioning_shard_count_drift_total` | Validations where a decodable record with a structurally valid generation history had a recorded `shard_count` that differed from the live `--shards` default (a record that fails structural validation is counted by the mismatch counter above, never here). The drift is tolerated and routing uses the record's own generation history, so this is informational: a nonzero value is expected after lowering the global default, not a fault. |
 
-### Store reachability (`ravel_store_reachable`, `ravel_store_probe_failures_total`)
+### Store reachability (`ravel_store_reachable`, `ravel_store_probe_failures_total`, `ravel_store_probe_last_run_timestamp_seconds`)
 
-Labels: `mode`. Both samples come from the background store-reachability probe.
+Labels: `mode`. All three samples come from the background store-reachability
+probe (`store_probe::spawn`, ADR-0050 section 7).
 
 | Metric | Meaning |
 |---|---|
 | `ravel_store_reachable` | Gauge. 1 when the probe reports the store reachable, 0 after K consecutive failed probes. |
 | `ravel_store_probe_failures_total` | Every failed probe cycle, monotonic, incremented even below the readiness threshold. |
+| `ravel_store_probe_last_run_timestamp_seconds` | Gauge. Unix time the probe task last completed a cycle, set whether that cycle succeeded or failed, 0 if none has run yet in this process. |
+
+The first two gauges are written only while the probe task is running: the
+task is a single `tokio::spawn` (issue #1728) with no restart path and no
+`JoinHandle` observation, so if it dies silently, both freeze at their last
+values, `ravel_store_reachable` most often frozen at 1, and `/readyz` reads
+that stale value as healthy forever. `ravel_store_probe_last_run_timestamp_seconds`
+is the signal that catches this: its AGE, not its value, is what a dead probe
+task changes, because a *failing* probe still completes a cycle and still
+advances this gauge every `--store-probe-interval`.
+
+Alert on `time() - ravel_store_probe_last_run_timestamp_seconds > 132`. The
+threshold is derived, not a round number: the probe's default interval
+(`store_probe::DEFAULT_STORE_PROBE_INTERVAL`) is 30s, and `store_probe::spawn`
+sleeps a jittered interval (`fold::jittered`) that adds up to 10%, so the
+worst-case gap between two live cycles is `30 * 1.1 = 33` seconds. `132` is
+`store_probe::K` (4) times that 33s ceiling: within that window, a probe that
+was merely failing (not dead) would already have flipped
+`ravel_store_reachable` to 0 and fired the existing `RavelStoreUnreachable`
+rule, since K consecutive real cycles complete well inside it. An alert that
+only fires after this much longer window therefore isolates the case
+`RavelStoreUnreachable` cannot see: the task stopped running probes at all.
+A `for: 5m` hold on top absorbs a single delayed scrape without adding a
+second interval-derived term.
 
 ### Graceful shutdown (`ravel_shutdown_drain_overrun_total`)
 

@@ -233,6 +233,52 @@ async fn metrics_render_queued_flush_families_named_by_the_flag_help() {
     }
 }
 
+/// Issue #1728: the store-probe liveness gauge must reach a real HTTP scrape,
+/// not just the in-process atomic `store_probe::probe_last_run_unix_ns`
+/// reads directly, since an operator's monitoring only ever sees the rendered
+/// body. Exactly one series, with its `gauge` TYPE header, in every mode: the
+/// family is unconditional (ADR-0050 section 7 reachability is meaningful
+/// even in `Mode::Maintain`, which runs no ingest router).
+#[tokio::test]
+async fn metrics_store_probe_last_run_gauge_on_rendered_metrics() {
+    for (mode, mode_label) in [
+        (Mode::All, "all"),
+        (Mode::Gateway, "gateway"),
+        (Mode::Query, "query"),
+        (Mode::Maintain, "maintain"),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let client = reqwest::Client::new();
+
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        assert_eq!(
+            body.matches("# TYPE ravel_store_probe_last_run_timestamp_seconds gauge")
+                .count(),
+            1,
+            "mode {mode:?} must declare the store-probe last-run gauge exactly once:\n{body}"
+        );
+        assert_eq!(
+            body.matches(&format!(
+                "ravel_store_probe_last_run_timestamp_seconds{{mode=\"{mode_label}\"}} "
+            ))
+            .count(),
+            1,
+            "mode {mode:?} must render the store-probe last-run gauge exactly once:\n{body}"
+        );
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
 /// ADR-0873's three observability families on a live `/metrics` scrape.
 ///
 /// The per-carrier drop tally renders in every mode: its four carriers are
