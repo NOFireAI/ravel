@@ -779,15 +779,28 @@ HEAD instead of covering the whole family.
 
 Before/after, expressed as the operations.md IAM wildcards:
 
-- Deny-delete (all four roles): `t/*/catalog/*/*` → `t/*/catalog/*/HEAD`.
+- Deny-delete, **`maintain.json` only**: `t/*/catalog/*/*` →
+  `t/*/catalog/*/HEAD`. The other three templates keep the whole-family
+  deny. None of them grants a catalog delete, so their deny costs nothing
+  and is left standing as defence in depth; narrowing it everywhere would
+  widen the blast radius of a credential this change has no reason to
+  touch.
 - Maintain delete grant (`MaintainDelete` only): add `t/*/catalog/*/snap/*`
   and `t/*/catalog/*/idx/*`.
-- `MaintainList` gains the two catalog prefixes as `s3:prefix` values and
-  `MaintainRead` gains `t/*/catalog/*/HEAD`, without which the sweep is
-  refused at its `ListBucket` before it reaches a delete at all.
+- `MaintainList` gains the two catalog prefixes as `s3:prefix` values;
+  `MaintainRead` gains `t/*/catalog/*/HEAD` and `t/*/catalog/*/snap/*`.
+  Without the list prefixes the sweep is refused at its `ListBucket`
+  before it reaches a delete at all, and without the snapshot-part read
+  the reachability pass that decides which objects are unreferenced
+  aborts on its first part GET: `SnapshotReachability::ensure_part`
+  returns `MaintainError::Store` on anything that is not `NotFound`, so
+  an AccessDenied there fails the whole pass for that signal rather than
+  one object.
 
-Amended in place (§1 table Maintain row, §2, §3 deny list, and Consequences)
-for the same reason as the amendments above. ADR-0064's statements that
-catalog objects are deny-deleted are qualified in that ADR by a pointer here:
-its argument depends on `.cstat` objects being reachable for deletion, which
-this narrowing is what provides.
+Recorded as an appended amendment rather than rewritten into §1's role table,
+§2 and §3: the three statements above that assert `catalog/*` is undeletable
+carry an inline pointer to this section, so a reader meets the qualification
+where the claim is made, and the decision text keeps its original wording.
+ADR-0064's statements that catalog objects are deny-deleted carry the same
+pointer, since its erasure argument depends on `.cstat` objects being
+reachable for deletion, which this narrowing is what provides.

@@ -2753,20 +2753,47 @@ fn maintain_template_covers_every_catalog_sweep_call() {
         }
     }
 
-    // Tightness (read): every pattern that reaches a catalog HEAD key must
-    // reach no key outside the catalog HEAD keyspace. read_head_reference
-    // GETs HEAD only; it never reads a snap/ or idx/ object's contents.
+    // Reachability (read): the sweep reads TWO catalog shapes, not one.
+    // `read_head_reference` GETs HEAD, and `SnapshotReachability::ensure_part`
+    // (crates/ravel-maintain/src/reachability.rs) GETs each covering snapshot
+    // part named by that HEAD. The part GET's error arm returns
+    // `MaintainError::Store` on anything that is not `NotFound`, so an
+    // AccessDenied there aborts the whole pass for that signal rather than
+    // failing one object -- which is what a HEAD-only read grant produced.
     let head_witnesses: Vec<String> = ALL_SIGNALS
         .iter()
         .map(|signal| format!("t/{hash}/catalog/{}/HEAD", signal.key_prefix()))
         .collect();
+    let part_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|signal| {
+            format!(
+                "t/{hash}/catalog/{}/snap/0000000000000000.csnap",
+                signal.key_prefix()
+            )
+        })
+        .collect();
+    for witness in head_witnesses.iter().chain(part_witnesses.iter()) {
+        assert!(
+            gets.iter().any(|p| glob_matches(p, witness)),
+            "maintain: no GetObject Allow reaches {witness:?}. The sweep's \
+             reachability pass GETs the HEAD and then every snapshot part it \
+             names; a read grant covering only one of the two aborts the pass \
+             at the first part (#1847)"
+        );
+    }
+
+    // Tightness (read): a catalog read pattern may reach HEAD and snapshot
+    // parts, and nothing else. `idx/` objects are listed and deleted but
+    // never read, so a read pattern reaching one is over-granted.
+    let readable: Vec<&String> = head_witnesses.iter().chain(part_witnesses.iter()).collect();
     let outside_head: Vec<&String> = key_domain()
         .iter()
-        .filter(|k| !head_witnesses.contains(k))
+        .filter(|k| !readable.contains(k))
         .collect();
     assert!(
         !outside_head.is_empty(),
-        "the key domain models no key outside the catalog HEAD keyspace, so \
+        "the key domain models no key outside the catalog read keyspace, so \
          the tightness assertion below examines nothing"
     );
     // One pre-existing grant reaches a HEAD witness incidentally rather than
@@ -2800,16 +2827,18 @@ fn maintain_template_covers_every_catalog_sweep_call() {
          (#1847)"
     );
     for pattern in &catalog_gets {
-        let reaches_head = head_witnesses.iter().any(|w| glob_matches(pattern, w));
-        if !reaches_head {
+        let reaches_readable = readable.iter().any(|w| glob_matches(pattern, w.as_str()));
+        if !reaches_readable {
             continue;
         }
         for key in &outside_head {
             assert!(
                 !glob_matches(pattern, key),
                 "maintain: GetObject Allow pattern {pattern:?} reaches a \
-                 catalog HEAD key AND {key:?}. read_head_reference GETs HEAD \
-                 only; a pattern reaching more is over-granted (#1847)"
+                 catalog key the sweep reads AND {key:?}, which it never \
+                 reads. The pass GETs HEAD and the snapshot parts HEAD names, \
+                 and nothing else -- not idx/, not anything outside the \
+                 catalog keyspace (#1847)"
             );
         }
     }
@@ -6813,6 +6842,15 @@ const CATALOG_SUBJECT_VALUE_RETIRED: &[&str] = &[
     "hold no subject values",
     "disjoint from subject erasure by construction",
     "the only place a subject physically lives",
+    // The IAM half of the same claim. The catalog delete-deny was
+    // narrowed to `catalog/<signal>/HEAD` (#1847), so a doc asserting the
+    // shipped policy refuses the delete outright now states an
+    // open-ended erasure bound where the contract states `+R`. Two
+    // passages survived the first sweep for exactly this reason: the
+    // retired list covered the sweep half only.
+    "the shipped Maintain IAM policy the delete is denied outright",
+    "open-ended under the shipped Maintain IAM policy",
+    "which denies the maintenance role every delete under the catalog",
 ];
 
 #[test]

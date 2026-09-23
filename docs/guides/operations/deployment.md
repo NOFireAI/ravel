@@ -95,9 +95,10 @@ lock over the keyspace delays that delete, and the value persists until the
 fold reconciles that hour and then a further retention period. The maintenance
 IAM policy Ravel ships permits that delete, with its catalog deny scoped to
 `catalog/<signal>/HEAD`; a copy of that template predating the narrowing
-denies it outright and leaves the bound open-ended until it is re-applied. The four-step mechanism, the exact bound, the IAM
-ceiling and the HEAD-scoping advice are in the contract page's "Required
-bucket configuration" section, "A lock on the catalog family".
+denies it outright and leaves the bound open-ended until it is re-applied.
+The four-step mechanism, the exact bound, the IAM ceiling and the
+HEAD-scoping advice are in the contract page's "Required bucket
+configuration" section, "A lock on the catalog family".
 
 **One lifecycle rule is not optional for any bucket Ravel writes to.**
 Configure `AbortIncompleteMultipartUpload` with a cleanup period of seven days
