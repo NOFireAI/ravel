@@ -461,7 +461,8 @@ stays the documented, informationally-probed gap ADR-0042 already named.
   deletes from today — but nothing else.
 - **`sys/tenancy`, `sys/qualification`, `sys/gc`, `prov`, `catalog/*`, and
   the legal-hold shard of the audit prefix (`u/0000/**`) are undeletable by
-  any role's policy.** This closes the brick-the-deployment risk
+  any role's policy.** (`catalog/*` is narrowed to `catalog/*/HEAD` by the
+  2026-09-23 amendment below.) This closes the brick-the-deployment risk
   outright and removes the "roll back a control object via delete-then-
   recreate" class of attack against the new resharding
   and readiness machinery, without weakening anything sweep or retention
@@ -553,7 +554,8 @@ Before/after, expressed as the operations.md IAM wildcards:
 - Maintain delete grant (`MaintainDelete` only): add `t/*/u/*/0001/*`.
 
 This does not weaken the brick-the-deployment protection or the delete-deny asks: `sys/*`, `prov`,
-`catalog/*`, and the legal-hold shard remain undeletable by any role. It only
+`catalog/*` (narrowed to `catalog/*/HEAD` by the 2026-09-23 amendment below),
+and the legal-hold shard remain undeletable by any role. It only
 lets the one role that already owns every delete (Maintain) reclaim the
 query-audit activity log, which — unlike a legal hold or a control object — is
 append-only telemetry with a bounded lifetime, not a durability anchor. Amended
@@ -673,7 +675,8 @@ Net effect on §1's role table: Admin's write column gains `t/*/*/del/*`
 Maintain's delete column (`MaintainDelete`) gains `t/*/*/del/*.dreq`; and §3's
 `DenyDeleteProtected` deny list gains `t/*/*/del/*.done` for every role. This
 does not weaken the brick-the-deployment protection or any prior delete-deny ask: `sys/*`, `prov`,
-`catalog/*`, the legal-hold shard, and now `.done` completion markers remain
+`catalog/*` (narrowed to `catalog/*/HEAD` by the 2026-09-23 amendment below),
+the legal-hold shard, and now `.done` completion markers remain
 undeletable by any role, and the one new deletable object (`.dreq`) is deleted
 only by the one role that already owns every delete, only after its own
 completion record and the protection horizon guarantee it is safe. The
@@ -731,3 +734,60 @@ deployed policy predates this change. The shipped `deploy/iam/admin.json`
 `tests/iam_templates.rs` guard are updated in the same change, and
 `docs/object-store-contract.md`'s qualification section now records that the
 shipped Admin template satisfies the delete-probe requirement.
+
+## Amendment (2026-09-23): the catalog delete-deny narrows to `catalog/*/HEAD`
+
+§3's `DenyDeleteProtected` denied every role delete under `t/*/catalog/*/*`,
+and the decision text above states `catalog/*` as undeletable by any role.
+That is narrowed here to `t/*/catalog/*/HEAD`, with `MaintainDelete` gaining
+`t/*/catalog/*/snap/*` and `t/*/catalog/*/idx/*`.
+
+The original ask was about bricking a deployment: a deleted control object
+that cannot be recreated, or a roll-back-by-delete-then-recreate attack on a
+durability anchor. `catalog/<signal>/HEAD` is that anchor, and it stays
+undeletable by every role including Maintain. The objects being opened up are
+not anchors: `snap/` and `idx/` are fold outputs that a HEAD reference either
+names or does not, and `sweep_unreferenced_catalog_objects`
+(`crates/ravel-maintain/src/sweep.rs`) exists precisely to delete the ones no
+HEAD names. Deleting an object HEAD does not reference changes no query
+result; deleting HEAD itself is what the deny still prevents.
+
+Two things forced the narrowing rather than merely permitting it:
+
+- **The sweep was unreachable.** IAM is default-deny and the deny beat the
+  grant, so every catalog pass was refused at its first delete. The garbage
+  the sweep exists to reclaim accumulated without bound.
+- **ADR-0064 erasure could not complete.** An unreferenced per-part
+  column-statistics object (`.cstat`) can hold a declared `Str` or `Bytes`
+  column's exact min, max and distinct-value dictionary, which for an erased
+  subject is that subject's own value held verbatim. While that object was
+  undeletable, selective subject erasure left the value in place, so the
+  deny defeated a guarantee this ADR's sibling makes.
+
+Residual risk, stated rather than elided: a compromised Maintain credential
+can now delete every `snap/` and `idx/` object under every tenant. HEAD
+survives, pointing at objects that are gone, so queries for the affected
+`(tenant, signal)` fail rather than return wrong answers. Recovery is a
+fold: rebuilding from no HEAD recomputes and re-PUTs every part, and a
+non-tail span keys on its stable `watermark_hour`, so the recomputed key is
+byte-identical to the object that was deleted (`docs/catalog-and-mvcc.md`).
+That recovery reads the commit records, which the same credential can
+already delete today under `t/*/*/c/*`. The blast radius is therefore
+bounded by a delete grant the role already had, not widened by this change.
+That is the trade accepted here, and it is the reason the narrowing stops at
+HEAD instead of covering the whole family.
+
+Before/after, expressed as the operations.md IAM wildcards:
+
+- Deny-delete (all four roles): `t/*/catalog/*/*` → `t/*/catalog/*/HEAD`.
+- Maintain delete grant (`MaintainDelete` only): add `t/*/catalog/*/snap/*`
+  and `t/*/catalog/*/idx/*`.
+- `MaintainList` gains the two catalog prefixes as `s3:prefix` values and
+  `MaintainRead` gains `t/*/catalog/*/HEAD`, without which the sweep is
+  refused at its `ListBucket` before it reaches a delete at all.
+
+Amended in place (§1 table Maintain row, §2, §3 deny list, and Consequences)
+for the same reason as the amendments above. ADR-0064's statements that
+catalog objects are deny-deleted are qualified in that ADR by a pointer here:
+its argument depends on `.cstat` objects being reachable for deletion, which
+this narrowing is what provides.
