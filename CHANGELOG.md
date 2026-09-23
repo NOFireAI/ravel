@@ -530,6 +530,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ravel-cli gc-config set --max-flush-lifetime`'s help text and generated
+  reference page now state the floor the flag is refused below** (issue
+  #1961). `set_gc_config` has always rejected a `max_flush_lifetime` below the
+  ingest pipeline's own default `max_flush_lifetime`
+  (`ingest_max_flush_lifetime_floor_ns`, read from
+  `ravel_ingest::IngestConfig::default()` rather than duplicated as a
+  constant, so the validator and the docs cannot state two different
+  numbers), but neither the flag's clap doc comment nor
+  `docs/reference/ravel-cli-flags.md` said so: an operator who supplied a
+  shorter duration got a refusal with no indication of what value would have
+  worked. The doc comment now names the floor and where it comes from, and
+  the reference page is regenerated from it.
+
 - **The shipped IAM templates now grant every permission the selective-erasure
   lifecycle needs** (issue #1849). ADR-0064 section 6 gives Maintain read on
   `del/**` and delete on `del/*.dreq`, but `deploy/iam/maintain.json` named no
