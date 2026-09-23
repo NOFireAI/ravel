@@ -1,6 +1,6 @@
 //! `deploy/prometheus/ravel.rules.yaml` ships alert rules an operator loads
-//! verbatim, and `deploy/grafana/dashboards/ravel.json` ships the dashboard
-//! the same operator imports. Every Ravel metric name in either must name a
+//! verbatim, and `deploy/grafana/dashboards-standalone/ravel.json` ships the
+//! dashboard the same operator imports. Every Ravel metric name in either must name a
 //! series Ravel really renders, or the rule matches nothing and the condition
 //! it covers pages nobody, and the panel draws an empty graph that reads as a
 //! quiet subsystem, both with no error at scrape time.
@@ -98,7 +98,7 @@ const EXPECTED_ALERTS_WITHOUT_FOR: usize = 15;
 /// collector's host CPU, which is not a Ravel family at all.
 const DASHBOARD_FILE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../deploy/grafana/dashboards/ravel.json"
+    "/../../deploy/grafana/dashboards-standalone/ravel.json"
 );
 
 /// The dashboard's shape, counted off the parsed JSON, and its distinct
@@ -1234,5 +1234,41 @@ fn the_extractor_reads_selectors_and_not_label_values_or_variables() {
             "ravel_store_ok_total".to_string(),
         ]),
         "only the two selectors are metric names; the job label value and the pod variable are not"
+    );
+}
+
+/// The operator dashboard must not sit in the directory the quickstart
+/// auto-provisions.
+///
+/// `deploy/docker-compose/ravel.yml` mounts the whole
+/// `deploy/grafana/dashboards` directory into the quickstart's Grafana, and
+/// `deploy/grafana/provisioning/dashboards/ravel.yaml` is a `type: file`
+/// provider over that path, so every JSON there is loaded. The quickstart
+/// scrapes no Ravel process -- `deploy/otel/collector-config.yaml` declares
+/// only the `hostmetrics` receiver -- so the only datasource that dashboard
+/// can reach holds no `ravel_` series and all of its panels draw nothing.
+///
+/// A blank dashboard is the silent failure this file's other tests exist to
+/// prevent, so the placement is pinned rather than left to a README sentence.
+#[test]
+fn the_operator_dashboard_is_not_auto_provisioned_into_the_quickstart() {
+    let provisioned = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/grafana/dashboards"
+    );
+    assert!(
+        !DASHBOARD_FILE.starts_with(provisioned),
+        "the operator dashboard {DASHBOARD_FILE} sits under {provisioned}, which \
+         deploy/docker-compose/ravel.yml mounts and \
+         deploy/grafana/provisioning/dashboards/ravel.yaml provisions as a \
+         `type: file` provider. The quickstart scrapes no ravel_ series, so every \
+         panel would draw nothing there. Keep it outside that directory, or give \
+         the quickstart a scrape path for ravel-server's /metrics first"
+    );
+    assert!(
+        std::path::Path::new(DASHBOARD_FILE).exists(),
+        "the operator dashboard must still exist at {DASHBOARD_FILE}; this test \
+         is about WHERE it lives, and a missing file would pass the check above \
+         while shipping no dashboard at all"
     );
 }
