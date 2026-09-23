@@ -269,6 +269,11 @@ absorb reconciliation lag. An operator who needs a tighter bound can
 configure a shorter `R`; this trades reconciliation request volume for a
 smaller overshoot window, a knob this ADR exposes rather than hard-codes.
 
+(This sizing is expressed purely in fleet size `N` and omits the per-cycle
+`2 * T * S` term the loop actually pays; see the 2026-09-23 amendment at the
+end of this ADR before shortening `R`, since halving it doubles a cost this
+section never states.)
+
 ### 5. Snapshot lifecycle: no new sweep needed
 
 A process's own snapshot for a (tenant, signal) it stops tracking (the
@@ -392,7 +397,10 @@ before landing.
 
 §1's cost argument rests on "most processes see most tenants never", and §5
 assumes a process stops tracking a `(tenant, signal)` when the tenant goes
-idle. **ADR-0069 decided the opposite**, and the code implements ADR-0069.
+idle. **ADR-0069 decided against §5's assumption directly**, and left §1's
+premise standing on nothing: it excludes admission-controller state from
+eviction, so the map a process holds does not shrink when a tenant goes
+idle. The code implements ADR-0069.
 
 ADR-0069 excludes admission-controller state from its eviction scheme, on the
 grounds that its active-series and stream counts are correctness-bearing caps
@@ -418,7 +426,15 @@ escape in the design fails to bound it:
 - the PUT per `(tenant, signal)` is unconditional, with no staleness check
   before it;
 - there is no cached listing, no deadline, no per-cycle budget and no
-  concurrency.
+  concurrency;
+- the one bound the code does implement does not apply on a shipped
+  deployment. The #1679 reap (`crates/ravel-ingest/src/reconcile.rs`)
+  bounds the LIST by deleting stale sibling snapshots, but this loop runs
+  in `Mode::All | Mode::Gateway`, and Gateway holds no delete grant:
+  §1's role table gives it `Delete: none` and `deploy/iam/gateway.json`
+  carries no `s3:DeleteObject` Allow. Every reap delete therefore returns
+  AccessDenied and is logged rather than reaped. That grant gap is
+  reported separately; it is not fixed here.
 
 The tenant map is in-memory, so `T` resets on restart. The degraded state is
 therefore a sawtooth across process lifetimes rather than a permanent
