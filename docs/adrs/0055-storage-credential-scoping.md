@@ -875,8 +875,8 @@ that `catalog/*` is undeletable:
 The places are written as a list rather than a count because the count was
 wrong three times while it was a number: the claim is phrased as a property, a
 disjointness argument, a deny list and a diagram node, so a search for the
-wording just corrected finds none of the others. A reader meets the qualification where the claim
-is made, and the decision text keeps its original wording.
+wording just corrected finds none of the others. A reader meets the qualification
+where the claim is made, and the decision text keeps its original wording.
 ADR-0064's statements that catalog objects are deny-deleted carry the same
 pointer, since its erasure argument depends on `.cstat` objects being
 reachable for deletion, which this narrowing is what provides.
