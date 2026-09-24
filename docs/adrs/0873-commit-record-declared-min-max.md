@@ -371,7 +371,10 @@ future clause is placed by argument, not by analogy):
   declared types for `.cstat` (ADR-0850). It is not a property of the
   statistic — a `.cstat` `STR` extremum is a perfectly coherent exact
   statistic that ADR-0850 ships and `declared_min_max_all` answers from
-  today — so applying it carrier-independently is itself a defect.
+  today — so applying it carrier-independently is itself a defect. The
+  "from today" half is withdrawn by the .cstat carrier amendment below:
+  the read side declines a declared `STR` column before either carrier is
+  examined, so no reader ever reaches that entry.
 
 Revision history, kept because both mis-scoping directions have now
 occurred. The first revision of this amendment under-scoped the
@@ -540,7 +543,9 @@ coverage, and `partition_statistics` still reports `Precision::Exact`
 min/max for that column with zero increments on the defect metric (same
 case once more with `BYTES`). The assertion that fails if the vocabulary
 clause is ever applied carrier-independently again is that entry's
-presence and the `Exact` precision.
+presence and the `Exact` precision. The `STR` half of that positive case
+is withdrawn with the claim it rests on (the .cstat carrier amendment
+below); the `BYTES` half stands.
 
 The `.cstat`
 lane adds the redundancy case of clause 4: an entry with `non_null_count +
@@ -591,6 +596,10 @@ Three further cases pin this revision's measured facts, one each:
 
 ### 3. Capture at write time
 
+Both producers described here fold the writer's per-block NumStats. Neither
+shipped that way, and the record-fold amendment below records the direct
+record fold as the decision instead.
+
 - **L0 flush (ravel-ingest, `log_shard.rs`).** The flush path learns the
   tenant's declared typed columns through the same durable-config
   bounded-staleness read that already supplies indexed fields to the writer
@@ -614,7 +623,9 @@ Three further cases pin this revision's measured facts, one each:
   copy an input's stamp. A copied stamp could carry an erased row's value as
   the recorded extremum — a statistics answer that resurrects erased data.
   A test pins this: erase the row holding the column's maximum, assert the
-  rewritten part's stamp shrinks.
+  rewritten part's stamp shrinks. This rule is rejected: by the force-empty
+  amendment below, a rewrite part carries no stamp at all and the test it
+  asks for is withdrawn with it.
 - **Metrics and spans signals** never stamp the field: declared typed
   columns are a logs concept (ADR-0090). The field is simply absent, which
   is the legal default forever.
@@ -804,9 +815,9 @@ order; the wide-schema case (ADR-0100, dozens of declared I64 columns) is
 the sizing worst case and belongs in the implementation's pre-registered
 figures.
 
-## Amendment: rewrite parts are written and read unstamped; the recompute is a rejected refinement
+### Amendment: rewrite parts are written and read unstamped; the recompute is a rejected refinement
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="3. Capture at write time|Consequences" pointer="force-empty amendment" -->
 
 2026-09-03.
 
@@ -889,7 +900,9 @@ one segment resolve through the same content hash, or "both carriers for
 one segment" has no meaning.
 
 Per `(content_hash, name, declared_type)` the reader resolves exactly one
-value, by cases. Only entries that passed the statistics validity
+value, by cases. Only the stamp side joins by content hash: the shipped
+`.cstat` side joins by the fold's own entry identity, as the .cstat
+carrier amendment below states. Only entries that passed the statistics validity
 predicate participate at all: an invalid entry is absent from the union
 (no coverage), never one side of a conflict.
 
@@ -900,6 +913,8 @@ predicate participate at all: an invalid entry is absent from the union
   union is empty by construction, coverage is `.cstat`'s or nothing, and
   the ADR-0850 read path for string extrema continues unchanged — the
   union degenerating to one carrier is not an error and not a conflict.
+  That degenerate case is `BYTES` only now: for `STR` there is no union at
+  all, by the .cstat carrier amendment below.
 - **Both:** the triples must be equal — min, max, and null_count each
   compared for exact equality (for the allowlisted types value equality
   and bit-identity coincide; a future F64 amendment must say which, and
@@ -1158,7 +1173,8 @@ flowchart TD
   carrier for every touched sealed segment at once, which is what makes
   it visible without a slow-query hunt.
 - **Tests the implementation owes** (prove-the-test discipline): the
-  erasure-rewrite recompute rule (erase the max, stamp must shrink); the
+  erasure-rewrite recompute rule (erase the max, stamp must shrink), which
+  the force-empty amendment below withdraws along with the rule itself; the
   statistics validity predicate of decision 2, one decode case per
   structural clause
   **per carrier** (one-sided min/max, `min > max`,
@@ -1230,7 +1246,7 @@ flowchart TD
 
 ## Amendment: the .cstat carrier joins by entry identity and STR extrema stay .cstat-only
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="2. Eligibility: an explicit allowlist, {I64, BOOL}, gated fail-closed|4. Read side: union of carriers, behind the existing gate" pointer=".cstat carrier amendment" -->
 
 Amended 2026-09-03. Two statements above do not describe the shipped reader.
 Decision 4 says both carriers of the union resolve through one segment
@@ -1274,7 +1290,7 @@ only; the `STR` case is not a degenerate union but no union at all.
 
 ## Amendment 2026-09-03: the stamp's basis is the merged attribute view
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="decision 3's basis, the merged view the writer's NumStats already count, is restated here rather than changed; what this records is a producer that had drifted off it and the fail-closed rule for an undecodable stream blob, neither of which retires wording above" -->
 
 Issue #1057. Decision 3 describes the L0 and L1 folds in terms of the
 writer's per-block NumStats, which count merged-view resolution per row
@@ -1303,7 +1319,7 @@ view, which is the fail-closed reading of decision 3's staleness rule.
 
 ## Amendment 2026-09-07: the stamp is a direct record fold, not a fold over the writer's per-block NumStats
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="3. Capture at write time" pointer="record-fold amendment" -->
 
 Issue #1168. Decision 3 ("Capture at write time") routes both stamp
 producers through `RlogWriter`'s per-block NumStats: the L0 flush folds the
