@@ -254,7 +254,7 @@ protected by that key.
 
 ## Amendment (2026-09-05): startup warm-up measures "most recent" from each tenant's latest ingest hour, not wall-clock now
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="no section above describes the startup warm-up pass; this records how cache_warm.rs picks its window and retires no earlier wording" -->
 
 The startup cache warm-up pass (`services/ravel-server/src/cache_warm.rs`)
 resolves each tenant's most recent parts to prime the RAM/disk tiers
