@@ -492,7 +492,8 @@ pub struct Catalog {
     /// Ephemeral, process-local, correctness-free: it changes only how many
     /// round trips overlap, never which segments a resolve returns.
     request_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Bounds what one shard-hour commit prefix keeps in flight, sized from
+    /// Bounds what one key prefix (a request's parent path) keeps in flight,
+    /// sized from
     /// `CatalogConfig::resolve_prefix_concurrency` (ADR-1733 decision 1). A
     /// prefix's semaphore is created on the first request that needs it and
     /// removed once no request holds or waits on it, so this holds one entry
@@ -619,15 +620,30 @@ impl Drop for RequestPermits<'_> {
             return;
         };
         let mut live = self.catalog.prefix_semaphores.lock();
-        // Two references left (the map's and this guard's) means no other
-        // request holds or waits on this prefix, so the semaphore has nothing
-        // left to bound and the entry can go. A request that is about to wait
-        // on this prefix cannot be missed here: it takes its own reference in
-        // `Catalog::prefix_semaphore` under this same lock, and holds it in
-        // its own guard from before it starts waiting until after it is done.
-        if let Some(mapped) = live.get(&prefix)
-            && Arc::ptr_eq(mapped, &semaphore)
-            && Arc::strong_count(&semaphore) == 2
+        // This guard's own reference is dropped HERE, under the map lock, and
+        // the count is read afterwards. Dropping it after the lock is released
+        // instead would let two guards on one prefix each see the other's
+        // reference still alive, each decline to remove, and leave the entry
+        // resident with nothing that would ever remove it. Under the lock the
+        // two drops are serialized, so the later one always reads a count that
+        // the earlier one has already left, and the last guard out removes the
+        // entry. Every other reference a request holds (the owned prefix
+        // permit, or the future still waiting for one) is gone before its
+        // guard's, so a count of one really is the map's alone.
+        let is_ours = live
+            .get(&prefix)
+            .is_some_and(|mapped| Arc::ptr_eq(mapped, &semaphore));
+        drop(semaphore);
+        // One reference left (the map's) means no other request holds or waits
+        // on this prefix, so the semaphore has nothing left to bound. A request
+        // that is about to wait on this prefix cannot be missed here: it takes
+        // its own reference in `Catalog::prefix_semaphore` under this same
+        // lock, and holds it in its own guard from before it starts waiting
+        // until after it is done.
+        if is_ours
+            && live
+                .get(&prefix)
+                .is_some_and(|mapped| Arc::strong_count(mapped) == 1)
         {
             live.remove(&prefix);
         }
@@ -901,12 +917,33 @@ impl Catalog {
         self.prefix_semaphores.lock().len()
     }
 
+    /// How many requests currently hold or wait on `prefix`'s permit, or
+    /// `None` when that prefix has no semaphore.
+    ///
+    /// A request that is neither entering nor leaving holds exactly two
+    /// references to its prefix's semaphore: its [`RequestPermits`] guard's,
+    /// and the one carried by either its owned permit or the `acquire_owned`
+    /// future still waiting for it. Beside the map's own reference that makes
+    /// the strong count `1 + 2n`, which is how a test tells "one holder and
+    /// one waiter" from "one holder" without reaching into the store.
+    #[cfg(test)]
+    pub(crate) fn prefix_requests_in_flight(&self, prefix: &str) -> Option<usize> {
+        self.prefix_semaphores
+            .lock()
+            .get(prefix)
+            .map(|semaphore| (Arc::strong_count(semaphore) - 1) / 2)
+    }
+
     /// This prefix's semaphore, created at
     /// `CatalogConfig::resolve_prefix_concurrency` permits if it has none.
     ///
-    /// Every clone of the returned `Arc` is made here, under the map lock,
-    /// which is what lets [`RequestPermits::drop`] read the strong count as
-    /// "is anyone else holding or waiting on this prefix".
+    /// The map's own reference and each guard's are made here, under the map
+    /// lock. A request makes one further clone outside it, in
+    /// [`Catalog::acquire_request_permits`], from its guard's reference and
+    /// for the permit or the wait; that clone is always released before the
+    /// guard it was made from. That is what lets [`RequestPermits::drop`],
+    /// which releases the guard's reference under this same lock, read the
+    /// strong count as "is anyone else holding or waiting on this prefix".
     fn prefix_semaphore(&self, prefix: &str) -> Arc<tokio::sync::Semaphore> {
         let mut live = self.prefix_semaphores.lock();
         if let Some(existing) = live.get(prefix) {
@@ -5991,8 +6028,8 @@ mod tests {
     /// (restore `request_key_prefix` to a segment walk returning `None` for
     /// anything that is not `t/<hash>/<signal>/c/<shard>/<hour>/`), and
     /// snapshot parts take no prefix permit at all: only the ceiling holds
-    /// them back, and the first assertion fails with a peak in the hundreds
-    /// (255 observed) against the 128 expected.
+    /// them back, and the first assertion fails with a peak far above the 128
+    /// expected, bounded only by the 1,024 ceiling and the 320 parts.
     #[tokio::test]
     async fn snapshot_part_fan_out_is_held_to_the_per_prefix_bound() {
         assert_folded_snapshot_fan_out_peaks_at(
@@ -6202,7 +6239,8 @@ mod tests {
     /// ADR-1733 decision 1: a zero `resolve_prefix_concurrency` is rejected
     /// at `Catalog::new` with a typed error, for the reason a zero ceiling
     /// is: a zero-permit prefix semaphore would deadlock every request that
-    /// lands under a shard-hour commit prefix.
+    /// lands under a key prefix, which is every request with a separator in
+    /// its key.
     ///
     /// FLIP: delete the `resolve_prefix_concurrency == 0` block in
     /// `Catalog::new` and this construction returns `Ok`.
@@ -6260,7 +6298,11 @@ mod tests {
             Some("t/aabb/catalog/m/idx/"),
             "postings and column stats share their own prefix"
         );
-        assert_eq!(request_key_prefix("t/aabb/m/head"), Some("t/aabb/m/"));
+        assert_eq!(
+            request_key_prefix("t/aabb/catalog/m/HEAD"),
+            Some("t/aabb/catalog/m/"),
+            "a HEAD is keyed by its signal's catalog directory"
+        );
         assert_eq!(request_key_prefix("t/aabb/m/c/0000"), Some("t/aabb/m/c/"));
         assert_eq!(request_key_prefix("head"), None, "no separator, no prefix");
         assert_eq!(request_key_prefix(""), None);
@@ -6406,12 +6448,183 @@ mod tests {
         for id in gate.held() {
             gate.release(id);
         }
-        let _ = task_a.await.expect("join A");
+        // A's key was never written, so its GET reaches the store and comes
+        // back `NotFound`. Asserting the outcome keeps the release path
+        // honest: a GET that never ran (or failed on a permit) would leave
+        // the same empty map as a GET that ran and found nothing.
+        let result_a = task_a.await.expect("join A");
+        assert!(
+            matches!(result_a, Err(StoreError::NotFound)),
+            "A's GET runs once released and reports the absent object, got {result_a:?}"
+        );
         assert_eq!(
             catalog.prefix_semaphores_live(),
             0,
             "no prefix semaphore outlives the requests that created it"
         );
+    }
+
+    /// A request cancelled while it waits for its PREFIX permit must also run
+    /// the idle-prefix cleanup. The test above covers a future parked on the
+    /// process ceiling, which is the other of the two `.await`s in
+    /// `Catalog::acquire_request_permits`; this one enters the prefix wait,
+    /// which no other test reaches.
+    ///
+    /// One prefix under a per-prefix bound of one: A's commit GET is held
+    /// inside the store and holds that prefix's only permit, so B, on the same
+    /// prefix, parks on the prefix semaphore rather than on the ceiling (which
+    /// is the default 128 and has 127 permits free). The in-flight count
+    /// before the abort is what pins B as parked THERE.
+    ///
+    /// Scope note: the `live == 0` assertion at the end cannot fail on its
+    /// own, because A shares B's prefix and A's own drop removes the entry
+    /// whatever B did. What this test pins is the prefix-wait state and that
+    /// leaving it drops both of B's references; the removal itself is pinned
+    /// by the two tests above.
+    #[tokio::test]
+    async fn a_request_cancelled_waiting_on_its_prefix_permit_releases_it() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    resolve_prefix_concurrency: 1,
+                    ..config(1)
+                },
+            )
+            .expect("catalog"),
+        );
+
+        let prefix = "t/aaaaaaaaaaaaaaaa/m/c/0000/2026091612/";
+        let key_a = "t/aaaaaaaaaaaaaaaa/m/c/0000/2026091612/000000000001";
+        let key_b = "t/aaaaaaaaaaaaaaaa/m/c/0000/2026091612/000000000002";
+
+        let cat_a = Arc::clone(&catalog);
+        let task_a = tokio::spawn(async move {
+            let accounting = QueryAccounting::new();
+            cat_a.guarded_get(key_a, GetRange::Full, &accounting).await
+        });
+        wait_until_held_bounded(&gate, 1).await;
+        assert_eq!(
+            catalog.prefix_requests_in_flight(prefix),
+            Some(1),
+            "A alone holds the prefix's only permit while its GET is held"
+        );
+
+        let cat_b = Arc::clone(&catalog);
+        let task_b = tokio::spawn(async move {
+            let accounting = QueryAccounting::new();
+            cat_b.guarded_get(key_b, GetRange::Full, &accounting).await
+        });
+        wait_until_prefix_requests(&catalog, prefix, 2).await;
+        assert_eq!(
+            gate.held().len(),
+            1,
+            "B is parked on the prefix permit, so its GET has not reached the store"
+        );
+
+        task_b.abort();
+        assert!(
+            task_b
+                .await
+                .expect_err("B was aborted while waiting on the prefix permit")
+                .is_cancelled()
+        );
+        assert_eq!(
+            catalog.prefix_requests_in_flight(prefix),
+            Some(1),
+            "the cancelled waiter drops both its references, leaving only A's"
+        );
+
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let result_a = task_a.await.expect("join A");
+        assert!(
+            matches!(result_a, Err(StoreError::NotFound)),
+            "A's GET runs once released and reports the absent object, got {result_a:?}"
+        );
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            0,
+            "no prefix semaphore outlives the requests that created it"
+        );
+    }
+
+    /// Waits until `prefix` has exactly `n` requests in flight, bounded the
+    /// same way [`wait_until_prefix_semaphores`] is. Panics naming the
+    /// observed count on timeout.
+    async fn wait_until_prefix_requests(catalog: &Catalog, prefix: &str, n: usize) {
+        let reached = async {
+            while catalog.prefix_requests_in_flight(prefix) != Some(n) {
+                tokio::task::yield_now().await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .is_err()
+        {
+            panic!(
+                "{:?} requests in flight on {prefix}, expected {n} within 5s",
+                catalog.prefix_requests_in_flight(prefix)
+            );
+        }
+    }
+
+    /// ADR-1733 decision 1: two requests leaving one prefix at the same time
+    /// must leave no entry behind. `RequestPermits::drop` decides by reference
+    /// count, so it releases its OWN reference under the map lock and reads
+    /// the count afterwards. Reading the count first instead lets each of two
+    /// concurrent droppers see the other's reference still alive, so each
+    /// declines to remove and the entry stays resident with nothing left that
+    /// would ever remove it.
+    ///
+    /// FLIP: in `RequestPermits::drop`, read `Arc::strong_count(&semaphore)
+    /// == 2` inside the `if` and release the lock before `drop(semaphore)`
+    /// (the ordering this replaced), AND widen the window between the two
+    /// with a `std::thread::yield_now()`: this then fails on round 0 with 1
+    /// prefix semaphore live and 0 requests in flight, which is the leaked
+    /// entry. The revert alone does not fail it in practice: the window
+    /// between releasing the lock and releasing the reference is a couple of
+    /// instructions, and the contender is parked on the mutex, so the losing
+    /// interleaving is rare enough that 80,000 drops did not hit it. With the
+    /// ordering below, the same widened experiment still passes, because the
+    /// two reference releases are serialized by the lock rather than racing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_drops_on_one_prefix_leave_nothing_behind() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Arc::new(Catalog::new(store, config(1)).expect("catalog"));
+        // One prefix, and a per-prefix bound wide enough that every request
+        // holds a permit at once: the point is the drop, not the wait.
+        let key = "t/aabb/catalog/m/snap/000100.abcdef0123456789.csnap";
+        let prefix = "t/aabb/catalog/m/snap/";
+        let droppers = 16;
+        assert!(config(1).resolve_prefix_concurrency >= droppers);
+
+        for round in 0..500 {
+            let barrier = Arc::new(tokio::sync::Barrier::new(droppers));
+            let tasks: Vec<_> = (0..droppers)
+                .map(|_| {
+                    let catalog = Arc::clone(&catalog);
+                    let barrier = Arc::clone(&barrier);
+                    tokio::spawn(async move {
+                        let permits = catalog.acquire_request_permits(key).await.expect("permits");
+                        barrier.wait().await;
+                        drop(permits);
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.expect("join dropper");
+            }
+            assert_eq!(
+                catalog.prefix_semaphores_live(),
+                0,
+                "round {round}: {droppers} concurrent drops left {:?} requests on {prefix}",
+                catalog.prefix_requests_in_flight(prefix)
+            );
+        }
     }
 
     /// Issue #1238: `resolve_get_concurrency` exactly at
