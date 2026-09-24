@@ -205,7 +205,10 @@ One operator knob, `--logs-fetch-policy`, new field
 `EngineConfig::logs_fetch_policy`, default **`cost-based`**. It is an
 intent layer that resolves, at startup, to the single quantity the fetch
 layer already runs on (`BlockRangeFetcher::request_cost_bytes`,
-`log_fetcher.rs:2831`), plus one new bound:
+`log_fetcher.rs:2831`), plus one new bound. The three named here are no
+longer the whole set: the latency-first amendment below adds a fourth,
+`latency-first`, for deployments where cold wall-clock outweighs the
+request count.
 
 - **`request-minimal`**: resolve the exchange rate to `u64::MAX`
   (saturating arithmetic already in place, `log_fetcher.rs:2976-2978`).
@@ -632,7 +635,7 @@ ravel-logseg by nothing.
 
 ## Amendment 2026-09-06 (issue #1196): a named latency-first policy
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="2. The fetch policy: `request-minimal \| byte-minimal \| cost-based`" pointer="latency-first amendment" -->
 
 996-9's reference-box cold run (#1185, 42 statements, true cold) measured
 `cost-based` against `byte-minimal` at `--store-get-concurrency=256`:
