@@ -22,6 +22,8 @@ use ravel_commit::keys::{
     erasure_request_key, l1_part_key, maint_cursor_key, retention_tombstone_key,
     rewrite_record_key,
 };
+use ravel_fleet::query_workers::query_worker_key;
+use ravel_fleet::worker_set::heartbeat_key;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
@@ -198,15 +200,37 @@ fn quarantine_witness_keys() -> Vec<String> {
 /// about `t/**` tenant data and must keep reading `representative_keys` alone).
 /// Every one carries a `/`, so a pattern such as `*/*` still matches all of
 /// them and is still vacuous.
-const NON_TENANT_WITNESS_KEYS: [&str; 7] = [
+const NON_TENANT_WITNESS_KEYS: [&str; 5] = [
     "sys/tenancy",
     "sys/qualification",
     "sys/gc",
     "sys/qualify/run-0/probe",
-    "sys/maintain/workers/worker-0",
-    "sys/query/workers/worker-0",
     "admission/query/query-0",
 ];
+
+/// The process id every fleet witness key below is built for. Any UUID works;
+/// what matters is that the key is the constructor's output and not a literal.
+const WITNESS_PROCESS_ID: u128 = 7;
+
+/// The two fleet heartbeat keys, built by the constructors the heartbeat
+/// writers and reapers themselves call: `heartbeat_key` for
+/// `sys/maintain/workers/<process_id>` (`crates/ravel-fleet/src/worker_set.rs`,
+/// ADR-0065 decision 1) and `query_worker_key` for
+/// `sys/query/workers/<process_id>` (`crates/ravel-fleet/src/query_workers.rs`,
+/// ADR-0071).
+///
+/// These were literals in `NON_TENANT_WITNESS_KEYS` until issue #1975. A
+/// literal is not evidence about the key a reaper deletes: it agrees with a
+/// pattern written against the same literal whether or not the code still
+/// builds that shape. `ravel-fleet` does not depend on `ravel-commit`, so
+/// taking it as a dev-dependency here is acyclic and costs nothing at runtime.
+fn fleet_witness_keys() -> Vec<String> {
+    let process_id = Uuid::from_u128(WITNESS_PROCESS_ID);
+    vec![
+        heartbeat_key(&process_id),
+        query_worker_key(&process_id.to_string()),
+    ]
+}
 
 /// One literal key per TENANT-ROUTED keyspace the templates name that
 /// `ravel-commit` has no key constructor for, so `representative_keys` produces
@@ -264,6 +288,7 @@ fn key_domain() -> &'static [String] {
     DOMAIN.get_or_init(|| {
         let mut keys = representative_keys();
         keys.extend(NON_TENANT_WITNESS_KEYS.iter().map(|k| (*k).to_string()));
+        keys.extend(fleet_witness_keys());
         keys.extend(constructor_free_tenant_witness_keys());
         keys.extend(quarantine_witness_keys());
         keys
@@ -1929,6 +1954,21 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // object, since the copy reads the LIVE key (already covered by
     // t/*/*/l0/*) and no restore path exists in the code. Asserted call by
     // call by maintain_template_covers_every_quarantine_call.
+    //
+    // sys/maintain/workers/* appears on the list and delete axes, and is
+    // reached on get and put by the wider sys/maintain/* the memo snapshots
+    // and the ADR-1029 compaction claims share. The ADR-0065 heartbeat
+    // lifecycle touches it on all four: write_heartbeat PUTs this process's
+    // own key, live_set_read LISTs the prefix and GETs each in-window
+    // sibling, and reap_keys DELETEs each key past the reap horizon (all in
+    // crates/ravel-fleet/src/worker_set.rs, driven from
+    // services/ravel-server/src/maintain.rs). The delete pattern is narrower
+    // than sys/maintain/* on purpose: the reaper is the only deleter under
+    // that prefix, and a memo snapshot or a compaction claim is not its to
+    // remove. Until issue #1975 the delete axis named no sys/ resource at
+    // all, so every reap was refused and the prefix the per-tick LIST walks
+    // grew without bound. Asserted call by call by
+    // maintain_template_covers_every_worker_heartbeat_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1981,6 +2021,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/del/*.dreq",
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
+            "sys/maintain/workers/*",
             "quarantine/t/*/*/l0/*",
         ],
         // Both delete operations, and the same two the Deny names. Maintain is
@@ -3501,6 +3542,184 @@ fn maintain_template_covers_every_quarantine_call() {
                          grant it deliberately and move this assertion (#1957)"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Every object-store call the ADR-0065 maintain worker-heartbeat lifecycle
+/// makes, asserted against the shipped Maintain template, derived from every
+/// call site that touches `sys/maintain/workers/` rather than from the one
+/// function issue #1975 names.
+///
+/// The lifecycle is `crates/ravel-fleet/src/worker_set.rs`, driven from the
+/// maintain tick in `services/ravel-server/src/maintain.rs`:
+///
+/// - `WorkerSet::write_heartbeat` PUTs this process's own key
+///   (`store.put(&heartbeat_key(...), ..., PutMode::Overwrite)`,
+///   worker_set.rs:358).
+/// - `WorkerSet::live_set_read` LISTs the whole prefix
+///   (`list_all(store, WORKERS_PREFIX)`, worker_set.rs:403) and GETs each
+///   sibling whose LIST metadata is inside the liveness window
+///   (`store.get(&meta.key, GetRange::Full)`, worker_set.rs:424).
+/// - `WorkerSet::reap_keys` DELETEs each key past the reap horizon
+///   (`store.delete(key)`, worker_set.rs:463), from the candidates that same
+///   listing already produced. `services/ravel-server/src/maintain.rs:1111` is
+///   the production caller; `WorkerSet::reap_dead_workers` is the standalone
+///   form and makes the same two calls.
+///
+/// IAM is default-deny and the delete axis named no resource under
+/// `sys/maintain/` before issue #1975, so on a shipped deployment every reap
+/// was refused: dead heartbeat keys were never removed and the per-tick LIST
+/// over the prefix grew with every maintain process that had ever run, which
+/// is the unbounded-LIST cost issue #1679 removed on the assumption that this
+/// delete succeeded.
+///
+/// Like every other reachability test in this file, this reads ALLOW patterns
+/// only, by the convention `erasure_lifecycle_calls_outside_the_sweep_are_reachable`
+/// set. It says an Allow reaches each call, NOT that the call succeeds under
+/// the effective policy: the Allow/Deny relationship is
+/// `delete_deny_and_allow_overlap_exactly_where_expected` and
+/// `every_allow_deny_key_overlap_is_named_by_the_deny`.
+/// `every_role_grants_exactly_the_expected_pattern_set` pins the pattern
+/// strings by exact equality.
+#[test]
+fn maintain_template_covers_every_worker_heartbeat_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+
+    // The witness is the constructor's own output, never a literal: this is
+    // the exact key `write_heartbeat` PUTs, `live_set_read` GETs back and
+    // `reap_keys` DELETEs.
+    let heartbeat = heartbeat_key(&Uuid::from_u128(WITNESS_PROCESS_ID));
+    // The prefix `live_set_read` passes to `list_all`. `WORKERS_PREFIX` is
+    // private to `worker_set`, so it is recovered from the constructor's
+    // output rather than retyped, the same way `quarantine_l0_data_prefix`
+    // recovers the reaper's listing prefix from a real data key.
+    let (workers_prefix_body, _process_id) = heartbeat
+        .rsplit_once('/')
+        .expect("a heartbeat key ends in a process-id segment");
+    let workers_prefix = format!("{workers_prefix_body}/");
+
+    // Call 1: write_heartbeat PUTs this process's own key (worker_set.rs:358).
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &heartbeat)),
+        "maintain: no PutObject Allow reaches the heartbeat key {heartbeat:?}, \
+         which WorkerSet::write_heartbeat writes every interval \
+         (worker_set.rs:358). The process never joins its own fleet's live set \
+         as seen by a sibling. Grants: {puts:?}"
+    );
+
+    // Call 2: live_set_read LISTs the whole prefix (worker_set.rs:403).
+    assert!(
+        list_prefixes
+            .iter()
+            .any(|p| glob_matches(p, &workers_prefix)),
+        "maintain: no ListBucket s3:prefix admits {workers_prefix:?}, the prefix \
+         WorkerSet::live_set_read passes to list_all (worker_set.rs:403). The \
+         live-set read is refused with AccessDenied before it sees a sibling, \
+         so unit ownership falls back to solo and the reap grant below is \
+         unreachable. s3:prefix values: {list_prefixes:?}"
+    );
+
+    // Call 3: live_set_read GETs each in-window sibling (worker_set.rs:424).
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &heartbeat)),
+        "maintain: no GetObject Allow reaches the sibling heartbeat \
+         {heartbeat:?}, which WorkerSet::live_set_read decodes to read its \
+         stamped heartbeat_unix_ns (worker_set.rs:424). Grants: {gets:?}"
+    );
+
+    // Call 4: reap_keys DELETEs each key past the reap horizon
+    // (worker_set.rs:463), driven from maintain.rs:1111.
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &heartbeat)),
+        "maintain: no delete Allow reaches the dead-worker heartbeat \
+         {heartbeat:?}, which WorkerSet::reap_keys deletes past the reap \
+         horizon (worker_set.rs:463, driven from maintain.rs:1111). IAM is \
+         default-deny, so every reap is refused, no dead worker's key is ever \
+         removed, and the per-tick LIST over {workers_prefix:?} grows with \
+         every maintain process that has ever run (#1975). Grants: {deletes:?}"
+    );
+
+    // Tightness: a pattern reaching the heartbeat key must reach nothing
+    // outside `sys/maintain/`. The read and write axes are deliberately the
+    // whole `sys/maintain/*` control-plane prefix (the memo snapshots and the
+    // ADR-1029 compaction claims live beside the heartbeats), so the bound is
+    // that prefix and not the workers prefix alone.
+    let maintain_control_prefix = {
+        let (parent, _workers) = workers_prefix
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("the workers prefix sits under a parent control-plane prefix");
+        format!("{parent}/")
+    };
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.starts_with(&maintain_control_prefix))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside {maintain_control_prefix:?}, so \
+         the tightness assertions below examine nothing"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:GetObject Allow", &gets),
+        ("s3:PutObject Allow", &puts),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns {
+            if !glob_matches(pattern, &heartbeat) {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the worker \
+                     heartbeat {heartbeat:?} AND {key:?}, which lies outside \
+                     {maintain_control_prefix:?}. The four calls need that \
+                     control-plane prefix and nothing else (#1975)"
+                );
+            }
+        }
+    }
+
+    // No role that does not run a maintain worker reaches a maintain
+    // heartbeat. Admin is excluded on purpose and not by oversight: its
+    // blanket `sys/*` read and list are the operator role's deliberate posture
+    // over the whole control plane, asserted by
+    // every_role_grants_exactly_the_expected_pattern_set. Gateway and query
+    // run no maintain worker and must reach these keys on no axis.
+    for role in ["gateway", "query"] {
+        let policy = load_policy(role);
+        for (axis, patterns) in [
+            (
+                "s3:prefix Allow",
+                list_prefix_patterns(&policy, Some("Allow")),
+            ),
+            (
+                "s3:GetObject Allow",
+                key_patterns_for(&policy, &["s3:GetObject"], Some("Allow")),
+            ),
+            (
+                "s3:PutObject Allow",
+                key_patterns_for(&policy, &["s3:PutObject"], Some("Allow")),
+            ),
+            ("delete Allow", delete_key_patterns(&policy, "Allow")),
+        ] {
+            for pattern in &patterns {
+                assert!(
+                    !glob_matches(pattern, &heartbeat),
+                    "{role}: {axis} pattern {pattern:?} reaches the maintain \
+                     heartbeat {heartbeat:?}. Only a maintain-mode process \
+                     writes, reads or reaps one (ADR-0065 decision 1); if \
+                     another role gained a caller, grant it deliberately and \
+                     move this assertion (#1975)"
+                );
             }
         }
     }
