@@ -861,9 +861,12 @@ term.
 task is spawned, and `store_probe::spawn` runs later in the same startup path,
 after the gRPC and mTLS listeners bind and after the blocking initial JWKS
 fetch. A scrape that lands in between reads `0` from a process that is starting
-normally. The window is bounded and clears on its own the moment
-`store_probe::spawn` stamps the gauge, well inside `for: 5m`, so it does not
-page.
+normally. The window ends the moment `store_probe::spawn` stamps the gauge.
+Its length is the startup path between the two: the listener binds, which are
+local, and, when OIDC refresh is configured, the initial JWKS fetch, the only
+step in that path that waits on the network, capped at 10 s by its client
+timeout. A fetch that fails refuses the start instead of leaving the gauge at
+`0`. That is well inside `for: 5m`, so it does not page.
 
 **Cause 3: a pre-1970 host clock.** `stamp_last_run` stores `clock.now_ns()`
 unconditionally, and `SystemClock::now_ns` returns `0` through its
@@ -884,10 +887,12 @@ dropped) leaves an ageing timestamp, which crosses `132` and holds past
 first cycle ever completed: `store_probe::spawn` stamps the gauge
 synchronously from the injected clock before the task's first (jittered) sleep,
 so such a task ages out on the same clock as one that ran for a week first.
-That spawn stamp also bounds cause 2: it and the first completed cycle are at
-most `interval * 1.1 + 200s = 233s` apart, the same worst-case gap derived
-above for any two live completions, so on a healthy start the comparison can be
-true for at most `233 - 132 = 101s` before that first cycle re-stamps the gauge.
+That spawn stamp ends cause 2 and starts a separate window: the stamp and the
+first completed cycle are at most `interval * 1.1 + 200s = 233s` apart, the
+same worst-case gap derived above for any two live completions, so on a healthy
+start the comparison can be true for at most `233 - 132 = 101s` after the
+stamp, with the gauge ageing rather than reading `0`, before that first cycle
+re-stamps it.
 
 The earlier shape of this alert paid for that coverage twice: an `and
 ravel_store_probe_last_run_timestamp_seconds > 0` term to keep the bare

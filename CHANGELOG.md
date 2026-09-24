@@ -554,7 +554,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **What a `0` on `ravel_store_probe_last_run_timestamp_seconds` means is
   documented in one place, and it states all three causes** (issue #1982). The
-  explanation was written out in ten places across the store-probe source, its
+  explanation was written out across the store-probe source, its
   tests, the shipped Prometheus rule file and the observability guide, and
   every copy gave the reading a single cause. Two were missing, and one of the
   two pages until an operator fixes something the alert's description does not

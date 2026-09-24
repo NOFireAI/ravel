@@ -2,7 +2,7 @@
 # Single-source guard for one claim: what a `0` on
 # `ravel_store_probe_last_run_timestamp_seconds` means.
 #
-# That explanation had been written out in ten places (the probe source, its
+# That explanation had been written out across the probe source, its
 # tests, the shipped Prometheus rule, the observability guide, the changelog),
 # and every copy stated it wrongly in the same way: one cause instead of three.
 # Four successive sweeps tried to keep the copies consistent and two of them
@@ -27,15 +27,17 @@
 #   tells        Around every mention of the gauge (or of the atomic and
 #                  accessors behind it), in every file in the tree, a phrase
 #                  that only appears when someone is explaining the claim is a
-#                  finding. This is the rule that makes a TENTH copy fail:
-#                  restating the causes means naming them, and naming them
-#                  means a tell. Restricted to a window around the gauge so
+#                  finding. This is the rule that catches a new copy written
+#                  in the words the old copies used. It is a list of phrases,
+#                  not a proof: a restatement in wording no tell matches
+#                  passes it.
+#                  Restricted to a window around the gauge so
 #                  unrelated prose elsewhere cannot trip it.
 #   help         The gauge's HELP line is the one deliberate exception (it
 #                  ships in /metrics output, where the reader has no link to
 #                  follow), so it carries a one-line summary instead of a
 #                  pointer. It is checked to still name all three causes rather
-#                  than being left to drift as the tenth copy by another route.
+#                  than being left to drift as another copy by another route.
 #
 # An exemption is spelled `claim-allow: store-probe-zero -- <reason>` on its own
 # comment line; it suppresses that line, the rest of its comment block, and the
