@@ -464,6 +464,8 @@ ADR, not this one.
 
 ## Amendment: fail-closed ingest-timestamp plausibility
 
+<!-- amendment-applies: none -->
+
 This amendment appends to the original decision; where it supersedes a
 sentence of §4 or a Consequences bullet, it says so explicitly.
 Everything else above stands unchanged.

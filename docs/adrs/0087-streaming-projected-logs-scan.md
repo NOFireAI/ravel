@@ -116,6 +116,8 @@ flowchart LR
 
 ## Amendment (2026-09-14): per-key `attrs['k']` projection is now in scope
 
+<!-- amendment-applies: none -->
+
 Decision 3 above says "per-key projection through `attrs['k']` expressions is
 out of scope for this ADR and left for the typed-attribute-columns epic", so a
 query naming `attrs` at all resolved every dynamic column plus `attrs_raw`.

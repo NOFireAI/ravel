@@ -292,6 +292,15 @@ jobs:
         run: bash scripts/guards/check-claim-single-source.test.sh
       - name: Store-probe zero claim has one home (issue #1982)
         run: scripts/guards/check-claim-single-source.sh
+
+      # An ADR amendment sometimes claims it updated other places in the same
+      # document to point back at it; review kept finding the edit only
+      # reached one of the named places (issue #1985). Cases first, same
+      # reason as the guards above.
+      - name: Amendment-integrity guard cases (issue #1985)
+        run: bash scripts/guards/check-amendment-integrity.test.sh
+      - name: Amendment-integrity guard (issue #1985)
+        run: scripts/guards/check-amendment-integrity.sh
       # A pull request whose feat/fix commits touch crates/ or services/ must
       # also touch CHANGELOG.md, or carry a `Changelog: none` trailer (issue
       # #1719). The rule is defined over a pull request's base..head commit

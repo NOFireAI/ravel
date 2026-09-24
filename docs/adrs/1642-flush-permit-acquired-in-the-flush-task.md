@@ -200,6 +200,8 @@ flowchart LR
 
 ## Amendment: the queued-flush cap (issue #1740)
 
+<!-- amendment-applies: none -->
+
 The `Unlimited` exposure in the consequences above is now bounded by a count,
 `IngestConfig::max_queued_flushes` (default 8, per shard). Before spawning a
 flush the actor compares its spawned-but-unreaped flush count against the cap,

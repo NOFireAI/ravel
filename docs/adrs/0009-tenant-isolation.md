@@ -34,6 +34,8 @@ from request bodies.
 
 ## Amendment (2026-09-07): the loopback refusal covers every listener the shared resolver backs
 
+<!-- amendment-applies: none -->
+
 The Decision above promised that `--dev-insecure-tenant-header` "refuses to
 enable outside loopback binds". As shipped, `Cli::validate` tested only
 `--listen-http`. But the dev-header resolver joins one shared resolver chain

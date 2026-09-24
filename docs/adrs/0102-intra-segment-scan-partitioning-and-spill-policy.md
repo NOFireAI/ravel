@@ -415,6 +415,8 @@ flowchart TB
 
 ## Amendment (2026-08-26, #693)
 
+<!-- amendment-applies: none -->
+
 Intra-segment block striping (decision 1) applies only when the fetcher
 carries ADR-0046's read cache. Without it the scan is segment-granular: each
 segment is assigned whole to one partition (relevant segment `j` in snapshot
@@ -432,6 +434,8 @@ records that the same predicate now selects the assignment mode, not only the
 partition count.
 
 ## Amendment (2026-08-26, #693 part 3): predicate-free full-window whole-segment assignment
+
+<!-- amendment-applies: none -->
 
 Decision 1 stripes a snapshot's surviving blocks across partitions and resolves
 the per-segment surviving-block counts up front, once, through a plan phase
@@ -480,6 +484,8 @@ recorded exactly once).
 
 ## Amendment (2026-08-26, #739): the block-range threshold is no longer a conjunct
 
+<!-- amendment-applies: none -->
+
 The amendment above lists four conjuncts, and conjunct 3 requires every relevant
 segment to be above the block-range threshold. That conjunct is removed. The
 other three (block-predicate freedom, no pending erasure, and at least
@@ -523,6 +529,8 @@ reading the scan's metrics can then state why a statement striped instead of
 inferring it from GET counts.
 
 ## Amendment (2026-08-26, #761): the plan phase and the fetch prune by the numeric arms
+
+<!-- amendment-applies: none -->
 
 Decision 1's plan phase (`compute_plan_counts` -> `plan_segment`) resolves each
 segment's surviving-block count before any partition drains a block, and the
@@ -594,6 +602,8 @@ unchanged; a numeric predicate whose survivors still cover >= 75% of a segment
 reads that segment whole, exactly as before.
 
 ## Amendment (2026-08-27, #740): the pass-through spill error misattributes, and `GroupValues::size()` under-counts
+
+<!-- amendment-applies: none -->
 
 Decision 3 above shipped the disabled-disk-manager spill as a typed
 `ResourcesExhausted`, mapped through unchanged from whatever DataFusion 54

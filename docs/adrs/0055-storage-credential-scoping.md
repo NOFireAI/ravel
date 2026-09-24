@@ -507,6 +507,8 @@ stays the documented, informationally-probed gap ADR-0042 already named.
 
 ## Amendment: Admin gains `c/**cmt` write for commit reconstruction
 
+<!-- amendment-applies: none -->
+
 ADR-0058 ships
 `ravel-cli commit reconstruct`, which rebuilds lost L0 commit records for a
 shard from the record-less data objects' own footers and writes each rebuilt
@@ -540,6 +542,8 @@ provisioned an Admin policy without this grant yet. The matching IAM policy JSON
 `docs/guides/operations.md` (`AdminWrite`) is updated in the same change.
 
 ## Amendment: the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete
+
+<!-- amendment-applies: none -->
 
 ADR-0062 brings the query-audit shard
 (`Signal::Audit` / `QUERY_AUDIT_SHARD` = 1) into the maintained set:
@@ -584,6 +588,8 @@ predates this change. The matching IAM policy JSON in
 blocks) is updated in the same change.
 
 ## Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant
+
+<!-- amendment-applies: none -->
 
 The per-tenant KMS work (ADR-0062 decision 1, ADR-0072 decision 2) wires
 `KmsRoutingStore` into `ravel-server`'s single store-construction site behind
@@ -641,6 +647,8 @@ first `--tenant-kms-config` startup — this is flagged as a required
 follow-up, not fixed here.
 
 ## Amendment: the selective-erasure `del/` paths
+
+<!-- amendment-applies: none -->
 
 ADR-0064 ships selective subject erasure: a durable
 erasure request under `t/<hash>/<sig>/del/<request_id>.dreq`, an asynchronous
@@ -704,6 +712,8 @@ amendment precedent.
 
 ## Amendment (2026-09-07): Admin gains `sys/qualify/*` delete for the qualification delete probe
 
+<!-- amendment-applies: none -->
+
 The object-store conformance suite
 (`crates/ravel-object-store/src/conformance.rs`, run by `ravel-cli store
 qualify`) gained a `DeleteVisibility` probe: it deletes a key under the run's
@@ -753,6 +763,8 @@ deployed policy predates this change. The shipped `deploy/iam/admin.json`
 shipped Admin template satisfies the delete-probe requirement.
 
 ## Amendment (2026-09-23): the catalog delete-deny narrows to `catalog/*/HEAD`
+
+<!-- amendment-applies: sections="What each role actually does, read from the code|The WORM pairing question this ADR must answer|1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|3. Deny-delete, everywhere, on the four prefixes nothing deletes|Consequences|Amendment: the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete|Amendment: the selective-erasure `del/` paths" pointer="2026-09-23 amendment" -->
 
 §3's `DenyDeleteProtected` denied every role delete under `t/*/catalog/*/*`,
 and the decision text above states `catalog/*` as undeletable by any role.
@@ -840,7 +852,7 @@ which only an inline pointer was added. What carries that pointer to this
 section is each of the nine places that asserts, in one phrasing or another,
 that `catalog/*` is undeletable:
 
-1. the Decision bullet;
+1. the Consequences bullet;
 2. §1's "nothing in the current codebase ever deletes ... `catalog/*`";
 3. §1's WORM list of prefixes nothing legitimately deletes;
 4. §2's "never ... `catalog/`" clause;
@@ -848,10 +860,10 @@ that `catalog/*` is undeletable:
 6. §2's description of what
    `no_delete_allow_reaches_the_disjoint_protected_keyspaces` asserts;
 7. §3's deny list;
-8. the deny subgraph in the §2 diagram, which a reader deriving a deny list
+8. the deny subgraph in the §1 diagram, which a reader deriving a deny list
    from a picture is the most likely to re-widen;
-9. the recaps in the 2026-09-06 and 2026-09-13 amendments that repeat the
-   claim.
+9. the recaps in the audit-deny-delete and selective-erasure `del/` paths
+   amendments that repeat the claim.
 
 The count is written as a list rather than a number because it was wrong
 three times while it was a number: the claim is phrased as a property, a

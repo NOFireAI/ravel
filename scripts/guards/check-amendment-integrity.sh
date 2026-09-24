@@ -21,7 +21,10 @@
 #     each named heading (exact text, found once elsewhere in the same
 #     file) must contain TEXT somewhere in its own section span (that
 #     heading up to the next heading at the same or a shallower level, or
-#     end of file).
+#     end of file). A heading nested inside another amendment's own block
+#     (a `### Decision` recounting the original one, say) does not count as
+#     a match: only the document's own structure, or another amendment's
+#     top-level heading, is something a pointer can be sent to.
 #
 #   <!-- amendment-supersedes: phrase="old wording" pointer="TEXT" -->
 #     `phrase` must not appear anywhere else in the file unless the line it
@@ -109,8 +112,29 @@ class Doc:
                 break
         return start, end
 
+    def amendment_spans(self) -> list[tuple[int, int]]:
+        return [
+            self.span(i)
+            for i, (_, level, text) in enumerate(self.headings)
+            if level == 2 and AMENDMENT_RE.match(text)
+        ]
+
     def find_section(self, name: str) -> tuple[int, int] | None:
-        matches = [i for i, (_, _, text) in enumerate(self.headings) if text == name]
+        """A heading matching `name`, excluding one nested inside another
+        amendment's own block (an amendment's internal subheadings, such as a
+        `### Decision` recounting the original one, are not a document
+        section a pointer can be sent to; the amendment's own top-level
+        heading remains a valid target)."""
+        spans = self.amendment_spans()
+        matches = []
+        for i, (line, level, text) in enumerate(self.headings):
+            if text != name:
+                continue
+            is_amendment_heading = level == 2 and AMENDMENT_RE.match(text)
+            nested = any(s < line < e for s, e in spans) and not is_amendment_heading
+            if nested:
+                continue
+            matches.append(i)
         if len(matches) == 0:
             return None
         if len(matches) > 1:

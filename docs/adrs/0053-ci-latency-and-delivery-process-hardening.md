@@ -195,6 +195,8 @@ script pair is deleted.
 
 ## Amendment: main-push coverage ratchet
 
+<!-- amendment-applies: none -->
+
 External review finding J-7 observes that coverage is measured and
 badged but never gated, so the number can only fall silently. Read
 quickly, that asks this ADR to reverse one of its own rejected
