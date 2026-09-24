@@ -109,6 +109,52 @@ impl SegmentResolver for SnapshotSegmentResolver {
     }
 }
 
+/// One slice's typed failure, carrying whatever that attempt had already spent
+/// when it failed (issue #1723).
+///
+/// A slice that fetched three segments and then took a store 503 on the fourth
+/// issued three segments' worth of real GETs. Reporting that failure with a
+/// zero snapshot tells the coordinator the attempt was free, and the
+/// coordinator re-dispatches the same slice to another worker, so the store
+/// serves the slice up to three times while the query's recorded cost is one
+/// attempt's. `spent`/`stats` are what [`summary_frame`] puts on the terminal
+/// frame, exactly as the byte-budget short-circuit already does for a refusal
+/// it raises itself.
+///
+/// [`From<(pb::status::Code, String)>`] builds the zero-spend shape, so a
+/// pre-fetch failure (version skew, a malformed request, an unresolved pinned
+/// segment) stays a plain `Err((code, message))?` at its call site and converts
+/// implicitly: those really did spend nothing.
+struct SliceFailure {
+    code: pb::status::Code,
+    message: String,
+    /// The accounting the attempt had accumulated before it failed.
+    spent: QueryAccountingSnapshot,
+    /// The page counters the attempt had accumulated before it failed.
+    stats: FetchStats,
+}
+
+impl From<(pb::status::Code, String)> for SliceFailure {
+    fn from((code, message): (pb::status::Code, String)) -> Self {
+        SliceFailure {
+            code,
+            message,
+            spent: QueryAccountingSnapshot::default(),
+            stats: FetchStats::default(),
+        }
+    }
+}
+
+impl SliceFailure {
+    /// Attach the spend this attempt had already made. Called at every failure
+    /// site that sits AFTER a fetch could have issued requests.
+    fn with_spend(mut self, accounting: &QueryAccounting, stats: &FetchStats) -> Self {
+        self.spent = accounting.snapshot();
+        self.stats = *stats;
+        self
+    }
+}
+
 /// The worker-side fragment service. Holds a [`SegmentFetcher`] over the same
 /// object store the coordinator's snapshot pins, and a [`SegmentResolver`] to
 /// turn shipped identities into refs.
@@ -220,19 +266,23 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     async fn run_slice(&self, request: pb::FetchRequest) -> Vec<pb::FetchResponse> {
         match self.run_slice_inner(request).await {
             Ok(frames) => frames,
-            // Pre-fetch/transport-shaped failures (version skew, malformed
-            // request, a vanished pinned segment, a hard fetch error) carry no
-            // accounting: nothing was scanned, or the query fails outright and
-            // the aggregate is moot. Post-fetch outcomes that *did* spend
-            // (budget trip, histogram fallback) build their own summary with
-            // real accounting inside `run_slice_inner`.
-            Err((code, message)) => vec![summary_frame(
-                &QueryAccountingSnapshot::default(),
+            // A failure's summary carries what the attempt had spent when it
+            // failed (issue #1723). A pre-fetch failure (version skew,
+            // malformed request, a pinned segment this worker cannot resolve)
+            // really did spend nothing and converts into a zero-spend
+            // [`SliceFailure`]; a fetch that took a store error partway through
+            // the slice's segments carries the segments it had already paid
+            // for, so the coordinator folds that cost before it re-dispatches
+            // the slice elsewhere. Post-fetch outcomes that spend and do not
+            // fail (budget trip, histogram fallback) build their own summary
+            // with real accounting inside `run_slice_inner`.
+            Err(failure) => vec![summary_frame(
+                &failure.spent,
                 0,
                 0,
-                code,
-                message,
-                &FetchStats::default(),
+                failure.code,
+                failure.message,
+                &failure.stats,
             )],
         }
     }
@@ -240,7 +290,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     async fn run_slice_inner(
         &self,
         request: pb::FetchRequest,
-    ) -> Result<Vec<pb::FetchResponse>, (pb::status::Code, String)> {
+    ) -> Result<Vec<pb::FetchResponse>, SliceFailure> {
         // Version skew: the coordinator falls back to local when it sees this.
         codec::check_protocol_version(request.protocol_version)
             .map_err(|e| (pb::status::Code::Unsupported, e.to_string()))?;
@@ -269,10 +319,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // falls back to raw fetch, rather than silently ignoring the request and
         // streaming frames a pushdown-expecting caller did not ask for.
         if request.partial_aggregate.is_some() && !matches!(signal, Signal::Metrics) {
-            return Err((
+            return Err(SliceFailure::from((
                 pb::status::Code::Unsupported,
                 format!("aggregation pushdown is not defined for signal {signal:?}"),
-            ));
+            )));
         }
 
         match signal {
@@ -330,10 +380,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             // Profiles has no distributed fetch path planned in this lane, so it
             // stays rejected exactly as every non-Metrics signal was before
             // #283: Unsupported, whole-query local fallback.
-            Signal::Profiles => Err((
+            Signal::Profiles => Err(SliceFailure::from((
                 pb::status::Code::Unsupported,
                 format!("signal {signal:?} is not distributed"),
-            )),
+            ))),
         }
     }
 
@@ -438,15 +488,15 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         matchers: Vec<ravel_promql::LabelMatcher>,
         erasure: Vec<crate::erasure::ErasurePredicate>,
         partial_aggregate: Option<pb::PartialAggregateRequest>,
-    ) -> Result<Vec<pb::FetchResponse>, (pb::status::Code, String)> {
+    ) -> Result<Vec<pb::FetchResponse>, SliceFailure> {
         let identities = match scope {
             Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments,
             // Cross-cluster resolve scope is future work; fall back to local.
             Some(pb::fetch_request::Scope::Resolve(_)) | None => {
-                return Err((
+                return Err(SliceFailure::from((
                     pb::status::Code::Unsupported,
                     "resolve-scope slices are not supported yet".to_string(),
-                ));
+                )));
             }
         };
 
@@ -458,10 +508,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             match self.resolver.resolve(identity) {
                 Some(seg) => segments.push(seg),
                 None => {
-                    return Err((
+                    return Err(SliceFailure::from((
                         pb::status::Code::SnapshotInvalidated,
                         "pinned segment not found on worker".to_string(),
-                    ));
+                    )));
                 }
             }
         }
@@ -481,7 +531,13 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                 .fetcher
                 .fetch_soa_and_histograms_accounted(tenant_hash, seg, &matchers, &accounting)
                 .await
-                .map_err(map_fetch_error)?;
+                // The failing segment's predecessors already cost real GETs
+                // (issue #1723): the terminal summary carries them, so the
+                // coordinator folds this attempt's spend before it re-dispatches
+                // the slice to another worker.
+                .map_err(|e| {
+                    SliceFailure::from(map_fetch_error(e)).with_spend(&accounting, &stats)
+                })?;
             histograms.extend(seg_hist);
             stats.raw_f64_pages += seg_stats.raw_f64_pages;
             stats.raw_f64_bytes += seg_stats.raw_f64_bytes;
@@ -567,16 +623,31 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                 (None, None) => None,
                 (Some(start), Some(end)) => Some((start, end)),
                 (Some(_), None) | (None, Some(_)) => {
-                    return Err((
+                    // Every segment of this slice was fetched before the
+                    // request shape was found bad, so the refusal carries what
+                    // those fetches cost (issue #1723). A caller bug is not a
+                    // free slice.
+                    return Err(SliceFailure::from((
                         pb::status::Code::Internal,
                         "PartialAggregateRequest carries exactly one of \
                          reduce_start_ns/reduce_end_ns; a caller must set both or neither"
                             .to_string(),
-                    ));
+                    ))
+                    .with_spend(&accounting, &stats));
                 }
             };
-            let (partials, samples_merged) =
-                reduce_partial_aggregates(scalar, &want, window).map_err(map_merge_error)?;
+            // The merge runs after the whole fetch loop, so a merge failure is
+            // a slice that already paid for every one of its segments
+            // (issue #1723). No object a worker can decode reaches this arm
+            // today: the caps passed here are `usize::MAX`, a non-monotonic run
+            // is refused by the fetch path above as `Corrupt`, and the writer
+            // refuses a priority column that is not parallel to its run. The
+            // spend rides along anyway, so the arm cannot become a free slice
+            // if a future decode path lets one of those through.
+            let (partials, samples_merged) = reduce_partial_aggregates(scalar, &want, window)
+                .map_err(|e| {
+                    SliceFailure::from(map_merge_error(e)).with_spend(&accounting, &stats)
+                })?;
             let series_returned = partials.len() as u64;
             let mut frames = Vec::with_capacity(partials.len() + 1);
             for partial in &partials {
@@ -671,12 +742,12 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         erasure: Vec<crate::erasure::ErasurePredicate>,
         window_start_ns: i64,
         window_end_ns: i64,
-    ) -> Result<Vec<pb::FetchResponse>, (pb::status::Code, String)> {
+    ) -> Result<Vec<pb::FetchResponse>, SliceFailure> {
         let Some(log_fetcher) = self.log_fetcher.as_ref() else {
-            return Err((
+            return Err(SliceFailure::from((
                 pb::status::Code::Unsupported,
                 "distributed log fetch is not configured on this worker".to_string(),
-            ));
+            )));
         };
 
         // Matcher pushdown for logs has no defined `LogQuery` mapping in this
@@ -684,19 +755,19 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // #284's scope). Ignoring matchers would under-filter, so fail closed to
         // the coordinator's local fallback rather than return a wrong result.
         if !matchers.is_empty() {
-            return Err((
+            return Err(SliceFailure::from((
                 pb::status::Code::Unsupported,
                 "distributed log fetch does not support matcher pushdown yet".to_string(),
-            ));
+            )));
         }
 
         let identities = match scope {
             Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments,
             Some(pb::fetch_request::Scope::Resolve(_)) | None => {
-                return Err((
+                return Err(SliceFailure::from((
                     pb::status::Code::Unsupported,
                     "resolve-scope slices are not supported yet".to_string(),
-                ));
+                )));
             }
         };
 
@@ -705,10 +776,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             match self.resolver.resolve(identity) {
                 Some(seg) => segments.push(seg),
                 None => {
-                    return Err((
+                    return Err(SliceFailure::from((
                         pb::status::Code::SnapshotInvalidated,
                         "pinned segment not found on worker".to_string(),
-                    ));
+                    )));
                 }
             }
         }
@@ -731,7 +802,11 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             let out = log_fetcher
                 .fetch_accounted_with_tenant(seg, tenant_hash, &query, &accounting)
                 .await
-                .map_err(map_log_fetch_error)?;
+                // Carries the spend of this slice's already-fetched segments,
+                // as the metric path does (issue #1723).
+                .map_err(|e| {
+                    SliceFailure::from(map_log_fetch_error(e)).with_spend(&accounting, &stats)
+                })?;
             if let Some(output) = out {
                 records.extend(output.records);
             }
@@ -805,12 +880,12 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         erasure: Vec<crate::erasure::ErasurePredicate>,
         window_start_ns: i64,
         window_end_ns: i64,
-    ) -> Result<Vec<pb::FetchResponse>, (pb::status::Code, String)> {
+    ) -> Result<Vec<pb::FetchResponse>, SliceFailure> {
         let Some(span_fetcher) = self.span_fetcher.as_ref() else {
-            return Err((
+            return Err(SliceFailure::from((
                 pb::status::Code::Unsupported,
                 "distributed span fetch is not configured on this worker".to_string(),
-            ));
+            )));
         };
 
         // Span matcher pushdown (service_name/name/duration/status) has no
@@ -819,19 +894,19 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // closed to the coordinator's local fallback rather than a wrong result,
         // exactly as the log path does.
         if !matchers.is_empty() {
-            return Err((
+            return Err(SliceFailure::from((
                 pb::status::Code::Unsupported,
                 "distributed span fetch does not support matcher pushdown yet".to_string(),
-            ));
+            )));
         }
 
         let identities = match scope {
             Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments,
             Some(pb::fetch_request::Scope::Resolve(_)) | None => {
-                return Err((
+                return Err(SliceFailure::from((
                     pb::status::Code::Unsupported,
                     "resolve-scope slices are not supported yet".to_string(),
-                ));
+                )));
             }
         };
 
@@ -840,10 +915,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             match self.resolver.resolve(identity) {
                 Some(seg) => segments.push(seg),
                 None => {
-                    return Err((
+                    return Err(SliceFailure::from((
                         pb::status::Code::SnapshotInvalidated,
                         "pinned segment not found on worker".to_string(),
-                    ));
+                    )));
                 }
             }
         }
@@ -868,7 +943,11 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             let out = span_fetcher
                 .fetch_accounted(seg, tenant_hash, &query, None, None, &[], &accounting)
                 .await
-                .map_err(map_span_fetch_error)?;
+                // Carries the spend of this slice's already-fetched segments,
+                // as the metric path does (issue #1723).
+                .map_err(|e| {
+                    SliceFailure::from(map_span_fetch_error(e)).with_spend(&accounting, &stats)
+                })?;
             if let Some(output) = out {
                 spans.extend(output.records);
             }

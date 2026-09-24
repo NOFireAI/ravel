@@ -64,6 +64,82 @@ pub enum DistribError {
         "remote returned a {0} frame this metrics coordinator cannot decode across the slice boundary"
     )]
     FrameSignalUnsupported(&'static str),
+    /// A slice attempt that failed after the store had already served it,
+    /// wrapping the error that ended the slice and the cost it had reached
+    /// (issue #1723).
+    ///
+    /// [`SliceFetcher::fetch`] answers with `Result<SliceResponse,
+    /// DistribError>`, so an attempt whose final outcome is `Err` has no
+    /// response to carry its accounting on, and a slice dispatched three times
+    /// would be charged for at most the one attempt that returned a summary.
+    /// This variant is the carrier: the coordinator folds `spend` into the
+    /// query's live accounting handle before it maps the error to a
+    /// [`crate::error::QueryError`]. `Display` is the wrapped error's, so a
+    /// caller reading the message or mapping the error to an HTTP class sees
+    /// exactly what it saw before the wrap.
+    ///
+    /// Only the accounting snapshot travels. The coordinator's error path
+    /// returns no `FetchStats` to the engine, so page counters carried here
+    /// would have no reader.
+    ///
+    /// Both fields are boxed. A snapshot is a per-operation counter array, far
+    /// larger than any other variant here, and every `Result<_, DistribError>`
+    /// in the slice path would otherwise grow by it.
+    #[error("{source}")]
+    Spent {
+        /// What the failed attempts had spent when the slice gave up.
+        spend: Box<ravel_types::accounting::QueryAccountingSnapshot>,
+        /// The error that ended the slice, unchanged.
+        source: Box<DistribError>,
+    },
+}
+
+impl DistribError {
+    /// Attach the spend a failed attempt already made, or merge it into the
+    /// spend already attached (issue #1723). A zero spend is a no-op, so an
+    /// attempt that broke before the store served it leaves the error
+    /// untouched and no caller sees a wrapper it has to look through.
+    #[must_use]
+    pub fn with_spend(self, spend: &ravel_types::accounting::QueryAccountingSnapshot) -> Self {
+        if *spend == ravel_types::accounting::QueryAccountingSnapshot::default() {
+            return self;
+        }
+        match self {
+            // Saturating, like every other #1723 fold: a worker reporting near
+            // `u64::MAX` clamps instead of wrapping under the byte budget.
+            DistribError::Spent {
+                spend: carried,
+                source,
+            } => DistribError::Spent {
+                spend: Box::new(carried.saturating_merge(spend)),
+                source,
+            },
+            other => DistribError::Spent {
+                spend: Box::new(*spend),
+                source: Box::new(other),
+            },
+        }
+    }
+
+    /// The spend carried by a failed slice, if any.
+    #[must_use]
+    pub fn spend(&self) -> Option<&ravel_types::accounting::QueryAccountingSnapshot> {
+        match self {
+            DistribError::Spent { spend, .. } => Some(spend),
+            _ => None,
+        }
+    }
+
+    /// The error that actually ended the slice, with any spend wrapper removed.
+    /// Every site that classifies a `DistribError` by variant (a cap refusal, a
+    /// transport loss) must match on this rather than on the wrapper.
+    #[must_use]
+    pub fn unspent(&self) -> &DistribError {
+        match self {
+            DistribError::Spent { source, .. } => source.unspent(),
+            other => other,
+        }
+    }
 }
 
 /// One slice's fully-decoded response, in the same in-memory shapes the local
