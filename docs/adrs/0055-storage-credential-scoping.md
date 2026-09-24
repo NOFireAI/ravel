@@ -811,11 +811,15 @@ Before/after, expressed as the operations.md IAM wildcards:
   returns `MaintainError::Store` on anything that is not `NotFound`, so
   an AccessDenied there fails the whole pass for that signal rather than
   one object. The `idx/` read is for the scrub tick's
-  `load_covering_postings`, which SWALLOWS its error: it returns
-  `Ok(None)` on any failure, which the tick cannot distinguish from "no
-  postings ref yet", so the postings scrub tier silently never runs.
-  That is not an outage, which is precisely why the grant has to be
-  derived rather than observed. (The fold reads the same keyspace for
+  `load_covering_postings`. When this ADR was written that function
+  swallowed its error, returning `Ok(None)` on any failure, which the tick
+  could not distinguish from "no postings ref yet", so the postings scrub
+  tier silently never ran. That was not an outage, which is precisely why
+  the grant had to be derived rather than observed. Issue #1964 changed the
+  behaviour: a non-`NotFound` failure now returns `Err` and disables the
+  postings tier loudly. The derivation argument stands unchanged, because a
+  surfaced error tells an operator the grant is missing and does not grant
+  it. (The fold reads the same keyspace for
   its `.cstat` and `.npost` reuse baseline, but never under this
   credential: the fold does not run in `Mode::Maintain`. Those reads are
   why `gateway.json` and `query.json` carry catalog reads.)

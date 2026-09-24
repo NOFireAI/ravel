@@ -414,8 +414,12 @@ pub async fn run_cycle(
             // an absent postings ref yields `None`, which every shard's tick
             // treats as "no postings tier this tick" exactly as before this
             // wiring landed (the documented "no postings ref yet" case,
-            // ADR-0059). A `tenant_hash`-binding breach (ADR-0050 §2) is logged
-            // and likewise degrades to `None` for this tick, never wedging the
+            // ADR-0059). That degrade is this caller's own: since #1964 the
+            // callee returns `Err` on a non-`NotFound` failure rather than
+            // `Ok(None)`, so the two cases arrive here distinguishably even
+            // though both end as `None` for the tick. A `tenant_hash`-binding
+            // breach (ADR-0050 §2) is logged and likewise degrades to `None`
+            // for this tick, never wedging the
             // content and structural tiers that do not depend on postings.
             let scan_shards = scan_shards(store, tenant, signal, shard_count).await;
 
@@ -441,8 +445,11 @@ pub async fn run_cycle(
             let covering = match ravel_catalog::load_covering_postings(store, tenant, signal).await
             {
                 Ok(loaded) => loaded,
+                // error!, not warn!: this is the same class of fault as the
+                // fold's `.cstat`/`.npost` reuse failures, which log at error,
+                // and a permission fault here recurs every tick.
                 Err(err) => {
-                    tracing::warn!(
+                    tracing::error!(
                         tenant = %tenant.to_hex(), signal = ?signal, error = %err,
                         "scrub: covering-postings load failed; postings tier skipped this tick, retried"
                     );

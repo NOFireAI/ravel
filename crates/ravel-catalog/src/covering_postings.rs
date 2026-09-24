@@ -15,21 +15,26 @@
 //! path (GET, blake3 verify, ADR-0050 §2 tenant-hash check, decode against the
 //! covered parts' blake3, entry-count check).
 //!
-//! # Degrade-to-None, one loud exception
+//! # Degrade-to-None, three loud exceptions
 //!
 //! Postings are a pure pruning/verification optimization, never a correctness
-//! gate: every failure short of an isolation breach degrades to `Ok(None)`
-//! (no HEAD yet, no postings ref, any GET error, a blake3 mismatch, a decode
-//! error, an entry-count mismatch), exactly as `load_snapshot_postings`
-//! documents. The scrubber then simply runs the structural and content tiers
-//! with no postings tier this tick and retries next tick. The two loud
-//! exceptions returned as a real [`LoadPostingsError`] are a genuinely
-//! unparseable HEAD or part (a real catalog defect, matching
-//! [`crate::seal_divergence`]) and a postings object whose declared
-//! `tenant_hash` names a different tenant (an isolation breach, ADR-0050 §2,
-//! never absorbed into a silent degrade).
+//! gate: an absent HEAD, an absent postings ref, a `NotFound` on the postings
+//! object, a blake3 mismatch, a decode error, or an entry-count mismatch all
+//! degrade to `Ok(None)`, exactly as `load_snapshot_postings` documents. The
+//! scrubber then simply runs the structural and content tiers with no
+//! postings tier this tick and retries next tick. Three loud exceptions
+//! return a real [`LoadPostingsError`] instead: a genuinely unparseable HEAD
+//! or part (a real catalog defect, matching [`crate::seal_divergence`]), a
+//! postings object whose declared `tenant_hash` names a different tenant (an
+//! isolation breach, ADR-0050 §2, never absorbed into a silent degrade), and
+//! a GET of the postings object itself failing for any reason other than
+//! `NotFound` (issue #1964: an `AccessDenied` there is a missing IAM grant,
+//! not an absent object, and must disable the postings tier loudly rather
+//! than reading as "no postings ref yet"). The HEAD GET and the per-part GETs
+//! above it still degrade to `Ok(None)` on any error, `NotFound` or not
+//! (tracked separately, not fixed here).
 
-use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::catalog::v1::SnapshotEntry;
 use ravel_types::{Signal, TenantHash};
 
@@ -56,12 +61,12 @@ pub struct LoadedCoveringPostings {
     pub covered_entries: Vec<SnapshotEntry>,
 }
 
-/// A genuinely unparseable object or an isolation breach encountered while
-/// loading covering postings: the only two conditions [`load_covering_postings`]
-/// surfaces as an error rather than degrading to `Ok(None)`. Every other
-/// failure mode (absent HEAD or postings ref, any GET error, a blake3 or
-/// entry-count mismatch, a postings decode error) is a `Ok(None)` degrade, not
-/// a variant here.
+/// A genuinely unparseable object, an isolation breach, or a non-`NotFound`
+/// GET failure on the postings object itself: the only conditions
+/// [`load_covering_postings`] surfaces as an error rather than degrading to
+/// `Ok(None)`. Every other failure mode (absent HEAD or postings ref, a
+/// `NotFound` on the postings object, a blake3 or entry-count mismatch, a
+/// postings decode error) is a `Ok(None)` degrade, not a variant here.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadPostingsError {
     /// The HEAD object is present but does not decode: a real catalog defect,
@@ -91,6 +96,18 @@ pub enum LoadPostingsError {
         expected: String,
         actual: String,
     },
+    /// The postings object GET failed for a reason other than `NotFound`
+    /// (issue #1964): most commonly a missing IAM read grant on `idx/*`,
+    /// surfaced as `StoreError::AccessDenied`. This disables the whole
+    /// postings tier for the tick, so it is a hard error the scrub tick can
+    /// count and retry, never a silent `Ok(None)` degrade indistinguishable
+    /// from "no postings ref yet".
+    #[error("postings object {key} GET failed: {source}")]
+    Store {
+        key: String,
+        #[source]
+        source: StoreError,
+    },
 }
 
 /// HEAD object key (docs/catalog-and-mvcc.md key layout, frozen format).
@@ -110,7 +127,7 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
 /// object is present, hash-verified, tenant-bound to this tenant, decodes
 /// against the covered parts' blake3, and its entry count matches the covered
 /// entries. See the [module docs](self) for the full degrade-to-`Ok(None)`
-/// contract and the two loud [`LoadPostingsError`] exceptions.
+/// contract and the three loud [`LoadPostingsError`] exceptions.
 pub async fn load_covering_postings(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -171,10 +188,22 @@ pub async fn load_covering_postings(
     // the declared tenant_hash BEFORE decode (ADR-0050 §2 -- a foreign tenant
     // is a hard error even for an object that would also fail to bind), decode
     // against the covered parts' blake3, then check the entry count. Every
-    // failure short of the tenant-hash breach degrades to Ok(None).
+    // failure short of the tenant-hash breach and a non-NotFound GET error
+    // degrades to Ok(None). `NotFound` means "no postings object at this ref
+    // yet", a normal degrade; any other GET error (issue #1964, most commonly
+    // AccessDenied on a missing idx/* read grant) is a real outage of the
+    // postings tier and must not be swallowed as though nothing was there.
     let data = match store.get(&postings_ref.key, GetRange::Full).await {
         Ok(got) => got.data,
-        Err(_) => return Ok(None),
+        Err(StoreError::NotFound) => return Ok(None),
+        // No log here: the returned error carries the key and the source, and
+        // the caller reports it. One fault, one line.
+        Err(source) => {
+            return Err(LoadPostingsError::Store {
+                key: postings_ref.key.clone(),
+                source,
+            });
+        }
     };
     let digest = blake3::hash(&data);
     if digest.as_bytes().as_slice() != postings_ref.blake3.as_slice() {
@@ -219,6 +248,7 @@ mod tests {
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_proto::commit::v1::CommitRecord;
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
@@ -364,6 +394,87 @@ mod tests {
         assert_eq!(loaded.covered_entries.len(), 1, "one covered entry");
         assert_eq!(loaded.part_blake3.len(), 1, "one covered part");
         assert!(!loaded.bytes.is_empty(), "the postings bytes are present");
+    }
+
+    /// Issue #1964: a GET failure on the postings object other than
+    /// `NotFound` (an `AccessDenied` on a missing `idx/*` read grant, most
+    /// commonly) must surface as a real error, not degrade to `Ok(None)`
+    /// indistinguishable from "no postings ref yet". `ScriptedFault` has no
+    /// `AccessDenied` kind (a `ravel-object-store` testing gap, out of scope
+    /// for this crate), so `Permanent` stands in as a structurally equivalent
+    /// non-`NotFound` GET failure: the code path this test pins branches on
+    /// `Err(StoreError::NotFound)` versus every other `Err`, not on which
+    /// variant the "other" arm carries.
+    #[tokio::test]
+    async fn postings_get_permanent_failure_surfaces_as_error() {
+        let inner = Arc::new(MemoryStore::new());
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        publish_real_segment(inner.as_ref(), 1, created, &["cpu", "mem"]).await;
+        fold(inner.clone(), now).await;
+
+        let key = head_key(&tenant_id().hash(), Signal::Metrics);
+        let head_bytes = inner.get(&key, GetRange::Full).await.expect("head").data;
+        let head = decode_head(&head_bytes).expect("decode head");
+        let postings_key = head.postings.expect("postings ref").key;
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(postings_key.clone()),
+        );
+        let faulty = FaultStore::new(inner.clone(), plan);
+
+        let err = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
+            .await
+            .expect_err(
+                "a non-NotFound GET failure on the postings object must surface as an error",
+            );
+        match err {
+            LoadPostingsError::Store { key: err_key, .. } => {
+                assert_eq!(err_key, postings_key, "error names the failing key");
+            }
+            other => panic!("expected LoadPostingsError::Store, got {other:?}"),
+        }
+        assert!(
+            faulty.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
+    /// The counterpart to `postings_get_permanent_failure_surfaces_as_error`:
+    /// a genuine `NotFound` on the postings object (modeled here with
+    /// `NotFoundBlip`, an eventual-consistency blip rather than a permission
+    /// fault) must still degrade quietly to `Ok(None)`, exactly as before
+    /// this fix.
+    #[tokio::test]
+    async fn postings_get_not_found_blip_still_degrades_to_none() {
+        let inner = Arc::new(MemoryStore::new());
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        publish_real_segment(inner.as_ref(), 1, created, &["cpu", "mem"]).await;
+        fold(inner.clone(), now).await;
+
+        let key = head_key(&tenant_id().hash(), Signal::Metrics);
+        let head_bytes = inner.get(&key, GetRange::Full).await.expect("head").data;
+        let head = decode_head(&head_bytes).expect("decode head");
+        let postings_key = head.postings.expect("postings ref").key;
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(postings_key),
+        );
+        let faulty = FaultStore::new(inner.clone(), plan);
+
+        let loaded = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
+            .await
+            .expect("a NotFound on the postings object must degrade to Ok(None), never an error");
+        assert!(loaded.is_none());
+        assert!(
+            faulty.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
     }
 
     #[tokio::test]
