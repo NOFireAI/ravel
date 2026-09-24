@@ -175,3 +175,82 @@ the reservation commit that used to work around it.
 | [1737](1737-idle-flush-byte-floor-and-buffered-durability-window.md) | Add `idle_flush_byte_floor` (default 0, today's behaviour): below the floor a buffer with no strict waiter waits `max_flush_lifetime`, stated as a one-hour buffered-mode loss window the operator opts into, with the shutdown-drain residue and memory occupancy named. Amends ADR-0051 section 7 and ADR-0076 decision 4 | Accepted (2026-09-16) |
 | [1746](1746-format-floor-evidence-and-writer-policy.md) | A format floor records its observation basis (entries, newest `created_unix_ns`, shards) as additive fields under a two-release `ProvisioningRecord` version bump, `audit-versions` classifies a stored floor as `Current`, `Stale`, `Contradicted` or `Unknown`, and a writer whose newest version sits below a floor warns at startup and refuses only in the write path, with an explicit override that contradicts the floor. Amends ADR-0066 decision 3 | Accepted (2026-09-16) |
 | [1751](1751-bulk-import-and-export-for-all-signals.md) | `ravel-cli load` takes `--signal` with a per-signal mapping section, historical metric samples bucket by load time, and a Parquet export mirrors load as a store read at a snapshot so `load(export(x))` round-trips every mapped field. Amends ADR-0089 | Accepted (2026-09-16) |
+
+## Amending an ADR
+
+A decision is never edited in place once it is Accepted. The change goes in
+an amendment section at the end of the file, and the earlier text it
+changes gets an inline pointer to that section, so a reader who lands on
+the decision learns it has moved on.
+
+`scripts/guards/check-amendment-integrity.sh` checks the amendment's claim
+about its own effect against the document. Every amendment heading (any
+heading below the title whose text contains a word starting "amend", at any
+level) must carry at least one marker in its own block, an HTML comment
+saying what the amendment did. A marker is one line: the guard reads it
+with a single-line pattern, so a marker wrapped across two lines reads as
+no marker at all.
+
+### The markers
+
+Nothing was retired, so nothing points here:
+
+```markdown
+## Amendment 2026-09-06 (issue #1196): a named latency-first policy
+
+<!-- amendment-applies: none reason="adds a fourth policy alongside the three decision 2 names, and retires none of them" -->
+```
+
+The reason is required. `none` is the marker that turns the checks off, so
+it is the one that has to justify itself: use it when the amendment adds a
+decision, records an outcome, resolves an open item, rejects a proposal, or
+amends a different document. If it supersedes, retires, replaces, narrows,
+or corrects earlier text in this ADR, it is not `none`.
+
+Named sections carry an inline pointer to the amendment:
+
+```markdown
+## Amendment: the queued-flush cap (issue #1740)
+
+<!-- amendment-applies: sections="Consequences|Rejected alternatives" pointer="queued-flush cap amendment" -->
+```
+
+Each named heading must exist exactly once in the file, matched on its exact
+text, and its own prose must contain `pointer` somewhere. `pointer` is free
+text, matched case-insensitively with whitespace collapsed, so the
+parenthetical an author already writes ("see the queued-flush cap amendment
+below") is what the marker names. `|` separates the names; a heading
+carrying one in its own text is named with `\|`:
+
+```markdown
+<!-- amendment-applies: sections="2. The fetch policy: `request-minimal \| byte-minimal \| cost-based`" pointer="latency-first amendment" -->
+```
+
+A wording the amendment retires must not survive elsewhere unqualified:
+
+```markdown
+<!-- amendment-supersedes: phrase="`max_inflight_flushes` binds first for per-shard overlap" pointer="#800 amendment" -->
+```
+
+Every occurrence outside the amendment's own block must be qualified: the
+pointer appears in the same sentence (formally, on the match's own lines,
+the line above, or the line below), or an
+`<!-- amendment-supersedes-allow: <reason> -->` marker with a non-empty
+reason sits in that window, for prose that cites the retired wording on
+purpose.
+
+An amendment may carry several markers. Marker comments are not prose: they
+never qualify a phrase and never count as an occurrence of one.
+
+### What the exit codes mean
+
+- **0**: every claim the markers make is true of the document.
+- **1**: a finding, something the document says that is not true of it: a
+  named section without its pointer, a retired phrase still standing
+  unqualified, or `amendment-applies: none` with no reason.
+- **70**: the claim could not be checked at all, which is not a pass: an
+  amendment heading with no marker, a marker missing `sections=`,
+  `pointer=` or `phrase=`, an empty `sections=`, a named heading that does
+  not exist or exists more than once, no ADR files, or zero amendments
+  scanned. Fix the marker or the heading it names; do not leave it at 70.
+- **64**: bad usage (more than one argument).
