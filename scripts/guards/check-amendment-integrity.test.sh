@@ -282,11 +282,11 @@ check "a retired phrase split across a wrap is still a finding" "${t}" 1 "appear
 # A marker comment is metadata, not prose: it neither qualifies the phrase
 # beside it nor counts as an occurrence of one.
 t="$(new_tree marker-not-a-qualifier)"
-sed -i.bak 's/## Decision/## Decision\n\n<!-- amendment-applies: sections="Section A" pointer="2026-09-23 amendment" -->\nThe fallback keeps using storage class STANDARD_FALLBACK for cold data./' "${t}/docs/adrs/0001-test-decision.md"
+sed -i.bak 's/## Decision/## Decision\n\n<!-- amendment-note: see the 2026-09-23 amendment -->\nThe fallback keeps using storage class STANDARD_FALLBACK for cold data./' "${t}/docs/adrs/0001-test-decision.md"
 check "a marker comment does not qualify the phrase beside it" "${t}" 1 "appears without its pointer"
 
 t="$(new_tree marker-not-an-occurrence)"
-sed -i.bak 's/## Decision/## Decision\n\n<!-- amendment-supersedes: phrase="storage class STANDARD_FALLBACK" pointer="2026-09-23 amendment" -->/' "${t}/docs/adrs/0001-test-decision.md"
+sed -i.bak 's/## Decision/## Decision\n\n<!-- amendment-note: storage class STANDARD_FALLBACK -->/' "${t}/docs/adrs/0001-test-decision.md"
 check "a phrase inside a marker comment is not an occurrence" "${t}" 0 "clean"
 
 # docs/adrs/README.md is the index, not an ADR.
@@ -383,6 +383,46 @@ s = s.replace(
 open(p, "w").write(s)
 PYFIX
 check "a reasonless allow on the phrase's own line does not hide it" "${t}" 1 "appears without its pointer"
+
+# A pointer sharing a line with a marker comment still counts as the
+# section's prose.
+t="$(new_tree pointer-beside-marker)"
+python3 - "${t}/docs/adrs/0001-test-decision.md" <<'PYFIX'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "Placement follows the active policy (2026-09-23 amendment below).\n"
+assert old in s
+s = s.replace(old, "Placement follows the active policy (2026-09-23 amendment below). <!-- amendment-supersedes-allow: unrelated note -->\n")
+open(p, "w").write(s)
+PYFIX
+check "a pointer on a line with a marker comment still counts" "${t}" 0 "clean"
+
+# A marker under a heading the guard does not recognise is never read.
+t="$(new_tree stray-marker)"
+cat >"${t}/docs/adrs/0002-stray.md" <<'MD'
+# ADR-0002: Stray
+
+## Section A
+
+Placement follows the active policy.
+
+## Revision (2026-09-23): placement narrows
+
+<!-- amendment-applies: sections="Section A" pointer="2026-09-23 revision" -->
+MD
+check "a marker outside any amendment block cannot be checked" "${t}" 70 "outside any amendment heading"
+
+# A duplicated section name is reported as duplicated, not also as missing.
+t="$(new_tree duplicate-only-once)"
+python3 - "${t}/docs/adrs/0001-test-decision.md" <<'PYFIX'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("## Section B\n", "## Section A\n\nDuplicate (2026-09-23 amendment below).\n\n## Section B\n", 1)
+open(p, "w").write(s)
+PYFIX
+check "a duplicated section name is not also reported missing" "${t}" 70 "occurs 2 times"
 
 # A directory outside the repository is bad usage, not a finding.
 t="$(new_tree outside-root)"
