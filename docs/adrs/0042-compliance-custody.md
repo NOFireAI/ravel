@@ -50,7 +50,8 @@ and one real gap the pinned `object_store` version cannot close:
    No new crypto code in Ravel: the KMS call happens inside AWS S3
    itself on every PUT, exactly like any other SSE-KMS bucket. BYOK
    means "the tenant supplies their own `kms_key_id`", not "Ravel
-   manages keys."
+   manages keys." The per-tenant `S3Config` field is superseded by the
+   key-prefix routing amendment below; the BYOK posture is not.
 2. **Legal hold via the existing `LeaseCheck` seam, not S3 Object
    Lock.** The sweeper's crash-matrix design already provisioned a
    `LeaseCheck` hook
@@ -141,11 +142,13 @@ and one real gap the pinned `object_store` version cannot close:
   dev/test flows and the `make demo` quickstart are unaffected.
 - `S3Config`'s new `kms_key_id` is optional and per-tenant; a tenant
   with none configured gets today's behavior (whatever bucket-default
-  SSE the deployment has) unchanged.
+  SSE the deployment has) unchanged. Superseded by the key-prefix
+  routing amendment below: the field is process-wide and the per-tenant
+  part is a routing decorator.
 
 ## Amendment: decision 1's mechanism is key-prefix routing, not a per-tenant `S3Config` field
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision|Consequences" pointer="key-prefix routing amendment" -->
 
 Decision 1 as originally written says "`S3Config` gains an optional
 `kms_key_id: Option<String>` (per-tenant, sourced the same way tenant
