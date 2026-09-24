@@ -838,8 +838,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now surfaces, naming the failing key. What changes for a caller: on the
   column-stats HEAD and stats-object reads, a retryable error (throttling, a
   timeout, a transient blip) still degrades quietly, so only a non-retryable
-  error such as `AccessDenied` fails the query, instead of running without
-  column-statistics pruning; the scrubber logs the postings-tier and
+  error such as `AccessDenied` fails the query (the client sees "upstream
+  storage temporarily unavailable", not an integrity failure), instead of
+  running without column-statistics pruning; the scrubber logs the postings-tier and
   seal-divergence reads (at `error` and `warn` respectively) and retries next
   tick, as it already did for other failures there; and `ravel-cli catalog
   verify` exits nonzero instead of reporting "nothing folded yet". The
