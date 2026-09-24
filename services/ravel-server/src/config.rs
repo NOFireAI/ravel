@@ -1490,10 +1490,11 @@ pub struct Cli {
 
     /// Per-process ceiling on the object-store requests (LISTs and GETs) the
     /// catalog resolve path keeps in flight at once, across every concurrent
-    /// resolve. Unset, it is derived from this process's query concurrency `Q`
-    /// as `clamp(Q * 128, 128, 4096)`, then held at an interim 1,024 until the
+    /// resolve. Unset, it is derived from a query concurrency `Q` as
+    /// `clamp(Q * 128, 128, 4096)`, then held at an interim 1,024 until the
     /// ADR-1170 memory reservation lands; `Q` is `--max-concurrent-queries`
-    /// when that flag bounds queries, and the same `max(8, 2 * cores)` the
+    /// (the fleet-wide ceiling, so a replica sizes for the whole fleet's
+    /// queries) when that flag bounds queries, and the same `max(8, 2 * cores)` the
     /// other derived performance defaults use when it does not. Set
     /// explicitly, the value is used as given: neither the derivation nor the
     /// interim cap applies to it. Either way the resolved number is logged at
