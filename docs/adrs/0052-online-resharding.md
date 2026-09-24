@@ -162,7 +162,9 @@ new actor set). Routers refresh their view of the provisioning record
 on a bounded interval `C`; a router whose cached record is older than
 `C` MUST fail the flush closed (typed error, counter) rather than route
 on a stale view — the same fail-closed posture as ADR-0050, and the
-property the safety argument in section 3 needs.
+property the safety argument in section 3 needs. This unconditional MUST
+is relaxed by the bounded degraded-grace routing amendment below, which
+allows a bounded grace window before the router fails closed.
 
 ### 3. Activation protocol and the safety window
 
@@ -182,7 +184,9 @@ at most `max_flush_lifetime` (both bounded and enforced,
 crates/ravel-ingest/src/config.rs), plus inter-writer clock
 skew. Define slack `S` = ceil of (`max_flush_delay` +
 `max_flush_lifetime` + max tolerated clock skew) in hours; with today's
-defaults (500 ms + 3600 s) `S = 2` is safe.
+defaults (500 ms + 3600 s) `S = 2` is safe. The value is corrected to
+`S = 3` by the bounded degraded-grace routing amendment below, which
+also adds a normative clock-skew assumption to this safety argument.
 
 - **Increase (the common case): no slack needed.** A straggler routed
   under the old, smaller count lands in a shard index that is a subset
@@ -263,6 +267,8 @@ format-change principles vacuously — additive by being a no-op, no
 dual-reader ambiguity because the token never needed the count.
 
 ### 7. Key layout: no byte change, one semantic amendment
+
+<!-- amendment-applies: none reason="this is a decision of this ADR, not an amendment to it; the wording it amends lives in docs/catalog-and-mvcc.md, ADR-0010 section 9 and ravel-catalog, and no earlier text in this document is retired" -->
 
 No new key shapes, no changed encodings; `shard` stays a 4-digit
 decimal, which caps `shard_count` at 10000 (enforced at append). The
@@ -396,7 +402,7 @@ future, deliberate, compaction-shaped process.
 
 ## Amendment: bounded degraded-grace routing and clock-skew-covering read slack
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="2. Routing rule (write side)|3. Activation protocol and the safety window" pointer="bounded degraded-grace routing amendment" -->
 
 Two of section 3's assumptions turned out to be load-bearing in a way that turns ordinary operational conditions into an outage (the grace-window case) or a silent-invisibility correctness gap (the read-slack case). This amendment revises the normative posture accordingly. Both changes ship together and MUST NOT be reverted independently: the grace window's safety depends on the widened read slack.
 

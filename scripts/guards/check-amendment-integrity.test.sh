@@ -129,7 +129,7 @@ cat >"${t}/docs/adrs/0002-no-amendments.md" <<'MD'
 
 Nothing here has ever been amended.
 MD
-check "an ADR tree with zero amendment headings cannot be checked" "${t}" 70 "no '## Amendment' headings"
+check "an ADR tree with zero amendment headings cannot be checked" "${t}" 70 "no amendment headings found"
 
 t="$(new_tree bad-usage)"
 out="$(cd "${t}" && bash scripts/guards/check-amendment-integrity.sh docs/adrs extra-arg 2>&1)"; rc=$?

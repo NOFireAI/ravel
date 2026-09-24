@@ -156,8 +156,10 @@ decision).
 
 ## Proposed amendment (issue #533): make tier B advisory-that-can-block
 
+<!-- amendment-applies: none reason="a recorded proposal that adopts nothing; it retires no earlier wording, and the 2026-09-19 amendment below resolves it as not adopted" -->
+
 Status: Proposed. Needs an owner's decision; not adopted by the change that
-adds this text.
+adds this text. Resolved as not adopted by the 2026-09-19 amendment below.
 
 Issue #533 asks for a tier B that is "advisory-that-can-block, not silently
 informational". That is a different decision from decision 3 above, which
@@ -206,7 +208,7 @@ probation condition in view rather than by default.
 
 ## Amendment (2026-09-19): decision 3 resolved as advisory, not blocking; no self-hosted runner
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Proposed amendment (issue #533): make tier B advisory-that-can-block" pointer="2026-09-19 amendment" -->
 
 The owner decided on 2026-09-19 that this repository gets no self-hosted
 GitHub Actions runner. The repository is public, and a self-hosted runner

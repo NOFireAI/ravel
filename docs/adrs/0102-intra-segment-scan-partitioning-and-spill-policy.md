@@ -103,7 +103,10 @@ The shipped design (`crates/ravel-sql/src/logs_scan.rs`) resolves all four:
   drains a block. Every partition awaits the same computation through a
   shared `tokio::sync::OnceCell` (`compute_plan_counts`), so the
   per-segment surviving-block counts partition assignment needs exist
-  before partitions start draining, not after.
+  before partitions start draining, not after. The plan phase is skipped
+  entirely for a predicate-free full-window statement (#693 part 3
+  amendment below) and prunes by the query's own numeric arms (#761
+  amendment below).
 - **Fetch-cost gated on the read cache, not assumed away.** The whole
   object is still fetched with one `GetRange::Full` GET per partition per
   segment it touches (no ranged block reader — that's ADR-0107, explicitly
@@ -117,7 +120,7 @@ The shipped design (`crates/ravel-sql/src/logs_scan.rs`) resolves all four:
   `logs_scan_scaling` report measures both sides: on its fixture,
   cache-wired request count stays flat across the `target_partitions`
   sweep, and un-cached it is flat too, at one plan read plus one scan read
-  per segment, because segments are assigned whole (amendment below; the
+  per segment, because segments are assigned whole (#693 amendment below; the
   original draft had it climbing until the segment-count cap bound).
 - **Double-count fixed by assigning ownership of the whole-segment totals
   to one partition.** `blocks_total` and the postings-prune drop are
@@ -165,6 +168,8 @@ flag's
 default follows the measurement, not a guess.
 
 #### Amendment, 2026-08-26: aggregation state scales with partition count (issue #680)
+
+<!-- amendment-applies: none reason="this adds two session_config thresholds measured under decision 2; it changes where aggregation state lives, not what any earlier section decides, and it says so of decision 3's typed-error requirement in as many words" -->
 
 High-cardinality ClickBench statements (`q06_distinct_searchphrase`,
 `q09_region_distinct_users`, `q14_search_phrases_distinct_users`) exhausted an
@@ -287,6 +292,8 @@ fails typed via `DiskManager::create_tmp_file`'s own
 `ResourcesExhausted("... DiskManager is disabled")`, mapped through the
 same `SqlError::ResourcesExhausted` variant the aggregation path uses
 (distinct message, same typed error). Both paths need their own test.
+The pass-through message is no longer carried unchanged: the #740
+amendment below rewrites it to name the consumer that filled the pool.
 
 Add tests that drive (a) a high-cardinality final aggregation and (b) a
 large `ORDER BY` past the pool budget, and assert the typed
@@ -415,7 +422,7 @@ flowchart TB
 
 ## Amendment (2026-08-26, #693)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="1. Intra-segment partitioning — redesigned and shipped" pointer="#693 amendment" -->
 
 Intra-segment block striping (decision 1) applies only when the fetcher
 carries ADR-0046's read cache. Without it the scan is segment-granular: each
@@ -435,7 +442,7 @@ partition count.
 
 ## Amendment (2026-08-26, #693 part 3): predicate-free full-window whole-segment assignment
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="1. Intra-segment partitioning — redesigned and shipped" pointer="#693 part 3 amendment" -->
 
 Decision 1 stripes a snapshot's surviving blocks across partitions and resolves
 the per-segment surviving-block counts up front, once, through a plan phase
@@ -465,7 +472,8 @@ reuse `plan_segment`'s own fast-path gate per segment):
 2. the snapshot carries no pending selective erasure (folded into (1) via
    `LogQuery::erasure`), since erasure removes rows the committed counts still
    include;
-3. every relevant (ts-overlapping) segment is above the block-range threshold,
+3. every relevant (ts-overlapping) segment is above the block-range threshold
+   (that half of the conjunct is removed by the #739 amendment below),
    has a well-formed span, and is fully CONTAINED in the query window
    (`ts_min <= seg.min && seg.max <= ts_max`) — strictly stronger than the
    overlap the provider already pruned on, so every block of every relevant
@@ -484,7 +492,7 @@ recorded exactly once).
 
 ## Amendment (2026-08-26, #739): the block-range threshold is no longer a conjunct
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment (2026-08-26, #693 part 3): predicate-free full-window whole-segment assignment" pointer="#739 amendment" -->
 
 The amendment above lists four conjuncts, and conjunct 3 requires every relevant
 segment to be above the block-range threshold. That conjunct is removed. The
@@ -530,7 +538,7 @@ inferring it from GET counts.
 
 ## Amendment (2026-08-26, #761): the plan phase and the fetch prune by the numeric arms
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="1. Intra-segment partitioning — redesigned and shipped" pointer="#761 amendment" -->
 
 Decision 1's plan phase (`compute_plan_counts` -> `plan_segment`) resolves each
 segment's surviving-block count before any partition drains a block, and the
@@ -603,7 +611,7 @@ reads that segment whole, exactly as before.
 
 ## Amendment (2026-08-27, #740): the pass-through spill error misattributes, and `GroupValues::size()` under-counts
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="3. Disable the disk manager explicitly; spill is a typed error, not silent degradation" pointer="#740 amendment" -->
 
 Decision 3 above shipped the disabled-disk-manager spill as a typed
 `ResourcesExhausted`, mapped through unchanged from whatever DataFusion 54
