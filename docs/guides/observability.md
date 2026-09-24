@@ -1507,7 +1507,7 @@ operational depth.
 | `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal. |
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
 | `ravel_ingest_body_conversions_total` | Log records whose structured (array or map) body was converted to canonical JSON text at normalization, by tenant and signal. Not a rejection, and not a count of stored records: see "Neither rule alerts on" below. |
-| `ravel_ingest_resource_attrs_dropped_total` | Metric resource attributes outside the configured allowlist, dropped rather than turned into labels, by tenant and signal. Not a rejection: the point that carried them was admitted. See "Resource attributes outside the allowlist" below. |
+| `ravel_ingest_resource_attrs_dropped_total` | Metric resource attributes outside the configured allowlist, dropped rather than turned into labels, by tenant, for the metrics signal only. Not a rejection: counted before the series cap and the write, so not a count of stored points. Covers OTLP HTTP and OTLP gRPC ingest only; OTAP is not covered, since it builds no resource labels at all. See "Resource attributes outside the allowlist" below. |
 | `ravel_admission_reconciliation_failures_total` | Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, by tenant and signal; the last-known soft threshold stays in force. |
 
 Four more series report the reconciliation cycle itself. They carry `mode`
@@ -1667,9 +1667,12 @@ one series.
 attributes, not points: one resource with five out-of-allowlist attributes
 adds 5, regardless of how many points that resource carried. It is
 informational like `ravel_ingest_body_conversions_total`, not a `reason` on
-`ravel_admission_rejected_total`, for the same reason: the point that carried
-the dropped attributes was admitted, and an operator alerting on rejection
-reasons must see nothing from it. The dropped attributes' key names are
+`ravel_admission_rejected_total`, for the same reason: it is counted before
+the series cap and the write, so not a count of stored points, and an
+operator alerting on rejection reasons must see nothing from it. It covers
+OTLP HTTP and OTLP gRPC ingest, for the metrics signal only; OTAP is not
+covered, since its normalizer builds no resource labels at all, and
+logs/traces never build them either. The dropped attributes' key names are
 deliberately not reported anywhere, on this counter or in the OTLP
 partial-success `error_message`: a resource attribute's key is caller-supplied
 and unbounded, so turning it into a label or a per-key series would hand a

@@ -17,15 +17,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   two resources differing only in such an attribute would flatten to the same
   label set and merge into one series with no signal that it had happened.
   Attributes outside the allowlist are **still dropped**: this is visibility
-  only, not a fix to the drop itself or a way to configure the allowlist.
-  The count (not the dropped keys, which are caller-controlled and
-  unbounded) is carried as an informational `Rejection::ResourceAttributesDropped`
-  from `ravel-otlp`, rendered on `GET /metrics` as
-  `ravel_ingest_resource_attrs_dropped_total` by tenant and signal (mirroring
-  `ravel_ingest_body_conversions_total`, not a `reason` on
-  `ravel_admission_rejected_total`, since the point that carried the
-  attributes was still admitted), and reaches the OTLP partial-success
-  `error_message` the same way every other rejection already does.
+  only, not a fix to the drop itself or a way to configure the allowlist
+  (not configurable today). The count (not the dropped keys, which are
+  caller-controlled and unbounded) is carried internally as an informational
+  `Rejection::ResourceAttributesDropped` from `ravel-otlp`, rendered on
+  `GET /metrics` as `ravel_ingest_resource_attrs_dropped_total` by tenant,
+  for the metrics signal only (mirroring `ravel_ingest_body_conversions_total`,
+  not a `reason` on `ravel_admission_rejected_total`, since it is counted
+  before the series cap and the write, so not a count of stored points), and
+  never reaches the OTLP partial-success response: every stock OpenTelemetry
+  SDK resource carries `telemetry.sdk.*` attributes the default allowlist
+  does not cover, so surfacing this to senders would flag nearly every clean
+  export as partial. Covers OTLP HTTP and OTLP gRPC ingest only; OTAP builds
+  no resource labels at all, so it is not covered.
 
 - **Prometheus alert rules ship in `deploy/prometheus/ravel.rules.yaml`**
   (issue #1730). `deploy/` previously held one dashboard graphing host CPU,
