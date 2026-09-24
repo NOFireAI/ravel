@@ -7600,6 +7600,184 @@ mod tests {
         );
     }
 
+    /// Issue #1976: `resolve_stats_head`'s HEAD GET must surface a
+    /// non-`NotFound` failure as a real error, not read as "nothing folded
+    /// yet". Caller: `ravel_sql::executor` (via `Catalog::load_column_stats`),
+    /// which propagates with `?` straight into the query's own error.
+    #[tokio::test]
+    async fn load_column_stats_head_get_permanent_failure_surfaces_as_error() {
+        let inner = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let part_hash = *blake3::hash(b"part-head-fault").as_bytes();
+        install_logs_stats(&inner, part_hash, 1).await;
+
+        let key = crate::fold::head_object_key(&tenant(), signal);
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(key.clone()),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let err = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect_err("a non-NotFound GET failure on the HEAD must surface as an error");
+        match err {
+            column_stats_resolve::LoadColumnStatsError::Store { key: err_key, .. } => {
+                assert_eq!(err_key, key, "error names the failing key");
+            }
+            other => panic!("expected LoadColumnStatsError::Store, got {other:?}"),
+        }
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
+    /// The counterpart to
+    /// `load_column_stats_head_get_permanent_failure_surfaces_as_error`: a
+    /// genuine `NotFound` on the HEAD (modeled with `NotFoundBlip`) is the
+    /// ordinary "nothing folded yet" case and must still degrade quietly to
+    /// `Ok(None)`, exactly as before this fix.
+    #[tokio::test]
+    async fn load_column_stats_head_get_not_found_blip_still_degrades_to_none() {
+        let inner = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let part_hash = *blake3::hash(b"part-head-blip").as_bytes();
+        install_logs_stats(&inner, part_hash, 1).await;
+
+        let key = crate::fold::head_object_key(&tenant(), signal);
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(key));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("a NotFound on the HEAD must degrade to Ok(None), never an error");
+        assert!(loaded.is_none());
+        assert!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
+    /// Issue #1976: `fetch_stats_object`'s GET of the resolved per-part v3
+    /// object must surface a non-`NotFound` failure as a real error, not be
+    /// read as "part simply uncovered". Same caller as the HEAD-GET tests
+    /// above.
+    #[tokio::test]
+    async fn load_column_stats_object_get_permanent_failure_surfaces_as_error() {
+        let inner = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let part_hash = *blake3::hash(b"part-object-fault").as_bytes();
+        install_logs_stats(&inner, part_hash, 1).await;
+
+        let head_bytes = inner
+            .get(
+                &crate::fold::head_object_key(&tenant(), signal),
+                GetRange::Full,
+            )
+            .await
+            .expect("head")
+            .data;
+        let head = crate::snapshot_format::decode_head(&head_bytes).expect("decode head");
+        let stats_key = head
+            .parts
+            .first()
+            .and_then(|p| p.column_stats.as_ref())
+            .expect("column_stats ref")
+            .key
+            .clone();
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(stats_key.clone()),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let err = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect_err("a non-NotFound GET failure on the stats object must surface as an error");
+        match err {
+            column_stats_resolve::LoadColumnStatsError::Store { key: err_key, .. } => {
+                assert_eq!(err_key, stats_key, "error names the failing key");
+            }
+            other => panic!("expected LoadColumnStatsError::Store, got {other:?}"),
+        }
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
+    /// The counterpart to
+    /// `load_column_stats_object_get_permanent_failure_surfaces_as_error`: a
+    /// genuine `NotFound` on the stats object (modeled with `NotFoundBlip`)
+    /// must still degrade quietly to the part being left uncovered, exactly
+    /// as before this fix.
+    #[tokio::test]
+    async fn load_column_stats_object_get_not_found_blip_still_degrades_to_none() {
+        let inner = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let part_hash = *blake3::hash(b"part-object-blip").as_bytes();
+        install_logs_stats(&inner, part_hash, 1).await;
+
+        let head_bytes = inner
+            .get(
+                &crate::fold::head_object_key(&tenant(), signal),
+                GetRange::Full,
+            )
+            .await
+            .expect("head")
+            .data;
+        let head = crate::snapshot_format::decode_head(&head_bytes).expect("decode head");
+        let stats_key = head
+            .parts
+            .first()
+            .and_then(|p| p.column_stats.as_ref())
+            .expect("column_stats ref")
+            .key
+            .clone();
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(stats_key),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("a NotFound on the stats object must degrade quietly, never an error");
+        assert!(
+            loaded.is_none(),
+            "the one part is simply left uncovered, with no other part to load: {loaded:?}"
+        );
+        assert!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
     /// Write a folded HEAD plus its per-part v3 `.cstat` object (ADR-1413
     /// decision 6, #1600: the v3 per-part ref is the only surviving published
     /// form) for `tenant`/`signal`, whose one segment carries a single I64
