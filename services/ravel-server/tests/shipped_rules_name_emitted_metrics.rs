@@ -553,9 +553,11 @@ fn parse_rule_file(text: &str) -> Result<Vec<RuleGroup>, String> {
 /// unit order, and with no fractional numbers. Units, largest to smallest:
 /// `y`, `w`, `d`, `h`, `m`, `s`, `ms`.
 ///
-/// This is the same syntactic check Prometheus applies when it loads a rule
-/// file; it says nothing about whether the duration is a reasonable value,
-/// only whether Prometheus would accept the text at all.
+/// This accepts a strict subset of what Prometheus accepts when it loads a
+/// rule file: Prometheus also takes a bare unitless `0`, which this refuses,
+/// so it can reject a file Prometheus would load but never pass one
+/// Prometheus would refuse. It says nothing about whether the duration is a
+/// reasonable value.
 fn validate_duration(text: &str) -> Result<(), String> {
     const UNITS: [&str; 7] = ["y", "w", "d", "h", "m", "s", "ms"];
     if text.is_empty() {
