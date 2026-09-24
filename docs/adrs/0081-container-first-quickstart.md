@@ -77,7 +77,9 @@ The image deliberately has no default `CMD` — the root `Dockerfile` records th
 therefore passes them explicitly: `--mode all --store s3 --listen-http
 0.0.0.0:4318 --listen-grpc 0.0.0.0:4317 --shards 4 --tenant-token
 demo-token=demo-tenant`, with the `RAVEL_S3_*` environment fallbacks supplying
-the MinIO endpoint, bucket, region, and credentials.
+the MinIO endpoint, bucket, region, and credentials. This vector is
+incomplete as written: A1 and A2 in the Amendments section below add the
+store qualification step and the tenant-hash scheme.
 
 Binding `0.0.0.0` is forced by the container boundary, and it has one
 consequence worth stating: `--dev-insecure-tenant-header` "refuses to enable
@@ -109,7 +111,9 @@ Blocks the reader is meant to run carry an explicit marker comment.
 `scripts/check-readme-commands.sh` extracts the marked set, runs each against a
 live stack, and asserts the documented outcome — not merely a zero exit, since
 `curl` exits zero on an HTTP 401 and on a JSON error envelope. A wrong port,
-table name, or missing header fails the job.
+table name, or missing header fails the job. A4 in the Amendments
+section below retires "an outcome both generators produce" as the
+readiness query rule.
 
 Two constraints follow from decision 3, and are binding on which blocks may be
 marked. CI brings up **the same compose file the reader runs**, collector
@@ -182,7 +186,9 @@ launders a real failure as background noise.
 `demo/kill-and-recover.sh` ingests under strict acknowledgement, captures the
 `x-ravel-commit-token`, hard-kills the server container, restarts it from empty,
 queries with `min_commit_token`, and exits non-zero if the sample is absent or
-the token is unsatisfiable. The artifact under test is the script, which fails
+the token is unsatisfiable. "Restarts it from empty" is read by A3 in the
+Amendments section below as replacing the container, not starting it
+again. The artifact under test is the script, which fails
 loudly on its own; the GIF is a recording of a passing run. Recording is a local
 step, not a CI step — CI runs the assertions.
 
@@ -250,6 +256,8 @@ not prove the data survives a process kill, which is Ravel's actual claim. The
 dashboard is the hook; the kill script is the evidence.
 
 ## Amendments
+
+<!-- amendment-applies: sections="Decision" pointer="Amendments section below" -->
 
 Four things this ADR got wrong or left unsaid, found while implementing it.
 Recorded here rather than silently patched into the decisions above, so the

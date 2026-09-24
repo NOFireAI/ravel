@@ -238,6 +238,9 @@ visible and reportable.
   both advertised bounds are admission-bounded. `end_ts < start_ts` is
   rejected outright. Consequence: a span longer than `max_ingest_lag`, or
   reported later than that after it started, is rejected at admission.
+  This span sentence is superseded by the fail-closed ingest-timestamp
+  plausibility amendment below: the lag bound moves from the span's start
+  to its end.
 
 The defaults are the same 10 m / 2 h the metrics path uses, because the
 catalog listing window (crates/ravel-catalog/src/config.rs) is one shared
@@ -449,6 +452,8 @@ ADR, not this one.
 - Long-running spans (duration > `max_ingest_lag`) are rejected at
   admission under the default 2 h window; deployments that need them
   raise the lag together with the catalog window config.
+  Superseded by the fail-closed ingest-timestamp plausibility amendment
+  below: a long-running span whose end is in window is admitted.
 - Senders with skewed clocks now see log/span rejections where they saw
   silent acceptance; that is the point, but it is a behavior change for
   any pipeline that was (unknowingly) storing unqueryable records.
@@ -464,7 +469,7 @@ ADR, not this one.
 
 ## Amendment: fail-closed ingest-timestamp plausibility
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="4. Event-time skew bounds for logs and spans|Consequences" pointer="fail-closed ingest-timestamp plausibility amendment" -->
 
 This amendment appends to the original decision; where it supersedes a
 sentence of §4 or a Consequences bullet, it says so explicitly.

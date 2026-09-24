@@ -293,6 +293,8 @@ same rehearsal-record discipline as §3.
 
 ### 5. ADR-0058 amendment
 
+<!-- amendment-applies: none reason="this is a decision of this ADR that amends ADR-0058; no earlier wording in this document is retired" -->
+
 ADR-0058 decision 5's document graduates from "honest statement of what
 does not exist" to the normative runbook above. Decisions 1–4 of ADR-0058
 (orphan-presence gauge, reconstruction tool, Admin `c/**` write grant,
