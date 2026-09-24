@@ -132,7 +132,11 @@ independently testable fetchers stay clearer than one with conditionals.
      doesn't carry the etag forward) is a #362/#363 interface question
      for decompose, not an ADR decision — either way, every block-range
      GET this fetcher issues checks against whichever etag was current
-     when the block extents it's trusting were read.
+     when the block extents it's trusting were read. The probe is no
+     longer the only place that pin can be established: given a footer
+     carried from the plan phase, the open skips its own probe and pins
+     on the first live section or block GET instead, by the footer-carry
+     amendment below.
    - A `NotFound` on any GET in the sequence (probe or block range) maps
      to the same `SnapshotInvalidated` path a whole-object `NotFound`
      already takes for a pinned segment (ADR-0018's compaction-race
@@ -143,8 +147,10 @@ independently testable fetchers stay clearer than one with conditionals.
      window in which that race is *observable* (multiple GETs instead of
      one) without introducing a new failure mode.
    - Bounds concurrency through the same shared-semaphore pattern
-     `SegmentFetcher` uses (superseded by the ADR-1195 amendment below):
-     sized independently for RLOG's call volume.
+     `SegmentFetcher` uses: sized independently for RLOG's call volume
+     (superseded by the ADR-1195 amendment below, which puts RLOG on the
+     one process-wide pool; the #700 amendment below says what that
+     independent sizing was while it stood).
 2. **Cache key needs no schema change.** `CacheKey` is already
    `(tenant_hash, content_hash, offset, len)` (ADR-0046, confirmed current
    at `crates/ravel-cache/src/key.rs`), which is range-shaped today purely
@@ -298,7 +304,7 @@ flowchart LR
 
 ## Amendment 2026-08-26 (issue #700)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="#700 amendment" -->
 
 "Sized independently for RLOG's call volume" in decision 1 means the RLOG
 permit pool is separate from RSEG's (superseded by the ADR-1195 amendment
@@ -312,7 +318,7 @@ the same 160 s at `--fetch-concurrency` 16 and 32.
 
 ## Amendment 2026-09-05 (ADR-1195): the RLOG permit pool is the shared GET limiter
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision|Amendment 2026-08-26 (issue #700)" pointer="ADR-1195 amendment" -->
 <!-- amendment-supersedes: phrase="sized independently for RLOG's call volume" pointer="ADR-1195 amendment" -->
 <!-- amendment-supersedes: phrase="separate from RSEG's" pointer="ADR-1195 amendment" -->
 
@@ -345,7 +351,7 @@ that limiter is the one process-wide pool described above
 
 ## Amendment 2026-08-26 (issue #693 part 3): a footer carried from the plan phase establishes the etag pin on the first data GET
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="footer-carry amendment" -->
 
 Decision 1 establishes the mandatory etag pin on the suffix probe: the probe is
 the first live GET of the sequence, so its etag is what every later block-range
@@ -379,13 +385,14 @@ buffer with a zeroed trailer.
 
 ## Amendment 2026-09-05 (issue #835): the plan phase's whole-object fallback carries its bytes into the scan
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="this covers the plan phase's own fallback read, which no decision in this ADR describes: decision 1 is the scan-side block-range fetcher, and the read-count wording this amendment corrects lives in docs/query-engine.md rather than here; what it adds is the carry and its memory bound, retiring nothing above" -->
 
 The amendment above carries a *footer* from the plan phase's predicate-free
 fast path so the scan skips its own probe. It does not cover the fallback
-this ADR's "Requests per object" section already describes: a predicate the
-skip index cannot decide (`has_word`/text, an `attrs` POSTINGS equality, a
-stream filter) makes `plan_segment` read the WHOLE object to count survivors,
+that `docs/query-engine.md`'s "Requests per object on a version-4 object"
+section describes: a predicate the skip index cannot decide
+(`has_word`/text, an `attrs` POSTINGS equality, a stream filter) makes
+`plan_segment` read the WHOLE object to count survivors,
 counted in `plan_full_reads`, and forwards no footer. `plan_full_reads` counts
 those fallback reads, not wire GETs: the read goes through ADR-0046's read
 cache, so a counted read can be served from cache and issue no store GET at
