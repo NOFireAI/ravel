@@ -479,7 +479,12 @@ fn normalize_resource(
     }
 
     let resource_labels = match build_resource_labels(resource, limits) {
-        Ok(labels) => labels,
+        Ok((labels, dropped)) => {
+            if dropped > 0 {
+                rejected.push(Rejection::ResourceAttributesDropped { count: dropped });
+            }
+            labels
+        }
         Err(reason) => {
             rejected.push(Rejection::Grouped {
                 reason: Box::new(reason),
@@ -1638,18 +1643,45 @@ fn explode_summary(
     Ok(series)
 }
 
+/// The three resource attribute keys `build_resource_labels` consumes for
+/// `job`/`instance` rather than through the configured allowlist. Shared
+/// between the label-building loop and the dropped-attribute count so the
+/// two can never disagree about which keys are "consumed".
+const JOB_INSTANCE_SOURCE_KEYS: [&str; 3] =
+    ["service.name", "service.namespace", "service.instance.id"];
+
+/// Builds the resource-derived labels, plus how many of the resource's own
+/// attributes were outside both the job/instance mapping and the configured
+/// allowlist and so were dropped. Counted per attribute occurrence on the
+/// resource (one entry in `resource.attributes` per unit), not per data
+/// point under it: a resource with 3 out-of-allowlist attributes returns 3
+/// regardless of how many points it carries, and a caller multiplies by
+/// nothing before recording it. Normative description:
+/// docs/guides/observability.md.
+///
+/// The count is a lower bound, not an exact figure, in two edge cases where
+/// a key matches by name but produces no label: a second occurrence of a
+/// job/instance-source or allowlisted key (`find_attr_value` takes only the
+/// first match, so a repeated key's later values are never looked at, but
+/// every occurrence still matches by key and so is excluded here), and an
+/// occurrence whose value is empty (`push_checked` drops an empty-value
+/// label per ADR-0038, but the count already excluded it by key before
+/// that happens). Both are pre-existing gaps in what "dropped" means here,
+/// not something this count was built to catch; a key match, not "produced
+/// a label", is what excludes an attribute from the count.
 fn build_resource_labels(
     resource: Option<&Resource>,
     limits: &IngestLimits,
-) -> Result<Vec<Label>, Rejection> {
+) -> Result<(Vec<Label>, usize), Rejection> {
     let Some(resource) = resource else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
 
     let mut labels = Vec::new();
 
     let service_name = find_attr_value(&resource.attributes, "service.name")?;
     let service_namespace = find_attr_value(&resource.attributes, "service.namespace")?;
+    let has_service_name = service_name.is_some();
     if let Some(name) = service_name {
         let job = match service_namespace {
             Some(ns) if !ns.is_empty() => format!("{ns}/{name}"),
@@ -1677,7 +1709,28 @@ fn build_resource_labels(
         }
     }
 
-    Ok(labels)
+    let dropped = resource
+        .attributes
+        .iter()
+        .filter(|kv| {
+            // `service.namespace` is only actually consumed above when
+            // `service.name` is present; without a name its value feeds
+            // nothing, so it must count as dropped like any other unused
+            // attribute rather than being blanket-excluded with the two keys
+            // that are always consumed.
+            let consumed = match kv.key.as_str() {
+                "service.namespace" => has_service_name,
+                key => JOB_INSTANCE_SOURCE_KEYS.contains(&key),
+            };
+            !consumed
+                && !limits
+                    .resource_attribute_allowlist
+                    .iter()
+                    .any(|allowed| allowed == &kv.key)
+        })
+        .count();
+
+    Ok((labels, dropped))
 }
 
 /// Push a resource-derived label after enforcing the same length limits
@@ -2006,6 +2059,7 @@ fn is_label_name_continue(c: char) -> bool {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::limits::resource_attrs_dropped_from_rejections;
     use opentelemetry_proto::tonic::metrics::v1::{
         Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
         ScopeMetrics, Sum, Summary, summary_data_point,
@@ -2314,7 +2368,9 @@ mod tests {
 
     #[test]
     fn no_job_label_without_service_name() {
-        // namespace alone, no service.name: nothing to synthesize job from.
+        // namespace alone, no service.name: nothing to synthesize job from,
+        // so the namespace's value is consumed by nothing and counts as
+        // dropped, exactly like any other unused attribute (issue #116).
         let rm = resource_metrics(
             vec![string_kv("service.namespace", "payments")],
             vec![gauge_metric(
@@ -2328,8 +2384,12 @@ mod tests {
             &IngestLimits::default(),
             1_000,
         );
-        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points[0].labels.get("job"), None);
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResourceAttributesDropped { count: 1 }]
+        );
+        assert_eq!(resource_attrs_dropped_from_rejections(&out.rejected), 1);
     }
 
     // --- allowlist flattening ---
@@ -2355,7 +2415,13 @@ mod tests {
             &IngestLimits::default(),
             1_000,
         );
-        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        // `some.other.attr` is outside the allowlist and not a job/instance
+        // source key, so it is informationally counted as dropped (issue
+        // #116), not rejected: it costs the point nothing.
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResourceAttributesDropped { count: 1 }]
+        );
         let labels = &out.points[0].labels;
         assert_eq!(labels.get("job"), Some("svc"));
         assert_eq!(labels.get("k8s_pod_name"), Some("pod-abc"));
@@ -2420,6 +2486,97 @@ mod tests {
             out_resource.points[0].series_id,
             out_attr.points[0].series_id
         );
+    }
+
+    // --- resource attribute drop counting (issue #116) ---
+
+    #[test]
+    fn resource_attributes_fully_covered_by_allowlist_drop_nothing() {
+        // Every attribute on the resource is either a job/instance source key
+        // or in the default allowlist, so nothing is dropped: exactly 0, not
+        // merely "no rejection of a different kind".
+        let rm = resource_metrics(
+            vec![
+                string_kv("service.name", "svc"),
+                string_kv("k8s.pod.name", "pod-abc"),
+                string_kv("host.name", "node1"),
+            ],
+            vec![gauge_metric(
+                "up",
+                vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(resource_attrs_dropped_from_rejections(&out.rejected), 0);
+    }
+
+    #[test]
+    fn three_unlisted_resource_attributes_drop_exactly_three() {
+        // Three attributes outside both the allowlist and the job/instance
+        // mapping must count as exactly 3, regardless of how many points the
+        // resource carries (two points here).
+        let rm = resource_metrics(
+            vec![
+                string_kv("service.name", "svc"),
+                string_kv("team", "payments"),
+                string_kv("region.code", "us-east"),
+                string_kv("build.id", "abc123"),
+            ],
+            vec![gauge_metric(
+                "up",
+                vec![
+                    number_point(vec![], 1_000, NumberValue::AsDouble(1.0)),
+                    number_point(vec![], 1_001, NumberValue::AsDouble(2.0)),
+                ],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResourceAttributesDropped { count: 3 }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), 0);
+        assert_eq!(out.rejected[0].admission_class(), None);
+        assert_eq!(resource_attrs_dropped_from_rejections(&out.rejected), 3);
+        // The points themselves are unaffected: both are admitted.
+        assert_eq!(out.points.len(), 2);
+    }
+
+    #[test]
+    fn job_instance_source_keys_are_never_counted_as_dropped() {
+        // service.name/service.namespace/service.instance.id are consumed
+        // into job/instance, not the allowlist, and must not be counted as
+        // dropped even though none of the three is itself an allowlist entry.
+        let rm = resource_metrics(
+            vec![
+                string_kv("service.name", "checkout"),
+                string_kv("service.namespace", "payments"),
+                string_kv("service.instance.id", "pod-1"),
+            ],
+            vec![gauge_metric(
+                "requests",
+                vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(resource_attrs_dropped_from_rejections(&out.rejected), 0);
     }
 
     // --- sanitization collisions -> duplicate rejection ---

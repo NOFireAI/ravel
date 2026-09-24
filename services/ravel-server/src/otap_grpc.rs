@@ -362,6 +362,16 @@ async fn write_batch(
         ravel_types::Signal::Metrics,
         NormalizeRejectCounts::from_metric_rejections(&normalized.rejected),
     );
+    // No resource_attrs_dropped recording here: OTAP's normalizer builds no
+    // job/instance/allowlist labels from resource attributes at all (unlike
+    // the OTLP path), so every resource attribute is dropped by design, not
+    // exception, and `normalized.rejected` never carries a
+    // `ResourceAttributesDropped` entry to count. Calling the OTLP-path
+    // recorder here would only ever record 0, which reads as "nothing was
+    // dropped" on a transport that drops everything. See
+    // `ravel_ingest_resource_attrs_dropped_total`'s HELP text and
+    // docs/guides/observability.md: the counter covers OTLP HTTP and OTLP
+    // gRPC only.
     // Synchronous, no I/O, off the acknowledgement path: see the twin call in
     // `crate::ingest::handle_export`.
     if let Some(sink) = &ingest.metadata_sink {

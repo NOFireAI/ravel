@@ -26,7 +26,10 @@ pub mod promcompat;
 pub mod traces_limits;
 pub mod traces_normalize;
 
-pub use limits::{AdmissionClass, IngestLimits, NormalizeRejectCounts, Rejection};
+pub use limits::{
+    AdmissionClass, IngestLimits, NormalizeRejectCounts, Rejection,
+    resource_attrs_dropped_from_rejections,
+};
 pub use logs_limits::{LogIngestLimits, LogRejection};
 pub use logs_normalize::{LogNormalizeOutput, NormalizedLogRecord, normalize_logs};
 pub use metadata::{MetricKind, MetricMetadata};
