@@ -37,9 +37,9 @@ of leaving a rule here matching no series. Parsing rather than scanning is
 what makes the rule count mean something: a corruption that leaves the
 `- alert:` lines intact keeps a string count at 32 while Prometheus refuses
 the whole file, and the reader the test uses refuses any line it cannot
-account for, so that corruption fails there instead. It checks structure
-only: a malformed `for:` duration or a broken `expr` is caught by Prometheus
-on load rather than by the test (issue #1928).
+account for, so that corruption fails there instead. It also checks the
+`for:` duration against Prometheus's duration grammar and parses every
+`expr` with Ravel's own PromQL parser.
 
 The same test parses the six fenced `yaml` blocks the
 [observability guide](../docs/guides/observability.md) prints, and asserts
