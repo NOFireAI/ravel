@@ -846,6 +846,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   log line: no metric counts these faults, so an alert on them has to come
   from logs rather than from `/metrics`.
 
+- **A `/readyz` test now pins the false-healthy window the store-probe
+  liveness gauge exists to expose** (issue #1963).
+  `store_probe_last_run_gauge_goes_stale_while_readyz_stays_green` never
+  started a server or queried `/readyz` despite its name, so nothing
+  covered the behaviour issue #1728 added the gauge for: a dead probe task
+  leaves `store_reachable()` frozen at `true`, so `/readyz` keeps answering
+  200 while the gauge goes stale. The test now starts a server as the
+  neighbouring `/readyz` tests do and asserts the endpoint through the
+  whole sequence -- 200 once the store is reachable, still 200 while the
+  gauge goes stale and reachability holds, and 503 once reachability flips.
+  That last assertion is what makes the coverage real: removing
+  `store_reachable()` from `Readiness::is_ready`'s conjunction leaves
+  `/readyz` at 200 and breaks it, where a test asserting only the 200 cases
+  would have passed against the broken code. It also pins that a failing
+  probe cycle still advances the gauge, which a success-branch-only
+  implementation would leave stuck.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added
