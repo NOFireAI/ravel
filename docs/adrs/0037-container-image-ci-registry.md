@@ -97,7 +97,9 @@ repo config).
    `check`/`coverage`/`k8s-integration`. Tag pushes and manual dispatch
    are infrequent enough that the same cache-miss cost is acceptable.
    Per-main-commit images are deferred to the same arm64/prebuilt
-   follow-up as multi-arch, not solved here. No tag scheme exists yet in
+   follow-up as multi-arch, not solved here (multi-arch itself ships in
+   the multi-architecture publishing amendment below; per-main-commit
+   publishing stays deferred). No tag scheme exists yet in
    the repo (workspace version is `0.1.0` pre-release, no git tags cut);
    this ADR establishes the first one. What a tag names and what a tag
    push does are both amended below by the verifiable release artifacts
@@ -149,7 +151,8 @@ repo config).
   list, which is a larger, independently reviewable change. Nothing in
   the current deploy targets (kind on the CI host, `deploy/k8s/`
   examples) requires arm64 images today. Tracked as a follow-up, not
-  blocking amd64 publishing.
+  blocking amd64 publishing (the multi-architecture publishing amendment
+  below ships it).
 - **Publishing from `Dockerfile.prebuilt`.** Rejected in decision 2: its
   glibc and binary-set differences from the shipping image are
   deliberate CI-lane optimizations, not properties a published,
@@ -171,7 +174,9 @@ repo config).
   also contending the shared 10 GB GHA cache with `check`/`coverage`/
   `k8s-integration`. Tag pushes and manual dispatch are infrequent
   enough to absorb that cost; per-main-commit images are deferred to
-  the arm64/prebuilt-image follow-up.
+  the arm64/prebuilt-image follow-up (multi-arch itself ships in the
+  multi-architecture publishing amendment below; per-main-commit
+  publishing stays deferred).
 
 ## Consequences
 
@@ -183,7 +188,8 @@ repo config).
   source for the first time; `deploy/k8s/operator/operator.yaml`'s
   placeholder tag now has a stated real-world replacement.
 - arm64 images remain a known gap, explicitly deferred rather than
-  silently absent.
+  silently absent (resolved by the multi-architecture publishing
+  amendment below).
 - No image is published on an ordinary main-branch push; a release
   requires cutting a `vX.Y.Z` tag or running `workflow_dispatch`.
 - The published packages are private until someone completes the
@@ -295,7 +301,8 @@ a pre-existing digest sees a new digest on the next publish (true of any
 rebuild) and any tooling that assumes `manifest inspect` returns a
 single image manifest must handle an index (true since v0.9.0). The
 multi-arch deferral in Rejected alternatives is unchanged; when arm64
-arrives it slots into the same index.
+arrives it slots into the same index (multi-architecture publishing amendment
+below assembles it differently; see decision 13).
 
 ### Decision 9: CI gates the tag, explicitly (amends decision 4)
 
@@ -391,7 +398,12 @@ symlink pointing outside the repository.
 
 ## Amendment: multi-architecture publishing
 
-<!-- amendment-applies: sections="Decision|Amendment: verifiable release artifacts" pointer="multi-architecture publishing amendment" -->
+<!-- amendment-applies: sections="Decision|Rejected alternatives|Consequences|Amendment: verifiable release artifacts" pointer="multi-architecture publishing amendment" -->
+<!-- amendment-supersedes: phrase="deferred to the same arm64/prebuilt follow-up as multi-arch" pointer="multi-architecture publishing amendment" -->
+<!-- amendment-supersedes: phrase="tracked as a follow-up, not blocking amd64 publishing" pointer="multi-architecture publishing amendment" -->
+<!-- amendment-supersedes: phrase="deferred to the arm64/prebuilt-image follow-up" pointer="multi-architecture publishing amendment" -->
+<!-- amendment-supersedes: phrase="arm64 images remain a known gap, explicitly deferred rather than silently absent" pointer="multi-architecture publishing amendment" -->
+<!-- amendment-supersedes: phrase="the multi-arch deferral in rejected alternatives is unchanged" pointer="multi-architecture publishing amendment" -->
 
 The original ADR deferred multi-arch rather than rejecting it, on two
 conditions that have both changed. It said nothing in the deploy targets
