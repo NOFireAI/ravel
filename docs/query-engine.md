@@ -935,7 +935,9 @@ second and touches segment data.
 
 `CatalogConfig::resolve_get_concurrency` bounds how many of these listing
 and record-GET requests one `Catalog` instance keeps in flight at once, via
-a per-instance `tokio::sync::Semaphore`. It defaults to 128 and is rejected
+a per-instance `tokio::sync::Semaphore`. Its `CatalogConfig` default is 128,
+which is the FLOOR rather than the value a server runs on (see the
+derivation below), and it is rejected
 at construction time (a typed `CatalogError::InvalidConfig`, never a silent
 clamp to 1) if configured to `0`, since a zero-permit semaphore would
 deadlock every resolve, or above `MAX_RESOLVE_GET_CONCURRENCY` (4096), because
@@ -967,10 +969,59 @@ shard-hour.
 This bounds one `Catalog` instance, not the process: `ravel-server` builds
 exactly one `Catalog` and shares it (an `Arc` clone per request, one
 underlying `request_semaphore`), so N concurrent queries against that
-instance are capped at 128 in flight TOTAL, not `N * 128`. `N * 128` in flight
-holds only across N distinct `Catalog` instances (separate CLI invocations
-or tests), never within one running server. A process-wide cap across
-instances is not implemented and is tracked as a follow-up.
+instance are capped at this many in flight TOTAL, not N times it. N times it
+in flight holds only across N distinct `Catalog` instances (separate CLI
+invocations or tests), never within one running server. A process-wide cap
+across instances is not implemented and is tracked as a follow-up.
+
+Because the bound is process-wide, a fixed 128 made cold-resolve throughput
+a property of the process count alone: at the same 30ms round trip, 128
+permits sustain about 4,267 requests/s for the whole process, so a host with
+more cores served no more cold resolves per second than one with fewer. The
+width `ravel-server` configures is therefore derived (ADR-1733 decision 2,
+`ravel_catalog::derive_resolve_get_concurrency`) as `4 * Q` clamped into
+`[128, 479]`, where `Q` is the process's query concurrency: the configured
+`--max-concurrent-queries` when it is `Bounded`, and otherwise the resolved
+`store_get_concurrency` (`max(8, 2 * cores)`, ADR-1195). On the default
+`--max-concurrent-queries` that is:
+
+| cores | `Q` | derived width | requests/s |
+|---|---|---|---|
+| 4 | 8 | 128 (floor) | 4,267 |
+| 8 | 16 | 128 (floor) | 4,267 |
+| 16 | 32 | 128 | 4,267 |
+| 32 | 64 | 256 | 8,533 |
+| 64+ | 128+ | 479 (memory bound) | 15,967 |
+
+479 is the in-flight memory bound: 64 MiB of concurrently in-flight resolve
+responses at a planning figure of 140,000 bytes each
+(`RESOLVE_INFLIGHT_MAX_BYTES / RESOLVE_INFLIGHT_BYTES_PER_REQUEST`). The
+figure is sized on the largest response the phase issues, an L1 compaction
+record over a shard-hour that sealed 1,800 L0 records, not on the ~864-byte
+typical commit record. Neither record type has a format-level size cap, so
+the figure is falsifiable rather than guaranteed: `Catalog` counts the
+responses that exceed it (`Catalog::inflight_budget_overruns`) and logs the
+key and size of each. The bound applies to the derived value only; an
+explicit `--catalog-resolve-concurrency` still reaches
+`MAX_RESOLVE_GET_CONCURRENCY`, with a startup warning naming the implied
+in-flight bytes above 479.
+
+ADR-1733 decision 1's per-prefix semaphore map is NOT implemented: the
+derived width is still one flat per-process bound, so a window that
+collapses to a single shard-hour concentrates the whole width on one prefix
+and can exceed the ~5,500 GET/s per-prefix guidance above 165 in flight.
+That is why the derivation's multiplier is 4 rather than the ADR's 128,
+which assumes the per-prefix bound exists.
+
+A resolve over a compacted bucket no longer reads the superseded L0 commit
+records that retention keeps for the protection horizon. `process_bucket`
+decides exclusion from the writer identity in each listed key, which the
+listing already carries, and reads only the records that survive it;
+`validate_expected_fields` holds every record it does read to the identity
+its key spells (ADR-0010 section 7), so no exclusion rests on an unread
+body. A shard-hour that sealed 1,800 L0 records into one L1 record costs one
+compaction-record GET per resolve rather than 1,801. An unsealed tail is
+unchanged: every listed record there is live, and each still costs one GET.
 
 ### GET concurrency (ADR-1195)
 

@@ -2141,12 +2141,15 @@ pub async fn start(
         // exactly one, so this number is the whole process's cold-resolve
         // request budget. A fixed 128 made that budget independent of the
         // host: adding cores bought no extra in-flight requests and the only
-        // way to resolve more was to run more processes. Derived from the SAME
-        // resolved `store_get_concurrency` (ADR-1195) the fetchers run on, so
-        // one `--store-get-concurrency`, or one host size, moves both.
+        // way to resolve more was to run more processes. ADR-1733 decision 2:
+        // derive it from the process's query concurrency, which is the
+        // configured `--max-concurrent-queries` when bounded and otherwise the
+        // resolved `store_get_concurrency` (ADR-1195, `max(8, 2 * cores)`), so
+        // one host size moves both this and the fetchers.
         // `--catalog-resolve-concurrency` still wins outright when set.
         Some(config.catalog_resolve_concurrency.unwrap_or_else(|| {
-            ravel_catalog::derive_resolve_get_concurrency(
+            derived_catalog_resolve_concurrency(
+                config.query_concurrency_limit,
                 config.query_budgets.store_get_concurrency,
             )
         })),
@@ -3560,6 +3563,81 @@ pub async fn start(
         drain_settle_interval: config.drain_settle_interval,
         query_worker_heartbeat,
     })
+}
+
+/// The catalog resolve width this process runs on when the operator passed no
+/// `--catalog-resolve-concurrency` (ADR-1733 decision 2).
+///
+/// `Q` is how this process expresses query concurrency: the configured
+/// `--max-concurrent-queries` when it is `Bounded`, and otherwise the
+/// resolved `store_get_concurrency` (ADR-1195, `max(8, 2 * cores)`), which is
+/// the same estimate of per-process query parallelism ADR-1195's own derived
+/// defaults use. `ravel_catalog::derive_resolve_get_concurrency` turns `Q`
+/// into permits and holds the result between the measured floor and the
+/// in-flight memory bound.
+fn derived_catalog_resolve_concurrency(
+    query_concurrency_limit: ravel_query::QueryConcurrencyLimit,
+    store_get_concurrency: usize,
+) -> usize {
+    let query_concurrency = match query_concurrency_limit {
+        ravel_query::QueryConcurrencyLimit::Bounded(n) => usize::try_from(n).unwrap_or(usize::MAX),
+        ravel_query::QueryConcurrencyLimit::Unlimited => store_get_concurrency,
+    };
+    ravel_catalog::derive_resolve_get_concurrency(query_concurrency)
+}
+
+/// Issue #1733: the one production `build_catalog` call passes this derived
+/// width, so a bigger host resolves wider. Without these the derivation is a
+/// capability no caller reaches.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod catalog_resolve_concurrency_tests {
+    use ravel_query::QueryConcurrencyLimit;
+
+    use super::derived_catalog_resolve_concurrency;
+
+    /// The default deployment: no `--max-concurrent-queries`, so the host's
+    /// own resolved GET concurrency is `Q`. The 16-core reference host
+    /// reproduces the measured 128 and a 64-core host resolves wider.
+    #[test]
+    fn an_unlimited_process_derives_from_its_host_size() {
+        assert_eq!(
+            derived_catalog_resolve_concurrency(QueryConcurrencyLimit::Unlimited, 32),
+            128,
+            "16 cores: max(8, 2 * 16) = 32, and 4 * 32 is the measured constant"
+        );
+        assert_eq!(
+            derived_catalog_resolve_concurrency(QueryConcurrencyLimit::Unlimited, 64),
+            256,
+            "32 cores"
+        );
+        assert_eq!(
+            derived_catalog_resolve_concurrency(QueryConcurrencyLimit::Unlimited, 128),
+            ravel_catalog::MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY,
+            "64 cores, held at the in-flight memory bound"
+        );
+    }
+
+    /// A configured query ceiling wins over the host estimate, and neither
+    /// input can push the width outside the floor or the memory bound.
+    #[test]
+    fn a_bounded_query_ceiling_is_the_input_instead() {
+        assert_eq!(
+            derived_catalog_resolve_concurrency(QueryConcurrencyLimit::Bounded(64), 8),
+            256,
+            "the ceiling decides, not the 4-core host estimate it overrides"
+        );
+        assert_eq!(
+            derived_catalog_resolve_concurrency(QueryConcurrencyLimit::Bounded(4), 128),
+            ravel_catalog::DEFAULT_RESOLVE_GET_CONCURRENCY,
+            "a low ceiling falls to the floor rather than below the measured basis"
+        );
+        assert_eq!(
+            derived_catalog_resolve_concurrency(QueryConcurrencyLimit::Bounded(u64::MAX), 8),
+            ravel_catalog::MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY,
+            "no ceiling can derive past the in-flight memory bound"
+        );
+    }
 }
 
 #[cfg(test)]

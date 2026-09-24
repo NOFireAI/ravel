@@ -459,22 +459,31 @@ pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
 /// the typo and that extreme fail with a typed error at startup.
 pub const MAX_RESOLVE_GET_CONCURRENCY: usize = 4_096;
 
-/// Resolve permits granted per unit of the process's resolved query GET
-/// concurrency, the multiplier in [`derive_resolve_get_concurrency`].
+/// Resolve permits granted per unit of the process's query concurrency, the
+/// multiplier in [`derive_resolve_get_concurrency`].
 ///
 /// 4, pinned to the measured basis rather than picked: `ravel-server`'s
-/// reference 16-core host resolves `store_get_concurrency` to 32
+/// reference 16-core host resolves a query concurrency of 32
 /// (`max(8, 2 * cores)`, ADR-1195), and 4 * 32 = 128, the value
 /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`] measures. So the reference host keeps
 /// exactly the shipped behaviour and only a host with more cores moves.
 ///
-/// Above 1 because the two concurrencies count different work. One
-/// `store_get_concurrency` permit covers a whole segment fetch (one or more
-/// large ranged GETs plus decode, tens of milliseconds of CPU); one resolve
-/// permit covers a single small metadata request that is almost entirely
-/// round-trip latency. A resolve therefore needs several requests in flight
-/// per concurrent query to keep the same wire busy.
-pub const RESOLVE_GET_CONCURRENCY_PER_STORE_GET: usize = 4;
+/// Above 1 because a permit and a query count different work. One query's
+/// unit of concurrency covers a whole segment fetch and decode (tens of
+/// milliseconds of CPU); one resolve permit covers a single small metadata
+/// request that is almost entirely round-trip latency. A resolve therefore
+/// needs several requests in flight per concurrent query to keep the same
+/// wire busy.
+///
+/// ADR-1733 decision 2 states this multiplier as 128, one per-prefix width
+/// per concurrent query. That is safe only together with its decision 1, the
+/// per-prefix semaphore map, which is a separate task and is not implemented
+/// here. Without it the whole derived width can land on a single shard-hour
+/// prefix, which at a multiplier of 128 means 4,096 requests on one prefix
+/// for the reference host alone: the outcome that ADR's own rejected
+/// alternatives describe as a `503 SlowDown` generator. The multiplier stays
+/// at the value the measured reference host supports until that split lands.
+pub const RESOLVE_GET_CONCURRENCY_PER_QUERY: usize = 4;
 
 /// Planning figure for the bytes one in-flight resolve response holds, used
 /// as the denominator of [`MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY`].
@@ -523,16 +532,20 @@ pub const RESOLVE_INFLIGHT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY: usize =
     (RESOLVE_INFLIGHT_MAX_BYTES / RESOLVE_INFLIGHT_BYTES_PER_REQUEST) as usize;
 
-/// Derive `resolve_get_concurrency` from the process's own resolved query
-/// GET concurrency (`ravel-server`'s `QueryBudgets::store_get_concurrency`,
-/// ADR-1195, itself `max(8, 2 * cores)` unless an operator set it).
+/// Derive `resolve_get_concurrency` from the process's query concurrency
+/// (ADR-1733 decision 2).
 ///
-/// That input is the only knob a running process actually sets for "how many
-/// object-store requests may a query have outstanding", and it moves with
-/// the host: `--max-concurrent-queries` is `Unlimited` when omitted and
-/// never reaches a `Catalog`, so it cannot serve as the input.
+/// The input `Q` is how the process expresses query concurrency, in
+/// `ravel-server`'s own order of preference: the configured
+/// `--max-concurrent-queries` when it is `Bounded`, and otherwise the
+/// resolved `QueryBudgets::store_get_concurrency` (ADR-1195, itself
+/// `max(8, 2 * cores)` unless an operator set it), which is the same
+/// `max(8, 2 * cores)` estimate of per-process query parallelism ADR-1195's
+/// derived defaults use. The fallback carries the case that matters for a
+/// default: `--max-concurrent-queries` is `Unlimited` when omitted, so
+/// deriving from it alone would leave almost every process on the floor.
 ///
-/// `4 * store_get_concurrency`, clamped into
+/// `4 * Q`, clamped into
 /// `[DEFAULT_RESOLVE_GET_CONCURRENCY, MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY]`.
 /// The floor wins over the memory bound: 128 in flight holds 128 * 140,000
 /// = 17.9 MB, well inside the 64 MiB budget, so the two clamps cannot
@@ -540,9 +553,10 @@ pub const MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY: usize =
 ///
 /// What each derived width implies for the PROCESS, at the ~30ms measured
 /// GET round trip [`DEFAULT_RESOLVE_GET_CONCURRENCY`] records
-/// (`requests/s = width / 0.030`):
+/// (`requests/s = width / 0.030`), for a process on the default
+/// `--max-concurrent-queries` (so `Q` is the core formula):
 ///
-/// | cores | `store_get_concurrency` | derived | requests/s |
+/// | cores | `Q` | derived | requests/s |
 /// |---|---|---|---|
 /// | 4 | 8 | 128 (floor) | 4,267 |
 /// | 8 | 16 | 128 (floor) | 4,267 |
@@ -560,9 +574,9 @@ pub const MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY: usize =
 /// exceed the guidance above 165 in flight; the store layer retries the
 /// resulting `503 SlowDown`, and `--catalog-resolve-concurrency` is the
 /// operator's lever for a deployment that sees them.
-pub fn derive_resolve_get_concurrency(store_get_concurrency: usize) -> usize {
-    store_get_concurrency
-        .saturating_mul(RESOLVE_GET_CONCURRENCY_PER_STORE_GET)
+pub fn derive_resolve_get_concurrency(query_concurrency: usize) -> usize {
+    query_concurrency
+        .saturating_mul(RESOLVE_GET_CONCURRENCY_PER_QUERY)
         .clamp(
             DEFAULT_RESOLVE_GET_CONCURRENCY,
             MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY,
@@ -967,7 +981,7 @@ mod tests {
     }
 
     /// The reference 16-core host must reproduce the measured constant
-    /// exactly: `store_get_concurrency` there is `max(8, 2 * 16) = 32`, and
+    /// exactly: `Q` there is `max(8, 2 * 16) = 32`, and
     /// the multiplier is chosen so `4 * 32 = 128`. If this fails, the
     /// derivation changed the value the 2.341s measurement was taken at.
     #[test]

@@ -200,8 +200,8 @@ pub fn build_catalog(
     // always passes one: either the operator's explicit
     // `--catalog-resolve-concurrency` or
     // `ravel_catalog::derive_resolve_get_concurrency` over the process's own
-    // resolved `store_get_concurrency`, so the running server never sits on
-    // the floor by accident.
+    // query concurrency, so the running server never sits on the floor by
+    // accident.
     if let Some(concurrency) = resolve_get_concurrency {
         catalog_config.resolve_get_concurrency = concurrency;
     }

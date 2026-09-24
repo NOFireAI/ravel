@@ -1086,7 +1086,14 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
 2. Partition the listed keys by shape (L0 commit record, compaction
    record, selective-erasure rewrite record, tombstone; ADR-0018, ADR-0019,
    ADR-0064). A key matching none of
-   the four shapes is a fail-loud error, not a skip. Decode all records.
+   the four shapes is a fail-loud error, not a skip. Decode the compaction
+   and rewrite records first, then only the L0 commit records the exclusion
+   set of step 3 leaves live: a superseded L0 is identified by the
+   `(writer_id, writer_epoch, writer_seq)` its key spells, which the listing
+   already carries, so it is never fetched. Retention keeps a compaction's
+   inputs for the whole protection horizon, so this is the difference
+   between one GET and N+1 GETs on every resolve over a compacted bucket
+   whose inputs have not yet been swept.
    Cache decoded records keyed by FULL object key; validate
    tenant_hash/signal/shard fields against the expected values on every hit;
    bound the cache per tenant. Records are immutable and never invalidated,
@@ -1155,6 +1162,11 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    - Include any L0 record not in `excluded` normally, and raise an
      interlock-violation metric if its created_unix_ns postdates the newest
      compaction/rewrite record (it should have been sealed before that ran).
+     Membership in `excluded` is decided from the identity in the record's
+     key, not from its body, so an excluded record is never read. The two
+     spellings cannot diverge: every record that IS read is held to the
+     identity its key spells (ADR-0010 section 7), a `FieldMismatch` on the
+     `writer identity` field otherwise.
    Two compaction records in one bucket with different input_set_hash:
    disjoint input sets include both parts sets and all L0s not covered by
    either (correct under overlap harmlessness; ADR-0018); overlapping input

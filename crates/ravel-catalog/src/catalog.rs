@@ -886,7 +886,8 @@ impl Catalog {
         if bytes <= crate::config::RESOLVE_INFLIGHT_BYTES_PER_REQUEST {
             return;
         }
-        self.inflight_budget_overruns.fetch_add(1, Ordering::Relaxed);
+        self.inflight_budget_overruns
+            .fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             key,
             bytes,
@@ -3873,10 +3874,7 @@ fn validate_expected_fields(
         return Err(CatalogError::FieldMismatch {
             key: key.to_string(),
             field: "writer identity",
-            expected: format!(
-                "{}.{}.{}",
-                key_identity.0, key_identity.1, key_identity.2
-            ),
+            expected: format!("{}.{}.{}", key_identity.0, key_identity.1, key_identity.2),
             actual: format!(
                 "{}.{}.{}",
                 record_identity.0, record_identity.1, record_identity.2

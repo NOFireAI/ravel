@@ -129,6 +129,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The catalog resolve request width is derived from the process query GET
+  concurrency instead of being fixed at 128** (issue #1733). One `Catalog`
+  exists per process and every resolve in it shares one semaphore, so the
+  fixed 128 capped a whole process at 128 / 0.030 s = about 4,267 object
+  store requests per second at the measured 30 ms GET round trip, whatever
+  the host was. An operator who adds CPU to a query process now sees cold
+  resolve throughput move with it: `ravel-server` sizes the width as four
+  times `QueryBudgets::store_get_concurrency` (itself `max(8, 2 * cores)`),
+  so a 32-core process resolves at 256 in flight (about 8,533 requests/s)
+  and a 64-core or larger process at 479 (about 15,967 requests/s), where
+  before all three sizes ran at 128. Hosts of 16 cores and under are
+  unchanged: 128 is now the floor, and the 16-core reference host derives
+  exactly the measured constant. `--catalog-resolve-concurrency` still wins
+  when set. Two bounds come with it. The width is capped at 479 because
+  in-flight resolve responses are now budgeted to 64 MiB at 140,000 bytes
+  per request (the size of one L1 compaction record over a shard-hour that
+  sealed 1,800 L0 records), and a record that exceeds that charge is
+  counted and logged rather than silently breaking the budget, readable as
+  `Catalog::inflight_budget_overruns`. An explicit
+  `--catalog-resolve-concurrency` above 479 is honoured and warns with the
+  implied in-flight bytes. Separately, a resolve over a compacted bucket no
+  longer reads the superseded L0 records that retention keeps for the
+  protection horizon: exclusion is decided from the identity in each key,
+  which the listing already carries, so a shard-hour that sealed 1,800 L0
+  records into one L1 record costs one compaction record GET per resolve
+  instead of 1,801. Nothing changes for an unsealed tail, where every
+  listed record is live and still costs one GET.
+
 - **A shard now refuses a flush trigger once `--max-queued-flushes` (default
   8) flush tasks are spawned and unacked, leaving the rows buffered for the
   next tick** (issue #1740). Before this, every trigger spawned a task, so a

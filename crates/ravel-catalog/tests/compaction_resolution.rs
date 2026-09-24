@@ -11,8 +11,10 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use prost::Message;
 use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -21,7 +23,10 @@ use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
+};
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord,
 };
@@ -177,6 +182,110 @@ fn hour_range_and_now() -> (TimeRange, i64) {
     )
 }
 
+/// True for an L0 commit-record key (`<writer_id>.<epoch>.<seq>.cmt`), false
+/// for the compaction (`l1.`) and rewrite (`rw.`) record shapes that share
+/// the suffix and for every other object a resolve reads.
+fn is_l0_record_key(key: &str) -> bool {
+    let file = key.rsplit('/').next().unwrap_or(key);
+    file.ends_with(".cmt") && !file.starts_with("l1.") && !file.starts_with("rw.")
+}
+
+fn is_l1_record_key(key: &str) -> bool {
+    let file = key.rsplit('/').next().unwrap_or(key);
+    file.ends_with(".cmt") && file.starts_with("l1.")
+}
+
+/// Every GET and LIST the catalog issued, by key, so a test can assert both
+/// how many requests a resolve made and exactly which objects they named.
+#[derive(Clone, Default)]
+struct Calls {
+    gets: Arc<Mutex<Vec<String>>>,
+    lists: Arc<Mutex<Vec<String>>>,
+}
+
+impl Calls {
+    fn gets(&self) -> Vec<String> {
+        self.gets.lock().unwrap().clone()
+    }
+
+    fn l0_record_gets(&self) -> usize {
+        self.gets().iter().filter(|k| is_l0_record_key(k)).count()
+    }
+
+    fn l1_record_gets(&self) -> usize {
+        self.gets().iter().filter(|k| is_l1_record_key(k)).count()
+    }
+
+    fn get_count(&self) -> usize {
+        self.gets.lock().unwrap().len()
+    }
+
+    fn list_count(&self) -> usize {
+        self.lists.lock().unwrap().len()
+    }
+
+    fn request_count(&self) -> usize {
+        self.get_count() + self.list_count()
+    }
+}
+
+struct CountingStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    calls: Calls,
+}
+
+impl CountingStore {
+    fn new(inner: Arc<dyn ObjectStoreBackend>) -> (Arc<Self>, Calls) {
+        let calls = Calls::default();
+        (
+            Arc::new(CountingStore {
+                inner,
+                calls: calls.clone(),
+            }),
+            calls,
+        )
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for CountingStore {
+    async fn put(&self, k: &str, d: Bytes, o: PutOptions) -> Result<PutOutcome, StoreError> {
+        self.inner.put(k, d, o).await
+    }
+    async fn get(&self, k: &str, r: GetRange) -> Result<GetOutcome, StoreError> {
+        self.calls.gets.lock().unwrap().push(k.to_string());
+        self.inner.get(k, r).await
+    }
+    async fn head(&self, k: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(k).await
+    }
+    async fn list(&self, p: &str, t: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.calls.lists.lock().unwrap().push(p.to_string());
+        self.inner.list(p, t).await
+    }
+    async fn list_after(
+        &self,
+        p: &str,
+        s: Option<&str>,
+        t: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.calls.lists.lock().unwrap().push(p.to_string());
+        self.inner.list_after(p, s, t).await
+    }
+    async fn list_delimited(&self, p: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(p).await
+    }
+    async fn delete(&self, k: &str) -> Result<(), StoreError> {
+        self.inner.delete(k).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
 fn l1_keys(snapshot: &ravel_catalog::Snapshot) -> Vec<String> {
     snapshot
         .segments
@@ -219,6 +328,100 @@ async fn compaction_record_includes_parts_and_excludes_input_l0s() {
         snapshot.segments[0].level,
         SegmentLevel::L1 { .. }
     ));
+    assert_eq!(catalog.interlock_violations(), 0);
+}
+
+/// Issue #1733: a compacted bucket whose superseded L0 records are still
+/// present costs zero L0 record GETs.
+///
+/// Retention keeps a compaction's inputs for the protection horizon, so for
+/// hours after the compaction every resolve over the bucket still lists
+/// them. `process_bucket` used to read each one and then discard it as
+/// excluded, one GET per superseded record per resolve. It now builds the
+/// live set from the listing's parsed identities and reads only that set, so
+/// the whole bucket costs the LISTs, the one compaction record, and nothing
+/// else.
+///
+/// RED: restoring the unconditional `prewarm_commit_records(&l0_keys, ..)`
+/// at the top of `process_bucket` reports 24 L0 record GETs where this
+/// demands 0, and 28 requests where it demands 4.
+#[tokio::test]
+async fn a_compacted_bucket_costs_no_gets_for_its_superseded_l0_inputs() {
+    const L0_COUNT: u64 = 24;
+
+    let (store, calls) = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (range, now) = hour_range_and_now();
+    let start = range.start_ns;
+
+    let mut inputs = Vec::with_capacity(L0_COUNT as usize);
+    for seq in 0..L0_COUNT {
+        let record = l0_record(
+            Uuid::from_u128(u128::from(seq) + 1),
+            0,
+            seq,
+            HOUR,
+            now,
+            start,
+            start + 100,
+        );
+        put_l0(store.as_ref(), &record).await;
+        inputs.push(record);
+    }
+    put_compaction_record(
+        store.as_ref(),
+        0,
+        HOUR,
+        &inputs.iter().collect::<Vec<_>>(),
+        vec![part(0, start, start + 100, 1)],
+        now,
+        b"set-cost",
+    )
+    .await;
+
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Metrics, range, &[], now)
+        .await
+        .expect("resolve");
+
+    assert_eq!(
+        snapshot.segments.len(),
+        1,
+        "the bucket resolves to the one L1 part; every L0 is an input"
+    );
+    assert_eq!(
+        calls.l0_record_gets(),
+        0,
+        "no superseded L0 record may be read; the resolve read {:?}",
+        calls
+            .gets()
+            .into_iter()
+            .filter(|k| is_l0_record_key(k))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        calls.l1_record_gets(),
+        1,
+        "the one compaction record is read exactly once"
+    );
+    assert_eq!(
+        calls.get_count(),
+        2,
+        "the catalog HEAD and the compaction record are the only GETs; \
+         the resolve read {:?}",
+        calls.gets()
+    );
+    assert_eq!(
+        calls.list_count(),
+        2,
+        "one bounded LIST per bucket in the listing window"
+    );
+    assert_eq!(
+        calls.request_count(),
+        4,
+        "{L0_COUNT} superseded L0 records plus one compaction record resolve \
+         in 4 requests, independent of {L0_COUNT}"
+    );
     assert_eq!(catalog.interlock_violations(), 0);
 }
 

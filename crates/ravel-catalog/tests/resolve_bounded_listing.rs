@@ -20,6 +20,12 @@
 //! so all nine LISTs can be held at once. RED: awaiting the erasure LIST after
 //! the fan-out means it is never issued while the shard LISTs are held, so at
 //! most eight are ever held simultaneously.
+//!
+//! Peak request width (issue #1733): two concurrent resolves over one
+//! `Catalog` hold exactly `derive_resolve_get_concurrency(query_concurrency)`
+//! GETs at once, neither more (the semaphore is shared, not per query) nor
+//! fewer (the width is derived from the host, not fixed). RED: pinning the
+//! width back to the fixed `DEFAULT_RESOLVE_GET_CONCURRENCY` peaks at 128.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -488,4 +494,179 @@ async fn erasure_list_overlaps_shard_fanout() {
         shard_count as usize,
         "every shard's record resolves once the LISTs are released"
     );
+}
+
+/// A second tenant, so two resolves can run concurrently against one
+/// `Catalog` with disjoint records.
+fn other_tenant() -> TenantHash {
+    TenantHash([0x91; 16])
+}
+
+/// [`publish_at`] for an explicit tenant and writer sequence, with the
+/// sequence folded into the payload so every record addresses a distinct data
+/// object and the resolved snapshot counts them all.
+async fn publish_for(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: TenantHash,
+    shard: u32,
+    ingest_hour_bucket: u32,
+    event_ts_ns: i64,
+    writer_seq: u64,
+) {
+    let payload =
+        format!("seg-{shard}-{ingest_hour_bucket}-{event_ts_ns}-{writer_seq}").into_bytes();
+    let content_hash = *blake3::hash(&payload).as_bytes();
+    let record = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard,
+        writer_id: Uuid::new_v4(),
+        writer_epoch: 1,
+        writer_seq,
+        object_size: payload.len() as u64,
+        content_hash,
+        sample_count: 1,
+        series_count: 1,
+        min_event_ts_ns: event_ts_ns,
+        max_event_ts_ns: event_ts_ns,
+        min_ingest_ts_ns: event_ts_ns,
+        max_ingest_ts_ns: event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: event_ts_ns,
+        ingest_hour_bucket,
+    })
+    .expect("valid record");
+    let data_key = keys::reconstruct_data_key(&record).expect("data key");
+    publish::put_data_object(store, &data_key, Bytes::from(payload))
+        .await
+        .expect("put data object");
+    publish::publish(store, &record, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// The resolve semaphore is per-`Catalog` and one process builds one
+/// `Catalog`, so its width is the PEAK number of object-store requests the
+/// whole process can have in flight, not a per-query allowance. This drives
+/// two concurrent resolves over a gated store and asserts that peak exactly.
+///
+/// The width under test is derived, not written down: 479 is
+/// `derive_resolve_get_concurrency(128)`, the value a 64-core host's query
+/// concurrency produces. Each tenant holds 300 records, so
+/// neither resolve can reach 479 alone and only the shared semaphore can hold
+/// the combined 600 at exactly 479.
+///
+/// RED against the pre-fix fixed constant: with
+/// `resolve_get_concurrency: DEFAULT_RESOLVE_GET_CONCURRENCY`, the first
+/// resolve alone exhausts the 128 permits, the peak never rises above 128 and
+/// the `wait_until_held(479)` below times out reporting that 128.
+#[tokio::test]
+async fn two_concurrent_resolves_peak_at_the_derived_request_width() {
+    // A 64-core host on the default `--max-concurrent-queries`: `Q` is
+    // `max(8, 2 * cores)` = 128, which is this test's one input.
+    const QUERY_CONCURRENCY: usize = 128;
+    const PER_TENANT: u64 = 300;
+    let width = ravel_catalog::derive_resolve_get_concurrency(QUERY_CONCURRENCY);
+    assert_eq!(
+        width,
+        ravel_catalog::MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY,
+        "at this input the in-flight memory bound is what decides the width"
+    );
+    assert!(
+        (PER_TENANT as usize) < width && (PER_TENANT as usize) * 2 > width,
+        "one tenant must be too small to reach the width alone and two must overshoot it"
+    );
+
+    let hour = 1001u32;
+    let inner = Arc::new(MemoryStore::new());
+    for tenant_hash in [tenant(), other_tenant()] {
+        for seq in 1..=PER_TENANT {
+            publish_for(inner.as_ref(), tenant_hash, 0, hour, hour_mid_ns(hour), seq).await;
+        }
+    }
+
+    // Hold every commit-record GET before it reaches the backend. LISTs and
+    // the snapshot-head GET are left alone: each resolve has to get far enough
+    // to list its own bucket, and gating the head GET would stall both resolves
+    // at one request each before any fan-out exists to measure.
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
+        FaultPlan::empty(),
+    ));
+    let gate = store.hold(Op::Get, Some(".cmt".to_string()), Occurrence::Always);
+    let catalog = Arc::new(
+        Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: width,
+                ..exact_config(1)
+            },
+        )
+        .expect("catalog"),
+    );
+
+    let now_ns = i64::from(hour) * NS_PER_HOUR + 40 * 60_000_000_000;
+    let range = TimeRange {
+        start_ns: i64::from(hour) * NS_PER_HOUR,
+        end_ns: now_ns,
+    };
+    let handles: Vec<_> = [tenant(), other_tenant()]
+        .into_iter()
+        .map(|tenant_hash| {
+            let resolver = Arc::clone(&catalog);
+            tokio::spawn(async move {
+                resolver
+                    .resolve(&tenant_hash, Signal::Metrics, range, &[], now_ns)
+                    .await
+            })
+        })
+        .collect();
+
+    let reached = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        gate.wait_until_held(width),
+    )
+    .await;
+    assert!(
+        reached.is_ok(),
+        "two concurrent resolves must reach {width} in-flight GETs; the peak the store saw was {}",
+        gate.held_count()
+    );
+
+    // Nothing above the width: every remaining GET future is already created
+    // (both prewarm fan-outs are `buffer_unordered(width)` over 300 keys each)
+    // and parked on the semaphore, so draining the ready queue cannot add one.
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        gate.held_count(),
+        width,
+        "{} gated GETs are outstanding across the two resolves and the shared semaphore holds the peak at {width}",
+        PER_TENANT * 2
+    );
+
+    // Drain continuously rather than once: the gate holds every commit-record
+    // GET, and the 121 the semaphore was still refusing are issued as the
+    // first releases free permits.
+    let releaser = {
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            loop {
+                for id in gate.held() {
+                    gate.release(id);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    for handle in handles {
+        let snapshot = handle.await.expect("join").expect("resolve");
+        assert_eq!(
+            snapshot.segments.len(),
+            PER_TENANT as usize,
+            "every record resolves once the GETs are released"
+        );
+    }
+    releaser.abort();
 }

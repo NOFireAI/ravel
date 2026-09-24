@@ -1484,8 +1484,14 @@ pub struct Cli {
 
     /// Number of in-flight object-store requests (LISTs and record GETs) the
     /// catalog resolve path (`Catalog::resolve_impl`) keeps in flight at
-    /// once, via a per-instance semaphore. Unset, it takes
-    /// `ravel_catalog::CatalogConfig`'s own default (currently 128). `0` is
+    /// once, via a per-instance semaphore, which is this whole process's
+    /// cold-resolve request budget. Unset, it is DERIVED (ADR-1733 decision
+    /// 2) as `ravel_catalog::derive_resolve_get_concurrency` of the process's
+    /// query concurrency: `--max-concurrent-queries` when bounded, otherwise
+    /// the resolved `--store-get-concurrency` (`max(8, 2 * cores)`), giving
+    /// 128 at or below 16 cores, 256 at 32 cores and 479 above, where 479 is
+    /// the in-flight memory bound (64 MiB at 140,000 bytes per response).
+    /// `0` is
     /// rejected by [`Cli::validate`]: a zero-permit semaphore would deadlock
     /// every resolve, never silently clamped to 1. A value above
     /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` is rejected too: past
