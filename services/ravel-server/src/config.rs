@@ -1161,8 +1161,13 @@ pub struct Cli {
     /// the OTAP zstd payload inflate; those stay bounded by
     /// `--max-inflight-ingest-requests` (docs/ingest.md, "Worst-case resident
     /// memory"). Like `--max-inflight-ingest-requests` this is a per-process
-    /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables the
-    /// ceiling (the gauge is still tracked for `/metrics`).
+    /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables
+    /// this byte ceiling, but it does not leave spawned-flush memory
+    /// unbounded on its own: `--max-queued-flushes` still caps the ordinary
+    /// flush queue regardless of this setting, and only a buffer that has
+    /// crossed its per-tenant memory backstop stays exempt from that cap
+    /// and, under `0`, unbounded except by how long a stall lasts (the
+    /// gauge itself is still tracked for `/metrics` either way).
     ///
     /// What `0` leaves unbounded is narrower than it was, but it is not
     /// nothing. Under ADR-1642 a flush task is spawned at every trigger and
