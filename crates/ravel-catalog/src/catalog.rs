@@ -593,17 +593,21 @@ impl crate::provisioning::AccountedRecordGet for GuardedRecordGet<'_> {
     }
 }
 
-/// The permits one resolve-path request holds while it is issued: its
-/// shard-hour commit prefix's, when it has one, and the catalog's ceiling
-/// (ADR-1733 decision 1). Both are released when this is dropped.
+/// The permits one resolve-path request holds while it is issued: its key
+/// prefix's, when it has one, and the catalog's ceiling (ADR-1733
+/// decision 1). Both are released when this is dropped.
+///
+/// Both permit fields are `Option` so that the guard can be built before
+/// either is awaited. That is what makes the acquisition cancellation-safe:
+/// a future dropped while it waits still owns the guard, so the idle-prefix
+/// cleanup below runs.
 struct RequestPermits<'a> {
     catalog: &'a Catalog,
     /// The prefix this request is bounded by, and that prefix's semaphore.
-    /// `None` for a request that sits under no shard-hour commit prefix,
-    /// which takes only the ceiling permit.
+    /// `None` for a request whose key sits under no prefix at all.
     prefix: Option<(String, Arc<tokio::sync::Semaphore>)>,
     prefix_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    _ceiling_permit: tokio::sync::SemaphorePermit<'a>,
+    _ceiling_permit: Option<tokio::sync::SemaphorePermit<'a>>,
 }
 
 impl Drop for RequestPermits<'_> {
@@ -617,10 +621,10 @@ impl Drop for RequestPermits<'_> {
         let mut live = self.catalog.prefix_semaphores.lock();
         // Two references left (the map's and this guard's) means no other
         // request holds or waits on this prefix, so the semaphore has nothing
-        // left to bound and the entry can go. Every other reference is a
-        // clone made in `Catalog::prefix_semaphore` under this same lock, so
-        // a request that is about to wait on this prefix cannot be missed
-        // here.
+        // left to bound and the entry can go. A request that is about to wait
+        // on this prefix cannot be missed here: it takes its own reference in
+        // `Catalog::prefix_semaphore` under this same lock, and holds it in
+        // its own guard from before it starts waiting until after it is done.
         if let Some(mapped) = live.get(&prefix)
             && Arc::ptr_eq(mapped, &semaphore)
             && Arc::strong_count(&semaphore) == 2
@@ -906,19 +910,13 @@ impl Catalog {
         }
     }
 
-    /// One store GET bounded by the resolve-wide in-flight semaphore. The permit is released the moment the GET resolves and is
-    /// never held across another guarded request, so a resolve fanning out
-    /// many records cannot wait on permits it already holds.
+    /// Number of key prefixes that currently have a semaphore.
     ///
-    /// The sole funnel for every GET a query issues (ADR-0044 decision 2): `accounting` is credited one [`AccountedOp::Get`] request
-    /// unconditionally, and its bytes only on success (`got.data.len()`,
-    /// mirroring `InstrumentedStore`'s convention that a failed GET moves no
-    /// bytes). Call sites never account for themselves.
-    /// Number of shard-hour commit prefixes that currently have a semaphore.
     /// Zero once every resolve has finished: a prefix's semaphore is created
     /// on demand and removed when the prefix goes idle (ADR-1733 decision 1),
     /// so this counts prefixes in flight, not prefixes the bucket holds.
-    pub fn prefix_semaphores_live(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn prefix_semaphores_live(&self) -> usize {
         self.prefix_semaphores.lock().len()
     }
 
@@ -950,31 +948,42 @@ impl Catalog {
     /// prefixes the two limits exist to remove.
     async fn acquire_request_permits(&self, key: &str) -> Result<RequestPermits<'_>, StoreError> {
         let closed = || StoreError::Transient("catalog request semaphore closed".to_string());
-        let prefix = shard_hour_commit_prefix(key);
-        let (prefix_semaphore, prefix_permit) = match prefix {
-            Some(prefix) => {
-                let semaphore = self.prefix_semaphore(prefix);
-                let permit = Arc::clone(&semaphore)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| closed())?;
-                (Some((prefix.to_string(), semaphore)), Some(permit))
-            }
-            None => (None, None),
-        };
-        let ceiling_permit = self
-            .request_semaphore
-            .acquire()
-            .await
-            .map_err(|_| closed())?;
-        Ok(RequestPermits {
+        // The guard owns the map entry's reference from here on, before either
+        // await, so a future cancelled while it waits for a permit still runs
+        // the idle-prefix cleanup in `RequestPermits::drop`.
+        let mut permits = RequestPermits {
             catalog: self,
-            prefix: prefix_semaphore,
-            prefix_permit,
-            _ceiling_permit: ceiling_permit,
-        })
+            prefix: shard_hour_commit_prefix(key)
+                .map(|prefix| (prefix.to_string(), self.prefix_semaphore(prefix))),
+            prefix_permit: None,
+            _ceiling_permit: None,
+        };
+        // The clone this await owns lives in an inner scope, so a cancellation
+        // here drops it before the guard and leaves the guard's own reference
+        // the only one besides the map's.
+        if let Some(semaphore) = permits.prefix.as_ref().map(|(_, s)| Arc::clone(s)) {
+            permits.prefix_permit = Some(semaphore.acquire_owned().await.map_err(|_| closed())?);
+        }
+        permits._ceiling_permit = Some(
+            self.request_semaphore
+                .acquire()
+                .await
+                .map_err(|_| closed())?,
+        );
+        Ok(permits)
     }
 
+    /// One store GET bounded by both resolve limits: its own key prefix's
+    /// in-flight bound and this catalog's process-wide ceiling (ADR-1733
+    /// decision 1). Both permits are released the moment the GET resolves and
+    /// neither is ever held across another guarded request, so a resolve
+    /// fanning out many records cannot wait on permits it already holds.
+    ///
+    /// The sole funnel for every GET a query issues (ADR-0044 decision 2):
+    /// `accounting` is credited one [`AccountedOp::Get`] request
+    /// unconditionally, and its bytes only on success (`got.data.len()`,
+    /// mirroring `InstrumentedStore`'s convention that a failed GET moves no
+    /// bytes). Call sites never account for themselves.
     pub(crate) async fn guarded_get(
         &self,
         key: &str,
@@ -6281,6 +6290,103 @@ mod tests {
             catalog.prefix_semaphores_live(),
             0,
             "the prefix semaphore is dropped once the prefix goes idle"
+        );
+    }
+
+    /// Waits until `catalog` has exactly `n` prefix semaphores live, bounded
+    /// the same way [`wait_until_held_bounded`] is: a request that never gets
+    /// as far as taking its prefix's reference would otherwise hang the run
+    /// instead of failing. Panics naming the observed count on timeout.
+    async fn wait_until_prefix_semaphores(catalog: &Catalog, n: usize) {
+        let reached = async {
+            while catalog.prefix_semaphores_live() != n {
+                tokio::task::yield_now().await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .is_err()
+        {
+            panic!(
+                "{} prefix semaphores live, expected {n} within 5s",
+                catalog.prefix_semaphores_live()
+            );
+        }
+    }
+
+    /// A request cancelled while it waits for a permit must still run the
+    /// idle-prefix cleanup. `Catalog::acquire_request_permits` builds the
+    /// guard that owns the prefix's reference before either `.await`, so
+    /// dropping the future drops the guard and the entry goes with it.
+    ///
+    /// Two tenants under a ceiling of one: A's commit GET is held inside the
+    /// store and holds the only ceiling permit, so B takes its own prefix's
+    /// permit (uncontended, a different prefix) and then parks on the
+    /// ceiling. Aborting B there is the cancellation the leak needs.
+    ///
+    /// FLIP: move the `RequestPermits` construction in
+    /// `Catalog::acquire_request_permits` back below both `.await`s, filling
+    /// its fields from locals as the original did, and the after-abort
+    /// assertion fails with 2 prefixes live: B's entry is left in the map
+    /// with nothing that will ever remove it.
+    #[tokio::test]
+    async fn a_request_cancelled_while_waiting_drops_its_prefix_semaphore() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    resolve_get_concurrency: 1,
+                    ..config(1)
+                },
+            )
+            .expect("catalog"),
+        );
+
+        let key_a = "t/aaaaaaaaaaaaaaaa/m/c/0000/2026091612/000000000001";
+        let key_b = "t/bbbbbbbbbbbbbbbb/m/c/0000/2026091612/000000000001";
+
+        let cat_a = Arc::clone(&catalog);
+        let task_a = tokio::spawn(async move {
+            let accounting = QueryAccounting::new();
+            cat_a.guarded_get(key_a, GetRange::Full, &accounting).await
+        });
+        wait_until_held_bounded(&gate, 1).await;
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            1,
+            "A's prefix has a semaphore while its GET is held inside the store"
+        );
+
+        let cat_b = Arc::clone(&catalog);
+        let task_b = tokio::spawn(async move {
+            let accounting = QueryAccounting::new();
+            cat_b.guarded_get(key_b, GetRange::Full, &accounting).await
+        });
+        wait_until_prefix_semaphores(&catalog, 2).await;
+
+        task_b.abort();
+        assert!(
+            task_b
+                .await
+                .expect_err("B was aborted while waiting on the ceiling")
+                .is_cancelled()
+        );
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            1,
+            "the cancelled request's prefix semaphore is removed, leaving only A's"
+        );
+
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let _ = task_a.await.expect("join A");
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            0,
+            "no prefix semaphore outlives the requests that created it"
         );
     }
 
