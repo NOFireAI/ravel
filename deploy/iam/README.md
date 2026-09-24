@@ -313,30 +313,59 @@ deliberate posture over the whole control plane.
 An operator who applied a copy of `maintain.json` older than this grant must
 re-apply it. Until they do, the reap stays refused: every dead worker's
 heartbeat key remains in the bucket, the per-tick `ListBucket` over
-`sys/maintain/workers/` keeps growing, and nothing else in a running system
-reports it, because `reap_keys` treats a failed delete as a key to retry next
-tick rather than as an error to surface. Re-applying drains the accumulated
-keys over subsequent ticks rather than at once. Nothing else in the maintain
-role stops working in the meantime: the other three axes were always granted,
-so heartbeating and live-set reads continue, and ownership stays correct. What
-degrades is cost, monotonically.
+`sys/maintain/workers/` keeps growing, and nothing fails or alerts. `reap_keys`
+logs a warning per refused delete and retries the key on the next tick, so the
+only trace is one log line per dead worker per tick. Re-applying drains the
+accumulated keys over subsequent ticks rather than at once. Nothing else in the
+maintain role stops working in the meantime: the other three axes were always
+granted, so heartbeating and live-set reads continue, and ownership stays
+correct. What degrades is cost, monotonically.
 
 ### The mechanical check
 
 `scripts/guards/check-iam-keyspace-axes.sh` is the cargo-free guard that makes
 this defect class fail without anyone remembering to write a reachability test
 for a particular prefix. It discovers every control-plane key space the code
-names (`sys/`, `quarantine/`, `admission/` roots, from `const NAME: &str` and
-`format!` literals), requires each to carry a manifest entry declaring its
-owner roles and, per axis, either a call site or a reason it is unused, and
-then checks each used axis against that owner's template. It runs in
-`scripts/gates.sh` and CI's `doc-scripts` job.
+names, under the `sys/`, `quarantine/` and `admission/` roots, in each of the
+three spellings the sources use: a `const NAME: &str`, the fixed head of a
+`format!` template, and a bare string literal handed to a store call. Each one
+must carry a manifest entry naming, per axis, either the roles whose process
+runs the call or the reason the axis is unused.
 
-It catches "this axis is granted nowhere under this key space", which is the
-shape all six instances of the class had. It does NOT catch "granted, but too
-narrowly", and it does not reach tenant-rooted (`t/...`) key spaces at all:
-those are composed by the constructors in `crates/ravel-commit/src/keys.rs`
-through `format!("{prefix}{...}")` chains whose components are const
-interpolations and match-arm literals, and deriving a glob from them soundly
-needs constant folding rather than a text scan. The per-lifecycle reachability
-tests remain the precise check, and the tables above remain the record.
+The axis half of that entry is derived from the code, not trusted. The guard
+follows every key-space value through locals, struct fields and returns until
+it reaches an object-store call, and reads the axis off the method that was
+called. That is what makes issue #1975's own shape fail: a new call on an
+already-declared key space needs no declaration change, so a hand-written
+"unused" note stays green while the axis is exercised and granted nowhere.
+Concretely, the guard fails when:
+
+- a discovered key space has no manifest entry, or an entry names a key space
+  nothing in the tree still spells;
+- an axis declared unused is exercised by a call, or an axis declared used is
+  reached by none while other axes of the same key space are;
+- a declared-used axis is granted by no `Allow` of an owner role's template,
+  and the gap is not one of the recorded `KNOWN_GAPS` entries;
+- a recorded gap has closed, or names an axis or role the manifest no longer
+  declares;
+- a key-bearing value reaches a call the derivation cannot classify, or the
+  scan drops below one of its anti-vacuity floors. Both refuse the scan
+  (exit 70) rather than reporting a narrowed one as clean.
+
+A grant on an axis declared unused fails only where a template names that key
+space specifically. Admin's blanket `sys/*` reaches every key space under
+`sys/` and distinguishes none of them, so it satisfies a need without being
+evidence of one.
+
+It runs in `scripts/gates.sh` and CI's `doc-scripts` job. It catches "this
+axis is granted nowhere under this key space", which is the shape every
+instance of the class had (#1849, #1934, #1847/#1955, #1957, #1975). It does
+NOT catch "granted, but too narrowly", and it does not reach tenant-rooted
+(`t/...`) key spaces at all: those are composed by the constructors in
+`crates/ravel-commit/src/keys.rs` through `format!("{prefix}{...}")` chains
+whose components are const interpolations and match-arm literals, and deriving
+a glob from them soundly needs constant folding rather than a text scan. A
+production writer that runs under no template in this directory, such as
+`services/ravel-operator`, is recorded on the manifest entry as out of the
+templates' scope rather than checked. The per-lifecycle reachability tests
+remain the precise check, and the tables above remain the record.

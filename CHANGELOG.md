@@ -630,8 +630,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   removed, so the prefix the per-tick LIST walks grew with every maintain
   process that had ever run against the bucket, which is the unbounded-LIST
   cost issue #1679 removed for admission snapshots on the assumption that this
-  delete succeeded. Nothing surfaced it, because `reap_keys` treats a failed
-  delete as a key to retry next tick rather than as an error.
+  delete succeeded. Nothing failed and nothing alerted: `reap_keys` logs a
+  warning per refused delete and retries the key on the next tick, so the only
+  trace was one log line per dead worker per tick.
   **An operator must re-apply `deploy/iam/maintain.json`.** Until they do, the
   reap stays refused, dead heartbeat keys keep accumulating and the per-tick
   `ListBucket` over `sys/maintain/workers/` keeps growing; re-applying drains
@@ -646,25 +647,37 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `heartbeat_key` itself rather than written out.
 
 - **A guard now fails when a control-plane key space is exercised on an axis
-  no role's IAM template grants** (issue #1975). This defect has shipped six
-  times, always the same way: a grant derived from the one function a ticket
-  named instead of from every call site touching the prefix, leaving one axis
-  with no `Allow` at all. `scripts/guards/check-iam-keyspace-axes.sh`
-  discovers every key space the code names under the `sys/`, `quarantine/` and
-  `admission/` roots, requires each to carry a manifest entry declaring its
-  owner roles and, per axis, either a call site or a reason the axis is
-  unused, and then checks each used axis against that owner's shipped
-  template. A new key space fails until it is declared, so no one has to
-  remember to write a reachability test for it; a declaration that goes stale
-  in either direction fails too. It records nine pre-existing gaps it found
-  (`sys/auth` on both serving roles, the `sys/gc` bootstrap write, the
-  `sys/maintain/memo/` list, the `sys/query/workers/` reap, and the `sys/t/`
-  recovery-manifest write), each with a reason, and fails again when one is
+  no role's IAM template grants** (issue #1975). This defect has shipped
+  before and always the same way (#1849, #1934, #1847/#1955, #1957, #1975): a
+  grant derived from the one function a ticket named instead of from every
+  call site touching the prefix, leaving one axis with no `Allow` at all.
+  `scripts/guards/check-iam-keyspace-axes.sh` discovers every key space the
+  code names under the `sys/`, `quarantine/` and `admission/` roots, whether
+  it is spelled as a `const &str`, as a `format!` template, or as a bare
+  literal handed to a store call, and requires each to carry a manifest entry
+  naming, per axis, either the roles whose process runs the call or the reason
+  the axis is unused. The axis half of that entry is checked against the code
+  rather than trusted: the guard follows each key-space value through locals,
+  struct fields and returns until it reaches an object-store call, and reads
+  the axis off the method. So an axis declared unused while a call exercises
+  it fails; an axis declared used that no call reaches fails wherever the key
+  space's other axes were derived; a key space no source names any more fails;
+  and a key-bearing call site the derivation cannot classify refuses the scan
+  instead of narrowing it. Every
+  declared-used axis is then checked against the template of each role that
+  owns it. A grant on an axis declared unused fails only where a template
+  names that key space specifically, since a role's blanket wildcard over the
+  whole control plane satisfies a need without being evidence of one. The
+  guard records the eight pre-existing gaps it found, each with its reason and
+  all tracked by #1995 (the `sys/auth` reads on both serving roles and the
+  `ravel-cli` token write, the `sys/gc` bootstrap write on both serving roles,
+  the `sys/maintain/memo/` list, the `sys/query/workers/` reap, and the
+  `sys/t/` recovery-manifest write), and fails again when one of them is
   closed so the table cannot go stale. It runs in `scripts/gates.sh` and CI's
-  `doc-scripts` job. It catches "granted nowhere", which is the shape all six
-  instances had; it does not catch "granted too narrowly" and does not reach
-  tenant-rooted key spaces, which are composed through `format!` chains that
-  no text scan can resolve to a glob soundly.
+  `doc-scripts` job. It catches "granted nowhere", which is the shape every
+  instance above had; it does not catch "granted too narrowly" and does not
+  reach tenant-rooted key spaces, which are composed through `format!` chains
+  that no text scan can resolve to a glob soundly.
 
 - **`ravel-cli gc-config set --max-flush-lifetime`'s help text and generated
   reference page now state the floor the flag is refused below** (issue
