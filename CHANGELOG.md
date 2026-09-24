@@ -1279,15 +1279,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TooManyBytesScanned`. The bytes it is refused for are bytes the store really
   served. Per-fragment stats report the same figure: a successful fragment's
   `bytes_reported` is the sum over its attempts, and a failed one reports what
-  its attempts carried instead of a flat zero. One gap remains, and it is wider
-  than a lost stream: an attempt reports its own cost only once its terminal
+  its attempts carried instead of a flat zero. Two gaps remain. When one slice
+  of a fan-out fails, the query stops and its in-flight sibling slices are
+  cancelled, so the GETs their workers already issued are not reported. And
+  an attempt reports its own cost only once its terminal
   summary is decoded, so any attempt that ends before that point contributes
   zero rather than a guess. That covers a stream broken mid-flight, a decode
   fault before the summary, and EVERY coordinator byte-cap or frame-cap
   refusal, since a worker streams its summary last and
   `SliceStreamDecoder::push` checks both caps before it stores a frame. Such a
   slice still carries the spend of any EARLIER abandoned attempt, so a refusal
-  on a re-dispatch reports the primary's cost and not its own. Closing the gap
+  on a re-dispatch reports the primary's cost and not its own. Closing that gap
   needs the worker to send its accounting ahead of the frames, which is a wire
   change.
 
