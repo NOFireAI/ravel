@@ -5834,12 +5834,13 @@ pub mod limits {
     /// call, but it must never grow a literal of its own: a second set of
     /// numbers here is a second thing to keep in agreement, and the last one
     /// diverged (1,000,000 in `ravel-ingest` against 200,000 here) with
-    /// nothing failing.  `shipped_defaults_are_the_library_default` below
-    /// fails if a literal comes back.
+    /// nothing failing. `shipped_defaults_are_the_library_default` below
+    /// fails if the two diverge; it compares values, so a literal that
+    /// happens to match today would still pass until the constant moves.
     ///
-    /// `max_active_series` and `max_active_streams` are lower than ADR-0051
-    /// section 3's table, because the ADR's own per-entry memory estimate
-    /// was wrong; the corrected arithmetic lives on
+    /// `max_active_series` and `max_active_streams` are lower than the
+    /// 1,000,000 ADR-0051 section 3 originally proposed, because the ADR's
+    /// own per-entry memory estimate was wrong; the corrected arithmetic lives on
     /// [`AdmissionLimits::DEFAULT_MAX_ACTIVE_SERIES`], and
     /// docs/guides/admission-limits.md carries the operator-facing version.
     pub fn shipped_defaults() -> AdmissionLimits {
