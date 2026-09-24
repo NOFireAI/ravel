@@ -196,7 +196,10 @@ small objects); discovery never reads block data.
   matcher is evaluated per decoded record with no block-level pushdown; a
   follow-up may extract a literal word from a regex into
   `Predicate::HasWord` for bloom pruning, which is sound because the bloom
-  is a prune and the record check stays.
+  is a prune and the record check stays. That follow-up has landed for the
+  matchers a literal can be proven a superset of, so "no block-level
+  pushdown" no longer holds for them: the bloom pruning amendment below
+  says which matchers those are.
 - `__name__` with any operator other than `=`, and a selector with no
   `__name__` matcher at all, never see log series. `{job="api"}` keeps its
   Prometheus meaning over metrics; `{__name__=~"ravel_log.*"}` matches
@@ -388,7 +391,7 @@ flowchart TD
 
 ## Amendment 2026-09-06 (issue #1202): `__body__` literal bloom pruning
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="3. Matchers: stream labels, severity, and `__body__`" pointer="bloom pruning amendment" -->
 
 The follow-up decision 3 anticipated ("extraction into `Predicate::HasWord`
 for bloom pruning") has landed, for the subset of `__body__` matchers a
