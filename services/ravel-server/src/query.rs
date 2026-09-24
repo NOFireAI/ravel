@@ -195,8 +195,13 @@ pub fn build_catalog(
     if let Some(ns) = max_ingest_lag_ns {
         catalog_config.max_ingest_lag_ns = ns;
     }
-    // `None` leaves ravel-catalog's own default (currently 128) as the sole
-    // source of truth; only override when the CLI passed an explicit value.
+    // `None` leaves ravel-catalog's own default (the floor, 128) as the sole
+    // source of truth; only override when the caller passed a value. `start`
+    // always passes one: either the operator's explicit
+    // `--catalog-resolve-concurrency` or
+    // `ravel_catalog::derive_resolve_get_concurrency` over the process's own
+    // resolved `store_get_concurrency`, so the running server never sits on
+    // the floor by accident.
     if let Some(concurrency) = resolve_get_concurrency {
         catalog_config.resolve_get_concurrency = concurrency;
     }

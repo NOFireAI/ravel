@@ -429,11 +429,21 @@ pub const DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS: u64 = 720;
 /// This bounds one `Catalog` instance, not the process: `ravel-server`
 /// builds exactly one `Catalog` and shares it (via `Arc` clone, so one
 /// underlying `request_semaphore`) across every request, so N concurrent
-/// queries against that instance are capped at 128 in flight TOTAL, not N *
-/// 128. N * 128 in flight holds only across N distinct `Catalog` instances
-/// (e.g. separate CLI invocations or tests), never within one running
-/// server. A process-wide cap across instances is not implemented here and
-/// is tracked as a follow-up.
+/// queries against that instance are capped at this many in flight TOTAL,
+/// not N times it. N times it holds only across N distinct `Catalog`
+/// instances (e.g. separate CLI invocations or tests), never within one
+/// running server.
+///
+/// Because it is process-wide, a fixed 128 made cold-resolve throughput a
+/// property of the process count alone: at the ~30ms round trip, 128 permits
+/// sustain 128 / 0.030s ~= 4,267 object-store requests/s for the WHOLE
+/// process, so a host with more cores served no more cold resolves per
+/// second than one with fewer. This constant is now the FLOOR rather than
+/// the shipped value: `ravel-server` derives the value it configures from
+/// its own resolved query GET concurrency via
+/// [`derive_resolve_get_concurrency`], which never returns less than this.
+/// The per-process request rate each derived value implies is stated on
+/// that function.
 pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
 
 /// Upper bound on `resolve_get_concurrency`, enforced by both
@@ -448,6 +458,116 @@ pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
 /// only a value past that would panic in `Semaphore::new`; with a bound, both
 /// the typo and that extreme fail with a typed error at startup.
 pub const MAX_RESOLVE_GET_CONCURRENCY: usize = 4_096;
+
+/// Resolve permits granted per unit of the process's resolved query GET
+/// concurrency, the multiplier in [`derive_resolve_get_concurrency`].
+///
+/// 4, pinned to the measured basis rather than picked: `ravel-server`'s
+/// reference 16-core host resolves `store_get_concurrency` to 32
+/// (`max(8, 2 * cores)`, ADR-1195), and 4 * 32 = 128, the value
+/// [`DEFAULT_RESOLVE_GET_CONCURRENCY`] measures. So the reference host keeps
+/// exactly the shipped behaviour and only a host with more cores moves.
+///
+/// Above 1 because the two concurrencies count different work. One
+/// `store_get_concurrency` permit covers a whole segment fetch (one or more
+/// large ranged GETs plus decode, tens of milliseconds of CPU); one resolve
+/// permit covers a single small metadata request that is almost entirely
+/// round-trip latency. A resolve therefore needs several requests in flight
+/// per concurrent query to keep the same wire busy.
+pub const RESOLVE_GET_CONCURRENCY_PER_STORE_GET: usize = 4;
+
+/// Planning figure for the bytes one in-flight resolve response holds, used
+/// as the denominator of [`MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY`].
+///
+/// 140,000, sized on the LARGEST response the resolve path issues rather
+/// than the typical one. An ordinary commit record is about 864 bytes
+/// ([`RECORD_CACHE_ENTRY_BYTES`]), but `prewarm_compaction_records` fans
+/// compaction records out at the same width, and one L1 record over a
+/// shard-hour that sealed 1,800 L0 records carries about 1,800
+/// `CompactionInputIdentity` entries and charges roughly 137 KB (see
+/// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`], which pins that figure against
+/// `oversized_compaction_entries_evict_on_bytes_not_count` in
+/// `crate::cache`). Sizing the budget on 864 bytes would bound the typical
+/// case and leave the case that actually exhausts memory unbounded.
+///
+/// It is a planning figure, not a validated ceiling: neither record type has
+/// a format-level size cap, so a response CAN exceed it. That is why
+/// [`crate::Catalog`] counts the responses that do
+/// (`Catalog::inflight_budget_overruns`) instead of asserting the figure is
+/// never wrong.
+pub const RESOLVE_INFLIGHT_BYTES_PER_REQUEST: u64 = 140_000;
+
+/// Memory budget for all concurrently in-flight resolve responses in one
+/// process: 64 MiB.
+///
+/// Deliberately small next to the record caches (45 MB per actively queried
+/// tenant, [`MAX_RECORD_CACHE_BYTES_PER_TENANT`]) because this memory is
+/// transient and unreclaimable: the idle-tenant sweep can evict a cache, but
+/// nothing can evict a response already on the wire. 64 MiB is also what the
+/// budget has to be for the bound to bind before
+/// [`MAX_RESOLVE_GET_CONCURRENCY`] does: at 4,096 in flight the same
+/// responses would hold 4,096 * 140,000 = 573 MB, which on the 30 GiB
+/// reference box ADR-1170 carves is a larger share than any cache it sizes.
+pub const RESOLVE_INFLIGHT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The in-flight memory bound expressed in permits: 64 MiB / 140,000 B =
+/// 479 concurrent responses. [`derive_resolve_get_concurrency`] never
+/// returns more than this, so no host size can derive a width whose
+/// responses exceed [`RESOLVE_INFLIGHT_MAX_BYTES`].
+///
+/// It bounds the DERIVED value only. An operator's explicit
+/// `--catalog-resolve-concurrency` still reaches
+/// [`MAX_RESOLVE_GET_CONCURRENCY`]; `Catalog::new` logs the implied
+/// footprint when an explicit value is above this, rather than refusing a
+/// value the flag has always accepted.
+pub const MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY: usize =
+    (RESOLVE_INFLIGHT_MAX_BYTES / RESOLVE_INFLIGHT_BYTES_PER_REQUEST) as usize;
+
+/// Derive `resolve_get_concurrency` from the process's own resolved query
+/// GET concurrency (`ravel-server`'s `QueryBudgets::store_get_concurrency`,
+/// ADR-1195, itself `max(8, 2 * cores)` unless an operator set it).
+///
+/// That input is the only knob a running process actually sets for "how many
+/// object-store requests may a query have outstanding", and it moves with
+/// the host: `--max-concurrent-queries` is `Unlimited` when omitted and
+/// never reaches a `Catalog`, so it cannot serve as the input.
+///
+/// `4 * store_get_concurrency`, clamped into
+/// `[DEFAULT_RESOLVE_GET_CONCURRENCY, MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY]`.
+/// The floor wins over the memory bound: 128 in flight holds 128 * 140,000
+/// = 17.9 MB, well inside the 64 MiB budget, so the two clamps cannot
+/// invert.
+///
+/// What each derived width implies for the PROCESS, at the ~30ms measured
+/// GET round trip [`DEFAULT_RESOLVE_GET_CONCURRENCY`] records
+/// (`requests/s = width / 0.030`):
+///
+/// | cores | `store_get_concurrency` | derived | requests/s |
+/// |---|---|---|---|
+/// | 4 | 8 | 128 (floor) | 4,267 |
+/// | 8 | 16 | 128 (floor) | 4,267 |
+/// | 16 | 32 | 128 | 4,267 |
+/// | 32 | 64 | 256 | 8,533 |
+/// | 64 | 128 | 479 (memory bound) | 15,967 |
+/// | 128+ | 256+ | 479 (memory bound) | 15,967 |
+///
+/// Those rates are per PROCESS and across all prefixes it touches. S3's
+/// published per-prefix guidance is about 5,500 GET/s, and a resolve spreads
+/// its requests over one `t/<tenant>/<sig>/c/<shard>/<hour>/` prefix per
+/// shard-hour in the window, so a 12-bucket window at 479 in flight offers
+/// about 1,330 requests/s to each prefix. A window that collapses to a
+/// single shard-hour does concentrate the whole rate on one prefix and can
+/// exceed the guidance above 165 in flight; the store layer retries the
+/// resulting `503 SlowDown`, and `--catalog-resolve-concurrency` is the
+/// operator's lever for a deployment that sees them.
+pub fn derive_resolve_get_concurrency(store_get_concurrency: usize) -> usize {
+    store_get_concurrency
+        .saturating_mul(RESOLVE_GET_CONCURRENCY_PER_STORE_GET)
+        .clamp(
+            DEFAULT_RESOLVE_GET_CONCURRENCY,
+            MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY,
+        )
+}
 
 /// Catalog configuration.
 ///
@@ -637,8 +757,14 @@ pub struct CatalogConfig {
     /// [`crate::Catalog::new`] rejects `0` with
     /// [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig)
     /// rather than silently clamping it to 1. See
-    /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`] for the measured basis. Default
-    /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`].
+    /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`] for the measured basis.
+    ///
+    /// Default [`DEFAULT_RESOLVE_GET_CONCURRENCY`], which is the FLOOR, not
+    /// the value a server runs on: `ravel-server` sets this from
+    /// [`derive_resolve_get_concurrency`] unless the operator passed
+    /// `--catalog-resolve-concurrency`. A caller that constructs a
+    /// `CatalogConfig` directly and wants the host-derived width must call
+    /// that function; the `Default` impl cannot, because it has no host.
     pub resolve_get_concurrency: usize,
 }
 
@@ -838,5 +964,76 @@ mod tests {
             }
         }
         assert_eq!(all.len() as u64, SIGNAL_STREAMS);
+    }
+
+    /// The reference 16-core host must reproduce the measured constant
+    /// exactly: `store_get_concurrency` there is `max(8, 2 * 16) = 32`, and
+    /// the multiplier is chosen so `4 * 32 = 128`. If this fails, the
+    /// derivation changed the value the 2.341s measurement was taken at.
+    #[test]
+    fn the_reference_host_derives_the_measured_constant() {
+        assert_eq!(
+            derive_resolve_get_concurrency(32),
+            DEFAULT_RESOLVE_GET_CONCURRENCY
+        );
+    }
+
+    /// The point of the change: adding cores to one process raises the
+    /// process-wide width instead of leaving it pinned at 128.
+    #[test]
+    fn a_bigger_host_derives_a_wider_limit() {
+        assert_eq!(derive_resolve_get_concurrency(64), 256, "32 cores");
+        assert_eq!(
+            derive_resolve_get_concurrency(128),
+            MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY,
+            "64 cores: 512 uncapped, held at the in-flight memory bound"
+        );
+    }
+
+    /// A small host never derives below the measured basis, so nothing
+    /// regresses from the fixed 128.
+    #[test]
+    fn a_small_host_holds_the_floor() {
+        assert_eq!(
+            derive_resolve_get_concurrency(8),
+            DEFAULT_RESOLVE_GET_CONCURRENCY,
+            "4 cores: 32 uncapped, raised to the floor"
+        );
+        assert_eq!(
+            derive_resolve_get_concurrency(1),
+            DEFAULT_RESOLVE_GET_CONCURRENCY
+        );
+    }
+
+    /// No host size, however large, can derive a width whose in-flight
+    /// responses exceed the budget. The saturating multiply is what makes
+    /// the extreme a clamp rather than an overflow.
+    #[test]
+    fn no_host_can_derive_past_the_memory_bound() {
+        for input in [256usize, 4_096, usize::MAX] {
+            let derived = derive_resolve_get_concurrency(input);
+            assert_eq!(derived, MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY);
+            assert!(
+                derived as u64 * RESOLVE_INFLIGHT_BYTES_PER_REQUEST <= RESOLVE_INFLIGHT_MAX_BYTES,
+                "derived width holds at most the budget"
+            );
+        }
+    }
+
+    /// The in-flight bound is a real bound only while it sits between the
+    /// floor and the typed maximum: below the floor the clamp would invert,
+    /// above the maximum it would never bind.
+    #[test]
+    fn the_memory_bound_binds_between_the_floor_and_the_maximum() {
+        const {
+            assert!(MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY > DEFAULT_RESOLVE_GET_CONCURRENCY);
+            assert!(MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY < MAX_RESOLVE_GET_CONCURRENCY);
+        };
+        assert_eq!(MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY, 479);
+        assert!(
+            DEFAULT_RESOLVE_GET_CONCURRENCY as u64 * RESOLVE_INFLIGHT_BYTES_PER_REQUEST
+                <= RESOLVE_INFLIGHT_MAX_BYTES,
+            "the floor's own footprint (17.9 MB) is inside the budget, so the clamps cannot invert"
+        );
     }
 }

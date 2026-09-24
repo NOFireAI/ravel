@@ -416,6 +416,19 @@ pub struct Catalog {
     /// segment is still included for correctness (overlap harmlessness); the
     /// counter surfaces the anomaly to metrics.
     interlock_violations: AtomicU64,
+    /// Count of resolve-path responses whose body exceeded
+    /// [`RESOLVE_INFLIGHT_BYTES_PER_REQUEST`](crate::RESOLVE_INFLIGHT_BYTES_PER_REQUEST),
+    /// the per-response planning figure the in-flight memory budget divides
+    /// ([`MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY`](crate::MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY)).
+    ///
+    /// Neither commit nor compaction records have a format-level size cap, so
+    /// the budget rests on a planning figure rather than a validated ceiling.
+    /// This counts the responses that falsify it, which is the difference
+    /// between a bound that is checked and one that is merely asserted: a
+    /// nonzero value says the deployment's real per-response size is above
+    /// 140,000 bytes and the derived width is holding more memory in flight
+    /// than [`RESOLVE_INFLIGHT_MAX_BYTES`](crate::RESOLVE_INFLIGHT_MAX_BYTES).
+    inflight_budget_overruns: AtomicU64,
     /// Count of buckets observed holding two compaction records with
     /// different `input_set_hash` (docs/catalog-and-mvcc.md step 3, §3.6 row
     /// 11: a sealed bucket must yield exactly one input set). Both parts
@@ -608,6 +621,22 @@ impl Catalog {
                 "resolve_get_concurrency exceeds MAX_RESOLVE_GET_CONCURRENCY",
             ));
         }
+        // The derived default can never land here
+        // (`derive_resolve_get_concurrency` clamps at the budget), so this is
+        // an operator's explicit `--catalog-resolve-concurrency`. That flag has
+        // always accepted up to MAX_RESOLVE_GET_CONCURRENCY and still does;
+        // what it did not do before is say what the value costs in memory the
+        // process cannot reclaim.
+        if config.resolve_get_concurrency > crate::config::MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY {
+            tracing::warn!(
+                resolve_get_concurrency = config.resolve_get_concurrency,
+                memory_bounded_max = crate::config::MEMORY_BOUNDED_RESOLVE_GET_CONCURRENCY,
+                implied_inflight_bytes = (config.resolve_get_concurrency as u64)
+                    .saturating_mul(crate::config::RESOLVE_INFLIGHT_BYTES_PER_REQUEST),
+                budget_bytes = crate::config::RESOLVE_INFLIGHT_MAX_BYTES,
+                "configured resolve_get_concurrency is above the in-flight memory budget"
+            );
+        }
         // `byte_cache_max_bytes == 0` is the disabled sentinel:
         // build no byte cache at all rather than a zero-capacity one, so the
         // resolve path reads straight through the store with no RAM tier and no
@@ -635,6 +664,7 @@ impl Catalog {
             postings_cache: PostingsCache::default(),
             byte_cache,
             interlock_violations: AtomicU64::new(0),
+            inflight_budget_overruns: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
             rewrite_sibling_conflicts: AtomicU64::new(0),
             isolation_breaches: AtomicU64::new(0),
@@ -836,9 +866,44 @@ impl Catalog {
         let result = self.store.get(key, range).await;
         accounting.record_s3_request(AccountedOp::Get);
         if let Ok(got) = &result {
-            accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            let bytes = got.data.len() as u64;
+            accounting.add_s3_bytes(AccountedOp::Get, bytes);
+            self.observe_inflight_bytes(key, bytes);
         }
         result
+    }
+
+    /// Check one response body against the per-response planning figure the
+    /// in-flight memory budget is divided by, counting (and naming, once per
+    /// occurrence) every response that exceeds it.
+    ///
+    /// The budget bounds `resolve_get_concurrency *
+    /// RESOLVE_INFLIGHT_BYTES_PER_REQUEST`, and no format caps either record
+    /// type's size, so the figure is a planning figure. This is what keeps it
+    /// honest: a deployment whose real responses are larger shows up as a
+    /// nonzero counter instead of as unexplained resident memory.
+    fn observe_inflight_bytes(&self, key: &str, bytes: u64) {
+        if bytes <= crate::config::RESOLVE_INFLIGHT_BYTES_PER_REQUEST {
+            return;
+        }
+        self.inflight_budget_overruns.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            key,
+            bytes,
+            planning_bytes = crate::config::RESOLVE_INFLIGHT_BYTES_PER_REQUEST,
+            resolve_get_concurrency = self.config.resolve_get_concurrency,
+            "resolve response exceeds the in-flight memory planning figure"
+        );
+    }
+
+    /// Responses observed above
+    /// [`RESOLVE_INFLIGHT_BYTES_PER_REQUEST`](crate::RESOLVE_INFLIGHT_BYTES_PER_REQUEST)
+    /// since this `Catalog` was built. Nonzero means the in-flight memory
+    /// budget's per-response planning figure is too small for this
+    /// deployment, so the configured width holds more than
+    /// [`RESOLVE_INFLIGHT_MAX_BYTES`](crate::RESOLVE_INFLIGHT_MAX_BYTES).
+    pub fn inflight_budget_overruns(&self) -> u64 {
+        self.inflight_budget_overruns.load(Ordering::Relaxed)
     }
 
     /// One store GET for an object named by a content-addressed ref
@@ -2714,12 +2779,21 @@ impl Catalog {
         // 2). An unrecognized shape is a fail-loud error, never a silent
         // skip (fail-loud on layout drift).
         let mut l0_keys: Vec<String> = Vec::new();
+        // Each L0 key's own `(writer_id, writer_epoch, writer_seq)`, in
+        // `l0_keys` order. The classification above already parsed it, so the
+        // identity every exclusion test below needs is free here, and reading
+        // it from the key is what lets a superseded record be skipped without
+        // being fetched first.
+        let mut l0_identities: Vec<(String, u64, u64)> = Vec::new();
         let mut compaction_keys: Vec<String> = Vec::new();
         let mut rewrite_keys: Vec<String> = Vec::new();
         let mut has_tombstone = false;
         for meta in objects {
             match keys::partition_bucket_entry(&meta.key)? {
-                BucketEntry::CommitRecord(_) => l0_keys.push(meta.key),
+                BucketEntry::CommitRecord(parsed) => {
+                    l0_identities.push((parsed.writer_id.to_string(), parsed.epoch, parsed.seq));
+                    l0_keys.push(meta.key);
+                }
                 BucketEntry::CompactionRecord(_) => compaction_keys.push(meta.key),
                 BucketEntry::RewriteRecord(_) => rewrite_keys.push(meta.key),
                 BucketEntry::Tombstone(_) => has_tombstone = true,
@@ -2736,21 +2810,15 @@ impl Catalog {
             return Ok(out);
         }
 
-        // Warm the record caches for this bucket concurrently before the
-        // sequential include logic runs: the includes below
-        // then hit the cache instead of each paying a serial GET. A GET
-        // failure surfaces here, exactly as it would have from the first
-        // sequential load.
-        self.prewarm_commit_records(tenant, signal, shard, &l0_keys, accounting)
-            .await?;
-        self.prewarm_compaction_records(tenant, signal, shard, &compaction_keys, accounting)
-            .await?;
-
         // No compaction AND no rewrite record: Phase 1 behavior, every
         // overlapping L0. A rewrite record supersedes inputs exactly as a
         // compaction record does, so its presence alone (even with no
-        // compaction record) rules out this fast path.
+        // compaction record) rules out this fast path. Nothing can be
+        // superseded here, so every listed record is read and the whole
+        // bucket warms at once.
         if compaction_keys.is_empty() && rewrite_keys.is_empty() {
+            self.prewarm_commit_records(tenant, signal, shard, &l0_keys, accounting)
+                .await?;
             for key in &l0_keys {
                 self.include_l0_if_overlaps(
                     tenant, signal, shard, key, &range, &mut out, accounting,
@@ -2766,6 +2834,12 @@ impl Catalog {
         // newest record's created_unix_ns for the interlock check on unlisted
         // L0s. Parts are included below, after the rewrite supersession pass,
         // so a part a rewrite superseded is never included.
+        //
+        // The compaction and rewrite records come FIRST, before any L0 record
+        // is fetched, because they are what says which L0 records still have a
+        // reader. The L0 warm below then covers only the survivors.
+        self.prewarm_compaction_records(tenant, signal, shard, &compaction_keys, accounting)
+            .await?;
         let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
         let mut newest_record_created_ns = i64::MIN;
         let mut input_set_hashes: HashSet<Vec<u8>> = HashSet::new();
@@ -2916,18 +2990,27 @@ impl Catalog {
         // any unlisted one normally, raising the interlock metric if it
         // postdates the newest compaction/rewrite record (docs/catalog-and-mvcc.md
         // step 3).
-        for key in &l0_keys {
+        //
+        // An excluded record contributes nothing to the snapshot, so it is not
+        // fetched: exclusion is decided from the identity in its key, which the
+        // listing already carries, and `validate_expected_fields` holds every
+        // fetched record's body to that same identity. Retention keeps a
+        // compacted bucket's inputs for the whole protection horizon, so before
+        // this a bucket whose shard-hour sealed 1,800 L0 records into one L1
+        // record paid 1,800 GETs per resolve to decode 1,800 records and
+        // discard all of them.
+        let live_l0_keys: Vec<String> = l0_keys
+            .iter()
+            .zip(l0_identities.iter())
+            .filter(|(_, identity)| !excluded.contains(*identity))
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.prewarm_commit_records(tenant, signal, shard, &live_l0_keys, accounting)
+            .await?;
+        for key in &live_l0_keys {
             let record = self
                 .load_and_validate(tenant, signal, shard, key, accounting)
                 .await?;
-            let identity = (
-                record.writer_id.clone(),
-                record.writer_epoch,
-                record.writer_seq,
-            );
-            if excluded.contains(&identity) {
-                continue;
-            }
             if record.created_unix_ns > newest_record_created_ns {
                 self.interlock_violations.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -3770,6 +3853,34 @@ fn validate_expected_fields(
             field: "shard",
             expected: shard.to_string(),
             actual: record.shard.to_string(),
+        });
+    }
+    // The commit key carries the record's own `(writer_id, writer_epoch,
+    // writer_seq)`, and `process_bucket` reads exclusion from the key rather
+    // than from the record so a record a compaction or rewrite superseded is
+    // never fetched at all. That is sound only while the two agree, so the
+    // agreement is checked here on every record that IS fetched, the same
+    // key-reconstructs-from-identity rule `validate_compaction_expected_fields`
+    // and `validate_rewrite_expected_fields` already enforce (ADR-0010 §7).
+    let parsed = keys::parse_commit_key(key)?;
+    let key_identity = (parsed.writer_id.to_string(), parsed.epoch, parsed.seq);
+    let record_identity = (
+        record.writer_id.clone(),
+        record.writer_epoch,
+        record.writer_seq,
+    );
+    if key_identity != record_identity {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "writer identity",
+            expected: format!(
+                "{}.{}.{}",
+                key_identity.0, key_identity.1, key_identity.2
+            ),
+            actual: format!(
+                "{}.{}.{}",
+                record_identity.0, record_identity.1, record_identity.2
+            ),
         });
     }
     Ok(())

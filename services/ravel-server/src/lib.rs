@@ -2137,7 +2137,19 @@ pub async fn start(
         config.disable_cache,
         config.catalog_cache_max_bytes,
         config.cache_dir.clone(),
-        config.catalog_resolve_concurrency,
+        // The resolve semaphore is per-`Catalog` and this process builds
+        // exactly one, so this number is the whole process's cold-resolve
+        // request budget. A fixed 128 made that budget independent of the
+        // host: adding cores bought no extra in-flight requests and the only
+        // way to resolve more was to run more processes. Derived from the SAME
+        // resolved `store_get_concurrency` (ADR-1195) the fetchers run on, so
+        // one `--store-get-concurrency`, or one host size, moves both.
+        // `--catalog-resolve-concurrency` still wins outright when set.
+        Some(config.catalog_resolve_concurrency.unwrap_or_else(|| {
+            ravel_catalog::derive_resolve_get_concurrency(
+                config.query_budgets.store_get_concurrency,
+            )
+        })),
         Some(ingest_lag.catalog_window_ns),
         config.max_flush_delay,
     )?;
