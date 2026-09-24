@@ -3874,6 +3874,7 @@ struct AdmissionAcc {
     rejected_skew: u64,
     rejected_structural: u64,
     body_conversions: u64,
+    resource_attrs_dropped: u64,
     reconciliation_failures: u64,
 }
 
@@ -3950,6 +3951,9 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
         acc.body_conversions = acc
             .body_conversions
             .saturating_add(row.body_conversions_total);
+        acc.resource_attrs_dropped = acc
+            .resource_attrs_dropped
+            .saturating_add(row.resource_attrs_dropped_total);
     }
 
     // A HashMap iterates in an unspecified order; Prometheus does not require
@@ -4109,6 +4113,42 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
             "ravel_ingest_body_conversions_total",
             &labels(mode, *hash, *signal),
             acc.body_conversions,
+        );
+    }
+
+    // Resource attributes outside the allowlist, dropped rather than turned
+    // into labels. Its own family for the same reason body-conversions is:
+    // this is not a rejection, counted before the series cap and the write,
+    // so not a count of stored points. Key names are caller-controlled and
+    // unbounded, a cardinality hazard as a label, so this counts drops,
+    // never names them; see `crate::normalize_reject_metrics` and the crate
+    // docs on `Rejection::ResourceAttributesDropped` for the full reasoning.
+    // Metrics-only: OTLP HTTP and OTLP gRPC build resource labels this way;
+    // OTAP builds none at all (`services/ravel-server/src/otap_grpc.rs`),
+    // and logs/traces never call the recorder, so a logs or spans row would
+    // always render 0. Skip them rather than render a figure that can never
+    // be anything else.
+    write_header(
+        out,
+        "ravel_ingest_resource_attrs_dropped_total",
+        "Metric resource attributes outside the configured allowlist, dropped rather than turned \
+         into labels, by tenant, for the metrics signal only. Not a rejection: counted before the \
+         series cap and the write, so not a count of stored points. Covers OTLP HTTP and OTLP \
+         gRPC ingest; OTAP is not covered, since it builds no resource labels at all. The \
+         allowlist is not configurable today. This counter only makes an existing silent drop \
+         visible, including the case where two resources differing only in a dropped attribute \
+         collapse into one series.",
+        "counter",
+    );
+    for ((hash, signal), acc) in &ordered {
+        if *signal != Signal::Metrics {
+            continue;
+        }
+        write_sample(
+            out,
+            "ravel_ingest_resource_attrs_dropped_total",
+            &labels(mode, *hash, *signal),
+            acc.resource_attrs_dropped,
         );
     }
 
@@ -9504,6 +9544,12 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
     /// bodies render as their own family rather than as a reason. The tenant
     /// here has no admission usage row at all, so this also pins that a
     /// normalize-only (tenant, signal) still renders a full row.
+    ///
+    /// `ravel_ingest_resource_attrs_dropped_total` is metrics-only (OTAP and
+    /// logs/traces never call the recorder), so its row is pinned on a
+    /// `Signal::Metrics` entry, a state the renderer can actually produce,
+    /// rather than on the `Signal::Logs` row above: a nonzero count on a
+    /// signal the counter never renders would pass vacuously.
     #[test]
     fn admission_family_renders_the_skew_and_structural_reasons() {
         let hash = ravel_types::TenantId::new("noisy").hash();
@@ -9511,13 +9557,24 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             usage: Vec::new(),
             tenant_labels: true,
             wire_bytes: Vec::new(),
-            normalize_rejects: vec![crate::normalize_reject_metrics::TenantNormalizeRejects {
-                tenant_hash: hash,
-                signal: Signal::Logs,
-                skew_total: 2,
-                structural_total: 3,
-                body_conversions_total: 4,
-            }],
+            normalize_rejects: vec![
+                crate::normalize_reject_metrics::TenantNormalizeRejects {
+                    tenant_hash: hash,
+                    signal: Signal::Logs,
+                    skew_total: 2,
+                    structural_total: 3,
+                    body_conversions_total: 4,
+                    resource_attrs_dropped_total: 0,
+                },
+                crate::normalize_reject_metrics::TenantNormalizeRejects {
+                    tenant_hash: hash,
+                    signal: Signal::Metrics,
+                    skew_total: 0,
+                    structural_total: 0,
+                    body_conversions_total: 0,
+                    resource_attrs_dropped_total: 5,
+                },
+            ],
             reconcile_cycle: ReconcileCycleSnapshot::default(),
         };
         let body = render(
@@ -9572,6 +9629,32 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                  signal=\"logs\"}} 4"
             )),
             "converted bodies are their own family, not a rejection reason:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_ingest_resource_attrs_dropped_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"metrics\"}} 5"
+            )),
+            "dropped resource attributes are their own family, not a rejection reason:\n{body}"
+        );
+        assert!(
+            !body.contains(&format!(
+                "ravel_ingest_resource_attrs_dropped_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"logs\""
+            )),
+            "the counter is metrics-only; a logs row must not render at all:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "# HELP ravel_ingest_resource_attrs_dropped_total Metric resource attributes \
+                 outside the configured allowlist, dropped rather than turned into labels, by \
+                 tenant, for the metrics signal only."
+            ),
+            "HELP text must state the metrics-only scope:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_resource_attrs_dropped_total counter"),
+            "must be typed as a counter:\n{body}"
         );
     }
 
