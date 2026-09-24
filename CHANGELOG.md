@@ -782,13 +782,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A permission fault there read as "no statistics yet", "not covered" or
   "nothing folded yet" on every attempt, with nothing an operator could see.
   `NotFound` still degrades exactly as before at all five. Any other error
-  now surfaces, naming the failing key. What changes for a caller: a SQL
-  query on the logs table fails with that error instead of running without
-  column-statistics pruning; the scrubber logs it (the postings tier at
-  `error`, seal-divergence at `warn`) and retries next tick, as it already
-  did for other failures there; and `ravel-cli catalog verify` exits nonzero
-  instead of reporting "nothing folded yet". The shipped query policy in
-  `deploy/iam/query.json` already grants these reads.
+  now surfaces, naming the failing key. What changes for a caller: on the
+  column-stats HEAD and stats-object reads, a retryable error (throttling, a
+  timeout, a transient blip) still degrades quietly, so only a non-retryable
+  error such as `AccessDenied` fails the query, instead of running without
+  column-statistics pruning; the scrubber logs the postings-tier and
+  seal-divergence reads (at `error` and `warn` respectively) and retries next
+  tick, as it already did for other failures there; and `ravel-cli catalog
+  verify` exits nonzero instead of reporting "nothing folded yet". The
+  shipped query policy in `deploy/iam/query.json` already grants these
+  reads.
 
 - **A denied read on a catalog `idx/` object no longer degrades silently
   into "nothing to reuse"** (issue #1964). Three GETs of catalog index
