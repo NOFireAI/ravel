@@ -86,7 +86,8 @@
 #   scripts/guards/check-amendment-integrity.sh [dir]
 #     default: docs/adrs   (README.md there is an index, not an ADR)
 #
-# Exit 0 clean, 1 finding(s), 64 bad usage, 70 could not check. A finding is
+# Exit 0 clean, 1 finding(s), 64 bad usage (more than one argument, or a
+# directory outside the repository), 70 could not check. A finding is
 # something the document says that is not true of the document: a named
 # section without its pointer, a retired phrase still standing unqualified,
 # a `none` marker with no reason. 70 is a claim that cannot be checked at
@@ -134,6 +135,8 @@ ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 NONE_RE = re.compile(r"^none\b")
 MARKER_LINE_RE = re.compile(r"<!--\s*amendment-")
 FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
+# The marker comment itself, to the end of the line if it is not closed there.
+MARKER_COMMENT_RE = re.compile(r"<!--\s*amendment-.*?(?:-->|$)")
 SECTION_SPLIT_RE = re.compile(r"(?<!\\)\|")
 WS_RE = re.compile(r"\s+")
 
@@ -164,14 +167,14 @@ def is_amendment(level: int, text: str) -> bool:
 class Flat:
     """Whitespace-collapsed, lowercased view of a document's prose, with a
     map from each character back to the line it came from. Marker comments
-    are dropped: they are metadata about the document, not text the document
-    asserts."""
+    comments are cut out: they are metadata about the document, not text the
+    document asserts. Prose sharing a line with a marker stays."""
 
     def __init__(self, lines: list[str]):
         parts: list[str] = []
         owner: list[int] = []
         for k, line in enumerate(lines):
-            piece = "" if MARKER_LINE_RE.search(line) else norm(line)
+            piece = norm(MARKER_COMMENT_RE.sub(" ", line))
             if not piece:
                 continue
             if parts:
@@ -300,8 +303,7 @@ class Doc:
                 allow = ALLOW_RE.search(line)
                 if allow and allow.group(1).strip():
                     allowed = True
-                continue
-            prose.append(line)
+            prose.append(MARKER_COMMENT_RE.sub(" ", line))
         return norm(" ".join(prose)), allowed
 
 

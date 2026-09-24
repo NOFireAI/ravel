@@ -255,4 +255,5 @@ never qualify a phrase and never count as an occurrence of one.
   not exist or exists more than once, no such directory, no ADR files, or
   zero amendments scanned. Fix the marker or the heading it names; do not
   leave it at 70.
-- **64**: bad usage (more than one argument).
+- **64**: bad usage (more than one argument, or a directory outside the
+  repository).
