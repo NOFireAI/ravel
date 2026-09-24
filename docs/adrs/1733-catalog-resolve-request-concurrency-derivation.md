@@ -62,7 +62,8 @@ a local threshold, `Unlimited` when unset
    before it is issued. The per-prefix bound is keyed by the shard-hour
    commit prefix `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/`
    (docs/catalog-and-mvcc.md, key layout), the unit the S3 guidance is
-   stated against. Its default is 128, the value
+   stated against (superseded: see the parent-path keying amendment below).
+   Its default is 128, the value
    `DEFAULT_RESOLVE_GET_CONCURRENCY` holds today, renamed to say what it
    bounds. It is a `CatalogConfig` field with no CLI flag: the guidance
    does not vary by deployment, and a flag is added only if a measurement
@@ -165,7 +166,9 @@ flowchart LR
   and which input produced it. The flags reference and the operations
   guide state the derivation.
 - A single cold resolve whose records sit under one shard-hour prefix runs
-  at the same speed as today: 128 in flight on that prefix. What changes is
+  at the same speed as today: 128 in flight on that prefix (the keying this
+  sentence assumes is superseded by the parent-path keying amendment below,
+  which does not change the figure for this case). What changes is
   that a second concurrent resolve on another prefix no longer waits for
   the first. Throughput scales across queries and prefixes, not within one
   prefix.
@@ -196,3 +199,30 @@ flowchart LR
      against the ADR's expected band (about 2x the single-resolve
      throughput) before the change lands, and record the result on the
      ticket.
+
+## Amendment: the per-prefix bound is keyed by a request's parent path
+<!-- amendment-applies: sections="Decision|Consequences" pointer="parent-path keying amendment" -->
+
+Decision 1 keys the per-prefix bound by the shard-hour commit prefix
+`t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/`. The implementation keys
+every resolve-path request by its own parent path instead: everything in the
+key up to and including its last separator, whatever kind of object it names
+(`request_key_prefix` in `crates/ravel-catalog/src/catalog.rs`).
+
+The reason is that decision 1's key left most of the resolve path unbounded.
+A commit record's parent path IS its shard-hour commit prefix, so commit
+records keep exactly the keying decision 1 names. But a resolve of a folded
+tenant reads a snapshot's parts, which all share
+`t/<tenant_hash>/catalog/<signal>/snap/`, and its postings and column stats,
+which share `.../idx/`. Those fan-outs run at the process ceiling's width,
+so under decision 1's key they took no prefix permit at all: raising the
+ceiling to 1,024 put 1,024 requests on one directory, which is the single
+thing the per-prefix bound exists to prevent, and the arithmetic behind the
+128 (S3's per-prefix guidance) applies to those prefixes exactly as it
+applies to a shard-hour. A LIST prefix already ends at a separator and so is
+keyed by itself.
+
+Nothing else in the ADR moves. The bound's value, its lack of a CLI flag,
+the lazy creation and idle removal of its semaphores, and the derivation of
+the process ceiling in decision 2 are unchanged, and no case that decision 1
+bounded is bounded more loosely now.
