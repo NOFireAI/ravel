@@ -102,7 +102,9 @@ catalog-to-query dependency direction the workspace otherwise holds
 throughout. The PromQL/SQL asymmetry (pre- versus post-prune counting)
 collapses into one definition: the sealed count is post-prune
 everywhere. SQL surfaces get the same recent-hour exemption and the
-same budget.
+same budget. The seam covers the local admission points; the federated
+discovery budget amendment below adds the coordinator's own re-check of
+the request budget after fan-out accounting is folded back.
 
 ### 5. What does not change
 
@@ -114,7 +116,9 @@ segments. The mixed-level total order and query-time dedup are
 untouched: this ADR changes which segments are *admitted*, never how
 they merge. Distribution (ADR-0071) composes: slices carry recent
 segments like any others, and the request budget folds worker spend
-through the existing accounting merge.
+through the existing accounting merge. That composition was incomplete
+on one call path; the federated discovery budget amendment below names
+it and closes it.
 
 ## Rejected alternatives
 
@@ -160,7 +164,7 @@ through the existing accounting merge.
 
 ## Amendment
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="4. One enforcement seam, all surfaces|5. What does not change" pointer="federated discovery budget amendment" -->
 
 The request budget from decision 3 is now also re-enforced on the
 cross-cluster/distributed coordinator path (ADR-0071), alongside the
