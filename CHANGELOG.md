@@ -321,29 +321,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   possibly zero) value existed for it. Both are now flat fields rendered
   for every `{mode, signal}` combination.
 
-- **A process-wide memory budget now bounds SQL execution and the fetch layer
-  together, with three new `/metrics` gauges** (issues #1170, #1254).
-  `QueryEngine` and `SqlExecutor` share one `Arc<MemoryBudget>`: every RSEG
-  `ensure_ranges` coalesced read, every RLOG block-range and whole-object
-  fetch, and every RSPAN whole-object fetch reserves the bytes its GET will
-  materialize before issuing it, for the reservation's whole lifetime, and a
-  SQL statement's own pooled reservation draws on the same counter. A
-  fetch-side refusal fails typed as `FetchMemoryExhausted { requested,
-  reserved, limit }`, mapped to the frozen gRPC `BudgetExceeded` code rather
-  than `Unavailable`: `Unavailable` is this codebase's re-dispatch-and-run-
-  locally class, so mapping a budget refusal to it re-dispatched the refused
-  slice to another worker and then ran it on the coordinator, amplifying the
-  load the budget exists to shed. `ravel_memory_budget_bytes` (the resolved
-  ceiling, `u64::MAX` meaning unlimited), `ravel_memory_reserved_bytes` by
-  `{component="sql"|"fetch"}`, and `ravel_memory_handoff_overlap_bytes` are
-  now on `/metrics`. Two startup defects in the derived budget were closed
-  alongside this: a host where memory could not be measured (any non-Linux
-  host) used to derive a budget of `0` instead of unlimited, and a
-  `--cache-max-bytes`/`--catalog-cache-max-bytes` combination landing at or
-  above the derived budget used to be accepted rather than refused; both
-  used to leave `MemoryBudget::new(0)` in place, which refuses every real
-  SQL or fetch reservation while a statement that reserves nothing (`SELECT
-  1`) kept answering.
+- **A process-wide memory budget now bounds SQL execution, with three new
+  `/metrics` gauges** (issues #1170, #1254). A SQL statement's pooled
+  reservation draws on one process-wide `MemoryBudget`. The fetch layer can
+  reserve against the same budget (every RSEG `ensure_ranges` coalesced read,
+  every RLOG block-range and whole-object fetch, and every RSPAN whole-object
+  fetch reserves the bytes its GET will materialize before issuing it), but no
+  shipped binary hands the fetchers that budget yet, so fetch buffers are not
+  counted against it and `component="fetch"` reads 0 (see the #1255 entry).
+  Where a fetcher is given the budget, a fetch-side refusal fails typed as
+  `FetchMemoryExhausted { requested, reserved, limit }`, mapped to the frozen
+  gRPC `BudgetExceeded` code rather than `Unavailable`: `Unavailable` is this
+  codebase's re-dispatch-and-run-locally class, so mapping a budget refusal to
+  it re-dispatched the refused slice to another worker and then ran it on the
+  coordinator, amplifying the load the budget exists to shed.
+  `ravel_memory_budget_bytes` (the resolved ceiling, `u64::MAX` meaning
+  unlimited), `ravel_memory_reserved_bytes` by `{component="sql"|"fetch"}`, and
+  `ravel_memory_handoff_overlap_bytes` are now on `/metrics`. Two startup
+  defects in the derived budget were closed alongside this: a host where memory
+  could not be measured (any non-Linux host) used to derive a budget of `0`
+  instead of unlimited, and a `--cache-max-bytes`/`--catalog-cache-max-bytes`
+  combination landing at or above the derived budget used to be accepted rather
+  than refused; both used to leave `MemoryBudget::new(0)` in place, which
+  refuses every real SQL or fetch reservation while a statement that reserves
+  nothing (`SELECT 1`) kept answering.
 
 - **`stats.io` on both the SQL and PromQL JSON responses now reports
   `unfoldedRecordsServedFromCache`, the count of commit records a query's
@@ -473,28 +474,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   held whether or not the current read addresses all of them.
 
 - **`ravel_maintain_l0_records_pending` and
-  `ravel_maintain_objects_deleted_total`
-  render on `/metrics`** (issue #1729). The compaction scan and the retention
-  sweep previously reported these figures to tracing only, so an operator
-  could not see how much L0 compaction work was queued, or how many objects
-  maintenance had actually deleted, without reading logs on every process.
-  `ravel_maintain_l0_records_pending` is now published by `signal`, summed
-  across every bucket this process owns and republished once per
-  maintenance cycle (default 300 seconds) after the cycle has covered all
-  of them, so a mid-cycle scrape reads the previous cycle's complete total
-  rather than a partial sum; a bucket the cadence memo
-  skipped for being safely below threshold still contributes its last-known
-  record count, so the buckets an operator most needs to watch cannot silently
-  drop out of the total. `ravel_maintain_objects_deleted_total` is published
-  by `kind`, one series per `SweepReport` count (including
-  `kind="quarantine_reaped"`). The troubleshooting guide documents both, and
-  says that a dip in the pending gauge is not corroborated by
+  `ravel_maintain_objects_deleted_total` render on `/metrics`** (issue #1729).
+  The compaction scan and the retention sweep previously reported these figures
+  to tracing only, so an operator could not see how much L0 compaction work was
+  queued, or how many objects maintenance had actually deleted, without reading
+  logs on every process. `ravel_maintain_l0_records_pending` is now published by
+  `signal`, summed across every bucket this process owns and republished once
+  per maintenance cycle (default 300 seconds) after the cycle has covered all of
+  them, so a mid-cycle scrape reads the previous cycle's complete total rather
+  than a partial sum; a bucket the cadence memo skipped for being safely below
+  threshold still contributes its last-known record count, so the buckets an
+  operator most needs to watch cannot silently drop out of the total.
+  `ravel_maintain_objects_deleted_total` is published by `kind`, one series for
+  each of the four `SweepReport` counts that record a physical delete (including
+  `kind="quarantine_reaped"`; a move to quarantine and a withheld candidate are
+  not deletes and are not counted). The troubleshooting guide documents both,
+  and says that a dip in the pending gauge is not corroborated by
   `ravel_maintain_units_stalled`: that gauge only moves for a per-unit failure
-  repeated past its stall threshold, and the paths that remove the most
-  records from the pending total (a tenant skipped whole-tick for a failed
-  legal-hold refresh, or by the provisioning or shard-generation check) never
-  reach per-unit accounting, so `units_stalled` can sit at zero while the
-  pending population moves for an unrelated reason.
+  repeated past its stall threshold, and the paths that remove the most records
+  from the pending total (a tenant skipped whole-tick for a failed legal-hold
+  refresh, or by the provisioning or shard-generation check) never reach
+  per-unit accounting, so `units_stalled` can sit at zero while the pending
+  population moves for an unrelated reason.
 
 - **The process memory budget now exposes gauges on `/metrics`, and startup
   refuses a container the budget cannot fit** (issues #1255, #1395).
@@ -530,7 +531,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   value of 0. The route runs the same tenant resolution, origin check, and body
   cap as the HTTP query surfaces before anything reaches the protocol layer, and
   each tool call is billed through the same admission permit, deadline clamp,
-  cost record, usage guard, audit submission, partial- result gate, and error
+  cost record, usage guard, audit submission, partial-result gate, and error
   redaction as an HTTP query. Starting the process with `--mcp` under `--mode
   gateway` or `--mode maintain` now fails at startup, naming the flag and the
   mode, instead of silently mounting nothing. `ravel_capabilities` reports which
@@ -2166,29 +2167,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   completing zero sweeps.
 
 - **The listing conformance suite's pagination probes now force a real
-  continuation-token boundary instead of passing on a fixed, small key
-  count** (issue #1695). `S3Store`'s declared page size does not change the
-  wire-level page size a real S3-compatible backend uses: each listing call
-  opens its own lazy stream, pulls at most the declared number of entries
-  off it, and drops the stream, so the backend's own continuation token
-  goes unfollowed only when the declared size is smaller than what one real
-  response actually carries. The suite's probes wrote a fixed handful of keys
-  and
-  accepted "more than one page" as proof of correct pagination, which an
-  in-memory backend could satisfy with a trailing empty page emitted purely
-  to mark the end of a listing, proving nothing about a real backend's
-  pagination at all. Both probes now write enough keys, relative to the
-  declared page size, to force at least two pages that actually carry
-  objects, and fail qualification naming the real page count otherwise.
-  `ravel-cli store qualify` gains a `--list-page-size` flag (default: the
-  production S3 page size) so a qualification run exercises a real boundary
-  against the store it is qualifying; a qualification run against the
-  default page size now leaves about 2,018 scratch objects behind rather
-  than a handful, which `docs/guides/kubernetes.md` and
-  `docs/object-store-contract.md` now state so an operator's cleanup sweep
-  sizes for the right number. The conformance suite version is unchanged:
-  this changes how existing probes size their input, not which properties
-  are checked, so no previously qualified store needs re-qualification.
+  continuation-token boundary instead of passing on a fixed, small key count**
+  (issue #1695). `S3Store`'s declared page size does not change the wire-level
+  page size a real S3-compatible backend uses: each listing call opens its own
+  lazy stream, pulls at most the declared number of entries off it, and drops
+  the stream, so the backend's own continuation token goes unfollowed only when
+  the declared size is smaller than what one real response actually carries. The
+  suite's probes wrote a fixed handful of keys and accepted "more than one page"
+  as proof of correct pagination, which an in-memory backend could satisfy with
+  a trailing empty page emitted purely to mark the end of a listing, proving
+  nothing about a real backend's pagination at all. Both probes now write enough
+  keys, relative to the declared page size, to force at least two pages that
+  actually carry objects, and fail qualification naming the real page count
+  otherwise. `ravel-cli store qualify` gains a `--list-page-size` flag (default:
+  the production S3 page size) so a qualification run exercises a real boundary
+  against the store it is qualifying; a qualification run against the default
+  page size now leaves about 2,018 scratch objects behind rather than a handful,
+  which `docs/object-store-contract.md` now states so an operator's cleanup
+  sweep sizes for the right number. The conformance suite version is unchanged:
+  this changes how existing probes size their input, not which properties are
+  checked, so no previously qualified store needs re-qualification.
 
 - **The quarantine reaper is now held for the full duration of a live
   mass-orphan incident, and a legal hold now reaches a quarantined copy**
@@ -2322,12 +2320,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one anonymous Docker Hub pull, down from three.
 
 - **Every image the quickstart deploy compose files and Kubernetes manifests
-  pull is now pinned to a release tag plus an immutable digest** (issue
-  #1720). Across the two quickstart compose files, 8 image lines are scanned
-  and 6 require a digest (Ravel's own released image is exempt by exact
-  match); all 6 images referenced by the Kubernetes manifests are now pinned
-  the same way. A repo-wide check now scans both compose files and the
-  manifests so the two cannot drift apart unnoticed.
+  pull is now pinned to a release tag plus an immutable digest** (issue #1720).
+  Across the two quickstart compose files, 8 image lines are scanned and 6
+  require a digest (Ravel's own released image is exempt by exact match); of the
+  6 images referenced by the Kubernetes manifests, 4 are now pinned the same
+  way, and Ravel's own locally built `ravel-server:latest` and
+  `ravel-operator:latest` are exempt by exact match. A repo-wide check now scans
+  both compose files and the manifests so the two cannot drift apart unnoticed.
 
 ## [0.15.0] - 2026-09-08
 
