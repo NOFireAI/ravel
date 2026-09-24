@@ -114,6 +114,75 @@ fn representative_keys() -> Vec<String> {
     keys
 }
 
+/// The top-level key space every quarantined orphan lives under, mirrored from
+/// `QUARANTINE_PREFIX` in `crates/ravel-maintain/src/sweep.rs` (ADR-0058
+/// decision 6). It is mirrored rather than imported for the reason
+/// `maintain_deletes_catalog_snap_and_idx_but_not_head` records: `ravel-commit`
+/// cannot depend on `ravel-maintain` without circularity, and the key builders
+/// there are private.
+///
+/// `quarantine/` sits ALONGSIDE `t/` and `sys/`, not under `t/`, which is why a
+/// `t/`-rooted grant reaches none of these keys and the reaper needs grants of
+/// its own (`maintain_template_covers_every_quarantine_call`).
+const QUARANTINE_PREFIX: &str = "quarantine/";
+
+/// The zero-padded `q<quarantined_at_ns>` stamp `quarantine_key` appends. Any
+/// value works as a witness; the WIDTH is what the key shape fixes, so it is
+/// written the way `sweep.rs` writes it rather than as a bare integer.
+const QUARANTINED_AT_NS: i64 = 1;
+
+/// Every L0 data key in `representative_keys`, which is every key shape the
+/// ADR-0058 orphan sweep can quarantine. Selected from that function's output
+/// rather than rebuilt, so a `data_key` signature or shard-width change moves
+/// the quarantine witnesses with it instead of leaving them behind.
+fn l0_data_keys() -> Vec<String> {
+    let keys: Vec<String> = representative_keys()
+        .into_iter()
+        .filter(|k| k.contains("/l0/"))
+        .collect();
+    assert!(
+        !keys.is_empty(),
+        "representative_keys() produces no l0/ data key, so every quarantine \
+         witness derived from one would be empty and the reachability \
+         assertions would examine nothing"
+    );
+    keys
+}
+
+/// `quarantine/<original key>/q<quarantined_at_ns>`, the key the sweep copies a
+/// quarantined orphan to (`quarantine_key`, `crates/ravel-maintain/src/sweep.rs`).
+/// The original key is preserved verbatim, so this composes a real `data_key`
+/// with the prefix and the stamp instead of spelling out a tenant key by hand.
+fn quarantine_key(live_key: &str) -> String {
+    format!("{QUARANTINE_PREFIX}{live_key}/q{QUARANTINED_AT_NS:020}")
+}
+
+/// `quarantine/t/<tenant_hash>/<signal>/l0/<shard>/`, the prefix the reaper
+/// passes to `list_all` (`quarantine_l0_data_prefix`, same file). Derived by
+/// dropping a real data key's object segment, so the shard segment's
+/// zero-padded width is never retyped here.
+fn quarantine_l0_data_prefix(live_key: &str) -> String {
+    let (shard_prefix, _object) = live_key
+        .rsplit_once('/')
+        .expect("an l0 data key ends in an object segment");
+    format!("{QUARANTINE_PREFIX}{shard_prefix}/")
+}
+
+/// The quarantine keyspace witnesses: one quarantine copy and one per-shard
+/// quarantine prefix per L0 data key shape. The prefix is included for the same
+/// reason `representative_keys` carries `del_prefix`: the `s3:prefix` the reaper
+/// lists with is a value a policy pattern is matched against, and a pattern
+/// witnessed by no key is invisible to every domain-wide measurement in this
+/// file (`assert_pattern_is_witnessed`).
+fn quarantine_witness_keys() -> Vec<String> {
+    let mut keys = Vec::new();
+    for live in l0_data_keys() {
+        keys.push(quarantine_key(&live));
+        keys.push(quarantine_l0_data_prefix(&live));
+    }
+    keys
+}
+
 /// One literal key per non-tenant keyspace the shipped templates name, for the
 /// keyspaces `ravel-commit` has no constructor for (`sys/`, `admission/`). They
 /// exist only as EXCLUSION WITNESSES for `glob_admits_everything`: a pattern
@@ -188,13 +257,15 @@ fn constructor_free_tenant_witness_keys() -> Vec<String> {
 /// The key domain the value-level checks in this file evaluate a pattern
 /// against: every key `ravel-commit`'s constructors can produce, plus one
 /// witness per non-tenant keyspace the templates name, plus one per
-/// tenant-routed keyspace no constructor builds. Built once.
+/// tenant-routed keyspace no constructor builds, plus the `quarantine/` copies
+/// and prefixes the ADR-0058 reaper works over. Built once.
 fn key_domain() -> &'static [String] {
     static DOMAIN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     DOMAIN.get_or_init(|| {
         let mut keys = representative_keys();
         keys.extend(NON_TENANT_WITNESS_KEYS.iter().map(|k| (*k).to_string()));
         keys.extend(constructor_free_tenant_witness_keys());
+        keys.extend(quarantine_witness_keys());
         keys
     })
 }
@@ -1845,6 +1916,19 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // and the shape that shipped again here three times (issue #1847, rounds
     // two through four). Asserted by
     // maintain_template_covers_every_catalog_sweep_call.
+    //
+    // quarantine/t/*/*/l0/* appears on three axes (list, put, delete) because
+    // the ADR-0058 orphan sweep and its reaper touch a key space that is NOT
+    // under t/: sweep_orphans PUTs each candidate's bytes to
+    // quarantine/<original key>/q<ns>, and sweep_quarantine LISTs
+    // quarantine/t/<hash>/<signal>/l0/<shard>/ and DELETEs what is past the
+    // second horizon. IAM is default-deny and `t/` is a literal in every other
+    // pattern here, so before this grant the reaper was refused at its
+    // ListBucket and the sweep could not quarantine an orphan at all
+    // (issue #1957). There is no matching GET: nothing reads a quarantine
+    // object, since the copy reads the LIVE key (already covered by
+    // t/*/*/l0/*) and no restore path exists in the code. Asserted call by
+    // call by maintain_template_covers_every_quarantine_call.
     ExpectedRolePatterns {
         role: "maintain",
         list_prefixes: &[
@@ -1857,6 +1941,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "sys/maintain/workers/*",
+            "quarantine/t/*/*/l0/*",
         ],
         list_actions: &["s3:ListBucket"],
         gets: &[
@@ -1884,6 +1969,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/gc",
             "sys/tenancy",
             "sys/maintain/*",
+            "quarantine/t/*/*/l0/*",
         ],
         put_actions: &["s3:PutObject"],
         deletes: &[
@@ -1895,6 +1981,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/del/*.dreq",
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
+            "quarantine/t/*/*/l0/*",
         ],
         // Both delete operations, and the same two the Deny names. Maintain is
         // the only role where that identity is load-bearing rather than
@@ -3211,6 +3298,209 @@ fn erasure_lifecycle_calls_outside_the_sweep_are_reachable() {
                     "{role}: pattern {pattern:?} reaches the erasure keyspace \
                      AND {key:?}, which lies outside del/ (#1849)"
                 );
+            }
+        }
+    }
+}
+
+/// Every object-store call the ADR-0058 quarantine lifecycle makes, asserted
+/// against the shipped Maintain template, whichever prefix the call lands on.
+///
+/// The lifecycle is orphan GC's two halves in
+/// `crates/ravel-maintain/src/sweep.rs`, and the grant set is derived from every
+/// call site that touches `QUARANTINE_PREFIX`, not from one function: scoping a
+/// reachability check to the function a ticket names is how #1849, #1934 and
+/// #1847 each shipped a grant whose own listing was refused.
+///
+/// - `sweep_orphans` (rule 1) builds `dest = quarantine_key(&meta.key, ...)`
+///   (sweep.rs:687) and calls `quarantine_object`, which GETs the LIVE object
+///   (`store.get(src, GetRange::Full)`, sweep.rs:762) and PUTs the copy
+///   (`store.put(dest, ...)`, sweep.rs:767).
+/// - `sweep_orphans` then deletes the live key (`store.delete(&meta.key)`,
+///   sweep.rs:690), copy-first and delete-second.
+/// - `sweep_quarantine` (rule 1b, the reaper) LISTs the shard's quarantine
+///   prefix (`list_all(store, &quarantine_l0_data_prefix(...))`, sweep.rs:901)
+///   and DELETEs each copy past the second horizon
+///   (`store.delete(&meta.key)`, sweep.rs:921).
+///
+/// Two of the five need a grant no `t/`-rooted pattern can give.
+/// `QUARANTINE_PREFIX` is a TOP-LEVEL key space alongside `t/` and `sys/`
+/// (sweep.rs:812), and under `StringLike` the literal `t/` in every other
+/// pattern anchors at the start of the key, so `quarantine/t/...` matches none
+/// of them -- asserted below rather than argued. IAM being default-deny, the
+/// reaper was refused at its `ListBucket` and the sweep's copy at its `PutObject`
+/// before this grant existed, so a deployment on the shipped template could not
+/// quarantine an orphan at all (issue #1957).
+///
+/// No GET is asserted on the quarantine keyspace, and none is granted: the copy
+/// reads the live key, the reaper reads its horizon out of the key itself
+/// (`parse_quarantine_timestamp`), and no restore path exists in the code. If
+/// one is added, it needs its own grant on whichever role runs it, and the
+/// closing per-role assertion below is what will fail until it gets one.
+#[test]
+fn maintain_template_covers_every_quarantine_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+
+    let live_keys = l0_data_keys();
+    for live in &live_keys {
+        let copy = quarantine_key(live);
+        let prefix = quarantine_l0_data_prefix(live);
+
+        // Call 1: quarantine_object GETs the live object (sweep.rs:762).
+        assert!(
+            gets.iter().any(|p| glob_matches(p, live)),
+            "maintain: no GetObject Allow reaches the live object {live:?}, which \
+             quarantine_object reads before it can copy it (sweep.rs:762). \
+             Nothing is quarantined and, fail-closed, nothing is deleted. \
+             Grants: {gets:?}"
+        );
+
+        // Call 2: quarantine_object PUTs the copy (sweep.rs:767).
+        assert!(
+            puts.iter().any(|p| glob_matches(p, &copy)),
+            "maintain: no PutObject Allow reaches the quarantine copy {copy:?}, \
+             which quarantine_object writes (sweep.rs:767). Every candidate's \
+             copy fails, so the sweep counts it refused and leaves it live \
+             forever: orphan GC never collects anything (#1957). Grants: {puts:?}"
+        );
+
+        // Call 3: sweep_orphans deletes the live key, copy-first (sweep.rs:690).
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, live)),
+            "maintain: no delete Allow reaches the live object {live:?}, which \
+             sweep_orphans deletes once its copy landed (sweep.rs:690). The \
+             object stays live with a quarantine copy beside it. \
+             Grants: {deletes:?}"
+        );
+
+        // Call 4: the reaper LISTs the shard's quarantine prefix (sweep.rs:901).
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "maintain: no ListBucket s3:prefix admits {prefix:?}, the prefix \
+             sweep_quarantine passes to list_all (sweep.rs:901). The reaper is \
+             refused with AccessDenied before it sees a single copy, so the \
+             quarantine prefix grows without bound and its delete grant is \
+             unreachable (#1957). s3:prefix values: {list_prefixes:?}"
+        );
+
+        // Call 5: the reaper deletes a copy past the second horizon
+        // (sweep.rs:921).
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &copy)),
+            "maintain: no delete Allow reaches the quarantine copy {copy:?}, \
+             which sweep_quarantine deletes past quarantine_horizon_ns \
+             (sweep.rs:921). This is the only place orphan-GC'd data is \
+             physically removed, so without it the prefix leaks forever \
+             (ADR-0058 decision 6). Grants: {deletes:?}"
+        );
+    }
+
+    // The premise the three new patterns rest on: `quarantine/` is not under
+    // `t/`, so no pattern written for the live keyspace reaches a copy. Without
+    // this, a reader could believe `t/*/*/l0/*` already covered the reaper and
+    // read the grants above as redundant.
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:GetObject Allow", &gets),
+        ("s3:PutObject Allow", &puts),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns
+            .iter()
+            .filter(|p| !p.starts_with(QUARANTINE_PREFIX))
+        {
+            for live in &live_keys {
+                let copy = quarantine_key(live);
+                assert!(
+                    !glob_matches(pattern, &copy),
+                    "maintain: {axis} pattern {pattern:?} is not written for the \
+                     quarantine keyspace yet reaches {copy:?}. Either the pattern \
+                     is wider than the live keyspace it names, or \
+                     QUARANTINE_PREFIX stopped being a top-level key space and \
+                     every grant in this test must be re-derived (#1957)"
+                );
+            }
+        }
+    }
+
+    // Tightness, the same shape the erasure tests use: a pattern that reaches a
+    // quarantine copy must reach nothing outside `quarantine/`. The five calls
+    // need that keyspace and the live l0 keyspace the template already named;
+    // a pattern spanning both (`*`, or a `quarantine/*` widened to `*/t/*`) is
+    // over-granted. The GET axis is absent because nothing GETs a quarantine
+    // object: its witness above is the LIVE key, which `t/*/*/l0/*` reaches by
+    // design.
+    let quarantine_copies: Vec<String> = live_keys.iter().map(|k| quarantine_key(k)).collect();
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.starts_with(QUARANTINE_PREFIX))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside quarantine/, so the tightness \
+         assertions below examine nothing"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:PutObject Allow", &puts),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns {
+            if !quarantine_copies.iter().any(|w| glob_matches(pattern, w)) {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the quarantine \
+                     keyspace AND {key:?}, which lies outside it. The five calls \
+                     need quarantine/ and nothing else (#1957)"
+                );
+            }
+        }
+    }
+
+    // No other role touches the quarantine keyspace on any axis. Maintain is
+    // the only role that runs the sweep, and `quarantine/` sits outside the
+    // blanket `t/*` and `sys/*` reads admin holds, so nothing else reaches it
+    // today. A restore path (ADR-0058 decision 6 describes recovery as a copy
+    // of the bytes back to the original key, but no command implements one)
+    // would be the first caller to need a grant here, and this assertion is
+    // where the template and the code get compared when it lands.
+    for role in ALL_ROLES {
+        if role == "maintain" {
+            continue;
+        }
+        let policy = load_policy(role);
+        for (axis, patterns) in [
+            (
+                "s3:prefix Allow",
+                list_prefix_patterns(&policy, Some("Allow")),
+            ),
+            (
+                "s3:GetObject Allow",
+                key_patterns_for(&policy, &["s3:GetObject"], Some("Allow")),
+            ),
+            (
+                "s3:PutObject Allow",
+                key_patterns_for(&policy, &["s3:PutObject"], Some("Allow")),
+            ),
+            ("delete Allow", delete_key_patterns(&policy, "Allow")),
+        ] {
+            for pattern in &patterns {
+                for copy in &quarantine_copies {
+                    assert!(
+                        !glob_matches(pattern, copy),
+                        "{role}: {axis} pattern {pattern:?} reaches the quarantine \
+                         copy {copy:?}. Only Maintain runs the ADR-0058 sweep and \
+                         its reaper; if another role gained a quarantine caller, \
+                         grant it deliberately and move this assertion (#1957)"
+                    );
+                }
             }
         }
     }
@@ -4736,7 +5026,13 @@ fn discovery_prefix_admitted_for_every_discovering_role() {
 
 #[test]
 fn every_in_scope_policy_pattern_matches_a_real_key_shape() {
-    let keys = representative_keys();
+    // The quarantine witnesses join the constructor output here rather than
+    // being skipped as out of scope: each one is a real `data_key` composed
+    // with the `quarantine/` prefix and stamp the reaper builds, so a
+    // `quarantine/...` pattern is held to the same real-key shape as every
+    // other pattern instead of passing unexamined.
+    let mut keys = representative_keys();
+    keys.extend(quarantine_witness_keys());
     for role in ALL_ROLES {
         let policy = load_policy(role);
         // None: this is a shape check (does every pattern name a real key?), not

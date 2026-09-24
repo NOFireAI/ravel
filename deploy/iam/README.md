@@ -63,9 +63,10 @@ grants below are what remains deletable after that deny applies.
   `sys/qualify/*` only.
 - **Maintain** (`maintain.json`): `MaintainDelete` grants delete on
   `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/u/*/0001/*`,
-  `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, and `t/*/catalog/*/idx/*`.
-  These are the objects the compaction, supersession, retention,
-  erasure-request, and unreferenced-catalog sweeps physically remove.
+  `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*`, and
+  `quarantine/t/*/*/l0/*`. These are the objects the compaction, supersession,
+  retention, erasure-request, unreferenced-catalog, and quarantine-reaper
+  sweeps physically remove.
   The catalog half of that list also needs reads, which are easy to miss
   because two of the three fail silently rather than refusing the pass:
   `MaintainRead` carries `t/*/catalog/*/HEAD` (the sweep resolves what is
@@ -152,3 +153,111 @@ tracked separately and is not created by this change.
   `t/<tenant_hash>/<signal>/del/` per resolve to attach pending predicates
   (`crates/ravel-commit/src/keys.rs`, `del_prefix`). ADR-0064's same bullet
   gives Query that read.
+
+### Quarantined orphans: the three grants the quarantine lifecycle needs
+
+ADR-0058 decision 6 has the orphan sweep quarantine an orphaned L0 data object
+instead of deleting it: copy first, delete the original second, and physically
+remove the copy only after a second horizon (`quarantine_horizon_ns`, 7 days by
+default) has elapsed. The copy lives in a TOP-LEVEL `quarantine/` key space,
+not under `t/`, so none of the tenant-scoped patterns above reaches it.
+
+Both halves run under the Maintain role, in
+`crates/ravel-maintain/src/sweep.rs`: `sweep_orphans` phase (d) makes the copy
+through `quarantine_object`, and `sweep_quarantine` is the reaper. The
+lifecycle makes five object-store calls, and the set below is derived from all
+five rather than from the reaper alone; two of them land on the live key and so
+need no new pattern.
+
+| Call | S3 operation | Grant |
+|---|---|---|
+| `quarantine_object` `store.get(src, GetRange::Full)` on the live orphan | `s3:GetObject` | `MaintainRead` `t/*/*/l0/*` (already present) |
+| `quarantine_object` `store.put(dest, ...)` on `quarantine_key(original, ns)` | `s3:PutObject` | `MaintainWrite` `quarantine/t/*/*/l0/*` |
+| `sweep_orphans` `store.delete(&meta.key)` on the live orphan, after the copy | `s3:DeleteObject` | `MaintainDelete` `t/*/*/l0/*` (already present) |
+| `sweep_quarantine` `list_all(store, &quarantine_l0_data_prefix(...))` | `s3:ListBucket` with `prefix=quarantine/t/<tenant_hash>/<signal>/l0/<shard>/` | `MaintainList` `s3:prefix` `quarantine/t/*/*/l0/*` |
+| `sweep_quarantine` `store.delete(&meta.key)` on the quarantined copy | `s3:DeleteObject` | `MaintainDelete` `quarantine/t/*/*/l0/*` |
+
+No role is granted `s3:GetObject` or a `quarantine/` list prefix outside
+Maintain. No *code* path reads a quarantined object back: the reaper decides
+from the key alone (`parse_quarantine_timestamp` and
+`original_key_from_quarantine` both parse the key, and the hold check reads the
+lease, not the object).
+
+**A restore path does exist, and no shipped template authorizes it.**
+`docs/guides/operations/troubleshooting.md` step 2 has an operator list
+`quarantine/t/<tenant_hash>/` recursively, GET each object, and copy it back
+to the live key stripped of the `quarantine/` prefix and the `/q<ns>` suffix.
+It is a documented human procedure rather than a `ravel-cli` command -- the
+runbook says so outright ("There is no `ravel-cli` command for this yet") --
+which is exactly why deriving grants from code call sites alone missed it. A
+runbook is a call site.
+
+That grant is deliberately NOT added here. It belongs in `admin.json`, it
+widens an operator role's reach over a keyspace holding data that was
+quarantined rather than deleted, and it deserves its own review rather than
+riding along with the Maintain fix. Until it lands, an operator following
+that runbook must use credentials outside these templates. Tracked in
+issue #1978.
+
+IAM is default-deny, so no grant here is useful on its own. Without the write
+the copy is refused and the sweep quarantines nothing, which is where a
+template predating this change stops; the original is deleted only after the
+copy succeeds, so nothing is lost, but nothing is reclaimed either. Without the
+list the reaper is refused at its first `ListBucket` and never sees a copy,
+which makes the delete unreachable. Without the delete the reaper lists copies
+it can never remove, and the quarantine grows for the life of the deployment.
+
+`maintain_template_covers_every_quarantine_call` in
+`crates/ravel-commit/tests/iam_templates.rs` asserts all five rows against the
+template's **Allow** patterns, with witness keys built from the same key
+constructors the calls use rather than from hand-written strings. It also pins
+the top-level premise (no pattern outside `quarantine/` reaches a quarantined
+copy, and no other role's template reaches one at all) and the tightness of the
+three new patterns.
+
+It does not subtract the Deny statements, and that distinction is not
+academic. Row 3 asserts the live-orphan delete over every witness
+`l0_data_keys()` produces, including the legal-hold audit key
+`t/<hash>/u/l0/0000/<writer>...rseg`, which `DenyDeleteProtected`'s
+`t/*/u/*/0000/*` matches: an Allow reaches that key and the effective policy
+still refuses the delete, which is what legal hold is for. So read the table
+as "an Allow reaches this call", not as "this call succeeds". The Allow/Deny
+relationship is covered separately, by
+`delete_deny_and_allow_overlap_exactly_where_expected` and
+`every_allow_deny_key_overlap_is_named_by_the_deny`; the reachability tests
+here follow the convention `erasure_lifecycle_calls_outside_the_sweep_are_reachable`
+set, which reads Allow patterns only.
+`every_role_grants_exactly_the_expected_pattern_set` pins every pattern string
+by exact equality.
+
+An operator who applied a copy of `maintain.json` older than these grants must
+re-apply it. Re-applying lets the orphan sweep quarantine again; each copy it
+writes becomes reapable once that copy's own `quarantine_horizon_ns` elapses,
+so the quarantine drains over subsequent passes rather than at once. A partial
+re-apply clears nothing: a copy carrying the delete but not the list is refused
+at the `ListBucket`, and one carrying list and delete but not the write never
+gets an orphan into the quarantine to begin with.
+
+Two known gaps are recorded here and are NOT closed by the grants above.
+
+- The new delete pattern `quarantine/t/*/*/l0/*` also reaches the quarantined
+  copy of a legal-hold audit object (`quarantine/t/<hash>/u/l0/0000/...`), which
+  `DenyDeleteProtected`'s `t/*/u/*/0000/*` does not cover, since the quarantine
+  key is not under `t/`. Nothing reaches that state today: the legal-hold audit
+  shard is never swept for orphans, so no copy of one is ever written, and the
+  reaper independently refuses a held key by resolving
+  `original_key_from_quarantine` and checking the lease. The protection is in
+  code rather than in the deny, which is a weaker posture than the live keyspace
+  has.
+
+- **The derivation above covers the S3 axis of the PUT, not the KMS axis.**
+  Per-tenant KMS routing (ADR-0062) decides by the literal `t/` prefix, and a
+  quarantine key is not under `t/`, so the copy is written under the
+  deployment-default key rather than the tenant's. The live original is
+  deleted once the copy lands, so for `quarantine_horizon_ns` (7 days by
+  default) the only surviving copy of that tenant's data is encrypted under
+  the wrong key, and destroying the tenant key to crypto-shred them does not
+  make it unreadable. That is a defect in the quarantine lifecycle rather
+  than in this template, but this template's write grant is what lets the
+  write happen on a shipped deployment, so it is recorded here. Tracked in
+  issue #1979.
