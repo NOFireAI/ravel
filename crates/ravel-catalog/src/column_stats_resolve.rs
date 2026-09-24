@@ -23,24 +23,27 @@
 //! into `ravel-sql`'s consumption of this type and is out of this change's
 //! scope.
 //!
-//! # Degrade-to-`None`, three loud exceptions
+//! # Degrade-to-`None`, loud exceptions
 //!
 //! Column statistics are an OPTIONAL metadata artifact, so every failure short
 //! of a store outage or an isolation breach degrades: no HEAD yet, no ref at
 //! all, a `NotFound` GET, a blake3 mismatch, a decode error, or a
-//! part-binding mismatch. Three of those cases are not silent. A DECODE
-//! failure on an object a covered part actually references means the fold
-//! wrote an object the reader cannot open, so the fetch path surfaces it as
-//! [`FetchOutcome::DecodeRefused`] (rather than folding it into a bare miss)
-//! for the caller to log once and count (issue #1400). A GET failure for any
-//! reason other than `NotFound`, on either the HEAD or a resolved stats
-//! object, is a store outage rather than an absence and surfaces as
-//! [`LoadColumnStatsError::Store`] (issue #1976: an `AccessDenied` there is a
-//! missing IAM read grant, not "no statistics yet"). And a genuinely
-//! unparseable HEAD (a real catalog defect, not an optional artifact) or a
-//! column-stats object declaring a foreign `tenant_hash` (an ADR-0050 §2
-//! isolation breach) are hard errors too: neither is absorbed into a silent
-//! degrade. The query still scans on every degrade; only visibility changes.
+//! part-binding mismatch. A DECODE failure on an object a covered part
+//! actually references means the fold wrote an object the reader cannot
+//! open, so the fetch path surfaces it as [`FetchOutcome::DecodeRefused`]
+//! (rather than folding it into a bare miss) for the caller to log once and
+//! count (issue #1400). A GET failure on either the HEAD or a resolved stats
+//! object degrades like a miss when [`StoreError::is_retryable`] reports it
+//! throttling, a timeout, or otherwise transient: the artifact is optional
+//! and the query is correct without it, so a blip is not worth failing a
+//! whole query over. A GET failure for any other reason (issue #1976: most
+//! commonly `AccessDenied` from a missing IAM read grant) is a store outage
+//! rather than a blip or an absence and surfaces as
+//! [`LoadColumnStatsError::Store`]. And a genuinely unparseable HEAD (a real
+//! catalog defect, not an optional artifact) or a column-stats object
+//! declaring a foreign `tenant_hash` (an ADR-0050 §2 isolation breach) are
+//! hard errors too: neither is absorbed into a silent degrade. The query
+//! still scans on every degrade; only visibility changes.
 //! `decode_column_stats` does not itself check part-binding against a
 //! caller-supplied part list (unlike `decode_postings`); this loader performs
 //! that check itself, exactly as
@@ -191,19 +194,21 @@ pub(crate) struct ResolvedStatsHead {
 }
 
 /// Outcome of [`fetch_stats_object`]: an object the reader decoded, or one of
-/// the two degrade-to-miss kinds the caller must tell apart. A store read that
-/// fails and a stale binding are legitimately "no statistics" ([`Self::Absent`]);
-/// a DECODE failure on the object HEAD (or a covered part) points at is not
-/// ([`Self::DecodeRefused`]) and the caller logs and counts it (issue #1400).
+/// the two degrade-to-miss kinds the caller must tell apart. A store read
+/// that fails with `NotFound` or retryably, and a stale binding, are
+/// legitimately "no statistics" ([`Self::Absent`]); a DECODE failure on the
+/// object HEAD (or a covered part) points at is not ([`Self::DecodeRefused`])
+/// and the caller logs and counts it (issue #1400).
 pub(crate) enum FetchOutcome {
     /// Fetched, hash-verified, tenant-checked, part-bound, and decoded.
     Loaded(DecodedStats),
-    /// No usable object, silently: the store GET returned `NotFound` (the
-    /// object may simply not exist for this HEAD yet), the content hash did
-    /// not match, a part hash was malformed, or the part binding was stale.
-    /// Every one of these is an ordinary "no statistics" and stays quiet. A
-    /// GET failure for any other reason is not folded in here; it surfaces as
-    /// `Err(LoadColumnStatsError::Store)` (issue #1976).
+    /// No usable object, silently: the store GET returned `NotFound` or a
+    /// retryable failure (`StoreError::is_retryable`: throttling, a timeout,
+    /// a transient blip), the content hash did not match, a part hash was
+    /// malformed, or the part binding was stale. Every one of these is an
+    /// ordinary "no statistics" and stays quiet. A non-retryable GET failure
+    /// is not folded in here; it surfaces as `Err(LoadColumnStatsError::Store)`
+    /// (issue #1976).
     Absent,
     /// HEAD (or a covered part) references an object the reader refused to
     /// DECODE: the fold wrote it and the ref points at it, but the bytes will
@@ -248,7 +253,8 @@ pub enum LoadColumnStatsError {
         actual: String,
     },
     /// A GET (the HEAD, or a resolved per-part stats object) failed for a
-    /// reason other than `NotFound` (issue #1976): most commonly a missing
+    /// reason other than `NotFound` or a retryable failure
+    /// (`StoreError::is_retryable`) (issue #1976): most commonly a missing
     /// IAM read grant, surfaced as `StoreError::AccessDenied`. This is a
     /// store outage, not "no statistics yet", so it is a hard error the
     /// caller can count and retry, never a silent `Ok(None)`/`Absent` degrade
@@ -284,13 +290,24 @@ pub(crate) async fn resolve_stats_head(
 ) -> Result<Option<ResolvedStatsHead>, LoadColumnStatsError> {
     let key = head_key(tenant, signal);
 
-    // `NotFound` is the ordinary "nothing folded yet" case. Any other GET
-    // failure (issue #1976: most commonly AccessDenied on a missing IAM read
-    // grant) is a store outage, not an absence, and must surface rather than
-    // read as "no statistics yet".
+    // `NotFound` is the ordinary "nothing folded yet" case. A retryable GET
+    // failure (throttling, a timeout, a transient blip) degrades the same
+    // way: the artifact is optional and the query is correct without it, so
+    // a single blip should not fail the whole query. Any other GET failure
+    // (issue #1976: most commonly AccessDenied on a missing IAM read grant)
+    // is a store outage, not an absence, and must surface rather than read
+    // as "no statistics yet".
     let head_bytes = match getter.accounted_get_full(&key).await {
         Ok(got) => got.data,
         Err(StoreError::NotFound) => return Ok(None),
+        Err(source) if source.is_retryable() => {
+            tracing::debug!(
+                key = %key,
+                error = %source,
+                "column-stats HEAD GET failed retryably, degrading to no statistics"
+            );
+            return Ok(None);
+        }
         Err(source) => {
             return Err(LoadColumnStatsError::Store {
                 key: key.clone(),
@@ -341,6 +358,17 @@ pub(crate) async fn fetch_stats_object(
         Ok(got) => got.data,
         // Store read: the object may simply not exist for this HEAD. Silent.
         Err(StoreError::NotFound) => return Ok(FetchOutcome::Absent),
+        // A retryable failure (throttling, a timeout, a transient blip)
+        // degrades the same way as NotFound: the artifact is optional and
+        // the query is correct without it.
+        Err(source) if source.is_retryable() => {
+            tracing::debug!(
+                key = %resolved.key,
+                error = %source,
+                "column-stats object GET failed retryably, degrading to no statistics"
+            );
+            return Ok(FetchOutcome::Absent);
+        }
         // Any other GET failure (issue #1976: most commonly AccessDenied on a
         // missing IAM read grant) is a store outage, not an absence, and must
         // surface rather than be read as "not covered".

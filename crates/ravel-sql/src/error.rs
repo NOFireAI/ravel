@@ -159,11 +159,14 @@ pub enum SqlError {
 
     /// Loading the ADR-0850 column-statistics object for the metadata-only
     /// aggregate path failed. Every ordinary miss (nothing folded yet, no
-    /// column-stats ref, a GET error, a decode error) already degrades to
-    /// `Ok(None)` inside [`ravel_catalog::Catalog::load_column_stats`] and
-    /// never reaches here; only a genuinely unparseable HEAD/part or an
-    /// ADR-0050 §2 tenant-hash isolation breach surfaces as this variant,
-    /// so it is treated as the same class of fault as
+    /// column-stats ref, a `NotFound` or retryable GET error, a decode error)
+    /// already degrades to `Ok(None)` inside
+    /// [`ravel_catalog::Catalog::load_column_stats`] and never reaches here.
+    /// Three conditions surface as this variant instead: a genuinely
+    /// unparseable HEAD or part, an ADR-0050 §2 tenant-hash isolation
+    /// breach, and (issue #1976) a non-retryable GET failure on the HEAD or
+    /// a resolved stats object, such as `AccessDenied` from a missing IAM
+    /// read grant. All three are treated as the same class of fault as
     /// [`SqlError::Catalog`], not silently absorbed into "no statistics".
     #[error("column statistics load failed: {0}")]
     ColumnStats(#[from] LoadColumnStatsError),
