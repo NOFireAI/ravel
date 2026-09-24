@@ -443,7 +443,8 @@ hard eviction caps carved from it (they cannot shed, so they cannot share);
 SQL and fetch draw from the remainder through the accountant, with the
 per-tenant ceiling as the fairness bound within it. The sum of hard caps plus
 the shared remainder equals the budget by construction, and startup refuses a
-flag combination whose hard caps alone exceed it.
+flag combination whose hard caps alone exceed it (the 2026-09-07 amendment
+below exempts `--disable-cache` from this refusal).
 
 The overhead reserve is a measured number, not a guess, and it is measured in
 a calibration run that is separate from, and frozen before, the acceptance
@@ -452,7 +453,9 @@ runs, so the acceptance assertion is not circular. Calibration: parts 1, 2 and
 10-connection window; the reserve is the maximum over the window of
 `ravel_process_allocator_bytes{stat="resident"}` minus the UNIQUE tracked
 total, plus a 25% margin, rounded up to the next 256 MiB, and it must exceed
-the `partitions x max batch bytes` exposure in decision 1.
+the `partitions x max batch bytes` exposure in decision 1. The 2026-09-07
+amendment below records that the value landed as a round placeholder, not
+yet this measured figure.
 
 The unique total is not the sum of the ledgers, because the handoff rule
 deliberately lets a buffer sit in two ledgers for the width of one call, and a
@@ -617,7 +620,7 @@ current, and the amendment has since been corrected to match.
 
 ## Amendment 2026-09-07 (issue #1255): decisions 3 and 4 landed
 
-<!-- amendment-applies: none reason="this records which decisions landed and which did not, and adds the cross-tenant cascade that follows from decision 1 as designed; every figure and rule above stands as written, including the provisional reserve decision 3 already calls a placeholder" -->
+<!-- amendment-applies: sections="3. A static carve under one number" pointer="2026-09-07 amendment" -->
 
 Decisions 3 and 4 landed in `ravel-server`. `resolve_performance_defaults`
 derives `memory_budget_bytes` from cgroup-capped effective memory minus
@@ -680,10 +683,11 @@ ADR opened with is not yet charged or refused by anything landed here, only
 observed through the existing allocator and cache-residency gauges as before.
 
 `MEMORY_OVERHEAD_RESERVE_BYTES` is, as landed, the round provisional 2 GiB
-decision 3 names as a placeholder (its own doc comment in
-`services/ravel-server/src/config.rs` states the calibration rule that will
+that its own doc comment in `services/ravel-server/src/config.rs` names a
+placeholder (that comment also states the calibration rule that will
 replace it), not the measured
-figure a frozen calibration run would produce. Decision 1's aggregate
+figure decision 3 specifies and a frozen calibration run would produce.
+Decision 1's aggregate
 exposure bound for the infallible `grow` path, `max_concurrent_queries x
 partitions x max batch bytes`, must stay under whatever reserve is in force
 for that path's blast radius to stay bounded; that inequality has not been
