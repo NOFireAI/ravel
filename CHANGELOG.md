@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-25
+
 ### Added
 
 - **`ravel_ingest_resource_attrs_dropped_total` counts metric resource
