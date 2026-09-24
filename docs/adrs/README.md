@@ -188,8 +188,9 @@ about its own effect against the document. Every amendment heading (any
 heading below the title whose text contains a word starting "amend" or
 "correction", at any level) must carry at least one marker in its own
 block, an HTML comment saying what the amendment did. A marker is one
-line: the guard reads it with a single-line pattern, so a marker wrapped
-across two lines reads as no marker at all.
+line: the guard reads it with a single-line pattern, and a marker wrapped
+across two lines is refused as unreadable. A marker outside every amendment
+heading's block is refused too, since nothing would read it.
 
 ### The markers
 

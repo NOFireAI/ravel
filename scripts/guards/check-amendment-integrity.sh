@@ -202,16 +202,19 @@ class Doc:
         self.flat = Flat(self.lines)
         self.headings: list[tuple[int, int, str]] = []  # (line_idx, level, text)
         # A `#` line inside a fenced code block is a comment, not a heading.
+        self.fenced: set[int] = set()
         fence = None
         for idx, line in enumerate(self.lines):
             f = FENCE_RE.match(line)
             if f:
+                self.fenced.add(idx)
                 if fence is None:
                     fence = f.group(1)[0]
                 elif f.group(1)[0] == fence:
                     fence = None
                 continue
             if fence is not None:
+                self.fenced.add(idx)
                 continue
             m = HEADING_RE.match(line)
             if m:
@@ -245,7 +248,7 @@ class Doc:
     def amendment_spans(self) -> list[tuple[int, int]]:
         return [self.span(i) for i in self.amendment_idxs()]
 
-    def find_section(self, name: str, whose: str) -> tuple[int, int] | None:
+    def find_section(self, name: str, whose: str) -> tuple[int, int] | None | bool:
         """A heading matching `name`, excluding one nested inside another
         amendment's own block (an amendment's internal subheadings, such as a
         `### Decision` recounting the original one, are not a document
@@ -270,7 +273,7 @@ class Doc:
                 f"{len(matches)} times; cannot tell which one the pointer "
                 "must reach"
             )
-            return None
+            return False
         return self.span(matches[0])
 
     def section_prose(self, sec_start: int, sec_end: int) -> str:
@@ -322,6 +325,22 @@ for path in paths:
     rel = str(path.relative_to(root))
     doc = Doc(rel, path.read_text())
     docs_scanned += 1
+
+    # A marker outside every amendment block is never read, so the claim it
+    # makes would go unchecked: usually a heading the guard does not
+    # recognise as an amendment ("Revision", "Update").
+    covered: set[int] = set()
+    for s0, e0 in doc.amendment_spans():
+        covered.update(range(s0, e0))
+    for n, line in enumerate(doc.lines):
+        if n in covered or n in doc.fenced:
+            continue
+        if APPLIES_RE.search(line) or SUPERSEDES_RE.search(line):
+            problem(
+                f"{rel}:{n + 1}: an amendment marker sits outside any "
+                "amendment heading's block, so nothing reads it; put it under "
+                "a heading containing a word starting 'amend' or 'correction'"
+            )
 
     for hi in doc.amendment_idxs():
         amendments_scanned += 1
@@ -389,6 +408,8 @@ for path in paths:
                 continue
             for name in names:
                 sec_span = doc.find_section(name, heading_text)
+                if sec_span is False:
+                    continue
                 if sec_span is None:
                     problem(
                         f"{where}: amendment {heading_text!r} names section "
