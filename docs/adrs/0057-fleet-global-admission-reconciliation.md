@@ -398,7 +398,7 @@ before landing.
 
 ## Amendment (2026-09-23): the cost argument's premise was reversed by ADR-0069
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="1. Per-process usage snapshot|5. Snapshot lifecycle: no new sweep needed" pointer="2026-09-23 amendment" -->
 
 §1's cost argument rests on "most processes see most tenants never", and §5
 assumes a process stops tracking a `(tenant, signal)` when the tenant goes

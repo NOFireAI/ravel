@@ -67,7 +67,8 @@ attempt that case.
 A new per-tenant limit, `QueryLimits { max_bytes_scanned: ByteLimit }`
 (`ByteLimit::Bounded(u64) | Unlimited`), following `AdmissionLimits`'
 exact shape and lifecycle (`crates/ravel-ingest/src/admission.rs:86-98`):
-loaded once at startup from a `--query-limits-file` TOML with a
+loaded once at startup from a `--query-limits-file` TOML (no such flag
+exists; see the `--limits-file` naming amendment below) with a
 `[defaults]` table and per-tenant `[tenants.<id>]` overrides, held
 per-process, changing a limit is a restart. This is deliberately the same
 shape operators already learned for ingest limits, not a new pattern.
@@ -77,7 +78,9 @@ checked, once per completed segment fetch, comparing
 `accounting.snapshot().total_s3_bytes()` against the tenant's
 `max_bytes_scanned`:
 - PromQL: alongside the existing `max_series`/`max_samples` checks in
-  `engine.rs`'s three merge functions.
+  `engine.rs`'s three merge functions (moved to the fetch stage by the
+  PromQL enforcement site amendment below, which found that site cannot
+  cancel mid-scan).
 - SQL: alongside the existing `max_series` check in
   `RsegScanExec::prepare_partition`.
 
@@ -99,7 +102,7 @@ new byte-budget half.
 
 ## Amendment: PromQL's enforcement site cannot deliver mid-scan cancellation
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="1. Per-tenant bytes-scanned budget, checked incrementally, enforced identically in both query languages" pointer="PromQL enforcement site amendment" -->
 
 Decision 1's PromQL location clause — "alongside the existing
 `max_series`/`max_samples` checks in `engine.rs`'s three merge functions"
@@ -160,7 +163,7 @@ segment finishes and cancel the rest, instead of waiting for all of them:
 
 ## Amendment: the config surface is `--limits-file`, not a new flag
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="1. Per-tenant bytes-scanned budget, checked incrementally, enforced identically in both query languages" pointer="`--limits-file` naming amendment" -->
 
 Implementing the config surface described above found the
 name wrong: there is no `--query-limits-file` flag, and this ADR should
