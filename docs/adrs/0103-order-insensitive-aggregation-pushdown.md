@@ -349,6 +349,8 @@ flowchart TB
 
 ## Amendment: narrowed to single-step `_over_time` range functions; decision 3's combine is a collect, not a sum
 
+<!-- amendment-applies: none -->
+
 T1-T3 shipped the eligibility gate, the `PartialAggregate` wire frame, and
 worker-side partial computation exactly as decided above. Wiring a real
 caller (T4) surfaced two errors in this ADR's original framing, caught

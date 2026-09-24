@@ -632,6 +632,8 @@ ravel-logseg by nothing.
 
 ## Amendment 2026-09-06 (issue #1196): a named latency-first policy
 
+<!-- amendment-applies: none -->
+
 996-9's reference-box cold run (#1185, 42 statements, true cold) measured
 `cost-based` against `byte-minimal` at `--store-get-concurrency=256`:
 

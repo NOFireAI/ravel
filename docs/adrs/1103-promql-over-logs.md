@@ -388,6 +388,8 @@ flowchart TD
 
 ## Amendment 2026-09-06 (issue #1202): `__body__` literal bloom pruning
 
+<!-- amendment-applies: none -->
+
 The follow-up decision 3 anticipated ("extraction into `Predicate::HasWord`
 for bloom pruning") has landed, for the subset of `__body__` matchers a
 literal can be proven a superset of: an equality matcher, and an anchored

@@ -301,6 +301,8 @@ flowchart TD
 
 ## Amendment 2026-09-06: the write-side function names in this ADR (#1135)
 
+<!-- amendment-applies: none -->
+
 This ADR names `record_level_winners` (Context, Decision 1, Consequences,
 and the diagram above) and cites `writer.rs:753-791`; it also names
 `merged_indexed_terms` (Context). Issue #1135 replaced the name-keyed,

@@ -398,6 +398,8 @@ before landing.
 
 ## Amendment (2026-09-23): the cost argument's premise was reversed by ADR-0069
 
+<!-- amendment-applies: none -->
+
 §1's cost argument rests on "most processes see most tenants never", and §5
 assumes a process stops tracking a `(tenant, signal)` when the tenant goes
 idle. **ADR-0069 decided against §5's assumption directly**, and left §1's

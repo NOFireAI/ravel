@@ -180,6 +180,16 @@ bash "$(dirname "$0")/guards/check-doc-figures.test.sh"
 echo "==> scripts/guards/check-doc-figures.sh"
 "$(dirname "$0")/guards/check-doc-figures.sh"
 
+# An ADR amendment sometimes claims it updated other places in the same
+# document to point back at it. Review kept finding the edit only reached one
+# of the named places (issue #1985): this checks the claim against the
+# document instead of trusting the prose. Cases first, same reason as the
+# guards above: a source scan, no build.
+echo "==> scripts/guards/check-amendment-integrity.test.sh"
+bash "$(dirname "$0")/guards/check-amendment-integrity.test.sh"
+echo "==> scripts/guards/check-amendment-integrity.sh"
+"$(dirname "$0")/guards/check-amendment-integrity.sh"
+
 # "No wall-clock wait in an injected-clock test helper" cost two gate reruns
 # (issue #1260: the flaky pair test, then its rewrite under #1235). Another
 # check rather than another paragraph, same reasoning as the hygiene guard

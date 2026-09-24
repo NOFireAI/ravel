@@ -167,6 +167,8 @@ evaluator scheduler mirrors, not a new scheduling mechanism.
 
 ## Amendment: repeat notifications while firing
 
+<!-- amendment-applies: none -->
+
 Decisions 4 and 6, combined, notify exactly once per transition: a rule
 that starts firing and stays firing sends one notification and then
 nothing for as long as the condition holds. Alertmanager auto-resolves

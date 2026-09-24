@@ -206,6 +206,8 @@ probation condition in view rather than by default.
 
 ## Amendment (2026-09-19): decision 3 resolved as advisory, not blocking; no self-hosted runner
 
+<!-- amendment-applies: none -->
+
 The owner decided on 2026-09-19 that this repository gets no self-hosted
 GitHub Actions runner. The repository is public, and a self-hosted runner
 executes workflow code from forked pull requests unless every entry point

@@ -296,6 +296,8 @@ read 2 columns of 32 blocks:            read 2 columns of 32 blocks:
 
 ## Amendment (2026-08-26, as implemented)
 
+<!-- amendment-applies: none -->
+
 The writer, PAGE_DIR codec, and dual reader landed as decisions 1-4 describe.
 Four points the decision text under-specified were resolved during
 implementation; this section records them against the code that shipped, and
