@@ -279,7 +279,14 @@ impl Distributed {
         let mut unsupported = false;
 
         while let Some(result) = stream.next().await {
-            let response = result.map_err(distrib_error)?;
+            // A slice whose FINAL attempt failed carries every attempt's
+            // spend on the error (issue #1723); fold it before the error
+            // leaves the loop, or the query reports a cost the store never
+            // charged.
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => return Err(fold_error_spend(accounting, err)),
+            };
             match response.status {
                 pb::status::Code::Ok => {
                     fold_slice(accounting, &mut running, &mut stats, &response);
@@ -343,7 +350,15 @@ impl Distributed {
                     per_slice.push(response.scalar);
                     per_slice_hist.push(response.histogram);
                 }
-                pb::status::Code::SnapshotInvalidated => invalidated = true,
+                pb::status::Code::SnapshotInvalidated => {
+                    // Fold before the re-resolve, for the same reason the
+                    // `Unsupported` arm folds before its fallback: a worker
+                    // that fetched three of this slice's segments and found the
+                    // fourth vanished paid for the three, and the whole query
+                    // is about to run again (issue #1723).
+                    fold_slice(accounting, &mut running, &mut stats, &response);
+                    invalidated = true;
+                }
                 pb::status::Code::Unsupported => {
                     // Fold the slice's spend before the fallback: the whole
                     // query re-runs locally, so without this the already-paid
@@ -370,7 +385,11 @@ impl Distributed {
                     // real defect, terminal and typed. The SliceFetcher never
                     // retries or falls back around it (that would mask the
                     // corruption behind a possibly-clean local read), so it
-                    // arrives here directly and fails the query typed.
+                    // arrives here directly and fails the query typed. The
+                    // spend the worker made before it hit the corruption is
+                    // folded first (issue #1723): a failed request is still a
+                    // request the store served.
+                    fold_slice(accounting, &mut running, &mut stats, &response);
                     return Err(QueryError::Distrib {
                         reason: format!(
                             "slice reported a corrupt segment: {}",
@@ -384,6 +403,15 @@ impl Distributed {
                     // the slice coordinator-local (ADR-0071 deliverable 1);
                     // reaching here means every attempt, local included, was
                     // unavailable. Fail typed, never with a partial merge.
+                    //
+                    // The accounting on this response is the SUM over those
+                    // attempts (issue #1723): each attempt that spent before it
+                    // failed reports its spend, and `RoutingSliceFetcher::dispatch`
+                    // carries the failed attempts' spend onto the surviving
+                    // one. Folding it here is what makes the query's reported
+                    // cost the store's real cost when a slice is served three
+                    // times and answers none of them.
+                    fold_slice(accounting, &mut running, &mut stats, &response);
                     return Err(QueryError::Distrib {
                         reason: format!(
                             "slice unavailable after re-dispatch and local execution: {}",
@@ -392,6 +420,7 @@ impl Distributed {
                     });
                 }
                 other => {
+                    fold_slice(accounting, &mut running, &mut stats, &response);
                     return Err(QueryError::Distrib {
                         reason: format!("slice returned {other:?}: {}", response.status_message),
                     });
@@ -512,7 +541,14 @@ impl Distributed {
         let mut unsupported = false;
 
         while let Some(result) = stream.next().await {
-            let response = result.map_err(distrib_error)?;
+            // A slice whose FINAL attempt failed carries every attempt's
+            // spend on the error (issue #1723); fold it before the error
+            // leaves the loop, or the query reports a cost the store never
+            // charged.
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => return Err(fold_error_spend(accounting, err)),
+            };
             match response.status {
                 pb::status::Code::Ok => {
                     fold_log_slice(accounting, &mut running, &response);
@@ -523,7 +559,14 @@ impl Distributed {
                     }
                     per_slice.push(response.records);
                 }
-                pb::status::Code::SnapshotInvalidated => invalidated = true,
+                pb::status::Code::SnapshotInvalidated => {
+                    // Fold before the re-resolve (issue #1723), as the metrics
+                    // loop does: a worker that paid for part of the slice and
+                    // then found a segment vanished still issued those
+                    // requests, and the whole query is about to run again.
+                    fold_log_slice(accounting, &mut running, &response);
+                    invalidated = true;
+                }
                 pb::status::Code::Unsupported => {
                     fold_log_slice(accounting, &mut running, &response);
                     unsupported = true;
@@ -537,6 +580,9 @@ impl Distributed {
                     ));
                 }
                 pb::status::Code::Corrupt => {
+                    // Fold the spend this attempt made before it hit the
+                    // corruption (issue #1723).
+                    fold_log_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
                         reason: format!(
                             "slice reported a corrupt segment: {}",
@@ -545,6 +591,12 @@ impl Distributed {
                     });
                 }
                 pb::status::Code::Unavailable => {
+                    // The accounting here is the sum over every attempt the
+                    // `SliceFetcher` made for this slice (issue #1723): the
+                    // primary, its one re-dispatch, and coordinator-local
+                    // execution each report what they spent, and a failed
+                    // attempt's spend is carried onto the surviving response.
+                    fold_log_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
                         reason: format!(
                             "slice unavailable after re-dispatch and local execution: {}",
@@ -553,6 +605,7 @@ impl Distributed {
                     });
                 }
                 other => {
+                    fold_log_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
                         reason: format!("slice returned {other:?}: {}", response.status_message),
                     });
@@ -665,7 +718,14 @@ impl Distributed {
         let mut unsupported = false;
 
         while let Some(result) = stream.next().await {
-            let response = result.map_err(distrib_error)?;
+            // A slice whose FINAL attempt failed carries every attempt's
+            // spend on the error (issue #1723); fold it before the error
+            // leaves the loop, or the query reports a cost the store never
+            // charged.
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => return Err(fold_error_spend(accounting, err)),
+            };
             match response.status {
                 pb::status::Code::Ok => {
                     fold_span_slice(accounting, &mut running, &response);
@@ -676,7 +736,14 @@ impl Distributed {
                     }
                     per_slice.push(response.spans);
                 }
-                pb::status::Code::SnapshotInvalidated => invalidated = true,
+                pb::status::Code::SnapshotInvalidated => {
+                    // Fold before the re-resolve (issue #1723), as the metrics
+                    // loop does: a worker that paid for part of the slice and
+                    // then found a segment vanished still issued those
+                    // requests, and the whole query is about to run again.
+                    fold_span_slice(accounting, &mut running, &response);
+                    invalidated = true;
+                }
                 pb::status::Code::Unsupported => {
                     fold_span_slice(accounting, &mut running, &response);
                     unsupported = true;
@@ -690,6 +757,9 @@ impl Distributed {
                     ));
                 }
                 pb::status::Code::Corrupt => {
+                    // Fold the spend this attempt made before it hit the
+                    // corruption (issue #1723).
+                    fold_span_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
                         reason: format!(
                             "slice reported a corrupt segment: {}",
@@ -698,6 +768,12 @@ impl Distributed {
                     });
                 }
                 pb::status::Code::Unavailable => {
+                    // The accounting here is the sum over every attempt the
+                    // `SliceFetcher` made for this slice (issue #1723): the
+                    // primary, its one re-dispatch, and coordinator-local
+                    // execution each report what they spent, and a failed
+                    // attempt's spend is carried onto the surviving response.
+                    fold_span_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
                         reason: format!(
                             "slice unavailable after re-dispatch and local execution: {}",
@@ -706,6 +782,7 @@ impl Distributed {
                     });
                 }
                 other => {
+                    fold_span_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
                         reason: format!("slice returned {other:?}: {}", response.status_message),
                     });
@@ -746,6 +823,33 @@ fn fold_slice(
     stats.raw_f64_bytes = stats
         .raw_f64_bytes
         .saturating_add(response.stats.raw_f64_bytes);
+}
+
+/// Folds a FAILED slice's carried spend into the query's live accounting handle
+/// and maps the error (issue #1723).
+///
+/// A slice that fails after the store served it is the case the fold arms above
+/// cannot reach: there is no response, only a [`DistribError`], and the cost
+/// rides on the error's [`DistribError::Spent`] wrapper. Folding it here, before
+/// the error leaves the loop, is what makes the metrics, logs and spans a failed
+/// query reports the cost the store really charged.
+///
+/// What rides there is the spend of the attempts ALREADY ABANDONED, not the
+/// spend of the attempt that failed last. An attempt reports its own cost only
+/// once its terminal summary is decoded, and a worker streams that summary last,
+/// while [`SliceStreamDecoder::push`] checks both decode caps before it stores a
+/// frame: so a coordinator byte-cap or frame-cap refusal, and any decode fault
+/// before the summary, carry none of what that attempt made the store serve.
+/// Closing that is a wire change (accounting ahead of the frames), not a
+/// coordinator-side one.
+///
+/// The running snapshot is deliberately not updated: the caller returns
+/// immediately, so nothing reads it again.
+fn fold_error_spend(live: &QueryAccounting, err: DistribError) -> QueryError {
+    if let Some(spend) = err.spend() {
+        live.merge_snapshot(spend);
+    }
+    distrib_error(err)
 }
 
 /// Folds one RLOG-family slice's accounting into the query's live handle and the
@@ -1317,6 +1421,34 @@ impl SliceStreamDecoder {
         self.frames
     }
 
+    /// The accounting and page counters of a terminal summary this decoder has
+    /// already accepted, or `None` if no summary arrived (issue #1723).
+    ///
+    /// For a caller that is about to discard the slice: a stream that carried
+    /// its summary and then broke, or a decode fault after the summary, still
+    /// cost the worker every request the summary reports, and the coordinator
+    /// re-dispatches the slice afterwards. Reading this is what keeps that
+    /// spend in the query's total instead of charging one attempt for three.
+    /// A decoder that errored BEFORE the summary arrived reports `None`: the
+    /// worker's spend is genuinely unobservable from here, and a zero is the
+    /// honest floor, not a measurement.
+    pub fn summary_spend(&self) -> Option<(QueryAccountingSnapshot, FetchStats)> {
+        let summary = self.summary.as_ref()?;
+        let accounting = summary
+            .accounting
+            .as_ref()
+            .map(|a| codec::decode_accounting(*a))
+            .unwrap_or_default();
+        Some((
+            accounting,
+            FetchStats {
+                raw_f64_pages: summary.raw_f64_pages,
+                raw_f64_bytes: summary.raw_f64_bytes,
+                histogram_series_skipped: 0,
+            },
+        ))
+    }
+
     /// The wire-byte cap this decoder enforces for its slice:
     /// [`codec::slice_byte_cap`], unless a test lowered it through
     /// [`with_max_bytes`](Self::with_max_bytes).
@@ -1415,8 +1547,12 @@ impl SliceStreamDecoder {
 /// `QueryError::Distrib`/`Federation`, which are redacted to a retryable 503.
 /// Retrying the same query against the same remote cannot succeed, so a 503
 /// would invite exactly the retry that cannot help.
+///
+/// Classification reads through a [`DistribError::Spent`] wrapper (issue
+/// #1723): a refused attempt that had already paid for segments is still a
+/// refusal, and must keep its 422.
 pub(crate) fn cap_refusal_error(err: &DistribError) -> Option<QueryError> {
-    match err {
+    match err.unspent() {
         DistribError::Codec(CodecError::SliceByteCapExceeded { bytes, max }) => {
             Some(QueryError::TooManySliceBytes {
                 bytes: *bytes,
