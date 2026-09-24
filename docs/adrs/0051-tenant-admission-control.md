@@ -333,7 +333,9 @@ extension seam the renderer's module docs define:
   `{body_size, byte_rate, series_rate, series_cap, skew, structural}`
 
 Cardinality is bounded by construction: (configured tenants + `other`) ×
-3 signals × 6 reasons, all through the compile-time-closed `Label` enum.
+3 signals × 6 reasons, all through the compile-time-closed `Label` enum
+(the fail-closed ingest-timestamp plausibility amendment below adds a
+seventh, `clock`).
 ADR-0044 blocked per-tenant series on an auth decision for the
 unauthenticated `/metrics` route; the decision here is an explicit
 opt-in flag, `--metrics-tenant-labels` (default off, everything folds to
@@ -469,7 +471,7 @@ ADR, not this one.
 
 ## Amendment: fail-closed ingest-timestamp plausibility
 
-<!-- amendment-applies: sections="4. Event-time skew bounds for logs and spans|Consequences" pointer="fail-closed ingest-timestamp plausibility amendment" -->
+<!-- amendment-applies: sections="4. Event-time skew bounds for logs and spans|6. Per-tenant usage export|Consequences" pointer="fail-closed ingest-timestamp plausibility amendment" -->
 
 This amendment appends to the original decision; where it supersedes a
 sentence of §4 or a Consequences bullet, it says so explicitly.
