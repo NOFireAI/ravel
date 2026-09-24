@@ -81,10 +81,14 @@ pub enum DistribError {
     /// Only the accounting snapshot travels. The coordinator's error path
     /// returns no `FetchStats` to the engine, so page counters carried here
     /// would have no reader.
+    ///
+    /// Both fields are boxed. A snapshot is a per-operation counter array, far
+    /// larger than any other variant here, and every `Result<_, DistribError>`
+    /// in the slice path would otherwise grow by it.
     #[error("{source}")]
     Spent {
         /// What the failed attempts had spent when the slice gave up.
-        spend: ravel_types::accounting::QueryAccountingSnapshot,
+        spend: Box<ravel_types::accounting::QueryAccountingSnapshot>,
         /// The error that ended the slice, unchanged.
         source: Box<DistribError>,
     },
@@ -107,11 +111,11 @@ impl DistribError {
                 spend: carried,
                 source,
             } => DistribError::Spent {
-                spend: carried.saturating_merge(spend),
+                spend: Box::new(carried.saturating_merge(spend)),
                 source,
             },
             other => DistribError::Spent {
-                spend: *spend,
+                spend: Box::new(*spend),
                 source: Box::new(other),
             },
         }

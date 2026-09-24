@@ -5186,6 +5186,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             raw_f64_pages: 7,
             raw_f64_bytes: 57_344,
         };
+        // Both abandoned attempts must report raw bytes, or the raw-byte sum
+        // below holds for a fixture that never exercised that counter.
+        const { assert!(A.raw_f64_bytes > 0 && B.raw_f64_bytes > 0) };
 
         let (store, now, request, local_only) = one_slice_corpus("three-attempt-tenant").await;
         let (endpoint_a, tries_a, _keep_a) =
@@ -5252,11 +5255,6 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             local_only.stats.raw_f64_bytes,
             A.raw_f64_bytes,
             B.raw_f64_bytes
-        );
-        assert!(
-            A.raw_f64_bytes > 0 && B.raw_f64_bytes > 0,
-            "both abandoned attempts must report raw bytes, or the sum above \
-             holds for a fixture that never exercised the counter"
         );
     }
 
