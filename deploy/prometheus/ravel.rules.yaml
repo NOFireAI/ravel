@@ -478,13 +478,14 @@ groups:
         # RavelStoreUnreachable well inside this window, so this rule is the
         # complement, not a duplicate.
         #
-        # One rule covers every dead-probe state, because the gauge carries no
-        # ambiguous sentinel: store_probe::spawn stamps it synchronously
-        # before the loop's first sleep, so a task that dies, panics, or is
-        # never reached by its first cycle leaves an AGEING timestamp that
-        # crosses this threshold like any other stoppage, and a process that
-        # never spawned a probe at all leaves 0, which makes time() - 0
-        # roughly the current Unix time and fires here too.
+        # One rule covers every dead-probe state: store_probe::spawn stamps
+        # the gauge synchronously before the loop's first sleep, so a task
+        # that dies, panics, or is never reached by its first cycle leaves an
+        # AGEING timestamp that crosses this threshold like any other
+        # stoppage, and time() - 0 is roughly the current Unix time, so a
+        # zero reading fires here too. What a 0 reading means is documented
+        # in one place: the "What 0 means" section of
+        # docs/guides/observability.md.
         #
         # 132 = K * interval * 1.1 at the defaults (K = 4, interval = 30s,
         # fold::jittered adds up to 10%). Both terms scale with
