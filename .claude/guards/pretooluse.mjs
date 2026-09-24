@@ -120,6 +120,61 @@ const FORCE_PUSH = /\bpush\b[^|;&]*(\s(-f|--force|--force-with-lease(=\S*)?)\b|\
 const PUSH_TARGETS_MAIN =
   /(\s['"]?\+?(refs\/heads\/)?main['"]?(\s|$)|\s['"]?\+?\S+:(refs\/heads\/)?main['"]?(\s|$))/;
 
+// --- bare 40-hex-char SHA literal rule ----------------------------------
+//
+// A 40-character hex run typed into a Bash command is almost always a git
+// SHA completed from a shorter prefix read off adjacent tool output. A
+// wrong digit has been recorded six times in this repository's sessions;
+// every time it was the RECEIVING system that caught it (GitHub's
+// --match-head-commit, --force-with-lease, the fleet control plane), never
+// the person, and twice in a session that had already read the note
+// forbidding it. The fix is always the same shape: resolve the SHA with a
+// command substitution in the same command that consumes it, so the
+// literal text never exists for a person to mistype.
+//
+// The boundary requires a non-hex character (or a string edge) on both
+// sides, so this matches a run of EXACTLY 40 hex characters: a 39- or
+// 41-char run cannot satisfy it, and neither can a 40-char window sitting
+// inside a longer unbroken hex run, because every such window has a hex
+// character just outside one of its two edges.
+const BARE_SHA_LITERAL = /(^|[^0-9a-fA-F])[0-9a-fA-F]{40}([^0-9a-fA-F]|$)/;
+// Same spelling and same reasoning as ALLOW_DESTRUCTIVE above: shell state
+// does not persist between tool calls, so the inline assignment in the
+// command text is the only spelling that can work.
+const ALLOW_LITERAL_SHA = /(^|[\s;&|(])ALLOW_LITERAL_SHA=(1|true|yes)(\s|$)/;
+
+function shaLiteralAllowed(rawStatement) {
+  return (
+    ALLOW_LITERAL_SHA.test(rawStatement) ||
+    process.env.ALLOW_LITERAL_SHA === "1"
+  );
+}
+
+// Judged on the raw statement, same as checkDestructiveGit: a substitution
+// body reaches this too, because scanTexts queues every substitution body
+// as its own statement, and a heredoc body never reaches it at all, because
+// checkBash strips heredoc bodies before scanTexts ever runs. A fixture SHA
+// written into a heredoc is data, not a command, and needs no escape hatch.
+function checkBareSha(rawStatement) {
+  const stmt = rawStatement.trim();
+  if (!BARE_SHA_LITERAL.test(stmt)) return;
+  if (shaLiteralAllowed(stmt)) return;
+  deny(
+    "This command contains a bare 40-character hex literal, almost always " +
+      "a SHA completed from a shorter prefix read off adjacent output. A " +
+      "wrong digit is only caught by whatever receives it " +
+      "(--match-head-commit, --force-with-lease, a fleet dispatch ref), " +
+      "never by re-reading the command. Resolve it instead: assign the " +
+      "SHA into a shell variable with a command substitution in the SAME " +
+      "command that consumes it, then pass the variable, quoted, to " +
+      "--match-head-commit or to the dispatch ref, e.g. " +
+      '`sha=$(git rev-parse origin/main) && gh pr merge 123 ' +
+      "--match-head-commit \"$sha\"`. If the literal text is genuinely " +
+      "needed (a fixture, a doc example, a known hash), prefix the " +
+      "command with ALLOW_LITERAL_SHA=1.",
+  );
+}
+
 // Command substitutions are checked as commands in their own right. Extending
 // the harmless-prefix list instead only ever covers the spellings someone
 // thought to enumerate: `out=$(gate | tail -1)` was covered and the same line
@@ -482,6 +537,7 @@ function checkBash(rawCommand) {
     }
 
     checkDestructiveGit(stmt);
+    checkBareSha(stmt);
   }
 }
 
