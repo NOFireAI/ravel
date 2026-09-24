@@ -45,7 +45,7 @@ exemplars.
 Layout, run-major to mirror the catalog, sorted by `(series_index,
 ts_ns)` so a per-series probe is a binary search. The sort is ascending
 but not strict: the duplicate sort keys amendment below settles that
-equal keys are legal and are never collapsed.
+equal keys are legal and are never collapsed:
 
 ```
 count: u32
