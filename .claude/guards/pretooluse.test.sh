@@ -349,6 +349,67 @@ check allow "force-push to main/foo"                   "$(bash_payload 'git push
 check allow "force-push to maintenance"                "$(bash_payload 'git push --force origin maintenance')"
 check allow "force-push to mainline"                   "$(bash_payload 'git push --force origin mainline')"
 
+# --- bare 40-hex-char SHA literal ----------------------------------------
+# A full SHA typed into a command is almost always completed from a shorter
+# prefix read off adjacent output, and a wrong digit has been caught by the
+# receiving system six times in this repository's sessions, never by the
+# person. SHA40 below is exactly 40 hex characters; SHA39/SHA41 are one
+# character short and one character over.
+SHA40='abc123def456abc123def456abc123def456abcd'
+SHA39='abc123def456abc123def456abc123def456abc'
+SHA41='abc123def456abc123def456abc123def456abcde'
+
+check deny  "bare 40-hex literal on --match-head-commit" \
+  "$(bash_payload "gh pr merge 123 --match-head-commit ${SHA40}")"
+check deny  "bare 40-hex literal, quoted" \
+  "$(bash_payload "gh pr merge 123 --match-head-commit \"${SHA40}\"")"
+check deny  "bare 40-hex literal inside a command substitution" \
+  "$(bash_payload "x=\$(git log -1 --format=%H ${SHA40})")"
+check allow "escape hatch permits a bare sha literal" \
+  "$(bash_payload "ALLOW_LITERAL_SHA=1 gh pr merge 123 --match-head-commit ${SHA40}")"
+check deny  "a different env prefix does not launder a sha literal" \
+  "$(bash_payload "CARGO_INCREMENTAL=0 gh pr merge 123 --match-head-commit ${SHA40}")"
+check allow "resolving the sha via substitution instead of a literal" \
+  "$(bash_payload 'sha=$(git rev-parse origin/main) && gh pr merge 123 --match-head-commit "$sha"')"
+
+# A 39- or 41-char hex run is not a SHA-sized literal, and neither is a
+# 40-char window sitting inside a longer unbroken hex run: the boundary on
+# either side is still hex, so no window can satisfy it.
+check allow "39-char hex run is not a sha literal" \
+  "$(bash_payload "echo ${SHA39}")"
+check allow "41-char hex run is not a sha literal" \
+  "$(bash_payload "echo ${SHA41}")"
+check allow "40-char window inside a longer hex run (extended right)" \
+  "$(bash_payload "echo ${SHA40}e")"
+check allow "40-char window inside a longer hex run (extended left)" \
+  "$(bash_payload "echo 1${SHA40}")"
+
+# A heredoc body is data, not shell, same as the gate-masking rule above: a
+# fixture file legitimately contains a bare SHA as text, not as a command
+# argument, and needs no escape hatch.
+check allow "a bare sha inside a heredoc body" \
+  "$(bash_payload "cat > /tmp/fixture.txt <<'EOF'
+${SHA40}
+EOF")"
+
+# Known false positives, decided deliberately rather than silently allowed:
+# reading history with a full SHA is low-stakes (a typo just errors as an
+# unknown revision), but it is still a hand-typed literal of the exact shape
+# this rule exists to catch, and the fix (resolve it, or use the escape
+# hatch) costs nothing extra. No exemption for read-only git subcommands.
+check deny  "git show naming a full sha" \
+  "$(bash_payload "git show ${SHA40}")"
+check deny  "git log naming a full sha" \
+  "$(bash_payload "git log -1 ${SHA40}")"
+# A non-SHA 40-hex literal (an HMAC, a test vector) is denied the same way:
+# the guard cannot tell a SHA from any other 40-hex string, and it should
+# not try to, since a hand-typed hex-shaped literal is the same failure
+# shape either way. The escape hatch covers this case too.
+check deny  "a non-sha 40-hex literal (hmac-shaped)" \
+  "$(bash_payload "curl -H \"Authorization: Bearer ${SHA40}\" https://example.com")"
+check allow "escape hatch permits a non-sha 40-hex literal" \
+  "$(bash_payload "ALLOW_LITERAL_SHA=1 curl -H \"Authorization: Bearer ${SHA40}\" https://example.com")"
+
 # --- malformed input must never block -----------------------------------
 check allow "empty stdin"                      ""
 check allow "not json"                         "wat"
