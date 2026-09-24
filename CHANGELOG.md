@@ -809,6 +809,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   log line: no metric counts these faults, so an alert on them has to come
   from logs rather than from `/metrics`.
 
+- **The shipped rule file's test now validates `for:` and `expr:` values, not
+  just structure** (issue #1928). `shipped_rules_name_emitted_metrics.rs`
+  parsed `deploy/prometheus/ravel.rules.yaml` into groups and rules but read
+  both fields as opaque scalar text, so `for: 10 minutes` and an unbalanced
+  bracket inside an `expr` block scalar each parsed there while Prometheus
+  refuses either on load, killing every alert in the file with no signal from
+  the test. Every `for:` is now checked against Prometheus's duration
+  grammar, and every `expr:` is parsed with Ravel's own PromQL parser
+  (`ravel_promql::complexity_guard::parse_guarded`), each pinned as a literal
+  count so a silently-empty extractor fails loudly rather than passing over
+  nothing. No shipped rule changed.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added
