@@ -591,11 +591,10 @@ impl Distributed {
                     });
                 }
                 pb::status::Code::Unavailable => {
-                    // The accounting here is the sum over every attempt the
-                    // `SliceFetcher` made for this slice (issue #1723): the
-                    // primary, its one re-dispatch, and coordinator-local
-                    // execution each report what they spent, and a failed
-                    // attempt's spend is carried onto the surviving response.
+                    // Folded like the metrics arm (issue #1723). No production
+                    // `SliceFetcher` overrides this signal's fetch yet, so the
+                    // multi-attempt carry the metrics path gets does not reach
+                    // here today; only test doubles exercise this arm.
                     fold_log_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
                         reason: format!(
@@ -768,11 +767,10 @@ impl Distributed {
                     });
                 }
                 pb::status::Code::Unavailable => {
-                    // The accounting here is the sum over every attempt the
-                    // `SliceFetcher` made for this slice (issue #1723): the
-                    // primary, its one re-dispatch, and coordinator-local
-                    // execution each report what they spent, and a failed
-                    // attempt's spend is carried onto the surviving response.
+                    // Folded like the metrics arm (issue #1723). No production
+                    // `SliceFetcher` overrides this signal's fetch yet, so the
+                    // multi-attempt carry the metrics path gets does not reach
+                    // here today; only test doubles exercise this arm.
                     fold_span_slice(accounting, &mut running, &response);
                     return Err(QueryError::Distrib {
                         reason: format!(
