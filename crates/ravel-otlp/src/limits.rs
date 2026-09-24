@@ -288,6 +288,24 @@ pub enum Rejection {
     )]
     IntegerValuePrecisionLoss { value: i64 },
 
+    /// Informational, not an admission failure: the resource's points were
+    /// admitted, but `count` of its attributes were outside the fixed
+    /// job/instance mapping (`service.name`, `service.namespace`,
+    /// `service.instance.id`) and the configured
+    /// `resource_attribute_allowlist`, so they were dropped rather than
+    /// turned into labels (issue #116). Counted per dropped attribute
+    /// occurrence on the resource, not per point: a resource with 3
+    /// out-of-allowlist attributes reports `count: 3` regardless of how many
+    /// points it carries. `rejected_count()` returns 0 so it never inflates
+    /// the sender-facing rejected-points count; the dropped keys themselves
+    /// are never carried here, since a resource attribute's key is
+    /// caller-supplied and unbounded. Normative description:
+    /// docs/guides/observability.md.
+    #[error(
+        "{count} resource attribute(s) dropped: outside the job/instance mapping and allowlist"
+    )]
+    ResourceAttributesDropped { count: usize },
+
     /// `reason` applied identically to `count` data points that share one
     /// scope (currently: every point under a `ResourceMetrics` whose
     /// resource labels failed to build). Represents the same information as
@@ -378,6 +396,26 @@ impl NormalizeRejectCounts {
     }
 }
 
+/// Total the resource attributes dropped for sitting outside the label
+/// allowlist over one metrics normalize pass (issue #116): every
+/// [`Rejection::ResourceAttributesDropped`] entry's `count`, summed.
+///
+/// Deliberately not folded into [`NormalizeRejectCounts`]: that struct's
+/// `skew`/`structural` totals feed `ravel_admission_rejected_total`'s
+/// `reason` label, and a dropped attribute is not a rejection (the point
+/// that carried it was admitted). Keeping the two totals as separate
+/// function results, both taken from the same `rejected` slice, is what
+/// keeps a dropped attribute from ever moving a rejection count.
+pub fn resource_attrs_dropped_from_rejections(rejected: &[Rejection]) -> usize {
+    rejected
+        .iter()
+        .map(|rejection| match rejection {
+            Rejection::ResourceAttributesDropped { count } => *count,
+            _ => 0,
+        })
+        .sum()
+}
+
 impl Rejection {
     /// The admission `reason` this rejection is counted under, or `None` when
     /// it costs the sender no data point (the informational variants, whose
@@ -426,7 +464,8 @@ impl Rejection {
             // Informational: the point was admitted and stored.
             Rejection::HistogramMinMaxDropped { .. }
             | Rejection::HistogramExemplarsDropped { .. }
-            | Rejection::IntegerValuePrecisionLoss { .. } => None,
+            | Rejection::IntegerValuePrecisionLoss { .. }
+            | Rejection::ResourceAttributesDropped { .. } => None,
 
             // A grouped rejection carries its own point count; the class is
             // the shared reason's. Delegating is safe only because the metrics
@@ -456,7 +495,8 @@ impl Rejection {
             | Rejection::Grouped { count, .. } => *count,
             Rejection::HistogramMinMaxDropped { .. }
             | Rejection::HistogramExemplarsDropped { .. }
-            | Rejection::IntegerValuePrecisionLoss { .. } => 0,
+            | Rejection::IntegerValuePrecisionLoss { .. }
+            | Rejection::ResourceAttributesDropped { .. } => 0,
             _ => 1,
         }
     }

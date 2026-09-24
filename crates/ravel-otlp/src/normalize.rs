@@ -479,7 +479,12 @@ fn normalize_resource(
     }
 
     let resource_labels = match build_resource_labels(resource, limits) {
-        Ok(labels) => labels,
+        Ok((labels, dropped)) => {
+            if dropped > 0 {
+                rejected.push(Rejection::ResourceAttributesDropped { count: dropped });
+            }
+            labels
+        }
         Err(reason) => {
             rejected.push(Rejection::Grouped {
                 reason: Box::new(reason),
@@ -1638,12 +1643,27 @@ fn explode_summary(
     Ok(series)
 }
 
+/// The three resource attribute keys `build_resource_labels` consumes for
+/// `job`/`instance` rather than through the configured allowlist. Shared
+/// between the label-building loop and the dropped-attribute count so the
+/// two can never disagree about which keys are "consumed".
+const JOB_INSTANCE_SOURCE_KEYS: [&str; 3] =
+    ["service.name", "service.namespace", "service.instance.id"];
+
+/// Builds the resource-derived labels, plus how many of the resource's own
+/// attributes were outside both the job/instance mapping and the configured
+/// allowlist and so were dropped (issue #116). Counted per attribute
+/// occurrence on the resource (one entry in `resource.attributes` per unit),
+/// not per data point under it: a resource with 3 out-of-allowlist
+/// attributes returns 3 regardless of how many points it carries, and a
+/// caller multiplies by nothing before recording it. Normative description:
+/// docs/guides/observability.md.
 fn build_resource_labels(
     resource: Option<&Resource>,
     limits: &IngestLimits,
-) -> Result<Vec<Label>, Rejection> {
+) -> Result<(Vec<Label>, usize), Rejection> {
     let Some(resource) = resource else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
 
     let mut labels = Vec::new();
@@ -1677,7 +1697,19 @@ fn build_resource_labels(
         }
     }
 
-    Ok(labels)
+    let dropped = resource
+        .attributes
+        .iter()
+        .filter(|kv| {
+            !JOB_INSTANCE_SOURCE_KEYS.contains(&kv.key.as_str())
+                && !limits
+                    .resource_attribute_allowlist
+                    .iter()
+                    .any(|allowed| allowed == &kv.key)
+        })
+        .count();
+
+    Ok((labels, dropped))
 }
 
 /// Push a resource-derived label after enforcing the same length limits
