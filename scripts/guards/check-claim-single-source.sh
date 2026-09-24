@@ -3,8 +3,8 @@
 # `ravel_store_probe_last_run_timestamp_seconds` means.
 #
 # That explanation had been written out across the probe source, its
-# tests, the shipped Prometheus rule, the observability guide, the changelog),
-# and every copy stated it wrongly in the same way: one cause instead of three.
+# tests, the shipped Prometheus rule, the observability guide and the
+# changelog, and every copy stated it wrongly in the same way: one cause instead of three.
 # Four successive sweeps tried to keep the copies consistent and two of them
 # ADDED copies while removing others. A sweep cannot fix that; one home plus a
 # check can, which is what issue #1982 asked for and what this is.

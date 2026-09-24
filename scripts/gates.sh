@@ -181,9 +181,10 @@ echo "==> scripts/guards/check-doc-figures.sh"
 "$(dirname "$0")/guards/check-doc-figures.sh"
 
 # What a `0` on the store-probe liveness gauge means had been written out
-# across the probe source, its tests, the rule file and the guides, four sweeps had failed to consolidate it and two had added a
-# copy (issue #1982). One canonical block, every other site a pointer, and
-# this check keeps it that way. A file scan, no build.
+# across the probe source, its tests, the rule file and the guides. Four
+# sweeps had failed to consolidate it and two had added a copy (issue #1982).
+# One canonical block, every other site a pointer, and this check keeps it
+# that way. A file scan, no build.
 echo "==> scripts/guards/check-claim-single-source.test.sh"
 bash "$(dirname "$0")/guards/check-claim-single-source.test.sh"
 echo "==> scripts/guards/check-claim-single-source.sh"

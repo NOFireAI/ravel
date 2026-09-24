@@ -859,8 +859,8 @@ term.
 
 **Cause 2: the startup window.** `/metrics` begins serving as soon as the HTTP
 task is spawned, and `store_probe::spawn` runs later in the same startup path,
-after the gRPC and mTLS listeners bind and after the blocking initial JWKS
-fetch. A scrape that lands in between reads `0` from a process that is starting
+after the listener binds this mode makes (gRPC, and Flight and mTLS when
+configured) and after the blocking initial JWKS fetch. A scrape that lands in between reads `0` from a process that is starting
 normally. The window ends the moment `store_probe::spawn` stamps the gauge.
 Its length is the startup path between the two: the listener binds, which are
 local, and, when OIDC refresh is configured, the initial JWKS fetch, the only
