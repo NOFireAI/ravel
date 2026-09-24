@@ -96,6 +96,8 @@ partial one.
 
 ### Two corrections to the earlier #837 analysis
 
+<!-- amendment-applies: none reason="corrects claims from the external issue #837 analysis; neither retired phrase appears elsewhere in this document" -->
+
 Both are load-bearing and are recorded here as corrections to that
 analysis, not as new claims.
 

@@ -129,6 +129,8 @@ so two L1 parts of one bucket never collide. Concretely:
 
 ### Correction: the join key is the data object content hash, not the part hash
 
+<!-- amendment-applies: none reason="the Decision text above already reads as the content hash; this narrates why the earlier part-hash identifier was wrong and records that the fix was not silently made, retiring no wording currently in this document" -->
+
 An earlier accepted revision of this ADR named the join key as the covered
 part's `SnapshotPartRef.blake3` and argued that "two L1 parts of one bucket
 have two distinct `blake3` values by construction." That identifier was wrong,
@@ -256,7 +258,8 @@ quiescent tenant**, and the reason is structural, not incidental:
   draft of this ADR cited it as an existing backfill lever. That was wrong.
 
 So an idle, already-compacted tenant folds nothing, rebuilds nothing, and
-gains no part-bound coverage from the re-key alone. The reference corpus is
+gains no part-bound coverage from the re-key alone (the 2026-08-31 correction
+below finds this false). The reference corpus is
 exactly such a tenant, which is why the re-key by itself moves no measured
 number: its `.cstat` (if any) stays L0-keyed under field 11 and every
 compacted segment keeps falling back to scan until something forces a
@@ -411,6 +414,8 @@ retention/rewrite-on-touch plus a backfill pass, not via continuous fold
 rewrite alone.
 
 ## Corrections
+
+<!-- amendment-supersedes: phrase="an idle, already-compacted tenant folds nothing" pointer="2026-08-31 correction" -->
 
 Two statements in the accepted text above are factually wrong against the
 implementation. The original text is left as written; these notes state what
