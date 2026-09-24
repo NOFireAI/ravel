@@ -196,7 +196,9 @@ edit.
 DataFusion validates every batch against one schema, so the type cannot vary
 per block. `logs_schema_with_declared`
 (`crates/ravel-sql/src/logs_schema.rs:109-115`) therefore types every declared
-`Str` column as `Dictionary(Int32, Utf8)` unconditionally. A dict-encoded page
+`Str` column as `Dictionary(Int32, Utf8)` unconditionally. "End to end" is
+the wire and scan type only: the grouping-type amendment below reads this
+decision down to that: the engine cannot group on it. A dict-encoded page
 becomes the dictionary and its ids with no per-row allocation; a plain page
 becomes a degenerate identity dictionary (values as-is, keys `0..n`), which
 costs no hashing and no dedup pass and leaves that case exactly as expensive
@@ -397,7 +399,7 @@ flowchart LR
 
 ## Amendment: decision 5 is a wire type, not a grouping type (issue #737)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="5. Declared `Str` columns are `Dictionary(Int32, Utf8)` end to end" pointer="grouping-type amendment" -->
 
 Decision 5 fixes `Dictionary(Int32, Utf8)` as the type a declared `Str` column
 is scanned into and delivered as. That part stands unchanged: the scan builds
