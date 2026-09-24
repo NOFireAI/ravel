@@ -558,25 +558,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runs a slice up to three times (the primary worker, one re-dispatch to the
   next rendezvous worker, then coordinator-local), and all three sit below the
   `SliceFetcher` seam. A worker that had already fetched part of its slice and
-  then took a store error reported its failure with a zero accounting snapshot,
-  the retry classification in `try_remote` dropped whatever an abandoned
-  attempt had spent, and the coordinator folded a slice's accounting only in
-  the `Ok` arm, so the recorded cost was one attempt's spend where the store
-  had really served up to three. A tenant with an 8 GiB byte budget could drive
-  24 GiB of real GET traffic with the recorded total still inside budget. A
-  failed attempt's real spend now travels on its terminal summary frame, in the
-  same shape the byte-budget short-circuit already used, is carried across
-  re-dispatches, and is folded into the coordinator's live accounting handle on
-  every terminal status rather than only on success. This is an operator-visible
-  behavior change: byte-budget enforcement
-  (`bytes_scanned_exceeded`, and the coordinator's in-loop check) now reads the
-  sum over all attempts, so a tenant near its limit is refused earlier than
-  before, and a query that retried slices and previously completed can now trip
-  `TooManyBytesScanned`. The bytes it is refused for are bytes the store really
-  served. Per-fragment stats (`bytes_reported`) likewise report the summed
-  per-slice cost. One gap remains: when the final attempt fails with a transport
-  error carrying no summary, the abandoned attempt's spend cannot be observed
-  and is carried as zero.
+  then took a store error reported its failure with a zero accounting snapshot;
+  the retry classification in `try_remote` dropped whatever an abandoned attempt
+  had spent; `AttemptSpend::fold_into` carried a spend onto an `Ok` result only;
+  and a slice whose final attempt ended in `Err` was mapped straight to a
+  `QueryError`, folding nothing. The recorded cost was therefore one attempt's
+  spend where the store had really served up to three, and a slice that failed
+  on every attempt was charged for nothing at all. As an illustration of the
+  scale, a tenant that had configured an 8 GiB byte budget could drive 24 GiB of
+  real GET traffic with the recorded total still inside it; the shipped default
+  for `max_bytes_scanned` is `Unlimited`, so this is a gap in what an operator
+  who sets a budget gets, not in a default deployment. A failed attempt's real
+  spend now travels on its terminal summary frame, in the same shape the
+  byte-budget short-circuit already used, is carried across re-dispatches, and
+  is folded into the coordinator's live accounting handle on every terminal
+  status and on the error path too, where a slice that failed outright carries
+  its spend on the error itself. This is an operator-visible behavior change:
+  byte-budget enforcement (`bytes_scanned_exceeded`, and the coordinator's
+  in-loop check) now reads the sum over all attempts, so a tenant near its limit
+  is refused earlier than before, and a query that retried slices and previously
+  completed can now trip `TooManyBytesScanned`. The bytes it is refused for are
+  bytes the store really served. Per-fragment stats report the same figure: a
+  successful fragment's `bytes_reported` is the sum over its attempts, and a
+  failed one reports what its attempts carried instead of a flat zero. One gap
+  remains: a stream that breaks before its terminal summary reveals nothing
+  about what that worker spent, so that attempt is carried as zero rather than
+  as a guess.
 
 - **`ravel-cli gc-config set --max-flush-lifetime`'s help text and generated
   reference page now state the floor the flag is refused below** (issue
