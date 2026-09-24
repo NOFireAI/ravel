@@ -272,6 +272,8 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
 
 ## Amendment: the rewrite key must bind to the applied request set, and a rewrite must be able to name a non-L0 predecessor
 
+<!-- amendment-applies: none -->
+
 Implementing decision 1 and this decision's `RewriteRecord`
 shape found two problems a checkpoint proved rather than
 merely argued.
@@ -431,6 +433,8 @@ net has a hole matching the shape above.
 
 ## Amendment: a targeted refold closes the out-of-window gap on demand
 
+<!-- amendment-applies: none -->
+
 The "out-of-window case remains open" correction above named the gap but no
 mechanism to close it on demand; `Catalog::fold_with_refold_request` (issue
 #526, ADR-0063 amendment) is that "something else." It takes a
@@ -453,6 +457,8 @@ caller retrying a DSAR-driven refold against an unchanged watermark can tell
 reading that field rather than assuming success from `no_op: false`.
 
 ## Amendment: completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies
+
+<!-- amendment-applies: none -->
 
 A later change closes two checkpoint findings (F1 and F3) against the
 landed rewrite pass (`services/ravel-server/src/maintain.rs`).
@@ -496,6 +502,8 @@ residuals are unchanged and already tracked: the out-of-window folded
 snapshot (§4 open item, above) and the query-audit keyspace (ADR-0062).
 
 ## Amendment: completion waits for a bucket that was open at the acknowledgement
+
+<!-- amendment-applies: none -->
 
 2026-09-07. Section 3 point 1 defers an unsealed bucket to the next pass. The
 completion gate in section 4 read that deferral as an exclusion from scope and
@@ -551,6 +559,8 @@ disappears, closing the §3.5 race window durably. The `.done` record (hash
 only, no PII) is permanent.
 
 ## Amendment: the .dreq release rule names completed_unix_ns and holds while a superseded input is still resolvable
+
+<!-- amendment-applies: none -->
 
 2026-09-03. Landing the superseded-input sweep found two mismatches between
 section 5 above and the shipped rule.

@@ -614,6 +614,8 @@ flowchart TD
 
 ## Amendment 2026-08-26 (issue #741): default flips to `true`
 
+<!-- amendment-applies: none -->
+
 Status: Accepted (amends decision 4's default; the classification of
 decision 1 and the determinism argument of decision 3 are unchanged).
 
@@ -693,6 +695,8 @@ final on. Do not read this amendment as a claim that every high-cardinality
 exact-typed class, not the partial-stage one.
 
 ## Amendment 2026-08-26 (issue #771): `avg` over integer input, rejected
+
+<!-- amendment-applies: none -->
 
 Status: Rejected. `avg`/`mean` remain never eligible, over every input type.
 Decision 1's classification is unchanged and no behavior changed with this

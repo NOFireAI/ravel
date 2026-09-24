@@ -289,6 +289,8 @@ Refs: #807
 
 ## Amendment (issue #800): both bulk-loader defaults move to 4
 
+<!-- amendment-applies: none -->
+
 ### What the audit above got wrong
 
 The audit concluded that "`max_inflight_flushes` binds first for per-shard

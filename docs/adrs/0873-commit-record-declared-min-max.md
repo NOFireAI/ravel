@@ -806,6 +806,8 @@ figures.
 
 ## Amendment: rewrite parts are written and read unstamped; the recompute is a rejected refinement
 
+<!-- amendment-applies: none -->
+
 2026-09-03.
 
 An erasure rewrite's output parts carry no declared min/max stamps. Every
@@ -1228,6 +1230,8 @@ flowchart TD
 
 ## Amendment: the .cstat carrier joins by entry identity and STR extrema stay .cstat-only
 
+<!-- amendment-applies: none -->
+
 Amended 2026-09-03. Two statements above do not describe the shipped reader.
 Decision 4 says both carriers of the union resolve through one segment
 identity, the data object's content hash. Decision 2 says a `.cstat` `STR`
@@ -1270,6 +1274,8 @@ only; the `STR` case is not a degenerate union but no union at all.
 
 ## Amendment 2026-09-03: the stamp's basis is the merged attribute view
 
+<!-- amendment-applies: none -->
+
 Issue #1057. Decision 3 describes the L0 and L1 folds in terms of the
 writer's per-block NumStats, which count merged-view resolution per row
 (docs/log-segment-format.md, "What a numeric stat bounds": a row that
@@ -1296,6 +1302,8 @@ for that object rather than an affirmative statement over an unresolved
 view, which is the fail-closed reading of decision 3's staleness rule.
 
 ## Amendment 2026-09-07: the stamp is a direct record fold, not a fold over the writer's per-block NumStats
+
+<!-- amendment-applies: none -->
 
 Issue #1168. Decision 3 ("Capture at write time") routes both stamp
 producers through `RlogWriter`'s per-block NumStats: the L0 flush folds the

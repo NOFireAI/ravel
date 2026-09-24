@@ -143,7 +143,8 @@ independently testable fetchers stay clearer than one with conditionals.
      window in which that race is *observable* (multiple GETs instead of
      one) without introducing a new failure mode.
    - Bounds concurrency through the same shared-semaphore pattern
-     `SegmentFetcher` uses, sized independently for RLOG's call volume.
+     `SegmentFetcher` uses (superseded by the ADR-1195 amendment below):
+     sized independently for RLOG's call volume.
 2. **Cache key needs no schema change.** `CacheKey` is already
    `(tenant_hash, content_hash, offset, len)` (ADR-0046, confirmed current
    at `crates/ravel-cache/src/key.rs`), which is range-shaped today purely
@@ -297,8 +298,11 @@ flowchart LR
 
 ## Amendment 2026-08-26 (issue #700)
 
+<!-- amendment-applies: none -->
+
 "Sized independently for RLOG's call volume" in decision 1 means the RLOG
-permit pool is separate from RSEG's, not that it is fixed. Its size is
+permit pool is separate from RSEG's (superseded by the ADR-1195 amendment
+below), not that it is fixed. Its size is
 `--fetch-concurrency` (ADR-0088), handed to the fetcher by
 `LogSegmentFetcher::with_max_concurrent_gets` at the two places that build
 one for queries (`ravel-server`'s query wiring and `sql_latency_bench`).
@@ -307,6 +311,10 @@ GETs in flight regardless of the flag, and a 100M-row `count(*)` measured
 the same 160 s at `--fetch-concurrency` 16 and 32.
 
 ## Amendment 2026-09-05 (ADR-1195): the RLOG permit pool is the shared GET limiter
+
+<!-- amendment-applies: none -->
+<!-- amendment-supersedes: phrase="sized independently for RLOG's call volume" pointer="ADR-1195 amendment" -->
+<!-- amendment-supersedes: phrase="separate from RSEG's" pointer="ADR-1195 amendment" -->
 
 ADR-1195 replaces the per-fetcher semaphores with one
 `ravel_query::GetLimiter` shared by every fetcher a `QueryEngine` owns, sized
@@ -336,6 +344,8 @@ that limiter is the one process-wide pool described above
 (`docs/query-engine.md`, "GET concurrency (ADR-1195)").
 
 ## Amendment 2026-08-26 (issue #693 part 3): a footer carried from the plan phase establishes the etag pin on the first data GET
+
+<!-- amendment-applies: none -->
 
 Decision 1 establishes the mandatory etag pin on the suffix probe: the probe is
 the first live GET of the sequence, so its etag is what every later block-range
@@ -368,6 +378,8 @@ places that tail region explicitly so a footer-carried open never assembles a
 buffer with a zeroed trailer.
 
 ## Amendment 2026-09-05 (issue #835): the plan phase's whole-object fallback carries its bytes into the scan
+
+<!-- amendment-applies: none -->
 
 The amendment above carries a *footer* from the plan phase's predicate-free
 fast path so the scan skips its own probe. It does not cover the fallback

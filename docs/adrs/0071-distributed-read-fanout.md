@@ -82,9 +82,9 @@ S3 credentials never cross a trust boundary. The coordinator authenticates
 to each remote with a per-remote operator-configured credential (a normal
 tenant credential of that remote); client credentials are never forwarded.
 Remote failures fail the query by default; a per-remote `skip_unavailable`
-opt-in returns partial results marked in the response `warnings` plus a
-`partial` stats block naming the skipped clusters. Intra-cluster execution
-never returns partial results.
+opt-in (consent-gated by the amendment below) returns partial results marked
+in the response `warnings` plus a `partial` stats block naming the skipped
+clusters. Intra-cluster execution never returns partial results.
 
 ## Architecture
 
@@ -199,10 +199,10 @@ coordinator name any tenant on a remote it holds one credential for.
 Partial coverage (a soft-timed-out or skipped remote, or a remote that
 answers `Unsupported` for the whole request, such as one on an older
 `PROTOCOL_VERSION`) is never silent. The query stats carry
-`partial: true` and one warning per degraded remote, merged into the
-Prometheus JSON envelope. Warnings name only the operator-facing cluster
-name; remote IP:port and errno are redacted, and `RemoteClusterConfig`'s
-`Debug` redacts the configured credential.
+`partial: true` (consent-gated by the amendment below) and one warning per
+degraded remote, merged into the Prometheus JSON envelope. Warnings name only
+the operator-facing cluster name; remote IP:port and errno are redacted, and
+`RemoteClusterConfig`'s `Debug` redacts the configured credential.
 
 ## Performance
 
@@ -287,6 +287,8 @@ TTL is already bounded by `protection_horizon - grace`, so the mechanism
 exists).
 
 ## Amendment: dedicated fragment listener and per-tenant fragment capabilities
+
+<!-- amendment-applies: none -->
 
 Finding F-1 (risk R7, P2). The Security section above made two
 claims that the adversarial review showed compose into a fleet-wide
@@ -614,6 +616,8 @@ that work reads in one place:
 
 ## Amendment: partial results are consent-gated and envelope-visible
 
+<!-- amendment-applies: sections="Decision|Security" pointer="consent-gated by the amendment below" -->
+
 Status: Accepted. Amends the response-contract halves of two
 sentences above: the Decision's "a per-remote `skip_unavailable` opt-in
 returns partial results marked in the response `warnings` plus a `partial`
@@ -753,6 +757,8 @@ shipped, and the cost of changing this contract only grows.
   touched.
 
 ## Amendment: federation TLS by default, engine-direct caller honesty, and dead-endpoint quarantine
+
+<!-- amendment-applies: none -->
 
 Status: Accepted. This amendment decides the three remaining items:
 (1) the `--remote-cluster` federation transport default flips
@@ -1109,6 +1115,8 @@ dedicated clones; only the merges serialize.
   state is config-time or in-memory.
 
 ## Amendment: log and span distributed fan-out
+
+<!-- amendment-applies: none -->
 
 Status: Accepted; the queryfrag (engine-level) lane is shipped. Amends the
 Decision, Architecture, and Failure semantics sections above to extend fan-out
@@ -1477,6 +1485,8 @@ SQL lane that drives log and trace *search* over the wire now exists and is
 tested, but neither is reached from a live server binary yet.
 
 ## Amendment: the whole budget goes to every slice, and workers clamp to their own
+
+<!-- amendment-applies: none -->
 
 ### Context
 

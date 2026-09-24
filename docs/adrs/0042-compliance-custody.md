@@ -145,6 +145,8 @@ and one real gap the pinned `object_store` version cannot close:
 
 ## Amendment: decision 1's mechanism is key-prefix routing, not a per-tenant `S3Config` field
 
+<!-- amendment-applies: none -->
+
 Decision 1 as originally written says "`S3Config` gains an optional
 `kms_key_id: Option<String>` (per-tenant, sourced the same way tenant
 tokens are configured today...)". The change that actually wires this

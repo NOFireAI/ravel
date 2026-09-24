@@ -254,6 +254,8 @@ protected by that key.
 
 ## Amendment (2026-09-05): startup warm-up measures "most recent" from each tenant's latest ingest hour, not wall-clock now
 
+<!-- amendment-applies: none -->
+
 The startup cache warm-up pass (`services/ravel-server/src/cache_warm.rs`)
 resolves each tenant's most recent parts to prime the RAM/disk tiers
 before `/readyz` latches. It originally resolved a fixed `[now - 24h,

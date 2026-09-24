@@ -99,6 +99,8 @@ new byte-budget half.
 
 ## Amendment: PromQL's enforcement site cannot deliver mid-scan cancellation
 
+<!-- amendment-applies: none -->
+
 Decision 1's PromQL location clause — "alongside the existing
 `max_series`/`max_samples` checks in `engine.rs`'s three merge functions"
 — is incompatible with the same paragraph's own requirement ("checked
@@ -157,6 +159,8 @@ segment finishes and cancel the rest, instead of waiting for all of them:
   after the fact.
 
 ## Amendment: the config surface is `--limits-file`, not a new flag
+
+<!-- amendment-applies: none -->
 
 Implementing the config surface described above found the
 name wrong: there is no `--query-limits-file` flag, and this ADR should

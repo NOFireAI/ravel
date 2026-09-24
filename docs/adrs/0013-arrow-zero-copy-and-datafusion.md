@@ -105,6 +105,8 @@ endpoint, C: Flight SQL, D: RavelQL lowering.
 
 ## Amendment: memory ceilings are best-effort for joins
 
+<!-- amendment-applies: none -->
+
 An independent ravel-sql audit found that the Decision's "budget exhaustion
 is an error" clause and the pool implementation disagree on the `grow` path.
 The code is correct; this amendment makes the ADR match it.

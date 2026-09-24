@@ -195,6 +195,8 @@ breaks a real key shape fails CI instead of a production deployment.
 
 ## Amendment: `sys/auth` entries get an ownership marker
 
+<!-- amendment-applies: none -->
+
 Decision 4's `remove_tokens_by_tenant` reconcile was unsafe as shipped:
 the operator's remove pass ran over every tenant absent from its Secret,
 including a tenant `ravel-cli tenant token upsert` had provisioned by
@@ -235,6 +237,8 @@ Service reconciliation on a sys/auth failure -- both were reconcile-loop
 defects the ownership marker didn't by itself fix.
 
 ## Amendment: `token_hash` is globally unique; last writer takes ownership
+
+<!-- amendment-applies: none -->
 
 A follow-up review found the ownership marker above could itself brick
 `sys/auth`: three doors all end with two entries sharing one `token_hash`
@@ -323,6 +327,8 @@ appears -- a lagging old server otherwise loses `sys/auth` entirely (its
 bounded-staleness refresh fails closed) until it, too, is upgraded.
 
 ## Amendment: cross-tenant token collisions are refused, not taken over
+
+<!-- amendment-applies: none -->
 
 The door 3 takeover decision above does not converge. Two tenants (say
 `acme` and `globex`) whose Secret-provisioned token values collide are

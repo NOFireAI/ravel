@@ -187,6 +187,8 @@ repo config).
 
 ## Amendment: verifiable release artifacts
 
+<!-- amendment-applies: none -->
+
 An independent due-diligence review (findings K-1 and K-2) rated the
 release artifact itself as the weak half of an otherwise strong
 build-and-test story: images publish under mutable tags, unsigned, with
@@ -378,6 +380,8 @@ symlink pointing outside the repository.
   always has.
 
 ## Amendment: multi-architecture publishing
+
+<!-- amendment-applies: none -->
 
 The original ADR deferred multi-arch rather than rejecting it, on two
 conditions that have both changed. It said nothing in the deploy targets
@@ -572,6 +576,8 @@ set out to avoid.
   This amendment is CI configuration, a compose file, and documentation.
 
 ## Amendment: repository topology
+
+<!-- amendment-applies: none -->
 
 The two amendments above reason throughout about releases publishing from a
 public mirror. Decision 7 grounds keyless signing in "the mirror is the

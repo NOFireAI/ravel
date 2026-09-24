@@ -385,6 +385,8 @@ gate it is meant to tighten.
 
 ## Amendment: decision 11 applied
 
+<!-- amendment-applies: none -->
+
 Decision 11 recorded the evidence and left the setting alone, because branch
 protection is a repository setting and a rule change that lands through an
 auto-merged pull request could silently loosen the gate it is meant to tighten.

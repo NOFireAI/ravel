@@ -205,6 +205,8 @@ construction once the codec seam exists.
 
 ## Amendment 2026-08-26: a part splits on a size target; a stream may span parts
 
+<!-- amendment-applies: none -->
+
 Status: accepted. Supersedes the one-stream-per-part rule that the RLOG
 merge implemented under "stream-merge N inputs into size-capped output
 parts" above. Issue #711.
@@ -338,6 +340,8 @@ reads, so neither the logs nor the spans erasure rewrite is unbounded any
 longer, and both emit N parts for the same reason a compaction does.
 
 ## Amendment 2026-08-29: the heap knob is a split target; the stored knob counts every section
+
+<!-- amendment-applies: none -->
 
 Status: accepted. Amends the wording of the 2026-08-26 amendment above.
 Issues #872, #680.

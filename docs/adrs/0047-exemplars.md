@@ -168,6 +168,8 @@ still holds, so v6 retires v5 in the change that introduces it.
 
 ## Amendment: duplicate sort keys are legal
 
+<!-- amendment-applies: none -->
+
 Decision 1 gave the EXEMPLARS section a `(series_index, ts_ns)` sort order.
 The implementation read that as strictly ascending and rejected an equal
 key, and the writer collapsed a run of equal keys to its last record.

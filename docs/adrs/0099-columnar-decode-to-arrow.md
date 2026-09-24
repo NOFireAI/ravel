@@ -397,6 +397,8 @@ flowchart LR
 
 ## Amendment: decision 5 is a wire type, not a grouping type (issue #737)
 
+<!-- amendment-applies: none -->
+
 Decision 5 fixes `Dictionary(Int32, Utf8)` as the type a declared `Str` column
 is scanned into and delivered as. That part stands unchanged: the scan builds
 dictionary arrays on both paths, the Flight statement path resends
