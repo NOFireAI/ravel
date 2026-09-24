@@ -19,11 +19,17 @@
 //! Prometheus refuses the whole file and every alert in it goes dead, so the
 //! count has to come off a parse to mean anything.
 //!
-//! The parse covers STRUCTURE, not the values inside `expr:` and `for:`. It
-//! refuses a line it cannot account for and a key it does not know, but it
-//! reads a plain scalar as text: `for: 10 minutes` and an unbalanced bracket
-//! inside an `expr` block scalar both parse here and are both refused by
-//! Prometheus on load. Issue #1928 covers validating those two fields.
+//! The parse covers STRUCTURE: it refuses a line it cannot account for and a
+//! key it does not know, but it reads a plain scalar as text. Two further
+//! checks hold the values inside those scalars to the same standard
+//! Prometheus applies on load: [`validate_duration`] checks every `for:`
+//! value against Prometheus's duration grammar (one or more
+//! `<number><unit>` pairs in descending unit order, no spaces, no
+//! fractional numbers), and every `expr:` is parsed with Ravel's own PromQL
+//! parser (`ravel_promql::complexity_guard::parse_guarded`). `for: 10
+//! minutes` and an unbalanced bracket inside an `expr` block scalar each
+//! parse as structure and are each caught by one of those two checks, the
+//! same way Prometheus itself refuses them on load.
 //!
 //! `docs/guides/observability.md` reprints 14 of these rules in fenced `yaml`
 //! blocks, to explain them in place. Those blocks are parsed the same way and
@@ -47,6 +53,7 @@ use std::sync::Arc;
 
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::memory::MemoryStore;
+use ravel_promql::complexity_guard::parse_guarded;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
@@ -90,6 +97,20 @@ const EXPECTED_ALERTS: usize = 32;
 /// duration, so they carry no `for:` and say so in an `as_documented`
 /// annotation. `deploy/README.md` states this figure too.
 const EXPECTED_ALERTS_WITHOUT_FOR: usize = 15;
+
+/// Alerts whose `for:` value is checked against Prometheus's duration
+/// grammar: every alert that carries one at all. Pinned for the same reason
+/// as the other counts here: an extractor that silently walks past every
+/// `for:` value (a field rename, a filter that matches nothing) would
+/// otherwise leave the grammar check iterating an empty set and passing
+/// while checking nothing.
+const EXPECTED_FOR_VALUES_VALIDATED: usize = EXPECTED_ALERTS - EXPECTED_ALERTS_WITHOUT_FOR;
+
+/// Alert expressions parsed with Ravel's own PromQL parser: every alert in
+/// the file, none excluded. See `shipped_rule_for_and_expr_values_are_valid`
+/// for what would have to change here if Ravel's parser ever refused a
+/// construct Prometheus accepts.
+const EXPECTED_EXPRS_PARSED: usize = EXPECTED_ALERTS;
 
 /// The shipped Grafana dashboard over Ravel's own families.
 ///
@@ -525,6 +546,58 @@ fn parse_rule_file(text: &str) -> Result<Vec<RuleGroup>, String> {
         });
     }
     Ok(out)
+}
+
+/// Prometheus's `for:`/range duration grammar: one or more `<number><unit>`
+/// pairs, written with no separating whitespace, in strictly descending
+/// unit order, and with no fractional numbers. Units, largest to smallest:
+/// `y`, `w`, `d`, `h`, `m`, `s`, `ms`.
+///
+/// This is the same syntactic check Prometheus applies when it loads a rule
+/// file; it says nothing about whether the duration is a reasonable value,
+/// only whether Prometheus would accept the text at all.
+fn validate_duration(text: &str) -> Result<(), String> {
+    const UNITS: [&str; 7] = ["y", "w", "d", "h", "m", "s", "ms"];
+    if text.is_empty() {
+        return Err("a duration must not be empty".to_string());
+    }
+    let bytes = text.as_bytes();
+    let mut pos = 0usize;
+    let mut last_rank: Option<usize> = None;
+    while pos < bytes.len() {
+        let digits_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if pos == digits_start {
+            return Err(format!(
+                "{text:?}: expected a number at byte {pos}, found {:?}",
+                &text[pos..]
+            ));
+        }
+        let unit_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_alphabetic() {
+            pos += 1;
+        }
+        let unit = &text[unit_start..pos];
+        if unit.is_empty() {
+            return Err(format!(
+                "{text:?}: no unit follows the number starting at byte {digits_start}"
+            ));
+        }
+        let rank = UNITS
+            .iter()
+            .position(|candidate| *candidate == unit)
+            .ok_or_else(|| format!("{text:?}: {unit:?} is not one of {UNITS:?}"))?;
+        if last_rank.is_some_and(|last| rank <= last) {
+            return Err(format!(
+                "{text:?}: unit {unit:?} is out of order, or repeats a unit already used; \
+                 units must appear largest to smallest and at most once each"
+            ));
+        }
+        last_rank = Some(rank);
+    }
+    Ok(())
 }
 
 /// The body of every ```` ```yaml ```` fenced block in a Markdown document.
@@ -1345,5 +1418,142 @@ fn is_rendered_accepts_a_suffix_only_on_a_histogram_or_summary_base() {
         !is_rendered("ravel_store_bytes_total_count", &rendered),
         "a counter base must not accept a _count suffix it never declared: \
          ravel_store_bytes_total is a counter, not a histogram or summary"
+    );
+}
+
+#[test]
+fn duration_grammar_accepts_known_good_examples() {
+    for text in ["5m", "1h30m", "90s", "0s"] {
+        assert!(
+            validate_duration(text).is_ok(),
+            "{text:?} is a valid Prometheus duration and must be accepted"
+        );
+    }
+}
+
+#[test]
+fn duration_grammar_refuses_the_issues_examples() {
+    for text in ["10 minutes", "5 m", "1.5h", "m", "30s5m"] {
+        assert!(
+            validate_duration(text).is_err(),
+            "{text:?} is not a valid Prometheus duration and must be refused"
+        );
+    }
+}
+
+/// Every shipped `for:` value against Prometheus's duration grammar, and
+/// every shipped `expr:` against Ravel's own PromQL parser.
+///
+/// Structure alone (`shipped_rule_groups`, via [`parse_rule_file`]) accepts
+/// `for: 10 minutes` and an `expr` with an unbalanced bracket, because it
+/// reads both as plain scalar text; see
+/// `a_prose_for_duration_parses_as_structure_but_is_refused_by_the_grammar_check`
+/// and
+/// `an_unbalanced_bracket_in_expr_parses_as_structure_but_is_refused_by_the_parser`
+/// for that contrast demonstrated directly. This test is the one that runs
+/// both checks over the file Prometheus actually loads.
+///
+/// No shipped expression is excluded: every one of Ravel's own PromQL
+/// constructs used here (aggregation, rate/increase, absent, comparisons,
+/// `and`/`or`, label matchers) is accepted by
+/// `ravel_promql::complexity_guard::parse_guarded`. If a future rule adds an
+/// expression the parser refuses, that failure must be reported rather than
+/// worked around, and the excluded expression named here with a reason
+/// rather than silently dropped from [`EXPECTED_EXPRS_PARSED`].
+#[test]
+fn shipped_rule_for_and_expr_values_are_valid() {
+    let groups = shipped_rule_groups();
+    let alerts: Vec<&AlertRule> = groups.iter().flat_map(|group| group.rules.iter()).collect();
+
+    let mut for_checked = 0usize;
+    for alert in &alerts {
+        if let Some(duration) = &alert.fires_after {
+            validate_duration(duration).unwrap_or_else(|e| {
+                panic!(
+                    "alert {:?}: `for: {duration}` is not a valid Prometheus duration: {e}",
+                    alert.name
+                )
+            });
+            for_checked += 1;
+        }
+    }
+    assert_eq!(
+        for_checked, EXPECTED_FOR_VALUES_VALIDATED,
+        "expected to validate exactly {EXPECTED_FOR_VALUES_VALIDATED} `for:` values, checked {for_checked}"
+    );
+
+    let mut expr_checked = 0usize;
+    for alert in &alerts {
+        parse_guarded(&alert.expr).unwrap_or_else(|e| {
+            panic!(
+                "alert {:?}: `expr` does not parse as PromQL: {e}",
+                alert.name
+            )
+        });
+        expr_checked += 1;
+    }
+    assert_eq!(
+        expr_checked, EXPECTED_EXPRS_PARSED,
+        "expected to parse exactly {EXPECTED_EXPRS_PARSED} `expr` values, parsed {expr_checked}"
+    );
+}
+
+/// A minimal rule file, shaped exactly like the shipped one, used only to
+/// demonstrate the two negative cases below without touching the shipped
+/// file itself.
+const FIXTURE_RULE_FILE: &str = "\
+groups:
+  - name: fixture-group
+    rules:
+      - alert: FixtureAlert
+        expr: |
+          up == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: fixture alert
+          runbook: docs/fixture.md#none
+";
+
+/// The failure issue #1928 names for `for:`: a prose duration parses as
+/// structure (the reader has no idea what `minutes` means; it just reads a
+/// plain scalar) and is refused only by Prometheus itself on load. The new
+/// grammar check closes that gap.
+#[test]
+fn a_prose_for_duration_parses_as_structure_but_is_refused_by_the_grammar_check() {
+    let corrupted = FIXTURE_RULE_FILE.replace("for: 5m", "for: 10 minutes");
+    let groups = parse_rule_file(&corrupted).expect(
+        "the structural parser accepts a plain-scalar `for:` value regardless of its \
+         content; issue #1928 is about the value, not the structure",
+    );
+    let duration = groups[0].rules[0]
+        .fires_after
+        .as_deref()
+        .expect("fixture rule carries a for:");
+    assert_eq!(duration, "10 minutes");
+    assert!(
+        validate_duration(duration).is_err(),
+        "`for: 10 minutes` must be refused: Prometheus's grammar has no unit named \
+         `minutes` and no space between the number and the unit"
+    );
+}
+
+/// The failure issue #1928 names for `expr:`: an unbalanced bracket inside a
+/// block scalar parses as structure (the reader treats the whole block as
+/// opaque text) and is refused only by Prometheus's PromQL parser on load.
+/// The new parse check closes that gap.
+#[test]
+fn an_unbalanced_bracket_in_expr_parses_as_structure_but_is_refused_by_the_parser() {
+    let corrupted = FIXTURE_RULE_FILE.replace("up == 1", "sum(up == 1");
+    let groups = parse_rule_file(&corrupted).expect(
+        "the structural parser reads `expr:` as an opaque block-scalar string; it does \
+         not look inside for balanced brackets",
+    );
+    let expr = &groups[0].rules[0].expr;
+    assert_eq!(expr, "sum(up == 1");
+    assert!(
+        parse_guarded(expr).is_err(),
+        "an expr with an unbalanced bracket must be refused by the PromQL parser"
     );
 }
