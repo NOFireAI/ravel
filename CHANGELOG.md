@@ -745,6 +745,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same falling-to-zero shape the description calls the alarm; it now carries
   the same idle clause as its sibling panel, "Query result cache hit ratio".
 
+- **A denied read on a catalog HEAD, a covered snapshot part, or a
+  column-stats object no longer degrades silently into "nothing here yet"**
+  (issue #1976). This is the follow-up #1964 left open: five more GETs
+  treated any store error, including `AccessDenied` from a missing IAM read
+  grant, the same as a genuine `NotFound`. `resolve_stats_head` and
+  `fetch_stats_object` (column-stats resolution) and `load_covering_postings`'s
+  HEAD and per-part GETs returned `Ok(None)`; `fetch_stats_object` returned
+  `Ok(FetchOutcome::Absent)`; `verify_seal_divergence`'s HEAD GET returned
+  `Ok(None)`. A permission fault recurs on every tick, so each of these read
+  as "no statistics yet", "part not covered", or "nothing folded yet", with
+  no signal an operator could act on.
+  `NotFound` still degrades exactly as before on every one of these five
+  reads: an absent HEAD genuinely means nothing has folded yet, and an
+  absent part or stats object genuinely means it is not covered. Any other
+  error now surfaces instead: `resolve_stats_head` and `fetch_stats_object`
+  return `Err(LoadColumnStatsError::Store)`, `load_covering_postings`
+  returns `Err(LoadPostingsError::HeadStore)` or
+  `Err(LoadPostingsError::PartStore)`, and `verify_seal_divergence` returns
+  `Err(SealDivergenceError::HeadFetch)`, each naming the failing key. Every
+  caller already either propagates the `Err` or has a generic catch-all that
+  logs and skips the tick (the postings scrub tick logs at `error!`, the
+  seal-divergence scrub tick at `warn!`, both pre-existing and unchanged by
+  this fix), so no caller needed new code, only these five call sites
+  stopped throwing the error away before it reached them.
+
 - **A denied read on a catalog `idx/` object no longer degrades silently
   into "nothing to reuse"** (issue #1964). Three GETs of catalog index
   objects treated any store error, including `AccessDenied` from a missing

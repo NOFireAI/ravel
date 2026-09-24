@@ -95,6 +95,17 @@ pub enum SealDivergenceError {
         #[source]
         source: SnapshotFormatError,
     },
+    /// The HEAD GET failed for a reason other than `NotFound` (issue #1976):
+    /// a `NotFound` there still means "nothing folded yet" and stays an
+    /// `Ok(None)` degrade, but any other failure (most commonly
+    /// `AccessDenied` on a missing IAM read grant) is a store outage, not an
+    /// absence.
+    #[error("failed to fetch HEAD {key}: {source}")]
+    HeadFetch {
+        key: String,
+        #[source]
+        source: StoreError,
+    },
     #[error("failed to fetch part {key}: {source}")]
     PartFetch {
         key: String,
@@ -169,11 +180,12 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
 /// diff them against the current folded snapshot.
 ///
 /// Returns `Ok(None)` when there is no HEAD yet (nothing folded, so nothing to
-/// verify): fetching the HEAD failed with a store error, exactly the "nothing
+/// verify): fetching the HEAD returned `NotFound`, exactly the "nothing
 /// folded yet" case the CLI has always treated as success. `Ok(Some(report))`
 /// carries the classified diff (see [`SealDivergenceReport`]). `Err` is a
-/// read/decode failure of the objects the comparison needs, never the presence
-/// of a divergence.
+/// read/decode failure of the objects the comparison needs -- including a
+/// non-`NotFound` HEAD GET failure (issue #1976) -- never the presence of a
+/// divergence.
 pub async fn verify_seal_divergence(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -181,12 +193,21 @@ pub async fn verify_seal_divergence(
 ) -> Result<Option<SealDivergenceReport>, SealDivergenceError> {
     let key = head_key(tenant_hash, signal);
 
-    // A store error fetching HEAD means nothing has been folded yet (or the
-    // HEAD is unreadable): there is no snapshot to verify against. This is the
-    // "nothing folded yet, nothing to verify" case, not a divergence.
+    // A `NotFound` fetching HEAD means nothing has been folded yet: there is
+    // no snapshot to verify against, the "nothing folded yet, nothing to
+    // verify" case, not a divergence. Any other GET failure (issue #1976:
+    // most commonly AccessDenied on a missing IAM read grant) is a store
+    // outage and must surface, not be swallowed as though nothing were
+    // folded.
     let head_bytes = match store.get(&key, GetRange::Full).await {
         Ok(outcome) => outcome.data,
-        Err(_) => return Ok(None),
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(source) => {
+            return Err(SealDivergenceError::HeadFetch {
+                key: key.clone(),
+                source,
+            });
+        }
     };
     let head = decode_head(&head_bytes).map_err(|source| SealDivergenceError::HeadCorrupt {
         key: key.clone(),
@@ -407,6 +428,7 @@ mod tests {
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::NewCommitRecord;
     use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::TenantId;
 
@@ -596,6 +618,75 @@ mod tests {
         assert!(report.orphaned.is_empty());
         assert_eq!(report.sealed_record_count, 2);
         assert_eq!(report.snapshot_entry_count, 2);
+    }
+
+    /// Issue #1976: the catalog HEAD GET must surface a non-`NotFound`
+    /// failure as a real error, not read as "nothing folded yet". Callers:
+    /// `ravel-cli`'s `catalog verify` (`services/ravel-cli/src/catalog.rs`,
+    /// which maps any `Err` through `anyhow` and exits nonzero) and
+    /// `ravel_server::scrub::run_seal_divergence_tick`, which already logs
+    /// any `Err` from this function at `error!` and skips the tick.
+    #[tokio::test]
+    async fn head_get_permanent_failure_surfaces_as_error() {
+        let inner = Arc::new(MemoryStore::new());
+        let tenant = "head-fault";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        publish_segment(inner.as_ref(), tenant, 1, created).await;
+        fold(inner.clone(), tenant, now).await;
+
+        let key = head_key(&TenantId::new(tenant).hash(), Signal::Metrics);
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(key.clone()),
+        );
+        let faulty = FaultStore::new(inner.clone(), plan);
+
+        let err = verify_seal_divergence(&faulty, &TenantId::new(tenant).hash(), Signal::Metrics)
+            .await
+            .expect_err("a non-NotFound GET failure on the HEAD must surface as an error");
+        match err {
+            SealDivergenceError::HeadFetch { key: err_key, .. } => {
+                assert_eq!(err_key, key, "error names the failing key");
+            }
+            other => panic!("expected SealDivergenceError::HeadFetch, got {other:?}"),
+        }
+        assert!(
+            faulty.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
+    /// The counterpart to `head_get_permanent_failure_surfaces_as_error`: a
+    /// genuine `NotFound` on the HEAD (modeled with `NotFoundBlip`) is the
+    /// ordinary "nothing folded yet" case and must still degrade quietly to
+    /// `Ok(None)`, exactly as before this fix.
+    #[tokio::test]
+    async fn head_get_not_found_blip_still_degrades_to_none() {
+        let inner = Arc::new(MemoryStore::new());
+        let tenant = "head-fault-blip";
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        publish_segment(inner.as_ref(), tenant, 1, created).await;
+        fold(inner.clone(), tenant, now).await;
+
+        let key = head_key(&TenantId::new(tenant).hash(), Signal::Metrics);
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(key));
+        let faulty = FaultStore::new(inner.clone(), plan);
+
+        let report =
+            verify_seal_divergence(&faulty, &TenantId::new(tenant).hash(), Signal::Metrics)
+                .await
+                .expect("a NotFound on the HEAD must degrade to Ok(None), never an error");
+        assert!(report.is_none());
+        assert!(
+            faulty.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
     }
 
     #[tokio::test]
