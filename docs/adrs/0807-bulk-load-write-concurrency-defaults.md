@@ -111,9 +111,11 @@ sit under that number, and they are not the same knob:
   writes requires raising `max_inflight_flushes`, which `ravel-cli load` cannot
   do today.
 
-So `max_inflight_flushes` binds first for per-shard overlap and is not
-operator-reachable, while `--pipeline-depth` binds the cross-batch barrier and is
-reachable. And `--shards` itself defaults to 4: on the 16-core reference box the
+So `max_inflight_flushes` binds first for per-shard overlap
+(retired by the #800 amendment below, which measures the two windows as
+symmetric) and is not operator-reachable, while `--pipeline-depth` binds
+the cross-batch barrier and is reachable. And `--shards` itself defaults to
+4: on the 16-core reference box the
 sustainable ceiling with `--pipeline-depth` raised is still `shards = 4` writes,
 well under core count, which is the residual idle. Three knobs interact; only two
 of them can be turned on the bulk path, and one of those (`--shards`) is a
@@ -199,7 +201,9 @@ the audit changed nothing.
    bulk path. Default 1, and 0 rejected at the edge exactly as the server rejects
    it (`config.rs:2065`). Exposing the knob is not changing its default.
 
-3. **Both bulk-loader defaults stay at 1.** `--pipeline-depth` and
+3. **Both bulk-loader defaults stay at 1.** (Both are 4 since the #800
+   amendment below; what follows is the reasoning it replaced.)
+   `--pipeline-depth` and
    `--max-inflight-flushes` both default to 1, preserving today's
    one-batch-at-a-time behavior and today's exact durable-token report.
    Note the formula above: at the defaults the ceiling is still `shards`
@@ -227,7 +231,10 @@ the audit changed nothing.
    underlying flush (`load.rs:891-892`). Once `ravel-ingest` gains a mechanism that
    provably prevents a cancelled batch from committing, `--pipeline-depth` > 1 no
    longer weakens the durable-token report, and a higher default becomes a plain
-   throughput decision to reopen here.
+   throughput decision to reopen here. That condition is not the only way to
+   close the gap: the #800 amendment below closes it by waiting for every
+   outstanding write instead, and raises the default without a cancellation
+   mechanism.
 
 ## Consequences
 
@@ -239,8 +246,10 @@ the audit changed nothing.
   arm A meaningful, but it does not apportion the gain between
   `--pipeline-depth` and `--max-inflight-flushes`. What is known about the split
   is one-sided: raising the depth ALONE aborts, so the second window is
-  necessary; no arm has isolated the flush window on its own. Cores busy rise
-  from 2.33 to 8.58 of 16.
+  necessary; no arm has isolated the flush window on its own. The #800
+  amendment below does apportion it, on a fixture rather than on the corpus:
+  neither window alone moves the wall, and together they give 3.97x. Cores
+  busy rise from 2.33 to 8.58 of 16.
   Two failed arms bracket it: doubling `--batch-rows` instead (bigger objects,
   both windows at default) was 11% SLOWER, and raising `--pipeline-depth` to 16
   alone aborted with `flush failed: timed out waiting for shard ack`, because
@@ -289,7 +298,8 @@ Refs: #807
 
 ## Amendment (issue #800): both bulk-loader defaults move to 4
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision|What binds first (verified from the code, not assumed)|Consequences" pointer="#800 amendment" -->
+<!-- amendment-supersedes: phrase="`max_inflight_flushes` binds first for per-shard overlap" pointer="#800 amendment" -->
 
 ### What the audit above got wrong
 
