@@ -44,6 +44,7 @@ struct Counts {
     skew: u64,
     structural: u64,
     body_conversions: u64,
+    resource_attrs_dropped: u64,
 }
 
 /// One `(tenant, signal)` row of accumulated normalize-layer decisions, for
@@ -66,6 +67,16 @@ pub struct TenantNormalizeRejects {
     /// counted record can still be dropped or lost. Read it as a conversion
     /// rate. Normative description: docs/guides/observability.md.
     pub body_conversions_total: u64,
+    /// Resource attributes outside the allowlist, dropped rather than turned
+    /// into labels (issue #116). Informational, like `body_conversions_total`:
+    /// the point that carried them was still admitted, so this must never be
+    /// read as, or folded into, a rejection reason. A tenant whose resources
+    /// carry high-cardinality attributes the allowlist does not cover shows up
+    /// here; the count says nothing about which attribute, since key names are
+    /// caller-controlled and unbounded and this crate does not label by them
+    /// (see the module docs on cardinality). Normative description:
+    /// docs/guides/observability.md.
+    pub resource_attrs_dropped_total: u64,
 }
 
 impl NormalizeRejectMetrics {
@@ -101,6 +112,19 @@ impl NormalizeRejectMetrics {
         row.body_conversions = row.body_conversions.saturating_add(count as u64);
     }
 
+    /// Adds `count` dropped-outside-the-allowlist resource attributes to
+    /// `(tenant, signal)` (issue #116). Separate from [`Self::record`] for the
+    /// same reason [`Self::record_body_conversions`] is: this is not a
+    /// rejection and must not move a rejection reason.
+    pub fn record_resource_attrs_dropped(&self, tenant: &TenantId, signal: Signal, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut rows = self.rows.lock();
+        let row = rows.entry((tenant.hash(), signal)).or_default();
+        row.resource_attrs_dropped = row.resource_attrs_dropped.saturating_add(count as u64);
+    }
+
     /// A point-in-time copy of every accumulated row, for `/metrics` rendering.
     pub fn snapshot(&self) -> Vec<TenantNormalizeRejects> {
         self.rows
@@ -112,6 +136,7 @@ impl NormalizeRejectMetrics {
                 skew_total: counts.skew,
                 structural_total: counts.structural,
                 body_conversions_total: counts.body_conversions,
+                resource_attrs_dropped_total: counts.resource_attrs_dropped,
             })
             .collect()
     }
@@ -135,6 +160,7 @@ mod tests {
             NormalizeRejectCounts::default(),
         );
         metrics.record_body_conversions(&tenant("acme"), Signal::Logs, 0);
+        metrics.record_resource_attrs_dropped(&tenant("acme"), Signal::Metrics, 0);
         assert!(metrics.snapshot().is_empty());
     }
 
@@ -174,6 +200,8 @@ mod tests {
                 structural: 0,
             },
         );
+        metrics.record_resource_attrs_dropped(&tenant("acme"), Signal::Metrics, 2);
+        metrics.record_resource_attrs_dropped(&tenant("acme"), Signal::Metrics, 3);
 
         let mut rows = metrics.snapshot();
         rows.sort_by_key(|r| (r.tenant_hash, r.signal as u8));
@@ -186,6 +214,7 @@ mod tests {
         assert_eq!(acme_metrics.skew_total, 3);
         assert_eq!(acme_metrics.structural_total, 3);
         assert_eq!(acme_metrics.body_conversions_total, 0);
+        assert_eq!(acme_metrics.resource_attrs_dropped_total, 5);
 
         let acme_logs = rows
             .iter()

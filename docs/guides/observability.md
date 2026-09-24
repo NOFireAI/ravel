@@ -1507,6 +1507,7 @@ operational depth.
 | `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal. |
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
 | `ravel_ingest_body_conversions_total` | Log records whose structured (array or map) body was converted to canonical JSON text at normalization, by tenant and signal. Not a rejection, and not a count of stored records: see "Neither rule alerts on" below. |
+| `ravel_ingest_resource_attrs_dropped_total` | Metric resource attributes outside the configured allowlist, dropped rather than turned into labels, by tenant and signal. Not a rejection: the point that carried them was admitted. See "Resource attributes outside the allowlist" below. |
 | `ravel_admission_reconciliation_failures_total` | Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, by tenant and signal; the last-known soft threshold stays in force. |
 
 Four more series report the reconciliation cycle itself. They carry `mode`
@@ -1651,6 +1652,38 @@ it is its own family rather than a `reason` on
 `ravel_admission_rejected_total`: a record it counts was admitted by
 normalization, and an operator alerting on rejection reasons must see nothing
 from it.
+
+#### Resource attributes outside the allowlist
+
+`job` and `instance` come from `service.name`/`service.namespace` and
+`service.instance.id`; every other resource attribute becomes a label only if
+it is in the (fixed, build-time) `resource_attribute_allowlist`. Before issue
+#116, an attribute outside both sets was dropped with no signal at all: no
+rejection, no counter, no partial-success detail, and two resources that
+differed only in such an attribute silently flattened to the same label set
+and merged into one series.
+
+`ravel_ingest_resource_attrs_dropped_total` makes that drop visible. It counts
+attributes, not points: one resource with five out-of-allowlist attributes
+adds 5, regardless of how many points that resource carried. It is
+informational like `ravel_ingest_body_conversions_total`, not a `reason` on
+`ravel_admission_rejected_total`, for the same reason: the point that carried
+the dropped attributes was admitted, and an operator alerting on rejection
+reasons must see nothing from it. The dropped attributes' key names are
+deliberately not reported anywhere, on this counter or in the OTLP
+partial-success `error_message`: a resource attribute's key is caller-supplied
+and unbounded, so turning it into a label or a per-key series would hand a
+sender control over this process's own cardinality, the same hazard the
+allowlist itself exists to bound. A nonzero, sustained rate on this counter
+means resources are carrying attributes the allowlist does not cover; find
+which ones by inspecting the sender's resource attributes directly, not from
+this metric.
+
+This counter does not change what gets dropped. The allowlist is still fixed
+at build time; making it configurable per tenant or per process is a separate
+decision (precedence between a tenant override and the process default,
+the cardinality blast radius of letting a tenant widen its own label set, and
+whether the setting is per-tenant or per-process) left to a follow-up ticket.
 
 `ravel_ingest_wire_bytes_total` is emitted from the ingest byte-metrics tracker
 rather than the admission snapshot, so its name carries the `ravel_ingest_`

@@ -355,7 +355,12 @@ and replaces dots with underscores. The default allowlist is
 `k8s.namespace.name`, `k8s.pod.name`, `k8s.container.name`, `host.name`,
 `deployment.environment.name`, `cloud.provider`, `cloud.region`. Ravel drops
 any resource attribute that is not on this list and not one of the three
-above; it does not store it as a label.
+above; it does not store it as a label. The allowlist is still fixed at build
+time, not configurable per tenant (issue #116 tracks that as separate work),
+but the drop is no longer silent: `ravel_ingest_resource_attrs_dropped_total`
+counts it, including the case where two resources differing only in a dropped
+attribute collapse into one series. See [the observability
+guide](observability.md#resource-attributes-outside-the-allowlist).
 
 An event-time skew alert
 ([observability guide](observability.md#reading-the-reason-label)) cannot be

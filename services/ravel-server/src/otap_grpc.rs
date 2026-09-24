@@ -362,6 +362,13 @@ async fn write_batch(
         ravel_types::Signal::Metrics,
         NormalizeRejectCounts::from_metric_rejections(&normalized.rejected),
     );
+    // Informational, not an admission decision (issue #116): counted
+    // separately so it never moves the `reason` label above.
+    ingest.normalize_metrics.record_resource_attrs_dropped(
+        tenant,
+        ravel_types::Signal::Metrics,
+        ravel_otlp::resource_attrs_dropped_from_rejections(&normalized.rejected),
+    );
     // Synchronous, no I/O, off the acknowledgement path: see the twin call in
     // `crate::ingest::handle_export`.
     if let Some(sink) = &ingest.metadata_sink {

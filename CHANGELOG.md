@@ -8,6 +8,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ravel_ingest_resource_attrs_dropped_total` counts metric resource
+  attributes dropped for sitting outside the label allowlist** (issue #116).
+  `build_resource_labels` turns `service.name`/`service.namespace` into `job`,
+  `service.instance.id` into `instance`, and a fixed allowlist of other
+  resource attributes into labels; every other attribute was silently
+  dropped, with no rejection, no counter, and no partial-success detail, and
+  two resources differing only in such an attribute would flatten to the same
+  label set and merge into one series with no signal that it had happened.
+  Attributes outside the allowlist are **still dropped**: this is visibility
+  only, not a fix to the drop itself or a way to configure the allowlist.
+  The count (not the dropped keys, which are caller-controlled and
+  unbounded) is carried as an informational `Rejection::ResourceAttributesDropped`
+  from `ravel-otlp`, rendered on `GET /metrics` as
+  `ravel_ingest_resource_attrs_dropped_total` by tenant and signal (mirroring
+  `ravel_ingest_body_conversions_total`, not a `reason` on
+  `ravel_admission_rejected_total`, since the point that carried the
+  attributes was still admitted), and reaches the OTLP partial-success
+  `error_message` the same way every other rejection already does.
+
 - **Prometheus alert rules ship in `deploy/prometheus/ravel.rules.yaml`**
   (issue #1730). `deploy/` previously held one dashboard graphing host CPU,
   no rule file and no `PrometheusRule` manifest, so about twenty alert
