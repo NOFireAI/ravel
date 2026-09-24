@@ -84,6 +84,7 @@ check "a clean ADR with both markers satisfied passes" "${t}" 0 "clean"
 t="$(new_tree missing-pointer)"
 sed -i.bak 's/Placement follows the active policy (2026-09-23 amendment below)./Placement follows the active policy./' "${t}/docs/adrs/0001-test-decision.md"
 check "a named section missing its pointer is a finding" "${t}" 1 "does not carry the pointer"
+check "a finding's output carries the marker-syntax hint" "${t}" 1 "Marker syntax: docs/adrs/README.md"
 
 # The retired phrase survives, unqualified, outside the amendment.
 t="$(new_tree unqualified-phrase)"
@@ -117,6 +118,19 @@ check "an amendment-supersedes-allow marker with no reason is still a finding" "
 t="$(new_tree no-marker)"
 sed -i.bak '/amendment-applies:/d; /amendment-supersedes:/d' "${t}/docs/adrs/0001-test-decision.md"
 check "an amendment heading with no marker cannot be checked" "${t}" 70 "carries no amendment-applies"
+check "a could-not-check result carries the marker-syntax hint" "${t}" 70 "Marker syntax: docs/adrs/README.md"
+
+# Recognition is case-insensitive on the heading text, not just the noun
+# form: a lowercase "amendment" heading is recognised too.
+t="$(new_tree lowercase-heading)"
+sed -i.bak 's/^## Section B$/### amendment (2026-09-24): a lowercase heading\n\nNo marker here.\n\n## Section B/' "${t}/docs/adrs/0001-test-decision.md"
+check "a lowercase 'amendment' heading with no marker cannot be checked" "${t}" 70 "carries no"
+
+# A "Correction" heading is recognised the same way as "Amendment": the
+# guard's own header says nothing is excluded by spelling.
+t="$(new_tree correction-heading)"
+sed -i.bak 's/^## Section B$/## Correction: the placement rule was misstated\n\nNo marker here.\n\n## Section B/' "${t}/docs/adrs/0001-test-decision.md"
+check "a Correction heading with no marker cannot be checked" "${t}" 70 "carries no"
 
 # A marker names a section heading that does not exist in this document.
 t="$(new_tree bad-section)"
@@ -183,6 +197,12 @@ t="$(new_tree none-with-reason)"
 sed -i.bak 's/sections="Section A|Section B" pointer="2026-09-23 amendment"/none reason="adds a placement class rather than retiring one"/' "${t}/docs/adrs/0001-test-decision.md"
 check "amendment-applies: none with a reason passes" "${t}" 0 "clean"
 
+# A reason= of pure whitespace is refused the same as an empty one: the
+# reason has to say something, not just be present.
+t="$(new_tree none-whitespace-reason)"
+sed -i.bak 's/sections="Section A|Section B" pointer="2026-09-23 amendment"/none reason="   "/' "${t}/docs/adrs/0001-test-decision.md"
+check "amendment-applies: none with a whitespace-only reason is a finding" "${t}" 1 "with no reason"
+
 # A marker that names nothing, or omits half of what it needs, is
 # unreadable rather than vacuously satisfied.
 t="$(new_tree empty-sections)"
@@ -200,6 +220,10 @@ check "an amendment-applies marker with a pointer and no sections= is refused" "
 t="$(new_tree supersedes-no-pointer)"
 sed -i.bak 's/phrase="storage class STANDARD_FALLBACK" pointer="2026-09-23 amendment"/phrase="storage class STANDARD_FALLBACK"/' "${t}/docs/adrs/0001-test-decision.md"
 check "an amendment-supersedes marker with no pointer= is refused" "${t}" 70 "missing phrase= or pointer="
+
+t="$(new_tree supersedes-no-phrase)"
+sed -i.bak 's/phrase="storage class STANDARD_FALLBACK" pointer="2026-09-23 amendment"/pointer="2026-09-23 amendment"/' "${t}/docs/adrs/0001-test-decision.md"
+check "an amendment-supersedes marker with no phrase= is refused" "${t}" 70 "missing phrase= or pointer="
 
 # Two headings with the named text: which one the pointer must reach is not
 # a question the guard may guess at.
@@ -224,6 +248,26 @@ t="$(new_tree nested-amendment-prose)"
 sed -i.bak 's/Placement follows the active policy (2026-09-23 amendment below)./Placement follows the active policy./' "${t}/docs/adrs/0001-test-decision.md"
 sed -i.bak 's/^## Section B$/### Amendment (2026-09-24): nested under Section A\n\n<!-- amendment-applies: none reason="restates the rule above rather than retiring it" -->\n\nThis block names the 2026-09-23 amendment, from inside Section A.\n\n## Section B/' "${t}/docs/adrs/0001-test-decision.md"
 check "an amendment nested in a section cannot carry that section's pointer" "${t}" 1 "does not carry the pointer"
+
+# A heading nested inside an amendment's own block does not become a valid
+# pointer target just because its own text is itself amendment-named: it
+# still belongs to the enclosing block, the same as any other nested
+# heading, so a later marker naming it cannot be checked.
+t="$(new_tree nested-amendment-as-target)"
+cat >>"${t}/docs/adrs/0001-test-decision.md" <<'MD'
+
+### Amendment (2026-09-24): a nested heading naming itself an amendment
+
+<!-- amendment-applies: none reason="restates the placement narrowing above; nested and retires nothing new" -->
+
+This heading is intentionally amendment-named and sits inside the
+2026-09-23 amendment's own block.
+
+## Amendment (2026-09-25): a third amendment naming the nested heading as a section
+
+<!-- amendment-applies: sections="Amendment (2026-09-24): a nested heading naming itself an amendment" pointer="2026-09-25 amendment" -->
+MD
+check "an amendment-named heading nested in another amendment's block is not a target" "${t}" 70 "no matching heading"
 
 # Phrase matching is case-insensitive and whitespace-collapsed, so
 # capitalisation and a line wrap do not hide a surviving phrase.
