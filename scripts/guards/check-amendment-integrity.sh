@@ -52,7 +52,9 @@
 #     block (a `### Decision` recounting the original one, say) does not
 #     count as a match either: only the document's own structure, or
 #     another amendment's top-level heading, is something a pointer can be
-#     sent to.
+#     sent to. `|` separates the names, so a heading carrying one in its
+#     own text is named with `\|` (ADR-0996's "2. The fetch policy:
+#     `request-minimal \| byte-minimal \| cost-based`").
 #
 #   <!-- amendment-supersedes: phrase="old wording" pointer="TEXT" -->
 #     `phrase` must not appear anywhere outside this amendment's own block
@@ -121,6 +123,7 @@ ALLOW_RE = re.compile(r"amendment-supersedes-allow:\s*(.*?)\s*(?:-->)?\s*$")
 ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 NONE_RE = re.compile(r"^none\b")
 MARKER_LINE_RE = re.compile(r"<!--\s*amendment-")
+SECTION_SPLIT_RE = re.compile(r"(?<!\\)\|")
 WS_RE = re.compile(r"\s+")
 
 SYNTAX_HINT = (
@@ -331,7 +334,11 @@ for path in paths:
                     "is missing sections= or pointer="
                 )
                 continue
-            names = [n.strip() for n in sections.split("|") if n.strip()]
+            names = [
+                n.replace("\\|", "|").strip()
+                for n in SECTION_SPLIT_RE.split(sections)
+            ]
+            names = [n for n in names if n]
             if not names:
                 problem(
                     f"{where}: amendment-applies marker on {heading_text!r} "
