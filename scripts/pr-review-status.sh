@@ -424,19 +424,19 @@ else
     # --rebase is redundant once the queue owns the strategy, but gh accepts
     # it here with an informational warning, and keeping it means the command
     # stays correct if the queue is ever removed. See 6a66e04 for the check.
-    echo "  -> gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+    echo "  -> ALLOW_LITERAL_SHA=1 gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   elif queue_is_active; then
     # Base is fresh right now, but a queue is enforced, so the prefix would
     # refuse the moment main moves between this check and the operator running
     # the line -- the pre-#1758 refusal reached by the fresh path instead of
     # the stale one. The queue re-validates the entry either way.
-    echo "  -> gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+    echo "  -> ALLOW_LITERAL_SHA=1 gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   else
     if [[ "${_queue_rc}" == "2" ]]; then
       # Same distinction the stale path makes: blocking is right, but the
       # operator must not read a failed lookup as an ordinary no-queue repo.
       echo "  -> NOTE: could not read the base branch's rules, so this command carries the freshness guard without knowing whether a merge queue would have re-validated it"
     fi
-    echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} origin ${base_ref} && gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+    echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} origin ${base_ref} && ALLOW_LITERAL_SHA=1 gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
   fi
 fi

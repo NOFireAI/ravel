@@ -160,18 +160,21 @@ function checkBareSha(rawStatement) {
   if (!BARE_SHA_LITERAL.test(stmt)) return;
   if (shaLiteralAllowed(stmt)) return;
   deny(
-    "This command contains a bare 40-character hex literal, almost always " +
-      "a SHA completed from a shorter prefix read off adjacent output. A " +
-      "wrong digit is only caught by whatever receives it " +
-      "(--match-head-commit, --force-with-lease, a fleet dispatch ref), " +
-      "never by re-reading the command. Resolve it instead: assign the " +
-      "SHA into a shell variable with a command substitution in the SAME " +
-      "command that consumes it, then pass the variable, quoted, to " +
-      "--match-head-commit or to the dispatch ref, e.g. " +
-      '`sha=$(git rev-parse origin/main) && gh pr merge 123 ' +
-      "--match-head-commit \"$sha\"`. If the literal text is genuinely " +
-      "needed (a fixture, a doc example, a known hash), prefix the " +
-      "command with ALLOW_LITERAL_SHA=1.",
+    "This command contains a bare 40-character hex literal. Which fix is " +
+      "right depends on where the literal came from. " +
+      "TYPED OR COMPLETED FROM MEMORY (a prefix read off earlier output and " +
+      "finished by hand): resolve it in the same command instead, e.g. " +
+      '`sha=$(git rev-parse origin/main)` for a dispatch ref. A wrong ' +
+      "digit is otherwise only caught by whatever receives it. " +
+      "COPIED FROM A CHECK YOU JUST RAN (the --match-head-commit value " +
+      "scripts/pr-review-status.sh printed, a ref you are asking a guard " +
+      "to validate): the literal IS the check. Do NOT re-resolve it: a " +
+      "re-resolved head matches whatever the head is now, so a push that " +
+      "landed after the check merges unreviewed, and a guard handed a " +
+      "freshly resolved value passes vacuously. Keep the literal and prefix " +
+      "the command with ALLOW_LITERAL_SHA=1; pr-review-status.sh already " +
+      "prints its merge line that way. The same prefix covers fixtures, " +
+      "doc examples and non-SHA hashes.",
   );
 }
 

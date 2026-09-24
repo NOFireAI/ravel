@@ -410,6 +410,34 @@ check deny  "a non-sha 40-hex literal (hmac-shaped)" \
 check allow "escape hatch permits a non-sha 40-hex literal" \
   "$(bash_payload "ALLOW_LITERAL_SHA=1 curl -H \"Authorization: Bearer ${SHA40}\" https://example.com")"
 
+# When the literal IS the check, it must be kept, not re-resolved: a
+# --match-head-commit value re-resolved at merge time matches whatever the
+# head is by then, so a push landing after review would merge unreviewed.
+# scripts/pr-review-status.sh prints its merge line with the escape hatch
+# already on it. Take every line it can print, exactly as it prints it, and
+# feed each through the guard: if the script ever loses the prefix, or the
+# guard stops honouring it after an `&&`, these fail rather than drifting.
+PRS="$(dirname "$0")/../../scripts/pr-review-status.sh"
+merge_lines=0
+while IFS= read -r line; do
+  cmd="${line#*-> }"
+  cmd="${cmd%\"}"
+  cmd="${cmd//\$\{pr\}/123}"
+  cmd="${cmd//\$\{base_ref\}/main}"
+  cmd="${cmd//\$\{head_sha\}/${SHA40}}"
+  merge_lines=$((merge_lines + 1))
+  check allow "pr-review-status merge line ${merge_lines} passes as printed" \
+    "$(bash_payload "$cmd")"
+  check deny  "pr-review-status merge line ${merge_lines} is denied without the prefix" \
+    "$(bash_payload "${cmd//ALLOW_LITERAL_SHA=1 /}")"
+done < <(grep -E 'echo ".*--match-head-commit \$\{head_sha\}' "$PRS")
+if [ "$merge_lines" -lt 1 ]; then
+  printf 'FAIL  %-52s found no --match-head-commit line to check\n' "pr-review-status merge lines exist"
+  fail=$((fail + 1))
+else
+  pass=$((pass + 1))
+fi
+
 # --- malformed input must never block -----------------------------------
 check allow "empty stdin"                      ""
 check allow "not json"                         "wat"
