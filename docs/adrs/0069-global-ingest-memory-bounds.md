@@ -138,6 +138,8 @@ transport layer needs to, or should, outlive one request.
 
 ## Amendment (2026-09-07): the OTLP HTTP gzip inflate is charged pre-inflate
 
+<!-- amendment-applies: none -->
+
 This amendment appends to decision 1; it moves the charge point for one
 transient and, in doing so, redefines what the gauge measures. Everything
 else above stands unchanged.
@@ -248,6 +250,8 @@ Rust ingest path a byte is charged, not the durability or visibility state
 machine.
 
 ## Amendment (2026-09-10): the Remote Write snappy inflate is charged
+
+<!-- amendment-applies: none -->
 
 This amendment appends to decision 1 and extends the 2026-09-07 amendment to a
 second ingest path. Everything above stands unchanged.
@@ -372,6 +376,8 @@ Unaffected, for the reason the 2026-09-07 amendment gives: shedding happens
 strictly before `PinFlush` and the model has no admission action.
 
 ## Amendment (2026-09-12): OTLP gRPC is bounded and documented, not charged
+
+<!-- amendment-applies: none -->
 
 This amendment resolves the OTLP gRPC gzip inflate that the 2026-09-10
 amendment left as an open item ("Why OTLP gRPC was not fixed here"). It changes

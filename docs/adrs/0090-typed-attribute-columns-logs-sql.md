@@ -413,6 +413,8 @@ flowchart TD
   so it lands in a following wave, after both.
 
 ## Amendment: #302's shipped CLI syntax, and a narrow catalog-visibility
+
+<!-- amendment-applies: none -->
    exception for validation reuse
 
 Two divergences from this ADR's original text, found at #302's

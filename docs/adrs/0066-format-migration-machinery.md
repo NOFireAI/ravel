@@ -173,6 +173,8 @@ Deleting an offboarded tenant's data is selective deletion's (ADR-0064) mechanis
 
 ## Amendment: `family` is a lowercase string, not an enum
 
+<!-- amendment-applies: none -->
+
 The implementation shipped `FormatFloor.family` as `string family = 1` (lowercase format-family
 id: `"rseg"`, `"rlog"`, `"rspan"`, mirroring each format's trailer magic),
 not the `uint32 family` enum sketched in Decision 3. Reason: by the time it
@@ -186,6 +188,8 @@ non-empty and lowercase, fail-closed on either violation, so the field is not
 an unconstrained string in practice — see `ravel_catalog::provisioning::FloorDefect`.
 
 ## Amendment (R1, #1300): the CAS-mutable sys/* records version on every additive change
+
+<!-- amendment-applies: none -->
 
 Decision 4's Class C filed every sys/* object as "never rewritten, so
 additive-only evolution is safe without a `format_version` bump." That premise
@@ -317,6 +321,8 @@ bug.
 
 ## Amendment (R2, 2026-09-07, #1300): the writer flip, and floors on the last two gates
 
+<!-- amendment-applies: none -->
+
 **The writer flip.** From this change the three CAS-mutable records this crate
 owns are stamped version 2 by every writer that emits them:
 `ProvisioningRecord` (`validate_or_adopt`, `append_generation`,
@@ -386,6 +392,8 @@ byte-identity assertion after each refusal.
 
 ## Amendment (2026-09-08, #1301): the Context claim made true for all three commit-family records
 
+<!-- amendment-applies: none -->
+
 The Context above (under "What is already versioned, per format") stated that
 `CommitRecord`, `CompactionRecord`, and `RetentionTombstone` "each carry their
 own `format_version` (= 1) with a typed check". That was true only for
@@ -422,6 +430,8 @@ version 1).
 
 ## Amendment (2026-09-12): the Context's "does not exist today" primitive has since shipped
 
+<!-- amendment-applies: none -->
+
 Context (under "Prior format changes, in practice") says a page-grammar
 migration "needs a true decode-and-re-encode primitive that does not exist
 today." That was true when this ADR was written; supplying it is decision 5's
@@ -433,6 +443,8 @@ sentence is left as written, a record of the gap this ADR closes; this note
 points forward to where it closed.
 
 ## Amendment (2026-09-13, #530): retention ages out only what this build can read
+
+<!-- amendment-applies: none -->
 
 Decision 4, Class A, convergence force 1 reads: "Retention: old-version objects
 age out with their hour buckets at zero marginal cost." That is true of an

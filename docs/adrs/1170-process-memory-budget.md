@@ -608,6 +608,8 @@ current, and the amendment has since been corrected to match.
 
 ## Amendment 2026-09-07 (issue #1255): decisions 3 and 4 landed
 
+<!-- amendment-applies: none -->
+
 Decisions 3 and 4 landed in `ravel-server`. `resolve_performance_defaults`
 derives `memory_budget_bytes` from cgroup-capped effective memory minus
 `MEMORY_OVERHEAD_RESERVE_BYTES` (both in

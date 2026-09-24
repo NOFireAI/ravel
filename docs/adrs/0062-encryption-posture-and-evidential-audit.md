@@ -114,6 +114,8 @@ Gaps closed: per-tenant KMS by 1a-1e; coverage by 2a; lossiness by 2b; unbounded
 
 ## Amendment: correct section 2d's audit-prefix transcription
 
+<!-- amendment-applies: none -->
+
 ADR-0072 found that section 2d wrote the legal-hold shard's
 deny-delete prefix as `t/<hash>/u/0/**`. That form is wrong: the shard is
 not a bare path segment, it is a four-digit zero-padded segment nested
@@ -139,6 +141,8 @@ built by `ravel-commit`'s own constructors, so a future recurrence of this
 mismatch fails CI instead of shipping silently.
 
 ## Amendment: mid-stream audit-flush failure fails closed symmetrically
+
+<!-- amendment-applies: none -->
 
 Issue #55 found that the Flight SQL mid-stream audit-flush-failure path
 was the one holdout that did not fail closed. Section 2b makes a failed

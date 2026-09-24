@@ -160,6 +160,8 @@ through the existing accounting merge.
 
 ## Amendment
 
+<!-- amendment-applies: none -->
+
 The request budget from decision 3 is now also re-enforced on the
 cross-cluster/distributed coordinator path (ADR-0071), alongside the
 bytes-scanned budget that path already re-checked after folding

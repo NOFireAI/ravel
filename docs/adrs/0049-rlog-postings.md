@@ -199,6 +199,8 @@ from SQL, and it is named here rather than assumed.
 
 ## Amendment: postings index the merged attribute view
 
+<!-- amendment-applies: none -->
+
 Decision 7 said the SQL path extracts attribute equality and `IN`, and that
 this closes ADR-0033 gap 2 and makes `attrs['k'] = 'v'` prunable end to end.
 Two things were wrong with that, both found by building it.
@@ -294,6 +296,8 @@ records, and it still cannot recover a record the index never listed.
 
 ## Amendment 2026-08-20: precedence among a record's own duplicate occurrences
 
+<!-- amendment-applies: none -->
+
 The 2026-08-03 amendment said POSTINGS indexes "the union of a record's
 resource, scope, and own attributes, with its own winning on a key collision,
 which is exactly what `ravel_sql::rlog_attrs::merged_attrs` computes". That
@@ -382,6 +386,8 @@ order -- the term written is right, the column probed is wrong -- and is fixed
 here because it sits in the same prune path.
 
 ## Amendment 2026-09-06: the write-side function names in this ADR (#1135)
+
+<!-- amendment-applies: none -->
 
 The 2026-08-20 amendment named `writer.rs::indexed_term_columns` as the
 write side's cross-type winner computation, with `stat_winner_columns` as

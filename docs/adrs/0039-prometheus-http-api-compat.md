@@ -101,6 +101,8 @@ additive only, no existing route changed:
 
 ## Amendment (ADR-1103)
 
+<!-- amendment-applies: none -->
+
 ADR-1103 decision 4 supersedes decision 2's empty-`data` claim for exactly
 two reserved family names, `ravel_log_lines` and `ravel_log_bytes`:
 for a request whose tenant resolves and whose cache is attached, the

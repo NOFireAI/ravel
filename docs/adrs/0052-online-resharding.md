@@ -396,6 +396,8 @@ future, deliberate, compaction-shaped process.
 
 ## Amendment: bounded degraded-grace routing and clock-skew-covering read slack
 
+<!-- amendment-applies: none -->
+
 Two of section 3's assumptions turned out to be load-bearing in a way that turns ordinary operational conditions into an outage (the grace-window case) or a silent-invisibility correctness gap (the read-slack case). This amendment revises the normative posture accordingly. Both changes ship together and MUST NOT be reverted independently: the grace window's safety depends on the widened read slack.
 
 Bounded degraded-grace routing. Section 2's rule that a router whose cached provisioning view has aged past the refresh interval C MUST fail every flush closed is relaxed to a bounded grace window. A router that fails to re-read past C MAY continue routing on its last-known-good view while hour_of(now) < hour_of(refreshed_at) + min_lead_hours(C), where min_lead_hours(C) = ceil(C) + 1; beyond that horizon it MUST fail closed as before. This converts sustained store slowness from a total ingest outage into bounded degraded throughput while a provably-still-current shard_count is in effect, and emits the grace_extended_stale_flushes counter so operators observe degraded mode. It is safe because an activation the router has not yet seen has activation_hour >= hour_of(refreshed_at) + L >= the grace horizon under synced clocks, so grace never routes past an unseen generation change.
