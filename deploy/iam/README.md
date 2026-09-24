@@ -63,10 +63,11 @@ grants below are what remains deletable after that deny applies.
   `sys/qualify/*` only.
 - **Maintain** (`maintain.json`): `MaintainDelete` grants delete on
   `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/u/*/0001/*`,
-  `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*`, and
-  `quarantine/t/*/*/l0/*`. These are the objects the compaction, supersession,
-  retention, erasure-request, unreferenced-catalog, and quarantine-reaper
-  sweeps physically remove.
+  `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*`,
+  `sys/maintain/workers/*`, and `quarantine/t/*/*/l0/*`. These are the objects
+  the compaction, supersession, retention, erasure-request,
+  unreferenced-catalog, dead-worker, and quarantine-reaper sweeps physically
+  remove.
   The catalog half of that list also needs reads, which are easy to miss
   because two of the three fail silently rather than refusing the pass:
   `MaintainRead` carries `t/*/catalog/*/HEAD` (the sweep resolves what is
@@ -261,3 +262,81 @@ Two known gaps are recorded here and are NOT closed by the grants above.
   than in this template, but this template's write grant is what lets the
   write happen on a shipped deployment, so it is recorded here. Tracked in
   issue #1979.
+
+### Worker heartbeats: the four grants the maintain fleet needs
+
+ADR-0065 decision 1 has every maintain process stamp a heartbeat at
+`sys/maintain/workers/<process_id>` and derive unit ownership by rendezvous
+over the set of keys that are still live. A process that stops heartbeating
+must have its key removed, or the set never shrinks.
+
+The lifecycle is `crates/ravel-fleet/src/worker_set.rs`, driven once per
+maintain tick from `services/ravel-server/src/maintain.rs`. All four axes are
+exercised, and a runbook is not involved: every one of these is a call in the
+serving path.
+
+| Call | Axis | Grant |
+|---|---|---|
+| `write_heartbeat` `store.put(&heartbeat_key(&process_id), ..)` (worker_set.rs:358) | `s3:PutObject` | `MaintainWrite` `sys/maintain/*` (already present) |
+| `live_set_read` `list_all(store, WORKERS_PREFIX)` (worker_set.rs:403) | `s3:ListBucket` with `prefix=sys/maintain/workers/` | `MaintainList` `s3:prefix` `sys/maintain/workers/*` (already present) |
+| `live_set_read` `store.get(&meta.key, GetRange::Full)` on each in-window sibling (worker_set.rs:424) | `s3:GetObject` | `MaintainRead` `sys/maintain/*` (already present) |
+| `reap_keys` `store.delete(key)` past the reap horizon (worker_set.rs:463, from maintain.rs:1111) | `s3:DeleteObject` | `MaintainDelete` `sys/maintain/workers/*` |
+
+Only the delete was missing, and it was missing completely: `MaintainDelete`
+named no `sys/` resource at all. IAM is default-deny, so this was not a
+narrowing, it was a refusal of every reap the maintain fleet has ever
+attempted.
+
+The cost is not the failed delete. Dead heartbeat keys are never removed, so
+the prefix `live_set_read` LISTs once per tick grows with every maintain
+process that has ever run against the bucket, and the per-tick LIST cost grows
+with it. That is the same unbounded-LIST cost issue #1679 removed for
+admission snapshots, and #1679's fix assumed this delete succeeded.
+
+The delete pattern is deliberately narrower than the `sys/maintain/*` the read
+and write axes use. The memo snapshots (`sys/maintain/memo/`) and the ADR-1029
+compaction claims (`sys/maintain/claims/compaction/`) share that prefix, the
+reaper is the only deleter under it, and neither of those is the reaper's to
+remove. ADR-1029 is explicit that an unconditional delete of a claim is the
+one write that would break its advisory guarantee.
+
+`maintain_template_covers_every_worker_heartbeat_call` in
+`crates/ravel-commit/tests/iam_templates.rs` asserts each of the four rows
+above against the shipped template, with the witness key built by
+`heartbeat_key` itself rather than written out, so a change to the key shape
+moves the test with the code. It also asserts the tightness premise (no
+pattern reaching a heartbeat reaches anything outside `sys/maintain/`) and
+that neither gateway nor query reaches one on any axis; admin is excluded on
+purpose, since its blanket `sys/*` read and list are the operator role's
+deliberate posture over the whole control plane.
+
+An operator who applied a copy of `maintain.json` older than this grant must
+re-apply it. Until they do, the reap stays refused: every dead worker's
+heartbeat key remains in the bucket, the per-tick `ListBucket` over
+`sys/maintain/workers/` keeps growing, and nothing else in a running system
+reports it, because `reap_keys` treats a failed delete as a key to retry next
+tick rather than as an error to surface. Re-applying drains the accumulated
+keys over subsequent ticks rather than at once. Nothing else in the maintain
+role stops working in the meantime: the other three axes were always granted,
+so heartbeating and live-set reads continue, and ownership stays correct. What
+degrades is cost, monotonically.
+
+### The mechanical check
+
+`scripts/guards/check-iam-keyspace-axes.sh` is the cargo-free guard that makes
+this defect class fail without anyone remembering to write a reachability test
+for a particular prefix. It discovers every control-plane key space the code
+names (`sys/`, `quarantine/`, `admission/` roots, from `const NAME: &str` and
+`format!` literals), requires each to carry a manifest entry declaring its
+owner roles and, per axis, either a call site or a reason it is unused, and
+then checks each used axis against that owner's template. It runs in
+`scripts/gates.sh` and CI's `doc-scripts` job.
+
+It catches "this axis is granted nowhere under this key space", which is the
+shape all six instances of the class had. It does NOT catch "granted, but too
+narrowly", and it does not reach tenant-rooted (`t/...`) key spaces at all:
+those are composed by the constructors in `crates/ravel-commit/src/keys.rs`
+through `format!("{prefix}{...}")` chains whose components are const
+interpolations and match-arm literals, and deriving a glob from them soundly
+needs constant folding rather than a text scan. The per-lifecycle reachability
+tests remain the precise check, and the tables above remain the record.

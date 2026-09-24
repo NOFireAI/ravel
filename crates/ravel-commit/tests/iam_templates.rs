@@ -226,7 +226,10 @@ const WITNESS_PROCESS_ID: u128 = 7;
 /// taking it as a dev-dependency here is acyclic and costs nothing at runtime.
 fn fleet_witness_keys() -> Vec<String> {
     let process_id = Uuid::from_u128(WITNESS_PROCESS_ID);
-    vec![heartbeat_key(&process_id), query_worker_key(&process_id.to_string())]
+    vec![
+        heartbeat_key(&process_id),
+        query_worker_key(&process_id.to_string()),
+    ]
 }
 
 /// One literal key per TENANT-ROUTED keyspace the templates name that
