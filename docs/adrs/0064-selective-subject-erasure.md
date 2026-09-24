@@ -599,7 +599,9 @@ Stated explicitly, per ADR-0055's own consequence:
   Maintain: completion records are permanent erasure evidence, and they
   can be permanent precisely because they carry no subject identifier.
 - **Erasure never touches ADR-0055's deny-delete prefixes.** `sys/*`,
-  `prov`, `catalog/*`, and `u/**` hold no subject attribute values
+  `prov`, `catalog/*` (narrowed to `catalog/*/HEAD` by ADR-0055's 2026-09-23
+  amendment, which is what lets an unreferenced `.cstat` holding an erased
+  value be deleted at all), and `u/**` hold no subject attribute values
   (Context; §7 requirement), so the WORM boundary and subject erasure are
   disjoint by construction — except the audit keyspace, which ADR-0062
   fixes (Consequences).
