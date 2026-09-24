@@ -67,7 +67,9 @@ chunk*), and the column chunks of one row group follow each other in
 `column_id` order. A block is no longer a contiguous byte range; it is a
 logical unit that exists in SKIP_IDX (level 0, unchanged: min/max ts,
 min/max stream_ref, `record_count`, per-column stats), in BLOOM (per
-block, unchanged), and in POSTINGS (block lists, unchanged).
+block, unchanged), and in POSTINGS (block lists, unchanged). Level 0's
+`block_offset`/`block_len` are retained but stop being exact here: the
+2026-08-26 amendment below states what they describe under version 4.
 
 Consequences for the reader:
 - A projection of `k` columns over a row group is `k` contiguous ranges
@@ -120,7 +122,10 @@ PAGE_DIR (uncompressed form):
 ```
 
 Page offsets are derived: a chunk's pages are contiguous from `offset` in
-listed order. The block header goes away in the new layout: its fields all
+listed order. The `page_count` annotation above holds only for a fully
+present column; the 2026-08-26 amendment below gives the bound the decoder
+actually enforces, and names the order the retained block crc folds pages
+in. The block header goes away in the new layout: its fields all
 live here now, and a page that a query does not want is never read, so
 nothing is lost by not having them inline.
 
@@ -198,7 +203,8 @@ selection too.
 
 `plan_segment` (#691, #693) needs only survivor counts, and under this ADR
 no plan ever touches a page. What it reads is scope-specific, and the
-as-built section below is normative: the predicate-free branch reads the
+as-built half of the 2026-08-26 amendment below is normative: it settles
+five points left open here. The predicate-free branch reads the
 footer alone, and the skip-decidable branch reads footer, SKIP_IDX and
 FIELD_DIR, bringing PAGE_DIR alongside for the scan phase.
 
@@ -296,7 +302,7 @@ read 2 columns of 32 blocks:            read 2 columns of 32 blocks:
 
 ## Amendment (2026-08-26, as implemented)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="1. A row group is a run of consecutive blocks whose pages are stored column-major|2. A PAGE_DIR section, with per-page checksums|5. The fetcher reads column chunks; the plan phase reads PAGE_DIR, not pages" pointer="2026-08-26 amendment" -->
 
 The writer, PAGE_DIR codec, and dual reader landed as decisions 1-4 describe.
 Four points the decision text under-specified were resolved during
