@@ -305,15 +305,19 @@ impl Clock for TestClock {
 /// Issue #1728: `ravel_store_reachable` alone reads healthy forever once
 /// nothing updates it, because it (like `ravel_store_probe_failures_total`)
 /// is written only while the probe task is alive. This is the exact
-/// false-healthy state a dead probe task produces, and the one signal that
-/// exposes it: `ravel_store_probe_last_run_timestamp_seconds` going stale
-/// while `store_reachable()` still answers `true`.
+/// false-healthy state a dead probe task produces: `/readyz` keeps answering
+/// 200 because `Readiness::is_ready` ANDs `store_reachable()`, not the
+/// liveness gauge's age, so the gauge going stale is the only externally
+/// visible sign that the probe task is gone.
 #[tokio::test]
 async fn store_probe_last_run_gauge_goes_stale_while_readyz_stays_green() {
     let _guard = PROBE_TEST_LOCK.lock().await;
 
     let (toggle, fail_gets) = ToggleFailStore::new();
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(toggle);
+    let running = start_server(store.clone()).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
     let mut hysteresis = ProbeHysteresis::new();
     let clock = TestClock::at(1_700_000_000_000_000_000);
 
@@ -326,11 +330,16 @@ async fn store_probe_last_run_gauge_goes_stale_while_readyz_stays_green() {
         "gauge must equal the injected clock's exact value after one cycle"
     );
     assert!(store_probe::store_reachable(), "starts reachable");
+    assert_eq!(
+        status(&client, &base, "/readyz").await,
+        200,
+        "readyz must be 200 once the store is reachable"
+    );
 
     // Advance the clock with NO new cycle driven. This is the exact
-    // false-healthy state: store_reachable() still says true, but the
-    // liveness gauge is now stale, which is what a dead probe task looks like
-    // from outside.
+    // false-healthy state: store_reachable() still says true, /readyz still
+    // answers 200, but the liveness gauge is now stale, which is what a dead
+    // probe task looks like from outside.
     clock.advance(Duration::from_secs(600));
     assert_eq!(
         store_probe::probe_last_run_unix_ns(),
@@ -341,6 +350,13 @@ async fn store_probe_last_run_gauge_goes_stale_while_readyz_stays_green() {
         store_probe::store_reachable(),
         "store_reachable() must still read true here: that is the false-healthy \
          state readable only through the liveness gauge's age, not its value"
+    );
+    assert_eq!(
+        status(&client, &base, "/readyz").await,
+        200,
+        "readyz must still answer 200 here: is_ready() ANDs store_reachable(), not \
+         the gauge's age, so a dead probe task (frozen reachable=true) leaves \
+         /readyz falsely green while the liveness gauge goes stale (issue #1728)"
     );
 
     // A FAILING cycle still advances the gauge (WRONG-1 sets it only on the
@@ -358,11 +374,19 @@ async fn store_probe_last_run_gauge_goes_stale_while_readyz_stays_green() {
         clock.now_ns(),
         "a failing cycle must still advance the liveness gauge to the clock's current value"
     );
+    assert_eq!(
+        status(&client, &base, "/readyz").await,
+        503,
+        "readyz must flip to 503 once store_reachable() flips, unlike the frozen \
+         false-healthy window above"
+    );
 
     // Recover, and reset the global for any later test in this process.
     fail_gets.store(false, Ordering::SeqCst);
     store_probe::run_probe_cycle(store.as_ref(), &mut hysteresis, &clock).await;
     assert!(store_probe::store_reachable(), "a single success recovers");
+
+    running.shutdown().await.expect("graceful shutdown");
 }
 
 /// Issue #1728: `store_probe::spawn` stamps the liveness gauge before the
