@@ -530,6 +530,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The shipped Maintain IAM template now grants the permissions the orphan
+  quarantine needs** (issue #1957). ADR-0058 decision 6 has the orphan sweep
+  copy an orphaned L0 object to a top-level `quarantine/` key space, delete the
+  original, and physically remove the copy once the quarantine horizon elapses,
+  but `deploy/iam/maintain.json` named no resource and no `s3:prefix` under
+  `quarantine/` at all. IAM is default-deny, so on a deployment running the
+  shipped template the quarantine was refused at its first `PutObject`: the
+  sweep could not quarantine a single orphan, and because the original is
+  deleted only after the copy succeeds, nothing was lost but nothing was
+  reclaimed either, and the reaper that drains the quarantine had no keys to
+  find and no authority to list for them. The grant set is derived from every
+  call site that touches the prefix rather than from one function:
+  `MaintainWrite` reaches `quarantine/t/*/*/l0/*` for the copy
+  `quarantine_object` PUTs, `MaintainList` admits the `s3:prefix`
+  `quarantine/t/*/*/l0/*` that `sweep_quarantine` LISTs, and `MaintainDelete`
+  reaches `quarantine/t/*/*/l0/*` for the reaper's physical delete. The GET of
+  the original and the delete of the original are the same live L0 key the
+  existing `t/*/*/l0/*` read and delete grants already cover, so neither needs a
+  new pattern, and nothing reads a quarantined object back, so no `GetObject`
+  is granted under `quarantine/`. No new pattern reaches a key outside
+  `quarantine/`, and no other role's template reaches one at all. An operator
+  who already applied an earlier copy of `maintain.json` must re-apply it; the
+  fix is in the template, not in any running binary, so upgrading Ravel alone
+  changes nothing. Re-applying lets the sweep quarantine orphans again, and the
+  copies it writes become deletable once each one's `quarantine_horizon_ns`
+  (7 days by default) elapses, not at once.
 - **The shipped IAM templates now grant every permission the selective-erasure
   lifecycle needs** (issue #1849). ADR-0064 section 6 gives Maintain read on
   `del/**` and delete on `del/*.dreq`, but `deploy/iam/maintain.json` named no

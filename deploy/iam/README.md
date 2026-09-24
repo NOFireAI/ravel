@@ -63,9 +63,10 @@ grants below are what remains deletable after that deny applies.
   `sys/qualify/*` only.
 - **Maintain** (`maintain.json`): `MaintainDelete` grants delete on
   `t/*/*/l0/*`, `t/*/*/c/*`, `t/*/*/l1/*`, `t/*/*/idem/*`, `t/*/u/*/0001/*`,
-  `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, and `t/*/catalog/*/idx/*`.
-  These are the objects the compaction, supersession, retention,
-  erasure-request, and unreferenced-catalog sweeps physically remove.
+  `t/*/*/del/*.dreq`, `t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*`, and
+  `quarantine/t/*/*/l0/*`. These are the objects the compaction, supersession,
+  retention, erasure-request, unreferenced-catalog, and quarantine-reaper
+  sweeps physically remove.
   The catalog half of that list also needs reads, which are easy to miss
   because two of the three fail silently rather than refusing the pass:
   `MaintainRead` carries `t/*/catalog/*/HEAD` (the sweep resolves what is
@@ -152,3 +153,72 @@ tracked separately and is not created by this change.
   `t/<tenant_hash>/<signal>/del/` per resolve to attach pending predicates
   (`crates/ravel-commit/src/keys.rs`, `del_prefix`). ADR-0064's same bullet
   gives Query that read.
+
+### Quarantined orphans: the three grants the quarantine lifecycle needs
+
+ADR-0058 decision 6 has the orphan sweep quarantine an orphaned L0 data object
+instead of deleting it: copy first, delete the original second, and physically
+remove the copy only after a second horizon (`quarantine_horizon_ns`, 7 days by
+default) has elapsed. The copy lives in a TOP-LEVEL `quarantine/` key space,
+not under `t/`, so none of the tenant-scoped patterns above reaches it.
+
+Both halves run under the Maintain role, in
+`crates/ravel-maintain/src/sweep.rs`: `sweep_orphans` phase (d) makes the copy
+through `quarantine_object`, and `sweep_quarantine` is the reaper. The
+lifecycle makes five object-store calls, and the set below is derived from all
+five rather than from the reaper alone; two of them land on the live key and so
+need no new pattern.
+
+| Call | S3 operation | Grant |
+|---|---|---|
+| `quarantine_object` `store.get(src, GetRange::Full)` on the live orphan | `s3:GetObject` | `MaintainRead` `t/*/*/l0/*` (already present) |
+| `quarantine_object` `store.put(dest, ...)` on `quarantine_key(original, ns)` | `s3:PutObject` | `MaintainWrite` `quarantine/t/*/*/l0/*` |
+| `sweep_orphans` `store.delete(&meta.key)` on the live orphan, after the copy | `s3:DeleteObject` | `MaintainDelete` `t/*/*/l0/*` (already present) |
+| `sweep_quarantine` `list_all(store, &quarantine_l0_data_prefix(...))` | `s3:ListBucket` with `prefix=quarantine/t/<tenant_hash>/<signal>/l0/<shard>/` | `MaintainList` `s3:prefix` `quarantine/t/*/*/l0/*` |
+| `sweep_quarantine` `store.delete(&meta.key)` on the quarantined copy | `s3:DeleteObject` | `MaintainDelete` `quarantine/t/*/*/l0/*` |
+
+No role is granted `s3:GetObject` under `quarantine/`, because nothing reads a
+quarantined object back: no restore path exists anywhere in the tree. The
+reaper decides from the key alone (`parse_quarantine_timestamp` and
+`original_key_from_quarantine` both parse the key, and the hold check reads the
+lease, not the object), so a read grant would be authority with no call site.
+If a restore is ever added it belongs in `admin.json`, alongside the other
+operator-driven recovery paths.
+
+IAM is default-deny, so no grant here is useful on its own. Without the write
+the copy is refused and the sweep quarantines nothing, which is where a
+template predating this change stops; the original is deleted only after the
+copy succeeds, so nothing is lost, but nothing is reclaimed either. Without the
+list the reaper is refused at its first `ListBucket` and never sees a copy,
+which makes the delete unreachable. Without the delete the reaper lists copies
+it can never remove, and the quarantine grows for the life of the deployment.
+
+`maintain_template_covers_every_quarantine_call` in
+`crates/ravel-commit/tests/iam_templates.rs` asserts all five rows against the
+whole policy (Allow minus Deny), with witness keys built from the same key
+constructors the calls use rather than from hand-written strings. It also pins
+the top-level premise (no pattern outside `quarantine/` reaches a quarantined
+copy, and no other role's template reaches one at all) and the tightness of the
+three new patterns.
+`every_role_grants_exactly_the_expected_pattern_set` pins every pattern string
+by exact equality.
+
+An operator who applied a copy of `maintain.json` older than these grants must
+re-apply it. Re-applying lets the orphan sweep quarantine again; each copy it
+writes becomes reapable once that copy's own `quarantine_horizon_ns` elapses,
+so the quarantine drains over subsequent passes rather than at once. A partial
+re-apply clears nothing: a copy carrying the delete but not the list is refused
+at the `ListBucket`, and one carrying list and delete but not the write never
+gets an orphan into the quarantine to begin with.
+
+One known gap is recorded here and is NOT closed by the grants above.
+
+- The new delete pattern `quarantine/t/*/*/l0/*` also reaches the quarantined
+  copy of a legal-hold audit object (`quarantine/t/<hash>/u/l0/0000/...`), which
+  `DenyDeleteProtected`'s `t/*/u/*/0000/*` does not cover, since the quarantine
+  key is not under `t/`. Nothing reaches that state today: the legal-hold audit
+  shard is never swept for orphans, so no copy of one is ever written, and the
+  reaper independently refuses a held key by resolving
+  `original_key_from_quarantine` and checking the lease. The protection is in
+  code rather than in the deny, which is a weaker posture than the live keyspace
+  has.
