@@ -428,6 +428,12 @@ impl SqlError {
             // A tenant-hash mismatch would otherwise embed both hashes and
             // an object key in its `Display`; corrupt HEAD/part errors embed
             // a key and the decode failure. Neither reaches the client.
+            // A store read that failed (issue #1976: most often AccessDenied
+            // on a missing read grant) is not corruption; it redacts to the
+            // same transient message a segment store fault does.
+            SqlError::ColumnStats(LoadColumnStatsError::Store { .. }) => {
+                MSG_UNAVAILABLE.to_string()
+            }
             SqlError::ColumnStats(_) => MSG_CORRUPT.to_string(),
             SqlError::Fetch(fetch) => match fetch {
                 FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
@@ -555,6 +561,20 @@ mod tests {
             !message.contains(RAW_STORE_TEXT),
             "leaked raw store text: {message}"
         );
+    }
+
+    /// Issue #1976: a column-stats store fault must not tell the client the
+    /// stored data failed integrity validation.
+    #[test]
+    fn column_stats_store_fault_redacts_to_unavailable_not_corrupt() {
+        let err = SqlError::ColumnStats(LoadColumnStatsError::Store {
+            key: LEAKY_KEY.to_string(),
+            source: StoreError::AccessDenied(RAW_STORE_TEXT.to_string()),
+        });
+        let message = err.client_message();
+        assert_eq!(message, MSG_UNAVAILABLE);
+        assert_redacted(&message);
+        assert_eq!(err.class(), ErrorClass::Unavailable);
     }
 
     #[test]
