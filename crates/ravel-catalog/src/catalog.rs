@@ -486,9 +486,20 @@ pub struct Catalog {
     /// a liveness signal a bounded false positive is the safe side; an
     /// unbounded false negative is not.
     fold_last_success_unix_ns: [AtomicI64; SIGNAL_SLOTS],
-    /// Bounds the object-store requests one resolve keeps in flight. Ephemeral, process-local, correctness-free: it changes only
-    /// how many round trips overlap, never which segments a resolve returns.
+    /// Bounds the object-store requests this catalog keeps in flight across
+    /// every tenant, shard and hour at once, sized from
+    /// `CatalogConfig::resolve_get_concurrency` (ADR-1733 decision 1).
+    /// Ephemeral, process-local, correctness-free: it changes only how many
+    /// round trips overlap, never which segments a resolve returns.
     request_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds what one key prefix (a request's parent path) keeps in flight,
+    /// sized from
+    /// `CatalogConfig::resolve_prefix_concurrency` (ADR-1733 decision 1). A
+    /// prefix's semaphore is created on the first request that needs it and
+    /// removed once no request holds or waits on it, so this holds one entry
+    /// per prefix in flight rather than one per prefix the bucket has ever
+    /// had.
+    prefix_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Whether resolve validates the configured `shard_count` against each
     /// (tenant, signal)'s durable provisioning record (ADR-0050 section 5). Off for the many in-crate and `ravel-query`/`ravel-sql` callers
     /// that build a `Catalog` directly; the server turns it on
@@ -583,11 +594,86 @@ impl crate::provisioning::AccountedRecordGet for GuardedRecordGet<'_> {
     }
 }
 
+/// The permits one resolve-path request holds while it is issued: its key
+/// prefix's, when it has one, and the catalog's ceiling (ADR-1733
+/// decision 1). Both are released when this is dropped.
+///
+/// Both permit fields are `Option` so that the guard can be built before
+/// either is awaited. That is what makes the acquisition cancellation-safe:
+/// a future dropped while it waits still owns the guard, so the idle-prefix
+/// cleanup below runs.
+struct RequestPermits<'a> {
+    catalog: &'a Catalog,
+    /// The prefix this request is bounded by, and that prefix's semaphore.
+    /// `None` for a request whose key sits under no prefix at all.
+    prefix: Option<(String, Arc<tokio::sync::Semaphore>)>,
+    prefix_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _ceiling_permit: Option<tokio::sync::SemaphorePermit<'a>>,
+}
+
+impl Drop for RequestPermits<'_> {
+    fn drop(&mut self) {
+        // Release this request's prefix permit before counting references,
+        // since the permit holds a reference of its own.
+        drop(self.prefix_permit.take());
+        let Some((prefix, semaphore)) = self.prefix.take() else {
+            return;
+        };
+        let mut live = self.catalog.prefix_semaphores.lock();
+        // This guard's own reference is dropped HERE, under the map lock, and
+        // the count is read afterwards. Dropping it after the lock is released
+        // instead would let two guards on one prefix each see the other's
+        // reference still alive, each decline to remove, and leave the entry
+        // resident with nothing that would ever remove it. Under the lock the
+        // two drops are serialized, so the later one always reads a count that
+        // the earlier one has already left, and the last guard out removes the
+        // entry. Every other reference a request holds (the owned prefix
+        // permit, or the future still waiting for one) is gone before its
+        // guard's, so a count of one really is the map's alone.
+        let is_ours = live
+            .get(&prefix)
+            .is_some_and(|mapped| Arc::ptr_eq(mapped, &semaphore));
+        drop(semaphore);
+        // One reference left (the map's) means no other request holds or waits
+        // on this prefix, so the semaphore has nothing left to bound. A request
+        // that is about to wait on this prefix cannot be missed here: it takes
+        // its own reference in `Catalog::prefix_semaphore` under this same
+        // lock, and holds it in its own guard from before it starts waiting
+        // until after it is done.
+        if is_ours
+            && live
+                .get(&prefix)
+                .is_some_and(|mapped| Arc::strong_count(mapped) == 1)
+        {
+            live.remove(&prefix);
+        }
+    }
+}
+
+/// The key prefix the per-prefix bound keys `key` by: everything up to and
+/// including its last separator, or `None` for a key that has none.
+///
+/// This is the prefix S3's per-prefix request guidance is stated against, for
+/// every kind of request the resolve path issues rather than for commit
+/// records alone. A commit record's parent path is exactly its shard-hour
+/// commit prefix `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/`
+/// (`ravel_commit::keys` spells the key as that prefix plus one segment), so
+/// commit records keep the keying ADR-1733 decision 1 names. A snapshot's
+/// parts all share `t/<tenant_hash>/catalog/<signal>/snap/` and its postings
+/// and column stats share `.../idx/`, and those fan-outs run at the ceiling's
+/// width, so without this they were the one place where raising the ceiling
+/// did add depth on a single prefix. A LIST prefix already ends at a
+/// separator and so is keyed by itself.
+fn request_key_prefix(key: &str) -> Option<&str> {
+    key.rfind('/').map(|last| &key[..=last])
+}
+
 impl Catalog {
     /// Errors if `config.shard_count == 0` (a resolvable catalog needs at
-    /// least one shard), `config.resolve_get_concurrency == 0` (a
-    /// zero-permit semaphore would deadlock every resolve, never silently
-    /// clamped to 1), or `config.resolve_get_concurrency >
+    /// least one shard), `config.resolve_get_concurrency == 0` or
+    /// `config.resolve_prefix_concurrency == 0` (a zero-permit semaphore
+    /// would deadlock every resolve, never silently clamped to 1), or
+    /// `config.resolve_get_concurrency >
     /// crate::config::MAX_RESOLVE_GET_CONCURRENCY` (past that ceiling,
     /// `tokio::sync::Semaphore::new` panics instead of failing typed --
     /// see that constant's doc comment for the basis).
@@ -606,6 +692,11 @@ impl Catalog {
         if config.resolve_get_concurrency > crate::config::MAX_RESOLVE_GET_CONCURRENCY {
             return Err(CatalogError::InvalidConfig(
                 "resolve_get_concurrency exceeds MAX_RESOLVE_GET_CONCURRENCY",
+            ));
+        }
+        if config.resolve_prefix_concurrency == 0 {
+            return Err(CatalogError::InvalidConfig(
+                "resolve_prefix_concurrency must be > 0",
             ));
         }
         // `byte_cache_max_bytes == 0` is the disabled sentinel:
@@ -644,6 +735,7 @@ impl Catalog {
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.resolve_get_concurrency,
             )),
+            prefix_semaphores: Mutex::new(HashMap::new()),
             enforce_provisioning: false,
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
@@ -815,11 +907,98 @@ impl Catalog {
         }
     }
 
-    /// One store GET bounded by the resolve-wide in-flight semaphore. The permit is released the moment the GET resolves and is
-    /// never held across another guarded request, so a resolve fanning out
-    /// many records cannot wait on permits it already holds.
+    /// Number of key prefixes that currently have a semaphore.
     ///
-    /// The sole funnel for every GET a query issues (ADR-0044 decision 2): `accounting` is credited one [`AccountedOp::Get`] request
+    /// Zero once every resolve has finished: a prefix's semaphore is created
+    /// on demand and removed when the prefix goes idle (ADR-1733 decision 1),
+    /// so this counts prefixes in flight, not prefixes the bucket holds.
+    #[cfg(test)]
+    pub(crate) fn prefix_semaphores_live(&self) -> usize {
+        self.prefix_semaphores.lock().len()
+    }
+
+    /// How many requests currently hold or wait on `prefix`'s permit, or
+    /// `None` when that prefix has no semaphore.
+    ///
+    /// A request that is neither entering nor leaving holds exactly two
+    /// references to its prefix's semaphore: its [`RequestPermits`] guard's,
+    /// and the one carried by either its owned permit or the `acquire_owned`
+    /// future still waiting for it. Beside the map's own reference that makes
+    /// the strong count `1 + 2n`, which is how a test tells "one holder and
+    /// one waiter" from "one holder" without reaching into the store.
+    #[cfg(test)]
+    pub(crate) fn prefix_requests_in_flight(&self, prefix: &str) -> Option<usize> {
+        self.prefix_semaphores
+            .lock()
+            .get(prefix)
+            .map(|semaphore| (Arc::strong_count(semaphore) - 1) / 2)
+    }
+
+    /// This prefix's semaphore, created at
+    /// `CatalogConfig::resolve_prefix_concurrency` permits if it has none.
+    ///
+    /// The map's own reference and each guard's are made here, under the map
+    /// lock. A request makes one further clone outside it, in
+    /// [`Catalog::acquire_request_permits`], from its guard's reference and
+    /// for the permit or the wait; that clone is always released before the
+    /// guard it was made from. That is what lets [`RequestPermits::drop`],
+    /// which releases the guard's reference under this same lock, read the
+    /// strong count as "is anyone else holding or waiting on this prefix".
+    fn prefix_semaphore(&self, prefix: &str) -> Arc<tokio::sync::Semaphore> {
+        let mut live = self.prefix_semaphores.lock();
+        if let Some(existing) = live.get(prefix) {
+            return Arc::clone(existing);
+        }
+        let created = Arc::new(tokio::sync::Semaphore::new(
+            self.config.resolve_prefix_concurrency,
+        ));
+        live.insert(prefix.to_string(), Arc::clone(&created));
+        created
+    }
+
+    /// Take the permits a resolve-path request holds while it is issued
+    /// (ADR-1733 decision 1): its own key prefix's, and this catalog's
+    /// ceiling, which every request takes.
+    ///
+    /// The prefix permit is taken first on purpose. A request that took the
+    /// ceiling permit first and then waited on a hot prefix would hold a
+    /// permit no other prefix can use, which is the starvation across
+    /// prefixes the two limits exist to remove.
+    async fn acquire_request_permits(&self, key: &str) -> Result<RequestPermits<'_>, StoreError> {
+        let closed = || StoreError::Transient("catalog request semaphore closed".to_string());
+        // The guard owns the map entry's reference from here on, before either
+        // await, so a future cancelled while it waits for a permit still runs
+        // the idle-prefix cleanup in `RequestPermits::drop`.
+        let mut permits = RequestPermits {
+            catalog: self,
+            prefix: request_key_prefix(key)
+                .map(|prefix| (prefix.to_string(), self.prefix_semaphore(prefix))),
+            prefix_permit: None,
+            _ceiling_permit: None,
+        };
+        // The clone this await owns lives in an inner scope, so a cancellation
+        // here drops it before the guard and leaves the guard's own reference
+        // the only one besides the map's.
+        if let Some(semaphore) = permits.prefix.as_ref().map(|(_, s)| Arc::clone(s)) {
+            permits.prefix_permit = Some(semaphore.acquire_owned().await.map_err(|_| closed())?);
+        }
+        permits._ceiling_permit = Some(
+            self.request_semaphore
+                .acquire()
+                .await
+                .map_err(|_| closed())?,
+        );
+        Ok(permits)
+    }
+
+    /// One store GET bounded by both resolve limits: its own key prefix's
+    /// in-flight bound and this catalog's process-wide ceiling (ADR-1733
+    /// decision 1). Both permits are released the moment the GET resolves and
+    /// neither is ever held across another guarded request, so a resolve
+    /// fanning out many records cannot wait on permits it already holds.
+    ///
+    /// The sole funnel for every GET a query issues (ADR-0044 decision 2):
+    /// `accounting` is credited one [`AccountedOp::Get`] request
     /// unconditionally, and its bytes only on success (`got.data.len()`,
     /// mirroring `InstrumentedStore`'s convention that a failed GET moves no
     /// bytes). Call sites never account for themselves.
@@ -829,10 +1008,7 @@ impl Catalog {
         range: GetRange,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, StoreError> {
-        let _permit =
-            self.request_semaphore.acquire().await.map_err(|_| {
-                StoreError::Transient("catalog request semaphore closed".to_string())
-            })?;
+        let _permits = self.acquire_request_permits(key).await?;
         let result = self.store.get(key, range).await;
         accounting.record_s3_request(AccountedOp::Get);
         if let Ok(got) = &result {
@@ -975,9 +1151,7 @@ impl Catalog {
             None,
             MAX_LIST_PAGES,
             |_start_after, page_token| async move {
-                let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                    StoreError::Transient("catalog request semaphore closed".to_string())
-                })?;
+                let _permits = self.acquire_request_permits(prefix).await?;
                 let page = self.store.list(prefix, page_token).await;
                 accounting.record_s3_request(AccountedOp::List);
                 Ok(page?)
@@ -2420,9 +2594,7 @@ impl Catalog {
                                 limit: cap,
                             });
                         }
-                        let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                            StoreError::Transient("catalog request semaphore closed".to_string())
-                        })?;
+                        let _permits = self.acquire_request_permits(prefix_ref).await?;
                         let page = self
                             .store
                             .list_after(prefix_ref, start_after.as_deref(), page_token)
@@ -2638,9 +2810,7 @@ impl Catalog {
             Some(&start_after),
             MAX_LIST_PAGES,
             |start_after: Option<String>, page_token| async move {
-                let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                    StoreError::Transient("catalog request semaphore closed".to_string())
-                })?;
+                let _permits = self.acquire_request_permits(prefix_ref).await?;
                 let page = self
                     .store
                     .list_after(prefix_ref, start_after.as_deref(), page_token)
@@ -3054,9 +3224,7 @@ impl Catalog {
                                 limit: cap,
                             });
                         }
-                        let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                            StoreError::Transient("catalog request semaphore closed".to_string())
-                        })?;
+                        let _permits = self.acquire_request_permits(prefix_ref).await?;
                         let page = self
                             .store
                             .list_after(prefix_ref, start_after.as_deref(), page_token)
@@ -5612,8 +5780,8 @@ mod tests {
     /// raw `validate_or_adopt(self.store.as_ref(), .., CheckOnly)` call (and
     /// `read_scan_generations` to `read_generations_from_store`). The held
     /// provisioning GET then holds no resolve permit, so `available_permits()`
-    /// stays at `DEFAULT_RESOLVE_GET_CONCURRENCY` and the
-    /// `== DEFAULT_RESOLVE_GET_CONCURRENCY - 1` assertion fails.
+    /// stays at `DEFAULT_RESOLVE_PREFIX_CONCURRENCY` (the default ceiling)
+    /// and the `== DEFAULT_RESOLVE_PREFIX_CONCURRENCY - 1` assertion fails.
     #[tokio::test]
     async fn provisioning_read_holds_a_resolve_semaphore_permit() {
         let mem = MemoryStore::new();
@@ -5640,7 +5808,7 @@ mod tests {
 
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY,
+            crate::config::DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
             "no permit is held before the resolve starts"
         );
 
@@ -5661,7 +5829,7 @@ mod tests {
         );
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY - 1,
+            crate::config::DEFAULT_RESOLVE_PREFIX_CONCURRENCY - 1,
             "the held provisioning GET holds a resolve semaphore permit: it routed through \
              guarded_get, not a raw store.get"
         );
@@ -5846,12 +6014,45 @@ mod tests {
     /// structural, not a gap this test closes.
     #[tokio::test]
     async fn resolve_fan_out_reaches_the_configured_concurrency_after_fold() {
-        assert_folded_snapshot_fan_out_peaks_at(32).await;
+        assert_folded_snapshot_fan_out_peaks_at(32, 128, 32).await;
     }
 
-    async fn assert_folded_snapshot_fan_out_peaks_at(concurrency: usize) {
+    /// ADR-1733 decision 1, the per-prefix half: every part of one snapshot
+    /// sits under that snapshot's single `.../snap/` prefix, and the part
+    /// fan-out runs at the ceiling's width, so at a ceiling above the
+    /// per-prefix bound it is the per-prefix bound that must decide the peak.
+    /// 320 parts and a ceiling of 1,024 leave both other candidates
+    /// distinguishable: 128 is neither 320 nor 1,024.
+    ///
+    /// FLIP: key the per-prefix bound by the shard-hour commit prefix again
+    /// (restore `request_key_prefix` to a segment walk returning `None` for
+    /// anything that is not `t/<hash>/<signal>/c/<shard>/<hour>/`), and
+    /// snapshot parts take no prefix permit at all: only the ceiling holds
+    /// them back, and the first assertion fails with a peak far above the 128
+    /// expected, bounded only by the 1,024 ceiling and the 320 parts.
+    #[tokio::test]
+    async fn snapshot_part_fan_out_is_held_to_the_per_prefix_bound() {
+        assert_folded_snapshot_fan_out_peaks_at(
+            1_024,
+            320,
+            CatalogConfig::default().resolve_prefix_concurrency,
+        )
+        .await;
+    }
+
+    /// Folds `part_count` sealed hours into one part each, then resolves
+    /// through a gate on the part GETs under a ceiling of `ceiling`, and
+    /// asserts the fan-out peaks at exactly `expected_peak` twice over.
+    async fn assert_folded_snapshot_fan_out_peaks_at(
+        ceiling: usize,
+        part_count: usize,
+        expected_peak: usize,
+    ) {
+        assert!(
+            part_count >= expected_peak * 2,
+            "the second wave needs {expected_peak} parts still unfetched"
+        );
         let store = Arc::new(MemoryStore::new());
-        let part_count = concurrency * 4;
         let base_hour = 500_000u32;
         let last_hour = base_hour + part_count as u32 - 1;
         let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
@@ -5910,7 +6111,7 @@ mod tests {
             Catalog::new(
                 gated_store.clone(),
                 CatalogConfig {
-                    resolve_get_concurrency: concurrency,
+                    resolve_get_concurrency: ceiling,
                     ..config(1)
                 },
             )
@@ -5929,12 +6130,12 @@ mod tests {
                 .await
         });
 
-        wait_until_held_bounded(&gate, concurrency).await;
+        wait_until_held_bounded(&gate, expected_peak).await;
         assert_eq!(
             gate.held_count(),
-            concurrency,
-            "exactly the configured number of snapshot-part GETs are in flight at once \
-             (concurrency = {concurrency})"
+            expected_peak,
+            "exactly {expected_peak} snapshot-part GETs are in flight at once \
+             (ceiling = {ceiling}, parts = {part_count})"
         );
 
         // Release the first wave and confirm the fan-out refills to exactly
@@ -5942,12 +6143,12 @@ mod tests {
         for id in gate.held() {
             gate.release(id);
         }
-        wait_until_held_bounded(&gate, concurrency).await;
+        wait_until_held_bounded(&gate, expected_peak).await;
         assert_eq!(
             gate.held_count(),
-            concurrency,
-            "the fan-out refills to exactly the configured bound on a second wave \
-             (concurrency = {concurrency})"
+            expected_peak,
+            "the fan-out refills to exactly the same bound on a second wave \
+             (ceiling = {ceiling}, parts = {part_count})"
         );
 
         let mut spins = 0;
@@ -5960,7 +6161,7 @@ mod tests {
             assert!(
                 spins < 10_000,
                 "resolve did not finish after releasing every held snapshot-part GET \
-                 (concurrency = {concurrency})"
+                 (ceiling = {ceiling}, parts = {part_count})"
             );
         }
         task.await.expect("join resolve task").expect("resolve");
@@ -6032,6 +6233,397 @@ mod tests {
             }
             Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
             Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
+    }
+
+    /// ADR-1733 decision 1: a zero `resolve_prefix_concurrency` is rejected
+    /// at `Catalog::new` with a typed error, for the reason a zero ceiling
+    /// is: a zero-permit prefix semaphore would deadlock every request that
+    /// lands under a key prefix, which is every request with a separator in
+    /// its key.
+    ///
+    /// FLIP: delete the `resolve_prefix_concurrency == 0` block in
+    /// `Catalog::new` and this construction returns `Ok`.
+    #[test]
+    fn zero_resolve_prefix_concurrency_is_rejected() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_prefix_concurrency: 0,
+                ..config(1)
+            },
+        );
+        match result {
+            Err(CatalogError::InvalidConfig(msg)) => {
+                assert_eq!(msg, "resolve_prefix_concurrency must be > 0");
+            }
+            Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
+    }
+
+    /// ADR-1733 decision 1: every resolve-path request is keyed by its own
+    /// key prefix, the path up to and including its last separator. A commit
+    /// record is still keyed by its shard-hour commit prefix, because that is
+    /// what its parent path is; a LIST is keyed by the prefix it lists; and
+    /// the objects that share one directory (a snapshot's parts, its postings
+    /// and column stats) are keyed by that shared directory, which is what
+    /// holds their fan-out to the per-prefix bound.
+    #[test]
+    fn every_request_is_keyed_by_its_own_key_prefix() {
+        let hour = "t/aabb/m/c/0000/2026091612/";
+        assert_eq!(
+            request_key_prefix("t/aabb/m/c/0000/2026091612/000000000123"),
+            Some(hour),
+            "a commit record is keyed by its shard-hour prefix"
+        );
+        assert_eq!(
+            request_key_prefix(hour),
+            Some(hour),
+            "a LIST of one shard-hour is keyed by that same prefix"
+        );
+        assert_eq!(
+            request_key_prefix("t/aabb/m/c/0000/"),
+            Some("t/aabb/m/c/0000/"),
+            "a LIST of a whole shard is keyed by the prefix it lists"
+        );
+        assert_eq!(
+            request_key_prefix("t/aabb/catalog/m/snap/000100.abcdef0123456789.csnap"),
+            Some("t/aabb/catalog/m/snap/"),
+            "every part of one snapshot shares the prefix that bounds them"
+        );
+        assert_eq!(
+            request_key_prefix("t/aabb/catalog/m/idx/abcdef0123456789.npost"),
+            Some("t/aabb/catalog/m/idx/"),
+            "postings and column stats share their own prefix"
+        );
+        assert_eq!(
+            request_key_prefix("t/aabb/catalog/m/HEAD"),
+            Some("t/aabb/catalog/m/"),
+            "a HEAD is keyed by its signal's catalog directory"
+        );
+        assert_eq!(request_key_prefix("t/aabb/m/c/0000"), Some("t/aabb/m/c/"));
+        assert_eq!(request_key_prefix("head"), None, "no separator, no prefix");
+        assert_eq!(request_key_prefix(""), None);
+    }
+
+    /// ADR-1733 decision 1: prefix semaphores are created lazily and dropped
+    /// when idle, so the map is bounded by the prefixes in flight rather than
+    /// by the bucket's history. A resolve holds one entry for the shard-hour
+    /// it is reading while a GET under that prefix is held inside the store,
+    /// and the map is empty again once the resolve finishes.
+    ///
+    /// FLIP: remove the `live.remove(&prefix)` call in
+    /// `RequestPermits::drop` and the after-resolve assertion fails with 1
+    /// entry left behind.
+    #[tokio::test]
+    async fn prefix_semaphores_are_created_lazily_and_dropped_when_idle() {
+        let mem = MemoryStore::new();
+        let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
+        publish_segment(&mem, 0, 1, 500_000, now, now - 1_000, now).await;
+        let store = Arc::new(FaultStore::new(mem, FaultPlan::empty()));
+        let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+        let catalog = Arc::new(Catalog::new(store.clone(), config(1)).expect("catalog"));
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            0,
+            "no prefix has a semaphore before the first request"
+        );
+
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+        let cat_task = catalog.clone();
+        let task = tokio::spawn(async move {
+            cat_task
+                .resolve(&tenant(), Signal::Metrics, range, &[], now)
+                .await
+        });
+
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            1,
+            "the shard-hour prefix whose record GET is in flight has a semaphore"
+        );
+        for id in gate.held() {
+            gate.release(id);
+        }
+        task.await.expect("join resolve task").expect("resolve");
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            0,
+            "the prefix semaphore is dropped once the prefix goes idle"
+        );
+    }
+
+    /// Waits until `catalog` has exactly `n` prefix semaphores live, bounded
+    /// the same way [`wait_until_held_bounded`] is: a request that never gets
+    /// as far as taking its prefix's reference would otherwise hang the run
+    /// instead of failing. Panics naming the observed count on timeout.
+    async fn wait_until_prefix_semaphores(catalog: &Catalog, n: usize) {
+        let reached = async {
+            while catalog.prefix_semaphores_live() != n {
+                tokio::task::yield_now().await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .is_err()
+        {
+            panic!(
+                "{} prefix semaphores live, expected {n} within 5s",
+                catalog.prefix_semaphores_live()
+            );
+        }
+    }
+
+    /// A request cancelled while it waits for a permit must still run the
+    /// idle-prefix cleanup. `Catalog::acquire_request_permits` builds the
+    /// guard that owns the prefix's reference before either `.await`, so
+    /// dropping the future drops the guard and the entry goes with it.
+    ///
+    /// Two tenants under a ceiling of one: A's commit GET is held inside the
+    /// store and holds the only ceiling permit, so B takes its own prefix's
+    /// permit (uncontended, a different prefix) and then parks on the
+    /// ceiling. Aborting B there is the cancellation the leak needs.
+    ///
+    /// FLIP: move the `RequestPermits` construction in
+    /// `Catalog::acquire_request_permits` back below both `.await`s, filling
+    /// its fields from locals as the original did, and the after-abort
+    /// assertion fails with 2 prefixes live: B's entry is left in the map
+    /// with nothing that will ever remove it.
+    #[tokio::test]
+    async fn a_request_cancelled_while_waiting_drops_its_prefix_semaphore() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    resolve_get_concurrency: 1,
+                    ..config(1)
+                },
+            )
+            .expect("catalog"),
+        );
+
+        let key_a = "t/aaaaaaaaaaaaaaaa/m/c/0000/2026091612/000000000001";
+        let key_b = "t/bbbbbbbbbbbbbbbb/m/c/0000/2026091612/000000000001";
+
+        let cat_a = Arc::clone(&catalog);
+        let task_a = tokio::spawn(async move {
+            let accounting = QueryAccounting::new();
+            cat_a.guarded_get(key_a, GetRange::Full, &accounting).await
+        });
+        wait_until_held_bounded(&gate, 1).await;
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            1,
+            "A's prefix has a semaphore while its GET is held inside the store"
+        );
+
+        let cat_b = Arc::clone(&catalog);
+        let task_b = tokio::spawn(async move {
+            let accounting = QueryAccounting::new();
+            cat_b.guarded_get(key_b, GetRange::Full, &accounting).await
+        });
+        wait_until_prefix_semaphores(&catalog, 2).await;
+
+        task_b.abort();
+        assert!(
+            task_b
+                .await
+                .expect_err("B was aborted while waiting on the ceiling")
+                .is_cancelled()
+        );
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            1,
+            "the cancelled request's prefix semaphore is removed, leaving only A's"
+        );
+
+        for id in gate.held() {
+            gate.release(id);
+        }
+        // A's key was never written, so its GET reaches the store and comes
+        // back `NotFound`. Asserting the outcome keeps the release path
+        // honest: a GET that never ran (or failed on a permit) would leave
+        // the same empty map as a GET that ran and found nothing.
+        let result_a = task_a.await.expect("join A");
+        assert!(
+            matches!(result_a, Err(StoreError::NotFound)),
+            "A's GET runs once released and reports the absent object, got {result_a:?}"
+        );
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            0,
+            "no prefix semaphore outlives the requests that created it"
+        );
+    }
+
+    /// A request cancelled while it waits for its PREFIX permit must also run
+    /// the idle-prefix cleanup. The test above covers a future parked on the
+    /// process ceiling, which is the other of the two `.await`s in
+    /// `Catalog::acquire_request_permits`; this one enters the prefix wait,
+    /// which no other test reaches.
+    ///
+    /// One prefix under a per-prefix bound of one: A's commit GET is held
+    /// inside the store and holds that prefix's only permit, so B, on the same
+    /// prefix, parks on the prefix semaphore rather than on the ceiling (which
+    /// is the default 128 and has 127 permits free). The in-flight count
+    /// before the abort is what pins B as parked THERE.
+    ///
+    /// Scope note: the `live == 0` assertion at the end cannot fail on its
+    /// own, because A shares B's prefix and A's own drop removes the entry
+    /// whatever B did. What this test pins is the prefix-wait state and that
+    /// leaving it drops both of B's references; the removal itself is pinned
+    /// by the two tests above.
+    #[tokio::test]
+    async fn a_request_cancelled_waiting_on_its_prefix_permit_releases_it() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    resolve_prefix_concurrency: 1,
+                    ..config(1)
+                },
+            )
+            .expect("catalog"),
+        );
+
+        let prefix = "t/aaaaaaaaaaaaaaaa/m/c/0000/2026091612/";
+        let key_a = "t/aaaaaaaaaaaaaaaa/m/c/0000/2026091612/000000000001";
+        let key_b = "t/aaaaaaaaaaaaaaaa/m/c/0000/2026091612/000000000002";
+
+        let cat_a = Arc::clone(&catalog);
+        let task_a = tokio::spawn(async move {
+            let accounting = QueryAccounting::new();
+            cat_a.guarded_get(key_a, GetRange::Full, &accounting).await
+        });
+        wait_until_held_bounded(&gate, 1).await;
+        assert_eq!(
+            catalog.prefix_requests_in_flight(prefix),
+            Some(1),
+            "A alone holds the prefix's only permit while its GET is held"
+        );
+
+        let cat_b = Arc::clone(&catalog);
+        let task_b = tokio::spawn(async move {
+            let accounting = QueryAccounting::new();
+            cat_b.guarded_get(key_b, GetRange::Full, &accounting).await
+        });
+        wait_until_prefix_requests(&catalog, prefix, 2).await;
+        assert_eq!(
+            gate.held().len(),
+            1,
+            "B is parked on the prefix permit, so its GET has not reached the store"
+        );
+
+        task_b.abort();
+        assert!(
+            task_b
+                .await
+                .expect_err("B was aborted while waiting on the prefix permit")
+                .is_cancelled()
+        );
+        assert_eq!(
+            catalog.prefix_requests_in_flight(prefix),
+            Some(1),
+            "the cancelled waiter drops both its references, leaving only A's"
+        );
+
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let result_a = task_a.await.expect("join A");
+        assert!(
+            matches!(result_a, Err(StoreError::NotFound)),
+            "A's GET runs once released and reports the absent object, got {result_a:?}"
+        );
+        assert_eq!(
+            catalog.prefix_semaphores_live(),
+            0,
+            "no prefix semaphore outlives the requests that created it"
+        );
+    }
+
+    /// Waits until `prefix` has exactly `n` requests in flight, bounded the
+    /// same way [`wait_until_prefix_semaphores`] is. Panics naming the
+    /// observed count on timeout.
+    async fn wait_until_prefix_requests(catalog: &Catalog, prefix: &str, n: usize) {
+        let reached = async {
+            while catalog.prefix_requests_in_flight(prefix) != Some(n) {
+                tokio::task::yield_now().await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .is_err()
+        {
+            panic!(
+                "{:?} requests in flight on {prefix}, expected {n} within 5s",
+                catalog.prefix_requests_in_flight(prefix)
+            );
+        }
+    }
+
+    /// ADR-1733 decision 1: two requests leaving one prefix at the same time
+    /// must leave no entry behind. `RequestPermits::drop` decides by reference
+    /// count, so it releases its OWN reference under the map lock and reads
+    /// the count afterwards. Reading the count first instead lets each of two
+    /// concurrent droppers see the other's reference still alive, so each
+    /// declines to remove and the entry stays resident with nothing left that
+    /// would ever remove it.
+    ///
+    /// FLIP: in `RequestPermits::drop`, read `Arc::strong_count(&semaphore)
+    /// == 2` inside the `if` and release the lock before `drop(semaphore)`
+    /// (the ordering this replaced), AND widen the window between the two
+    /// with a `std::thread::yield_now()`: this then fails on round 0 with 1
+    /// prefix semaphore live and 0 requests in flight, which is the leaked
+    /// entry. The revert alone does not fail it in practice: the window
+    /// between releasing the lock and releasing the reference is a couple of
+    /// instructions, and the contender is parked on the mutex, so the losing
+    /// interleaving is rare enough that 80,000 drops did not hit it. With the
+    /// ordering below, the same widened experiment still passes, because the
+    /// two reference releases are serialized by the lock rather than racing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_drops_on_one_prefix_leave_nothing_behind() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Arc::new(Catalog::new(store, config(1)).expect("catalog"));
+        // One prefix, and a per-prefix bound wide enough that every request
+        // holds a permit at once: the point is the drop, not the wait.
+        let key = "t/aabb/catalog/m/snap/000100.abcdef0123456789.csnap";
+        let prefix = "t/aabb/catalog/m/snap/";
+        let droppers = 16;
+        assert!(config(1).resolve_prefix_concurrency >= droppers);
+
+        for round in 0..500 {
+            let barrier = Arc::new(tokio::sync::Barrier::new(droppers));
+            let tasks: Vec<_> = (0..droppers)
+                .map(|_| {
+                    let catalog = Arc::clone(&catalog);
+                    let barrier = Arc::clone(&barrier);
+                    tokio::spawn(async move {
+                        let permits = catalog.acquire_request_permits(key).await.expect("permits");
+                        barrier.wait().await;
+                        drop(permits);
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.expect("join dropper");
+            }
+            assert_eq!(
+                catalog.prefix_semaphores_live(),
+                0,
+                "round {round}: {droppers} concurrent drops left {:?} requests on {prefix}",
+                catalog.prefix_requests_in_flight(prefix)
+            );
         }
     }
 
@@ -7595,7 +8187,7 @@ mod tests {
         );
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY,
+            crate::config::DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
             "every acquired permit was released"
         );
     }

@@ -1488,15 +1488,26 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub cache_dir: Option<PathBuf>,
 
-    /// Number of in-flight object-store requests (LISTs and record GETs) the
-    /// catalog resolve path (`Catalog::resolve_impl`) keeps in flight at
-    /// once, via a per-instance semaphore. Unset, it takes
-    /// `ravel_catalog::CatalogConfig`'s own default (currently 128). `0` is
-    /// rejected by [`Cli::validate`]: a zero-permit semaphore would deadlock
-    /// every resolve, never silently clamped to 1. A value above
-    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` is rejected too: past
-    /// that ceiling the number is a typo, not a setting (see the constant's
-    /// doc for the per-prefix arithmetic).
+    /// Per-process ceiling on the object-store requests (LISTs and GETs) the
+    /// catalog resolve path keeps in flight at once, across every concurrent
+    /// resolve. Unset, it is derived from this process's query concurrency `Q`
+    /// as `clamp(Q * 128, 128, 4096)`, then held at an interim 1,024 until the
+    /// ADR-1170 memory reservation lands; `Q` is `--max-concurrent-queries`
+    /// when that flag bounds queries, and the same `max(8, 2 * cores)` the
+    /// other derived performance defaults use when it does not. Set
+    /// explicitly, the value is used as given: neither the derivation nor the
+    /// interim cap applies to it. Either way the resolved number is logged at
+    /// startup beside the other derived performance defaults. `0` is rejected
+    /// at startup rather than clamped to 1, because a zero-permit semaphore
+    /// would deadlock every resolve, and so is any value above 4,096
+    /// (`ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY`), past which the number is
+    /// a typo rather than a setting. This is not the only resolve bound: each
+    /// key prefix also carries its own 128-request bound with no flag, and a
+    /// request holds a permit of each, so no one prefix exceeds 128 however
+    /// high this ceiling is set.
+    ///
+    /// Both refusals above are [`Cli::validate`]'s; see the constant's doc for
+    /// the per-prefix arithmetic behind the 4,096.
     #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
     pub catalog_resolve_concurrency: Option<usize>,
 
@@ -2448,6 +2459,53 @@ pub const FETCH_CONCURRENCY_PER_CORE: usize = 2;
 /// fan-out rather than dropping below it.
 pub const MIN_DERIVED_FETCH_CONCURRENCY: usize = 8;
 
+/// Catalog resolve requests the derived process ceiling allows per concurrent
+/// query (ADR-1733 decision 2): one shard-hour prefix's worth, so `Q`
+/// concurrent resolves on `Q` different prefixes each run at the per-prefix
+/// bound. Named through `ravel_catalog`'s own constant rather than repeated,
+/// so the derivation cannot drift from the bound it is a multiple of. It is
+/// also the floor the derivation clamps up to: a single-query process still
+/// gets one prefix's worth.
+pub const RESOLVE_CONCURRENCY_PER_QUERY: usize = ravel_catalog::DEFAULT_RESOLVE_PREFIX_CONCURRENCY;
+
+/// Interim ceiling on the DERIVED catalog resolve concurrency (ADR-1733
+/// decision 3), applied after the `clamp(Q * 128, 128, 4_096)` derivation.
+/// The ADR bounds in-flight resolve memory by reserving each request's listed
+/// size from the ADR-1170 process budget; until that reservation is wired into
+/// the resolve path, a large `Q` would let the derived ceiling admit more bytes
+/// than a host that has not been measured can hold. It caps the derivation
+/// only: an explicit `--catalog-resolve-concurrency` is honoured up to
+/// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY`, and this constant is deleted
+/// in the commit that lands the reservation.
+pub const INTERIM_CATALOG_RESOLVE_CEILING: usize = 1_024;
+
+/// [`ResolvedPerformanceDefaults::catalog_resolve_query_concurrency_input`]:
+/// `Q` is the operator's `--max-concurrent-queries` ceiling.
+pub const RESOLVE_Q_INPUT_QUERY_CEILING: &str = "max-concurrent-queries";
+
+/// [`ResolvedPerformanceDefaults::catalog_resolve_query_concurrency_input`]:
+/// no query ceiling is set, so `Q` is the ADR-1195 core estimate of per-process
+/// query parallelism, `max(MIN_DERIVED_FETCH_CONCURRENCY,
+/// FETCH_CONCURRENCY_PER_CORE * cores)`.
+pub const RESOLVE_Q_INPUT_CORES: &str = "cores";
+
+/// The catalog resolve path's per-process ceiling for a process running `q`
+/// concurrent queries: `clamp(q * 128, 128, 4_096)`, then held at
+/// [`INTERIM_CATALOG_RESOLVE_CEILING`] (ADR-1733 decisions 2 and 3).
+///
+/// Pure arithmetic on `q`; the caller decides what `q` is (see
+/// [`resolve_performance_defaults`]). The result is always a legal
+/// `--catalog-resolve-concurrency` value: never `0`, never above
+/// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY`, which startup refuses.
+pub fn derive_catalog_resolve_concurrency(q: usize) -> usize {
+    q.saturating_mul(RESOLVE_CONCURRENCY_PER_QUERY)
+        .clamp(
+            RESOLVE_CONCURRENCY_PER_QUERY,
+            ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY,
+        )
+        .min(INTERIM_CATALOG_RESOLVE_CEILING)
+}
+
 /// Provisional placeholder for the overhead reserve subtracted from
 /// cgroup-capped effective memory to derive `memory_budget_bytes`. NOT the
 /// measured figure the calibration run below produces; that run is future
@@ -2571,6 +2629,16 @@ pub struct PerformanceFlags {
     pub sql_partition_count: Option<usize>,
     /// `--promql-fetch-fanout` (ADR-1195).
     pub promql_fetch_fanout: Option<usize>,
+    /// `--catalog-resolve-concurrency` (ADR-1733 decision 2): the catalog's
+    /// per-process resolve ceiling. An explicit value is honoured unchanged;
+    /// `None` derives it from the query concurrency below.
+    pub catalog_resolve_concurrency: Option<usize>,
+    /// `--max-concurrent-queries`, the raw flag rather than the parsed
+    /// `QueryConcurrencyLimit` (`None` is `Unlimited`). Sets `Q` in the
+    /// ADR-1733 decision 2 derivation and nothing else: the query admission
+    /// ceiling itself is resolved by `Cli::parse_query_concurrency_limit`,
+    /// which is also where a `0` is refused, so no zero reaches here.
+    pub max_concurrent_queries: Option<u64>,
     /// `--max-segments`.
     pub max_segments: Option<usize>,
     /// `--cache-max-bytes`.
@@ -2614,6 +2682,25 @@ pub struct ResolvedPerformanceDefaults {
     /// Reaches `EngineConfig::promql_fetch_fanout` and, from there, the
     /// PromQL/analytics `buffer_unordered` fan-out width (ADR-1195).
     pub promql_fetch_fanout: usize,
+    /// Reaches `ServerConfig::catalog_resolve_concurrency` and, from there,
+    /// `query::build_catalog`, which sets it as the one `Catalog`'s
+    /// `resolve_get_concurrency`: the per-process ceiling on resolve-path
+    /// object-store requests across every tenant, shard and hour (ADR-1733
+    /// decision 2). NOT the per-prefix bound, which is
+    /// `ravel_catalog::DEFAULT_RESOLVE_PREFIX_CONCURRENCY` and has no flag.
+    pub catalog_resolve_concurrency: usize,
+    /// The `Q` the ceiling above was derived from, and the input that produced
+    /// it ([`RESOLVE_Q_INPUT_QUERY_CEILING`] or [`RESOLVE_Q_INPUT_CORES`]).
+    /// Both are facts about this process's query parallelism, so they are
+    /// resolved and logged even when an explicit flag won the ceiling itself.
+    pub catalog_resolve_query_concurrency: usize,
+    /// See [`Self::catalog_resolve_query_concurrency`].
+    pub catalog_resolve_query_concurrency_input: &'static str,
+    /// Whether [`INTERIM_CATALOG_RESOLVE_CEILING`] held the derived ceiling
+    /// below what `Q` alone would have produced (ADR-1733 decision 3). Always
+    /// false when the ceiling came from an explicit flag, which the interim cap
+    /// does not touch.
+    pub catalog_resolve_interim_cap_applied: bool,
     /// Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
     /// Reaches the query fetcher cache's byte ceiling
@@ -2706,6 +2793,7 @@ pub struct PerformanceSources {
     pub store_get_concurrency: &'static str,
     pub sql_partition_count: &'static str,
     pub promql_fetch_fanout: &'static str,
+    pub catalog_resolve_concurrency: &'static str,
     pub max_segments: &'static str,
     pub cache_max_bytes: &'static str,
     pub catalog_cache_max_bytes: &'static str,
@@ -2761,6 +2849,12 @@ fn resolve_knob(
 ///
 /// - `fetch_concurrency`: `max(MIN_DERIVED_FETCH_CONCURRENCY,
 ///   FETCH_CONCURRENCY_PER_CORE * cores)`.
+/// - `catalog_resolve_concurrency` (ADR-1733 decision 2):
+///   `clamp(Q * RESOLVE_CONCURRENCY_PER_QUERY, RESOLVE_CONCURRENCY_PER_QUERY,
+///   ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY)`, then held at
+///   [`INTERIM_CATALOG_RESOLVE_CEILING`] until the ADR-1170 reservation lands
+///   (decision 3). `Q` is `--max-concurrent-queries` when the operator set a
+///   ceiling, else the same core estimate `fetch_concurrency` uses.
 /// - `memory_budget_bytes` (ADR-1170 decision 3, amended by issue #1255):
 ///   cgroup-capped effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`],
 ///   or `u64::MAX` when memory is unknown (no trustworthy ceiling can be
@@ -2832,6 +2926,34 @@ pub fn resolve_performance_defaults(
         flags.fetch_concurrency,
         derived_fetch_concurrency,
     );
+
+    // ADR-1733 decision 2: the catalog's per-process resolve ceiling scales
+    // with how many queries share it, not with cores. `Q` is the operator's
+    // query ceiling when they set one (the effective admission threshold
+    // starts there and only reconciles downward), and otherwise the same
+    // core-based estimate of per-process query parallelism ADR-1195's derived
+    // defaults use. A query ceiling above `usize` on a 32-bit target
+    // saturates, which the derivation's own clamp then bounds.
+    let (query_concurrency, query_concurrency_input) = match flags.max_concurrent_queries {
+        Some(q) => (
+            usize::try_from(q).unwrap_or(usize::MAX),
+            RESOLVE_Q_INPUT_QUERY_CEILING,
+        ),
+        None => (derived_fetch_concurrency, RESOLVE_Q_INPUT_CORES),
+    };
+    let derived_catalog_resolve_concurrency = derive_catalog_resolve_concurrency(query_concurrency);
+    let (catalog_resolve_concurrency, catalog_resolve_source) =
+        match flags.catalog_resolve_concurrency {
+            Some(n) => (n, PERF_SOURCE_FLAG),
+            None => (derived_catalog_resolve_concurrency, PERF_SOURCE_DERIVED),
+        };
+    // True only when the interim cap is what held the derived value down, so
+    // the startup log says the ceiling is the unmeasured-host cap rather than
+    // anything `Q` produced. An explicit flag is not capped, so it never sets
+    // this.
+    let catalog_resolve_interim_cap_applied = catalog_resolve_source == PERF_SOURCE_DERIVED
+        && query_concurrency.saturating_mul(RESOLVE_CONCURRENCY_PER_QUERY)
+            > INTERIM_CATALOG_RESOLVE_CEILING;
 
     let (max_segments, segments_source) = match flags.max_segments {
         Some(n) => (n, PERF_SOURCE_FLAG),
@@ -2941,6 +3063,10 @@ pub fn resolve_performance_defaults(
         store_get_concurrency,
         sql_partition_count,
         promql_fetch_fanout,
+        catalog_resolve_concurrency,
+        catalog_resolve_query_concurrency: query_concurrency,
+        catalog_resolve_query_concurrency_input: query_concurrency_input,
+        catalog_resolve_interim_cap_applied,
         max_segments,
         cache_max_bytes,
         catalog_cache_max_bytes,
@@ -2957,6 +3083,7 @@ pub fn resolve_performance_defaults(
             store_get_concurrency: store_get_concurrency_source,
             sql_partition_count: sql_partition_count_source,
             promql_fetch_fanout: promql_fetch_fanout_source,
+            catalog_resolve_concurrency: catalog_resolve_source,
             max_segments: segments_source,
             cache_max_bytes: cache_source,
             catalog_cache_max_bytes: catalog_cache_source,
@@ -3117,6 +3244,24 @@ impl ResolvedPerformanceDefaults {
             setting = "promql_fetch_fanout",
             value = self.promql_fetch_fanout,
             source = self.sources.promql_fetch_fanout,
+            "performance default resolved"
+        );
+        // ADR-1733 decision 2: the catalog's per-process resolve ceiling. It
+        // carries three extra fields because the number alone does not say
+        // where it came from: `query_concurrency` and its input name the `Q`
+        // the derivation used, and `interim_cap_applied` says the value is
+        // decision 3's 1,024 cap rather than anything `Q` produced. The
+        // per-prefix bound is not logged here: it has no flag and no
+        // derivation, so it is the compiled-in
+        // `ravel_catalog::DEFAULT_RESOLVE_PREFIX_CONCURRENCY` in every
+        // process.
+        tracing::info!(
+            setting = "catalog_resolve_concurrency",
+            value = self.catalog_resolve_concurrency,
+            source = self.sources.catalog_resolve_concurrency,
+            query_concurrency = self.catalog_resolve_query_concurrency,
+            query_concurrency_input = self.catalog_resolve_query_concurrency_input,
+            interim_cap_applied = self.catalog_resolve_interim_cap_applied,
             "performance default resolved"
         );
         tracing::info!(
@@ -5411,6 +5556,8 @@ impl Cli {
             store_get_concurrency: self.store_get_concurrency,
             sql_partition_count: self.sql_partition_count,
             promql_fetch_fanout: self.promql_fetch_fanout,
+            catalog_resolve_concurrency: self.catalog_resolve_concurrency,
+            max_concurrent_queries: self.max_concurrent_queries,
             max_segments: self.max_segments,
             cache_max_bytes: self.cache_max_bytes,
             sql_max_query_bytes: self.sql_max_query_bytes,
@@ -8679,6 +8826,176 @@ mod tests {
             .expect("typed MemoryBudgetExceeded error");
         assert_eq!(exceeded.hard_caps_total, budget);
         assert_eq!(exceeded.memory_budget_bytes, budget);
+    }
+
+    /// ADR-1733 decision 2 and 3, the derivation on its own at its extremes:
+    /// `clamp(Q * 128, 128, 4096)` held at the interim 1,024.
+    ///
+    /// Prove-the-test: drop the `.min(INTERIM_CATALOG_RESOLVE_CEILING)` from
+    /// `derive_catalog_resolve_concurrency` and the `Q = 16` and `Q = 32`
+    /// cases fail with 2,048 and 4,096; drop the `.clamp(..)` floor and the
+    /// `Q = 0` case fails with 0.
+    #[test]
+    fn the_resolve_ceiling_derivation_holds_at_its_extremes() {
+        // A single query still gets one shard-hour prefix's worth, which is
+        // also the clamp's floor.
+        assert_eq!(derive_catalog_resolve_concurrency(1), 128);
+        // The unreachable Q = 0 clamps up to the same floor rather than
+        // producing a zero-permit semaphore.
+        assert_eq!(derive_catalog_resolve_concurrency(0), 128);
+        // Four concurrent queries: 4 * 128, under every cap.
+        assert_eq!(derive_catalog_resolve_concurrency(4), 512);
+        // Eight is the last Q whose product lands on the interim cap exactly
+        // rather than being held down to it.
+        assert_eq!(derive_catalog_resolve_concurrency(8), 1_024);
+        // 16 * 128 = 2,048, held at the interim 1,024.
+        assert_eq!(derive_catalog_resolve_concurrency(16), 1_024);
+        // 32 * 128 = 4,096, the clamp's own ceiling, still held at 1,024.
+        assert_eq!(derive_catalog_resolve_concurrency(32), 1_024);
+        // Past the clamp ceiling the product stops growing before the interim
+        // cap even applies, so an absurd Q cannot overflow into a larger
+        // number.
+        assert_eq!(derive_catalog_resolve_concurrency(1_000_000), 1_024);
+        assert_eq!(derive_catalog_resolve_concurrency(usize::MAX), 1_024);
+    }
+
+    /// With `--max-concurrent-queries` bounding queries, that flag is the `Q`
+    /// the ceiling derives from, and the derived value is reported as such.
+    ///
+    /// Prove-the-test: make the `flags.max_concurrent_queries` arm of the
+    /// derivation in `resolve_performance_defaults` fall through to
+    /// `derived_fetch_concurrency` and the value becomes 1,024 (the reference
+    /// host's Q = 32) instead of 512.
+    #[test]
+    fn a_bounded_query_ceiling_is_the_q_the_resolve_ceiling_derives_from() {
+        let cli = Cli::try_parse_from(["ravel-server", "--max-concurrent-queries", "4"])
+            .expect("flag parses");
+        let resolved = resolved_from(&cli);
+
+        assert_eq!(resolved.catalog_resolve_concurrency, 512);
+        assert_eq!(
+            resolved.sources.catalog_resolve_concurrency,
+            PERF_SOURCE_DERIVED
+        );
+        assert_eq!(resolved.catalog_resolve_query_concurrency, 4);
+        assert_eq!(
+            resolved.catalog_resolve_query_concurrency_input,
+            RESOLVE_Q_INPUT_QUERY_CEILING
+        );
+        assert!(
+            !resolved.catalog_resolve_interim_cap_applied,
+            "4 * 128 = 512 is under the interim cap, so the cap did not apply"
+        );
+
+        // Q = 1 is the low extreme through the same path.
+        let cli = Cli::try_parse_from(["ravel-server", "--max-concurrent-queries", "1"])
+            .expect("flag parses");
+        assert_eq!(resolved_from(&cli).catalog_resolve_concurrency, 128);
+    }
+
+    /// Unbounded queries have no `Q` to read off a flag, so the ceiling
+    /// derives from the same `max(8, 2 * cores)` figure the other derived
+    /// performance defaults use, and the interim cap is reported when it bites.
+    ///
+    /// Prove-the-test: change the `None` arm of the derivation in
+    /// `resolve_performance_defaults` to a constant `1` and the 8-core case
+    /// fails with 128 instead of 1,024. Change it to read the RESOLVED
+    /// `fetch_concurrency` (which honours the flags) rather than
+    /// `derived_fetch_concurrency` and the held-down-flags case fails with 2
+    /// and 256.
+    #[test]
+    fn unbounded_queries_derive_the_resolve_ceiling_from_cores() {
+        let eight_cores = resolve_performance_defaults(
+            HostProfile::new(8, Some(REFERENCE_MEM_BYTES)),
+            PerformanceFlags::default(),
+        );
+        assert_eq!(
+            eight_cores.catalog_resolve_query_concurrency, 16,
+            "8 cores derive max(8, 2 * 8) = 16 concurrent queries"
+        );
+        assert_eq!(
+            eight_cores.catalog_resolve_concurrency, 1_024,
+            "16 * 128 = 2,048, held at the interim cap"
+        );
+        assert_eq!(
+            eight_cores.catalog_resolve_query_concurrency_input,
+            RESOLVE_Q_INPUT_CORES
+        );
+        assert!(eight_cores.catalog_resolve_interim_cap_applied);
+        assert_eq!(
+            eight_cores.sources.catalog_resolve_concurrency,
+            PERF_SOURCE_DERIVED
+        );
+
+        // Under default flags the derived fetch concurrency is the same 16, so
+        // a derivation reading `Q` off `--store-get-concurrency` or
+        // `--fetch-concurrency` would give the same answers above. Hold both
+        // flags down to 2 and only the cores-derived answer stays 16. The two
+        // are mutually exclusive at the CLI layer, not here: this calls the
+        // derivation directly, and setting both pins it against both inputs at
+        // once.
+        let low_fetch_flags = resolve_performance_defaults(
+            HostProfile::new(8, Some(REFERENCE_MEM_BYTES)),
+            PerformanceFlags {
+                store_get_concurrency: Some(2),
+                fetch_concurrency: Some(2),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            low_fetch_flags.catalog_resolve_query_concurrency, 16,
+            "`Q` is the cores figure, not either fetch-concurrency flag"
+        );
+        assert_eq!(
+            low_fetch_flags.catalog_resolve_concurrency, 1_024,
+            "16 * 128 = 2,048, held at the interim cap"
+        );
+        assert_eq!(
+            low_fetch_flags.catalog_resolve_query_concurrency_input,
+            RESOLVE_Q_INPUT_CORES
+        );
+        assert!(low_fetch_flags.catalog_resolve_interim_cap_applied);
+
+        // A single-core host is the low extreme: the floor under the derived
+        // query concurrency is 8, so the ceiling is 8 * 128 = 1,024 there too.
+        // The cap does not apply there: the clamp product lands exactly on
+        // 1,024 rather than above it, and only a product above it is held down.
+        let one_core = resolve_performance_defaults(
+            HostProfile::new(1, Some(REFERENCE_MEM_BYTES)),
+            PerformanceFlags::default(),
+        );
+        assert_eq!(one_core.catalog_resolve_query_concurrency, 8);
+        assert_eq!(one_core.catalog_resolve_concurrency, 1_024);
+        assert!(
+            !one_core.catalog_resolve_interim_cap_applied,
+            "8 * 128 lands on the cap rather than being held down to it"
+        );
+    }
+
+    /// An explicit `--catalog-resolve-concurrency` wins over the derivation
+    /// unchanged: the interim cap does not apply to it, and it is reported as
+    /// flag-sourced.
+    ///
+    /// Prove-the-test: apply `derive_catalog_resolve_concurrency` to the
+    /// `Some(n)` arm as well and the 2,048 case fails with 1,024.
+    #[test]
+    fn an_explicit_resolve_ceiling_wins_over_the_derivation() {
+        let cli = Cli::try_parse_from(["ravel-server", "--catalog-resolve-concurrency", "2048"])
+            .expect("flag parses");
+        let resolved = resolved_from(&cli);
+
+        assert_eq!(
+            resolved.catalog_resolve_concurrency, 2_048,
+            "an explicit value above the interim cap is used as given"
+        );
+        assert_eq!(
+            resolved.sources.catalog_resolve_concurrency,
+            PERF_SOURCE_FLAG
+        );
+        assert!(
+            !resolved.catalog_resolve_interim_cap_applied,
+            "the interim cap bounds the derivation, not an operator's own value"
+        );
     }
 
     /// `--disable-cache` builds no fetcher cache (`store::build_cache` returns

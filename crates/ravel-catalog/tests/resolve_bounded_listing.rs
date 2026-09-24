@@ -2,7 +2,7 @@
 //! one bounded LIST per shard (not one per (shard, hour)), and overlaps the
 //! pending-erasure LIST with that fan-out.
 //!
-//! Three properties, each with a stated red flip.
+//! Four properties, each with a stated red flip.
 //!
 //! Differential + request count: a folded tenant with data in some but not all
 //! (shard, hour) buckets above the watermark, plus sealed data below it,
@@ -20,6 +20,12 @@
 //! so all nine LISTs can be held at once. RED: awaiting the erasure LIST after
 //! the fan-out means it is never issued while the shard LISTs are held, so at
 //! most eight are ever held simultaneously.
+//!
+//! ADR-1733: a resolve request holds a per-prefix permit and a per-process
+//! permit, so the peak GETs in flight is the per-prefix bound inside one
+//! shard-hour prefix and the configured ceiling across two. RED: without the
+//! per-prefix permit one prefix holds every pending GET at once; without the
+//! ceiling permit two prefixes hold twice the per-prefix bound.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -30,12 +36,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ravel_catalog::{
     Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
-    DEFAULT_MAX_FLUSH_LIFETIME_NS, SegmentOrigin,
+    DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_RESOLVE_PREFIX_CONCURRENCY, SegmentOrigin,
 };
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
-use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -96,10 +102,21 @@ async fn publish_at(
     ingest_hour_bucket: u32,
     event_ts_ns: i64,
 ) -> String {
-    let payload = format!("seg-{shard}-{ingest_hour_bucket}-{event_ts_ns}").into_bytes();
+    publish_for(store, tenant(), shard, ingest_hour_bucket, event_ts_ns).await
+}
+
+async fn publish_for(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: TenantHash,
+    shard: u32,
+    ingest_hour_bucket: u32,
+    event_ts_ns: i64,
+) -> String {
+    let hex = tenant_hash.to_hex();
+    let payload = format!("seg-{hex}-{shard}-{ingest_hour_bucket}-{event_ts_ns}").into_bytes();
     let content_hash = *blake3::hash(&payload).as_bytes();
     let record = record::build(NewCommitRecord {
-        tenant_hash: tenant(),
+        tenant_hash,
         signal: Signal::Metrics,
         shard,
         writer_id: Uuid::new_v4(),
@@ -488,4 +505,253 @@ async fn erasure_list_overlaps_shard_fanout() {
         shard_count as usize,
         "every shard's record resolves once the LISTs are released"
     );
+}
+
+/// Releases every held call as it arrives, so a resolve whose GETs were held
+/// for a peak assertion can run to completion afterwards.
+fn drain_gate(gate: GateHandle) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+}
+
+/// The peak GETs a resolve keeps in flight, once the gate has stopped moving.
+/// `wait_until_held` only proves the count reached `expected`; the settle
+/// window then lets any further GET the bounds should have blocked arrive, so
+/// the assertion is on the exact peak rather than on a lower bound. tokio's
+/// `test-util` clock is not enabled workspace-wide, so the window is real time.
+async fn settled_peak(gate: &GateHandle, expected: usize) -> usize {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        gate.wait_until_held(expected),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "only {} GETs were ever held, wanted {expected}",
+            gate.held_count()
+        )
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    gate.held_count()
+}
+
+/// ADR-1733 decision 1: a resolve request takes a per-prefix permit and a
+/// per-process permit before it issues its GET, so one shard-hour prefix never
+/// exceeds `DEFAULT_RESOLVE_PREFIX_CONCURRENCY` in flight and two prefixes
+/// together never exceed the configured `resolve_get_concurrency` ceiling,
+/// which two concurrent resolves share. The ceiling is hand-set here, not
+/// derived: what the derivation produces is `ravel-server`'s own test.
+///
+/// The ceiling here (200) sits above the per-prefix bound and below twice it,
+/// and each prefix holds more pending record GETs (150) than either number, so
+/// the two peaks are distinguishable: 128 is not 150 and 200 is not 256.
+///
+/// RED, per-prefix bound removed (drop the prefix permit that
+/// `Catalog::acquire_request_permits` takes before the ceiling permit): the
+/// single-prefix peak becomes 150, the number of pending GETs, and the 128
+/// assertion fails. RED, ceiling ignored (build `request_semaphore` in
+/// `Catalog::new` with `Semaphore::MAX_PERMITS` instead of
+/// `config.resolve_get_concurrency`): the two-prefix peak becomes 256, twice
+/// the per-prefix bound, and the 200 assertion fails.
+#[tokio::test]
+async fn two_concurrent_resolves_share_the_configured_in_flight_ceiling() {
+    const CEILING: usize = 200;
+    const RECORDS_PER_PREFIX: usize = 150;
+    const HOUR: u32 = 1001;
+
+    // Two tenants, so each resolve's records sit under one shard-hour commit
+    // prefix and the two resolves sit under different ones.
+    let tenant_a = TenantHash([0xa1; 16]);
+    let tenant_b = TenantHash([0xb2; 16]);
+    let inner = Arc::new(MemoryStore::new());
+    for i in 0..RECORDS_PER_PREFIX {
+        let event_ts_ns = hour_mid_ns(HOUR) + i as i64 * 1_000_000_000;
+        publish_for(inner.as_ref(), tenant_a, 0, HOUR, event_ts_ns).await;
+        publish_for(inner.as_ref(), tenant_b, 0, HOUR, event_ts_ns).await;
+    }
+
+    let catalog_config = CatalogConfig {
+        resolve_get_concurrency: CEILING,
+        ..exact_config(1)
+    };
+    let now_ns = i64::from(HOUR) * NS_PER_HOUR + 40 * 60_000_000_000;
+    let range = TimeRange {
+        start_ns: i64::from(HOUR) * NS_PER_HOUR,
+        end_ns: now_ns,
+    };
+
+    // Phase A: one resolve, so every record GET is under one prefix. The
+    // ceiling (200) is above the per-prefix bound and the prefix has 150
+    // pending GETs, so only the per-prefix bound can decide the peak.
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
+        FaultPlan::empty(),
+    ));
+    // Only commit-record GETs, so the peak is the fan-out this phase means
+    // to measure and not a head or snapshot read that happens to overlap it.
+    let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+    let catalog = Arc::new(Catalog::new(store, catalog_config).expect("catalog"));
+
+    let resolver = Arc::clone(&catalog);
+    let handle = tokio::spawn(async move {
+        resolver
+            .resolve(&tenant_a, Signal::Metrics, range, &[], now_ns)
+            .await
+    });
+    assert_eq!(
+        settled_peak(&gate, DEFAULT_RESOLVE_PREFIX_CONCURRENCY).await,
+        DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
+        "one shard-hour prefix holds exactly the per-prefix bound in flight, \
+         not all {RECORDS_PER_PREFIX} pending GETs"
+    );
+
+    let drain = drain_gate(gate.clone());
+    let snapshot = handle.await.expect("join").expect("resolve");
+    drain.abort();
+    assert_eq!(
+        snapshot.segments.len(),
+        RECORDS_PER_PREFIX,
+        "every record resolves once the GETs drain"
+    );
+
+    // Phase B: two resolves over two prefixes on one Catalog, on a fresh
+    // Catalog so phase A's record cache cannot serve any of these GETs. Each
+    // prefix would allow 128, so 256 requests are eligible and only the
+    // process ceiling can decide the peak.
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
+        FaultPlan::empty(),
+    ));
+    let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+    let catalog = Arc::new(Catalog::new(store, catalog_config).expect("catalog"));
+
+    let mut handles = Vec::new();
+    for tenant_hash in [tenant_a, tenant_b] {
+        let resolver = Arc::clone(&catalog);
+        handles.push(tokio::spawn(async move {
+            resolver
+                .resolve(&tenant_hash, Signal::Metrics, range, &[], now_ns)
+                .await
+        }));
+    }
+    assert_eq!(
+        settled_peak(&gate, CEILING).await,
+        CEILING,
+        "two prefixes share the process ceiling, so the peak is the ceiling \
+         and not two per-prefix bounds"
+    );
+
+    let drain = drain_gate(gate.clone());
+    for handle in handles {
+        let snapshot = handle.await.expect("join").expect("resolve");
+        assert_eq!(
+            snapshot.segments.len(),
+            RECORDS_PER_PREFIX,
+            "both resolves complete once the GETs drain"
+        );
+    }
+    drain.abort();
+}
+
+/// ADR-1733 decision 1 pins the ORDER the two permits are taken in: the
+/// prefix permit first, then the ceiling permit. A request that took the
+/// ceiling permit first and then waited on a saturated prefix would sit on a
+/// permit no other prefix can use, which is exactly the starvation across
+/// prefixes the two limits exist to remove.
+///
+/// The order is observable as the peak. One prefix is saturated first: 150
+/// pending GETs against a per-prefix bound of 128 leaves 22 requests waiting
+/// on that prefix, and a ceiling of 200 leaves 72 permits for anyone else.
+/// Prefix-first, those 22 wait holding nothing, so a second prefix can use
+/// all 72 and the peak is 128 + 72 = 200, the ceiling exactly. Ceiling-first,
+/// those same 22 each hold a ceiling permit while they wait on the prefix
+/// they cannot enter, so only 50 are left and the peak is 128 + 50 = 178.
+///
+/// RED, order swapped (in `Catalog::acquire_request_permits`, take the
+/// `request_semaphore` permit before the prefix permit): the second prefix
+/// never gets past 50 in flight, the peak settles at 178, and this fails in
+/// `settled_peak` with "only 178 GETs were ever held, wanted 200".
+#[tokio::test]
+async fn a_saturated_prefix_holds_no_ceiling_permits_it_cannot_use() {
+    const CEILING: usize = 200;
+    const RECORDS_PER_PREFIX: usize = 150;
+    const HOUR: u32 = 1001;
+    // 128 held on the saturated prefix plus the ceiling's remaining 72, which
+    // the other prefix can only reach if the saturated one holds none of them.
+    const EXPECTED_PEAK: usize =
+        DEFAULT_RESOLVE_PREFIX_CONCURRENCY + (CEILING - DEFAULT_RESOLVE_PREFIX_CONCURRENCY);
+
+    let tenant_a = TenantHash([0xa1; 16]);
+    let tenant_b = TenantHash([0xb2; 16]);
+    let inner = Arc::new(MemoryStore::new());
+    for i in 0..RECORDS_PER_PREFIX {
+        let event_ts_ns = hour_mid_ns(HOUR) + i as i64 * 1_000_000_000;
+        publish_for(inner.as_ref(), tenant_a, 0, HOUR, event_ts_ns).await;
+        publish_for(inner.as_ref(), tenant_b, 0, HOUR, event_ts_ns).await;
+    }
+
+    let now_ns = i64::from(HOUR) * NS_PER_HOUR + 40 * 60_000_000_000;
+    let range = TimeRange {
+        start_ns: i64::from(HOUR) * NS_PER_HOUR,
+        end_ns: now_ns,
+    };
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
+        FaultPlan::empty(),
+    ));
+    let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+    let catalog = Arc::new(
+        Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: CEILING,
+                ..exact_config(1)
+            },
+        )
+        .expect("catalog"),
+    );
+
+    // Saturate one prefix first and let it settle there, so the 22 requests
+    // it cannot admit are already waiting when the other prefix starts.
+    let resolver = Arc::clone(&catalog);
+    let handle_a = tokio::spawn(async move {
+        resolver
+            .resolve(&tenant_a, Signal::Metrics, range, &[], now_ns)
+            .await
+    });
+    assert_eq!(
+        settled_peak(&gate, DEFAULT_RESOLVE_PREFIX_CONCURRENCY).await,
+        DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
+        "the first prefix saturates at the per-prefix bound"
+    );
+
+    let resolver = Arc::clone(&catalog);
+    let handle_b = tokio::spawn(async move {
+        resolver
+            .resolve(&tenant_b, Signal::Metrics, range, &[], now_ns)
+            .await
+    });
+    assert_eq!(
+        settled_peak(&gate, EXPECTED_PEAK).await,
+        EXPECTED_PEAK,
+        "the second prefix reaches every ceiling permit the saturated one is \
+         not using, so the peak is the ceiling exactly"
+    );
+
+    let drain = drain_gate(gate.clone());
+    for handle in [handle_a, handle_b] {
+        let snapshot = handle.await.expect("join").expect("resolve");
+        assert_eq!(
+            snapshot.segments.len(),
+            RECORDS_PER_PREFIX,
+            "both resolves complete once the GETs drain"
+        );
+    }
+    drain.abort();
 }

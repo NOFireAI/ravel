@@ -639,11 +639,14 @@ pub struct ServerConfig {
     /// share one directory and no separate disk-capacity flag, not one number.
     /// `None` keeps the RAM-only path, byte-for-byte today's behavior.
     pub cache_dir: Option<std::path::PathBuf>,
-    /// `--catalog-resolve-concurrency`: the number of in-flight object-store
-    /// requests `Catalog::resolve_impl` keeps in flight at once, from
-    /// `Cli::catalog_resolve_concurrency`. `None` when the flag is unset,
-    /// which leaves `ravel_catalog::CatalogConfig`'s own default (currently
-    /// 128) in place; [`start`] passes this straight through to
+    /// The RESOLVED per-process ceiling on in-flight resolve-path
+    /// object-store requests (ADR-1733 decision 2), not the raw flag:
+    /// `main` fills it from `ResolvedPerformanceDefaults`, which is either
+    /// `--catalog-resolve-concurrency` when set or the value derived from this
+    /// process's query concurrency. `None` means no ceiling was resolved,
+    /// which leaves `ravel_catalog::CatalogConfig`'s own default in place;
+    /// that default is the per-prefix bound, which every request is held to
+    /// separately in any case. [`start`] passes this straight through to
     /// [`query::build_catalog`].
     pub catalog_resolve_concurrency: Option<usize>,
     /// The process-wide in-flight ingest-request ceiling, from
@@ -2131,16 +2134,8 @@ pub async fn start(
                 .merge(remote_write::router(mtls_rw_state));
         }
     }
-    let catalog = query::build_catalog(
-        store.clone(),
-        config.shard_count,
-        config.disable_cache,
-        config.catalog_cache_max_bytes,
-        config.cache_dir.clone(),
-        config.catalog_resolve_concurrency,
-        Some(ingest_lag.catalog_window_ns),
-        config.max_flush_delay,
-    )?;
+    let catalog =
+        query::build_catalog_for_server(store.clone(), &config, ingest_lag.catalog_window_ns)?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the
     // fetcher cache.
@@ -3548,6 +3543,40 @@ pub async fn start(
         drain_settle_interval: config.drain_settle_interval,
         query_worker_heartbeat,
     })
+}
+
+#[cfg(test)]
+mod start_catalog_wiring_tests {
+    /// ADR-1733 decision 2 reachability: [`start`] must reach its `Catalog`
+    /// through [`query::build_catalog_for_server`], the one field mapping a
+    /// test can call. Reverting that call site to an inline
+    /// `query::build_catalog` call passing `None` for the ceiling type-checks
+    /// and leaves every test in this workspace green, because `start` builds a
+    /// whole process and no test can call it, and `None` is a value the
+    /// parameter accepts. What the claim is about is which function that one
+    /// line names, and that is exact.
+    ///
+    /// Asserted over this file's own source, the way `main.rs` pins its
+    /// `ServerConfig` literal. The needles are a path and an open paren, which
+    /// rustfmt has no line to break inside, and they are assembled with
+    /// `concat!` so this test's own source cannot match itself.
+    #[test]
+    fn start_builds_its_catalog_through_build_catalog_for_server() {
+        const SRC: &str = include_str!("lib.rs");
+        let wired = concat!("query::build_catalog_for_", "server(");
+        let inline = concat!("query::build_", "catalog(");
+        assert_eq!(
+            SRC.matches(wired).count(),
+            1,
+            "start must call query::build_catalog_for_server exactly once"
+        );
+        assert_eq!(
+            SRC.matches(inline).count(),
+            0,
+            "start must not call query::build_catalog directly: the argument mapping would then \
+             live inside start, where no test can reach it"
+        );
+    }
 }
 
 #[cfg(test)]
