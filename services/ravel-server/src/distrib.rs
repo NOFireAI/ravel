@@ -67,6 +67,7 @@ use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::instrument::{LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT};
 use ravel_proto::queryfrag::v1 as pb;
+use ravel_query::FetchStats;
 use ravel_query::ReadCache;
 use ravel_query::SegmentFetcher;
 use ravel_query::distrib::SliceStreamDecoder;
@@ -78,6 +79,7 @@ use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use ravel_query::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
 use ravel_query::http::TenantResolver;
+use ravel_types::accounting::QueryAccountingSnapshot;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -1218,6 +1220,76 @@ enum Owner {
     Remote(String),
 }
 
+/// What one attempt of a slice cost before it was abandoned (issue #1723).
+///
+/// A re-dispatched attempt is not a free attempt: the worker that reported
+/// `Unavailable` had already GET the segments it managed to read, and the store
+/// served them. `dispatch` carries this onto whichever attempt finally answers,
+/// so the coordinator folds the sum of every attempt into the query's live
+/// accounting handle rather than the survivor's share of it.
+#[derive(Debug, Default, Clone)]
+struct AttemptSpend {
+    accounting: QueryAccountingSnapshot,
+    stats: FetchStats,
+}
+
+impl AttemptSpend {
+    /// Field-wise saturating sum, so a worker reporting near `u64::MAX` clamps
+    /// instead of wrapping under the byte budget the coordinator re-enforces.
+    fn merge(&mut self, other: &AttemptSpend) {
+        self.accounting = self.accounting.saturating_merge(&other.accounting);
+        self.stats.raw_f64_pages = self
+            .stats
+            .raw_f64_pages
+            .saturating_add(other.stats.raw_f64_pages);
+        self.stats.raw_f64_bytes = self
+            .stats
+            .raw_f64_bytes
+            .saturating_add(other.stats.raw_f64_bytes);
+        self.stats.histogram_series_skipped = self
+            .stats
+            .histogram_series_skipped
+            .saturating_add(other.stats.histogram_series_skipped);
+    }
+
+    /// Whether this attempt spent anything at all: a pure-transport loss with
+    /// no summary reports nothing, and merging it must stay a no-op.
+    fn is_zero(&self) -> bool {
+        self.accounting == QueryAccountingSnapshot::default() && self.stats == FetchStats::default()
+    }
+
+    /// Fold this carried spend into a slice result, so the coordinator sees one
+    /// response whose accounting is the sum over every attempt. An `Err` result
+    /// has nowhere to carry it: `SliceFetcher::fetch` is
+    /// `Result<SliceResponse, DistribError>`, and a transport/decode error
+    /// carries no accounting field, so a slice whose LAST attempt fails that
+    /// way still under-reports by the earlier attempts' spend.
+    fn fold_into(
+        &self,
+        result: Result<SliceResponse, DistribError>,
+    ) -> Result<SliceResponse, DistribError> {
+        if self.is_zero() {
+            return result;
+        }
+        result.map(|mut response| {
+            response.accounting = response.accounting.saturating_merge(&self.accounting);
+            response.stats.raw_f64_pages = response
+                .stats
+                .raw_f64_pages
+                .saturating_add(self.stats.raw_f64_pages);
+            response.stats.raw_f64_bytes = response
+                .stats
+                .raw_f64_bytes
+                .saturating_add(self.stats.raw_f64_bytes);
+            response.stats.histogram_series_skipped = response
+                .stats
+                .histogram_series_skipped
+                .saturating_add(self.stats.histogram_series_skipped);
+            response
+        })
+    }
+}
+
 /// The classification of one remote dispatch attempt (ADR-0071 deliverable 1).
 enum Attempt {
     /// A terminal outcome: a decoded response with a non-`Unavailable` status,
@@ -1226,8 +1298,14 @@ enum Attempt {
     /// because a `SliceResponse` is large relative to the `Retry` variant.
     Keep(Box<Result<SliceResponse, DistribError>>),
     /// Transport loss or an `Unavailable` summary. Re-dispatch may skip past
-    /// this attempt to the next rendezvous worker, then coordinator-local.
-    Retry,
+    /// this attempt to the next rendezvous worker, then coordinator-local. The
+    /// payload is what this abandoned attempt already spent (issue #1723): the
+    /// response's own accounting for an `Unavailable` summary, whatever a
+    /// terminal summary reported before a stream broke, and zero for a
+    /// transport loss with no summary, where the worker's spend cannot be
+    /// observed from here at all. Boxed to keep the variant small beside
+    /// `Keep`.
+    Retry(Box<AttemptSpend>),
 }
 
 /// The coordinator's [`SliceFetcher`] (ADR-0071 deliverable 3). Rendezvous-maps
@@ -1495,14 +1573,20 @@ impl RoutingSliceFetcher {
     /// (ADR-0071 deliverable 1). Transport loss and an `Unavailable` summary are
     /// [`Attempt::Retry`] (re-dispatchable); every other outcome, success or a
     /// hard decode/framing error, is [`Attempt::Keep`] and terminal.
+    ///
+    /// Retrying drops the attempt's RESULT, never its COST (issue #1723): an
+    /// `Unavailable` summary carries what that worker spent before it gave up,
+    /// and [`Attempt::Retry`] carries it forward so `dispatch` can fold it into
+    /// whichever attempt finally answers.
     async fn try_remote(
         &self,
         endpoint: &str,
         request: &pb::FetchRequest,
         wire_bytes: &AtomicU64,
     ) -> Attempt {
+        let mut salvaged = None;
         match self
-            .remote_fetch(endpoint, request.clone(), wire_bytes)
+            .remote_fetch(endpoint, request.clone(), wire_bytes, &mut salvaged)
             .await
         {
             Ok(response) if response.status == pb::status::Code::Unavailable => {
@@ -1510,7 +1594,10 @@ impl RoutingSliceFetcher {
                     %endpoint,
                     "remote slice reported Unavailable; re-dispatching to next worker"
                 );
-                Attempt::Retry
+                Attempt::Retry(Box::new(AttemptSpend {
+                    accounting: response.accounting,
+                    stats: response.stats,
+                }))
             }
             Ok(response) => Attempt::Keep(Box::new(Ok(response))),
             Err(DistribError::Transport(message)) => {
@@ -1519,7 +1606,10 @@ impl RoutingSliceFetcher {
                     error = %message,
                     "remote slice fetch failed at transport; re-dispatching to next worker"
                 );
-                Attempt::Retry
+                // A stream that broke after its terminal summary still told us
+                // what the worker spent; one that broke before it did not, and
+                // reports zero rather than a guess.
+                Attempt::Retry(Box::new(salvaged.unwrap_or_default()))
             }
             // A decode, framing, or worker-reported corruption error is a real
             // defect, not a routing miss: propagate it typed rather than mask it
@@ -1581,11 +1671,17 @@ impl RoutingSliceFetcher {
     /// `wire_bytes` accumulates the frame bytes this attempt accepted, including
     /// the frame that tripped a cap, so a refused slice still reports what it
     /// made the coordinator hold.
+    ///
+    /// `salvaged` receives the spend of a terminal summary that arrived before
+    /// the attempt failed, and is left `None` otherwise (issue #1723). It is an
+    /// out-parameter because it is meaningful only on the `Err` return, where
+    /// there is no `SliceResponse` to put it on.
     async fn remote_fetch(
         &self,
         endpoint: &str,
         mut request: pb::FetchRequest,
         wire_bytes: &AtomicU64,
+        salvaged: &mut Option<AttemptSpend>,
     ) -> Result<SliceResponse, DistribError> {
         let channel = self.channel(endpoint).await?;
         // Mint and attach the per-query capability (ADR-0071 amendment, decision
@@ -1625,6 +1721,9 @@ impl RoutingSliceFetcher {
         match outcome {
             Ok(()) => decoder.finish(),
             Err(err) => {
+                *salvaged = decoder
+                    .summary_spend()
+                    .map(|(accounting, stats)| AttemptSpend { accounting, stats });
                 if matches!(
                     err,
                     DistribError::Codec(codec::CodecError::SliceFrameCapExceeded { .. })
@@ -1685,7 +1784,14 @@ impl RoutingSliceFetcher {
     ///
     /// Slice atomicity holds by construction: each attempt is decoded whole
     /// before it is returned, so partial frames from a failed attempt are
-    /// discarded and never merged.
+    /// discarded and never merged. A failed attempt's DATA is discarded; its
+    /// COST is not (issue #1723). Each abandoned attempt's spend accumulates in
+    /// `carried` and is folded into whichever attempt answers, so the one
+    /// `SliceResponse` the coordinator folds carries the sum of what the store
+    /// actually served for this slice, not the survivor's share of it. Without
+    /// that, a store answering 503 lets one slice be fetched three times and be
+    /// charged once, and the byte budget is enforced against the third of it
+    /// that got reported.
     ///
     /// Returns the slice result, the endpoint label for its `fragments[]` stats
     /// entry, and whether it fell back to local after a failed remote attempt.
@@ -1708,6 +1814,10 @@ impl RoutingSliceFetcher {
             Some(Owner::Remote(endpoint)) => endpoint.clone(),
         };
 
+        // What the attempts that were abandoned already spent (issue #1723),
+        // folded into the attempt that answers.
+        let mut carried = AttemptSpend::default();
+
         // First remote attempt against the top owner.
         match self.try_remote(&primary, &request, wire_bytes).await {
             Attempt::Keep(result) => {
@@ -1718,7 +1828,10 @@ impl RoutingSliceFetcher {
             // live-view stamp so later queries route past it without re-paying
             // the connect timeout (ADR-0071 amendment, decision 3, Mark). This
             // reuses the existing classification, adding no new failure signal.
-            Attempt::Retry => self.mark_quarantine(&primary),
+            Attempt::Retry(spend) => {
+                carried.merge(&spend);
+                self.mark_quarantine(&primary);
+            }
         }
 
         // The primary was lost or Unavailable. Re-dispatch EXACTLY once to the
@@ -1735,11 +1848,14 @@ impl RoutingSliceFetcher {
             match self.try_remote(next, &request, wire_bytes).await {
                 Attempt::Keep(result) => {
                     self.metrics.record_slice_remote();
-                    return (*result, next.clone(), false);
+                    return (carried.fold_into(*result), next.clone(), false);
                 }
                 // The re-dispatch target also failed re-dispatchably: quarantine
                 // it too, so a subsequent query skips both corpses.
-                Attempt::Retry => self.mark_quarantine(next),
+                Attempt::Retry(spend) => {
+                    carried.merge(&spend);
+                    self.mark_quarantine(next);
+                }
             }
         }
 
@@ -1748,7 +1864,11 @@ impl RoutingSliceFetcher {
         // access is the same, so a successful local read is byte-identical to
         // the remote result; only if local also fails does the slice fail typed.
         self.metrics.record_slice_fallback();
-        (self.local.run_local(request).await, primary, true)
+        (
+            carried.fold_into(self.local.run_local(request).await),
+            primary,
+            true,
+        )
     }
 }
 
