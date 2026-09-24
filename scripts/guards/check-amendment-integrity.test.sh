@@ -90,6 +90,18 @@ t="$(new_tree unqualified-phrase)"
 sed -i.bak 's/## Decision/## Decision\n\nThe fallback keeps using storage class STANDARD_FALLBACK for cold data./' "${t}/docs/adrs/0001-test-decision.md"
 check "a retired phrase left unqualified is a finding" "${t}" 1 "appears without its pointer"
 
+# The pointer in the same sentence is what qualifies a surviving phrase,
+# including when the sentence wraps across the match.
+t="$(new_tree qualified-phrase)"
+sed -i.bak 's/## Decision/## Decision\n\nThe fallback kept using storage class STANDARD_FALLBACK for cold data\nuntil the 2026-09-23 amendment below./' "${t}/docs/adrs/0001-test-decision.md"
+check "a retired phrase with the pointer beside it passes" "${t}" 0 "clean"
+
+# The pointer itself may straddle the wrap, indentation and all: the window
+# is read as collapsed prose, not as the lines it was typed on.
+t="$(new_tree wrapped-pointer)"
+sed -i.bak 's/## Decision/## Decision\n\n- The fallback kept using storage class STANDARD_FALLBACK until the 2026-09-23\n  amendment below narrowed it./' "${t}/docs/adrs/0001-test-decision.md"
+check "a pointer split across an indented wrap still qualifies" "${t}" 0 "clean"
+
 # amendment-supersedes-allow suppresses the same finding when it carries a
 # reason, on the line above the phrase.
 t="$(new_tree allowed-phrase)"
