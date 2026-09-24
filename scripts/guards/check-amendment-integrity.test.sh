@@ -124,6 +124,130 @@ sed -i.bak 's/^## Section A$/## Section A: one \| two/' "${t}/docs/adrs/0001-tes
 sed -i.bak 's/sections="Section A|Section B"/sections="Section A: one | two|Section B"/' "${t}/docs/adrs/0001-test-decision.md"
 check "an unescaped separator inside a name cannot be checked" "${t}" 70 "no matching heading"
 
+# An amendment heading is recognised at any level below the title, and an
+# unmarked one is refused rather than skipped.
+t="$(new_tree amendment-level-3)"
+sed -i.bak 's/^## Section B$/### Amendment (2026-09-24): a level-3 amendment\n\nNo marker here.\n\n## Section B/' "${t}/docs/adrs/0001-test-decision.md"
+check "a level-3 amendment with no marker cannot be checked" "${t}" 70 "carries no"
+
+t="$(new_tree amendment-level-4)"
+sed -i.bak 's/^## Section B$/#### Amendment (2026-09-24): a level-4 amendment\n\nNo marker here.\n\n## Section B/' "${t}/docs/adrs/0001-test-decision.md"
+check "a level-4 amendment with no marker cannot be checked" "${t}" 70 "carries no"
+
+# Recognition is on the word stem, not the noun: "Amended ..." counts too.
+t="$(new_tree amended-heading)"
+sed -i.bak 's/^## Section B$/## Amended 2026-09-24: the placement rule again\n\nNo marker here.\n\n## Section B/' "${t}/docs/adrs/0001-test-decision.md"
+check "an 'Amended ...' heading with no marker cannot be checked" "${t}" 70 "carries no"
+
+# The document title is not an amendment section, whatever it mentions.
+t="$(new_tree amend-in-title)"
+cat >"${t}/docs/adrs/0003-how-we-amend.md" <<'MD'
+# ADR-0003: How we amend decisions
+
+## Decision
+
+A title naming amendment is not itself an amendment section.
+MD
+check "a title mentioning amendment is not an amendment" "${t}" 0 "clean"
+
+# A subheading inside an amendment block belongs to that block: the
+# enclosing amendment's markers speak for it.
+t="$(new_tree nested-subheading)"
+cat >>"${t}/docs/adrs/0001-test-decision.md" <<'MD'
+
+### Consequences of this amendment
+
+A heading inside the block is not a second amendment needing its own
+marker.
+MD
+check "a subheading inside an amendment block is part of it" "${t}" 0 "clean"
+
+# `none` turns the checks off, so it has to say why.
+t="$(new_tree none-no-reason)"
+sed -i.bak 's/sections="Section A|Section B" pointer="2026-09-23 amendment"/none/' "${t}/docs/adrs/0001-test-decision.md"
+check "amendment-applies: none with no reason is a finding" "${t}" 1 "with no reason"
+
+t="$(new_tree none-with-reason)"
+sed -i.bak 's/sections="Section A|Section B" pointer="2026-09-23 amendment"/none reason="adds a placement class rather than retiring one"/' "${t}/docs/adrs/0001-test-decision.md"
+check "amendment-applies: none with a reason passes" "${t}" 0 "clean"
+
+# A marker that names nothing, or omits half of what it needs, is
+# unreadable rather than vacuously satisfied.
+t="$(new_tree empty-sections)"
+sed -i.bak 's/sections="Section A|Section B"/sections=""/' "${t}/docs/adrs/0001-test-decision.md"
+check "an empty sections= names no section" "${t}" 70 "names no section"
+
+t="$(new_tree applies-no-pointer)"
+sed -i.bak 's/sections="Section A|Section B" pointer="2026-09-23 amendment"/sections="Section A|Section B"/' "${t}/docs/adrs/0001-test-decision.md"
+check "an amendment-applies marker with no pointer= is refused" "${t}" 70 "missing sections= or pointer="
+
+t="$(new_tree applies-no-sections)"
+sed -i.bak 's/sections="Section A|Section B" pointer=/pointer=/' "${t}/docs/adrs/0001-test-decision.md"
+check "an amendment-applies marker with a pointer and no sections= is refused" "${t}" 70 "missing sections= or pointer="
+
+t="$(new_tree supersedes-no-pointer)"
+sed -i.bak 's/phrase="storage class STANDARD_FALLBACK" pointer="2026-09-23 amendment"/phrase="storage class STANDARD_FALLBACK"/' "${t}/docs/adrs/0001-test-decision.md"
+check "an amendment-supersedes marker with no pointer= is refused" "${t}" 70 "missing phrase= or pointer="
+
+# Two headings with the named text: which one the pointer must reach is not
+# a question the guard may guess at.
+t="$(new_tree duplicate-heading)"
+sed -i.bak 's/^## Section B$/## Section A/' "${t}/docs/adrs/0001-test-decision.md"
+check "a section name matching two headings is refused" "${t}" 70 "occurs 2 times"
+
+# A heading inside an amendment's own block is not a section a pointer can
+# be sent to, so it does not make the name ambiguous either.
+t="$(new_tree nested-section-heading)"
+cat >>"${t}/docs/adrs/0001-test-decision.md" <<'MD'
+
+### Section A
+
+The amendment restates the rule; this is not the document's Section A.
+MD
+check "a section heading inside an amendment block is not a target" "${t}" 0 "clean"
+
+# An amendment nested under the section it amends may not answer for the
+# pointer: that would make the marker prove itself.
+t="$(new_tree nested-amendment-prose)"
+sed -i.bak 's/Placement follows the active policy (2026-09-23 amendment below)./Placement follows the active policy./' "${t}/docs/adrs/0001-test-decision.md"
+sed -i.bak 's/^## Section B$/### Amendment (2026-09-24): nested under Section A\n\n<!-- amendment-applies: none reason="restates the rule above rather than retiring it" -->\n\nThis block names the 2026-09-23 amendment, from inside Section A.\n\n## Section B/' "${t}/docs/adrs/0001-test-decision.md"
+check "an amendment nested in a section cannot carry that section's pointer" "${t}" 1 "does not carry the pointer"
+
+# Phrase matching is case-insensitive and whitespace-collapsed, so
+# capitalisation and a line wrap do not hide a surviving phrase.
+t="$(new_tree capitalised-phrase)"
+sed -i.bak 's/## Decision/## Decision\n\nThe fallback keeps using Storage Class STANDARD_FALLBACK for cold data./' "${t}/docs/adrs/0001-test-decision.md"
+check "a retired phrase recapitalised is still a finding" "${t}" 1 "appears without its pointer"
+
+t="$(new_tree wrapped-phrase)"
+sed -i.bak 's/## Decision/## Decision\n\nThe fallback keeps using storage\nclass STANDARD_FALLBACK for cold data./' "${t}/docs/adrs/0001-test-decision.md"
+check "a retired phrase split across a wrap is still a finding" "${t}" 1 "appears without its pointer"
+
+# A marker comment is metadata, not prose: it neither qualifies the phrase
+# beside it nor counts as an occurrence of one.
+t="$(new_tree marker-not-a-qualifier)"
+sed -i.bak 's/## Decision/## Decision\n\n<!-- amendment-applies: sections="Section A" pointer="2026-09-23 amendment" -->\nThe fallback keeps using storage class STANDARD_FALLBACK for cold data./' "${t}/docs/adrs/0001-test-decision.md"
+check "a marker comment does not qualify the phrase beside it" "${t}" 1 "appears without its pointer"
+
+t="$(new_tree marker-not-an-occurrence)"
+sed -i.bak 's/## Decision/## Decision\n\n<!-- amendment-supersedes: phrase="storage class STANDARD_FALLBACK" pointer="2026-09-23 amendment" -->/' "${t}/docs/adrs/0001-test-decision.md"
+check "a phrase inside a marker comment is not an occurrence" "${t}" 0 "clean"
+
+# docs/adrs/README.md is the index, not an ADR.
+t="$(new_tree readme-index)"
+cat >"${t}/docs/adrs/README.md" <<'MD'
+# ADR index
+
+## Amending an ADR
+
+The index documents the marker syntax and carries no markers of its own.
+MD
+check "docs/adrs/README.md is an index, not an ADR" "${t}" 0 "clean"
+
+# A directory that is not there is not an empty one.
+t="$(new_tree missing-dir)"
+check "a missing docs directory cannot be checked" "${t}" 70 "no such directory" "docs/nope"
+
 # An empty docs directory is a structural failure, not a vacuous pass.
 t="${TMP}/empty-docs"
 mkdir -p "${t}/scripts/guards" "${t}/docs/adrs"
@@ -151,6 +275,17 @@ if [[ "${rc}" == 64 ]]; then
   passes=$((passes + 1))
 else
   printf 'FAIL  %s: exit %s, wanted 64\n' "two arguments is bad usage" "${rc}"
+  fails=$((fails + 1))
+fi
+
+# The guard's failure output sends the author to docs/adrs/README.md,
+# "Amending an ADR". A hint naming a section that is not there is worse
+# than no hint.
+if grep -q '^## Amending an ADR$' "${REPO_ROOT}/docs/adrs/README.md"; then
+  printf 'ok    %s\n' "docs/adrs/README.md carries the section the hint names"
+  passes=$((passes + 1))
+else
+  printf 'FAIL  %s\n' "docs/adrs/README.md has no \"Amending an ADR\" section"
   fails=$((fails + 1))
 fi
 
