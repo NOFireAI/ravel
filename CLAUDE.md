@@ -369,15 +369,24 @@ command substitution (`out="$(guard | tail -1)"` and its backtick
 spelling run the same gate and read the same pipe's status), an
 assignment to zsh's reserved `status`/`path`/
 `argv`/`PWD`, a `ScheduleWakeup` under 900 s, an `Edit`/`Write`
-inside the primary checkout, and three destructive git operations:
-`reset --hard/--soft` onto a remote ref, `filter-branch`, and a
-force-push naming `main`. The gate patterns match cargo's global flags
+inside the primary checkout, a bare 40-character hex literal in a Bash
+command, and three destructive git operations: `reset --hard/--soft` onto
+a remote ref, `filter-branch`, and a force-push naming `main`. The gate
+patterns match cargo's global flags
 too (`cargo --locked test | tail -1` was allowed until they did). It
 fails open on any internal error, and it exempts a dispatched fleet clone
 (which is itself the isolated workspace).
 `RAVEL_GUARD_ALLOW_PRIMARY=1` is the escape hatch for the worktree rule;
 `ALLOW_DESTRUCTIVE=1`, written inline at the front of the command (shell
 state does not survive between tool calls), is the one for the git rules.
+`ALLOW_LITERAL_SHA=1`, spelled the same way, is the one for the hex rule,
+and which answer is right depends on where the literal came from. A SHA
+typed or finished from a prefix read off earlier output gets resolved in
+the same command instead. A SHA copied from a check just run is the check,
+and must be kept: a `--match-head-commit` value re-resolved at merge time
+matches whatever the head is by then, so a push landing after review merges
+unreviewed. That is why `scripts/pr-review-status.sh` prints its merge line
+with the prefix already on it.
 Its cases live in `.claude/guards/pretooluse.test.sh` and run in CI's
 doc-scripts job; add one there before changing a rule.
 
