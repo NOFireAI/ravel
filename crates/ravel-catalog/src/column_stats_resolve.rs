@@ -23,28 +23,34 @@
 //! into `ravel-sql`'s consumption of this type and is out of this change's
 //! scope.
 //!
-//! # Degrade-to-`None`, one loud exception
+//! # Degrade-to-`None`, three loud exceptions
 //!
 //! Column statistics are an OPTIONAL metadata artifact, so every failure short
-//! of an isolation breach degrades: no HEAD yet, no ref at all, any GET error,
-//! a blake3 mismatch, a decode error, or a part-binding mismatch. One of those
-//! degrades is not silent: a DECODE failure on an object a covered part
-//! actually references means the fold wrote an object the reader cannot open,
-//! so the fetch path surfaces it as [`FetchOutcome::DecodeRefused`] (rather
-//! than folding it into a bare miss) for the caller to log once and count
-//! (issue #1400). The query still scans; only its visibility changes.
+//! of a store outage or an isolation breach degrades: no HEAD yet, no ref at
+//! all, a `NotFound` GET, a blake3 mismatch, a decode error, or a
+//! part-binding mismatch. Three of those cases are not silent. A DECODE
+//! failure on an object a covered part actually references means the fold
+//! wrote an object the reader cannot open, so the fetch path surfaces it as
+//! [`FetchOutcome::DecodeRefused`] (rather than folding it into a bare miss)
+//! for the caller to log once and count (issue #1400). A GET failure for any
+//! reason other than `NotFound`, on either the HEAD or a resolved stats
+//! object, is a store outage rather than an absence and surfaces as
+//! [`LoadColumnStatsError::Store`] (issue #1976: an `AccessDenied` there is a
+//! missing IAM read grant, not "no statistics yet"). And a genuinely
+//! unparseable HEAD (a real catalog defect, not an optional artifact) or a
+//! column-stats object declaring a foreign `tenant_hash` (an ADR-0050 §2
+//! isolation breach) are hard errors too: neither is absorbed into a silent
+//! degrade. The query still scans on every degrade; only visibility changes.
 //! `decode_column_stats` does not itself check part-binding against a
 //! caller-supplied part list (unlike `decode_postings`); this loader performs
 //! that check itself, exactly as
 //! [`crate::column_stats_build::decode_previous_column_stats`] does on the
-//! fold side. The only two loud exceptions are a genuinely unparseable HEAD (a
-//! real catalog defect, not an optional artifact) and a column-stats object
-//! declaring a foreign `tenant_hash` (an ADR-0050 §2 isolation breach): neither
-//! is absorbed into a silent degrade.
+//! fold side.
 
 use std::collections::HashMap;
 
 use prost::Message;
+use ravel_object_store::StoreError;
 use ravel_proto::catalog::v1::{ColumnStatsSegment, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
 
@@ -192,10 +198,12 @@ pub(crate) struct ResolvedStatsHead {
 pub(crate) enum FetchOutcome {
     /// Fetched, hash-verified, tenant-checked, part-bound, and decoded.
     Loaded(DecodedStats),
-    /// No usable object, silently: the store GET failed (the object may simply
-    /// not exist for this HEAD yet), the content hash did not match, a part
-    /// hash was malformed, or the part binding was stale. Every one of these is
-    /// an ordinary "no statistics" and stays quiet.
+    /// No usable object, silently: the store GET returned `NotFound` (the
+    /// object may simply not exist for this HEAD yet), the content hash did
+    /// not match, a part hash was malformed, or the part binding was stale.
+    /// Every one of these is an ordinary "no statistics" and stays quiet. A
+    /// GET failure for any other reason is not folded in here; it surfaces as
+    /// `Err(LoadColumnStatsError::Store)` (issue #1976).
     Absent,
     /// HEAD (or a covered part) references an object the reader refused to
     /// DECODE: the fold wrote it and the ref points at it, but the bytes will
@@ -239,6 +247,18 @@ pub enum LoadColumnStatsError {
         expected: String,
         actual: String,
     },
+    /// A GET (the HEAD, or a resolved per-part stats object) failed for a
+    /// reason other than `NotFound` (issue #1976): most commonly a missing
+    /// IAM read grant, surfaced as `StoreError::AccessDenied`. This is a
+    /// store outage, not "no statistics yet", so it is a hard error the
+    /// caller can count and retry, never a silent `Ok(None)`/`Absent` degrade
+    /// indistinguishable from an ordinary miss.
+    #[error("store read at {key} failed: {source}")]
+    Store {
+        key: String,
+        #[source]
+        source: StoreError,
+    },
 }
 
 /// HEAD object key (docs/catalog-and-mvcc.md key layout, frozen format).
@@ -264,9 +284,19 @@ pub(crate) async fn resolve_stats_head(
 ) -> Result<Option<ResolvedStatsHead>, LoadColumnStatsError> {
     let key = head_key(tenant, signal);
 
+    // `NotFound` is the ordinary "nothing folded yet" case. Any other GET
+    // failure (issue #1976: most commonly AccessDenied on a missing IAM read
+    // grant) is a store outage, not an absence, and must surface rather than
+    // read as "no statistics yet".
     let head_bytes = match getter.accounted_get_full(&key).await {
         Ok(got) => got.data,
-        Err(_) => return Ok(None),
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(source) => {
+            return Err(LoadColumnStatsError::Store {
+                key: key.clone(),
+                source,
+            });
+        }
     };
     let head = decode_head(&head_bytes).map_err(|source| LoadColumnStatsError::HeadCorrupt {
         key: key.clone(),
@@ -310,7 +340,16 @@ pub(crate) async fn fetch_stats_object(
     let data = match getter.accounted_get_full(&resolved.key).await {
         Ok(got) => got.data,
         // Store read: the object may simply not exist for this HEAD. Silent.
-        Err(_) => return Ok(FetchOutcome::Absent),
+        Err(StoreError::NotFound) => return Ok(FetchOutcome::Absent),
+        // Any other GET failure (issue #1976: most commonly AccessDenied on a
+        // missing IAM read grant) is a store outage, not an absence, and must
+        // surface rather than be read as "not covered".
+        Err(source) => {
+            return Err(LoadColumnStatsError::Store {
+                key: resolved.key.clone(),
+                source,
+            });
+        }
     };
     let digest = blake3::hash(&data);
     if *digest.as_bytes() != resolved.blake3 {

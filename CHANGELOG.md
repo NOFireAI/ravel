@@ -772,6 +772,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same falling-to-zero shape the description calls the alarm; it now carries
   the same idle clause as its sibling panel, "Query result cache hit ratio".
 
+- **A denied read on a catalog HEAD, a covered snapshot part, or a
+  column-stats object no longer degrades silently into "nothing here yet"**
+  (issue #1976). This is the follow-up #1964 left open. Five more GETs
+  treated any store error, including `AccessDenied` from a missing IAM read
+  grant, the same as a genuine `NotFound`: the column-stats HEAD and stats
+  object reads, the catalog HEAD and per-part reads behind the scrubber's
+  postings tier, and the catalog HEAD read in seal-divergence verification.
+  A permission fault there read as "no statistics yet", "not covered" or
+  "nothing folded yet" on every attempt, with nothing an operator could see.
+  `NotFound` still degrades exactly as before at all five. Any other error
+  now surfaces, naming the failing key. What changes for a caller: a SQL
+  query on the logs table fails with that error instead of running without
+  column-statistics pruning; the scrubber logs it (the postings tier at
+  `error`, seal-divergence at `warn`) and retries next tick, as it already
+  did for other failures there; and `ravel-cli catalog verify` exits nonzero
+  instead of reporting "nothing folded yet". The shipped query policy in
+  `deploy/iam/query.json` already grants these reads.
+
 - **A denied read on a catalog `idx/` object no longer degrades silently
   into "nothing to reuse"** (issue #1964). Three GETs of catalog index
   objects treated any store error, including `AccessDenied` from a missing
