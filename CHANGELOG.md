@@ -570,6 +570,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The shipped Maintain IAM template now grants the delete the dead-worker
+  reaper issues** (issue #1975). `MaintainDelete` named nothing under `sys/`,
+  so every `sys/maintain/workers/<process_id>` delete from
+  `WorkerSet::reap_keys` came back `AccessDenied` on a deployment using the
+  template. No heartbeat key was ever removed, and the prefix the live-set
+  LIST reads once per maintain tick grew with every maintain process that had
+  ever run. `deploy/iam/maintain.json` now allows `s3:DeleteObject` on
+  `sys/maintain/workers/*` only: the memo snapshots and compaction claims that
+  share `sys/maintain/` are not the reaper's to delete. Re-apply the Maintain
+  policy to pick this up. A test drives all four heartbeat operations against
+  the shipped policy with keys built by `heartbeat_key` itself.
+
 - **What a `0` on `ravel_store_probe_last_run_timestamp_seconds` means is
   documented in one place, and it states all three causes** (issue #1982). The
   explanation was written out across the store-probe source, its
