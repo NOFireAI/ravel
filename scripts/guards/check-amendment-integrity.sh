@@ -15,11 +15,12 @@
 # WHAT COUNTS AS AN AMENDMENT HEADING
 #
 # Any heading at level 2 or deeper (`##` through `######`, so every heading
-# below the document title) whose text contains a word starting "amend" in
-# any case: "Amendment", "Amendments", "Amended 2026-09-02", "Proposed
-# amendment", "#### Amendment, 2026-08-26". Nothing is excluded by
-# spelling or by level, because every narrower rule tried here skipped a
-# real amendment section silently.
+# below the document title) whose text contains a word starting "amend" or
+# "correction" in any case: "Amendment", "Amendments", "Amended
+# 2026-09-02", "Proposed amendment", "#### Amendment, 2026-08-26",
+# "Correction", "Corrections", "### Correction: the join key is wrong".
+# Nothing is excluded by spelling or by level, because every narrower rule
+# tried here skipped a real amendment or correction section silently.
 #
 # One structural exclusion, and it is not silent: a recognised heading that
 # sits inside another recognised amendment's block belongs to that block
@@ -91,10 +92,10 @@
 # a `none` marker with no reason. 70 is a claim that cannot be checked at
 # all: an amendment heading with no marker, a marker missing a required
 # attribute or carrying an empty `sections=`, a named section heading that
-# does not exist or exists more than once, no ADR files, or zero amendments
-# scanned. 70 rather than a silent 0, because a scan that did not run and a
-# clean tree are different answers, and this guard exists precisely to stop
-# a false claim from reading as clean.
+# does not exist or exists more than once, no such directory, no ADR files,
+# or zero amendments scanned. 70 rather than a silent 0, because a scan that
+# did not run and a clean tree are different answers, and this guard exists
+# precisely to stop a false claim from reading as clean.
 set -uo pipefail
 
 if [[ $# -gt 1 ]]; then
@@ -115,7 +116,7 @@ root = Path(sys.argv[1])
 docs_dir = root / sys.argv[2]
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
-AMENDMENT_RE = re.compile(r"\bamend", re.IGNORECASE)
+AMENDMENT_RE = re.compile(r"\b(?:amend|correction)", re.IGNORECASE)
 APPLIES_RE = re.compile(r"<!--\s*amendment-applies:\s*(.*?)\s*-->")
 SUPERSEDES_RE = re.compile(r"<!--\s*amendment-supersedes:\s*(.*?)\s*-->")
 ALLOW_RE = re.compile(r"amendment-supersedes-allow:\s*(.*?)\s*(?:-->)?\s*$")
@@ -231,7 +232,7 @@ class Doc:
         for i, (line, level, text) in enumerate(self.headings):
             if text != name:
                 continue
-            nested = any(s < line < e for s, e in spans) and not is_amendment(level, text)
+            nested = any(s < line < e for s, e in spans)
             if nested:
                 continue
             matches.append(i)
