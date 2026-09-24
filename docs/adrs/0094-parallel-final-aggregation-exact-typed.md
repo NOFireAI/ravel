@@ -304,7 +304,9 @@ explained there.
    means a config change plus a process restart, the same rollback
    story every other `SqlConfig` field already has; an earlier draft
    incorrectly described this as flippable without a redeploy, which
-   this repo's config loading does not support.
+   this repo's config loading does not support. The default is now
+   `true`: see the default-flip amendment below for the ClickBench
+   evidence that changed it.
 5. **Differential test proves bit-identical results across partition
    counts under an explicit canonical ordering, not "bit-identical rows"
    unqualified.** A `GROUP BY` without an `ORDER BY` has no row-order
@@ -614,7 +616,7 @@ flowchart TD
 
 ## Amendment 2026-08-26 (issue #741): default flips to `true`
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="default-flip amendment" -->
 
 Status: Accepted (amends decision 4's default; the classification of
 decision 1 and the determinism argument of decision 3 are unchanged).
@@ -696,7 +698,7 @@ exact-typed class, not the partial-stage one.
 
 ## Amendment 2026-08-26 (issue #771): `avg` over integer input, rejected
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="this rejects a proposed widening, so decision 1's classification stands exactly as written; what it adds is the cited DataFusion accumulator behaviour and tests that pin it" -->
 
 Status: Rejected. `avg`/`mean` remain never eligible, over every input type.
 Decision 1's classification is unchanged and no behavior changed with this

@@ -78,7 +78,9 @@ the other two:
    treated as referencing every dynamic column plus the `attrs_raw`
    overflow column; per-key projection through `attrs['k']` expressions
    is out of scope for this ADR and left for the typed-attribute-columns
-   epic. `read_block` decompresses and decodes only pages for the
+   epic (that exclusion is retired by the per-key projection amendment
+   below, which brings literal-key `attrs['k']` chains into scope).
+   `read_block` decompresses and decodes only pages for the
    resolved column set; skip-index and bloom evaluation, which already
    operate on stored statistics rather than decoded pages, are unchanged.
    Whole-object GET is retained; `RlogRangeReader` (`ravel-logseg::ranged`)
@@ -116,7 +118,7 @@ flowchart LR
 
 ## Amendment (2026-09-14): per-key `attrs['k']` projection is now in scope
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="per-key projection amendment" -->
 
 Decision 3 above says "per-key projection through `attrs['k']` expressions is
 out of scope for this ADR and left for the typed-attribute-columns epic", so a
