@@ -3706,6 +3706,16 @@ fn worker_partial_aggregate_reduction_window_is_load_bearing() {
 /// bound is a caller bug. The worker rejects a request carrying exactly one of
 /// `reduce_start_ns`/`reduce_end_ns` with a typed `Internal` status (never a
 /// silent one-sided filter), in either order.
+///
+/// The refusal runs after the whole per-segment fetch loop, so it also reports
+/// what those fetches cost (issue #1723). The oracle is the same request with a
+/// well-formed window over the same worker and the same store: identical
+/// segments fetched by an uncached `SegmentFetcher`, so an identical cost.
+///
+/// Mutation proof: RED against the reverted line. Dropping
+/// `.with_spend(&accounting, &stats)` from the lone-bound refusal in
+/// `SeriesFetchService::run_slice_metrics` (`service.rs`) makes both refusals
+/// report a default, zero-cost snapshot while the oracle's figure is nonzero.
 #[test]
 fn worker_partial_aggregate_lone_window_bound_is_internal_error() {
     let rt = Runtime::new().expect("runtime");
@@ -3713,6 +3723,29 @@ fn worker_partial_aggregate_lone_window_bound_is_internal_error() {
         let store = Arc::new(MemoryStore::new());
         let segments = partial_pushdown_corpus(&store).await;
         let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+
+        // The cost oracle: the same slice, a well-formed window, no refusal.
+        let accepted = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: false,
+                    want_max: false,
+                    reduce_start_ns: Some(NS),
+                    reduce_end_ns: Some(4 * NS),
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds");
+        assert_eq!(accepted.status, pb::status::Code::Ok);
+        assert!(
+            accepted.accounting.total_s3_bytes() > 0,
+            "the corpus must cost real bytes for the refusals to have something \
+             to report"
+        );
 
         // Only the start bound set.
         let start_only = SliceFetcher::fetch(
@@ -3736,6 +3769,10 @@ fn worker_partial_aggregate_lone_window_bound_is_internal_error() {
                 && start_only.status_message.contains("both or neither"),
             "expected the lone-bound refusal, got {:?}",
             start_only.status_message
+        );
+        assert_eq!(
+            start_only.accounting, accepted.accounting,
+            "the refusal reports what its fetch loop already spent, to the byte"
         );
 
         // Only the end bound set: the mirror-image caller bug is rejected the
@@ -3762,6 +3799,10 @@ fn worker_partial_aggregate_lone_window_bound_is_internal_error() {
                 && end_only.status_message.contains("both or neither"),
             "expected the lone-bound refusal, got {:?}",
             end_only.status_message
+        );
+        assert_eq!(
+            end_only.accounting, accepted.accounting,
+            "and so does the mirror-image refusal"
         );
     });
 }

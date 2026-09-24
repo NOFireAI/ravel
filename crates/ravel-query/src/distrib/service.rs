@@ -638,7 +638,12 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             };
             // The merge runs after the whole fetch loop, so a merge failure is
             // a slice that already paid for every one of its segments
-            // (issue #1723).
+            // (issue #1723). No object a worker can decode reaches this arm
+            // today: the caps passed here are `usize::MAX`, a non-monotonic run
+            // is refused by the fetch path above as `Corrupt`, and the writer
+            // refuses a priority column that is not parallel to its run. The
+            // spend rides along anyway, so the arm cannot become a free slice
+            // if a future decode path lets one of those through.
             let (partials, samples_merged) = reduce_partial_aggregates(scalar, &want, window)
                 .map_err(|e| {
                     SliceFailure::from(map_merge_error(e)).with_spend(&accounting, &stats)
