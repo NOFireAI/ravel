@@ -249,7 +249,8 @@ never qualify a phrase and never count as an occurrence of one.
   named section without its pointer, a retired phrase still standing
   unqualified, or `amendment-applies: none` with no reason.
 - **70**: the claim could not be checked at all, which is not a pass: an
-  amendment heading with no marker, a marker missing `sections=`,
+  amendment heading with no marker, a marker line that does not parse
+  (wrapped across lines, or a misspelled name), a marker missing `sections=`,
   `pointer=` or `phrase=`, an empty `sections=`, a named heading that does
   not exist or exists more than once, no such directory, no ADR files, or
   zero amendments scanned. Fix the marker or the heading it names; do not

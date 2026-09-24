@@ -721,11 +721,13 @@ than passing for "no pull request open".
   `amendment-applies: none` with no `reason=` (`none` turns the checks off,
   so it is the marker that has to justify itself). Exit 70 is a claim that
   could not be checked at all: an amendment heading with no marker, a marker
-  missing `sections=`, `pointer=` or `phrase=`, an empty `sections=`, a
+  line that does not parse (wrapped, or misspelled), a marker missing
+  `sections=`, `pointer=` or `phrase=`, an empty `sections=`, a
   named section heading that does not exist or that exists more than once,
   no such directory, no ADR files (`docs/adrs/*.md` less `README.md`, which
   is the index), or zero amendments scanned, since a scan that could not run
-  and a clean tree are different answers. Exit 64 is bad usage. Wired into
+  and a clean tree are different answers. Exit 64 is bad usage, including a
+  directory argument outside the repository. Wired into
   `gates.sh` and ci.yml's `doc-scripts` job, cases first. Cases in
   `scripts/guards/check-amendment-integrity.test.sh`.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an

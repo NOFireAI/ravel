@@ -90,8 +90,9 @@
 # something the document says that is not true of the document: a named
 # section without its pointer, a retired phrase still standing unqualified,
 # a `none` marker with no reason. 70 is a claim that cannot be checked at
-# all: an amendment heading with no marker, a marker missing a required
-# attribute or carrying an empty `sections=`, a named section heading that
+# all: an amendment heading with no marker, a marker line that does not
+# parse (wrapped, or misspelled), a marker missing a required attribute or
+# carrying an empty `sections=`, a named section heading that
 # does not exist or exists more than once, no such directory, no ADR files,
 # or zero amendments scanned. 70 rather than a silent 0, because a scan that
 # did not run and a clean tree are different answers, and this guard exists
@@ -114,6 +115,15 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 docs_dir = root / sys.argv[2]
+try:
+    docs_dir.resolve().relative_to(root.resolve())
+except ValueError:
+    print(
+        f"check-amendment-integrity.sh: {sys.argv[2]} is not under the "
+        f"repository root {root}",
+        file=sys.stderr,
+    )
+    sys.exit(64)
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 AMENDMENT_RE = re.compile(r"\b(?:amend|correction)", re.IGNORECASE)
@@ -123,6 +133,7 @@ ALLOW_RE = re.compile(r"amendment-supersedes-allow:\s*(.*?)\s*(?:-->)?\s*$")
 ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 NONE_RE = re.compile(r"^none\b")
 MARKER_LINE_RE = re.compile(r"<!--\s*amendment-")
+FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
 SECTION_SPLIT_RE = re.compile(r"(?<!\\)\|")
 WS_RE = re.compile(r"\s+")
 
@@ -187,7 +198,18 @@ class Doc:
         self.lines = text.splitlines()
         self.flat = Flat(self.lines)
         self.headings: list[tuple[int, int, str]] = []  # (line_idx, level, text)
+        # A `#` line inside a fenced code block is a comment, not a heading.
+        fence = None
         for idx, line in enumerate(self.lines):
+            f = FENCE_RE.match(line)
+            if f:
+                if fence is None:
+                    fence = f.group(1)[0]
+                elif f.group(1)[0] == fence:
+                    fence = None
+                continue
+            if fence is not None:
+                continue
             m = HEADING_RE.match(line)
             if m:
                 self.headings.append((idx, len(m.group(1)), m.group(2)))
@@ -308,6 +330,24 @@ for path in paths:
 
         applies_markers = APPLIES_RE.findall(block_text)
         supersedes_markers = SUPERSEDES_RE.findall(block_text)
+
+        # Every marker-shaped line must parse. A wrapped or misspelled marker
+        # beside a well-formed one would otherwise vanish, and the claim it
+        # makes would go unchecked while the tree reads clean.
+        unparsed = [
+            start + off + 1
+            for off, line in enumerate(doc.lines[start:end])
+            if MARKER_LINE_RE.search(line)
+            and "amendment-supersedes-allow:" not in line
+            and not (APPLIES_RE.search(line) or SUPERSEDES_RE.search(line))
+        ]
+        if unparsed:
+            problem(
+                f"{where}: amendment {heading_text!r} has a marker the guard "
+                f"cannot read at line(s) {unparsed}: a marker is one line, "
+                "named amendment-applies or amendment-supersedes"
+            )
+            continue
 
         if not applies_markers and not supersedes_markers:
             problem(

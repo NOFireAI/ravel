@@ -324,6 +324,55 @@ Nothing here has ever been amended.
 MD
 check "an ADR tree with zero amendment headings cannot be checked" "${t}" 70 "no amendment headings found"
 
+# A `#` comment inside a fenced code block is not a heading. Treated as one,
+# it cut Section A short above its pointer and reported a correct ADR as
+# lying about itself.
+t="$(new_tree fenced-comment)"
+python3 - "${t}/docs/adrs/0001-test-decision.md" <<'PYFIX'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace(
+    "## Section A\n\n",
+    "## Section A\n\n```yaml\n# Retention policy\nretain: 7d\n```\n\n",
+)
+open(p, "w").write(s)
+PYFIX
+check "a comment inside a fenced block is not a heading" "${t}" 0 "clean"
+
+# A second marker wrapped across two lines used to vanish beside a
+# well-formed first one, leaving its phrase unchecked on a clean exit.
+t="$(new_tree wrapped-second-marker)"
+python3 - "${t}/docs/adrs/0001-test-decision.md" <<'PYFIX'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = '<!-- amendment-supersedes: phrase="storage class STANDARD_FALLBACK" pointer="2026-09-23 amendment" -->'
+assert old in s
+s = s.replace(
+    old,
+    '<!-- amendment-supersedes: phrase="storage class STANDARD_FALLBACK"\npointer="2026-09-23 amendment" -->',
+)
+s = s.replace("## Decision\n", "## Decision\n\nCold data uses storage class STANDARD_FALLBACK.\n")
+open(p, "w").write(s)
+PYFIX
+check "a wrapped marker beside a valid one cannot be checked" "${t}" 70 "cannot read"
+
+# A misspelled marker name beside a valid one is refused the same way.
+t="$(new_tree misspelled-marker)"
+python3 - "${t}/docs/adrs/0001-test-decision.md" <<'PYFIX'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("<!-- amendment-supersedes:", "<!-- amendment-supercedes:")
+open(p, "w").write(s)
+PYFIX
+check "a misspelled marker beside a valid one cannot be checked" "${t}" 70 "cannot read"
+
+# A directory outside the repository is bad usage, not a finding.
+t="$(new_tree outside-root)"
+check "a directory outside the repository is bad usage" "${t}" 64 "is not under the repository root" "${TMP}"
+
 t="$(new_tree bad-usage)"
 out="$(cd "${t}" && bash scripts/guards/check-amendment-integrity.sh docs/adrs extra-arg 2>&1)"; rc=$?
 if [[ "${rc}" == 64 ]]; then
