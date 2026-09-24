@@ -7671,6 +7671,38 @@ mod tests {
         );
     }
 
+    /// Issue #1976: `resolve_stats_head`'s HEAD GET must degrade quietly on
+    /// a retryable failure (`StoreError::is_retryable`), not surface as an
+    /// error: the artifact is optional and the query is correct without it,
+    /// so a single throttling/timeout blip must not fail the whole query.
+    /// The counterpart to
+    /// `load_column_stats_head_get_permanent_failure_surfaces_as_error`.
+    #[tokio::test]
+    async fn load_column_stats_head_get_retryable_failure_degrades_to_none() {
+        let inner = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let part_hash = *blake3::hash(b"part-head-retryable").as_bytes();
+        install_logs_stats(&inner, part_hash, 1).await;
+
+        let key = crate::fold::head_object_key(&tenant(), signal);
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::Timeout).with_key_contains(key.clone()));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("a retryable failure on the HEAD must degrade to Ok(None), never an error");
+        assert!(loaded.is_none());
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Timeout) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
     /// Issue #1976: `fetch_stats_object`'s GET of the resolved per-part v3
     /// object must surface a non-`NotFound` failure as a real error, not be
     /// read as "part simply uncovered". Same caller as the HEAD-GET tests
@@ -7723,6 +7755,58 @@ mod tests {
         }
         assert!(
             store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
+    /// Issue #1976: `fetch_stats_object`'s GET of the resolved per-part v3
+    /// object must degrade quietly on a retryable failure
+    /// (`StoreError::is_retryable`), not surface as an error, for the same
+    /// reason as `load_column_stats_head_get_retryable_failure_degrades_to_none`.
+    #[tokio::test]
+    async fn load_column_stats_object_get_retryable_failure_degrades_to_none() {
+        let inner = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let part_hash = *blake3::hash(b"part-object-retryable").as_bytes();
+        install_logs_stats(&inner, part_hash, 1).await;
+
+        let head_bytes = inner
+            .get(
+                &crate::fold::head_object_key(&tenant(), signal),
+                GetRange::Full,
+            )
+            .await
+            .expect("head")
+            .data;
+        let head = crate::snapshot_format::decode_head(&head_bytes).expect("decode head");
+        let stats_key = head
+            .parts
+            .first()
+            .and_then(|p| p.column_stats.as_ref())
+            .expect("column_stats ref")
+            .key
+            .clone();
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Timeout).with_key_contains(stats_key.clone()),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect(
+                "a retryable failure on the stats object must degrade quietly, never an error",
+            );
+        assert!(
+            loaded.is_none(),
+            "the one part is simply left uncovered, with no other part to load: {loaded:?}"
+        );
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Timeout) >= 1,
             "the injected fault must actually have fired"
         );
     }
