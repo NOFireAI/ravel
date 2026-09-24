@@ -1670,6 +1670,7 @@ fn build_resource_labels(
 
     let service_name = find_attr_value(&resource.attributes, "service.name")?;
     let service_namespace = find_attr_value(&resource.attributes, "service.namespace")?;
+    let has_service_name = service_name.is_some();
     if let Some(name) = service_name {
         let job = match service_namespace {
             Some(ns) if !ns.is_empty() => format!("{ns}/{name}"),
@@ -1701,7 +1702,16 @@ fn build_resource_labels(
         .attributes
         .iter()
         .filter(|kv| {
-            !JOB_INSTANCE_SOURCE_KEYS.contains(&kv.key.as_str())
+            // `service.namespace` is only actually consumed above when
+            // `service.name` is present; without a name its value feeds
+            // nothing, so it must count as dropped like any other unused
+            // attribute rather than being blanket-excluded with the two keys
+            // that are always consumed.
+            let consumed = match kv.key.as_str() {
+                "service.namespace" => has_service_name,
+                key => JOB_INSTANCE_SOURCE_KEYS.contains(&key),
+            };
+            !consumed
                 && !limits
                     .resource_attribute_allowlist
                     .iter()
@@ -2347,7 +2357,9 @@ mod tests {
 
     #[test]
     fn no_job_label_without_service_name() {
-        // namespace alone, no service.name: nothing to synthesize job from.
+        // namespace alone, no service.name: nothing to synthesize job from,
+        // so the namespace's value is consumed by nothing and counts as
+        // dropped, exactly like any other unused attribute (issue #116).
         let rm = resource_metrics(
             vec![string_kv("service.namespace", "payments")],
             vec![gauge_metric(
@@ -2361,8 +2373,12 @@ mod tests {
             &IngestLimits::default(),
             1_000,
         );
-        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points[0].labels.get("job"), None);
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResourceAttributesDropped { count: 1 }]
+        );
+        assert_eq!(resource_attrs_dropped_from_rejections(&out.rejected), 1);
     }
 
     // --- allowlist flattening ---
