@@ -2134,16 +2134,8 @@ pub async fn start(
                 .merge(remote_write::router(mtls_rw_state));
         }
     }
-    let catalog = query::build_catalog(
-        store.clone(),
-        config.shard_count,
-        config.disable_cache,
-        config.catalog_cache_max_bytes,
-        config.cache_dir.clone(),
-        config.catalog_resolve_concurrency,
-        Some(ingest_lag.catalog_window_ns),
-        config.max_flush_delay,
-    )?;
+    let catalog =
+        query::build_catalog_for_server(store.clone(), &config, ingest_lag.catalog_window_ns)?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the
     // fetcher cache.

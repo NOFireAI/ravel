@@ -12,6 +12,8 @@ use ravel_query::http::{AppState, TenantResolver};
 use ravel_query::{EngineConfig, GetLimiter, QueryAdmissionController, QueryEngine, ReadCache};
 use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
 
+use crate::ServerConfig;
+
 /// The per-query `stats` object attached beside a query response's data
 /// (ADR-0044 sections 1 and 3): this query's actual accounting
 /// counters and its pre-execution cost estimate, rendered as camelCase JSON to
@@ -237,6 +239,34 @@ pub fn build_catalog(
         _ => catalog,
     };
     Ok(Arc::new(catalog))
+}
+
+/// The one place a `ServerConfig` becomes a `Catalog`: every field
+/// [`build_catalog`] reads is taken from `config` here, and [`crate::start`]
+/// calls only this.
+///
+/// It exists so that the field mapping is reachable from a test. `start`
+/// builds a whole process and cannot be called from one, so a mapping
+/// assembled inside it (`config.catalog_resolve_concurrency` silently
+/// becoming `None`, or the per-prefix constant) would type-check and leave
+/// every test green. `catalog_window_ns` is the one input that is not a
+/// `ServerConfig` field: `start` resolves it through `resolve_ingest_lag`
+/// first.
+pub fn build_catalog_for_server(
+    store: Arc<dyn ObjectStoreBackend>,
+    config: &ServerConfig,
+    catalog_window_ns: i64,
+) -> anyhow::Result<Arc<Catalog>> {
+    build_catalog(
+        store,
+        config.shard_count,
+        config.disable_cache,
+        config.catalog_cache_max_bytes,
+        config.cache_dir.clone(),
+        config.catalog_resolve_concurrency,
+        Some(catalog_window_ns),
+        config.max_flush_delay,
+    )
 }
 
 /// Build the query `AppState`. `engine_config` carries the resolved query
@@ -881,6 +911,120 @@ mod catalog_cache_tests {
             catalog.config().byte_cache_max_bytes,
             0,
             "--disable-cache still turns the byte cache off"
+        );
+    }
+
+    /// A `ServerConfig` carrying whatever `start` would have resolved for a
+    /// plain `--mode all` process. Only the catalog inputs matter to the
+    /// tests below; the rest is here because `ServerConfig` has no `Default`.
+    fn server_config() -> crate::ServerConfig {
+        crate::ServerConfig {
+            mode: crate::Mode::All,
+            listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            shard_count: 1,
+            max_inflight_flushes: 1,
+            max_queued_flushes: 8,
+            adaptive_flush_delay: false,
+            max_flush_delay: Duration::from_secs(2),
+            max_flush_delay_idle: Duration::from_secs(40),
+            min_flush_bytes: 256 * 1024,
+            tenant_resolver: Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            mtls_listener: None,
+            fold_tenants: Vec::new(),
+            fold: crate::FoldTaskConfig::default(),
+            maintain: crate::MaintenanceTaskConfig::default(),
+            alerting: crate::AlertEvalConfig::default(),
+            oidc_refresh: None,
+            otap: false,
+            limits: crate::LimitsConfig::default(),
+            metrics_tenant_labels: false,
+            deployment_key: None,
+            gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+            query_deadline: EngineConfig::default().deadline,
+            store_probe_interval: crate::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+            admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+            query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+            max_s3_requests: EngineConfig::default().max_s3_requests,
+            query_budgets: crate::config::QueryBudgets::default(),
+            scrub_period: Duration::from_secs(7 * 86_400),
+            indexed_fields: crate::postings_config::IndexedFieldConfig::default(),
+            typed_attr_columns: crate::typed_attr_config::TypedAttrColumnConfig::default(),
+            disable_cache: false,
+            cache_max_bytes: 256 * 1024 * 1024,
+            catalog_cache_max_bytes: 256 * 1024 * 1024,
+            process_memory_budget_bytes: u64::MAX,
+            process_memory_budget_is_fallback: false,
+            cache_dir: None,
+            catalog_resolve_concurrency: None,
+            ingest_concurrency_limit: crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+                1024,
+            ),
+            ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            idle_tenant_state_ttl: Duration::from_secs(3600),
+            distrib: None,
+            remote_clusters: Vec::new(),
+            audit_pipeline: ravel_maintain::AuditPipelineConfig::default(),
+            audit_text: ravel_maintain::AuditTextPolicy::default(),
+            shutdown_timeout: crate::DEFAULT_SHUTDOWN_TIMEOUT,
+            drain_settle_interval: Duration::ZERO,
+            max_ingest_lag: crate::DEFAULT_MAX_INGEST_LAG,
+        }
+    }
+
+    /// ADR-1733 decision 2, the last hop: the ceiling `start` resolved onto
+    /// `ServerConfig::catalog_resolve_concurrency` must reach the `Catalog`
+    /// the process serves queries from. `start` itself cannot be called from
+    /// a test, which is why the field mapping lives in
+    /// `build_catalog_for_server` and this asserts on the catalog that
+    /// function returns.
+    ///
+    /// RED: in `build_catalog_for_server`, pass `None` for the ceiling, or
+    /// the `DEFAULT_RESOLVE_PREFIX_CONCURRENCY` constant, instead of
+    /// `config.catalog_resolve_concurrency`. Both type-check, and the
+    /// catalog's ceiling is then 128 rather than the 512 asserted here.
+    #[test]
+    fn build_catalog_for_server_applies_the_configured_resolve_ceiling() {
+        let derived = crate::config::derive_catalog_resolve_concurrency(4);
+        assert_ne!(
+            derived,
+            ravel_catalog::DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
+            "sanity: the derived ceiling must differ from the per-prefix default, or this \
+             test could not tell a dropped ceiling from an applied one"
+        );
+        let config = crate::ServerConfig {
+            catalog_resolve_concurrency: Some(derived),
+            ..server_config()
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &config, 7_200_000_000_000).expect("catalog builds");
+        assert_eq!(
+            catalog.config().resolve_get_concurrency,
+            derived,
+            "the resolved per-process ceiling must reach the catalog the server queries"
+        );
+    }
+
+    /// The same mapping's other inputs: `build_catalog_for_server` reads them
+    /// from the `ServerConfig` too, so a field crossed with another one, or
+    /// left at a constant, is visible on the catalog it returns.
+    #[test]
+    fn build_catalog_for_server_applies_the_other_catalog_inputs() {
+        let config = crate::ServerConfig {
+            shard_count: 3,
+            catalog_cache_max_bytes: 64 * 1024 * 1024,
+            ..server_config()
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &config, 9_000_000_000_000).expect("catalog builds");
+        assert_eq!(catalog.config().shard_count, 3);
+        assert_eq!(catalog.config().byte_cache_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            catalog.config().max_ingest_lag_ns,
+            9_000_000_000_000,
+            "the listening window is the caller's resolved value, not the config default"
         );
     }
 }
