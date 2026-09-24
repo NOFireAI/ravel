@@ -114,7 +114,8 @@ changes once real data exists.
 second crate.** Extract a trait (name TBD at implementation time, e.g.
 `SegmentCodec`) covering what `build.rs`/`read.rs` need per signal:
 decode an input object's footer/identity, stream-merge N inputs into
-size-capped output parts, encode an output object. `scan.rs`,
+size-capped output parts (split on a size target only, never on a stream
+boundary: 2026-08-26 amendment below), encode an output object. `scan.rs`,
 `publish.rs`, `config.rs`, and the crash-recovery/convergence logic stay
 untouched and fully shared. Implement the trait twice: a thin wrapper
 around the existing RSEG logic (behavior-preserving refactor, gated by
@@ -205,7 +206,7 @@ construction once the codec seam exists.
 
 ## Amendment 2026-08-26: a part splits on a size target; a stream may span parts
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="2026-08-26 amendment" -->
 
 Status: accepted. Supersedes the one-stream-per-part rule that the RLOG
 merge implemented under "stream-merge N inputs into size-capped output
@@ -341,7 +342,7 @@ longer, and both emit N parts for the same reason a compaction does.
 
 ## Amendment 2026-08-29: the heap knob is a split target; the stored knob counts every section
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment 2026-08-26: a part splits on a size target; a stream may span parts" pointer="2026-08-29 amendment" -->
 
 Status: accepted. Amends the wording of the 2026-08-26 amendment above.
 Issues #872, #680.

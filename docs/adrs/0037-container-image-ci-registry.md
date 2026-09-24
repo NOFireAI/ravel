@@ -69,7 +69,10 @@ repo config).
 3. **Runner: `ubuntu-latest`, matching `docker-build`.** Native amd64,
    no QEMU, so the SIGSEGV above cannot occur in CI. `linux/amd64` is
    the only platform published; see Rejected alternatives for why
-   arm64 is deferred rather than added now.
+   arm64 is deferred rather than added now. Amended below: the
+   verifiable release artifacts amendment adds SBOM and provenance to
+   what this decision builds, and the multi-architecture publishing
+   amendment retires the single-platform rule.
 
 4. **Trigger and tag scheme**, new workflow
    `.github/workflows/publish-images.yml`, a separate workflow file from
@@ -96,7 +99,9 @@ repo config).
    Per-main-commit images are deferred to the same arm64/prebuilt
    follow-up as multi-arch, not solved here. No tag scheme exists yet in
    the repo (workspace version is `0.1.0` pre-release, no git tags cut);
-   this ADR establishes the first one.
+   this ADR establishes the first one. What a tag names and what a tag
+   push does are both amended below by the verifiable release artifacts
+   amendment.
    The job declares `permissions: {contents: read, packages: write}`
    explicitly rather than relying on the org default (which may be
    read-only), and the image path is the hardcoded, already-lowercase
@@ -187,7 +192,7 @@ repo config).
 
 ## Amendment: verifiable release artifacts
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="verifiable release artifacts amendment" -->
 
 An independent due-diligence review (findings K-1 and K-2) rated the
 release artifact itself as the weak half of an otherwise strong
@@ -264,7 +269,10 @@ and signing step.
 Because releases publish from the mirror, the certificate identity
 consumers verify is the mirror's workflow path. That is a feature: the
 mirror is the repository strangers can actually read, so the identity in
-the certificate is auditable by the people the signature is for.
+the certificate is auditable by the people the signature is for. (The
+mirror premise is retired by the repository topology amendment below,
+which leaves the identity string unchanged; what is signed is changed by
+the multi-architecture publishing amendment below.)
 `workflow_dispatch` `manual-<short-sha>` images are signed too; their
 certificate carries the branch ref instead of a tag ref, which is
 exactly the distinction a verifier should see.
@@ -300,8 +308,10 @@ closed on failure, absence, or timeout.
 The implicit gate argument ("tags are only ever cut from commits that
 already passed PR CI on protected `main`") was considered and rejected,
 because for this repository it is factually hollow: the tagged commit
-lives on the mirror's rewritten history, so its SHA never went through
-the private repo's protected-main PR CI at all. The only CI evidence
+lives on the mirror's rewritten history (a premise the repository
+topology amendment below retires, without weakening this rejection), so
+its SHA never went through the private repo's protected-main PR CI at
+all. The only CI evidence
 that can exist for the exact tagged commit is the mirror's own
 push-to-main `ci.yml` run, and today nothing checks that it ran, let
 alone passed. Discipline on the private repo cannot gate a SHA it has
@@ -381,7 +391,7 @@ symlink pointing outside the repository.
 
 ## Amendment: multi-architecture publishing
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision|Amendment: verifiable release artifacts" pointer="multi-architecture publishing amendment" -->
 
 The original ADR deferred multi-arch rather than rejecting it, on two
 conditions that have both changed. It said nothing in the deploy targets
@@ -426,7 +436,9 @@ The publish matrix gains a platform dimension. `linux/amd64` builds on
 QEMU.
 
 GitHub's arm64-hosted runners are generally available and free for public
-repositories, which this one is, and releases publish from the public mirror.
+repositories, which this one is, and releases publish from the public mirror
+(retired by the repository topology amendment below: this repository is the
+public one).
 The label is `ubuntu-24.04-arm` or `ubuntu-22.04-arm`; there is no
 `ubuntu-latest-arm`, so the version is part of the label and pinning it is not
 optional.
@@ -577,7 +589,7 @@ set out to avoid.
 
 ## Amendment: repository topology
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment: verifiable release artifacts|Amendment: multi-architecture publishing" pointer="repository topology amendment" -->
 
 The two amendments above reason throughout about releases publishing from a
 public mirror. Decision 7 grounds keyless signing in "the mirror is the

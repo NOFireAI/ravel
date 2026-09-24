@@ -34,7 +34,7 @@ from request bodies.
 
 ## Amendment (2026-09-07): the loopback refusal covers every listener the shared resolver backs
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="the Decision's loopback refusal stands exactly as written; this records an implementation that did not honour it and the tightened guard, and retires no earlier wording" -->
 
 The Decision above promised that `--dev-insecure-tenant-header` "refuses to
 enable outside loopback binds". As shipped, `Cli::validate` tested only

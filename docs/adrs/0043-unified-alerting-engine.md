@@ -75,7 +75,9 @@ evaluator scheduler mirrors, not a new scheduling mechanism.
    itself). Sink failures are logged and retried next tick from the
    latest record, never block the record from being written - the
    durable record is the source of truth, the sink is a notification,
-   not a second commit path.
+   not a second commit path. "On the same tick a transition is written"
+   is no longer the only time a sink fires: the repeat notifications
+   amendment below adds a repeat cadence while a rule stays firing.
 7. **Query surface**: `alerts` and `audit` SQL tables follow
    the exact `logs` table provider/pushdown/scan pattern (ADR-0033),
    reusing `LogSegmentFetcher`'s shape against the shared RLOG-format
@@ -167,7 +169,7 @@ evaluator scheduler mirrors, not a new scheduling mechanism.
 
 ## Amendment: repeat notifications while firing
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="repeat notifications amendment" -->
 
 Decisions 4 and 6, combined, notify exactly once per transition: a rule
 that starts firing and stays firing sends one notification and then

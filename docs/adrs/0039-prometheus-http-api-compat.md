@@ -54,7 +54,9 @@ additive only, no existing route changed:
    empty `data` object is a valid, honest answer under Prometheus's own
    contract (an empty result is not an error) rather than inventing
    metadata Ravel doesn't have. A future epic can populate it for real if
-   OTLP metric descriptors get captured; that is out of scope here.
+   OTLP metric descriptors get captured; that is out of scope here. The
+   always-empty half of this is superseded for two reserved family names
+   by the ADR-1103 amendment below.
 3. `GET /-/healthy` and `GET /-/ready`: thin aliases over the existing
    `/healthz`/`/readyz` handlers (`services/ravel-server/src/health.rs`).
    No new health logic. These are Prometheus's own path convention,
@@ -95,13 +97,14 @@ additive only, no existing route changed:
   changed.
 - `/api/v1/metadata` returning empty is a known, visible limitation until
   a later epic captures real OTLP metric descriptors; not silently
-  degraded, documented in docs/query-engine.md.
+  degraded, documented in docs/query-engine.md. Narrowed by the ADR-1103
+  amendment below: two reserved log families are always present.
 - The native-histogram subquery gap stays open, tracked separately, and
   does not block the "Grafana works day one" acceptance bar.
 
 ## Amendment (ADR-1103)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision|Consequences" pointer="ADR-1103 amendment below" -->
 
 ADR-1103 decision 4 supersedes decision 2's empty-`data` claim for exactly
 two reserved family names, `ravel_log_lines` and `ravel_log_bytes`:
