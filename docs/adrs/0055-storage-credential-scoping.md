@@ -861,8 +861,10 @@ section is each of the places that asserts, in one phrasing or another,
 that `catalog/*` is undeletable:
 
 1. the Consequences bullet;
-2. §1's "nothing in the current codebase ever deletes ... `catalog/*`";
-3. §1's WORM list of prefixes nothing legitimately deletes;
+2. the context's "nothing in the current codebase ever deletes ...
+   `catalog/*`" (under "What each role actually does, read from the code");
+3. the context's WORM list of prefixes nothing legitimately deletes (under
+   "The WORM pairing question this ADR must answer");
 4. §2's "never ... `catalog/`" clause;
 5. §2's disjointness paragraph;
 6. §2's description of what

@@ -369,6 +369,21 @@ open(p, "w").write(s)
 PYFIX
 check "a misspelled marker beside a valid one cannot be checked" "${t}" 70 "cannot read"
 
+# Prose sharing a line with a marker is still prose: a reasonless allow
+# marker at the end of the phrase's own line must not hide the phrase.
+t="$(new_tree allow-same-line)"
+python3 - "${t}/docs/adrs/0001-test-decision.md" <<'PYFIX'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace(
+    "## Decision\n",
+    "## Decision\n\nThe store uses storage class STANDARD_FALLBACK for cold data. <!-- amendment-supersedes-allow: -->\n",
+)
+open(p, "w").write(s)
+PYFIX
+check "a reasonless allow on the phrase's own line does not hide it" "${t}" 1 "appears without its pointer"
+
 # A directory outside the repository is bad usage, not a finding.
 t="$(new_tree outside-root)"
 check "a directory outside the repository is bad usage" "${t}" 64 "is not under the repository root" "${TMP}"
