@@ -3546,6 +3546,40 @@ pub async fn start(
 }
 
 #[cfg(test)]
+mod start_catalog_wiring_tests {
+    /// ADR-1733 decision 2 reachability: [`start`] must reach its `Catalog`
+    /// through [`query::build_catalog_for_server`], the one field mapping a
+    /// test can call. Reverting that call site to an inline
+    /// `query::build_catalog` call passing `None` for the ceiling type-checks
+    /// and leaves every test in this workspace green, because `start` builds a
+    /// whole process and no test can call it, and `None` is a value the
+    /// parameter accepts. What the claim is about is which function that one
+    /// line names, and that is exact.
+    ///
+    /// Asserted over this file's own source, the way `main.rs` pins its
+    /// `ServerConfig` literal. The needles are a path and an open paren, which
+    /// rustfmt has no line to break inside, and they are assembled with
+    /// `concat!` so this test's own source cannot match itself.
+    #[test]
+    fn start_builds_its_catalog_through_build_catalog_for_server() {
+        const SRC: &str = include_str!("lib.rs");
+        let wired = concat!("query::build_catalog_for_", "server(");
+        let inline = concat!("query::build_", "catalog(");
+        assert_eq!(
+            SRC.matches(wired).count(),
+            1,
+            "start must call query::build_catalog_for_server exactly once"
+        );
+        assert_eq!(
+            SRC.matches(inline).count(),
+            0,
+            "start must not call query::build_catalog directly: the argument mapping would then \
+             live inside start, where no test can reach it"
+        );
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod shutdown_drain_tests {
     use std::sync::Arc;

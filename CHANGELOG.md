@@ -145,7 +145,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Every resolve-path request is bounded that way, keyed by its own key
   prefix: a commit record by its shard-hour prefix, a snapshot's parts by the
   one directory they share, its postings and column stats by theirs, and a
-  LIST by the prefix it lists. The 1,024 is an interim cap: the ADR bounds
+  LIST by the prefix it lists. A prefix's semaphore is created on the first
+  request that needs it and removed once no request holds or waits on it,
+  including when the last requests on that prefix finish at the same moment,
+  so a long-running process holds one entry per prefix in flight rather than
+  one per prefix the bucket has ever had. The 1,024 is an interim cap: the ADR bounds
   in-flight resolve memory by reserving each request's listed size against
   the ADR-1170 process budget, that reservation is not wired up yet, and
   until it is a derived ceiling is held at 1,024 rather than allowed to reach

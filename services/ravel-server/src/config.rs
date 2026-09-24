@@ -1484,25 +1484,24 @@ pub struct Cli {
 
     /// Per-process ceiling on the object-store requests (LISTs and GETs) the
     /// catalog resolve path keeps in flight at once, across every concurrent
-    /// resolve. Unset, it is derived from this process's query
-    /// concurrency `Q` as `clamp(Q * 128, 128, 4096)`, then held at an interim
-    /// 1,024 until the ADR-1170 memory reservation lands. `0` is rejected at
-    /// startup rather than clamped to 1, because a zero-permit semaphore would
-    /// deadlock every resolve, and so is any value above 4,096
+    /// resolve. Unset, it is derived from this process's query concurrency `Q`
+    /// as `clamp(Q * 128, 128, 4096)`, then held at an interim 1,024 until the
+    /// ADR-1170 memory reservation lands; `Q` is `--max-concurrent-queries`
+    /// when that flag bounds queries, and the same `max(8, 2 * cores)` the
+    /// other derived performance defaults use when it does not. Set
+    /// explicitly, the value is used as given: neither the derivation nor the
+    /// interim cap applies to it. Either way the resolved number is logged at
+    /// startup beside the other derived performance defaults. `0` is rejected
+    /// at startup rather than clamped to 1, because a zero-permit semaphore
+    /// would deadlock every resolve, and so is any value above 4,096
     /// (`ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY`), past which the number is
     /// a typo rather than a setting. This is not the only resolve bound: each
     /// key prefix also carries its own 128-request bound with no flag, and a
     /// request holds a permit of each, so no one prefix exceeds 128 however
     /// high this ceiling is set.
     ///
-    /// `Q` is `--max-concurrent-queries` when that flag bounds queries, and
-    /// the same `max(8, 2 * cores)` the other derived performance defaults use
-    /// when queries are unbounded, so a host deriving more than 1,024 gets
-    /// 1,024. Set explicitly, this value wins over the derivation unchanged
-    /// and is used as given. Either way the resolved number is logged at
-    /// startup beside the other derived performance defaults. Both refusals
-    /// above are [`Cli::validate`]'s; see the constant's doc for the
-    /// per-prefix arithmetic behind the 4,096.
+    /// Both refusals above are [`Cli::validate`]'s; see the constant's doc for
+    /// the per-prefix arithmetic behind the 4,096.
     #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
     pub catalog_resolve_concurrency: Option<usize>,
 

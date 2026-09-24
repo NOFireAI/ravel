@@ -937,8 +937,13 @@ Two limits bound these requests, and a resolve request holds a permit of
 each (ADR-1733 decision 1).
 
 `CatalogConfig::resolve_prefix_concurrency` bounds how many of them may be
-in flight under one shard-hour commit prefix, whatever else the process is
-doing. It defaults to 128, the figure measured below, and has no CLI flag:
+in flight under one key prefix, whatever else the process is doing. A
+request's prefix is its key's parent path, so a commit record is bounded by
+its shard-hour commit prefix, a snapshot's parts by the one `snap/`
+directory they share, its postings and column stats by their `idx/`
+directory, and a LIST by the prefix it lists (the keying is stated below and
+amended on ADR-1733). It defaults to 128, the figure measured below, and has
+no CLI flag:
 it is a property of what one S3 prefix sustains, not of the host. Its
 semaphores are created on first use for a prefix and dropped once no
 request holds one, so a resolve over many shard-hours does not leave a
