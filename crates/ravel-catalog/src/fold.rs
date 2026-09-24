@@ -3090,6 +3090,7 @@ mod tests {
     use ravel_proto::commit::v1::{CompactionInputIdentity, RetentionTombstone, RewriteDrop};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
     use crate::config::{
@@ -3763,6 +3764,377 @@ mod tests {
             loaded.by_content_hash.len(),
             3,
             "the reused baseline plus the new segment cover all three"
+        );
+    }
+
+    /// Captures WARN and ERROR events with their message and fields flattened
+    /// to one line each, so a test can assert which level a log line landed
+    /// at without depending on `tracing`'s own formatting.
+    #[derive(Clone, Default)]
+    struct LevelCapture {
+        lines: Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl LevelCapture {
+        fn lines(&self) -> Vec<(tracing::Level, String)> {
+            self.lines.lock().expect("lock").clone()
+        }
+
+        fn count_at(&self, level: tracing::Level, needle: &str) -> usize {
+            self.lines
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(l, line)| *l == level && line.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LevelCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let level = *event.metadata().level();
+            if level != tracing::Level::WARN && level != tracing::Level::ERROR {
+                return;
+            }
+            let mut visitor = LevelCaptureVisitor::default();
+            event.record(&mut visitor);
+            self.lines
+                .lock()
+                .expect("lock")
+                .push((level, visitor.finish()));
+        }
+    }
+
+    #[derive(Default)]
+    struct LevelCaptureVisitor {
+        message: String,
+        fields: Vec<String>,
+    }
+
+    impl LevelCaptureVisitor {
+        fn finish(self) -> String {
+            let mut line = self.message;
+            for field in self.fields {
+                line.push(' ');
+                line.push_str(&field);
+            }
+            line
+        }
+    }
+
+    impl tracing::field::Visit for LevelCaptureVisitor {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields.push(format!("{}={}", field.name(), value));
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields.push(format!("{}={:?}", field.name(), value));
+            }
+        }
+    }
+
+    /// Issue #1964: a GET failure on the previous fold's per-part
+    /// column-stats object (`.cstat`), other than `NotFound`, must surface at
+    /// `error!`, naming the key, rather than the quiet `warn!` a genuine
+    /// absence gets. Either way the fold still falls back to rebuilding the
+    /// part's statistics from scratch: the reuse baseline is an optimization,
+    /// never a correctness gate. `ScriptedFault` has no `AccessDenied` kind (a
+    /// `ravel-object-store` testing gap, out of scope here), so `Permanent`
+    /// stands in as a structurally equivalent non-`NotFound` GET failure: the
+    /// fixed code branches on `Err(StoreError::NotFound)` versus every other
+    /// `Err`, not on which variant the "other" arm carries.
+    #[tokio::test]
+    async fn cstat_baseline_permanent_failure_logs_at_error() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(".cstat"),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        set_status_column_config(store.inner()).await;
+
+        publish_logs_segment(store.inner(), 1, 10, &[200, 404, 200]).await;
+        publish_logs_segment(store.inner(), 2, 10, &[500, 200]).await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(
+            first.column_stats_part_objects_built > 0,
+            "the first fold must build a column-stats baseline for the second fold to reuse"
+        );
+
+        publish_logs_segment(store.inner(), 3, 11, &[200, 200]).await;
+
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold succeeds despite the faulted baseline read");
+        assert!(!second.rebuilt);
+
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+        assert!(
+            capture.count_at(
+                tracing::Level::ERROR,
+                "previous per-part column-stats object GET failed"
+            ) >= 1,
+            "a non-NotFound GET failure on the .cstat baseline must log at error!, not warn!: {:?}",
+            capture.lines()
+        );
+    }
+
+    /// Counterpart to `cstat_baseline_permanent_failure_logs_at_error`: a
+    /// genuine `NotFound` on the `.cstat` baseline (modeled with
+    /// `NotFoundBlip`, an eventual-consistency blip rather than a permission
+    /// fault) must still degrade quietly to a `warn!`, exactly as before this
+    /// fix, never an `error!`.
+    #[tokio::test]
+    async fn cstat_baseline_not_found_blip_still_warns_quietly() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(".cstat"));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        set_status_column_config(store.inner()).await;
+
+        publish_logs_segment(store.inner(), 1, 10, &[200, 404, 200]).await;
+        publish_logs_segment(store.inner(), 2, 10, &[500, 200]).await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.column_stats_part_objects_built > 0);
+
+        publish_logs_segment(store.inner(), 3, 11, &[200, 200]).await;
+
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold succeeds");
+        assert!(!second.rebuilt);
+
+        assert!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
+        assert!(
+            capture.count_at(
+                tracing::Level::WARN,
+                "previous per-part column-stats object not found"
+            ) >= 1,
+            "a NotFound on the .cstat baseline must still log at warn!: {:?}",
+            capture.lines()
+        );
+        assert_eq!(
+            capture.count_at(
+                tracing::Level::ERROR,
+                "previous per-part column-stats object GET failed"
+            ),
+            0,
+            "a genuine absence must never log at error!"
+        );
+    }
+
+    /// Issue #1964: a GET failure on the previous fold's postings object
+    /// (`.npost`), other than `NotFound`, must surface at `error!`, naming
+    /// the key, rather than the quiet `warn!` a genuine absence gets. Either
+    /// way the fold still falls back to rebuilding postings from scratch:
+    /// reuse is an optimization, never a correctness gate. Uses real metrics
+    /// segments (`publish_real_segment`), not logs: a logs RLOG object never
+    /// decodes as an RSEG, so `build_postings` returns `None` before a
+    /// `.npost` object is ever written, and the reuse path this test targets
+    /// would never be reached.
+    #[tokio::test]
+    async fn npost_baseline_permanent_failure_logs_at_error() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(".npost"),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_1 = now_at_seal(10);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - NS_PER_HOUR,
+            &["cpu", "mem"],
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(
+            first.postings_built,
+            "the first fold must build a postings ref for the second fold's reuse baseline to exist"
+        );
+
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold succeeds despite the faulted baseline read");
+        assert!(!second.rebuilt);
+
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+        assert!(
+            capture.count_at(tracing::Level::ERROR, "previous postings GET failed") >= 1,
+            "a non-NotFound GET failure on the .npost baseline must log at error!, not warn!: {:?}",
+            capture.lines()
+        );
+    }
+
+    /// Counterpart to `npost_baseline_permanent_failure_logs_at_error`: a
+    /// genuine `NotFound` on the `.npost` baseline (modeled with
+    /// `NotFoundBlip`) must still degrade quietly to a `warn!`, exactly as
+    /// before this fix, never an `error!`.
+    #[tokio::test]
+    async fn npost_baseline_not_found_blip_still_warns_quietly() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(".npost"));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_1 = now_at_seal(10);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - NS_PER_HOUR,
+            &["cpu", "mem"],
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(first.postings_built);
+
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold succeeds");
+        assert!(!second.rebuilt);
+
+        assert!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
+        assert!(
+            capture.count_at(tracing::Level::WARN, "previous postings not found") >= 1,
+            "a NotFound on the .npost baseline must still log at warn!: {:?}",
+            capture.lines()
+        );
+        assert_eq!(
+            capture.count_at(tracing::Level::ERROR, "previous postings GET failed"),
+            0,
+            "a genuine absence must never log at error!"
         );
     }
 

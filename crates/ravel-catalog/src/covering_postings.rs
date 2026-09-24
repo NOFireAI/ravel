@@ -252,6 +252,7 @@ mod tests {
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_proto::commit::v1::CommitRecord;
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
@@ -397,6 +398,87 @@ mod tests {
         assert_eq!(loaded.covered_entries.len(), 1, "one covered entry");
         assert_eq!(loaded.part_blake3.len(), 1, "one covered part");
         assert!(!loaded.bytes.is_empty(), "the postings bytes are present");
+    }
+
+    /// Issue #1964: a GET failure on the postings object other than
+    /// `NotFound` (an `AccessDenied` on a missing `idx/*` read grant, most
+    /// commonly) must surface as a real error, not degrade to `Ok(None)`
+    /// indistinguishable from "no postings ref yet". `ScriptedFault` has no
+    /// `AccessDenied` kind (a `ravel-object-store` testing gap, out of scope
+    /// for this crate), so `Permanent` stands in as a structurally equivalent
+    /// non-`NotFound` GET failure: the code path this test pins branches on
+    /// `Err(StoreError::NotFound)` versus every other `Err`, not on which
+    /// variant the "other" arm carries.
+    #[tokio::test]
+    async fn postings_get_permanent_failure_surfaces_as_error() {
+        let inner = Arc::new(MemoryStore::new());
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        publish_real_segment(inner.as_ref(), 1, created, &["cpu", "mem"]).await;
+        fold(inner.clone(), now).await;
+
+        let key = head_key(&tenant_id().hash(), Signal::Metrics);
+        let head_bytes = inner.get(&key, GetRange::Full).await.expect("head").data;
+        let head = decode_head(&head_bytes).expect("decode head");
+        let postings_key = head.postings.expect("postings ref").key;
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(postings_key.clone()),
+        );
+        let faulty = FaultStore::new(inner.clone(), plan);
+
+        let err = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
+            .await
+            .expect_err(
+                "a non-NotFound GET failure on the postings object must surface as an error",
+            );
+        match err {
+            LoadPostingsError::Store { key: err_key, .. } => {
+                assert_eq!(err_key, postings_key, "error names the failing key");
+            }
+            other => panic!("expected LoadPostingsError::Store, got {other:?}"),
+        }
+        assert!(
+            faulty.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+    }
+
+    /// The counterpart to `postings_get_permanent_failure_surfaces_as_error`:
+    /// a genuine `NotFound` on the postings object (modeled here with
+    /// `NotFoundBlip`, an eventual-consistency blip rather than a permission
+    /// fault) must still degrade quietly to `Ok(None)`, exactly as before
+    /// this fix.
+    #[tokio::test]
+    async fn postings_get_not_found_blip_still_degrades_to_none() {
+        let inner = Arc::new(MemoryStore::new());
+        let now = 600_000 * NS_PER_HOUR;
+        let created = now - SEALED_AGE_NS;
+        publish_real_segment(inner.as_ref(), 1, created, &["cpu", "mem"]).await;
+        fold(inner.clone(), now).await;
+
+        let key = head_key(&tenant_id().hash(), Signal::Metrics);
+        let head_bytes = inner.get(&key, GetRange::Full).await.expect("head").data;
+        let head = decode_head(&head_bytes).expect("decode head");
+        let postings_key = head.postings.expect("postings ref").key;
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(postings_key),
+        );
+        let faulty = FaultStore::new(inner.clone(), plan);
+
+        let loaded = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
+            .await
+            .expect("a NotFound on the postings object must degrade to Ok(None), never an error");
+        assert!(loaded.is_none());
+        assert!(
+            faulty.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
     }
 
     #[tokio::test]
