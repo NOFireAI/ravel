@@ -190,11 +190,17 @@ inline sit in the review BODY under "Findings outside the diff:" and are
 counted separately on the status line; read those too. Once every finding is
 accounted for, `pr-review-status.sh` prints the exact merge command, pinned
 to the head SHA it just checked via `--match-head-commit` so the merge
-refuses if the branch moved since:
+refuses if the branch moved since. Run it as printed:
 
 ```sh
-gh pr merge <number> --rebase --match-head-commit <sha>
+ALLOW_LITERAL_SHA=1 gh pr merge <number> --rebase --match-head-commit <sha>
 ```
+
+The PreToolUse hook refuses a bare 40-character SHA unless the command
+carries `ALLOW_LITERAL_SHA=1`, and this is the case the prefix exists for:
+the pinned SHA is the check. Never swap it for a head resolved at merge time
+(`gh pr view --json headRefOid`), which matches whatever the head is by then
+and merges a push that landed after the review.
 
 **A merge queue landed on `protect-main` on 2026-09-13, and it changes what
 that command does.** The PR is added to the queue rather than merged on the
