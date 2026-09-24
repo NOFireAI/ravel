@@ -139,8 +139,8 @@ flowchart LR
     flush queue except host memory" still holds for it. What `Unlimited`
     opts out of is the process-wide bound on the sum of buffered rows
     waiting in the tenant maps; each individual buffer is still bounded by
-    that backstop, which is why the exemption exists. See the amendment
-    below.
+    that backstop, which is why the exemption exists. See the queued-flush
+    cap amendment below.
 
   `max_inflight_flushes` keeps its other meaning unchanged: it is the
   concurrency of flushes actually executing against the object store, and so
@@ -195,12 +195,12 @@ flowchart LR
 
   Amended by issue #1740. That last sentence is wrong: it enumerates two
   policies for a reached bound and there is a third, refusing the trigger
-  and leaving the rows buffered. See "Amendment: the queued-flush cap"
-  below, which adopts the count bound this bullet rejected.
+  and leaving the rows buffered. See the queued-flush cap amendment below,
+  which adopts the count bound this bullet rejected.
 
 ## Amendment: the queued-flush cap (issue #1740)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Consequences|Rejected alternatives" pointer="queued-flush cap amendment" -->
 
 The `Unlimited` exposure in the consequences above is now bounded by a count,
 `IngestConfig::max_queued_flushes` (default 8, per shard). Before spawning a

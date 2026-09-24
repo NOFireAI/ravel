@@ -111,6 +111,19 @@ t="$(new_tree bad-section)"
 sed -i.bak 's/sections="Section A|Section B"/sections="Section A|Section C"/' "${t}/docs/adrs/0001-test-decision.md"
 check "a marker naming a nonexistent section cannot be checked" "${t}" 70 "no matching heading"
 
+# A heading whose own text contains the separator is named with `\|`.
+t="$(new_tree escaped-pipe)"
+sed -i.bak 's/^## Section A$/## Section A: one \| two/' "${t}/docs/adrs/0001-test-decision.md"
+sed -i.bak 's/sections="Section A|Section B"/sections="Section A: one \\| two|Section B"/' "${t}/docs/adrs/0001-test-decision.md"
+check "a section name may escape the separator" "${t}" 0 "clean"
+
+# Without the escape the same name splits into two, and neither half is a
+# heading: unreadable, not clean.
+t="$(new_tree unescaped-pipe)"
+sed -i.bak 's/^## Section A$/## Section A: one \| two/' "${t}/docs/adrs/0001-test-decision.md"
+sed -i.bak 's/sections="Section A|Section B"/sections="Section A: one | two|Section B"/' "${t}/docs/adrs/0001-test-decision.md"
+check "an unescaped separator inside a name cannot be checked" "${t}" 70 "no matching heading"
+
 # An empty docs directory is a structural failure, not a vacuous pass.
 t="${TMP}/empty-docs"
 mkdir -p "${t}/scripts/guards" "${t}/docs/adrs"
