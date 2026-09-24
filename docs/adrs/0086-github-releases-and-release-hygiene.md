@@ -387,7 +387,7 @@ gate it is meant to tighten.
 
 ## Amendment: decision 11 applied
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="this records an outcome, that the owner applied decision 11's recommendation by hand on 2026-08-18; decision 11's own rule, that the list is proposed here and never flipped by a merged pull request, is what produced that outcome and stands unchanged" -->
 
 Decision 11 recorded the evidence and left the setting alone, because branch
 protection is a repository setting and a rule change that lands through an

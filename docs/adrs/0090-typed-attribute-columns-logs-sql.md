@@ -412,10 +412,9 @@ flowchart TD
   a trait `ravel-sql` defines and reads a field `ravel-catalog` defines,
   so it lands in a following wave, after both.
 
-## Amendment: #302's shipped CLI syntax, and a narrow catalog-visibility
+## Amendment: #302's shipped CLI syntax, and a narrow catalog-visibility exception for validation reuse
 
-<!-- amendment-applies: none -->
-   exception for validation reuse
+<!-- amendment-applies: none reason="both halves record divergences rather than retire wording: decision 1's flag syntax was corrected in place when #302 shipped, and the catalog-visibility exception resolves a conflict between decision 1 and #302's dispatch spec, which is a different document" -->
 
 Two divergences from this ADR's original text, found at #302's
 checkpoint and recorded here rather than left implicit.
