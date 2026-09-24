@@ -43,7 +43,9 @@ section kinds, so an object without it is simply an object with no
 exemplars.
 
 Layout, run-major to mirror the catalog, sorted by `(series_index,
-ts_ns)` so a per-series probe is a binary search:
+ts_ns)` so a per-series probe is a binary search. The sort is ascending
+but not strict: the duplicate sort keys amendment below settles that
+equal keys are legal and are never collapsed.
 
 ```
 count: u32
@@ -168,7 +170,7 @@ still holds, so v6 retires v5 in the change that introduces it.
 
 ## Amendment: duplicate sort keys are legal
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="1. A new RSEG section, kind 10, `EXEMPLARS`" pointer="duplicate sort keys amendment" -->
 
 Decision 1 gave the EXEMPLARS section a `(series_index, ts_ns)` sort order.
 The implementation read that as strictly ascending and rejected an equal

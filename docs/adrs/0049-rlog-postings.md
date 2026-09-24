@@ -113,7 +113,8 @@ joins them. No posting list is ever concatenated across inputs.
 extraction, under the existing widen-only rule: DataFusion re-applies the
 original predicate above the scan, so a prune may only widen the fetch,
 never drop a true result. This is what finally closes ADR-0033 gap 2 and
-makes `attrs['k'] = 'v'` prunable end to end.
+makes `attrs['k'] = 'v'` prunable end to end. Both of those claims are
+corrected by the merged attribute view amendment below.
 
 Note the ADR-0033 subscript-planning gap is separate and still open: the
 crate builds DataFusion with `features = ["sql"]` only, so no nested
@@ -199,7 +200,7 @@ from SQL, and it is named here rather than assumed.
 
 ## Amendment: postings index the merged attribute view
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="7. The SQL path extracts the predicate" pointer="merged attribute view amendment" -->
 
 Decision 7 said the SQL path extracts attribute equality and `IN`, and that
 this closes ADR-0033 gap 2 and makes `attrs['k'] = 'v'` prunable end to end.
@@ -241,7 +242,9 @@ results. A sound disjunctive form is tracked separately.
 **POSTINGS indexes the merged attribute view**: for each record, the union
 of its resource, scope, and own attributes, with its own winning on a key
 collision, which is exactly what `ravel_sql::rlog_attrs::merged_attrs`
-computes. The prune then answers the question SQL asks.
+computes. The prune then answers the question SQL asks. Precedence among
+one record's own repeated occurrences of a key is left undefined here and
+is settled by the 2026-08-20 amendment below.
 
 The `POSTINGS_VERSION` byte goes from 1 to 2. The grammar is unchanged; the
 meaning of what a posting list contains is not, and a reader cannot tell the
@@ -296,11 +299,12 @@ records, and it still cannot recover a record the index never listed.
 
 ## Amendment 2026-08-20: precedence among a record's own duplicate occurrences
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment: postings index the merged attribute view" pointer="2026-08-20 amendment" -->
 
-The 2026-08-03 amendment said POSTINGS indexes "the union of a record's
-resource, scope, and own attributes, with its own winning on a key collision,
-which is exactly what `ravel_sql::rlog_attrs::merged_attrs` computes". That
+The merged attribute view amendment above said POSTINGS indexes "the union
+of a record's resource, scope, and own attributes, with its own winning on
+a key collision, which is exactly what
+`ravel_sql::rlog_attrs::merged_attrs` computes". That
 defined precedence *between* layers (record over resource/scope) but left
 precedence *among* a single record's own multiple occurrences of one key
 undefined. `LogRecord::attrs` is an ordered list that has always permitted
@@ -312,7 +316,8 @@ keep both), so this gap was reachable.
 Two functions folded a record's own duplicates in two different orders, and
 nothing said which was authoritative:
 
-- `writer.rs::indexed_term_columns` (write side) folded a record's attributes
+- `writer.rs::indexed_term_columns` (write side, a name retired by the
+  2026-09-06 amendment below) folded a record's attributes
   last-wins over their **original write-time occurrence order**.
 - `reader.rs::rebuild_record` reconstructs a record's attributes in a fixed
   order the on-disk format dictates -- its FIELD_DIR columnar entries in
@@ -348,7 +353,8 @@ stream (resource/scope) layer as before. This is exactly what `rebuild_record`
 followed by `merged_attrs` already, incidentally, produces.
 
 This amendment is what makes that incidental read-side behavior an intentional,
-documented contract. It now governs both sides: `indexed_term_columns` computes
+documented contract. It now governs both sides: `indexed_term_columns` (see the
+2026-09-06 amendment below for the function that computes this today) computes
 this same winner (its job is to *predict* what `rebuild_record` + `merged_attrs`
 will report for an indexed key, not to independently pick one), and the read
 side is its authoritative definition. No on-disk format changes: `ResolvedRow`'s
@@ -368,8 +374,8 @@ never wrote, a v1-grammar object now declines POSTINGS pruning for its equality
 arms unconditionally, on both the content and prune channels. This is
 widen-only (ADR-0013): it costs the pruning optimization on legacy objects,
 never correctness, and it subsumes the narrower version-1 resource/scope
-exclusion the 2026-08-03 amendment introduced (which covered only the
-stream-level hazard, not the duplicate one).
+exclusion the merged attribute view amendment introduced (which covered
+only the stream-level hazard, not the duplicate one).
 
 ### A distinct, adjacent hazard: cross-type stringification
 
@@ -387,7 +393,7 @@ here because it sits in the same prune path.
 
 ## Amendment 2026-09-06: the write-side function names in this ADR (#1135)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment 2026-08-20: precedence among a record's own duplicate occurrences" pointer="2026-09-06 amendment" -->
 
 The 2026-08-20 amendment named `writer.rs::indexed_term_columns` as the
 write side's cross-type winner computation, with `stat_winner_columns` as
