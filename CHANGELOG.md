@@ -553,6 +553,54 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The shipped Maintain IAM template now grants the dead-worker heartbeat
+  delete the maintain fleet needs** (issue #1975). ADR-0065 decision 1 has
+  every maintain process stamp a heartbeat at
+  `sys/maintain/workers/<process_id>`, LIST that prefix once per tick to read
+  the live set, and reap the keys of processes past the reap horizon. The
+  first three axes were granted; `MaintainDelete` named no `sys/` resource at
+  all. IAM is default-deny, so this was not a narrowing but a refusal of every
+  reap `WorkerSet::reap_keys` has ever attempted on a shipped deployment. The
+  visible cost is not the failed delete: no dead worker's key was ever
+  removed, so the prefix the per-tick LIST walks grew with every maintain
+  process that had ever run against the bucket, which is the unbounded-LIST
+  cost issue #1679 removed for admission snapshots on the assumption that this
+  delete succeeded. Nothing surfaced it, because `reap_keys` treats a failed
+  delete as a key to retry next tick rather than as an error.
+  **An operator must re-apply `deploy/iam/maintain.json`.** Until they do, the
+  reap stays refused, dead heartbeat keys keep accumulating and the per-tick
+  `ListBucket` over `sys/maintain/workers/` keeps growing; re-applying drains
+  the backlog over subsequent ticks rather than at once. Nothing else stops
+  working in the meantime, since heartbeat writes and live-set reads were
+  always granted and unit ownership stays correct: what degrades is cost,
+  monotonically. The new delete pattern is deliberately narrower than the
+  `sys/maintain/*` the read and write axes use, because the memo snapshots and
+  the ADR-1029 compaction claims share that prefix and neither is the reaper's
+  to remove. `maintain_template_covers_every_worker_heartbeat_call` asserts
+  all four calls against the shipped template with a witness key built by
+  `heartbeat_key` itself rather than written out.
+
+- **A guard now fails when a control-plane key space is exercised on an axis
+  no role's IAM template grants** (issue #1975). This defect has shipped six
+  times, always the same way: a grant derived from the one function a ticket
+  named instead of from every call site touching the prefix, leaving one axis
+  with no `Allow` at all. `scripts/guards/check-iam-keyspace-axes.sh`
+  discovers every key space the code names under the `sys/`, `quarantine/` and
+  `admission/` roots, requires each to carry a manifest entry declaring its
+  owner roles and, per axis, either a call site or a reason the axis is
+  unused, and then checks each used axis against that owner's shipped
+  template. A new key space fails until it is declared, so no one has to
+  remember to write a reachability test for it; a declaration that goes stale
+  in either direction fails too. It records nine pre-existing gaps it found
+  (`sys/auth` on both serving roles, the `sys/gc` bootstrap write, the
+  `sys/maintain/memo/` list, the `sys/query/workers/` reap, and the `sys/t/`
+  recovery-manifest write), each with a reason, and fails again when one is
+  closed so the table cannot go stale. It runs in `scripts/gates.sh` and CI's
+  `doc-scripts` job. It catches "granted nowhere", which is the shape all six
+  instances had; it does not catch "granted too narrowly" and does not reach
+  tenant-rooted key spaces, which are composed through `format!` chains that
+  no text scan can resolve to a glob soundly.
+
 - **`ravel-cli gc-config set --max-flush-lifetime`'s help text and generated
   reference page now state the floor the flag is refused below** (issue
   #1961). `set_gc_config` has always rejected a `max_flush_lifetime` below the

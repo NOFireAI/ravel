@@ -180,6 +180,19 @@ bash "$(dirname "$0")/guards/check-doc-figures.test.sh"
 echo "==> scripts/guards/check-doc-figures.sh"
 "$(dirname "$0")/guards/check-doc-figures.sh"
 
+# Every control-plane key space the code names is declared, and every axis an
+# owner role exercises over it is granted by that role's template. IAM is
+# default-deny, so an ungranted axis is a refusal, and that has shipped six
+# times (#1849, #1934, #1847/#1955, #1957, #1975) because the grant was
+# derived from the one function a ticket named. The per-lifecycle reachability
+# tests in crates/ravel-commit/tests/iam_templates.rs catch it precisely but
+# only where somebody wrote one; this needs nobody to remember. A file scan,
+# no build. Cases first.
+echo "==> scripts/guards/check-iam-keyspace-axes.test.sh"
+bash "$(dirname "$0")/guards/check-iam-keyspace-axes.test.sh"
+echo "==> scripts/guards/check-iam-keyspace-axes.sh"
+"$(dirname "$0")/guards/check-iam-keyspace-axes.sh"
+
 # "No wall-clock wait in an injected-clock test helper" cost two gate reruns
 # (issue #1260: the flaky pair test, then its rewrite under #1235). Another
 # check rather than another paragraph, same reasoning as the hygiene guard

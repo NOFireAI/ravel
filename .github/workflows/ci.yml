@@ -284,6 +284,14 @@ jobs:
         run: bash scripts/guards/check-doc-figures.test.sh
       - name: Operator-facing figures match the record-cache constants
         run: scripts/guards/check-doc-figures.sh
+      # IAM is default-deny, so an axis a role exercises and its template does
+      # not grant is a refusal on every shipped deployment. That has shipped
+      # six times (issue #1975 is the latest), each time from a grant derived
+      # off one named function instead of off every call site. Cases first.
+      - name: IAM key-space axis guard cases (issue #1975)
+        run: bash scripts/guards/check-iam-keyspace-axes.test.sh
+      - name: Every control-plane key space is declared and its axes granted
+        run: scripts/guards/check-iam-keyspace-axes.sh
       # A pull request whose feat/fix commits touch crates/ or services/ must
       # also touch CHANGELOG.md, or carry a `Changelog: none` trailer (issue
       # #1719). The rule is defined over a pull request's base..head commit
