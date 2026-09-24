@@ -386,6 +386,8 @@ note in the eventual docs, not a redesign of this ADR.
 
 ## Correction
 
+<!-- amendment-applies: none reason="sections 2 and 4 above already carry the corrected equal-fleet-share formula; this records that the wrong additive-headroom formula was caught and fixed before the first implementation, and retires no wording currently in this document" -->
+
 The rate-cap formula in section 2 and the rate-cap overshoot bound in
 section 4 were corrected before this ADR's first implementation landed.
 The originally accepted text applied the count-cap additive-headroom
