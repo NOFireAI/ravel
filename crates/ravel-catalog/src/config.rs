@@ -413,34 +413,29 @@ pub const DEFAULT_FRONTIER_RECONCILE_MAX_HOURS: u32 = 168;
 /// identical snapshots and both respect [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`],
 /// so any value is correct.
 pub const DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS: u64 = 720;
-/// Default `resolve_get_concurrency`: the number of in-flight object-store
-/// requests (LISTs and record GETs) `Catalog::resolve_impl` and its helpers
-/// keep in flight at once, via a per-`Catalog`-instance semaphore
-/// (`Catalog::request_semaphore`). 128, derived from a measured S3 GET round
-/// trip of about 30ms: 128 requests in flight sustain roughly 128 / 0.030s ~=
-/// 4,300 GET/s, under S3's published guidance of about 5,500 GET/s per
-/// prefix, and every request this bounds lands under one
-/// `m/c/<shard>/<hour>/` prefix per shard-hour. Measured end to end on a
+/// Default `resolve_prefix_concurrency`: the number of resolve-path
+/// object-store requests one shard-hour commit prefix
+/// `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/` may have in flight at
+/// once (ADR-1733 decision 1), via a semaphore created for that prefix on
+/// demand. 128, derived from a measured S3 GET round trip of about 30ms: 128
+/// requests in flight sustain roughly 128 / 0.030s ~= 4,300 GET/s, under S3's
+/// published guidance of about 5,500 GET/s per prefix, which is stated per
+/// prefix and is what this bound is stated against. Measured end to end on a
 /// 10,000-record unsealed tail (one cold resolve each, 10,001 GETs and 13
 /// LISTs at every concurrency level -- request count does not move, only the
 /// number of concurrency-bound rounds does): 23.157s at 16 (the prior fixed
 /// constant), 4.374s at 64, 2.341s at 128.
 ///
-/// This bounds one `Catalog` instance, not the process: `ravel-server`
-/// builds exactly one `Catalog` and shares it (via `Arc` clone, so one
-/// underlying `request_semaphore`) across every request, so N concurrent
-/// queries against that instance are capped at 128 in flight TOTAL, not N *
-/// 128. N * 128 in flight holds only across N distinct `Catalog` instances
-/// (e.g. separate CLI invocations or tests), never within one running
-/// server. A process-wide cap across instances is not implemented here and
-/// is tracked as a follow-up.
-pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
+/// It has no CLI flag: the guidance does not vary by deployment, and a flag
+/// is added only if a measurement shows a backend that needs one.
+pub const DEFAULT_RESOLVE_PREFIX_CONCURRENCY: usize = 128;
 
-/// Upper bound on `resolve_get_concurrency`, enforced by both
-/// [`crate::Catalog::new`] (typed [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig))
-/// and `ravel-server`'s `Cli::validate`. At the ~30ms per-round GET latency
-/// [`DEFAULT_RESOLVE_GET_CONCURRENCY`]'s doc comment measures against, 4,096
-/// in flight sustains roughly 4,096 / 0.030s ~= 136,000 GET/s, about
+/// Upper bound on `resolve_get_concurrency`, the process ceiling, enforced by
+/// both [`crate::Catalog::new`] (typed
+/// [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig)) and
+/// `ravel-server`'s `Cli::validate`. At the ~30ms per-round GET latency
+/// [`DEFAULT_RESOLVE_PREFIX_CONCURRENCY`]'s doc comment measures against,
+/// 4,096 in flight sustains roughly 4,096 / 0.030s ~= 136,000 GET/s, about
 /// twenty-five times S3's published per-prefix guidance of ~5,500 GET/s.
 /// Nothing above this is a sane operator value; anything above it is a typo.
 /// The bound sits here for that arithmetic, not for tokio's sake: tokio's own
@@ -631,15 +626,43 @@ pub struct CatalogConfig {
     /// [`crate::FoldReport::frontier_hours_deferred`], never silently skipped.
     /// Default [`DEFAULT_FRONTIER_RECONCILE_MAX_HOURS`].
     pub frontier_reconcile_max_hours: u32,
-    /// Number of in-flight object-store requests (LISTs and record GETs)
-    /// the resolve path keeps in flight at once, via a per-instance
-    /// semaphore (`Catalog::request_semaphore`). Must be greater than zero;
+    /// Ceiling on the object-store requests (LISTs and record GETs) this
+    /// `Catalog` keeps in flight across every tenant, shard and hour at once,
+    /// via a per-instance semaphore (`Catalog::request_semaphore`) every
+    /// resolve-path request takes a permit from (ADR-1733 decision 1).
+    ///
+    /// `ravel-server` builds exactly one `Catalog` and shares it (via `Arc`
+    /// clone, so one underlying semaphore) across every request, so this is
+    /// the process ceiling there, and `--catalog-resolve-concurrency` sets
+    /// it; unset, `ravel-server` derives it from the process's query
+    /// concurrency (ADR-1733 decision 2). A CLI invocation or a test that
+    /// builds its own `Catalog` gets a per-instance ceiling instead, which is
+    /// what a single-process-per-invocation caller wants.
+    ///
+    /// This is a ceiling on the aggregate, not a per-prefix bound: what any
+    /// one shard-hour prefix may have in flight is
+    /// [`Self::resolve_prefix_concurrency`], and a request holds both permits
+    /// before it is issued. Must be greater than zero;
     /// [`crate::Catalog::new`] rejects `0` with
     /// [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig)
-    /// rather than silently clamping it to 1. See
-    /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`] for the measured basis. Default
-    /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`].
+    /// rather than silently clamping it to 1, and rejects anything above
+    /// [`MAX_RESOLVE_GET_CONCURRENCY`]. Default
+    /// [`DEFAULT_RESOLVE_PREFIX_CONCURRENCY`]: one prefix's worth, the value
+    /// a `Catalog` resolving a single shard-hour can use anyway.
     pub resolve_get_concurrency: usize,
+    /// Number of resolve-path requests any one shard-hour commit prefix
+    /// `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/` may have in flight
+    /// at once (ADR-1733 decision 1). Requests that do not sit under such a
+    /// prefix (the head object, snapshot parts and postings, and every LIST
+    /// whose prefix is broader than one shard-hour) take only
+    /// [`Self::resolve_get_concurrency`]'s permit.
+    ///
+    /// Prefix semaphores are created on demand and dropped once the prefix
+    /// goes idle, so the map holds one entry per prefix in flight rather than
+    /// one per prefix in the bucket's history. Must be greater than zero;
+    /// [`crate::Catalog::new`] rejects `0` the same way it rejects a zero
+    /// ceiling. Default [`DEFAULT_RESOLVE_PREFIX_CONCURRENCY`].
+    pub resolve_prefix_concurrency: usize,
 }
 
 impl CatalogConfig {
@@ -718,7 +741,8 @@ impl Default for CatalogConfig {
             fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
             frontier_reconcile_max_hours: DEFAULT_FRONTIER_RECONCILE_MAX_HOURS,
-            resolve_get_concurrency: DEFAULT_RESOLVE_GET_CONCURRENCY,
+            resolve_get_concurrency: DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
+            resolve_prefix_concurrency: DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
         }
     }
 }
