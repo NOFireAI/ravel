@@ -20,7 +20,7 @@ Every persistent format in Ravel is a frozen contract, and nearly every one is a
 - RLOG (logs): magic `RLG1`, version 2 only (`crates/ravel-logseg/src/footer.rs:22`, gate `:250-254`), but the error is stringly typed (`LogSegError::Corrupted(format!(...))`), not a distinct variant. The nested POSTINGS section is the one multi-version decoder in the tree: it accepts versions 1 and 2 and records which it saw (`postings.rs:350-354`, `:521-522`; ADR-0049's deliberate carve-out).
 - RSPAN (spans): magic `RSP1`, version 3 only (`crates/ravel-rspan/src/footer.rs:16,24`), also stringly typed.
 
-**Commit-family metadata records** (immutable protobufs, field numbers frozen): `CommitRecord`, `CompactionRecord`, `RetentionTombstone` each carry their own `format_version` (= 1) with a typed check (`crates/ravel-commit/src/record.rs:127-131`), and `CommitRecord.segment_format_version` (proto field 17) plus `CompactionPart.segment_format_version` (field 11) record the trailer version of every live data object. The catalog therefore knows the format version of every live segment without a single data-object GET. `ravel-cli maintain audit-versions` (`services/ravel-cli/src/maintain.rs:277-408`) already exploits this: an operator-triggered walk of a whole tenant, histogramming live L0/L1 objects by version from commit and compaction records alone, exiting nonzero on any anomaly. Its own doc comment states the gap this ADR closes: "there is no migration path, only this report".
+**Commit-family metadata records** (immutable protobufs, field numbers frozen): `CommitRecord`, `CompactionRecord`, `RetentionTombstone` each carry their own `format_version` (= 1) with a typed check (`crates/ravel-commit/src/record.rs:127-131`; true of `CommitRecord` only until the 2026-09-08 amendment below made it true of all three), and `CommitRecord.segment_format_version` (proto field 17) plus `CompactionPart.segment_format_version` (field 11) record the trailer version of every live data object. The catalog therefore knows the format version of every live segment without a single data-object GET. `ravel-cli maintain audit-versions` (`services/ravel-cli/src/maintain.rs:277-408`) already exploits this: an operator-triggered walk of a whole tenant, histogramming live L0/L1 objects by version from commit and compaction records alone, exiting nonzero on any anomaly. Its own doc comment states the gap this ADR closes: "there is no migration path, only this report".
 
 **Catalog snapshot objects** (derived state, rebuilt continuously by the fold): `.csnap` parts have magic `RCS1` + envelope version byte + a redundant header `format_version` cross-check (`crates/ravel-catalog/src/snapshot_format/part.rs:95-133`); `.npost` postings have magic `RNP1` + version byte; the HEAD is a bare protobuf with `format_version` checked at `snapshot_format/head.rs:29-33`. One hazard found in this survey: the fold treats any HEAD decode failure, including `UnsupportedHeadVersion`, as `HeadState::Corrupt` and CAS-overwrites it (`crates/ravel-catalog/src/fold.rs:866-869`, `:796-798`). Under a rolling upgrade a lagging process would clobber a newer-format HEAD written by an upgraded one. Migration machinery makes this path load-bearing, so Decision 2 fixes it.
 
@@ -37,7 +37,7 @@ RSEG went v1 through v6. Through v5 every bump kept a dual reader dispatching on
 Two structural facts about compaction bound what "rewrite" can mean:
 
 - Every compaction output is a brand-new object PUT with `CreateIfAbsent`, stamped with the current format version (`crates/ravel-maintain/src/build.rs:70-72`, `rlog.rs:103`, `rspan_codec.rs:80`), superseding its inputs through the compaction record. Rewrite-shaped migration inherits durability, custody (ADR-0042 holds bind to objects; sweep is hold-aware), and commit-token resolution for free only if it rides this exact path.
-- RSEG compaction copies page bytes verbatim, never decoded (`build.rs:1-14`; ADR-0018: "a re-layout, not a rewrite"). So the existing compactor can carry a trailer/section-layer version bump but not a page-grammar change; a page-grammar migration needs a true decode-and-re-encode primitive that does not exist today. RLOG and RSPAN compaction genuinely re-encode already.
+- RSEG compaction copies page bytes verbatim, never decoded (`build.rs:1-14`; ADR-0018: "a re-layout, not a rewrite"). So the existing compactor can carry a trailer/section-layer version bump but not a page-grammar change; a page-grammar migration needs a true decode-and-re-encode primitive that does not exist today (it has since shipped; see the 2026-09-12 amendment below). RLOG and RSPAN compaction genuinely re-encode already.
 
 And one blocking fact: today's readers accept exactly one version, so the compactor cannot open an old-version object at all (`crates/ravel-maintain/src/read.rs:257` via the single-version gates). Any convergence mechanism presupposes the N/N-1 reader window of Decision 1.
 
@@ -93,13 +93,13 @@ repeated FormatFloor format_floors = 7;  // CAS append, like generations
 
 A recorded floor F for family X asserts that no live object of family X below version F exists for this (tenant, signal). Floors are raised only by the verification step of the migration job (Decision 5) after an audit-versions enumeration over current commit and compaction records comes back clean at >= F, and never lower. The load-bearing consumer is release engineering: deleting version V's read support is legal only when every bucket's floor exceeds V — a checkable fact, where today there is only ADR-0027's wipe-and-hope. This is deliberately the ADR-0052 shape: version facts live in the per-(tenant, signal) durable record, appended under CAS, never rewritten.
 
-ADR-1746 amends this decision: a floor also records the basis of the audit that raised it, a stored floor counts as evidence only when re-classified `Current` against current records, and a writer below a floor warns at startup and refuses in the write path.
+ADR-1746 amends this decision: a floor also records the basis of the audit that raised it, a stored floor counts as evidence only when re-classified `Current` against current records, and a writer below a floor warns at startup and refuses in the write path. `family` shipped as a lowercase string rather than the enum sketched above; see the `family` string amendment below.
 
 ### 4. Convergence, by migration class
 
 **Class A — bulk data objects (RSEG, RLOG, RSPAN).** Large, immutable, never rewritten in place. Three convergence forces, in preference order:
 
-1. Retention: old-version objects age out with their hour buckets at zero marginal cost. Deployments whose retention window is shorter than their release cadence converge on this alone.
+1. Retention: old-version objects age out with their hour buckets at zero marginal cost. Deployments whose retention window is shorter than their release cadence converge on this alone. (Narrowed to versions this build can read by the 2026-09-13 amendment below.)
 2. Rewrite-on-touch: compaction outputs are always current-version, so L0 converges through the normal maintenance loop once the N-1 reader exists. Additionally, maintenance treats "live L1 part with `segment_format_version` < current" as compaction-eligible at low priority under the existing maintenance cost budget, so compacted data converges opportunistically too. Caveat honored from Context: this carries trailer/section-layer bumps through the existing verbatim-copy pipeline; a page-grammar bump routes through the re-encode primitive of Decision 5 instead.
 3. The operator-triggered migration job (Decision 5) for the tail neither force reaches fast enough, and for verify-and-raise-floor.
 
@@ -173,7 +173,7 @@ Deleting an offboarded tenant's data is selective deletion's (ADR-0064) mechanis
 
 ## Amendment: `family` is a lowercase string, not an enum
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="3. Durable format floors in the provisioning record" pointer="`family` string amendment" -->
 
 The implementation shipped `FormatFloor.family` as `string family = 1` (lowercase format-family
 id: `"rseg"`, `"rlog"`, `"rspan"`, mirroring each format's trailer magic),
@@ -189,7 +189,7 @@ an unconstrained string in practice — see `ravel_catalog::provisioning::FloorD
 
 ## Amendment (R1, #1300): the CAS-mutable sys/* records version on every additive change
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="4. Convergence, by migration class" pointer="R1 amendment" -->
 
 Decision 4's Class C filed every sys/* object as "never rewritten, so
 additive-only evolution is safe without a `format_version` bump." That premise
@@ -321,7 +321,7 @@ bug.
 
 ## Amendment (R2, 2026-09-07, #1300): the writer flip, and floors on the last two gates
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment (R1, #1300): the CAS-mutable sys/* records version on every additive change" pointer="R2 amendment" -->
 
 **The writer flip.** From this change the three CAS-mutable records this crate
 owns are stamped version 2 by every writer that emits them:
@@ -392,7 +392,7 @@ byte-identity assertion after each refusal.
 
 ## Amendment (2026-09-08, #1301): the Context claim made true for all three commit-family records
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="What is already versioned, per format" pointer="2026-09-08 amendment" -->
 
 The Context above (under "What is already versioned, per format") stated that
 `CommitRecord`, `CompactionRecord`, and `RetentionTombstone` "each carry their
@@ -430,7 +430,7 @@ version 1).
 
 ## Amendment (2026-09-12): the Context's "does not exist today" primitive has since shipped
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Prior format changes, in practice" pointer="2026-09-12 amendment" -->
 
 Context (under "Prior format changes, in practice") says a page-grammar
 migration "needs a true decode-and-re-encode primitive that does not exist
@@ -444,7 +444,7 @@ points forward to where it closed.
 
 ## Amendment (2026-09-13, #530): retention ages out only what this build can read
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="4. Convergence, by migration class" pointer="2026-09-13 amendment" -->
 
 Decision 4, Class A, convergence force 1 reads: "Retention: old-version objects
 age out with their hour buckets at zero marginal cost." That is true of an
