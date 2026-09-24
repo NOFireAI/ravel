@@ -1140,8 +1140,7 @@ prefix to 128 requests whatever this ceiling is. Every resolve-path request
 is bounded this way, keyed by its own key prefix: a commit record by its
 shard-hour prefix, a snapshot's parts by the one directory they share, its
 postings and column stats by theirs, and a LIST by the prefix it lists. So
-raising this ceiling adds breadth across prefixes and never depth within
-one.
+raising this ceiling adds breadth across prefixes and never depth within one.
 
 Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
 25%, catalog byte cache a separate 5% ceiling, 256 MiB each if memory is

@@ -1006,14 +1006,27 @@ mod catalog_cache_tests {
         );
     }
 
-    /// The same mapping's other inputs: `build_catalog_for_server` reads them
-    /// from the `ServerConfig` too, so a field crossed with another one, or
-    /// left at a constant, is visible on the catalog it returns.
-    #[test]
-    fn build_catalog_for_server_applies_the_other_catalog_inputs() {
+    /// Every other input the same mapping carries: the shard count, the
+    /// catalog cache ceiling, the flush delay (through the derived record
+    /// cache capacity), the cache directory, and `--disable-cache`. A field
+    /// crossed with another one, or left at a constant, shows up on the
+    /// catalog this returns.
+    ///
+    /// RED: swap any one of those fields in `build_catalog_for_server` for
+    /// the constant `build_catalog` would otherwise see. Passing
+    /// `Duration::ZERO` for the flush delay, for instance, changes the
+    /// derived capacity and fails the `cache_capacity_per_tenant` assertion.
+    ///
+    /// It runs on a runtime because the byte cache's disk tier spawns onto
+    /// one the moment `--cache-dir` attaches it.
+    #[tokio::test]
+    async fn build_catalog_for_server_applies_the_other_catalog_inputs() {
+        let cache_dir = tempfile::tempdir().expect("temp cache dir");
         let config = crate::ServerConfig {
             shard_count: 3,
             catalog_cache_max_bytes: 64 * 1024 * 1024,
+            max_flush_delay: Duration::from_secs(11),
+            cache_dir: Some(cache_dir.path().to_path_buf()),
             ..server_config()
         };
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -1022,10 +1035,35 @@ mod catalog_cache_tests {
         assert_eq!(catalog.config().shard_count, 3);
         assert_eq!(catalog.config().byte_cache_max_bytes, 64 * 1024 * 1024);
         assert_eq!(
+            catalog.config().cache_capacity_per_tenant,
+            ravel_catalog::derive_cache_capacity_per_tenant(3, Duration::from_secs(11)),
+            "the record cache capacity derives from this config's shard count and flush delay"
+        );
+        assert!(
+            catalog.byte_cache_disk_metrics().is_some(),
+            "--cache-dir reaches the byte cache's disk tier"
+        );
+        assert_eq!(
             catalog.config().max_ingest_lag_ns,
             9_000_000_000_000,
             "the listening window is the caller's resolved value, not the config default"
         );
+
+        // The other side of the cache flag: with it set, no byte cache is
+        // built and the disk tier has nothing to attach to.
+        let disabled = crate::ServerConfig {
+            disable_cache: true,
+            ..config
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &disabled, 9_000_000_000_000).expect("catalog builds");
+        assert_eq!(
+            catalog.config().byte_cache_max_bytes,
+            0,
+            "--disable-cache reaches the catalog's byte cache"
+        );
+        assert!(catalog.byte_cache_disk_metrics().is_none());
     }
 }
 

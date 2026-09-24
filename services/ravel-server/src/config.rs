@@ -1482,9 +1482,9 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub cache_dir: Option<PathBuf>,
 
-    /// Per-process ceiling on the object-store requests (LISTs and record
-    /// GETs) the catalog resolve path keeps in flight at once, across every
-    /// concurrent resolve. Unset, it is derived from this process's query
+    /// Per-process ceiling on the object-store requests (LISTs and GETs) the
+    /// catalog resolve path keeps in flight at once, across every concurrent
+    /// resolve. Unset, it is derived from this process's query
     /// concurrency `Q` as `clamp(Q * 128, 128, 4096)`, then held at an interim
     /// 1,024 until the ADR-1170 memory reservation lands. `0` is rejected at
     /// startup rather than clamped to 1, because a zero-permit semaphore would
@@ -8875,10 +8875,10 @@ mod tests {
         );
 
         // Under default flags the derived fetch concurrency is the same 16, so
-        // a derivation reading `Q` off either of those flags instead of off
-        // the cores would give the same answers above. Hold them both down to
-        // 2 and only the cores-derived answer stays 16. The two flags are
-        // mutually exclusive at the CLI layer, not here: this calls the
+        // a derivation reading `Q` off `--store-get-concurrency` or
+        // `--fetch-concurrency` would give the same answers above. Hold both
+        // flags down to 2 and only the cores-derived answer stays 16. The two
+        // are mutually exclusive at the CLI layer, not here: this calls the
         // derivation directly, and setting both pins it against both inputs at
         // once.
         let low_fetch_flags = resolve_performance_defaults(
