@@ -17,18 +17,23 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use proptest::prelude::*;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
-use ravel_logseg::{AttrValue, LogRecord, stream_attrs_bytes};
+use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::SeriesData;
 use ravel_proto::queryfrag::v1 as pb;
+use ravel_rspan::{
+    ObjectIdentity as SpanObjectIdentity, RspanConfig, RspanWriter, SpanQuery, SpanRecord,
+};
 use ravel_segment::{
     CompactionMetaV4, IngestBounds, RunInputV7, SampleProvenance, SegmentIdentity, SegmentWriter,
     SeriesInput, SeriesInputV7, SeriesValues, encode_run_v4,
 };
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::logstream::{LogStreamId, log_stream_id};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use tokio::runtime::Runtime;
@@ -39,7 +44,10 @@ use uuid::Uuid;
 
 use crate::config::EngineConfig;
 use crate::distrib::Distributed;
-use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, SliceResponse};
+use crate::distrib::client::{
+    DistribError, RemoteSliceFetcher, SliceFetcher, SliceLogResponse, SliceResponse,
+    SliceSpanResponse,
+};
 use crate::distrib::federation::{Federation, RemoteCluster};
 use crate::distrib::partition::DistribThresholds;
 use crate::distrib::proto::series_fetch_server::SeriesFetch;
@@ -49,8 +57,9 @@ use crate::distrib::{
 };
 use crate::engine::merge_soa_runs;
 use crate::erasure::ErasurePredicate;
+use crate::error::QueryError;
 use crate::fetcher::SegmentFetcher;
-use crate::log_fetcher::{LogFetchError, LogSegmentFetcher};
+use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
 use crate::span_fetcher::{SpanFetchError, SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
@@ -4641,93 +4650,683 @@ fn failed_slice_spend_reaches_the_live_accounting_handle() {
     });
 }
 
-/// The operator-visible consequence of issue #1723, pinned at the seam where the
-/// byte budget is enforced: the coordinator's in-loop check reads
-/// `running.total_s3_bytes()`, the running fold over every slice's reported
-/// accounting. A response carrying one attempt's share passes a budget that the
-/// same slice's real three-attempt cost exceeds.
+/// A scripted per-attempt spend: `requests` GETs that moved `bytes`.
+fn scripted_spend(requests: u64, bytes: u64) -> QueryAccountingSnapshot {
+    let acct = QueryAccounting::new();
+    for _ in 0..requests {
+        acct.record_s3_request(AccountedOp::Get);
+    }
+    acct.add_s3_bytes(AccountedOp::Get, bytes);
+    acct.snapshot()
+}
+
+/// A [`SliceFetcher`] double answering every signal with one scripted terminal
+/// status and the spend the slice reached before it ended.
+struct StatusSpendWorker {
+    status: pb::status::Code,
+    spend: QueryAccountingSnapshot,
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for StatusSpendWorker {
+    async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        Ok(SliceResponse {
+            scalar: Vec::new(),
+            histogram: Vec::new(),
+            partials: Vec::new(),
+            accounting: self.spend,
+            stats: crate::fetcher::FetchStats::default(),
+            series_returned: 0,
+            samples_returned: 0,
+            status: self.status,
+            status_message: "scripted".to_string(),
+        })
+    }
+
+    async fn fetch_logs(
+        &self,
+        _request: pb::FetchRequest,
+    ) -> Result<SliceLogResponse, DistribError> {
+        Ok(SliceLogResponse {
+            records: Vec::new(),
+            accounting: self.spend,
+            stats: crate::fetcher::FetchStats::default(),
+            records_returned: 0,
+            status: self.status,
+            status_message: "scripted".to_string(),
+        })
+    }
+
+    async fn fetch_spans(
+        &self,
+        _request: pb::FetchRequest,
+    ) -> Result<SliceSpanResponse, DistribError> {
+        Ok(SliceSpanResponse {
+            spans: Vec::new(),
+            accounting: self.spend,
+            stats: crate::fetcher::FetchStats::default(),
+            spans_returned: 0,
+            status: self.status,
+            status_message: "scripted".to_string(),
+        })
+    }
+}
+
+/// A [`SliceFetcher`] double whose every signal fails with `make()`, carrying
+/// the spend the failed attempts made. This is the shape
+/// `RoutingSliceFetcher::dispatch` produces once the attempt that ends a slice
+/// ends it with an `Err`: there is no response left to carry the cost, so it
+/// rides on the error (issue #1723).
+struct FailingSpendWorker {
+    make: fn() -> DistribError,
+    spend: QueryAccountingSnapshot,
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for FailingSpendWorker {
+    async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        Err((self.make)().with_spend(&self.spend))
+    }
+
+    async fn fetch_logs(
+        &self,
+        _request: pb::FetchRequest,
+    ) -> Result<SliceLogResponse, DistribError> {
+        Err((self.make)().with_spend(&self.spend))
+    }
+
+    async fn fetch_spans(
+        &self,
+        _request: pb::FetchRequest,
+    ) -> Result<SliceSpanResponse, DistribError> {
+        Err((self.make)().with_spend(&self.spend))
+    }
+}
+
+/// The one-segment snapshot the coordinator-fold tests fan out over. What the
+/// segment holds does not matter: every worker double below answers from a
+/// script, never from the store.
+async fn one_slice_snapshot(store: &MemoryStore) -> Snapshot {
+    let seg = write_segment(
+        store,
+        0,
+        0,
+        100,
+        &[SeriesDesc {
+            metric: "m0".to_string(),
+            samples: vec![(NS, 1.0f64.to_bits())],
+        }],
+    )
+    .await;
+    Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// Runs one fan-out of `signal` over `fetcher` and returns the live handle's
+/// snapshot afterwards, so a caller can assert the exact cost a failed or
+/// refused query reported.
+async fn folded_spend_of(
+    fetcher: Arc<dyn SliceFetcher>,
+    signal: Signal,
+    snapshot: &Snapshot,
+    config: &EngineConfig,
+) -> (Option<QueryError>, QueryAccountingSnapshot) {
+    let distributed = Distributed::new(
+        fetcher,
+        DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: 1,
+        },
+    );
+    let accounting = QueryAccounting::new();
+    let outcome = match signal {
+        Signal::Logs => distributed
+            .fetch_logs(
+                TENANT,
+                Signal::Logs,
+                snapshot,
+                &[],
+                &[],
+                &accounting,
+                config,
+                i64::MAX,
+            )
+            .await
+            .err(),
+        Signal::Spans => distributed
+            .fetch_spans(
+                TENANT,
+                Signal::Spans,
+                snapshot,
+                &[],
+                &[],
+                &accounting,
+                config,
+                i64::MAX,
+            )
+            .await
+            .err(),
+        _ => distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                snapshot,
+                &[],
+                &[],
+                &accounting,
+                config,
+                i64::MAX,
+                None,
+            )
+            .await
+            .err(),
+    };
+    (outcome, accounting.snapshot())
+}
+
+/// Every terminal status arm of all three coordinator fan-out loops folds the
+/// slice's reported spend into the query's live accounting handle (issue
+/// #1723). That handle is what `QueryEngine` reports as the query's cost and
+/// what the metrics, logs and spans of a query are built from, so an arm that
+/// returns without folding charges the tenant nothing for work the store really
+/// did.
 ///
-/// Both halves run the same corpus, the same budget, and the same worker double,
-/// differing only in the reported spend, so the assertion turns on the reported
-/// figure alone. This is why the fix changes refusal timing for a tenant near
-/// its limit: a query that previously completed while the store served three
-/// times its budget now trips the budget, at the attempt that crosses it.
+/// One case per (signal, status) pair, each with its OWN spend figure, so no
+/// assertion can be satisfied by another case's fold or by a last-attempt
+/// figure multiplied by the case count. Both counters are asserted exactly.
+///
+/// Mutation proof: RED against each fold individually. Deleting the
+/// `fold_slice(..)` call from the `SnapshotInvalidated`, `Corrupt` or catch-all
+/// arm of `Distributed::fetch`, or the `fold_log_slice(..)`/`fold_span_slice(..)`
+/// call from the corresponding arm of `fetch_logs`/`fetch_spans` (`mod.rs`),
+/// leaves the live handle at zero for that case while the script says the store
+/// served thousands of bytes, and the `total_s3_bytes` assertion for exactly
+/// that pair fails.
 #[test]
-fn folded_sum_trips_the_byte_budget_one_attempts_share_passes() {
-    /// One attempt's spend, below the budget.
-    const SURVIVOR_ONLY: u64 = 4_096;
-    /// The same slice served three times, above it.
-    const ALL_THREE: u64 = 3 * SURVIVOR_ONLY;
-    const BUDGET: u64 = 8_192;
+fn every_terminal_slice_status_folds_its_spend_on_every_signal() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = one_slice_snapshot(&store).await;
+        let config = EngineConfig::default();
+
+        let signals = [Signal::Metrics, Signal::Logs, Signal::Spans];
+        let statuses = [
+            pb::status::Code::SnapshotInvalidated,
+            pb::status::Code::Unsupported,
+            pb::status::Code::BudgetExceeded,
+            pb::status::Code::Corrupt,
+            pb::status::Code::Unavailable,
+            // The catch-all arm: a status none of the arms above name.
+            pb::status::Code::BadData,
+        ];
+
+        // Every case runs, and every mismatch is reported: each case is its own
+        // fan-out over its own accounting handle, so one arm's fold cannot
+        // affect another's result and the full list names exactly the arms that
+        // dropped their spend.
+        let mut wrong: Vec<String> = Vec::new();
+        for (s, signal) in signals.iter().enumerate() {
+            for (i, status) in statuses.iter().enumerate() {
+                // A distinct figure per case, so one case's fold can never
+                // stand in for another's.
+                let case = (s * statuses.len() + i + 1) as u64;
+                let spend = scripted_spend(case, case * 1_024);
+                let (_outcome, folded) = folded_spend_of(
+                    Arc::new(StatusSpendWorker {
+                        status: *status,
+                        spend,
+                    }),
+                    *signal,
+                    &snapshot,
+                    &config,
+                )
+                .await;
+                if folded.total_s3_bytes() != case * 1_024 || folded.total_s3_requests() != case {
+                    wrong.push(format!(
+                        "{signal:?}/{status:?}: folded {} bytes in {} requests, \
+                         the slice reported {} in {}",
+                        folded.total_s3_bytes(),
+                        folded.total_s3_requests(),
+                        case * 1_024,
+                        case
+                    ));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "these arms did not fold the spend their slice reported:\n{}",
+            wrong.join("\n")
+        );
+    });
+}
+
+/// The gap issue #1723's first round left open: a slice whose FINAL attempt
+/// ends in an `Err` rather than a summary. `SliceFetcher::fetch` answers
+/// `Result<SliceResponse, DistribError>`, so there is no response to fold and
+/// the cost of every attempt rides on the error itself; the coordinator folds it
+/// before it maps the error. Pinned on all three signals, each with its own
+/// figure.
+///
+/// Mutation proof: RED against the pre-fix line. Restoring any of the three
+/// `let response = result.map_err(distrib_error)?;` lines in `mod.rs` (the head
+/// of the `fetch`, `fetch_logs` and `fetch_spans` collect loops) drops the
+/// carried spend on the floor, and that signal's `total_s3_bytes` assertion
+/// reads 0 against the thousands of bytes the script says the store served.
+#[test]
+fn failed_slice_error_spend_reaches_the_live_handle_on_every_signal() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = one_slice_snapshot(&store).await;
+        let config = EngineConfig::default();
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (i, signal) in [Signal::Metrics, Signal::Logs, Signal::Spans]
+            .iter()
+            .enumerate()
+        {
+            let case = (i + 1) as u64;
+            let spend = scripted_spend(3 * case, 7_000 * case);
+            let (outcome, folded) = folded_spend_of(
+                Arc::new(FailingSpendWorker {
+                    make: || DistribError::Transport("worker died mid-slice".to_string()),
+                    spend,
+                }),
+                *signal,
+                &snapshot,
+                &config,
+            )
+            .await;
+            let err = outcome.expect("a failed slice fails the query");
+            assert!(
+                matches!(err, QueryError::Distrib { .. }),
+                "{signal:?}: expected the typed distrib failure, got {err:?}"
+            );
+            if folded.total_s3_bytes() != 7_000 * case || folded.total_s3_requests() != 3 * case {
+                wrong.push(format!(
+                    "{signal:?}: folded {} bytes in {} requests, the failed \
+                     attempts spent {} in {}",
+                    folded.total_s3_bytes(),
+                    folded.total_s3_requests(),
+                    7_000 * case,
+                    3 * case
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "these fan-out loops dropped the spend carried on the error:\n{}",
+            wrong.join("\n")
+        );
+    });
+}
+
+/// The failing case with the most spend behind it: the coordinator's own
+/// decode byte cap refuses a slice the worker had already read in full. The
+/// refusal keeps its typed 422 class with both counts intact (issue #1687 part
+/// B) AND reports what the refused attempt cost (issue #1723); the two must not
+/// be traded against each other.
+///
+/// Mutation proof: RED against either line. Restoring `mod.rs`'s
+/// `let response = result.map_err(distrib_error)?;` leaves the live handle at 0
+/// instead of 12288. Restoring `cap_refusal_error`'s `match err` (instead of
+/// `match err.unspent()`) stops it seeing the cap breach through the spend
+/// wrapper, so the refusal renders as a retryable `QueryError::Distrib` and the
+/// `TooManySliceBytes` assertion fails.
+#[test]
+fn byte_cap_refusal_keeps_its_422_and_reports_what_it_paid() {
+    const REFUSED_BYTES: u64 = 9_001;
+    const CAP: u64 = 8_192;
+    const SPENT_BYTES: u64 = 12_288;
+    const SPENT_REQUESTS: u64 = 6;
+
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = MemoryStore::new();
+        let snapshot = one_slice_snapshot(&store).await;
+        let (outcome, folded) = folded_spend_of(
+            Arc::new(FailingSpendWorker {
+                make: || {
+                    DistribError::Codec(crate::distrib::codec::CodecError::SliceByteCapExceeded {
+                        bytes: REFUSED_BYTES,
+                        max: CAP,
+                    })
+                },
+                spend: scripted_spend(SPENT_REQUESTS, SPENT_BYTES),
+            }),
+            Signal::Metrics,
+            &snapshot,
+            &EngineConfig::default(),
+        )
+        .await;
+
+        match outcome.expect("a refused slice fails the query") {
+            QueryError::TooManySliceBytes { bytes, max } => {
+                assert_eq!(bytes, REFUSED_BYTES);
+                assert_eq!(max, CAP);
+            }
+            other => panic!("expected the typed cap refusal, got {other:?}"),
+        }
+        assert_eq!(
+            folded.total_s3_bytes(),
+            SPENT_BYTES,
+            "the refused attempt's bytes are on the live handle: the worker \
+             read them before the coordinator declined to hold the result"
+        );
+        assert_eq!(folded.total_s3_requests(), SPENT_REQUESTS);
+    });
+}
+
+/// Writes one real RLOG object holding `count` records and returns a matching
+/// L0 `SegmentRef`. `key` makes the object key, the writer identity and the
+/// content hash unique, so two segments of one slice resolve to different refs
+/// on the worker.
+async fn write_log_segment(store: &MemoryStore, key: u64, count: i64) -> SegmentRef {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str(format!("svc-{key}")),
+    )];
+    let stream_id = log_stream_id(&resource, "scope", "1.0", &[]);
+    let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+    let records: Vec<LogRecord> = (0..count)
+        .map(|i| LogRecord {
+            stream_id,
+            stream_attrs: stream_attrs.clone(),
+            ts_ns: i,
+            observed_ts_ns: i,
+            severity_num: 9,
+            severity_text: "INFO".to_string(),
+            body: format!("line {i} of {key}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        })
+        .collect();
+
+    let identity = LogObjectIdentity {
+        tenant_hash: TENANT.0,
+        shard: 0,
+        writer_id: [key as u8; 16],
+        writer_epoch: 1,
+        writer_seq: key,
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for record in &records {
+        writer.push(record.clone()).expect("push record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+    let size = bytes.len() as u64;
+    let object_key = format!("seg/{key}.rlog");
+    store
+        .put(&object_key, Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put log segment object");
+
+    SegmentRef {
+        data_object_key: object_key,
+        object_size: size,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: count - 1,
+        ingest_hour_bucket: 0,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash: [key as u8; 32],
+        writer_id: Uuid::from_u128(u128::from(key) + 100),
+        writer_epoch: 1,
+        writer_seq: key,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
+    }
+}
+
+/// Writes one real RSPAN object holding `count` spans and returns a matching L0
+/// `SegmentRef`, on the same terms as [`write_log_segment`].
+async fn write_span_segment(store: &MemoryStore, key: u64, count: u8) -> SegmentRef {
+    let records: Vec<SpanRecord> = (0..count)
+        .map(|i| SpanRecord {
+            trace_id: [key as u8 ^ i; 16],
+            span_id: [i + 1; 8],
+            parent_span_id: None,
+            name: "op".to_string(),
+            start_ts_ns: i64::from(i),
+            end_ts_ns: i64::from(i) + 10,
+            status_code: ravel_rspan::StatusCode::Unset,
+            status_message: None,
+            attrs: Vec::new(),
+        })
+        .collect();
+
+    let identity = SpanObjectIdentity {
+        tenant_hash: TENANT.0,
+        shard: 0,
+        writer_id: [key as u8; 16],
+        writer_epoch: 1,
+        writer_seq: key,
+    };
+    let mut writer = RspanWriter::new(RspanConfig::default(), identity);
+    for record in &records {
+        writer.push(record.clone());
+    }
+    let bytes = writer.finish().expect("finish rspan object");
+    let size = bytes.len() as u64;
+    let object_key = format!("seg/{key}.rspan");
+    store
+        .put(&object_key, Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put span segment object");
+
+    SegmentRef {
+        data_object_key: object_key,
+        object_size: size,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: i64::from(count) + 10,
+        ingest_hour_bucket: 0,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash: [key as u8 ^ 0x5a; 32],
+        writer_id: Uuid::from_u128(u128::from(key) + 200),
+        writer_epoch: 1,
+        writer_seq: key,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+        declared_column_stats: Default::default(),
+    }
+}
+
+/// A pinned-scope request for `segments` on `signal`, over the whole time
+/// range so no segment is pruned by the ts filter.
+fn signal_request(segments: &[SegmentRef], signal: Signal) -> pb::FetchRequest {
+    pb::FetchRequest {
+        signal: crate::distrib::codec::signal_to_u32(signal),
+        window_start_ns: i64::MIN,
+        window_end_ns: i64::MAX,
+        ..pushdown_request(segments, None)
+    }
+}
+
+/// The worker half of issue #1723 on the RLOG-family path: a log slice that
+/// fetched its first segment and then took a store 503 on the second reports the
+/// first segment's real cost on its terminal `Unavailable` summary, exactly as
+/// the metric path does.
+///
+/// The oracle is what fetching that first segment alone costs through the same
+/// `LogSegmentFetcher` over a clean store. The GET the fault answered adds
+/// nothing to either counter: the fetcher records a request and its bytes once
+/// the store has served them, so a refused GET is charged for neither.
+///
+/// Mutation proof: RED against the reverted line. Dropping
+/// `.with_spend(&accounting, &stats)` from the fetch-error site in
+/// `SeriesFetchService::run_slice_logs` (`service.rs`) sends the failure through
+/// the catch-all, whose summary is built from a default snapshot, so the bytes
+/// assertion reads 0 against the oracle's figure.
+#[test]
+fn failed_log_slice_reports_the_segments_it_already_paid_for() {
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async {
         let store = Arc::new(MemoryStore::new());
-        let seg = write_segment(
-            &store,
-            0,
-            0,
-            100,
-            &[SeriesDesc {
-                metric: "m0".to_string(),
-                samples: vec![(NS, 1.0f64.to_bits())],
-            }],
+        let first = write_log_segment(&store, 1, 20).await;
+        let second = write_log_segment(&store, 2, 20).await;
+
+        let oracle = {
+            let accounting = QueryAccounting::new();
+            LogSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)
+                .fetch_accounted_with_tenant(
+                    &first,
+                    TENANT,
+                    &LogQuery::new(i64::MIN, i64::MAX),
+                    &accounting,
+                )
+                .await
+                .expect("the first log segment fetches cleanly");
+            accounting.snapshot()
+        };
+        assert!(
+            oracle.total_s3_bytes() > 0,
+            "the fixture's first log segment must cost real bytes"
+        );
+
+        let faulty = Arc::new(FaultStore::new(
+            Arc::clone(&store),
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Transient("store 503 on the second log segment".into()),
+                )
+                .with_key_contains(second.data_object_key.clone()),
+            ),
+        ));
+        let backend: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let (fetcher, server) = spawn_worker_with_log_fetcher(
+            Arc::clone(&backend),
+            LogSegmentFetcher::new(backend),
+            vec![first.clone(), second.clone()],
         )
         .await;
-        let snapshot = Snapshot {
-            segments: vec![seg],
-            segments_pruned: 0,
-            pending_erasure: Vec::new(),
-        };
-        let config = EngineConfig {
-            max_bytes_scanned: crate::config::ByteLimit::Bounded(BUDGET),
-            ..EngineConfig::default()
-        };
+        let response =
+            SliceFetcher::fetch(&fetcher, signal_request(&[first, second], Signal::Logs))
+                .await
+                .expect("the worker answers with a terminal summary");
+        server.abort();
 
-        let run = async |reported: u64| {
-            let distributed = Distributed::new(
-                Arc::new(LyingBudgetWorker {
-                    spend_bytes: reported,
-                }),
-                DistribThresholds {
-                    min_store_bytes: 0,
-                    min_segments: 0,
-                    max_parallel_slices: 1,
-                },
-            );
-            let accounting = QueryAccounting::new();
-            let outcome = distributed
-                .fetch(
-                    TENANT,
-                    Signal::Metrics,
-                    &snapshot,
-                    &[],
-                    &[],
-                    &accounting,
-                    &config,
-                    i64::MAX,
-                    None,
-                )
-                .await;
-            (outcome, accounting.snapshot().total_s3_bytes())
-        };
-
-        let (passing, reported) = run(SURVIVOR_ONLY).await;
-        assert!(
-            passing.is_ok(),
-            "one attempt's share is inside the budget, so the query completes"
-        );
-        assert_eq!(reported, SURVIVOR_ONLY);
-
-        let (refused, reported) = run(ALL_THREE).await;
-        let err = refused.expect_err("the summed spend is over the budget");
-        assert!(
-            matches!(err, crate::error::QueryError::TooManyBytesScanned { .. }),
-            "expected TooManyBytesScanned once enforcement sees the sum, got {err:?}"
+        assert_eq!(
+            faulty.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the fault must actually have fired, once"
         );
         assert_eq!(
-            reported, ALL_THREE,
-            "and the refused query still reports the whole cost the store served"
+            response.status,
+            pb::status::Code::Unavailable,
+            "a non-NotFound store error is the re-dispatchable class"
+        );
+        assert_eq!(
+            response.accounting.total_s3_bytes(),
+            oracle.total_s3_bytes(),
+            "the failure summary carries the bytes the first log segment really \
+             moved; the refused GET transferred none"
+        );
+        assert_eq!(
+            response.accounting.total_s3_requests(),
+            oracle.total_s3_requests(),
+            "and the requests that served them; the refused GET is charged for \
+             neither bytes nor a request on this path"
+        );
+    });
+}
+
+/// The worker half of issue #1723 on the Spans path, on the same terms as
+/// [`failed_log_slice_reports_the_segments_it_already_paid_for`].
+///
+/// Mutation proof: RED against the reverted line. Dropping
+/// `.with_spend(&accounting, &stats)` from the fetch-error site in
+/// `SeriesFetchService::run_slice_spans` (`service.rs`) makes the summary report
+/// zero for a slice that really moved the oracle's bytes off the store.
+#[test]
+fn failed_span_slice_reports_the_segments_it_already_paid_for() {
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let first = write_span_segment(&store, 1, 8).await;
+        let second = write_span_segment(&store, 2, 8).await;
+
+        let oracle = {
+            let accounting = QueryAccounting::new();
+            SpanSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)
+                .fetch_accounted(
+                    &first,
+                    TENANT,
+                    &SpanQuery::ts_range(i64::MIN, i64::MAX),
+                    None,
+                    None,
+                    &[],
+                    &accounting,
+                )
+                .await
+                .expect("the first span segment fetches cleanly");
+            accounting.snapshot()
+        };
+        assert!(
+            oracle.total_s3_bytes() > 0,
+            "the fixture's first span segment must cost real bytes"
+        );
+
+        let faulty = Arc::new(FaultStore::new(
+            Arc::clone(&store),
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Transient("store 503 on the second span segment".into()),
+                )
+                .with_key_contains(second.data_object_key.clone()),
+            ),
+        ));
+        let backend: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let (fetcher, server) = spawn_worker_with_log_fetcher(
+            Arc::clone(&backend),
+            LogSegmentFetcher::new(backend),
+            vec![first.clone(), second.clone()],
+        )
+        .await;
+        let response =
+            SliceFetcher::fetch(&fetcher, signal_request(&[first, second], Signal::Spans))
+                .await
+                .expect("the worker answers with a terminal summary");
+        server.abort();
+
+        assert_eq!(
+            faulty.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the fault must actually have fired, once"
+        );
+        assert_eq!(response.status, pb::status::Code::Unavailable);
+        assert_eq!(
+            response.accounting.total_s3_bytes(),
+            oracle.total_s3_bytes(),
+            "the failure summary carries the bytes the first span segment \
+             really moved; the refused GET transferred none"
+        );
+        assert_eq!(
+            response.accounting.total_s3_requests(),
+            oracle.total_s3_requests(),
+            "and the requests that served them; the refused GET is charged for \
+             neither bytes nor a request on this path"
         );
     });
 }
