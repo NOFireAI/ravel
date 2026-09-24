@@ -147,8 +147,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   multiplies by the two tracked signals, not just the two rotating epochs:
   `cap x bytes-per-entry x 2 epochs x 2 signals`. At the 1,000,000 the ADR
   proposed that is 140,000,000 to 224,000,000 bytes (134 to 214 MiB) per fully
-  active tenant, 4x what the original figure implied; at the 200,000 that ships
-  it is 28,000,000 to 44,800,000 bytes (27 to 43 MiB). The ADR's section 3
+  active tenant, 4.4x to 7x what the original figure implied; at the 200,000
+  that ships it is 28,000,000 to 44,800,000 bytes (27 to 43 MiB). The ADR's section 3
   defaults table now carries the shipped figure with the proposed one beside
   it. Documentation only, no behavior change.
 

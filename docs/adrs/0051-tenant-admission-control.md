@@ -168,7 +168,7 @@ epochs:
 
 At the 1,000,000 this ADR first proposed that is 140,000,000 to
 224,000,000 bytes (134 to 214 MiB) per fully active tenant, before
-multiplying across tenants and replicas: 4× what the original figure
+multiplying across tenants and replicas: 4.4× to 7× what the original figure
 implied, and the reason the shipped default in section 3 is no longer
 1,000,000.
 
