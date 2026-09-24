@@ -711,10 +711,10 @@ than passing for "no pull request open".
   pointer to this amendment") and review kept finding the edit only reached
   one of the named places (issue #1985); this checks the claim against the
   document instead of trusting the prose. An amendment heading is any
-  heading below the title whose text contains a word starting "amend", at
-  any level, since every narrower rule tried here skipped a real amendment
-  silently; one nested inside another amendment's block belongs to that
-  block. `docs/adrs/README.md`, "Amending an ADR", is the author-facing
+  heading below the title whose text contains a word starting "amend" or
+  "correction", in any case, at any level, since every narrower rule tried
+  here skipped a real amendment or correction silently; one nested inside
+  another amendment's block belongs to that block. `docs/adrs/README.md`, "Amending an ADR", is the author-facing
   marker syntax with one example per kind, and the guard's own failure
   output points there. Exit 1 is a finding: a named section without its
   pointer, a retired phrase still standing unqualified, or an
@@ -723,10 +723,10 @@ than passing for "no pull request open".
   could not be checked at all: an amendment heading with no marker, a marker
   missing `sections=`, `pointer=` or `phrase=`, an empty `sections=`, a
   named section heading that does not exist or that exists more than once,
-  no ADR files (`docs/adrs/*.md` less `README.md`, which is the index), or
-  zero amendments scanned, since a scan that could not run and a clean tree
-  are different answers. Exit 64 is bad usage. Wired into `gates.sh` and
-  ci.yml's `doc-scripts` job, cases first. Cases in
+  no such directory, no ADR files (`docs/adrs/*.md` less `README.md`, which
+  is the index), or zero amendments scanned, since a scan that could not run
+  and a clean tree are different answers. Exit 64 is bad usage. Wired into
+  `gates.sh` and ci.yml's `doc-scripts` job, cases first. Cases in
   `scripts/guards/check-amendment-integrity.test.sh`.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
   injected-clock test helper contains `thread::sleep`, `tokio::time::sleep`,

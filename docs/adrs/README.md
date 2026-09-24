@@ -185,20 +185,20 @@ the decision learns it has moved on.
 
 `scripts/guards/check-amendment-integrity.sh` checks the amendment's claim
 about its own effect against the document. Every amendment heading (any
-heading below the title whose text contains a word starting "amend", at any
-level) must carry at least one marker in its own block, an HTML comment
-saying what the amendment did. A marker is one line: the guard reads it
-with a single-line pattern, so a marker wrapped across two lines reads as
-no marker at all.
+heading below the title whose text contains a word starting "amend" or
+"correction", at any level) must carry at least one marker in its own
+block, an HTML comment saying what the amendment did. A marker is one
+line: the guard reads it with a single-line pattern, so a marker wrapped
+across two lines reads as no marker at all.
 
 ### The markers
 
 Nothing was retired, so nothing points here:
 
 ```markdown
-## Amendment 2026-09-06 (issue #1196): a named latency-first policy
+## Amendment (2026-09-07): the loopback refusal covers every listener the shared resolver backs
 
-<!-- amendment-applies: none reason="adds a fourth policy alongside the three decision 2 names, and retires none of them" -->
+<!-- amendment-applies: none reason="the Decision's loopback refusal stands exactly as written; this records an implementation that did not honour it and the tightened guard, and retires no earlier wording" -->
 ```
 
 The reason is required. `none` is the marker that turns the checks off, so
@@ -251,6 +251,7 @@ never qualify a phrase and never count as an occurrence of one.
 - **70**: the claim could not be checked at all, which is not a pass: an
   amendment heading with no marker, a marker missing `sections=`,
   `pointer=` or `phrase=`, an empty `sections=`, a named heading that does
-  not exist or exists more than once, no ADR files, or zero amendments
-  scanned. Fix the marker or the heading it names; do not leave it at 70.
+  not exist or exists more than once, no such directory, no ADR files, or
+  zero amendments scanned. Fix the marker or the heading it names; do not
+  leave it at 70.
 - **64**: bad usage (more than one argument).
