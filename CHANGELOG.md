@@ -170,54 +170,51 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `absent()` branch so a scrape target list that drops every folding
   process entirely still fires.
 
-- **Per-part (v3) column-statistics objects, written alongside the
-  existing whole-snapshot v1 and v2 statistics** (issue #1482, ADR-1413).
-  The fold now writes one `.cstat` object per newly-written snapshot part,
-  referenced by an additive field 7 (`column_stats`) on `SnapshotPartRef`.
-  A part whose statistics would exceed `DEFAULT_MAX_COLUMN_STATS_BYTES`
-  (256 MiB, the same ceiling the v3 reader already enforces) degrades
-  rather than stalls the fold: the largest remaining dictionary is dropped
-  and the part re-measured, repeating until it fits, clearing only
-  `dictionary_present`/`dictionary` and keeping min/max/count/sum exact;
-  the fold fails a part only once no dictionary is left to drop and it is
-  still over the ceiling. `FoldReport::column_stats_dictionaries_dropped`
-  reports how many dictionaries a fold cleared this way. Objects are keyed
-  by the content hash of their own bytes rather than the part's hash, so
-  two folds that recompute a byte-identical part but hit different
-  segment-fetch outcomes cannot collide on a key naming bytes that were
-  never stored there; the v3 object is built and bound-checked before the
-  part's own `.csnap` is written, so a refused part leaves no orphaned
-  `.csnap` behind. The degrade loop tracks each dropped dictionary's exact
-  byte contribution instead of re-measuring the whole part per drop, so a
-  part needing tens of thousands of drops still finishes. An incremental
-  fold also skips the v3 baseline fetch for any old part it is not
-  genuinely re-deriving, cutting one object GET per untouched sealed part
-  on every incremental fold. `ravel-maintain`'s unreferenced-object sweep
-  now carries every part's field-7 key into its referenced-key set;
-  without that, a v3 object outlived only by the sealed part naming it
-  would have crossed the protection horizon and been swept from under it.
+- **Per-part (v3) column-statistics objects** (issue #1482, ADR-1413; the
+  whole-snapshot v1 and v2 statistics they were first written alongside are
+  retired later in this release, see the #1600 entry). The fold now writes one
+  `.cstat` object per newly-written snapshot part, referenced by an additive
+  field 7 (`column_stats`) on `SnapshotPartRef`. A part whose statistics would
+  exceed `DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB, the same ceiling the v3
+  reader already enforces) degrades rather than stalls the fold: the largest
+  remaining dictionary is dropped and the part re-measured, repeating until it
+  fits, clearing only `dictionary_present`/`dictionary` and keeping
+  min/max/count/sum exact; the fold fails a part only once no dictionary is left
+  to drop and it is still over the ceiling.
+  `FoldReport::column_stats_dictionaries_dropped` reports how many dictionaries
+  a fold cleared this way. Objects are keyed by the content hash of their own
+  bytes rather than the part's hash, so two folds that recompute a
+  byte-identical part but hit different segment-fetch outcomes cannot collide on
+  a key naming bytes that were never stored there; the v3 object is built and
+  bound-checked before the part's own `.csnap` is written, so a refused part
+  leaves no orphaned `.csnap` behind. The degrade loop tracks each dropped
+  dictionary's exact byte contribution instead of re-measuring the whole part
+  per drop, so a part needing tens of thousands of drops still finishes. An
+  incremental fold also skips the v3 baseline fetch for any old part it is not
+  genuinely re-deriving, cutting one object GET per untouched sealed part on
+  every incremental fold. `ravel-maintain`'s unreferenced-object sweep now
+  carries every part's field-7 key into its referenced-key set; without that, a
+  v3 object outlived only by the sealed part naming it would have crossed the
+  protection horizon and been swept from under it.
 
-- **`ravel-cli catalog fold --json`, and full column-statistics visibility
-  in `catalog fold` and `catalog inspect`** (issue #1598). `catalog
-  fold`'s human report used to print only 10 of `FoldReport`'s
-  then-23 fields, silently dropping counters such as
-  `column_stats_dictionaries_dropped`; it now renders every field, and
-  `--json` emits the whole struct as a JSON document (the store
-  selection, `signal`, and `seal_margin` ride along as extra top-level
-  keys rather than being lost). `catalog inspect` prints each
-  column-statistics reference (HEAD fields 11 and 13, and the new
-  per-part field 7) as `key=... size=...`, or an explicit `ABSENT`
-  marker, so an omitted line and an unset field are no longer
-  indistinguishable. A new `ravel-cli inspect cstat <key>` decodes a
-  `.cstat` object's envelope and header without decompressing its body,
-  so an object whose declared uncompressed length exceeds the decode
-  ceiling still yields every header field and an over-ceiling verdict
-  instead of an error; under the ceiling it goes on to list each
-  column's `dictionary_present`. `FoldReport::put_requests` previously
-  undercounted: three of the six fold PUT call sites only incremented on
-  success or `AlreadyExists`, so a store-side error on an
-  otherwise-issued PUT went uncounted even though the object may have
-  been durably written as an orphan; all six sites now increment
+- **`ravel-cli catalog fold --json`, and full column-statistics visibility in
+  `catalog fold` and `catalog inspect`** (issue #1598). `catalog fold`'s human
+  report used to print only 10 of `FoldReport`'s then-23 fields, silently
+  dropping counters such as `column_stats_dictionaries_dropped`; it now renders
+  every field, and `--json` emits the whole struct as a JSON document (the store
+  selection, `signal`, and `seal_margin` ride along as extra top-level keys
+  rather than being lost). `catalog inspect` prints each column-statistics
+  reference (the per-part field 7) as `key=... size=...`, or an explicit
+  `ABSENT` marker, so an omitted line and an unset field are no longer
+  indistinguishable. A new `ravel-cli inspect cstat <key>` decodes a `.cstat`
+  object's envelope and header without decompressing its body, so an object
+  whose declared uncompressed length exceeds the decode ceiling still yields
+  every header field and an over-ceiling verdict instead of an error; under the
+  ceiling it goes on to list each column's `dictionary_present`.
+  `FoldReport::put_requests` previously undercounted: three of the six fold PUT
+  call sites only incremented on success or `AlreadyExists`, so a store-side
+  error on an otherwise-issued PUT went uncounted even though the object may
+  have been durably written as an orphan; all six sites now increment
   unconditionally once the request resolves.
 
 - **`ravel_declared_stats_drops_observed_total`,
@@ -528,30 +525,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   serving listeners, behind its own feature and flag** (issue #1381). `--mcp`
   opts a build carrying the `mcp` cargo feature into serving `POST /mcp`;
   `--mcp-allowed-origins` is a mandatory origin allowlist (an empty list is
-  accepted only on a loopback listener, and fails startup on any other
-  address); `--mcp-max-body-bytes` caps the request body (default 1 MiB) and
-  refuses a value of 0. The route runs the same tenant resolution, origin
-  check, and body cap as the HTTP query surfaces before anything reaches the
-  protocol layer, and each tool call is billed through the same admission
-  permit, deadline clamp, cost record, usage guard, audit submission, partial-
-  result gate, and error redaction as an HTTP query. Starting the process with
-  `--mcp` under `--mode gateway` or `--mode maintain` now fails at startup,
-  naming the flag and the mode, instead of silently mounting nothing. Of the
-  nine catalogued tools, only `ravel_capabilities` has a body today; the other
-  eight return a typed `NotShipped` protocol error naming the tool, and
-  `ravel_capabilities` itself reports which tools are actually served
-  (`tools.enabled`) separately from the full catalog (`tools.catalogued`). A
-  JSON integer above `i64::MAX` returned from a tool call (an unsigned 64-bit
-  counter) now renders as an exact-digit string cell rather than a lossy float
-  cell, matching the string-precision treatment integer and timestamp cells
-  already get. A `finish` response now names `visibility.snapshot_id`,
+  accepted only on a loopback listener, and fails startup on any other address);
+  `--mcp-max-body-bytes` caps the request body (default 1 MiB) and refuses a
+  value of 0. The route runs the same tenant resolution, origin check, and body
+  cap as the HTTP query surfaces before anything reaches the protocol layer, and
+  each tool call is billed through the same admission permit, deadline clamp,
+  cost record, usage guard, audit submission, partial- result gate, and error
+  redaction as an HTTP query. Starting the process with `--mcp` under `--mode
+  gateway` or `--mode maintain` now fails at startup, naming the flag and the
+  mode, instead of silently mounting nothing. `ravel_capabilities` reports which
+  tools are actually served (`tools.enabled`) separately from the full catalog
+  (`tools.catalogued`). A `finish` response now names `visibility.snapshot_id`,
   `visibility.watermark_hour`, `ids.query_id`, or `ids.audit_ref` in its
   `warnings` list when the underlying operation left that field unmeasured,
   rather than rendering an empty string a caller cannot distinguish from a
   genuinely empty value. A malformed MCP budget argument is now refused rather
   than silently defaulted, and `row_cap_hit` together with the produced row
-  count now survive through to `finish` instead of being dropped along the
-  way.
+  count now survive through to `finish` instead of being dropped along the way.
 
 - **A `--max-ingest-lag` flag replaces the hardcoded 2h ingest admission
   bound** (issue #1682). The value drives both the catalog listing window and
@@ -2290,17 +2280,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so a `rejected_data_points` count of 0 can still carry a populated
   `error_message`, which is what the OTLP proto reserves that field for.
 
-- **The quickstart deploy's MinIO images and OpenTelemetry Collector image
-  move off Docker Hub** (issue #1645). Docker Hub's anonymous pull allowance
-  is scoped by source IP and shared with every other project on a runner, so
-  an exhausted allowance failed the quickstart job with a message that pointed
-  at credentials rather than at the real limit. Eight MinIO references move to
-  quay.io (both images in `docker-compose/minio.yml`, `docker-
-  compose/ravel.yml`, `k8s/minio.yaml`, and `metricsbench/docker-compose.yml`,
-  plus the `mc` invocations in the chaos and demo scripts), preserving the
+- **The quickstart deploy's MinIO images and OpenTelemetry Collector image move
+  off Docker Hub** (issue #1645). Docker Hub's anonymous pull allowance is
+  scoped by source IP and shared with every other project on a runner, so an
+  exhausted allowance failed the quickstart job with a message that pointed at
+  credentials rather than at the real limit. Eight MinIO image references (both
+  images in `docker-compose/minio.yml`, `docker-compose/ravel.yml`,
+  `k8s/minio.yaml`, and `metricsbench/docker-compose.yml`) and the two `mc`
+  invocations in the chaos and demo scripts move to quay.io, preserving the
   existing digest pins, which quay.io serves under the identical digest. The
-  Collector moves to the `ghcr.io` path the upstream project publishes it
-  under. Grafana's image stays on Docker Hub: no anonymous mirror was found on
+  Collector moves to the `ghcr.io` path the upstream project publishes it under.
+  Grafana's image stays on Docker Hub: no anonymous mirror was found on
   `ghcr.io`, `quay.io`, or `public.ecr.aws`, so the quickstart job still makes
   one anonymous Docker Hub pull, down from three.
 
