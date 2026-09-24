@@ -69,7 +69,7 @@ Cost and latency: the response tail gains up to `max_age` plus one dual-PUT roun
 
 **2c. Bounded keyspace: maintain the query-audit shard.** `Signal::Audit` shard `QUERY_AUDIT_SHARD=1` joins the maintained set as a fourth maintenance target with its own policy knob: RLOG compaction (existing machinery, new signal/shard parameter) and a dedicated `audit_retention` window (default 90 d, configurable; deployments with regulatory retention set it to their obligation). Sweep remains horizon-gated and passes through `LegalHoldCheck`, so a placed legal hold protects audit evidence exactly as it protects data. Legal-hold shard 0 stays excluded from maintenance (its growth is per operator action, not per query) and stays deny-delete forever.
 
-**2d. ADR-0055 amendment (required by 2c).** The deny-delete prefix `t/<hash>/u/**` narrows to the legal-hold shard's prefix. Real audit object keys carry their shard as a four-digit segment (`t/<hash>/u/<l0|c|l1>/<shard:04>/…`), so in prefix terms that narrowing is `t/<hash>/u/*/0000/**`, not `t/<hash>/u/0/**` — see the amendment below, which corrects this section's original text. Maintain's delete grant gains the query-audit shard's objects, which the retention sweep — the same code path, same role, same horizon gating as every other signal — now legitimately deletes. No other role gains anything; Query's grant remains append-only `Put` on the query-audit shard. The amendment is narrow and mechanical, and this ADR records it rather than leaving ADR-0055 contradicted in place.
+**2d. ADR-0055 amendment (required by 2c).** The deny-delete prefix `t/<hash>/u/**` narrows to the legal-hold shard's prefix. Real audit object keys carry their shard as a four-digit segment (`t/<hash>/u/<l0|c|l1>/<shard:04>/…`), so in prefix terms that narrowing is `t/<hash>/u/*/0000/**`, not `t/<hash>/u/0/**` — see the audit-prefix transcription amendment below, which corrects this section's original text. Maintain's delete grant gains the query-audit shard's objects, which the retention sweep — the same code path, same role, same horizon gating as every other signal — now legitimately deletes. No other role gains anything; Query's grant remains append-only `Put` on the query-audit shard. The amendment is narrow and mechanical, and this ADR records it rather than leaving ADR-0055 contradicted in place.
 
 **2e. PII policy: keyed tokenization, plaintext by explicit opt-in.**
 
@@ -114,7 +114,7 @@ Gaps closed: per-tenant KMS by 1a-1e; coverage by 2a; lossiness by 2b; unbounded
 
 ## Amendment: correct section 2d's audit-prefix transcription
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="2. Audit: one evidential pipeline for every query surface" pointer="audit-prefix transcription amendment" -->
 
 ADR-0072 found that section 2d wrote the legal-hold shard's
 deny-delete prefix as `t/<hash>/u/0/**`. That form is wrong: the shard is
@@ -142,7 +142,7 @@ mismatch fails CI instead of shipping silently.
 
 ## Amendment: mid-stream audit-flush failure fails closed symmetrically
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="this records the #55 fix that brought the Flight SQL mid-stream path under section 2b's existing required-mode rule, and adds an error-precedence rule for a path section 2b does not describe; no earlier wording is narrowed or retired" -->
 
 Issue #55 found that the Flight SQL mid-stream audit-flush-failure path
 was the one holdout that did not fail closed. Section 2b makes a failed

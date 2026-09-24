@@ -215,7 +215,9 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
 3. **Publish**: one new additive record type, `RewriteRecord`
    (proto/ravel/commit.proto; key `c/<shard>/<hour>/rw.<input_set_hash16>.cmt`,
    same prefix as every other record so the existing single LIST discovers
-   it). It names its exact input set — L0 commit identities and/or the
+   it; the hash's preimage and the predecessor field are corrected by the
+   rewrite key binding amendment below). It names its exact input set — L0
+   commit identities and/or the
    compaction record it supersedes — its output parts, the request_ids
    applied, and per-request dropped counts. Published with
    `CreateIfAbsent`; racing publishers resolve exactly as compaction races
@@ -270,9 +272,9 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    `protection_horizon`, under the same `LegalHoldCheck` gate as every
    other delete.
 
-## Amendment: the rewrite key must bind to the applied request set, and a rewrite must be able to name a non-L0 predecessor
+### Amendment: the rewrite key must bind to the applied request set, and a rewrite must be able to name a non-L0 predecessor
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="3. The rewrite pass: physical erasure by rewrite-and-supersede" pointer="rewrite key binding amendment" -->
 
 Implementing decision 1 and this decision's `RewriteRecord`
 shape found two problems a checkpoint proved rather than
@@ -339,7 +341,10 @@ publishes rewrite records.
 When every bucket in a request's scope has a live record set consisting
 only of rewrite outputs with that request applied (re-verified by a fresh
 LIST per bucket, the ADR-0048 re-verify discipline), the pass writes the
-`.done` record. Completion is verified, not assumed.
+`.done` record. Completion is verified, not assumed. The unsealed bucket
+completion amendment below adds a second condition: no `.done` while a
+bucket that was in the request's scope at the acknowledgement is still
+open.
 
 **The deletion guarantee Ravel makes**, to be stated normatively in a new
 "Deletion guarantees" section of docs/consistency-model.md:
@@ -347,7 +352,7 @@ LIST per bucket, the ADR-0048 re-verify discipline), the pass writes the
 | Stage | Guarantee | Worst-case bound (defaults) |
 |---|---|---|
 | Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drained within `max_query_duration` (30 s) |
-| Rewrite complete (`.done`) | Every live segment, index entry, and derived dataset is free of matching records | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric |
+| Rewrite complete (`.done`) | Every live segment, index entry, and derived dataset is free of matching records (scope narrowed, and proved sufficient, by the completion resolver amendment below) | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric |
 | Physical bytes gone from the bucket | Superseded inputs swept | `.done` + `protection_horizon` (default `max_query_duration` + 24 h grace) + one sweep interval — with defaults, under 4 days end to end |
 | Physical bytes gone from query-node disk caches | Non-durable local copies aged out | sweep + disk-tier entry max-age (24 h); or immediately, by deleting cache directories |
 
@@ -383,7 +388,8 @@ remains open: the rewrite pass's own scope (§3.1, "every sealed bucket ...
 all buckets when no range is given") is far wider than 26 hours, so a DSAR
 against data outside the reconcile window is not automatically re-folded,
 and the folded snapshot can keep serving the pre-erasure input until
-something else forces a re-fold of that hour.
+something else forces a re-fold of that hour. The targeted refold
+amendment below names that mechanism and makes it callable on demand.
 
 This is now a **binding requirement on the rewrite pass**, not a
 follow-up nicety: the pass's completion verification (§4 above, "re-verified by
@@ -431,9 +437,9 @@ record set is rewrite-output-only" check), so the pass must not derive that
 check independently of the same exclusion logic the resolver uses, or this
 net has a hole matching the shape above.
 
-## Amendment: a targeted refold closes the out-of-window gap on demand
+### Amendment: a targeted refold closes the out-of-window gap on demand
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="4. Completion, verification, and the stated worst-case bound" pointer="targeted refold amendment" -->
 
 The "out-of-window case remains open" correction above named the gap but no
 mechanism to close it on demand; `Catalog::fold_with_refold_request` (issue
@@ -456,9 +462,9 @@ caller retrying a DSAR-driven refold against an unchanged watermark can tell
 "nothing sealed since last time" apart from "the request was serviced" by
 reading that field rather than assuming success from `no_op: false`.
 
-## Amendment: completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies
+### Amendment: completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="4. Completion, verification, and the stated worst-case bound" pointer="completion resolver amendment" -->
 
 A later change closes two checkpoint findings (F1 and F3) against the
 landed rewrite pass (`services/ravel-server/src/maintain.rs`).
@@ -501,9 +507,9 @@ section are narrowed to state this proof explicitly. The two honest
 residuals are unchanged and already tracked: the out-of-window folded
 snapshot (§4 open item, above) and the query-audit keyspace (ADR-0062).
 
-## Amendment: completion waits for a bucket that was open at the acknowledgement
+### Amendment: completion waits for a bucket that was open at the acknowledgement
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="4. Completion, verification, and the stated worst-case bound" pointer="unsealed bucket completion amendment" -->
 
 2026-09-07. Section 3 point 1 defers an unsealed bucket to the next pass. The
 completion gate in section 4 read that deferral as an exclusion from scope and
@@ -552,15 +558,17 @@ docs/consistency-model.md's `.done` row carries the normative wording.
 
 The `.dreq` contains the subject identifier, so it must not outlive its
 purpose. A new sweep rule deletes `.dreq` when **all** hold: its `.done`
-exists; `now >= done.created_unix_ns + protection_horizon`; and the
-`LegalHoldCheck` passes. The horizon wait guarantees no resolvable snapshot
+exists; `now >= done.created_unix_ns + protection_horizon` (the field is
+named `completed_unix_ns`, and a further hold applies: see the `.dreq`
+release amendment below); and the `LegalHoldCheck` passes. The horizon
+wait guarantees no resolvable snapshot
 can still include a pre-rewrite input by the time the query-time filter
 disappears, closing the §3.5 race window durably. The `.done` record (hash
 only, no PII) is permanent.
 
-## Amendment: the .dreq release rule names completed_unix_ns and holds while a superseded input is still resolvable
+### Amendment: the .dreq release rule names completed_unix_ns and holds while a superseded input is still resolvable
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="5. Erasing the erasure request itself" pointer="`.dreq` release amendment" -->
 
 2026-09-03. Landing the superseded-input sweep found two mismatches between
 section 5 above and the shipped rule.

@@ -71,8 +71,9 @@ structurally instead of procedurally.
 ### D2. Correct the required-check set
 
 `coverage` leaves the required set and stops running on PRs
-entirely; it runs on pushes to main (badge and JSON artifact unchanged)
-and its double test execution collapses to one `--no-report` run followed
+entirely; it runs on pushes to main (badge and JSON artifact unchanged,
+and given a floor by the main-push coverage ratchet amendment below) and
+its double test execution collapses to one `--no-report` run followed
 by two `report` invocations. `k8s-integration` joins the required set, but
 only after D5 makes it fast and non-flaky. Net effect: the PR-blocking
 critical path drops from coverage's 22-26m to `check`'s 13-17m
@@ -158,7 +159,9 @@ script pair is deleted.
 - Keep `coverage` required with a threshold gate: a hard threshold on a
   codebase growing 2,000+ lines/day generates noise merges can trip over,
   while the job still duplicates `check`'s test run. Visibility, not
-  gating, is what coverage provides here.
+  gating, is what coverage provides here on pull requests; the main-push
+  coverage ratchet amendment below gates main pushes alone, and prices
+  that difference.
 - `needs: check` on expensive lanes for fail-fast: serializes 13-17m in
   front of k8s/coverage on every green run. The metadata-only `lint` job
   gives the same early kill for one-third the serialized cost.
@@ -195,7 +198,7 @@ script pair is deleted.
 
 ## Amendment: main-push coverage ratchet
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="D2. Correct the required-check set|Rejected alternatives" pointer="main-push coverage ratchet amendment" -->
 
 External review finding J-7 observes that coverage is measured and
 badged but never gated, so the number can only fall silently. Read
