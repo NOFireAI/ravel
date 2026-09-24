@@ -4461,19 +4461,13 @@ fn log_record_order_key_discriminates_every_field() {
 /// exactly, since a failed GET transfers none, and requests are the oracle's
 /// plus that one attempt.
 ///
-/// Mutation proof: RED against the pre-fix code. Restoring the fetch-error site
-/// in `SeriesFetchService::run_slice` to `SliceFailure::from(map_fetch_error(e))`
-/// (no `.with_spend(..)`) sends the failure through the catch-all, whose summary
-/// is built from `QueryAccountingSnapshot::default()`, so the summary reports
-/// zero for a slice that really moved the oracle's bytes off the store. The
-/// byte assertion below then fails with:
-///
-/// ```text
-/// assertion `left == right` failed: the failure summary carries the bytes the
-/// first segment really moved; the failed GET transferred none
-///   left: 0
-///  right: 306
-/// ```
+/// Mutation proof: RED when the fetch-error site in
+/// `SeriesFetchService::run_slice` goes back to
+/// `SliceFailure::from(map_fetch_error(e))` with no `.with_spend(..)`. The
+/// failure then takes the catch-all, whose summary is built from
+/// `QueryAccountingSnapshot::default()`, and the byte assertion below fails
+/// against a summary reporting zero for a slice that really moved the oracle's
+/// bytes off the store.
 #[test]
 fn failed_slice_reports_the_segments_it_already_paid_for() {
     use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
@@ -4613,16 +4607,10 @@ impl SliceFetcher for UnavailableWorker {
 /// The scripted spend is the sum `RoutingSliceFetcher::dispatch` now carries:
 /// three attempts of 4 GETs over 4096 bytes each.
 ///
-/// Mutation proof: RED against the pre-fix code. Deleting the `fold_slice(..)`
-/// call from the `Unavailable` arm of `Distributed::fetch` leaves the live
-/// handle at zero while the store served 12288 bytes:
-///
-/// ```text
-/// assertion `left == right` failed: the whole fan-out's spend is on the live
-/// handle, not only the share a successful slice would have contributed
-///   left: 0
-///  right: 12288
-/// ```
+/// Mutation proof: RED when the `fold_slice(..)` call in the `Unavailable` arm
+/// of the metrics fan-out in `Distributed::fetch` is deleted. The live handle
+/// then reads zero for a fan-out whose store served every attempt, and the byte
+/// assertion below fails.
 #[test]
 fn failed_slice_spend_reaches_the_live_accounting_handle() {
     const ATTEMPTS: u64 = 3;
