@@ -1165,9 +1165,10 @@ pub struct Cli {
     /// this byte ceiling, but it does not leave spawned-flush memory
     /// unbounded on its own: `--max-queued-flushes` still caps the ordinary
     /// flush queue regardless of this setting. The exemption from that cap
-    /// that can keep growing is a buffer that has crossed its per-tenant
-    /// memory backstop, and under `0` it is bounded only by how long a stall
-    /// lasts (the gauge itself is still tracked for `/metrics` either way).
+    /// that can keep growing is a buffer that has crossed its per-(shard,
+    /// tenant) memory backstop, and under `0` it is bounded only by how long
+    /// a stall lasts (the gauge itself is still tracked for `/metrics` either
+    /// way).
     ///
     /// What `0` leaves unbounded is narrower than it was, but it is not
     /// nothing. Under ADR-1642 a flush task is spawned at every trigger and
@@ -6563,6 +6564,33 @@ mod tests {
             help.contains(&bounded_needle),
             "help must state the budgeted backstop as \"{bounded_needle}\": {help}"
         );
+    }
+
+    /// `-h` and the generated reference page render only the first paragraph
+    /// of a flag's doc comment, so what `--max-ingest-buffer-bytes 0` leaves
+    /// unbounded has to be stated there, not further down (issue #1740).
+    #[test]
+    fn max_ingest_buffer_bytes_short_help_names_the_queue_cap_and_backstop() {
+        use clap::CommandFactory;
+
+        let cmd = Cli::command();
+        let help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "max_ingest_buffer_bytes")
+            .expect("--max-ingest-buffer-bytes is defined on the command")
+            .get_help()
+            .expect("--max-ingest-buffer-bytes carries short help")
+            .to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--max-queued-flushes",
+            "per-(shard, tenant) memory backstop",
+        ] {
+            assert!(
+                help.contains(needle),
+                "short help must name {needle:?}: {help}"
+            );
+        }
     }
 
     /// `--disable-cache`'s long help is a fourth operator-facing restatement

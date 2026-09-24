@@ -589,11 +589,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`--max-ingest-buffer-bytes`'s help text and generated reference page now
   state what `0` actually leaves unbounded, instead of calling it a disabled
-  ceiling and nothing more** (issue #1740). The flag's short help -- the text
-  `--help` prints and the generator that renders
-  `docs/reference/ravel-server-flags.md` both draw only the doc comment's
-  first paragraph, so a fuller explanation added elsewhere in the comment
-  never reached either surface. An operator reading either one saw "`0`
+  ceiling and nothing more** (issue #1740). `-h` and the generator that
+  renders `docs/reference/ravel-server-flags.md` both show only the doc
+  comment's first paragraph (`--help` shows all of it), so the fuller
+  explanation further down the comment never reached either surface. An operator reading either one saw "`0`
   disables the ceiling (the gauge is still tracked for `/metrics`)" and
   nothing else, which is how a `0` setting produced a flush queue bounded
   only by host memory under a sustained object-store stall with no warning
@@ -601,8 +600,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that `0` does not leave spawned-flush memory unbounded on its own --
   `--max-queued-flushes` still caps the ordinary flush queue at every
   setting of this flag -- and names the one exemption from that cap that can
-  keep growing under `0`: a buffer that has crossed its per-tenant memory
-  backstop, which with the byte ceiling disabled is bounded only by the
+  keep growing under `0`: a buffer that has crossed its per-(shard, tenant)
+  memory backstop, which with the byte ceiling disabled is bounded only by the
   length of the stall. No runtime behavior changes;
   this is a documentation-only fix, regenerated from the updated doc
   comment with `RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-server
