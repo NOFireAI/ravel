@@ -933,19 +933,32 @@ from, and a separate knob from, the fetch-phase `GetLimiter` described
 below: resolve happens first and touches catalog metadata, fetch happens
 second and touches segment data.
 
-`CatalogConfig::resolve_get_concurrency` bounds how many of these listing
-and record-GET requests one `Catalog` instance keeps in flight at once, via
-a per-instance `tokio::sync::Semaphore`. It defaults to 128 and is rejected
-at construction time (a typed `CatalogError::InvalidConfig`, never a silent
-clamp to 1) if configured to `0`, since a zero-permit semaphore would
-deadlock every resolve, or above `MAX_RESOLVE_GET_CONCURRENCY` (4096), because
-nothing past that is a sane operator value: at roughly 30 ms per round it is
-about 136,000 GET/s, twenty-five times S3's per-prefix guidance, so a larger
+Two limits bound these requests, and a resolve request holds a permit of
+each (ADR-1733 decision 1).
+
+`CatalogConfig::resolve_prefix_concurrency` bounds how many of them may be
+in flight under one shard-hour commit prefix, whatever else the process is
+doing. It defaults to 128, the figure measured below, and has no CLI flag:
+it is a property of what one S3 prefix sustains, not of the host. Its
+semaphores are created on first use for a prefix and dropped once no
+request holds one, so a resolve over many shard-hours does not leave a
+semaphore per prefix resident.
+
+`CatalogConfig::resolve_get_concurrency` is the per-process ceiling across
+every prefix and every concurrent resolve. It is rejected at construction
+time (a typed `CatalogError::InvalidConfig`, never a silent clamp to 1) if
+configured to `0`, since a zero-permit semaphore would deadlock every
+resolve, or above `MAX_RESOLVE_GET_CONCURRENCY` (4096), because nothing past
+that is a sane operator value: at roughly 30 ms per round it is about
+136,000 GET/s, twenty-five times S3's per-prefix guidance, so a larger
 number is a typo, not a setting. Tokio's own ceiling
 (`Semaphore::MAX_PERMITS`, `usize::MAX >> 3`) is far above it and is not what
-the bound exists for. `ravel-server`
-exposes it as
-`--catalog-resolve-concurrency`; unset, the catalog's own default applies.
+the bound exists for. `ravel-server` exposes it as
+`--catalog-resolve-concurrency` and derives it from the process's query
+concurrency when the flag is unset; see
+[the configuration guide](guides/operations/configuration.md#per-query-budgets).
+Unset in any other caller, `CatalogConfig`'s own default applies, which is
+the per-prefix bound.
 
 The default was raised from a fixed 16 after measuring against real S3 on a
 10,000-record unsealed tail (one cold resolve each; every level below
@@ -964,13 +977,15 @@ under S3's published guidance of about 5,500 GET/s per prefix, and every
 request this phase issues lands under one `m/c/<shard>/<hour>/` prefix per
 shard-hour.
 
-This bounds one `Catalog` instance, not the process: `ravel-server` builds
-exactly one `Catalog` and shares it (an `Arc` clone per request, one
-underlying `request_semaphore`), so N concurrent queries against that
-instance are capped at 128 in flight TOTAL, not `N * 128`. `N * 128` in flight
-holds only across N distinct `Catalog` instances (separate CLI invocations
-or tests), never within one running server. A process-wide cap across
-instances is not implemented and is tracked as a follow-up.
+128 is what one prefix sustains, so it is where the per-prefix bound sits
+and where the per-process ceiling starts. `ravel-server` builds exactly one
+`Catalog` and shares it (an `Arc` clone per request, one underlying
+`request_semaphore`), so N concurrent queries share that one ceiling: the
+process never exceeds it, and no single shard-hour prefix exceeds 128
+however high it is set. The ceiling scales with the queries the process
+admits rather than staying at one prefix's worth, because N concurrent
+queries usually resolve over N different shard-hours and would otherwise
+serialize behind a bound sized for one.
 
 ### GET concurrency (ADR-1195)
 

@@ -128,6 +128,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The catalog resolve path's request ceiling now derives from the server's
+  query concurrency instead of sitting at a flat 128** (issue #1733, ADR-1733).
+  Only the unset default moves: an explicit `--catalog-resolve-concurrency` is
+  still used verbatim, and `0` or a value above 4,096 is still a startup
+  refusal. Unset, the ceiling resolves to `clamp(Q * 128, 128, 4096)`, where
+  `Q` is `--max-concurrent-queries` when that flag bounds queries and the
+  derived `max(8, 2 x cores)` when it does not. So a server run with
+  `--max-concurrent-queries 1` keeps 128, one run with
+  `--max-concurrent-queries 4` gets 512, and an unbounded 8-core host
+  (`Q` = 16, deriving 2,048) gets 1,024. The resolved number is logged at
+  startup beside the other derived performance defaults, with the `Q` and the
+  input it came from. A second bound, per shard-hour commit prefix and with no
+  flag, holds any single prefix to 128 requests whatever the ceiling is, so a
+  higher ceiling buys concurrency across prefixes and never more pressure on
+  one. The 1,024 is an interim cap: the ADR bounds in-flight resolve memory by
+  reserving each request's listed size against the ADR-1170 process budget,
+  that reservation is not wired up yet, and until it is a derived ceiling is
+  held at 1,024 rather than allowed to reach the 4,096 the clamp permits.
+
 - **A shard now refuses a flush trigger once `--max-queued-flushes` (default
   8) flush tasks are spawned and unacked, leaving the rows buffered for the
   next tick** (issue #1740). Before this, every trigger spawned a task, so a
