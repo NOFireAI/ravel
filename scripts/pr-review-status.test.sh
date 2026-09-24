@@ -431,7 +431,7 @@ check_eq "outside-diff body finding: counted on the summary line" \
   "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0 outside_diff_body_findings@head=1" \
   "$(printf '%s\n' "${finding_out}" | sed -n 1p)"
 check_eq "outside-diff body finding: verdict is not clean" \
-  "  -> 1 outside-diff finding(s) in the review BODY at head, not inline; read the body with \`gh api repos/NOFireAI/ravel/pulls/908/reviews --jq '.[] | select(.commit_id==\"${SHA}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered" \
+  "  -> 1 outside-diff finding(s) in the review BODY at head, not inline; read the body with \`ALLOW_LITERAL_SHA=1 gh api repos/NOFireAI/ravel/pulls/908/reviews --jq '.[] | select(.commit_id==\"${SHA}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered" \
   "$(printf '%s\n' "${finding_out}" | sed -n 2p)"
 check_eq "outside-diff body finding: no merge command offered" \
   "" \
