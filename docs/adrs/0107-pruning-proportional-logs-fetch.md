@@ -46,6 +46,8 @@ ships — see the scope correction below.
 
 ### The scope correction this ADR makes: column-level fetch savings are not available today
 
+<!-- amendment-applies: none reason="corrects the originating epic's (#363) expectation, not any wording elsewhere in this document; nothing here is retired" -->
+
 The originating epic (#363) was written expecting per-block **column**
 projection to shrink bytes on the wire — "fetch only the pages a
 `ColumnSelection` needs." That is not achievable without a frozen-format

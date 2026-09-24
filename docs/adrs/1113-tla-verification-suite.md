@@ -476,6 +476,8 @@ model action that must be re-examined.
 
 ### D11. Rust regression tests and documentation corrections land in the same epic
 
+<!-- amendment-applies: none reason="names documentation corrections as a deliverable of this epic; retires no wording in this document" -->
+
 After the models are reviewed, one task per reached crate adds the
 deterministic Rust tests D7 calls for, and one documentation task
 corrects the normative statements the reconnaissance found false
