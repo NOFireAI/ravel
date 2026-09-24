@@ -5829,41 +5829,21 @@ pub mod limits {
     /// tenant with no `--limits-file` at all, and as the base a `[defaults]`
     /// table's fields overlay onto.
     ///
-    /// `max_active_series` and `max_active_streams` are lower than ADR-0051
-    /// section 2's proposed `1,000,000`. That figure assumed roughly 16
-    /// bytes per tracked identity in `AdmissionController`'s two-epoch
-    /// `HashSet<SeriesId>` / `HashSet<LogStreamId>` tracker; measurement
-    /// puts the actual cost at 35-56 bytes per live entry once
-    /// hashbrown's power-of-two table sizing at 7/8 load and allocator
-    /// headroom are counted, 2-4x the ADR's assumption. At `1,000,000` that
-    /// is roughly 140-224 MiB per fully active tenant (cap x bytes-per-entry
-    /// x 2 rotating epochs x 2 tracked signals), before multiplying across
-    /// tenants and replicas. `200,000` keeps the same shape of guarantee
-    /// (a generous, finite, overridable per-tenant cap) at a worst case of
-    /// roughly 27-43 MiB per fully active tenant instead - see
-    /// docs/guides/admission-limits.md for the arithmetic and per-tenant-count
-    /// examples. This is a deliberate change from the ADR's proposed number,
-    /// not the ADR's own 16-byte figure being corrected in place: that
-    /// correction belongs in ADR-0051 section 2 itself.
+    /// This is `AdmissionLimits::default()` and nothing else. It stays a
+    /// function so the `--limits-file` code and the tests have one name to
+    /// call, but it must never grow a literal of its own: a second set of
+    /// numbers here is a second thing to keep in agreement, and the last one
+    /// diverged (1,000,000 in `ravel-ingest` against 200,000 here) with
+    /// nothing failing.  `shipped_defaults_are_the_library_default` below
+    /// fails if a literal comes back.
     ///
-    /// `ingest_bytes_per_sec` / `ingest_byte_burst` and
-    /// `series_creation_rate_per_sec` / `series_creation_burst` are
-    /// unchanged from the ADR: a token bucket's memory is two `u64`s
-    /// regardless of the configured rate, so the corrected per-entry cost
-    /// has no bearing on those two knobs.
+    /// `max_active_series` and `max_active_streams` are lower than ADR-0051
+    /// section 3's table, because the ADR's own per-entry memory estimate
+    /// was wrong; the corrected arithmetic lives on
+    /// [`AdmissionLimits::DEFAULT_MAX_ACTIVE_SERIES`], and
+    /// docs/guides/admission-limits.md carries the operator-facing version.
     pub fn shipped_defaults() -> AdmissionLimits {
-        AdmissionLimits {
-            max_active_series: CountLimit::Bounded(200_000),
-            max_active_streams: CountLimit::Bounded(200_000),
-            ingest_byte_rate: RateLimit::Bounded {
-                per_sec: AdmissionLimits::DEFAULT_INGEST_BYTES_PER_SEC,
-                burst: AdmissionLimits::DEFAULT_INGEST_BYTE_BURST,
-            },
-            series_creation_rate: RateLimit::Bounded {
-                per_sec: AdmissionLimits::DEFAULT_SERIES_CREATION_RATE_PER_SEC,
-                burst: AdmissionLimits::DEFAULT_SERIES_CREATION_BURST,
-            },
-        }
+        AdmissionLimits::default()
     }
 
     /// The per-tenant query cost governance limits resolved from the same
@@ -6185,6 +6165,46 @@ pub mod limits {
                 .expect("quiet tenant is present with no fields set");
             assert_eq!(quiet, &parsed.defaults);
             assert_eq!(quiet.max_active_series, CountLimit::Bounded(42));
+        }
+
+        /// Issue #23: the server used to build its own `AdmissionLimits`
+        /// literal, so `ravel-ingest`'s `Default` drifted to a count cap 5x
+        /// this service's with nothing failing. Every field is compared, not
+        /// just the two that diverged, because the next divergence is as
+        /// likely to be a rate knob.
+        #[test]
+        fn shipped_defaults_are_the_library_default() {
+            assert_eq!(shipped_defaults(), AdmissionLimits::default());
+            // Named individually so a failure says which knob moved rather
+            // than printing two whole structs.
+            let lib = AdmissionLimits::default();
+            assert_eq!(shipped_defaults().max_active_series, lib.max_active_series);
+            assert_eq!(
+                shipped_defaults().max_active_streams,
+                lib.max_active_streams
+            );
+            assert_eq!(shipped_defaults().ingest_byte_rate, lib.ingest_byte_rate);
+            assert_eq!(
+                shipped_defaults().series_creation_rate,
+                lib.series_creation_rate
+            );
+        }
+
+        /// The value itself, pinned where an operator-facing change to it is
+        /// visible in the diff: docs/guides/admission-limits.md and
+        /// docs/guides/operations/configuration.md both publish 200,000 and
+        /// the 27-43 MiB worst case derived from it, so moving the constant
+        /// without moving those two is a stale-doc bug.
+        #[test]
+        fn shipped_active_count_caps_are_200_000() {
+            assert_eq!(
+                shipped_defaults().max_active_series,
+                CountLimit::Bounded(200_000)
+            );
+            assert_eq!(
+                shipped_defaults().max_active_streams,
+                CountLimit::Bounded(200_000)
+            );
         }
 
         #[test]

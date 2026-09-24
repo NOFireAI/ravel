@@ -109,6 +109,11 @@ tracked signals) gives 134-214 MiB per tenant, before multiplying across
 tenants and replicas. The `--limits-file` raises it per tenant where the
 memory is available.
 
+200,000 is also `ravel-ingest`'s own `AdmissionLimits::default()`, which is
+what `ravel-server` serves as its shipped defaults rather than a second copy
+of the number, so a process embedding the ingest library enforces the same
+caps this guide documents.
+
 ## What a breach looks like to a client
 
 The rejection shape depends on the limit's scope. A **request-scoped** limit

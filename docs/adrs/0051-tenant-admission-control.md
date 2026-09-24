@@ -153,8 +153,24 @@ epochs: a series is active if seen in the current or previous epoch.
 Exact, not sketched, because the workspace invariant is exact semantics
 by default and approximation must be opt-in and visible; the memory
 argument for a sketch does not apply here, since the set stops growing at
-`max_active_series` — the cap itself bounds the tracker at roughly
-16 bytes × cap × 2 epochs per tenant.
+`max_active_series` — the cap itself bounds the tracker.
+
+**Corrected (issue #22).** This section originally put that bound at
+roughly 16 bytes × cap × 2 epochs per tenant. The 16 bytes was an
+estimate and it was wrong: a live entry costs **35 to 56 bytes** once
+hashbrown's power-of-two table sizing at 7/8 load and allocator headroom
+are counted. The worst case also multiplies by the two tracked signals,
+since a tenant sending both metrics and logs holds a
+`HashSet<SeriesId>` and a `HashSet<LogStreamId>`, each over two rotating
+epochs:
+
+    worst case = cap × bytes-per-entry × 2 epochs × 2 signals
+
+At the 1,000,000 this ADR first proposed that is 140,000,000 to
+224,000,000 bytes (134 to 214 MiB) per fully active tenant, before
+multiplying across tenants and replicas: 4× what the original figure
+implied, and the reason the shipped default in section 3 is no longer
+1,000,000.
 
 Enforcement state is **per process**. With N ingest replicas the
 fleet-wide effective bound is N × the configured limit. This is stated
@@ -182,13 +198,26 @@ Shipped defaults (all per tenant, all overridable):
 |---|---|
 | max_request_body_bytes | 16 MiB |
 | ingest_bytes_per_sec / burst | 32 MiB/s / 64 MiB |
-| max_active_series (metrics) | 1,000,000 |
-| max_active_streams (logs) | 1,000,000 |
+| max_active_series (metrics) | 200,000 (proposed 1,000,000; see below) |
+| max_active_streams (logs) | 200,000 (proposed 1,000,000; see below) |
 | series_creation_rate_per_sec / burst | 10,000/s / 100,000 |
 | max_future_skew (all signals) | 10 m |
 | max_ingest_lag (all signals) | 2 h |
 | max_flush_delay_idle | 10 s |
 | min_flush_bytes | 64 KiB |
+
+The two active-count caps ship at 200,000, not the 1,000,000 this ADR
+proposed, because section 2's per-entry memory estimate was wrong (see
+the correction there): 1,000,000 bounds a fully active tenant's tracker
+at 134 to 214 MiB, where 200,000 bounds it at 28,000,000 to 44,800,000
+bytes (27 to 43 MiB). The shape of the guarantee is unchanged: a
+generous, finite, per-tenant cap that `--limits-file` raises where the
+memory is available. That figure lives in exactly one place in the code,
+`AdmissionLimits::DEFAULT_MAX_ACTIVE_SERIES` /
+`DEFAULT_MAX_ACTIVE_STREAMS` in `ravel-ingest`, which
+`ravel-server`'s `config::limits::shipped_defaults` returns rather than
+restating; issue #23 removed the second copy that had drifted from it.
+docs/guides/admission-limits.md is the operator-facing version.
 
 ### 4. Event-time skew bounds for logs and spans
 

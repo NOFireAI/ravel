@@ -128,6 +128,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The shipped admission defaults are now one value, `ravel-ingest`'s
+  `AdmissionLimits::default()`, instead of two that had drifted** (issue #23).
+  **No deployment's effective limits move.** A shipped `ravel-server` already
+  applied 200,000 for `max_active_series` and `max_active_streams`, and it
+  still does; what changed is where that number lives. `ravel-server`'s
+  `config::limits::shipped_defaults` built its own `AdmissionLimits` literal
+  and never called the `Default` impl, so `ravel-ingest` kept 1,000,000 for
+  every other caller with nothing failing when the two disagreed. The library
+  constants are now 200,000 and the server returns them, so an embedder
+  building an `AdmissionController` from `AdmissionLimits::default()` gets the
+  caps the server ships rather than a 5x looser pair. A test asserts the two
+  are equal field by field.
+
+- **ADR-0051 section 2's per-entry memory estimate is corrected from about 16
+  bytes to the measured 35 to 56 bytes** (issue #22). The worst case also
+  multiplies by the two tracked signals, not just the two rotating epochs:
+  `cap x bytes-per-entry x 2 epochs x 2 signals`. At the 1,000,000 the ADR
+  proposed that is 140,000,000 to 224,000,000 bytes (134 to 214 MiB) per fully
+  active tenant, 4x what the original figure implied; at the 200,000 that ships
+  it is 28,000,000 to 44,800,000 bytes (27 to 43 MiB). The ADR's section 3
+  defaults table now carries the shipped figure with the proposed one beside
+  it. Documentation only, no behavior change.
+
 - **A shard now refuses a flush trigger once `--max-queued-flushes` (default
   8) flush tasks are spawned and unacked, leaving the rows buffered for the
   next tick** (issue #1740). Before this, every trigger spawned a task, so a
