@@ -2038,6 +2038,7 @@ fn is_label_name_continue(c: char) -> bool {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::limits::resource_attrs_dropped_from_rejections;
     use opentelemetry_proto::tonic::metrics::v1::{
         Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
         ScopeMetrics, Sum, Summary, summary_data_point,
@@ -2387,7 +2388,13 @@ mod tests {
             &IngestLimits::default(),
             1_000,
         );
-        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        // `some.other.attr` is outside the allowlist and not a job/instance
+        // source key, so it is informationally counted as dropped (issue
+        // #116), not rejected: it costs the point nothing.
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResourceAttributesDropped { count: 1 }]
+        );
         let labels = &out.points[0].labels;
         assert_eq!(labels.get("job"), Some("svc"));
         assert_eq!(labels.get("k8s_pod_name"), Some("pod-abc"));
@@ -2452,6 +2459,97 @@ mod tests {
             out_resource.points[0].series_id,
             out_attr.points[0].series_id
         );
+    }
+
+    // --- resource attribute drop counting (issue #116) ---
+
+    #[test]
+    fn resource_attributes_fully_covered_by_allowlist_drop_nothing() {
+        // Every attribute on the resource is either a job/instance source key
+        // or in the default allowlist, so nothing is dropped: exactly 0, not
+        // merely "no rejection of a different kind".
+        let rm = resource_metrics(
+            vec![
+                string_kv("service.name", "svc"),
+                string_kv("k8s.pod.name", "pod-abc"),
+                string_kv("host.name", "node1"),
+            ],
+            vec![gauge_metric(
+                "up",
+                vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(resource_attrs_dropped_from_rejections(&out.rejected), 0);
+    }
+
+    #[test]
+    fn three_unlisted_resource_attributes_drop_exactly_three() {
+        // Three attributes outside both the allowlist and the job/instance
+        // mapping must count as exactly 3, regardless of how many points the
+        // resource carries (two points here).
+        let rm = resource_metrics(
+            vec![
+                string_kv("service.name", "svc"),
+                string_kv("team", "payments"),
+                string_kv("region.code", "us-east"),
+                string_kv("build.id", "abc123"),
+            ],
+            vec![gauge_metric(
+                "up",
+                vec![
+                    number_point(vec![], 1_000, NumberValue::AsDouble(1.0)),
+                    number_point(vec![], 1_001, NumberValue::AsDouble(2.0)),
+                ],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert_eq!(
+            out.rejected,
+            vec![Rejection::ResourceAttributesDropped { count: 3 }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), 0);
+        assert_eq!(out.rejected[0].admission_class(), None);
+        assert_eq!(resource_attrs_dropped_from_rejections(&out.rejected), 3);
+        // The points themselves are unaffected: both are admitted.
+        assert_eq!(out.points.len(), 2);
+    }
+
+    #[test]
+    fn job_instance_source_keys_are_never_counted_as_dropped() {
+        // service.name/service.namespace/service.instance.id are consumed
+        // into job/instance, not the allowlist, and must not be counted as
+        // dropped even though none of the three is itself an allowlist entry.
+        let rm = resource_metrics(
+            vec![
+                string_kv("service.name", "checkout"),
+                string_kv("service.namespace", "payments"),
+                string_kv("service.instance.id", "pod-1"),
+            ],
+            vec![gauge_metric(
+                "requests",
+                vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
+            )],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(resource_attrs_dropped_from_rejections(&out.rejected), 0);
     }
 
     // --- sanitization collisions -> duplicate rejection ---

@@ -624,6 +624,108 @@ mod tests {
         );
     }
 
+    /// A resource attribute dropped for sitting outside the label allowlist
+    /// (issue #116) must never move any existing rejection figure: same
+    /// delta-temporality request as `delta_sum_export_counts_every_point_
+    /// as_structural`, with two extra non-allowlisted resource attributes
+    /// added, must report the identical `rejected_data_points` and
+    /// skew/structural totals. The dropped attributes surface only through
+    /// their own `resource_attrs_dropped_total` counter.
+    #[tokio::test]
+    async fn dropped_resource_attributes_do_not_move_the_rejected_points_figure() {
+        use opentelemetry_proto::tonic::common::v1::AnyValue;
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric::Data as MetricData,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        fn string_kv(key: &str, value: &str) -> KeyValue {
+            KeyValue {
+                key: key.to_string(),
+                value: Some(AnyValue {
+                    value: Some(AnyValueVariant::StringValue(value.to_string())),
+                }),
+                ..Default::default()
+            }
+        }
+
+        const POINT_COUNT: usize = 3;
+
+        let state = state();
+        let before = metrics_normalize_totals(&state);
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_kv("team", "payments"),
+                        string_kv("build.id", "abc123"),
+                    ],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests".to_string(),
+                        data: Some(MetricData::Sum(Sum {
+                            data_points: (0..POINT_COUNT)
+                                .map(|i| NumberDataPoint {
+                                    time_unix_nano: BASE_TS_NS as u64,
+                                    value: Some(NumberValue::AsDouble(i as f64)),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            // AGGREGATION_TEMPORALITY_DELTA.
+                            aggregation_temporality: 1,
+                            is_monotonic: true,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            request,
+            BASE_TS_NS,
+        )
+        .await
+        .expect("buffered write with zero admitted points never fails");
+        let after = metrics_normalize_totals(&state);
+
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the whole delta metric was rejected");
+        assert_eq!(
+            partial_success.rejected_data_points, POINT_COUNT as i64,
+            "the dropped resource attributes must not inflate rejected_data_points"
+        );
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (0, POINT_COUNT as u64),
+            "dropped resource attributes must not move the skew/structural totals"
+        );
+
+        let resource_attrs_dropped: u64 = state
+            .normalize_metrics
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.signal == Signal::Metrics)
+            .map(|row| row.resource_attrs_dropped_total)
+            .sum();
+        assert_eq!(
+            resource_attrs_dropped, 2,
+            "the two non-allowlisted resource attributes are counted separately"
+        );
+    }
+
     #[test]
     fn build_error_message_collapses_one_grouped_reason_into_one_entry_with_count() {
         let rejected = vec![Rejection::Grouped {

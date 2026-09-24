@@ -618,6 +618,7 @@ mod tests {
                 Rejection::HistogramMinMaxDropped { .. } => None,
                 Rejection::HistogramExemplarsDropped { .. } => None,
                 Rejection::IntegerValuePrecisionLoss { .. } => None,
+                Rejection::ResourceAttributesDropped { .. } => None,
 
                 // Carries its reason's class, whatever that reason is.
                 Rejection::Grouped { reason, .. } => expected(reason),
@@ -693,6 +694,7 @@ mod tests {
             Rejection::HistogramMinMaxDropped { count: 1 },
             Rejection::HistogramExemplarsDropped { count: 1 },
             Rejection::IntegerValuePrecisionLoss { value: i64::MAX },
+            Rejection::ResourceAttributesDropped { count: 1 },
             Rejection::Grouped {
                 reason: Box::new(Rejection::ComplexAttributeValue),
                 count: 3,
@@ -701,7 +703,7 @@ mod tests {
 
         // One entry per variant, each a distinct one, so no variant is
         // covered twice while another is missing.
-        assert_eq!(variants.len(), 32);
+        assert_eq!(variants.len(), 33);
         for (i, a) in variants.iter().enumerate() {
             for b in &variants[i + 1..] {
                 assert_ne!(

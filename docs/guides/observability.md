@@ -1657,11 +1657,11 @@ from it.
 
 `job` and `instance` come from `service.name`/`service.namespace` and
 `service.instance.id`; every other resource attribute becomes a label only if
-it is in the (fixed, build-time) `resource_attribute_allowlist`. Before issue
-#116, an attribute outside both sets was dropped with no signal at all: no
-rejection, no counter, no partial-success detail, and two resources that
-differed only in such an attribute silently flattened to the same label set
-and merged into one series.
+it is in the (fixed, build-time) `resource_attribute_allowlist`. Previously, an
+attribute outside both sets was dropped with no signal at all: no rejection,
+no counter, no partial-success detail, and two resources that differed only
+in such an attribute silently flattened to the same label set and merged into
+one series.
 
 `ravel_ingest_resource_attrs_dropped_total` makes that drop visible. It counts
 attributes, not points: one resource with five out-of-allowlist attributes
