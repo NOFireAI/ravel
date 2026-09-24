@@ -553,6 +553,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A distributed query's recorded cost now covers every slice attempt, not
+  only the one that survived** (issue #1723). `RoutingSliceFetcher::dispatch`
+  runs a slice up to three times (the primary worker, one re-dispatch to the
+  next rendezvous worker, then coordinator-local), and all three sit below the
+  `SliceFetcher` seam. A worker that had already fetched part of its slice and
+  then took a store error reported its failure with a zero accounting snapshot,
+  the retry classification in `try_remote` dropped whatever an abandoned
+  attempt had spent, and the coordinator folded a slice's accounting only in
+  the `Ok` arm, so the recorded cost was one attempt's spend where the store
+  had really served up to three. A tenant with an 8 GiB byte budget could drive
+  24 GiB of real GET traffic with the recorded total still inside budget. A
+  failed attempt's real spend now travels on its terminal summary frame, in the
+  same shape the byte-budget short-circuit already used, is carried across
+  re-dispatches, and is folded into the coordinator's live accounting handle on
+  every terminal status rather than only on success. This is an operator-visible
+  behavior change: byte-budget enforcement
+  (`bytes_scanned_exceeded`, and the coordinator's in-loop check) now reads the
+  sum over all attempts, so a tenant near its limit is refused earlier than
+  before, and a query that retried slices and previously completed can now trip
+  `TooManyBytesScanned`. The bytes it is refused for are bytes the store really
+  served. Per-fragment stats (`bytes_reported`) likewise report the summed
+  per-slice cost. One gap remains: when the final attempt fails with a transport
+  error carrying no summary, the abandoned attempt's spend cannot be observed
+  and is carried as zero.
+
 - **`ravel-cli gc-config set --max-flush-lifetime`'s help text and generated
   reference page now state the floor the flag is refused below** (issue
   #1961). `set_gc_config` has always rejected a `max_flush_lifetime` below the

@@ -1389,7 +1389,7 @@ impl SliceStreamDecoder {
         let accounting = summary
             .accounting
             .as_ref()
-            .map(|a| codec::decode_accounting(a.clone()))
+            .map(|a| codec::decode_accounting(*a))
             .unwrap_or_default();
         Some((
             accounting,
