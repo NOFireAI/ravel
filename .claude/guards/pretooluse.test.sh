@@ -367,6 +367,14 @@ check deny  "bare 40-hex literal inside a command substitution" \
   "$(bash_payload "x=\$(git log -1 --format=%H ${SHA40})")"
 check allow "escape hatch permits a bare sha literal" \
   "$(bash_payload "ALLOW_LITERAL_SHA=1 gh pr merge 123 --match-head-commit ${SHA40}")"
+check allow "escape hatch covers a sha on a continuation line" \
+  "$(bash_payload "ALLOW_LITERAL_SHA=1 gh pr merge 123 --rebase \\
+  --match-head-commit ${SHA40}")"
+check allow "escape hatch covers a sha inside a substitution body" \
+  "$(bash_payload "ALLOW_LITERAL_SHA=1 gh pr merge 123 --match-head-commit \"\$(echo ${SHA40})\"")"
+check deny  "a continuation-line sha without the prefix is still denied" \
+  "$(bash_payload "gh pr merge 123 --rebase \\
+  --match-head-commit ${SHA40}")"
 check deny  "a different env prefix does not launder a sha literal" \
   "$(bash_payload "CARGO_INCREMENTAL=0 gh pr merge 123 --match-head-commit ${SHA40}")"
 check allow "resolving the sha via substitution instead of a literal" \
@@ -418,21 +426,43 @@ check allow "escape hatch permits a non-sha 40-hex literal" \
 # feed each through the guard: if the script ever loses the prefix, or the
 # guard stops honouring it after an `&&`, these fail rather than drifting.
 PRS="$(dirname "$0")/../../scripts/pr-review-status.sh"
-merge_lines=0
+# Every command pr-review-status.sh prints for the operator to run with the
+# checked head SHA in it: the merge lines (after "-> ") and any command quoted
+# in backticks inside a hint. Both must pass as printed and fail unprefixed.
+subst_printed() {
+  local c="$1"
+  c="${c//\\\"/\"}"
+  c="${c//\$\{repo\}/o/r}"
+  c="${c//\$\{pr\}/123}"
+  c="${c//\$\{base_ref\}/main}"
+  c="${c//\$\{head_sha\}/${SHA40}}"
+  printf '%s' "$c"
+}
+sha_cmds=()
 while IFS= read -r line; do
-  cmd="${line#*-> }"
-  cmd="${cmd%\"}"
-  cmd="${cmd//\$\{pr\}/123}"
-  cmd="${cmd//\$\{base_ref\}/main}"
-  cmd="${cmd//\$\{head_sha\}/${SHA40}}"
-  merge_lines=$((merge_lines + 1))
-  check allow "pr-review-status merge line ${merge_lines} passes as printed" \
+  if [[ "$line" == *'--match-head-commit ${head_sha}'* ]]; then
+    c="${line#*-> }"
+    sha_cmds+=("${c%\"}")
+  fi
+  rest="$line"
+  while [[ "$rest" == *'\`'*'\`'* ]]; do
+    rest="${rest#*\\\`}"
+    span="${rest%%\\\`*}"
+    rest="${rest#*\\\`}"
+    [[ "$span" == *'${head_sha}'* ]] && sha_cmds+=("$span")
+  done
+done < <(grep -E '^[[:space:]]*echo ".*\$\{head_sha\}' "$PRS")
+n=0
+for raw in "${sha_cmds[@]}"; do
+  n=$((n + 1))
+  cmd="$(subst_printed "$raw")"
+  check allow "pr-review-status sha command ${n} passes as printed" \
     "$(bash_payload "$cmd")"
-  check deny  "pr-review-status merge line ${merge_lines} is denied without the prefix" \
+  check deny  "pr-review-status sha command ${n} is denied without the prefix" \
     "$(bash_payload "${cmd//ALLOW_LITERAL_SHA=1 /}")"
-done < <(grep -E 'echo ".*--match-head-commit \$\{head_sha\}' "$PRS")
-if [ "$merge_lines" -lt 1 ]; then
-  printf 'FAIL  %-52s found no --match-head-commit line to check\n' "pr-review-status merge lines exist"
+done
+if [ "$n" -lt 4 ]; then
+  printf 'FAIL  %-52s found %d printed sha command(s), expected at least 4\n' "pr-review-status sha commands exist" "$n"
   fail=$((fail + 1))
 else
   pass=$((pass + 1))

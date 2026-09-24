@@ -360,7 +360,7 @@ elif [[ "${pending}" != "0" ]]; then
 elif [[ "${inline_comments}" != "0" && "${confirm_addressed}" != "1" ]]; then
   echo "  -> ${inline_comments} inline review comment(s); read them, then re-run with --confirm-addressed once each is fixed or answered (the API cannot tell; see the header comment)"
 elif [[ "${outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
-  echo "  -> ${outside_diff} outside-diff finding(s) in the review BODY at head, not inline; read the body with \`gh api repos/${repo}/pulls/${pr}/reviews --jq '.[] | select(.commit_id==\"${head_sha}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered"
+  echo "  -> ${outside_diff} outside-diff finding(s) in the review BODY at head, not inline; read the body with \`ALLOW_LITERAL_SHA=1 gh api repos/${repo}/pulls/${pr}/reviews --jq '.[] | select(.commit_id==\"${head_sha}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered"
 # Ahead of the mergeState check on purpose. A stale base is always actionable
 # and the fix is always the same; mergeState UNKNOWN is often just GitHub still
 # computing. Green CI on a stale base says nothing about the merge: a PR that

@@ -143,9 +143,14 @@ const BARE_SHA_LITERAL = /(^|[^0-9a-fA-F])[0-9a-fA-F]{40}([^0-9a-fA-F]|$)/;
 // command text is the only spelling that can work.
 const ALLOW_LITERAL_SHA = /(^|[\s;&|(])ALLOW_LITERAL_SHA=(1|true|yes)(\s|$)/;
 
-function shaLiteralAllowed(rawStatement) {
+// Tested once against the whole command rather than per statement: the
+// literal can sit on a continuation line or inside a substitution body, each
+// of which is its own statement here, and the prefix is only ever on the
+// first. The hatch is voluntary, so widening its scope admits nothing a
+// session could not already spell.
+function shaLiteralAllowed(rawCommand) {
   return (
-    ALLOW_LITERAL_SHA.test(rawStatement) ||
+    ALLOW_LITERAL_SHA.test(rawCommand) ||
     process.env.ALLOW_LITERAL_SHA === "1"
   );
 }
@@ -155,10 +160,10 @@ function shaLiteralAllowed(rawStatement) {
 // as its own statement, and a heredoc body never reaches it at all, because
 // checkBash strips heredoc bodies before scanTexts ever runs. A fixture SHA
 // written into a heredoc is data, not a command, and needs no escape hatch.
-function checkBareSha(rawStatement) {
+function checkBareSha(rawStatement, allowed) {
   const stmt = rawStatement.trim();
   if (!BARE_SHA_LITERAL.test(stmt)) return;
-  if (shaLiteralAllowed(stmt)) return;
+  if (allowed) return;
   deny(
     "This command contains a bare 40-character hex literal. Which fix is " +
       "right depends on where the literal came from. " +
@@ -503,6 +508,7 @@ function scanTexts(command) {
 function checkBash(rawCommand) {
   if (typeof rawCommand !== "string" || rawCommand === "") return;
   const command = stripHeredocBodies(rawCommand);
+  const shaAllowed = shaLiteralAllowed(command);
 
   for (const raw of scanTexts(command).flatMap(splitStatements)) {
     const stmt = raw.trim();
@@ -540,7 +546,7 @@ function checkBash(rawCommand) {
     }
 
     checkDestructiveGit(stmt);
-    checkBareSha(stmt);
+    checkBareSha(stmt, shaAllowed);
   }
 }
 
