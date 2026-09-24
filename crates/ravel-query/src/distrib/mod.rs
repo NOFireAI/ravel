@@ -279,7 +279,14 @@ impl Distributed {
         let mut unsupported = false;
 
         while let Some(result) = stream.next().await {
-            let response = result.map_err(distrib_error)?;
+            // A slice whose FINAL attempt failed carries every attempt's
+            // spend on the error (issue #1723); fold it before the error
+            // leaves the loop, or the query reports a cost the store never
+            // charged.
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => return Err(fold_error_spend(accounting, err)),
+            };
             match response.status {
                 pb::status::Code::Ok => {
                     fold_slice(accounting, &mut running, &mut stats, &response);
@@ -534,7 +541,14 @@ impl Distributed {
         let mut unsupported = false;
 
         while let Some(result) = stream.next().await {
-            let response = result.map_err(distrib_error)?;
+            // A slice whose FINAL attempt failed carries every attempt's
+            // spend on the error (issue #1723); fold it before the error
+            // leaves the loop, or the query reports a cost the store never
+            // charged.
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => return Err(fold_error_spend(accounting, err)),
+            };
             match response.status {
                 pb::status::Code::Ok => {
                     fold_log_slice(accounting, &mut running, &response);
@@ -704,7 +718,14 @@ impl Distributed {
         let mut unsupported = false;
 
         while let Some(result) = stream.next().await {
-            let response = result.map_err(distrib_error)?;
+            // A slice whose FINAL attempt failed carries every attempt's
+            // spend on the error (issue #1723); fold it before the error
+            // leaves the loop, or the query reports a cost the store never
+            // charged.
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => return Err(fold_error_spend(accounting, err)),
+            };
             match response.status {
                 pb::status::Code::Ok => {
                     fold_span_slice(accounting, &mut running, &response);
@@ -802,6 +823,27 @@ fn fold_slice(
     stats.raw_f64_bytes = stats
         .raw_f64_bytes
         .saturating_add(response.stats.raw_f64_bytes);
+}
+
+/// Folds a FAILED slice's carried spend into the query's live accounting handle
+/// and maps the error (issue #1723).
+///
+/// A slice that fails after the store served it is the case the fold arms above
+/// cannot reach: there is no response, only a [`DistribError`], and every
+/// attempt's cost rides on the error's [`DistribError::Spent`] wrapper. Folding
+/// it here, before the error leaves the loop, is what makes the metrics, logs
+/// and spans a failed query reports the cost the store really charged. A slice
+/// refused by the coordinator's byte cap is the case with the most spend on it:
+/// the worker read everything it was asked for before the coordinator declined
+/// to hold it.
+///
+/// The running snapshot is deliberately not updated: the caller returns
+/// immediately, so nothing reads it again.
+fn fold_error_spend(live: &QueryAccounting, err: DistribError) -> QueryError {
+    if let Some(spend) = err.spend() {
+        live.merge_snapshot(spend);
+    }
+    distrib_error(err)
 }
 
 /// Folds one RLOG-family slice's accounting into the query's live handle and the
@@ -1499,8 +1541,12 @@ impl SliceStreamDecoder {
 /// `QueryError::Distrib`/`Federation`, which are redacted to a retryable 503.
 /// Retrying the same query against the same remote cannot succeed, so a 503
 /// would invite exactly the retry that cannot help.
+///
+/// Classification reads through a [`DistribError::Spent`] wrapper (issue
+/// #1723): a refused attempt that had already paid for segments is still a
+/// refusal, and must keep its 422.
 pub(crate) fn cap_refusal_error(err: &DistribError) -> Option<QueryError> {
-    match err {
+    match err.unspent() {
         DistribError::Codec(CodecError::SliceByteCapExceeded { bytes, max }) => {
             Some(QueryError::TooManySliceBytes {
                 bytes: *bytes,

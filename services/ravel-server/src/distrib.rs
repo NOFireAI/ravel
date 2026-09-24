@@ -1174,6 +1174,11 @@ where
 
 /// Record one completed slice into the task-local [`FragmentStatsSink`], if a
 /// query handler scoped one on this task; a no-op otherwise.
+///
+/// `bytes_reported` is the slice's whole cost either way (issue #1723): the
+/// summed accounting of every attempt on success, and the spend carried on the
+/// error when the slice ended failed. It reads zero for a failure only when no
+/// attempt got far enough to report a summary.
 fn record_fragment_stat(
     result: &Result<SliceResponse, DistribError>,
     worker_endpoint: String,
@@ -1186,7 +1191,10 @@ fn record_fragment_stat(
             response.accounting.total_s3_bytes(),
             if fell_back { "fallback" } else { "ok" },
         ),
-        Err(_) => (0, "error"),
+        Err(err) => (
+            err.spend().map_or(0, |spend| spend.total_s3_bytes()),
+            "error",
+        ),
     };
     let entry = FragmentStatEntry {
         worker_endpoint,
@@ -1259,11 +1267,17 @@ impl AttemptSpend {
     }
 
     /// Fold this carried spend into a slice result, so the coordinator sees one
-    /// response whose accounting is the sum over every attempt. An `Err` result
-    /// has nowhere to carry it: `SliceFetcher::fetch` is
-    /// `Result<SliceResponse, DistribError>`, and a transport/decode error
-    /// carries no accounting field, so a slice whose LAST attempt fails that
-    /// way still under-reports by the earlier attempts' spend.
+    /// outcome whose accounting is the sum over every attempt.
+    ///
+    /// Both arms carry. On `Ok` the spend merges into the response's
+    /// accounting and `FetchStats`. On `Err` there is no response to merge
+    /// into, so the accounting rides on the error itself as
+    /// [`DistribError::Spent`] and the coordinator folds it before it maps the
+    /// error (issue #1723); that is the path a byte-cap refusal, a decode fault
+    /// and a failed local fallback all take, and it is where a slice has
+    /// usually spent the most. The `FetchStats` page counters do not survive
+    /// the `Err` arm: the coordinator returns no stats for a query that fails,
+    /// so they would have no reader.
     fn fold_into(
         &self,
         result: Result<SliceResponse, DistribError>,
@@ -1271,22 +1285,25 @@ impl AttemptSpend {
         if self.is_zero() {
             return result;
         }
-        result.map(|mut response| {
-            response.accounting = response.accounting.saturating_merge(&self.accounting);
-            response.stats.raw_f64_pages = response
-                .stats
-                .raw_f64_pages
-                .saturating_add(self.stats.raw_f64_pages);
-            response.stats.raw_f64_bytes = response
-                .stats
-                .raw_f64_bytes
-                .saturating_add(self.stats.raw_f64_bytes);
-            response.stats.histogram_series_skipped = response
-                .stats
-                .histogram_series_skipped
-                .saturating_add(self.stats.histogram_series_skipped);
-            response
-        })
+        let carried = self.accounting;
+        result
+            .map_err(|err| err.with_spend(&carried))
+            .map(|mut response| {
+                response.accounting = response.accounting.saturating_merge(&self.accounting);
+                response.stats.raw_f64_pages = response
+                    .stats
+                    .raw_f64_pages
+                    .saturating_add(self.stats.raw_f64_pages);
+                response.stats.raw_f64_bytes = response
+                    .stats
+                    .raw_f64_bytes
+                    .saturating_add(self.stats.raw_f64_bytes);
+                response.stats.histogram_series_skipped = response
+                    .stats
+                    .histogram_series_skipped
+                    .saturating_add(self.stats.histogram_series_skipped);
+                response
+            })
     }
 }
 
@@ -1614,7 +1631,18 @@ impl RoutingSliceFetcher {
             // A decode, framing, or worker-reported corruption error is a real
             // defect, not a routing miss: propagate it typed rather than mask it
             // with a retry or a local fallback (ADR-0071 deliverable 3).
-            Err(other) => Attempt::Keep(Box::new(Err(other))),
+            //
+            // Terminal does not mean free (issue #1723). This arm ends the
+            // slice, so whatever the stream salvaged before it broke has no
+            // later attempt to ride on and must ride on the error. A byte-cap
+            // refusal reaches here having read a whole slice's worth of
+            // segments; `salvaged` is that summary's spend, and it is `None`
+            // for a stream that broke before its summary, where the wrap is a
+            // no-op.
+            Err(other) => Attempt::Keep(Box::new(Err(match salvaged {
+                Some(spend) => other.with_spend(&spend.accounting),
+                None => other,
+            }))),
         }
     }
 

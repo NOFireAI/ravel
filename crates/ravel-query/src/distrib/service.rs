@@ -623,16 +623,26 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                 (None, None) => None,
                 (Some(start), Some(end)) => Some((start, end)),
                 (Some(_), None) | (None, Some(_)) => {
+                    // Every segment of this slice was fetched before the
+                    // request shape was found bad, so the refusal carries what
+                    // those fetches cost (issue #1723). A caller bug is not a
+                    // free slice.
                     return Err(SliceFailure::from((
                         pb::status::Code::Internal,
                         "PartialAggregateRequest carries exactly one of \
                          reduce_start_ns/reduce_end_ns; a caller must set both or neither"
                             .to_string(),
-                    )));
+                    ))
+                    .with_spend(&accounting, &stats));
                 }
             };
-            let (partials, samples_merged) =
-                reduce_partial_aggregates(scalar, &want, window).map_err(map_merge_error)?;
+            // The merge runs after the whole fetch loop, so a merge failure is
+            // a slice that already paid for every one of its segments
+            // (issue #1723).
+            let (partials, samples_merged) = reduce_partial_aggregates(scalar, &want, window)
+                .map_err(|e| {
+                    SliceFailure::from(map_merge_error(e)).with_spend(&accounting, &stats)
+                })?;
             let series_returned = partials.len() as u64;
             let mut frames = Vec::with_capacity(partials.len() + 1);
             for partial in &partials {
