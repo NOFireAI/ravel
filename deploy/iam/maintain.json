@@ -61,6 +61,7 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.dreq",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/maintain/workers/*",
         "arn:aws:s3:::my-ravel-bucket/quarantine/t/*/*/l0/*"
       ]
     },

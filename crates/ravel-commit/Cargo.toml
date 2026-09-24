@@ -24,6 +24,10 @@ tracing = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
+# For the IAM-template reachability tests only: the fleet heartbeat key
+# constructors are the ground truth those tests build witnesses from, and
+# ravel-fleet does not depend on ravel-commit, so this direction is acyclic.
+ravel-fleet = { workspace = true }
 
 [lints]
 workspace = true
