@@ -414,10 +414,13 @@ pub const DEFAULT_FRONTIER_RECONCILE_MAX_HOURS: u32 = 168;
 /// so any value is correct.
 pub const DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS: u64 = 720;
 /// Default `resolve_prefix_concurrency`: the number of resolve-path
-/// object-store requests one shard-hour commit prefix
-/// `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/` may have in flight at
-/// once (ADR-1733 decision 1), via a semaphore created for that prefix on
-/// demand. 128, derived from a measured S3 GET round trip of about 30ms: 128
+/// object-store requests one key prefix may have in flight at once (ADR-1733
+/// decision 1), via a semaphore created for that prefix on demand. A
+/// request's prefix is its key up to and including the last separator, so a
+/// commit record is bounded by its shard-hour commit prefix
+/// `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/`, a snapshot's parts by
+/// the `snap/` directory they share, and a LIST by the prefix it lists.
+/// 128, derived from a measured S3 GET round trip of about 30ms: 128
 /// requests in flight sustain roughly 128 / 0.030s ~= 4,300 GET/s, under S3's
 /// published guidance of about 5,500 GET/s per prefix, which is stated per
 /// prefix and is what this bound is stated against. Measured end to end on a
@@ -640,7 +643,7 @@ pub struct CatalogConfig {
     /// what a single-process-per-invocation caller wants.
     ///
     /// This is a ceiling on the aggregate, not a per-prefix bound: what any
-    /// one shard-hour prefix may have in flight is
+    /// one key prefix may have in flight is
     /// [`Self::resolve_prefix_concurrency`], and a request holds both permits
     /// before it is issued. Must be greater than zero;
     /// [`crate::Catalog::new`] rejects `0` with
@@ -650,12 +653,14 @@ pub struct CatalogConfig {
     /// [`DEFAULT_RESOLVE_PREFIX_CONCURRENCY`]: one prefix's worth, the value
     /// a `Catalog` resolving a single shard-hour can use anyway.
     pub resolve_get_concurrency: usize,
-    /// Number of resolve-path requests any one shard-hour commit prefix
-    /// `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/` may have in flight
-    /// at once (ADR-1733 decision 1). Requests that do not sit under such a
-    /// prefix (the head object, snapshot parts and postings, and every LIST
-    /// whose prefix is broader than one shard-hour) take only
-    /// [`Self::resolve_get_concurrency`]'s permit.
+    /// Number of resolve-path requests any one key prefix may have in flight
+    /// at once (ADR-1733 decision 1). Every request is keyed, by its key up
+    /// to and including the last separator: a commit record by its shard-hour
+    /// commit prefix `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/`, a
+    /// snapshot's parts by the `snap/` directory they share, its postings and
+    /// column stats by their `idx/` directory, and a LIST by the prefix it
+    /// lists. So no fan-out puts more than this many requests on one prefix,
+    /// however high [`Self::resolve_get_concurrency`] is set.
     ///
     /// Prefix semaphores are created on demand and dropped once the prefix
     /// goes idle, so the map holds one entry per prefix in flight rather than

@@ -973,16 +973,19 @@ concurrency, not request count):
 
 The basis for 128: a measured S3 GET round trip of about 30ms means 128
 requests in flight sustain roughly 128 / 0.030s ~= 4,300 GET/s, comfortably
-under S3's published guidance of about 5,500 GET/s per prefix, and every
-request this phase issues lands under one `m/c/<shard>/<hour>/` prefix per
-shard-hour.
+under S3's published guidance of about 5,500 GET/s per prefix, which is
+stated per prefix and so is what this bound is stated against. Every request
+this phase issues is bounded by the prefix it lands on: a commit record by
+its `m/c/<shard>/<hour>/` prefix, a snapshot's parts by the one `snap/`
+directory they share, its postings and column stats by their `idx/`
+directory, and a LIST by the prefix it lists.
 
 128 is what one prefix sustains, so it is where the per-prefix bound sits
 and where the per-process ceiling starts. `ravel-server` builds exactly one
 `Catalog` and shares it (an `Arc` clone per request, one underlying
 `request_semaphore`), so N concurrent queries share that one ceiling: the
-process never exceeds it, and no single shard-hour prefix exceeds 128
-however high it is set. The ceiling scales with the queries the process
+process never exceeds it, and no single prefix exceeds 128 however high it
+is set. The ceiling scales with the queries the process
 admits rather than staying at one prefix's worth, because N concurrent
 queries usually resolve over N different shard-hours and would otherwise
 serialize behind a bound sized for one.

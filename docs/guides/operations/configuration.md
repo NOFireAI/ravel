@@ -1122,9 +1122,10 @@ that flag, raised before any fetcher, engine, or SQL session exists.
 
 `--catalog-resolve-concurrency` derives from the same startup resolution, but
 from query concurrency rather than from cores or memory directly, and it
-bounds the process rather than one query. It is the ceiling on object-store
-requests (prefix LISTs and commit-record GETs) the catalog resolve path keeps
-in flight across every concurrent query. Unset, it resolves to
+bounds the process rather than one query. It is the ceiling on every
+object-store request the catalog resolve path keeps in flight across every
+concurrent query: prefix LISTs, commit-record GETs, snapshot-part GETs, and
+the postings and column-stats reads that go with them. Unset, it resolves to
 `clamp(Q * 128, 128, 4096)` held at an interim 1,024, where `Q` is
 `--max-concurrent-queries` when that flag bounds queries and the same
 `max(8, 2 x cores)` the flags above use when queries are unbounded. 128 is
@@ -1134,9 +1135,13 @@ different shard-hours each get one prefix's worth. Worked examples:
 512, and an unbounded 8-core host to 1,024 (its `Q` of 16 derives 2,048, held
 at the interim cap). Set explicitly, the flag value is used verbatim and the
 interim cap does not apply to it; `0` and any value above 4,096 are startup
-errors. A second bound the flag does not reach holds each individual
-shard-hour prefix to 128 requests whatever this ceiling is, so raising it
-adds breadth across prefixes, never depth within one.
+errors. A second bound the flag does not reach holds each individual key
+prefix to 128 requests whatever this ceiling is. Every resolve-path request
+is bounded this way, keyed by its own key prefix: a commit record by its
+shard-hour prefix, a snapshot's parts by the one directory they share, its
+postings and column stats by theirs, and a LIST by the prefix it lists. So
+raising this ceiling adds breadth across prefixes and never depth within
+one.
 
 Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
 25%, catalog byte cache a separate 5% ceiling, 256 MiB each if memory is

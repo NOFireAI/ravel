@@ -545,7 +545,8 @@ async fn settled_peak(gate: &GateHandle, expected: usize) -> usize {
 /// per-process permit before it issues its GET, so one shard-hour prefix never
 /// exceeds `DEFAULT_RESOLVE_PREFIX_CONCURRENCY` in flight and two prefixes
 /// together never exceed the configured `resolve_get_concurrency` ceiling,
-/// which two concurrent resolves share.
+/// which two concurrent resolves share. The ceiling is hand-set here, not
+/// derived: what the derivation produces is `ravel-server`'s own test.
 ///
 /// The ceiling here (200) sits above the per-prefix bound and below twice it,
 /// and each prefix holds more pending record GETs (150) than either number, so
@@ -559,7 +560,7 @@ async fn settled_peak(gate: &GateHandle, expected: usize) -> usize {
 /// `config.resolve_get_concurrency`): the two-prefix peak becomes 256, twice
 /// the per-prefix bound, and the 200 assertion fails.
 #[tokio::test]
-async fn two_concurrent_resolves_share_the_derived_in_flight_ceiling() {
+async fn two_concurrent_resolves_share_the_configured_in_flight_ceiling() {
     const CEILING: usize = 200;
     const RECORDS_PER_PREFIX: usize = 150;
     const HOUR: u32 = 1001;
@@ -592,8 +593,8 @@ async fn two_concurrent_resolves_share_the_derived_in_flight_ceiling() {
         Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
         FaultPlan::empty(),
     ));
-    // Commit records are the only keys under a shard-hour prefix, so this
-    // holds exactly the GETs both bounds govern.
+    // Only commit-record GETs, so the peak is the fan-out this phase means
+    // to measure and not a head or snapshot read that happens to overlap it.
     let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
     let catalog = Arc::new(Catalog::new(store, catalog_config).expect("catalog"));
 
@@ -648,6 +649,103 @@ async fn two_concurrent_resolves_share_the_derived_in_flight_ceiling() {
 
     let drain = drain_gate(gate.clone());
     for handle in handles {
+        let snapshot = handle.await.expect("join").expect("resolve");
+        assert_eq!(
+            snapshot.segments.len(),
+            RECORDS_PER_PREFIX,
+            "both resolves complete once the GETs drain"
+        );
+    }
+    drain.abort();
+}
+
+/// ADR-1733 decision 1 pins the ORDER the two permits are taken in: the
+/// prefix permit first, then the ceiling permit. A request that took the
+/// ceiling permit first and then waited on a saturated prefix would sit on a
+/// permit no other prefix can use, which is exactly the starvation across
+/// prefixes the two limits exist to remove.
+///
+/// The order is observable as the peak. One prefix is saturated first: 150
+/// pending GETs against a per-prefix bound of 128 leaves 22 requests waiting
+/// on that prefix, and a ceiling of 200 leaves 72 permits for anyone else.
+/// Prefix-first, those 22 wait holding nothing, so a second prefix can use
+/// all 72 and the peak is 128 + 72 = 200, the ceiling exactly. Ceiling-first,
+/// those same 22 each hold a ceiling permit while they wait on the prefix
+/// they cannot enter, so only 50 are left and the peak is 128 + 50 = 178.
+///
+/// RED, order swapped (in `Catalog::acquire_request_permits`, take the
+/// `request_semaphore` permit before the prefix permit): the second prefix
+/// never gets past 50 in flight, the peak settles at 178, and this fails in
+/// `settled_peak` with "only 178 GETs were ever held, wanted 200".
+#[tokio::test]
+async fn a_saturated_prefix_holds_no_ceiling_permits_it_cannot_use() {
+    const CEILING: usize = 200;
+    const RECORDS_PER_PREFIX: usize = 150;
+    const HOUR: u32 = 1001;
+    // 128 held on the saturated prefix plus the ceiling's remaining 72, which
+    // the other prefix can only reach if the saturated one holds none of them.
+    const EXPECTED_PEAK: usize =
+        DEFAULT_RESOLVE_PREFIX_CONCURRENCY + (CEILING - DEFAULT_RESOLVE_PREFIX_CONCURRENCY);
+
+    let tenant_a = TenantHash([0xa1; 16]);
+    let tenant_b = TenantHash([0xb2; 16]);
+    let inner = Arc::new(MemoryStore::new());
+    for i in 0..RECORDS_PER_PREFIX {
+        let event_ts_ns = hour_mid_ns(HOUR) + i as i64 * 1_000_000_000;
+        publish_for(inner.as_ref(), tenant_a, 0, HOUR, event_ts_ns).await;
+        publish_for(inner.as_ref(), tenant_b, 0, HOUR, event_ts_ns).await;
+    }
+
+    let now_ns = i64::from(HOUR) * NS_PER_HOUR + 40 * 60_000_000_000;
+    let range = TimeRange {
+        start_ns: i64::from(HOUR) * NS_PER_HOUR,
+        end_ns: now_ns,
+    };
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
+        FaultPlan::empty(),
+    ));
+    let gate = store.hold(Op::Get, Some("/c/".to_string()), Occurrence::Always);
+    let catalog = Arc::new(
+        Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: CEILING,
+                ..exact_config(1)
+            },
+        )
+        .expect("catalog"),
+    );
+
+    // Saturate one prefix first and let it settle there, so the 22 requests
+    // it cannot admit are already waiting when the other prefix starts.
+    let resolver = Arc::clone(&catalog);
+    let handle_a = tokio::spawn(async move {
+        resolver
+            .resolve(&tenant_a, Signal::Metrics, range, &[], now_ns)
+            .await
+    });
+    assert_eq!(
+        settled_peak(&gate, DEFAULT_RESOLVE_PREFIX_CONCURRENCY).await,
+        DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
+        "the first prefix saturates at the per-prefix bound"
+    );
+
+    let resolver = Arc::clone(&catalog);
+    let handle_b = tokio::spawn(async move {
+        resolver
+            .resolve(&tenant_b, Signal::Metrics, range, &[], now_ns)
+            .await
+    });
+    assert_eq!(
+        settled_peak(&gate, EXPECTED_PEAK).await,
+        EXPECTED_PEAK,
+        "the second prefix reaches every ceiling permit the saturated one is \
+         not using, so the peak is the ceiling exactly"
+    );
+
+    let drain = drain_gate(gate.clone());
+    for handle in [handle_a, handle_b] {
         let snapshot = handle.await.expect("join").expect("resolve");
         assert_eq!(
             snapshot.segments.len(),

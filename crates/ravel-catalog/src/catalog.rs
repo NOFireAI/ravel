@@ -634,41 +634,22 @@ impl Drop for RequestPermits<'_> {
     }
 }
 
-/// The shard-hour commit prefix `t/<tenant_hash>/<signal>/c/<shard>/<hour>/`
-/// that `key` sits under, or `None` when it sits under none.
+/// The key prefix the per-prefix bound keys `key` by: everything up to and
+/// including its last separator, or `None` for a key that has none.
 ///
-/// `None` covers the head object, snapshot parts and postings, provisioning
-/// records, and every LIST whose prefix is broader than one shard-hour: those
-/// requests take the catalog's ceiling permit and no prefix permit, because
-/// the per-prefix guidance the prefix bound states is about one shard-hour
-/// prefix. A key or LIST prefix that stops at the shard-hour level counts
-/// only with its trailing separator present, which is how
-/// `ravel_commit::keys` spells both.
-fn shard_hour_commit_prefix(key: &str) -> Option<&str> {
-    let mut segments = key.split_inclusive('/');
-    let tenant_root = segments.next()?;
-    let tenant_hash = segments.next()?;
-    let signal = segments.next()?;
-    let commit_root = segments.next()?;
-    let shard = segments.next()?;
-    let hour = segments.next()?;
-    if tenant_root != "t/" || commit_root != "c/" {
-        return None;
-    }
-    if !tenant_hash.ends_with('/')
-        || !signal.ends_with('/')
-        || !shard.ends_with('/')
-        || !hour.ends_with('/')
-    {
-        return None;
-    }
-    let len = tenant_root.len()
-        + tenant_hash.len()
-        + signal.len()
-        + commit_root.len()
-        + shard.len()
-        + hour.len();
-    Some(&key[..len])
+/// This is the prefix S3's per-prefix request guidance is stated against, for
+/// every kind of request the resolve path issues rather than for commit
+/// records alone. A commit record's parent path is exactly its shard-hour
+/// commit prefix `t/<tenant_hash>/<signal>/c/<shard>/<ingest_hour>/`
+/// (`ravel_commit::keys` spells the key as that prefix plus one segment), so
+/// commit records keep the keying ADR-1733 decision 1 names. A snapshot's
+/// parts all share `t/<tenant_hash>/catalog/<signal>/snap/` and its postings
+/// and column stats share `.../idx/`, and those fan-outs run at the ceiling's
+/// width, so without this they were the one place where raising the ceiling
+/// did add depth on a single prefix. A LIST prefix already ends at a
+/// separator and so is keyed by itself.
+fn request_key_prefix(key: &str) -> Option<&str> {
+    key.rfind('/').map(|last| &key[..=last])
 }
 
 impl Catalog {
@@ -939,8 +920,8 @@ impl Catalog {
     }
 
     /// Take the permits a resolve-path request holds while it is issued
-    /// (ADR-1733 decision 1): its shard-hour commit prefix's, when `key` sits
-    /// under one, and this catalog's ceiling, which every request takes.
+    /// (ADR-1733 decision 1): its own key prefix's, and this catalog's
+    /// ceiling, which every request takes.
     ///
     /// The prefix permit is taken first on purpose. A request that took the
     /// ceiling permit first and then waited on a hot prefix would hold a
@@ -953,7 +934,7 @@ impl Catalog {
         // the idle-prefix cleanup in `RequestPermits::drop`.
         let mut permits = RequestPermits {
             catalog: self,
-            prefix: shard_hour_commit_prefix(key)
+            prefix: request_key_prefix(key)
                 .map(|prefix| (prefix.to_string(), self.prefix_semaphore(prefix))),
             prefix_permit: None,
             _ceiling_permit: None,
@@ -5996,12 +5977,45 @@ mod tests {
     /// structural, not a gap this test closes.
     #[tokio::test]
     async fn resolve_fan_out_reaches_the_configured_concurrency_after_fold() {
-        assert_folded_snapshot_fan_out_peaks_at(32).await;
+        assert_folded_snapshot_fan_out_peaks_at(32, 128, 32).await;
     }
 
-    async fn assert_folded_snapshot_fan_out_peaks_at(concurrency: usize) {
+    /// ADR-1733 decision 1, the per-prefix half: every part of one snapshot
+    /// sits under that snapshot's single `.../snap/` prefix, and the part
+    /// fan-out runs at the ceiling's width, so at a ceiling above the
+    /// per-prefix bound it is the per-prefix bound that must decide the peak.
+    /// 320 parts and a ceiling of 1,024 leave both other candidates
+    /// distinguishable: 128 is neither 320 nor 1,024.
+    ///
+    /// FLIP: key the per-prefix bound by the shard-hour commit prefix again
+    /// (restore `request_key_prefix` to a segment walk returning `None` for
+    /// anything that is not `t/<hash>/<signal>/c/<shard>/<hour>/`), and
+    /// snapshot parts take no prefix permit at all: only the ceiling holds
+    /// them back, and the first assertion fails with a peak in the hundreds
+    /// (255 observed) against the 128 expected.
+    #[tokio::test]
+    async fn snapshot_part_fan_out_is_held_to_the_per_prefix_bound() {
+        assert_folded_snapshot_fan_out_peaks_at(
+            1_024,
+            320,
+            CatalogConfig::default().resolve_prefix_concurrency,
+        )
+        .await;
+    }
+
+    /// Folds `part_count` sealed hours into one part each, then resolves
+    /// through a gate on the part GETs under a ceiling of `ceiling`, and
+    /// asserts the fan-out peaks at exactly `expected_peak` twice over.
+    async fn assert_folded_snapshot_fan_out_peaks_at(
+        ceiling: usize,
+        part_count: usize,
+        expected_peak: usize,
+    ) {
+        assert!(
+            part_count >= expected_peak * 2,
+            "the second wave needs {expected_peak} parts still unfetched"
+        );
         let store = Arc::new(MemoryStore::new());
-        let part_count = concurrency * 4;
         let base_hour = 500_000u32;
         let last_hour = base_hour + part_count as u32 - 1;
         let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
@@ -6060,7 +6074,7 @@ mod tests {
             Catalog::new(
                 gated_store.clone(),
                 CatalogConfig {
-                    resolve_get_concurrency: concurrency,
+                    resolve_get_concurrency: ceiling,
                     ..config(1)
                 },
             )
@@ -6079,12 +6093,12 @@ mod tests {
                 .await
         });
 
-        wait_until_held_bounded(&gate, concurrency).await;
+        wait_until_held_bounded(&gate, expected_peak).await;
         assert_eq!(
             gate.held_count(),
-            concurrency,
-            "exactly the configured number of snapshot-part GETs are in flight at once \
-             (concurrency = {concurrency})"
+            expected_peak,
+            "exactly {expected_peak} snapshot-part GETs are in flight at once \
+             (ceiling = {ceiling}, parts = {part_count})"
         );
 
         // Release the first wave and confirm the fan-out refills to exactly
@@ -6092,12 +6106,12 @@ mod tests {
         for id in gate.held() {
             gate.release(id);
         }
-        wait_until_held_bounded(&gate, concurrency).await;
+        wait_until_held_bounded(&gate, expected_peak).await;
         assert_eq!(
             gate.held_count(),
-            concurrency,
-            "the fan-out refills to exactly the configured bound on a second wave \
-             (concurrency = {concurrency})"
+            expected_peak,
+            "the fan-out refills to exactly the same bound on a second wave \
+             (ceiling = {ceiling}, parts = {part_count})"
         );
 
         let mut spins = 0;
@@ -6110,7 +6124,7 @@ mod tests {
             assert!(
                 spins < 10_000,
                 "resolve did not finish after releasing every held snapshot-part GET \
-                 (concurrency = {concurrency})"
+                 (ceiling = {ceiling}, parts = {part_count})"
             );
         }
         task.await.expect("join resolve task").expect("resolve");
@@ -6211,35 +6225,45 @@ mod tests {
         }
     }
 
-    /// ADR-1733 decision 1: the per-prefix bound is keyed by the shard-hour
-    /// commit prefix, and only requests that sit under one are keyed at all.
-    /// A commit record and a LIST of its own shard-hour resolve to the same
-    /// key; the head object, a provisioning record, a snapshot part and a
-    /// LIST of a whole shard resolve to none, so those take only the
-    /// catalog's ceiling permit.
+    /// ADR-1733 decision 1: every resolve-path request is keyed by its own
+    /// key prefix, the path up to and including its last separator. A commit
+    /// record is still keyed by its shard-hour commit prefix, because that is
+    /// what its parent path is; a LIST is keyed by the prefix it lists; and
+    /// the objects that share one directory (a snapshot's parts, its postings
+    /// and column stats) are keyed by that shared directory, which is what
+    /// holds their fan-out to the per-prefix bound.
     #[test]
-    fn shard_hour_commit_prefix_keys_only_shard_hour_requests() {
+    fn every_request_is_keyed_by_its_own_key_prefix() {
         let hour = "t/aabb/m/c/0000/2026091612/";
         assert_eq!(
-            shard_hour_commit_prefix("t/aabb/m/c/0000/2026091612/000000000123"),
+            request_key_prefix("t/aabb/m/c/0000/2026091612/000000000123"),
             Some(hour),
             "a commit record is keyed by its shard-hour prefix"
         );
         assert_eq!(
-            shard_hour_commit_prefix(hour),
+            request_key_prefix(hour),
             Some(hour),
             "a LIST of one shard-hour is keyed by that same prefix"
         );
         assert_eq!(
-            shard_hour_commit_prefix("t/aabb/m/c/0000/"),
-            None,
-            "a LIST of a whole shard spans many shard-hours"
+            request_key_prefix("t/aabb/m/c/0000/"),
+            Some("t/aabb/m/c/0000/"),
+            "a LIST of a whole shard is keyed by the prefix it lists"
         );
-        assert_eq!(shard_hour_commit_prefix("t/aabb/m/head"), None);
-        assert_eq!(shard_hour_commit_prefix("t/aabb/m/prov"), None);
-        assert_eq!(shard_hour_commit_prefix("t/aabb/m/s/part/abcdef"), None);
-        assert_eq!(shard_hour_commit_prefix("t/aabb/m/c/0000"), None);
-        assert_eq!(shard_hour_commit_prefix(""), None);
+        assert_eq!(
+            request_key_prefix("t/aabb/catalog/m/snap/000100.abcdef0123456789.csnap"),
+            Some("t/aabb/catalog/m/snap/"),
+            "every part of one snapshot shares the prefix that bounds them"
+        );
+        assert_eq!(
+            request_key_prefix("t/aabb/catalog/m/idx/abcdef0123456789.npost"),
+            Some("t/aabb/catalog/m/idx/"),
+            "postings and column stats share their own prefix"
+        );
+        assert_eq!(request_key_prefix("t/aabb/m/head"), Some("t/aabb/m/"));
+        assert_eq!(request_key_prefix("t/aabb/m/c/0000"), Some("t/aabb/m/c/"));
+        assert_eq!(request_key_prefix("head"), None, "no separator, no prefix");
+        assert_eq!(request_key_prefix(""), None);
     }
 
     /// ADR-1733 decision 1: prefix semaphores are created lazily and dropped

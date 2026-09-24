@@ -139,10 +139,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--max-concurrent-queries 4` gets 512, and an unbounded 8-core host
   (`Q` = 16, deriving 2,048) gets 1,024. The resolved number is logged at
   startup beside the other derived performance defaults, with the `Q` and the
-  input it came from. A second bound, per shard-hour commit prefix and with no
-  flag, holds any single prefix to 128 requests whatever the ceiling is, so a
-  higher ceiling buys concurrency across prefixes and never more pressure on
-  one. The 1,024 is an interim cap: the ADR bounds in-flight resolve memory by
+  input it came from. A second bound, per key prefix and with no flag, holds
+  any single prefix to 128 requests whatever the ceiling is, so a higher
+  ceiling buys concurrency across prefixes and never more pressure on one.
+  Every resolve-path request is bounded that way, keyed by its own key
+  prefix: a commit record by its shard-hour prefix, a snapshot's parts by the
+  one directory they share, its postings and column stats by theirs, and a
+  LIST by the prefix it lists. The 1,024 is an interim cap: the ADR bounds
+  in-flight resolve memory by
   reserving each request's listed size against the ADR-1170 process budget,
   that reservation is not wired up yet, and until it is a derived ceiling is
   held at 1,024 rather than allowed to reach the 4,096 the clamp permits.
