@@ -81,11 +81,11 @@ static PROBE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// at `/metrics` as `ravel_store_probe_last_run_timestamp_seconds`; its AGE is
 /// the probe-liveness signal (see docs/guides/observability.md).
 ///
-/// `0` means exactly one thing: the probe task was never spawned in this
-/// process. The spawn stamp is what makes that unambiguous, so a task that
-/// dies, panics, or has its channel dropped before its first cycle leaves an
-/// AGEING timestamp that the staleness alert catches on its own, rather than
-/// a frozen sentinel that every consumer has to special-case.
+/// A `0` reading has three causes, documented in one place: the "What `0`
+/// means" section of docs/guides/observability.md. The spawn stamp is what
+/// keeps a task that dies, panics, or has its channel dropped before its first
+/// cycle out of that set: it leaves an AGEING timestamp that the staleness
+/// alert catches on its own.
 static PROBE_LAST_RUN_UNIX_NS: AtomicI64 = AtomicI64::new(0);
 
 /// Whether the store is currently reachable (the `ravel_store_reachable` gauge
@@ -101,9 +101,10 @@ pub fn probe_failures_total() -> u64 {
 }
 
 /// Unix time (nanoseconds) of the last completed probe cycle or of the probe
-/// task's spawn, whichever is later; 0 only if no probe task was ever spawned
-/// in this process (the `ravel_store_probe_last_run_timestamp_seconds` gauge
-/// source).
+/// task's spawn, whichever is later (the
+/// `ravel_store_probe_last_run_timestamp_seconds` gauge source). For what a
+/// `0` reading means, see the "What `0` means" section of
+/// docs/guides/observability.md.
 pub fn probe_last_run_unix_ns() -> i64 {
     PROBE_LAST_RUN_UNIX_NS.load(Ordering::Relaxed)
 }
@@ -235,12 +236,12 @@ pub fn spawn_with_clock(
 ) -> StoreProbeTask {
     // The spawn stamp (issue #1728). Written here, synchronously, before the
     // task exists and therefore before its first jittered sleep, so the gauge
-    // is real from the instant a probe exists and `0` means only "no probe was
-    // ever spawned in this process". Without it the gauge would hold its zero
-    // value for a whole jittered interval plus one cycle after every start,
-    // and a task that died in that window would hold it forever, which no
-    // amount of alert-side arithmetic can distinguish from a process that
-    // never spawned one.
+    // is real from the instant a probe exists. Without it the gauge would hold
+    // its zero value for a whole jittered interval plus one cycle after every
+    // start, and a task that died in that window would hold it forever, which
+    // no amount of alert-side arithmetic can resolve. For what a `0` reading
+    // means, see the "What `0` means" section of
+    // docs/guides/observability.md.
     stamp_last_run(clock.as_ref());
     let (tx, mut rx) = oneshot::channel();
     // Production OS-entropy jitter source (ADR-0068 decision 2), the same

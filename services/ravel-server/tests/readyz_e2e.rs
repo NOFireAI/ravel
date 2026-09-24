@@ -366,14 +366,14 @@ async fn store_probe_last_run_gauge_goes_stale_while_readyz_stays_green() {
 }
 
 /// Issue #1728: `store_probe::spawn` stamps the liveness gauge before the
-/// loop's first sleep, so `0` means only "no probe task was ever spawned in
-/// this process". Without that stamp the gauge holds `0` for a whole jittered
-/// interval plus one cycle after every start, and a task that dies inside that
-/// window holds it forever, which no alert expression can tell apart from a
-/// process that never spawned a probe. The interval here is long enough that
-/// no cycle can complete during the test, so the value asserted can only have
-/// come from the spawn stamp itself, and the clock is injected so the
-/// assertion is an exact value rather than a wall-clock band.
+/// loop's first sleep. Without that stamp the gauge holds `0` for a whole
+/// jittered interval plus one cycle after every start, and a task that dies
+/// inside that window holds it forever, which no alert expression can tell
+/// apart from the other causes a `0` reading has (the "What `0` means" section
+/// of docs/guides/observability.md states them). The interval here is long
+/// enough that no cycle can complete during the test, so the value asserted
+/// can only have come from the spawn stamp itself, and the clock is injected
+/// so the assertion is an exact value rather than a wall-clock band.
 #[tokio::test]
 async fn store_probe_spawn_stamps_the_liveness_gauge_before_any_cycle_runs() {
     let _guard = PROBE_TEST_LOCK.lock().await;
@@ -394,8 +394,8 @@ async fn store_probe_spawn_stamps_the_liveness_gauge_before_any_cycle_runs() {
         store_probe::probe_last_run_unix_ns(),
         SPAWN_NS,
         "spawn must stamp the liveness gauge from the injected clock before the \
-         task's first sleep, so the gauge is never left at its never-spawned 0 \
-         by a process that did spawn a probe"
+         task's first sleep, so a process that did spawn a probe does not sit \
+         at 0 for a whole interval"
     );
 
     // The stamp is not a cycle: nothing ran, so reachability is untouched and

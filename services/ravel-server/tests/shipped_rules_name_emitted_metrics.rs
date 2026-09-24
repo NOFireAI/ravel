@@ -1127,15 +1127,15 @@ fn the_guide_and_the_shipped_rule_file_agree() {
 }
 
 /// `store_probe::spawn` stamps `ravel_store_probe_last_run_timestamp_seconds`
-/// before the loop's first sleep, so the gauge carries no ambiguous sentinel:
-/// an ageing timestamp is a stopped probe and `0` is a probe that was never
-/// spawned, and one bare staleness comparison covers both. Pinning the exact
-/// expression, rather than only asserting the metric name appears, is what
-/// catches a future edit that reintroduces the `> 0` guard term (which would
-/// reopen the hole: a probe that died before its first cycle would then never
-/// fire any rule) or that adds a second rule on the sentinel (whose window can
-/// only be derived from the DEFAULT interval, so it pages on every rollout of
-/// a fleet running a longer `--store-probe-interval`).
+/// before the loop's first sleep, so one bare staleness comparison covers both
+/// an ageing timestamp and a `0` reading (the "What `0` means" section of
+/// docs/guides/observability.md states what a `0` reading means). Pinning the
+/// exact expression, rather than only asserting the metric name appears, is
+/// what catches a future edit that reintroduces the `> 0` guard term (which
+/// would reopen the hole: a probe that died before its first cycle would then
+/// never fire any rule) or that adds a second rule on the zero reading (whose
+/// window can only be derived from the DEFAULT interval, so it pages on every
+/// rollout of a fleet running a longer `--store-probe-interval`).
 #[test]
 fn store_probe_stalled_rule_is_one_unguarded_staleness_comparison() {
     let groups = shipped_rule_groups();
@@ -1152,16 +1152,15 @@ fn store_probe_stalled_rule_is_one_unguarded_staleness_comparison() {
         names,
         vec!["RavelStoreProbeStalled"],
         "exactly one shipped rule may read the liveness gauge; a companion \
-         sentinel rule is what the spawn stamp removed the need for"
+         zero-reading rule is what the spawn stamp removed the need for"
     );
 
     const EXPECTED_EXPR: &str = "time() - ravel_store_probe_last_run_timestamp_seconds > 132";
     assert_eq!(
         probe_rules[0].expr, EXPECTED_EXPR,
-        "RavelStoreProbeStalled must be the bare staleness comparison: the \
-         spawn stamp makes 0 mean only never-spawned, which this expression \
-         already fires on, so a `> 0` guard term would exclude coverage \
-         instead of buying any"
+        "RavelStoreProbeStalled must be the bare staleness comparison: this \
+         expression already fires on a 0 reading, so a `> 0` guard term would \
+         exclude coverage instead of buying any"
     );
 }
 

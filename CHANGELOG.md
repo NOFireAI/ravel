@@ -58,9 +58,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its outcome, and once by `store_probe::spawn` before the loop's first sleep,
   so its AGE (not its value) is the signal that the task itself has stopped: a
   failing-but-alive probe keeps advancing it every cycle, and a task that dies
-  before its first cycle ages out from its spawn stamp. That spawn stamp
-  leaves `0` meaning exactly one thing, that no probe task was ever spawned in
-  this process, so a single shipped alert covers every dead-probe state:
+  before its first cycle ages out from its spawn stamp. A single shipped alert
+  covers every dead-probe state:
   `RavelStoreProbeStalled` in `deploy/prometheus/ravel.rules.yaml` fires on
   `time() - ravel_store_probe_last_run_timestamp_seconds > 132` held for
   `5m`, with no sentinel guard term and no companion never-ran rule.
@@ -552,6 +551,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loop belongs with the ADR-0069 follow-up.
 
 ### Fixed
+
+- **What a `0` on `ravel_store_probe_last_run_timestamp_seconds` means is
+  documented in one place, and it states all three causes** (issue #1982). The
+  explanation was written out in ten places across the store-probe source, its
+  tests, the shipped Prometheus rule file and the observability guide, and
+  every copy gave the reading a single cause. Two were missing, and one of the
+  two pages until an operator fixes something the alert's description does not
+  mention. Four sweeps had already tried to keep the copies consistent; two of
+  them added copies while removing others. The "What `0` means" section of
+  `docs/guides/observability.md` is now the one statement of the causes, every
+  other site points at it, and
+  `scripts/guards/check-claim-single-source.sh` fails the build on a
+  restatement that is not a pointer, on a registered pointer that stops
+  pointing, and on a canonical block that has moved or lost a cause. The one
+  exception is the gauge's `HELP` line, which ships in `/metrics` output where
+  a reader has no link to follow, so it carries a one-line summary naming the
+  three; the guard checks that summary too. No behaviour changed.
 
 - **`ravel-cli gc-config set --max-flush-lifetime`'s help text and generated
   reference page now state the floor the flag is refused below** (issue
