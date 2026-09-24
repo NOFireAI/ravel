@@ -218,9 +218,9 @@ handoff cases immediately below it. Concretely:
   `crates/ravel-sql/src/logs_scan.rs:2992-3068`, and `scan.rs:598` for RSEG),
   which now reaches the same process budget through the adapter. The fetch
   guard is released only after that `try_grow` has succeeded, so the bytes are
-  double-counted from the handoff until the buffer drops (see the amendment
-  below, which corrects an earlier "width of one call" reading) and never
-  uncounted. A `try_grow`
+  double-counted from the handoff until the buffer drops (see the 2026-09-06
+  amendment below, which corrects an earlier "width of one call" reading) and
+  never uncounted. A `try_grow`
   refusal at handoff drops the buffer and surfaces the SQL error; the fetch
   guard's release follows the drop.
 - A buffer inserted into a cache is covered by the cache's hard cap from the
@@ -243,6 +243,8 @@ problem. That is the precondition ADR-1196 needs before a latency-first policy
 can be a default.
 
 #### Amendment (2026-09-06, Refs: #1254)
+
+<!-- amendment-applies: sections="2. A fetch byte reservation at the points where the unit is known|3. A static carve under one number" pointer="2026-09-06 amendment" -->
 
 Reviewing the implemented fetch reservations against the text above found two
 claims that describe an intended design the code does not implement. The
@@ -340,6 +342,8 @@ marked):
 
 #### Amendment (2026-09-13, Refs: #1170)
 
+<!-- amendment-applies: sections="Amendment (2026-09-06, Refs: #1254)" pointer="first 2026-09-13 amendment" -->
+
 The 2026-09-06 amendment above marked cache hits in the whole-object funnel
 (`log_fetcher.rs`/`span_fetcher.rs`, `Source::Cache`) and concluded that doing
 so left the SQL boundary as the only untracked overlap. That conclusion
@@ -369,9 +373,13 @@ in the same file, so closing either is a mirror of existing code, not new
 design; neither is done in this amendment; the reserve derivation must
 account for both terms of `d`, or mark both sites, before decision 3's
 `1.25 x d` sizing can be measured against a value smaller than what the
-calibration run linked from decision 2 already computes.
+calibration run linked from decision 2 already computes. (Both were marked
+by the second amendment below, which also found a fourth and larger
+untracked class, so this paragraph's residual is no longer current.)
 
 #### Amendment (2026-09-13, second pass, Refs: #1170)
+
+<!-- amendment-applies: sections="Amendment (2026-09-06, Refs: #1254)|Amendment (2026-09-13, Refs: #1170)|3. A static carve under one number" pointer="second amendment" -->
 
 Both sites the amendment above left open are now marked:
 `covering_read`'s single-GET cache-insert branch (`log_fetcher.rs`), and a
@@ -459,7 +467,8 @@ subtracts.
 
 This paragraph originally said that expression was exact by construction. It is
 exact only if every overlap is marked, which the first implementation did not
-achieve: see the amendments under decision 2. Cache hits are now marked at
+achieve: see the 2026-09-06 amendment and the two 2026-09-13 amendments under
+decision 2. Cache hits are now marked at
 every call site, and so are `covering_read`'s cache-insert branch and RSEG's
 `ensure_ranges` reservation (2026-09-13, second amendment), but two classes of
 overlap remain unmarked: the SQL cross-boundary one, where the fetch guard and
@@ -608,7 +617,7 @@ current, and the amendment has since been corrected to match.
 
 ## Amendment 2026-09-07 (issue #1255): decisions 3 and 4 landed
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="this records which decisions landed and which did not, and adds the cross-tenant cascade that follows from decision 1 as designed; every figure and rule above stands as written, including the provisional reserve decision 3 already calls a placeholder" -->
 
 Decisions 3 and 4 landed in `ravel-server`. `resolve_performance_defaults`
 derives `memory_budget_bytes` from cgroup-capped effective memory minus
