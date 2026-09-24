@@ -38,6 +38,10 @@ OOM — applies directly.
    shed counter render on /metrics inside the existing label allowlist.
    Interacts with ADR-0067: in-flight pipelined flushes stay charged until
    their PUTs complete, so pipelining depth is automatically accounted.
+   Two decompression paths charge earlier than "after decode" and widen
+   what the gauge measures: the OTLP HTTP gzip inflate, by the 2026-09-07
+   amendment below, and the Remote Write snappy inflate, by the
+   2026-09-10 amendment below.
 2. **Idle-tenant eviction, only for re-derivable state.** A background
    sweep (jittered interval, same worker shape as every other loop) evicts
    per-tenant entries idle past a threshold (default 1 h) from: generation
@@ -138,7 +142,7 @@ transport layer needs to, or should, outlive one request.
 
 ## Amendment (2026-09-07): the OTLP HTTP gzip inflate is charged pre-inflate
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="2026-09-07 amendment" -->
 
 This amendment appends to decision 1; it moves the charge point for one
 transient and, in doing so, redefines what the gauge measures. Everything
@@ -251,7 +255,7 @@ machine.
 
 ## Amendment (2026-09-10): the Remote Write snappy inflate is charged
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision" pointer="2026-09-10 amendment" -->
 
 This amendment appends to decision 1 and extends the 2026-09-07 amendment to a
 second ingest path. Everything above stands unchanged.
@@ -377,7 +381,7 @@ strictly before `PinFlush` and the model has no admission action.
 
 ## Amendment (2026-09-12): OTLP gRPC is bounded and documented, not charged
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: none reason="this resolves the open item the 2026-09-10 amendment left (that path stays uncharged, now as a decision with its bound stated and pinned by a test); no earlier wording is narrowed or retired" -->
 
 This amendment resolves the OTLP gRPC gzip inflate that the 2026-09-10
 amendment left as an open item ("Why OTLP gRPC was not fixed here"). It changes

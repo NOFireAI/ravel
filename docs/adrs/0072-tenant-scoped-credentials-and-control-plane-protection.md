@@ -135,7 +135,10 @@ deployments impossible, not lock semantics in-process.
   reconciles `sys/auth` from the CRD token Secret: upsert on new
   values, `remove_tokens_by_tenant` for tenants absent from the Secret.
   Because removal is by tenant name, it is correct after an operator
-  restart with no in-memory history. The operator also stops
+  restart with no in-memory history. The ownership marker amendment
+  below narrows that removal to entries the operator itself wrote: by
+  tenant name alone it also revoked tenants nobody had asked it to
+  manage. The operator also stops
   hardcoding `--tenant-hash-unkeyed` when the CRD carries a deployment
   key, so `DurableBearerResolver` actually constructs on managed
   clusters (prerequisite for any of this to matter; the migration story
@@ -195,7 +198,7 @@ breaks a real key shape fails CI instead of a production deployment.
 
 ## Amendment: `sys/auth` entries get an ownership marker
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="4. `sys/auth` gets an owner; revocation gets a durable primitive" pointer="ownership marker amendment" -->
 
 Decision 4's `remove_tokens_by_tenant` reconcile was unsafe as shipped:
 the operator's remove pass ran over every tenant absent from its Secret,
@@ -220,7 +223,9 @@ both survive a reconcile whose Secret does not name them; an
 operator-managed tenant absent from the Secret is still revoked. This is
 the load-bearing compatibility rule, not the field's mere presence: an
 operator that filtered on "absent OR operator" instead would still wipe
-every pre-amendment entry on its next reconcile.
+every pre-amendment entry on its next reconcile. Scoping the replace this
+way is what left two entries able to share one `token_hash`; the global
+hash-uniqueness amendment below adds a cross-scope drop on top of it.
 
 `AUTH_TOKEN_MAP_FORMAT_VERSION` moves 1 -> 2. The bump is a floor signal,
 not a wire necessity -- `managed_by` is `optional` and additive, so a
@@ -238,7 +243,7 @@ defects the ownership marker didn't by itself fix.
 
 ## Amendment: `token_hash` is globally unique; last writer takes ownership
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment: `sys/auth` entries get an ownership marker" pointer="global hash-uniqueness amendment" -->
 
 A follow-up review found the ownership marker above could itself brick
 `sys/auth`: three doors all end with two entries sharing one `token_hash`
@@ -328,7 +333,7 @@ bounded-staleness refresh fails closed) until it, too, is upgraded.
 
 ## Amendment: cross-tenant token collisions are refused, not taken over
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment: `token_hash` is globally unique; last writer takes ownership" pointer="cross-tenant token collisions are refused, not taken over" -->
 
 The door 3 takeover decision above does not converge. Two tenants (say
 `acme` and `globex`) whose Secret-provisioned token values collide are

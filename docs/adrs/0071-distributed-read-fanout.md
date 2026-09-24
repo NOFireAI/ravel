@@ -63,7 +63,9 @@ patterns. The coordinator k-way merges all slices under the existing total
 order and then runs the unchanged PromQL evaluator or the unchanged
 single-partition SQL aggregation. Aggregation and evaluation do not move in
 v1; results are byte-identical to local execution, and a differential test
-enforces that property for arbitrary partitions.
+enforces that property for arbitrary partitions. This lane is metrics only;
+the log and span fan-out amendment below extends it to Logs, Alerts, Audit,
+and Spans.
 
 Dispatch is cost-gated: the existing pre-execution estimate decides local
 versus distributed, so a cheap query runs today's path untouched. Worker
@@ -120,7 +122,8 @@ erasure predicates, and trace context. Response streams per-series frames
 payloads, -0.0, and the staleness marker) and ends with a summary frame
 carrying the worker's accounting snapshot and typed status. This is a
 transient wire contract between processes, not a persistent format; no
-stored byte changes.
+stored byte changes. The response oneof gained log-record and span frames
+under the log and span fan-out amendment below.
 
 ## Failure semantics
 
@@ -134,13 +137,16 @@ stored byte changes.
 - Budget trip on a slice or on the merged total: the same typed errors the
   local path produces, never a transport error. A worker's own refusal is
   parsed back into its typed form by the coordinator, so it renders as the
-  same 422 a local budget trip does.
+  same 422 a local budget trip does (the budget amendment below re-decided
+  what a slice is allowed to scan and made that parse typed).
 - Deadline: the coordinator deadline (already bounded by `sys/gc`
   `max_query_duration`, which keeps every worker inside the GC protection
   horizon) cancels the fan-out; stream teardown reaches workers and the
   existing drop-based cancellation frees GETs and permits.
 - Protocol version mismatch (rolling deploy): silent fallback to fully local
-  execution, never an error.
+  execution, never an error. A worker that answers `Unsupported` for a
+  signal it does not serve falls back the same way, which is the skew
+  mechanism the log and span fan-out amendment below relies on.
 - Fragment admission runs under a separate internal workload class with its
   own cap, so a coordinator holding a client-query permit can never deadlock
   waiting on fragments that need the same permit pool.
@@ -288,7 +294,7 @@ exists).
 
 ## Amendment: dedicated fragment listener and per-tenant fragment capabilities
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Security" pointer="Dedicated fragment listener and per-tenant fragment capabilities" -->
 
 Finding F-1 (risk R7, P2). The Security section above made two
 claims that the adversarial review showed compose into a fleet-wide
@@ -735,10 +741,12 @@ shipped, and the cost of changing this contract only grows.
   it is federation transport hardening, not response honesty; it was
   bundled into this amendment's scope but belongs with the
   fragment-listener amendment's transport work above, and this amendment
-  recommends re-homing it there rather than deciding it here.
+  recommends re-homing it there rather than deciding it here. That
+  recommendation is superseded: the federation TLS and quarantine
+  amendment below decides the default instead.
 - The dead-endpoint ranking window after mass worker death (a P3 item): a
   recovery-latency tuning, no response-contract impact, stays a separate
-  task.
+  task. The federation TLS and quarantine amendment below is that task.
 - Per-rule partial-coverage policy in alerting: belongs with the alerting
   work that owns that surface, as decided above.
 
@@ -758,7 +766,7 @@ shipped, and the cost of changing this contract only grows.
 
 ## Amendment: federation TLS by default, engine-direct caller honesty, and dead-endpoint quarantine
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment: partial results are consent-gated and envelope-visible" pointer="federation TLS and quarantine amendment" -->
 
 Status: Accepted. This amendment decides the three remaining items:
 (1) the `--remote-cluster` federation transport default flips
@@ -1116,7 +1124,7 @@ dedicated clones; only the merges serialize.
 
 ## Amendment: log and span distributed fan-out
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Decision|Architecture|Failure semantics" pointer="log and span fan-out amendment" -->
 
 Status: Accepted; the queryfrag (engine-level) lane is shipped. Amends the
 Decision, Architecture, and Failure semantics sections above to extend fan-out
@@ -1486,7 +1494,7 @@ tested, but neither is reached from a live server binary yet.
 
 ## Amendment: the whole budget goes to every slice, and workers clamp to their own
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Architecture|Failure semantics" pointer="budget amendment" -->
 
 ### Context
 
