@@ -66,8 +66,8 @@ measurement-backed follow-up once real workload data exists — this ADR is
 about giving operators a lever, not about deciding where the lever should
 default to for workloads nobody has measured yet.
 
-(Superseded by the amendment below: that follow-up is issue #1141, and
-the measurement is #968.)
+(Superseded by the 2026-09-02 amendment below: that follow-up is issue
+#1141, and the measurement is #968.)
 
 ```mermaid
 flowchart TD
@@ -129,10 +129,12 @@ flowchart TD
   `docs/guides/admission-limits.md` gain the new flags and the
   `--max-s3-requests` sizing guidance.
 - No behavior change at default flag values: every default matches
-  today's compiled-in constant exactly. (Amended below: an unset flag is
-  now derived from the host.)
+  today's compiled-in constant exactly. (Amended by the 2026-09-02
+  amendment below: an unset flag is now derived from the host.)
 
 ## Amended 2026-09-02: unset means derive (issue #1141)
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="2026-09-02 amendment below" -->
 
 The follow-up this ADR deferred ("Changing the default is a separate,
 measurement-backed follow-up once real workload data exists") is now

@@ -345,6 +345,8 @@ natively on arm64 against the bar ADR-0037 decision 16 set: the stack up,
 
 ## Decision 10: ADR-0037's stale topology gets a dated amendment, not a silent edit
 
+<!-- amendment-applies: none reason="this is a decision of this ADR about amending ADR-0037; no earlier wording in this document is retired" -->
+
 ADR-0037's amendments reason about releases publishing from a public mirror,
 written when this repository was the private `store` and a separate public
 mirror existed. `origin` is now `NOFireAI/ravel` directly and there is no

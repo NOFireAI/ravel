@@ -227,6 +227,8 @@ deletes, so it does not need Maintain's delete grant.
 
 ### 3. ADR-0055 amendment: Admin gets `c/**cmt` write
 
+<!-- amendment-applies: none reason="this is a decision of this ADR that amends ADR-0055's role table; no earlier wording in this document is retired" -->
+
 Amend ADR-0055 §1's role table: Admin's write column gains
 `s3:PutObject` on `t/*/*/c/*` (the same prefix Gateway already writes,
 scoped the same way), justified specifically by this reconstruction tool.
