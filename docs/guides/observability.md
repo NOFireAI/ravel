@@ -766,7 +766,7 @@ probe (`store_probe::spawn`).
 |---|---|
 | `ravel_store_reachable` | Gauge. 1 when the probe reports the store reachable, 0 after K consecutive failed probes. |
 | `ravel_store_probe_failures_total` | Every failed probe cycle, monotonic, incremented even below the readiness threshold. |
-| `ravel_store_probe_last_run_timestamp_seconds` | Gauge. Unix time of the probe task's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed. `0` means only that no probe task was ever spawned in this process. |
+| `ravel_store_probe_last_run_timestamp_seconds` | Gauge. Unix time of the probe task's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed. `0` means no probe task has been spawned in this process (see "What `0` means" below for the two other, non-paging windows that also read `0`). |
 
 The first two gauges are written only while the probe task is running: the
 task is a single `tokio::spawn` with no restart path and no
@@ -839,19 +839,36 @@ to avoid.
 
 `store_probe::spawn` stamps the gauge synchronously, from the injected clock,
 before the task's first (jittered) sleep. So the gauge holds a real timestamp
-from the instant a probe task exists, and `0` means exactly one thing: no
-probe task was ever spawned in this process.
+from the instant a probe task exists, and `0` means no probe task has been
+spawned in this process yet -- with two other windows that also read `0`
+without meaning that, neither of which can hold long enough to page:
 
-That single meaning is what lets one rule cover every dead-probe state:
+- The gap between `/metrics` starting to serve and `store_probe::spawn`
+  actually running. `/metrics` starts answering as soon as the HTTP task is
+  spawned, before the gRPC, Flight and mTLS listeners bind and before the
+  initial JWKS fetch; `store_probe::spawn` runs after all of that. A scrape
+  landing in that gap on a healthy starting process reads `0`. The gap is
+  bounded by those binds plus the JWKS fetch's own timeout
+  (`JWKS_FETCH_TIMEOUT`, 10s in `ravel-tenant-resolve`), far inside the
+  alert's `for: 5m`.
+- A host clock reading before the Unix epoch. `SystemClock::now_ns` maps a
+  `duration_since(UNIX_EPOCH)` failure to `0` rather than panicking, which a
+  host booting with no RTC can hit on its very first stamp.
+
+Neither window changes the rule's coverage: both fire the same expression as
+the never-spawned state below, and both clear well inside `for: 5m` once the
+process finishes starting or the clock advances past the epoch.
+
+That still lets one rule cover every dead-probe state:
 
 - A probe that stops completing cycles (the task died, panicked, or its
   channel was dropped) leaves an ageing timestamp, which crosses `132` and
   holds past `for: 5m` like any other stoppage. That includes a task that
   died before its first cycle ever completed: it still carries its spawn
   stamp, so it ages out on the same clock as one that ran for a week first.
-- A process that never spawned a probe at all leaves `0`, and `time() - 0`
-  is roughly the current Unix time, far over the threshold, so the same
-  expression fires on it too.
+- A process that has not spawned a probe at all (including the two windows
+  above) leaves `0`, and `time() - 0` is roughly the current Unix time, far
+  over the threshold, so the same expression fires on it too.
 
 The startup window needs no special case for the same reason the steady state
 does not. The spawn stamp and the first completed cycle are at most

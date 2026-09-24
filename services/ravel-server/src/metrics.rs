@@ -2420,7 +2420,7 @@ fn render_store_probe_family(
     write_header(
         out,
         "ravel_store_probe_last_run_timestamp_seconds",
-        "Unix time of the background store probe's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed, and 0 means no probe task was ever spawned in this process. Its age is the probe-liveness signal: unlike ravel_store_reachable and ravel_store_probe_failures_total, which only move while the probe task is alive, this stops advancing the moment the task itself dies.",
+        "Unix time of the background store probe's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed. 0 means no probe task has been spawned in this process, plus the brief startup window before that spawn call and a pre-1970 host clock; none holds past the RavelStoreProbeStalled alert's for: 5m on a healthy process. Its age is the probe-liveness signal: unlike ravel_store_reachable and ravel_store_probe_failures_total, which only move while the probe task is alive, this stops advancing the moment the task itself dies.",
         "gauge",
     );
     write_sample_f64(

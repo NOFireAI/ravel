@@ -81,11 +81,15 @@ static PROBE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// at `/metrics` as `ravel_store_probe_last_run_timestamp_seconds`; its AGE is
 /// the probe-liveness signal (see docs/guides/observability.md).
 ///
-/// `0` means exactly one thing: the probe task was never spawned in this
-/// process. The spawn stamp is what makes that unambiguous, so a task that
-/// dies, panics, or has its channel dropped before its first cycle leaves an
-/// AGEING timestamp that the staleness alert catches on its own, rather than
-/// a frozen sentinel that every consumer has to special-case.
+/// `0` means no probe task has been spawned in this process. Two windows
+/// also read `0` without meaning the task is missing: the brief startup gap
+/// before [`spawn`] runs (bounded well inside the alert's `for: 5m`, see
+/// docs/guides/observability.md), and a pre-1970 host clock, which
+/// [`ravel_ingest::SystemClock::now_ns`] maps to `0` rather than panicking.
+/// A task that dies, panics, or has its channel dropped before its first
+/// cycle leaves an AGEING timestamp that the staleness alert catches on its
+/// own, rather than a frozen sentinel that every consumer has to
+/// special-case.
 static PROBE_LAST_RUN_UNIX_NS: AtomicI64 = AtomicI64::new(0);
 
 /// Whether the store is currently reachable (the `ravel_store_reachable` gauge
@@ -101,9 +105,10 @@ pub fn probe_failures_total() -> u64 {
 }
 
 /// Unix time (nanoseconds) of the last completed probe cycle or of the probe
-/// task's spawn, whichever is later; 0 only if no probe task was ever spawned
-/// in this process (the `ravel_store_probe_last_run_timestamp_seconds` gauge
-/// source).
+/// task's spawn, whichever is later; 0 means no probe task has been spawned
+/// in this process, or the brief startup window before that spawn call, or a
+/// pre-1970 host clock (the `ravel_store_probe_last_run_timestamp_seconds`
+/// gauge source; see the doc comment on `PROBE_LAST_RUN_UNIX_NS`).
 pub fn probe_last_run_unix_ns() -> i64 {
     PROBE_LAST_RUN_UNIX_NS.load(Ordering::Relaxed)
 }
@@ -235,12 +240,14 @@ pub fn spawn_with_clock(
 ) -> StoreProbeTask {
     // The spawn stamp (issue #1728). Written here, synchronously, before the
     // task exists and therefore before its first jittered sleep, so the gauge
-    // is real from the instant a probe exists and `0` means only "no probe was
-    // ever spawned in this process". Without it the gauge would hold its zero
-    // value for a whole jittered interval plus one cycle after every start,
-    // and a task that died in that window would hold it forever, which no
-    // amount of alert-side arithmetic can distinguish from a process that
-    // never spawned one.
+    // is real from the instant a probe exists. `0` on its own only means no
+    // probe task has been spawned in this process (plus the startup gap
+    // before this call runs, and a pre-1970 host clock; see the doc comment
+    // on PROBE_LAST_RUN_UNIX_NS). Without this stamp the gauge would hold its
+    // zero value for a whole jittered interval plus one cycle after every
+    // start, and a task that died in that window would hold it forever,
+    // which no amount of alert-side arithmetic can distinguish from a
+    // process that never spawned one.
     stamp_last_run(clock.as_ref());
     let (tx, mut rx) = oneshot::channel();
     // Production OS-entropy jitter source (ADR-0068 decision 2), the same

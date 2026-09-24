@@ -663,6 +663,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   admission, the same max-age bound in sweep intervals. A RAM-only cache
   (no `--cache-dir`) is unaffected, since it never touched the disk tier.
 
+- **The store-probe liveness gauge's documentation no longer claims `0` has
+  one cause** (issue #1963). `ravel_store_probe_last_run_timestamp_seconds`
+  reading `0` was documented in three places (the observability guide, the
+  gauge's `HELP` text, and the static's doc comment in
+  `store_probe.rs`, plus two more duplicate phrasings a sweep turned up in
+  the same file and in `readyz_e2e.rs`) as meaning exactly one thing: no
+  probe task ever spawned in this process. Two other states also produce
+  `0` and are not that: the startup gap between `/metrics` serving and
+  `store_probe::spawn` actually running, and a pre-1970 host clock, which
+  `SystemClock::now_ns` maps to `0` rather than panicking. Neither can page,
+  since both clear well inside the `RavelStoreProbeStalled` alert's
+  `for: 5m`, and all documentation now says so instead of asserting a
+  single cause. Also renamed and fixed
+  `store_probe_last_run_gauge_goes_stale_while_readyz_stays_green`
+  (`readyz_e2e.rs`), which never started a server or queried `/readyz`
+  despite its name: it now starts a server as the neighbouring `/readyz`
+  tests do and asserts the endpoint answers 200 while the gauge is stale,
+  driving the exact false-healthy behavior issue #1728 introduced the
+  gauge to expose.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added
