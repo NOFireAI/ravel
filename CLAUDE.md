@@ -694,19 +694,31 @@ than passing for "no pull request open".
   ci.yml's `doc-scripts` job with the pull request's base SHA. Cases in
   `scripts/guards/check-changelog-touched.test.sh`.
 - `scripts/guards/check-amendment-integrity.sh [dir]`: exits non-zero when an
-  ADR `## Amendment` heading's own marker claims something the document does
-  not back up: a named section that does not carry the amendment's pointer,
-  or a phrase the amendment declares retired still appearing elsewhere
+  ADR amendment heading's own marker claims something the document does not
+  back up: a named section that does not carry the amendment's pointer, or a
+  phrase the amendment declares retired still appearing elsewhere
   unqualified. An amendment section makes this kind of claim about its own
   effect ("the role table, section 2 and section 3 now carry an inline
   pointer to this amendment") and review kept finding the edit only reached
   one of the named places (issue #1985); this checks the claim against the
-  document instead of trusting the prose. Exit 1 is a finding; exit 70 is an
-  amendment heading with no readable marker, a marker naming a section
-  heading that does not exist, or zero ADRs/amendments scanned, since a scan
-  that could not run and a clean tree are different answers. Exit 64 is bad
-  usage. Wired into `gates.sh` and ci.yml's `doc-scripts` job, cases first.
-  Cases in `scripts/guards/check-amendment-integrity.test.sh`.
+  document instead of trusting the prose. An amendment heading is any
+  heading below the title whose text contains a word starting "amend", at
+  any level, since every narrower rule tried here skipped a real amendment
+  silently; one nested inside another amendment's block belongs to that
+  block. `docs/adrs/README.md`, "Amending an ADR", is the author-facing
+  marker syntax with one example per kind, and the guard's own failure
+  output points there. Exit 1 is a finding: a named section without its
+  pointer, a retired phrase still standing unqualified, or an
+  `amendment-applies: none` with no `reason=` (`none` turns the checks off,
+  so it is the marker that has to justify itself). Exit 70 is a claim that
+  could not be checked at all: an amendment heading with no marker, a marker
+  missing `sections=`, `pointer=` or `phrase=`, an empty `sections=`, a
+  named section heading that does not exist or that exists more than once,
+  no ADR files (`docs/adrs/*.md` less `README.md`, which is the index), or
+  zero amendments scanned, since a scan that could not run and a clean tree
+  are different answers. Exit 64 is bad usage. Wired into `gates.sh` and
+  ci.yml's `doc-scripts` job, cases first. Cases in
+  `scripts/guards/check-amendment-integrity.test.sh`.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
   injected-clock test helper contains `thread::sleep`, `tokio::time::sleep`,
   a bare or aliased `sleep()` call, `tokio::time::timeout`, `Instant::`,

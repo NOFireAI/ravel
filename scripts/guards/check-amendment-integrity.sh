@@ -105,7 +105,6 @@ fi
 root_arg="${1:-docs/adrs}"
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-cd "${repo_root}" || exit 70
 
 exec python3 - "${repo_root}" "${root_arg}" <<'PY'
 import re
