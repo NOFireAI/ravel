@@ -26,8 +26,9 @@
 //! # Degrade-to-`None`, loud exceptions
 //!
 //! Column statistics are an OPTIONAL metadata artifact, so every failure short
-//! of a store outage or an isolation breach degrades: no HEAD yet, no ref at
-//! all, a `NotFound` GET, a blake3 mismatch, a decode error, or a
+//! of a store outage, an unparseable HEAD or an isolation breach degrades: no
+//! HEAD yet, no ref at all, a `NotFound` GET, a blake3 mismatch, a decode
+//! error, or a
 //! part-binding mismatch. A DECODE failure on an object a covered part
 //! actually references means the fold wrote an object the reader cannot
 //! open, so the fetch path surfaces it as [`FetchOutcome::DecodeRefused`]
