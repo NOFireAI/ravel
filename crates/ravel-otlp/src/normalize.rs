@@ -1652,12 +1652,23 @@ const JOB_INSTANCE_SOURCE_KEYS: [&str; 3] =
 
 /// Builds the resource-derived labels, plus how many of the resource's own
 /// attributes were outside both the job/instance mapping and the configured
-/// allowlist and so were dropped (issue #116). Counted per attribute
-/// occurrence on the resource (one entry in `resource.attributes` per unit),
-/// not per data point under it: a resource with 3 out-of-allowlist
-/// attributes returns 3 regardless of how many points it carries, and a
-/// caller multiplies by nothing before recording it. Normative description:
+/// allowlist and so were dropped. Counted per attribute occurrence on the
+/// resource (one entry in `resource.attributes` per unit), not per data
+/// point under it: a resource with 3 out-of-allowlist attributes returns 3
+/// regardless of how many points it carries, and a caller multiplies by
+/// nothing before recording it. Normative description:
 /// docs/guides/observability.md.
+///
+/// The count is a lower bound, not an exact figure, in two edge cases where
+/// a key matches by name but produces no label: a second occurrence of a
+/// job/instance-source or allowlisted key (`find_attr_value` takes only the
+/// first match, so a repeated key's later values are never looked at, but
+/// every occurrence still matches by key and so is excluded here), and an
+/// occurrence whose value is empty (`push_checked` drops an empty-value
+/// label per ADR-0038, but the count already excluded it by key before
+/// that happens). Both are pre-existing gaps in what "dropped" means here,
+/// not something this count was built to catch; a key match, not "produced
+/// a label", is what excludes an attribute from the count.
 fn build_resource_labels(
     resource: Option<&Resource>,
     limits: &IngestLimits,

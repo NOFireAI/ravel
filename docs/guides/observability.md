@@ -1682,6 +1682,12 @@ means resources are carrying attributes the allowlist does not cover; find
 which ones by inspecting the sender's resource attributes directly, not from
 this metric.
 
+The count is a lower bound, not an exact figure, when a resource repeats a
+job/instance-source or allowlisted key, or gives one an empty value: only
+the first occurrence of a repeated key is ever consulted, and an
+empty-value label is dropped after this count already excluded that
+attribute by key, so neither case is added back in as dropped.
+
 This counter does not change what gets dropped. The allowlist is still fixed
 at build time; making it configurable per tenant or per process is a separate
 decision (precedence between a tenant override and the process default,
