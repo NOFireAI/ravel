@@ -15,21 +15,26 @@
 //! path (GET, blake3 verify, ADR-0050 §2 tenant-hash check, decode against the
 //! covered parts' blake3, entry-count check).
 //!
-//! # Degrade-to-None, one loud exception
+//! # Degrade-to-None, three loud exceptions
 //!
 //! Postings are a pure pruning/verification optimization, never a correctness
-//! gate: every failure short of an isolation breach degrades to `Ok(None)`
-//! (no HEAD yet, no postings ref, any GET error, a blake3 mismatch, a decode
-//! error, an entry-count mismatch), exactly as `load_snapshot_postings`
-//! documents. The scrubber then simply runs the structural and content tiers
-//! with no postings tier this tick and retries next tick. The two loud
-//! exceptions returned as a real [`LoadPostingsError`] are a genuinely
-//! unparseable HEAD or part (a real catalog defect, matching
-//! [`crate::seal_divergence`]) and a postings object whose declared
-//! `tenant_hash` names a different tenant (an isolation breach, ADR-0050 §2,
-//! never absorbed into a silent degrade).
+//! gate: an absent HEAD, an absent postings ref, a `NotFound` on the postings
+//! object, a blake3 mismatch, a decode error, or an entry-count mismatch all
+//! degrade to `Ok(None)`, exactly as `load_snapshot_postings` documents. The
+//! scrubber then simply runs the structural and content tiers with no
+//! postings tier this tick and retries next tick. Three loud exceptions
+//! return a real [`LoadPostingsError`] instead: a genuinely unparseable HEAD
+//! or part (a real catalog defect, matching [`crate::seal_divergence`]), a
+//! postings object whose declared `tenant_hash` names a different tenant (an
+//! isolation breach, ADR-0050 §2, never absorbed into a silent degrade), and
+//! a GET of the postings object itself failing for any reason other than
+//! `NotFound` (issue #1964: an `AccessDenied` there is a missing IAM grant,
+//! not an absent object, and must disable the postings tier loudly rather
+//! than reading as "no postings ref yet"). The HEAD GET and the per-part GETs
+//! above it still degrade to `Ok(None)` on any error, `NotFound` or not
+//! (tracked separately, not fixed here).
 
-use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::catalog::v1::SnapshotEntry;
 use ravel_types::{Signal, TenantHash};
 
@@ -56,12 +61,12 @@ pub struct LoadedCoveringPostings {
     pub covered_entries: Vec<SnapshotEntry>,
 }
 
-/// A genuinely unparseable object or an isolation breach encountered while
-/// loading covering postings: the only two conditions [`load_covering_postings`]
-/// surfaces as an error rather than degrading to `Ok(None)`. Every other
-/// failure mode (absent HEAD or postings ref, any GET error, a blake3 or
-/// entry-count mismatch, a postings decode error) is a `Ok(None)` degrade, not
-/// a variant here.
+/// A genuinely unparseable object, an isolation breach, or a non-`NotFound`
+/// GET failure on the postings object itself: the only conditions
+/// [`load_covering_postings`] surfaces as an error rather than degrading to
+/// `Ok(None)`. Every other failure mode (absent HEAD or postings ref, a
+/// `NotFound` on the postings object, a blake3 or entry-count mismatch, a
+/// postings decode error) is a `Ok(None)` degrade, not a variant here.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadPostingsError {
     /// The HEAD object is present but does not decode: a real catalog defect,
@@ -90,6 +95,18 @@ pub enum LoadPostingsError {
         key: String,
         expected: String,
         actual: String,
+    },
+    /// The postings object GET failed for a reason other than `NotFound`
+    /// (issue #1964): most commonly a missing IAM read grant on `idx/*`,
+    /// surfaced as `StoreError::AccessDenied`. This disables the whole
+    /// postings tier for the tick, so it is a hard error the scrub tick can
+    /// count and retry, never a silent `Ok(None)` degrade indistinguishable
+    /// from "no postings ref yet".
+    #[error("postings object {key} GET failed: {source}")]
+    Store {
+        key: String,
+        #[source]
+        source: StoreError,
     },
 }
 
@@ -171,10 +188,26 @@ pub async fn load_covering_postings(
     // the declared tenant_hash BEFORE decode (ADR-0050 §2 -- a foreign tenant
     // is a hard error even for an object that would also fail to bind), decode
     // against the covered parts' blake3, then check the entry count. Every
-    // failure short of the tenant-hash breach degrades to Ok(None).
+    // failure short of the tenant-hash breach and a non-NotFound GET error
+    // degrades to Ok(None). `NotFound` means "no postings object at this ref
+    // yet", a normal degrade; any other GET error (issue #1964, most commonly
+    // AccessDenied on a missing idx/* read grant) is a real outage of the
+    // postings tier and must not be swallowed as though nothing was there.
     let data = match store.get(&postings_ref.key, GetRange::Full).await {
         Ok(got) => got.data,
-        Err(_) => return Ok(None),
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(source) => {
+            tracing::warn!(
+                key = %postings_ref.key,
+                error = %source,
+                "covering postings object GET failed for a reason other than \
+                 not-found; disabling the postings tier this tick"
+            );
+            return Err(LoadPostingsError::Store {
+                key: postings_ref.key.clone(),
+                source,
+            });
+        }
     };
     let digest = blake3::hash(&data);
     if digest.as_bytes().as_slice() != postings_ref.blake3.as_slice() {

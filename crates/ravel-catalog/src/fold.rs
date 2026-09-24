@@ -1735,9 +1735,26 @@ impl Catalog {
                                 }
                             }
                         }
-                        Err(err) => {
+                        // `NotFound` cannot actually happen here (the ref
+                        // comes from a HEAD the previous fold just wrote),
+                        // but is handled the same quiet way as any other
+                        // "nothing to reuse" case rather than promoted: only
+                        // a non-NotFound failure (issue #1964, most commonly
+                        // AccessDenied on a missing idx/* read grant) is an
+                        // outage worth an operator's attention, since it
+                        // recurs on every fold and silently turns reuse into
+                        // a permanent full rebuild.
+                        Err(StoreError::NotFound) => {
                             tracing::warn!(
+                                key = %stats_ref.key,
+                                tenant = %tenant.to_hex(),
+                                "previous per-part column-stats object not found; rebuilding every segment's statistics for parts that reuse it"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::error!(
                                 error = %err,
+                                key = %stats_ref.key,
                                 tenant = %tenant.to_hex(),
                                 "previous per-part column-stats object GET failed; rebuilding every segment's statistics for parts that reuse it"
                             );
@@ -2360,9 +2377,14 @@ impl Catalog {
     /// `load_snapshot_postings` applies at query time, plus an
     /// `entry_count` check against `previous_entry_count` -- the ordinal
     /// boundary this fold's merge carries forward, not the post-fold total.
-    /// Any failure (no postings ref, cache/GET miss, hash mismatch, decode
-    /// error, entry_count mismatch) returns `None`, so the caller decodes
-    /// every current entry from scratch instead of merging.
+    /// Any failure (no postings ref, cache miss, a `NotFound` GET, hash
+    /// mismatch, decode error, entry_count mismatch) returns `None`, so the
+    /// caller decodes every current entry from scratch instead of merging.
+    /// A GET failure other than `NotFound` (issue #1964, most commonly
+    /// AccessDenied on a missing idx/* read grant) also returns `None` --
+    /// merging is an optimization, never a correctness gate -- but is logged
+    /// at `error!`, not `warn!`, since it recurs on every fold and silently
+    /// turns postings reuse into a permanent full rebuild.
     async fn load_previous_postings(
         &self,
         tenant: &TenantHash,
@@ -2395,8 +2417,23 @@ impl Catalog {
 
         let got = match self.store().get(&postings_ref.key, GetRange::Full).await {
             Ok(got) => got,
-            Err(err) => {
+            // `NotFound` cannot actually happen here (the ref comes from a
+            // HEAD the previous fold just wrote), but degrades the same
+            // quiet way as any other "nothing to merge from" case; only a
+            // non-NotFound failure (issue #1964, most commonly AccessDenied
+            // on a missing idx/* read grant) is an outage worth an
+            // operator's attention, since it recurs on every fold and
+            // silently turns postings reuse into a permanent full rebuild.
+            Err(StoreError::NotFound) => {
                 tracing::warn!(
+                    key = %postings_ref.key,
+                    tenant = %tenant.to_hex(),
+                    "previous postings not found, rebuilding postings from scratch"
+                );
+                return None;
+            }
+            Err(err) => {
+                tracing::error!(
                     error = %err,
                     key = %postings_ref.key,
                     tenant = %tenant.to_hex(),
