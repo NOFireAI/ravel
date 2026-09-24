@@ -441,7 +441,7 @@ flowchart TB
 
 ## Amendment 2026-08-20: measured outcome of epic #309
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Context" pointer="Amendment 2026-08-20" -->
 
 Epic #309 shipped every decision in this ADR: run-merged L1 with per-sample
 provenance (decision 1, #315), the differential test as the exactness gate
@@ -474,6 +474,10 @@ table):
 The gate pins the ratio at `FRAG_RATIO_MIN = 2.4` (about 20% below the
 measured 2.99, the same margin policy #312 used), for both the
 provenance-free and the provenance-carrying merged shape.
+
+Every 8.88 in this amendment is the incompressible-value bound rather than
+the representative merged cost; Amendment 2026-08-21 below re-measures the
+same fixture on realistic value shapes and gives 2.50 to 3.00.
 
 How the numbers moved, so the next reader does not treat any intermediate as
 current *(issue record for the intermediates)*: this ADR's 42.14 became
@@ -548,7 +552,7 @@ regression until #348 lands.
 
 ## Amendment 2026-08-21: 8.88 is the incompressible-value bound (issue #370)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Amendment 2026-08-20: measured outcome of epic #309" pointer="Amendment 2026-08-21" -->
 
 The 2026-08-20 amendment recorded 8.88 bytes per sample as the shipped merged
 cost. That measurement was correct for the fixture it used and wrong as a
