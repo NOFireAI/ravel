@@ -284,9 +284,9 @@ jobs:
         run: bash scripts/guards/check-doc-figures.test.sh
       - name: Operator-facing figures match the record-cache constants
         run: scripts/guards/check-doc-figures.sh
-      # The store-probe `0` explanation had nine copies and four failed
-      # sweeps behind it (issue #1982). One canonical block, pointers
-      # everywhere else, and this guard refusing the tenth copy. Cases
+      # The store-probe `0` explanation had been copied across the tree,
+      # with four failed sweeps behind it (issue #1982). One canonical
+      # block, pointers everywhere else, and this guard refusing a new copy. Cases
       # first, same reason as every other guard here.
       - name: Claim single-source guard cases (issue #1982)
         run: bash scripts/guards/check-claim-single-source.test.sh
