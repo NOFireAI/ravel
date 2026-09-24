@@ -201,7 +201,6 @@ flowchart LR
      ticket.
 
 ## Amendment: the per-prefix bound is keyed by a request's parent path
-
 <!-- amendment-applies: sections="Decision|Consequences" pointer="parent-path keying amendment" -->
 
 Decision 1 keys the per-prefix bound by the shard-hour commit prefix
