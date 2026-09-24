@@ -2420,7 +2420,10 @@ fn render_store_probe_family(
     write_header(
         out,
         "ravel_store_probe_last_run_timestamp_seconds",
-        "Unix time of the background store probe's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed, and 0 means no probe task was ever spawned in this process. Its age is the probe-liveness signal: unlike ravel_store_reachable and ravel_store_probe_failures_total, which only move while the probe task is alive, this stops advancing the moment the task itself dies.",
+        // claim-allow: store-probe-zero -- this HELP line ships in /metrics
+        // output, where the reader has no link to follow, so it carries a
+        // one-line summary of the three causes rather than a pointer.
+        "Unix time of the background store probe's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed. A reading of 0 has three causes: no probe task in this process, a scrape inside the startup window before the probe is spawned, or a pre-1970 host clock, which a live probe re-stamps as 0 every interval (see the What 0 means section of docs/guides/observability.md). Its age is the probe-liveness signal: unlike ravel_store_reachable and ravel_store_probe_failures_total, which only move while the probe task is alive, this stops advancing the moment the task itself dies.",
         "gauge",
     );
     write_sample_f64(
@@ -7791,10 +7794,10 @@ mod tests {
             body.contains("ravel_store_probe_failures_total{mode=\"all\"} 0"),
             "missing store-probe failure counter:\n{body}"
         );
-        // No probe task was spawned in this process, which is the one state
-        // the liveness gauge's 0 now means (issue #1728): a spawned task
-        // stamps it before its first sleep, so a real process only reads 0
-        // here when it runs no probe at all.
+        // This renderer runs no probe, so the liveness gauge reads its
+        // unstamped 0 (issue #1728). For the causes a 0 reading has in a real
+        // process, see the "What `0` means" section of
+        // docs/guides/observability.md.
         assert!(
             body.contains("ravel_store_probe_last_run_timestamp_seconds{mode=\"all\"} 0"),
             "missing store-probe last-run gauge:\n{body}"

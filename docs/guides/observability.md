@@ -766,7 +766,7 @@ probe (`store_probe::spawn`).
 |---|---|
 | `ravel_store_reachable` | Gauge. 1 when the probe reports the store reachable, 0 after K consecutive failed probes. |
 | `ravel_store_probe_failures_total` | Every failed probe cycle, monotonic, incremented even below the readiness threshold. |
-| `ravel_store_probe_last_run_timestamp_seconds` | Gauge. Unix time of the probe task's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed. `0` means only that no probe task was ever spawned in this process. |
+| `ravel_store_probe_last_run_timestamp_seconds` | Gauge. Unix time of the probe task's last completed cycle or of its spawn, whichever is later; a cycle stamps it whether it succeeded or failed. A reading of `0` has three causes: see [What `0` means](#what-0-means) below. |
 
 The first two gauges are written only while the probe task is running: the
 task is a single `tokio::spawn` with no restart path and no
@@ -779,8 +779,8 @@ advances this gauge every `--store-probe-interval`.
 
 Alert on `time() - ravel_store_probe_last_run_timestamp_seconds > 132`,
 for: 5m. One rule covers every case; there is no second term and no companion
-rule, because the gauge carries no ambiguous value (see "What `0` means"
-below). `132` is `K * interval * 1.1`: the probe's default interval
+rule, for the reasons [What `0` means](#what-0-means) below gives.
+`132` is `K * interval * 1.1`: the probe's default interval
 (`store_probe::DEFAULT_STORE_PROBE_INTERVAL`) is 30s, `store_probe::spawn`
 sleeps a jittered interval (`fold::jittered`) that adds up to 10%, and
 `store_probe::K` is 4, so `4 * 30 * 1.1 = 132`.
@@ -837,38 +837,67 @@ to avoid.
 
 #### What `0` means
 
-`store_probe::spawn` stamps the gauge synchronously, from the injected clock,
-before the task's first (jittered) sleep. So the gauge holds a real timestamp
-from the instant a probe task exists, and `0` means exactly one thing: no
-probe task was ever spawned in this process.
+<!-- claim:store-probe-zero:canonical-begin -->
+This section is the single source for what a `0` on
+`ravel_store_probe_last_run_timestamp_seconds` means. Every other place in this
+repository that touches the question points here rather than restating it, and
+`scripts/guards/check-claim-single-source.sh` fails the build on a restatement
+that is not a pointer. The one deliberate exception is the gauge's own `HELP`
+line in `/metrics` output, where the reader has no link to follow, so it
+carries a one-line summary of the three causes below.
 
-That single meaning is what lets one rule cover every dead-probe state:
+A reading of `0` has three causes. They do not behave alike, and only the first
+two are about the probe task at all.
 
-- A probe that stops completing cycles (the task died, panicked, or its
-  channel was dropped) leaves an ageing timestamp, which crosses `132` and
-  holds past `for: 5m` like any other stoppage. That includes a task that
-  died before its first cycle ever completed: it still carries its spawn
-  stamp, so it ages out on the same clock as one that ran for a week first.
-- A process that never spawned a probe at all leaves `0`, and `time() - 0`
-  is roughly the current Unix time, far over the threshold, so the same
-  expression fires on it too.
+**Cause 1: no probe task in this process.** `store_probe::spawn` was not called
+here, so nothing stamped the gauge. `time() - 0` is roughly the current Unix
+time, far over the `132` threshold, so `RavelStoreProbeStalled` goes true
+immediately and holds past `for: 5m`. That is the alert firing correctly: a
+process exporting this family with no probe behind it has no reachability
+signal at all, and the single staleness comparison covers it with no second
+term.
 
-The startup window needs no special case for the same reason the steady state
-does not. The spawn stamp and the first completed cycle are at most
-`interval * 1.1 + 200s = 233s` apart, which is the same worst-case gap derived
-above for any two live completions, so on a healthy start the comparison can
-be true for at most `233 - 132 = 101s` before that first cycle re-stamps the
-gauge, well inside `for: 5m`.
+**Cause 2: the startup window.** `/metrics` begins serving as soon as the HTTP
+task is spawned, and `store_probe::spawn` runs later in the same startup path,
+after the gRPC and mTLS listeners bind and after the blocking initial JWKS
+fetch. A scrape that lands in between reads `0` from a process that is starting
+normally. The window is bounded and clears on its own the moment
+`store_probe::spawn` stamps the gauge, well inside `for: 5m`, so it does not
+page.
+
+**Cause 3: a pre-1970 host clock.** `stamp_last_run` stores `clock.now_ns()`
+unconditionally, and `SystemClock::now_ns` returns `0` through its
+`unwrap_or(0)` when `SystemTime::now().duration_since(UNIX_EPOCH)` fails, which
+is what a host clock set earlier than the Unix epoch produces. A probe task
+that is alive and completing cycles then re-stamps `0` on every interval. This
+one does not clear on its own and it does page, until the host clock is
+corrected. It is a true positive about the host and a false one about the
+probe: the alert's description points at a dead task, and under this cause the
+task is running normally. Check the host clock before going to look for a probe
+that is not missing.
+<!-- claim:store-probe-zero:canonical-end -->
+
+Causes 1 and 2 are why the rule is a single bare staleness comparison. A probe
+that stops completing cycles (the task died, panicked, or its channel was
+dropped) leaves an ageing timestamp, which crosses `132` and holds past
+`for: 5m` like any other stoppage, including a task that stopped before its
+first cycle ever completed: `store_probe::spawn` stamps the gauge
+synchronously from the injected clock before the task's first (jittered) sleep,
+so such a task ages out on the same clock as one that ran for a week first.
+That spawn stamp also bounds cause 2: it and the first completed cycle are at
+most `interval * 1.1 + 200s = 233s` apart, the same worst-case gap derived
+above for any two live completions, so on a healthy start the comparison can be
+true for at most `233 - 132 = 101s` before that first cycle re-stamps the gauge.
 
 The earlier shape of this alert paid for that coverage twice: an `and
 ravel_store_probe_last_run_timestamp_seconds > 0` term to keep the bare
-comparison from firing on the sentinel at every process start, plus a
-companion rule on the sentinel itself, whose `for:` window was derived
-entirely from the *default* 30s interval. Because `--store-probe-interval` is
-an unbounded flag, a fleet running `--store-probe-interval 5m` held the
-sentinel for the whole first interval after every restart, and that companion
-rule paged CRITICAL on a healthy process on every rollout. Stamping at spawn
-removes the ambiguity at its source instead of encoding it in YAML.
+comparison quiet at every process start, plus a companion rule on the zero
+reading itself, whose `for:` window was derived entirely from the *default* 30s
+interval. Because `--store-probe-interval` is an unbounded flag, a fleet
+running `--store-probe-interval 5m` read zero for the whole first interval
+after every restart, and that companion rule paged CRITICAL on a healthy
+process on every rollout. Stamping at spawn narrows the window to the startup
+path itself instead of encoding it in YAML.
 
 `132` scales with `--store-probe-interval`, which is a flag
 (`ServerConfig::store_probe_interval`, parsed by `parse_store_probe_interval`
@@ -888,8 +917,8 @@ series is absent rather than `0`, and alerting with `absent(...)` the way
 specifically so a metrics-only monitoring setup with nothing reading
 `/readyz` still sees a store outage or a dead probe task; suppressing the
 sample would reverse that documented decision, and it would buy nothing the
-spawn stamp does not already buy, since `time() - 0` fires on the
-never-spawned state under the one expression the rule already carries.
+spawn stamp does not already buy, since `time() - 0` already fires under the
+one expression the rule carries (cause 1 above).
 
 #### The store-probe liveness alert
 
@@ -912,13 +941,14 @@ groups:
         # RavelStoreUnreachable well inside this window, so this rule is the
         # complement, not a duplicate.
         #
-        # One rule covers every dead-probe state, because the gauge carries no
-        # ambiguous sentinel: store_probe::spawn stamps it synchronously
-        # before the loop's first sleep, so a task that dies, panics, or is
-        # never reached by its first cycle leaves an AGEING timestamp that
-        # crosses this threshold like any other stoppage, and a process that
-        # never spawned a probe at all leaves 0, which makes time() - 0
-        # roughly the current Unix time and fires here too.
+        # One rule covers every dead-probe state: store_probe::spawn stamps
+        # the gauge synchronously before the loop's first sleep, so a task
+        # that dies, panics, or is never reached by its first cycle leaves an
+        # AGEING timestamp that crosses this threshold like any other
+        # stoppage, and time() - 0 is roughly the current Unix time, so a
+        # zero reading fires here too. What a 0 reading means is documented
+        # in one place: the "What 0 means" section of
+        # docs/guides/observability.md.
         #
         # 132 = K * interval * 1.1 at the defaults (K = 4, interval = 30s,
         # fold::jittered adds up to 10%). Both terms scale with
