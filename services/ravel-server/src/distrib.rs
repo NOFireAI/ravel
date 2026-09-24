@@ -1274,10 +1274,12 @@ impl AttemptSpend {
     /// into, so the accounting rides on the error itself as
     /// [`DistribError::Spent`] and the coordinator folds it before it maps the
     /// error (issue #1723); that is the path a byte-cap refusal, a decode fault
-    /// and a failed local fallback all take, and it is where a slice has
-    /// usually spent the most. The `FetchStats` page counters do not survive
-    /// the `Err` arm: the coordinator returns no stats for a query that fails,
-    /// so they would have no reader.
+    /// and a failed local fallback all take. What travels on that arm is
+    /// `self`, the spend of the attempts already abandoned; the failing attempt
+    /// adds its own only if its terminal summary was decoded first, which a
+    /// decode-cap refusal never manages. The `FetchStats` page counters do not
+    /// survive the `Err` arm: the coordinator returns no stats for a query that
+    /// fails, so they would have no reader.
     fn fold_into(
         &self,
         result: Result<SliceResponse, DistribError>,
@@ -1633,12 +1635,14 @@ impl RoutingSliceFetcher {
             // with a retry or a local fallback (ADR-0071 deliverable 3).
             //
             // Terminal does not mean free (issue #1723). This arm ends the
-            // slice, so whatever the stream salvaged before it broke has no
-            // later attempt to ride on and must ride on the error. A byte-cap
-            // refusal reaches here having read a whole slice's worth of
-            // segments; `salvaged` is that summary's spend, and it is `None`
-            // for a stream that broke before its summary, where the wrap is a
-            // no-op.
+            // slice, so a terminal summary decoded before the fault has no
+            // later attempt to ride on and must ride on the error. `salvaged`
+            // is that summary's spend. It is `None` for every attempt that
+            // ended before its summary was decoded, where the wrap is a no-op,
+            // and that includes both decode-cap refusals: a worker streams its
+            // summary last and `push` checks the caps before it stores a
+            // frame, so a refusal here reports none of what it made the worker
+            // pay.
             Err(other) => Attempt::Keep(Box::new(Err(match salvaged {
                 Some(spend) => other.with_spend(&spend.accounting),
                 None => other,
@@ -1747,7 +1751,19 @@ impl RoutingSliceFetcher {
         };
         wire_bytes.fetch_add(decoder.bytes_consumed(), Ordering::Relaxed);
         match outcome {
-            Ok(()) => decoder.finish(),
+            // A stream can close cleanly and still fail to finish: a summary
+            // carrying no status, or a status code only a newer worker emits.
+            // That summary already said what the attempt spent and this arm
+            // ends the slice, so its spend is salvaged here too (issue #1723).
+            // Reading it before `finish` consumes the decoder costs one
+            // snapshot decode on the success path.
+            Ok(()) => {
+                let reported = decoder.summary_spend();
+                decoder.finish().inspect_err(|_| {
+                    *salvaged =
+                        reported.map(|(accounting, stats)| AttemptSpend { accounting, stats });
+                })
+            }
             Err(err) => {
                 *salvaged = decoder
                     .summary_spend()
@@ -4994,7 +5010,27 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 })),
             }
         }
+
+        /// The same terminal summary, carrying a status code this build does
+        /// not know: what a worker from a newer version sends. The decoder
+        /// accepts the frame (and its accounting) and `finish` refuses it
+        /// afterwards, which is the shape issue #1723's `finish` salvage
+        /// exists for.
+        fn summary_with_raw_status(&self, raw_code: i32) -> pb::FetchResponse {
+            let mut frame = self.summary(pb::status::Code::Ok);
+            if let Some(pb::fetch_response::Frame::Summary(summary)) = frame.frame.as_mut()
+                && let Some(status) = summary.status.as_mut()
+            {
+                status.code = raw_code;
+            }
+            frame
+        }
     }
+
+    /// A `Status.code` past the highest this build's proto defines
+    /// (`INTERNAL = 8`), so `codec::decode_status_code` refuses it as
+    /// `UnknownStatusCode`.
+    const UNKNOWN_STATUS_CODE: i32 = 9;
 
     /// How a scripted worker ends one attempt: the three ways a re-dispatchable
     /// attempt reaches `try_remote`, and the three that end it terminally.
@@ -5018,6 +5054,11 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         /// summary, with enough of them to pass a lowered byte cap before the
         /// summary is reached: a refusal that knows nothing about the spend.
         FloodThenSummary,
+        /// A terminal summary whose status code this build does not know, then
+        /// a clean close. The stream never breaks, so the fault surfaces out of
+        /// `SliceStreamDecoder::finish` rather than out of `push`, after the
+        /// summary's accounting was already accepted.
+        UnknownStatusSummary,
     }
 
     /// The per-slice wire cap the two scripted flood endings are refused under,
@@ -5062,6 +5103,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 }
                 Ending::SummaryThenFlood => std::iter::once(summary()).chain(flood()).collect(),
                 Ending::FloodThenSummary => flood().chain(std::iter::once(summary())).collect(),
+                Ending::UnknownStatusSummary => {
+                    vec![Ok(self.spend.summary_with_raw_status(UNKNOWN_STATUS_CODE))]
+                }
             };
             Ok(tonic::Response::new(Box::pin(futures::stream::iter(items))))
         }
@@ -5169,8 +5213,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// so the line this pins is the `carried.fold_into(..)` around
     /// `self.local.run_local(request)` at the end of `dispatch`. Reverting it to
     /// return `run_local`'s result unfolded reports the local attempt's spend
-    /// alone, and the request sum fails 1 against the expected 9. The
-    /// re-dispatch fold is a different line and a different test
+    /// alone: the request assertion then reads `local` against the expected
+    /// `local + A + B`. The re-dispatch fold is a different line and a
+    /// different test
     /// (`redispatch_success_folds_the_abandoned_primarys_spend`).
     #[tokio::test]
     async fn three_attempt_slice_records_the_sum_of_every_attempt() {
@@ -5270,7 +5315,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// `Unavailable` arm goes back to carrying nothing, which is what
     /// discarding that response whole, result and cost together, amounts to.
     /// Either way the local fallback answers with its own spend and the request
-    /// sum here fails 1 against the expected 4.
+    /// assertion reads `local` against the expected `local + REMOTE`.
     #[tokio::test]
     async fn unavailable_summary_retry_folds_the_abandoned_attempts_spend() {
         const REMOTE: Spend = Spend {
@@ -5318,8 +5363,10 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// `try_remote`'s transport arm stops reading it
     /// (`salvaged.unwrap_or_default()` back to `AttemptSpend::default()`), and
     /// when the local fallback's `carried.fold_into(..)` is reverted: any of the
-    /// three turns a transport error into a free attempt, and the byte sum here
-    /// fails 316 against the expected 4412. The no-summary half passes before
+    /// three turns a transport error into a free attempt, and the byte
+    /// assertion reads `local` against the expected `local + REMOTE`, the
+    /// figure the second half pins as the no-summary case. The no-summary half
+    /// passes before
     /// and after: it pins the deliberate under-report, so a later change that
     /// starts inventing a figure there fails here.
     #[tokio::test]
@@ -5398,8 +5445,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     ///
     /// Mutation proof: RED when the successful re-dispatch returns
     /// `(*result, next.clone(), false)` instead of folding `carried` into it.
-    /// The slice then reports only what the worker that answered spent (5
-    /// requests against the expected 8) and the primary's attempt is free.
+    /// The slice then reports only what the worker that answered spent
+    /// (`ANSWERED` against the expected `LOST + ANSWERED`) and the primary's
+    /// attempt is free.
     #[tokio::test]
     async fn redispatch_success_folds_the_abandoned_primarys_spend() {
         const LOST: Spend = Spend {
@@ -5541,13 +5589,15 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
 
     /// The byte-cap refusal as a slice's final attempt, in both wire orders.
     ///
-    /// A refusal is where a slice has usually spent the most: the coordinator
-    /// declines to HOLD what the worker already read. When the summary landed
-    /// before the cap tripped, the refusal reports that figure exactly; when
-    /// the frames came first, which is the order a real worker streams in,
-    /// nothing was decoded to report and the refusal carries no spend rather
-    /// than a guess. Both halves keep the typed 422 class, which is what
-    /// `cap_refusal_error` matches on.
+    /// What a refusal reports is decided by whether the attempt's terminal
+    /// summary was decoded before the cap tripped, not by what the worker
+    /// really read. With the summary first the refusal reports that figure
+    /// exactly; with the frames first, which is the order a real worker streams
+    /// in, nothing was decoded and the refusal carries no spend rather than a
+    /// guess. The second half is therefore the shape every production refusal
+    /// takes: the coordinator declines to hold a result the worker did pay for,
+    /// and reports none of that attempt's own cost. Both halves keep the typed
+    /// 422 class, which is what `cap_refusal_error` matches on.
     ///
     /// Mutation proof: the first half is RED when `try_remote`'s terminal arm
     /// stops reading `salvaged`, the same line as
@@ -5620,6 +5670,228 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         assert!(
             err.spend().is_none(),
             "a refusal before any summary cannot observe the worker's spend"
+        );
+    }
+
+    /// The two attempts of a slice that ends refused, each with its own spend:
+    /// the primary reports `Unavailable` after spending, and the re-dispatch
+    /// target is refused by the coordinator's byte cap after its summary
+    /// landed. The error the slice ends with must carry BOTH figures, summed.
+    ///
+    /// No local attempt runs (the refusal is terminal), so both sides of the
+    /// sum are exact constants and each counter is asserted against
+    /// `PRIMARY + REFUSED`.
+    ///
+    /// Mutation proof, two lines, one revert each:
+    ///
+    /// * `AttemptSpend::fold_into`'s `.map_err(|err| err.with_spend(&carried))`
+    ///   reverted to returning `result` unchanged on the `Err` arm. The carried
+    ///   primary is then dropped and the error reports `REFUSED` alone.
+    /// * `DistribError::with_spend`'s `DistribError::Spent { .. }` arm removed,
+    ///   so an already-carrying error is wrapped a second time instead of
+    ///   merged. `spend()` then reads the outer wrapper only and reports
+    ///   `PRIMARY` alone, with `REFUSED` buried under it.
+    #[tokio::test]
+    async fn a_refused_redispatch_carries_the_primarys_spend_and_its_own() {
+        const PRIMARY: Spend = Spend {
+            get_requests: 3,
+            get_bytes: 4_096,
+            raw_f64_pages: 2,
+            raw_f64_bytes: 16_384,
+        };
+        const REFUSED: Spend = Spend {
+            get_requests: 5,
+            get_bytes: 8_192,
+            raw_f64_pages: 7,
+            raw_f64_bytes: 57_344,
+        };
+        // The two attempts must differ per counter, or a sum cannot be told
+        // from one attempt's share reported twice.
+        const {
+            assert!(PRIMARY.get_requests != REFUSED.get_requests);
+            assert!(PRIMARY.get_bytes != REFUSED.get_bytes);
+        };
+
+        let (store, now, request, _local_only) =
+            one_slice_corpus("refused-redispatch-tenant").await;
+        let (endpoint_a, tries_a, _keep_a) =
+            spawn_scripted(PRIMARY, pb::status::Code::Unavailable, Ending::Summary).await;
+        let (endpoint_b, tries_b, _keep_b) =
+            spawn_scripted(REFUSED, pb::status::Code::Ok, Ending::SummaryThenFlood).await;
+
+        let fetcher = coordinator_over(store, now).with_max_slice_bytes(CAP_UNDER_TEST);
+        let wire_bytes = AtomicU64::new(0);
+        let (result, named, fell_back) = fetcher
+            .dispatch(
+                vec![Owner::Remote(endpoint_a), Owner::Remote(endpoint_b.clone())],
+                request,
+                &wire_bytes,
+            )
+            .await;
+        let err = result.expect_err("the re-dispatched slice is refused by the byte cap");
+
+        assert_eq!(
+            tries_a.load(Ordering::Relaxed),
+            1,
+            "primary dispatched once"
+        );
+        assert_eq!(
+            tries_b.load(Ordering::Relaxed),
+            1,
+            "re-dispatched to the next owner once"
+        );
+        assert!(
+            !fell_back,
+            "a refusal is terminal, so no coordinator-local attempt ran"
+        );
+        assert_eq!(
+            named, endpoint_b,
+            "the stats entry names the worker that was refused"
+        );
+        assert!(
+            matches!(
+                err.unspent(),
+                DistribError::Codec(codec::CodecError::SliceByteCapExceeded { .. })
+            ),
+            "one merged wrapper, with the typed refusal still underneath it: \
+             {err:?}"
+        );
+
+        let spend = err.spend().expect("the failed slice reports what it paid");
+        assert_eq!(
+            spend.total_s3_requests(),
+            PRIMARY.get_requests + REFUSED.get_requests,
+            "both attempts' requests, summed (primary {} + refused {})",
+            PRIMARY.get_requests,
+            REFUSED.get_requests
+        );
+        assert_eq!(
+            spend.total_s3_bytes(),
+            PRIMARY.get_bytes + REFUSED.get_bytes,
+            "both attempts' bytes, summed (primary {} + refused {})",
+            PRIMARY.get_bytes,
+            REFUSED.get_bytes
+        );
+    }
+
+    /// A stream that closes cleanly and still fails to finish: the summary
+    /// decodes, carrying its accounting, and its status code is one this build
+    /// does not know (what a newer worker sends).
+    ///
+    /// The fault surfaces out of `SliceStreamDecoder::finish`, not out of
+    /// `push`, so it takes the one path in `remote_fetch` where the decoder is
+    /// not consulted for a salvage. The attempt is terminal, so that summary's
+    /// spend has no later attempt to ride on and must reach accounting on the
+    /// error.
+    ///
+    /// Mutation proof: RED when `remote_fetch`'s `Ok(())` arm goes back to a
+    /// bare `decoder.finish()`. `salvaged` is then never set on this path, the
+    /// error carries no spend at all, and `spend()` is `None`.
+    #[tokio::test]
+    async fn an_unknown_status_summary_carries_what_that_attempt_paid() {
+        const PAID: Spend = Spend {
+            get_requests: 4,
+            get_bytes: 12_288,
+            raw_f64_pages: 3,
+            raw_f64_bytes: 24_576,
+        };
+
+        let (store, now, request, _local_only) = one_slice_corpus("unknown-status-tenant").await;
+        let (endpoint, tries, _keep) =
+            spawn_scripted(PAID, pb::status::Code::Ok, Ending::UnknownStatusSummary).await;
+
+        let fetcher = coordinator_over(store, now);
+        let wire_bytes = AtomicU64::new(0);
+        let (result, named, fell_back) = fetcher
+            .dispatch(vec![Owner::Remote(endpoint.clone())], request, &wire_bytes)
+            .await;
+        let err = result.expect_err("an unknown status code ends the slice typed");
+
+        assert_eq!(
+            tries.load(Ordering::Relaxed),
+            1,
+            "a decode fault is not re-dispatched"
+        );
+        assert!(
+            !fell_back,
+            "and does not fall back to the coordinator either"
+        );
+        assert_eq!(named, endpoint);
+        assert!(
+            matches!(
+                err.unspent(),
+                DistribError::Codec(codec::CodecError::UnknownStatusCode(UNKNOWN_STATUS_CODE))
+            ),
+            "the spend wrapper keeps the typed class underneath it: {err:?}"
+        );
+
+        let spend = err
+            .spend()
+            .expect("the summary said what the attempt paid before finish refused it");
+        assert_eq!(spend.total_s3_requests(), PAID.get_requests);
+        assert_eq!(spend.total_s3_bytes(), PAID.get_bytes);
+    }
+
+    /// A failed slice's `fragments[]` entry reports the spend its error
+    /// carried, not a flat zero (issue #1723).
+    ///
+    /// This drives `RoutingSliceFetcher::fetch` rather than `dispatch`, because
+    /// `record_fragment_stat` sits in `fetch`: the live worker set holds one
+    /// scripted worker, and with no self id set the slice routes to it. That
+    /// worker sends its summary and then a frame the decoder refuses, so the
+    /// slice ends in a terminal error carrying `PAID`.
+    ///
+    /// Mutation proof: RED when `record_fragment_stat`'s `Err` arm goes back to
+    /// reporting `0` instead of `err.spend().map_or(0, ..)`.
+    #[tokio::test]
+    async fn a_failed_slices_fragment_entry_reports_the_spend_it_carried() {
+        const PAID: Spend = Spend {
+            get_requests: 4,
+            get_bytes: 12_288,
+            raw_f64_pages: 3,
+            raw_f64_bytes: 24_576,
+        };
+
+        let (store, now, request, _local_only) =
+            one_slice_corpus("fragment-stat-error-tenant").await;
+        let (endpoint, _tries, _keep) =
+            spawn_scripted(PAID, pb::status::Code::Ok, Ending::SummaryThenEmptyFrame).await;
+
+        // One live worker and no self id: every slice ranks that worker top, so
+        // `fetch` dispatches to it rather than running local.
+        let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+            process_id: uuid::Uuid::from_u128(7).to_string(),
+            fragment_endpoint: endpoint.clone(),
+            flight_sql_endpoint: endpoint.clone(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        }])));
+        let fetcher = RoutingSliceFetcher::new(
+            Arc::new(OnceLock::new()),
+            live,
+            test_keys(),
+            pinned_service(store, now),
+            Arc::new(FragmentMetrics::new()),
+        );
+
+        let sink = FragmentStatsSink::new();
+        with_fragment_stats(sink.clone(), async {
+            let err = fetcher
+                .fetch(request)
+                .await
+                .expect_err("an empty frame ends the slice typed");
+            assert!(matches!(err.unspent(), DistribError::EmptyFrame), "{err:?}");
+        })
+        .await;
+
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "one slice, one entry: {recorded:?}");
+        let entry = &recorded[0];
+        assert_eq!(entry.status, "error");
+        assert_eq!(entry.worker_endpoint, endpoint);
+        assert_eq!(
+            entry.bytes_reported, PAID.get_bytes,
+            "a failed fragment reports the bytes its error carried"
         );
     }
 }

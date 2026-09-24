@@ -4996,11 +4996,18 @@ fn failed_slice_error_spend_reaches_the_live_handle_on_every_signal() {
     });
 }
 
-/// The failing case with the most spend behind it: the coordinator's own
-/// decode byte cap refuses a slice the worker had already read in full. The
-/// refusal keeps its typed 422 class with both counts intact (issue #1687 part
-/// B) AND reports what the refused attempt cost (issue #1723); the two must not
-/// be traded against each other.
+/// A byte-cap refusal that reaches the coordinator carrying spend keeps its
+/// typed 422 class with both counts intact (issue #1687 part B) AND still
+/// reports that spend (issue #1723); the two must not be traded against each
+/// other.
+///
+/// The spend on such an error is what EARLIER abandoned attempts of the same
+/// slice carried, which is what `AttemptSpend::fold_into` attaches. A refusal
+/// reports none of its own: `SliceStreamDecoder::push` checks the cap before it
+/// stores a frame and a worker streams its summary last, so nothing of that
+/// attempt's accounting is decoded by the time the cap trips. The double here
+/// fabricates the carried figure directly, so this test pins the coordinator's
+/// fold and its classification, not the decoder's timing.
 ///
 /// Mutation proof: RED against either line. Restoring `mod.rs`'s
 /// `let response = result.map_err(distrib_error)?;` leaves the live handle at 0
@@ -5045,8 +5052,9 @@ fn byte_cap_refusal_keeps_its_422_and_reports_what_it_paid() {
         assert_eq!(
             folded.total_s3_bytes(),
             SPENT_BYTES,
-            "the refused attempt's bytes are on the live handle: the worker \
-             read them before the coordinator declined to hold the result"
+            "the bytes carried onto the refusal are on the live handle: the \
+             store served them for this slice before the coordinator declined \
+             to hold the result"
         );
         assert_eq!(folded.total_s3_requests(), SPENT_REQUESTS);
     });

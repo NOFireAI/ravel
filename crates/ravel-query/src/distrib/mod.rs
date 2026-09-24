@@ -829,13 +829,19 @@ fn fold_slice(
 /// and maps the error (issue #1723).
 ///
 /// A slice that fails after the store served it is the case the fold arms above
-/// cannot reach: there is no response, only a [`DistribError`], and every
-/// attempt's cost rides on the error's [`DistribError::Spent`] wrapper. Folding
-/// it here, before the error leaves the loop, is what makes the metrics, logs
-/// and spans a failed query reports the cost the store really charged. A slice
-/// refused by the coordinator's byte cap is the case with the most spend on it:
-/// the worker read everything it was asked for before the coordinator declined
-/// to hold it.
+/// cannot reach: there is no response, only a [`DistribError`], and the cost
+/// rides on the error's [`DistribError::Spent`] wrapper. Folding it here, before
+/// the error leaves the loop, is what makes the metrics, logs and spans a failed
+/// query reports the cost the store really charged.
+///
+/// What rides there is the spend of the attempts ALREADY ABANDONED, not the
+/// spend of the attempt that failed last. An attempt reports its own cost only
+/// once its terminal summary is decoded, and a worker streams that summary last,
+/// while [`SliceStreamDecoder::push`] checks both decode caps before it stores a
+/// frame: so a coordinator byte-cap or frame-cap refusal, and any decode fault
+/// before the summary, carry none of what that attempt made the store serve.
+/// Closing that is a wire change (accounting ahead of the frames), not a
+/// coordinator-side one.
 ///
 /// The running snapshot is deliberately not updated: the caller returns
 /// immediately, so nothing reads it again.
