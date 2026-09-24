@@ -541,7 +541,7 @@ async fn main() -> anyhow::Result<()> {
         process_memory_budget_is_fallback: performance.sources.memory_budget_bytes
             == ravel_server::config::PERF_SOURCE_FALLBACK,
         cache_dir: cli.cache_dir.clone(),
-        catalog_resolve_concurrency: cli.catalog_resolve_concurrency,
+        catalog_resolve_concurrency: Some(performance.catalog_resolve_concurrency),
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,
@@ -665,6 +665,45 @@ mod tests {
              allocation: the process is not running under the jemalloc global allocator"
         );
         std::hint::black_box(big);
+    }
+
+    /// ADR-1733 decision 2 reachability: the one production `ServerConfig`
+    /// (the literal above, which `start` hands to `query::build_catalog`) must
+    /// take the catalog resolve ceiling from the RESOLVED performance
+    /// defaults, not from the raw flag. The two differ exactly where it
+    /// matters: unset, the raw flag is `None`, which leaves
+    /// `CatalogConfig`'s compiled-in per-prefix constant as the process
+    /// ceiling and is the behaviour this ADR replaces.
+    ///
+    /// Asserted over this file's own source. The value is assembled inside
+    /// `main`'s single 90-line struct literal, which cannot be called from a
+    /// test, and the field's type (`Option<usize>`) accepts the reverted
+    /// spelling just as well, so no type or runtime check can tell the two
+    /// apart. What the claim is about is which expression that field is
+    /// assigned, and that is exact. The needles are assembled with `concat!`
+    /// so this test's own source cannot match itself.
+    #[test]
+    fn server_config_takes_the_resolved_catalog_resolve_ceiling() {
+        const SRC: &str = include_str!("main.rs");
+        let resolved = concat!(
+            "catalog_resolve_concurrency: ",
+            "Some(performance.catalog_resolve_concurrency),"
+        );
+        let raw_flag = concat!(
+            "catalog_resolve_concurrency: ",
+            "cli.catalog_resolve_concurrency"
+        );
+        assert_eq!(
+            SRC.matches(resolved).count(),
+            1,
+            "the ServerConfig literal must assign the resolved ceiling exactly once"
+        );
+        assert_eq!(
+            SRC.matches(raw_flag).count(),
+            0,
+            "the raw --catalog-resolve-concurrency flag must not reach ServerConfig: unset it \
+             is None, which leaves the catalog's own per-prefix constant as the process ceiling"
+        );
     }
 
     /// the modes that build a query engine (and therefore spawn the alert

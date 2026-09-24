@@ -108,9 +108,15 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// catalog RAM tier already share. `--disable-cache` (the `0` sentinel) wins
 /// over a configured `cache_dir`: no cache of either tier is built.
 ///
-/// `resolve_get_concurrency` is the CLI's `--catalog-resolve-concurrency`.
-/// `None` leaves `ravel_catalog::CatalogConfig`'s own default in place;
-/// `Some(n)` overrides it for this catalog instance.
+/// `resolve_ceiling` is the per-process ceiling on resolve-path object-store
+/// requests (ADR-1733 decision 2). It is a resolved value, not a raw flag:
+/// `ravel-server` derives it from the process's query concurrency and passes
+/// the derived number here, and an explicit `--catalog-resolve-concurrency`
+/// reaches this parameter only because it won that resolution. `None` leaves
+/// `ravel_catalog::CatalogConfig`'s own default in place, which is the
+/// per-prefix bound, and is the path callers with no query concurrency to
+/// derive from take. The per-prefix bound is not exposed here: it has no flag,
+/// and a request holds a permit of each.
 ///
 /// `max_ingest_lag_ns` is the catalog listing window (ADR-0051 section 4), from
 /// `--max-ingest-lag`. `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)`
@@ -163,7 +169,7 @@ pub fn build_catalog(
     disable_cache: bool,
     cache_max_bytes: u64,
     cache_dir: Option<PathBuf>,
-    resolve_get_concurrency: Option<usize>,
+    resolve_ceiling: Option<usize>,
     max_ingest_lag_ns: Option<i64>,
     max_flush_delay: Duration,
 ) -> anyhow::Result<Arc<Catalog>> {
@@ -195,10 +201,14 @@ pub fn build_catalog(
     if let Some(ns) = max_ingest_lag_ns {
         catalog_config.max_ingest_lag_ns = ns;
     }
-    // `None` leaves ravel-catalog's own default (currently 128) as the sole
-    // source of truth; only override when the CLI passed an explicit value.
-    if let Some(concurrency) = resolve_get_concurrency {
-        catalog_config.resolve_get_concurrency = concurrency;
+    // The per-process ceiling on resolve-path object-store requests (ADR-1733
+    // decision 2). `ravel-server` derives it from the process's query
+    // concurrency and passes it here, so the production catalog never runs on
+    // the constant; `None` leaves `CatalogConfig`'s own default, which is the
+    // per-prefix bound, and is the path CLI, bench and test callers that know
+    // no `Q` take.
+    if let Some(ceiling) = resolve_ceiling {
+        catalog_config.resolve_get_concurrency = ceiling;
     }
     // Durable shard_count enforcement on the read path (ADR-0050 section 5,
     // EC5): the first resolve for each (tenant, signal) validates this
@@ -769,6 +779,62 @@ mod catalog_cache_tests {
             catalog.config().cache_capacity_per_tenant,
             expected,
             "build_catalog must pass the derived capacity through, not the flat constant"
+        );
+    }
+
+    /// ADR-1733 decision 2: `build_catalog` takes the derived per-process
+    /// ceiling as its input rather than the constant, so the ceiling the
+    /// catalog enforces is the number the caller resolved. `None` still means
+    /// "no ceiling was resolved" and leaves `CatalogConfig`'s own default,
+    /// which is the per-prefix bound.
+    #[test]
+    fn build_catalog_applies_the_passed_resolve_ceiling() {
+        let derived = crate::config::derive_catalog_resolve_concurrency(4);
+        assert_eq!(
+            derived, 512,
+            "sanity: four concurrent queries derive 4 * 128 = 512"
+        );
+        assert_ne!(
+            derived,
+            ravel_catalog::DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
+            "sanity: the derived ceiling must differ from the per-prefix default, or this test \
+             passes on a call site that ignores its argument"
+        );
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store,
+            4,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            Some(derived),
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog builds");
+        assert_eq!(
+            catalog.config().resolve_get_concurrency,
+            derived,
+            "build_catalog must apply the ceiling it was passed"
+        );
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let unset = build_catalog(
+            store,
+            4,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog builds");
+        assert_eq!(
+            unset.config().resolve_get_concurrency,
+            ravel_catalog::DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
+            "an unresolved ceiling leaves CatalogConfig's own default in place"
         );
     }
 

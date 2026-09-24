@@ -639,11 +639,14 @@ pub struct ServerConfig {
     /// share one directory and no separate disk-capacity flag, not one number.
     /// `None` keeps the RAM-only path, byte-for-byte today's behavior.
     pub cache_dir: Option<std::path::PathBuf>,
-    /// `--catalog-resolve-concurrency`: the number of in-flight object-store
-    /// requests `Catalog::resolve_impl` keeps in flight at once, from
-    /// `Cli::catalog_resolve_concurrency`. `None` when the flag is unset,
-    /// which leaves `ravel_catalog::CatalogConfig`'s own default (currently
-    /// 128) in place; [`start`] passes this straight through to
+    /// The RESOLVED per-process ceiling on in-flight resolve-path
+    /// object-store requests (ADR-1733 decision 2), not the raw flag:
+    /// `main` fills it from `ResolvedPerformanceDefaults`, which is either
+    /// `--catalog-resolve-concurrency` when set or the value derived from this
+    /// process's query concurrency. `None` means no ceiling was resolved,
+    /// which leaves `ravel_catalog::CatalogConfig`'s own default in place;
+    /// that default is the per-prefix bound, which every request is held to
+    /// separately in any case. [`start`] passes this straight through to
     /// [`query::build_catalog`].
     pub catalog_resolve_concurrency: Option<usize>,
     /// The process-wide in-flight ingest-request ceiling, from
