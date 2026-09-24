@@ -745,6 +745,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same falling-to-zero shape the description calls the alarm; it now carries
   the same idle clause as its sibling panel, "Query result cache hit ratio".
 
+- **A denied read on a catalog `idx/` object no longer degrades silently
+  into "nothing to reuse"** (issue #1964). Three GETs of catalog index
+  objects treated any store error, including `AccessDenied` from a missing
+  IAM read grant, the same as a genuine `NotFound`: `load_covering_postings`
+  returned `Ok(None)` as if no postings ref existed yet, and `fold_inner`'s
+  two reuse-baseline reads (the prior part's column-stats object and the
+  prior postings object) logged the same `warn!` and fell back to a full
+  rebuild regardless of why the read failed. A permission fault recurs on
+  every tick, so this reads as the postings tier or the reuse baseline
+  never applying, with no signal an operator could act on.
+  `NotFound` still degrades exactly as before: `load_covering_postings`
+  returns `Ok(None)` and `fold_inner` falls back to a rebuild with a
+  `warn!`. Any other error now surfaces: `load_covering_postings` returns
+  `Err(LoadPostingsError::Store)` naming the key, which the scrub tick logs
+  at `error!` before skipping the postings tier for that tick, and
+  `fold_inner`'s two reads log at `error!` with the failing key instead of
+  `warn!`, though the fold still falls back to a rebuild either way, since
+  reuse is an optimization and not a correctness gate. The new signal is a
+  log line: no metric counts these faults, so an alert on them has to come
+  from logs rather than from `/metrics`.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added

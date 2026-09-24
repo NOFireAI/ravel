@@ -1830,10 +1830,12 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // aborts the whole pass for that signal rather than one object.
     //
     // Maintain-mode processes also GET t/*/catalog/*/idx/*, from the scrub
-    // tick's load_covering_postings. It returns Ok(None) on ANY error, which
-    // the tick cannot tell from "no postings ref yet", so a missing grant
-    // there is not an outage but a silent downgrade: the postings scrub tier
-    // never runs and nothing says so. (fold_inner also GETs idx/ objects for
+    // tick's load_covering_postings. Since #1964 it returns Err on anything
+    // that is not NotFound, so a missing grant there now surfaces instead of
+    // reading as "no postings ref yet". Before that it returned Ok(None) on
+    // ANY error, which is why this grant had to be DERIVED rather than
+    // observed: at the time nothing in a running system would have reported
+    // it. (fold_inner also GETs idx/ objects for
     // its .cstat and .npost reuse baseline, but the fold never runs under
     // Mode::Maintain -- folds_in_process excludes it and the maintain arm
     // returns FoldTasks::none -- so those reads are why gateway.json and
@@ -2779,19 +2781,21 @@ fn maintain_template_covers_every_catalog_sweep_call() {
     //   `MaintainError::Store` on anything that is not `NotFound`, so an
     //   AccessDenied there aborts the whole pass for that signal rather than
     //   failing one object -- which is what a HEAD-only read grant produced.
-    // - `idx/` objects, by the scrub tick's `load_covering_postings`, which
-    //   SWALLOWS the failure: it returns `Ok(None)` on any error
-    //   (crates/ravel-catalog/src/covering_postings.rs), which the tick
-    //   cannot tell from "no postings ref yet", so the postings scrub tier
-    //   silently never runs. `fold_inner`'s `.cstat`/`.npost` reuse GETs
-    //   read the same keyspace but never under this credential: the fold
-    //   does not run in `Mode::Maintain`.
+    // - `idx/` objects, by the scrub tick's `load_covering_postings`
+    //   (crates/ravel-catalog/src/covering_postings.rs). Since #1964 a
+    //   non-`NotFound` failure there returns `Err` and disables the postings
+    //   tier for the tick loudly; `NotFound` still degrades to `Ok(None)`.
+    //   `fold_inner`'s `.cstat`/`.npost` reuse GETs read the same keyspace
+    //   but never under this credential: the fold does not run in
+    //   `Mode::Maintain`.
     //
-    // The third shape is why this assertion covers reads that fail SILENTLY as
-    // well as loudly. A missing grant on the first two announces itself; a
-    // missing grant on `idx/` looks exactly like an empty catalog and a
-    // permanent cost regression, and nothing in the running system says
-    // otherwise.
+    // The third shape is why this assertion had to exist BEFORE that fix, and
+    // why the grant was derived rather than observed: until #1964 a missing
+    // grant on `idx/` looked exactly like an empty catalog plus a permanent
+    // cost regression, and nothing in the running system said otherwise. The
+    // assertion stays because deriving the grant is still the only thing that
+    // keeps it correct -- a surfaced error tells an operator the grant is
+    // missing, it does not put it back.
     let head_witnesses: Vec<String> = ALL_SIGNALS
         .iter()
         .map(|signal| format!("t/{hash}/catalog/{}/HEAD", signal.key_prefix()))
