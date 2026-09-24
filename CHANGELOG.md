@@ -163,11 +163,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is never read again rather than missed by one generation; `docs/ingest.md`
   and ADR-1642 carry the arithmetic. Bounding the deferral itself is issue
   #1916.
-
-  bounded buffer; and the server now **refuses to start** when
-  `--max-inflight-flushes` exceeds `--max-queued-flushes`, since only a
-  spawned task can hold a permit and the excess would silently reduce flush
-  concurrency.
 - **The at-rest scrub corpus now covers compaction and rewrite output parts,
   not only original L0 segments, and `ravel_scrub_checksum_mismatch_total`
   carries a new `level` label** (issue #1686). The corpus previously skipped
@@ -568,6 +563,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exception is the gauge's `HELP` line, which ships in `/metrics` output where
   a reader has no link to follow, so it carries a one-line summary naming the
   three; the guard checks that summary too. No behaviour changed.
+
+- **`--max-ingest-buffer-bytes`'s help text and generated reference page now
+  state what `0` actually leaves unbounded, instead of calling it a disabled
+  ceiling and nothing more** (issue #1740). The flag's short help -- the text
+  `--help` prints and the generator that renders
+  `docs/reference/ravel-server-flags.md` both draw only the doc comment's
+  first paragraph, so a fuller explanation added elsewhere in the comment
+  never reached either surface. An operator reading either one saw "`0`
+  disables the ceiling (the gauge is still tracked for `/metrics`)" and
+  nothing else, which is how a `0` setting produced a flush queue bounded
+  only by host memory under a sustained object-store stall with no warning
+  in the documentation that read it. The first paragraph now says directly
+  that `0` does not leave spawned-flush memory unbounded on its own --
+  `--max-queued-flushes` still caps the ordinary flush queue at every
+  setting of this flag -- and names the one exemption from that cap that can
+  keep growing under `0`: a buffer that has crossed its per-tenant memory
+  backstop, which with the byte ceiling disabled is bounded only by the
+  length of the stall. No runtime behavior changes;
+  this is a documentation-only fix, regenerated from the updated doc
+  comment with `RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-server
+  --test cli_reference`.
 
 - **`ravel-cli gc-config set --max-flush-lifetime`'s help text and generated
   reference page now state the floor the flag is refused below** (issue
