@@ -126,6 +126,515 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   CI. The cargo tests that pin the same figures still run in CI; this is the
   half that runs where cargo does not.
 
+- **`Catalog::fold_with_refold_request` re-folds already-sealed ingest hours
+  that receive a late compaction or rewrite record** (issue #526). The
+  fold's fixed reconcile window and its retention-frontier band each cover
+  only the hours near their own edge, so a rewrite landing in an hour
+  outside both bands left its snapshot part naming pre-rewrite inputs
+  indefinitely: the unreferenced-object sweep's HEAD-reachability gate kept
+  holding those inputs, and they occupied storage until retention dropped
+  the hour. A new `RefoldRequest` names the ingest hours to re-run through
+  the same per-bucket classify-and-diff pass the two existing reconcile
+  passes use, landing in the same single HEAD compare-and-swap; hours
+  already covered by another pass, or named by no snapshot entry, are
+  dropped, and the request is capped at `frontier_reconcile_max_hours`
+  (default 168), spent oldest-first. A request is a hint, never a
+  durability dependency: an unrequested or dropped hour just keeps today's
+  behavior. The maintain-tier wiring that turns the unreferenced-object
+  sweep's blocked hours into a `RefoldRequest` is separate follow-up work;
+  until it lands, this entry point has no production caller and
+  `Catalog::fold` behaves exactly as before.
+
+- **Per-signal fold-liveness metrics:
+  `ravel_catalog_fold_cycles_total`, `ravel_catalog_fold_failures_total`,
+  and `ravel_catalog_fold_last_success_timestamp_seconds`** (issues #1306
+  and #1625). A stalled catalog fold was invisible: the scheduled fold
+  loop logged its outcome and dropped it, so nothing distinguished a fold
+  running every five minutes from one that had not run in a day, and the
+  first symptom was a slow query weeks later as unsealed ingest hours
+  piled up. The three families are accumulated inside `Catalog::fold`
+  itself, the single point every fold path (the scheduled loop, the
+  on-demand admin route, the CLI, and the resolve bench) goes through, so
+  a metric fed by only one caller cannot happen; a no-op fold still counts
+  as a cycle, since a loop that wakes and finds nothing sealed is working
+  correctly. Because the server spawns one fold loop per signal with no
+  supervisor, the families are keyed by `signal` rather than global, so a
+  dead loop for one signal cannot hide behind two healthy ones. The
+  last-success gauge takes a plain store rather than a max, since a
+  forward clock step under a max would latch permanently and mask a later
+  genuine stall; a plain store only risks a bounded, self-clearing false
+  stall from a backwards step. `docs/guides/observability.md` ships
+  `RavelCatalogFoldStalled`, derived from the seal window
+  (`max_flush_lifetime` 3600s + `clock_skew_allowance` 300s +
+  `fold_safety_margin` 900s = 4800s) rather than a round number, plus an
+  `absent()` branch so a scrape target list that drops every folding
+  process entirely still fires.
+
+- **Per-part (v3) column-statistics objects, written alongside the
+  existing whole-snapshot v1 and v2 statistics** (issue #1482, ADR-1413).
+  The fold now writes one `.cstat` object per newly-written snapshot part,
+  referenced by an additive field 7 (`column_stats`) on `SnapshotPartRef`.
+  A part whose statistics would exceed `DEFAULT_MAX_COLUMN_STATS_BYTES`
+  (256 MiB, the same ceiling the v3 reader already enforces) degrades
+  rather than stalls the fold: the largest remaining dictionary is dropped
+  and the part re-measured, repeating until it fits, clearing only
+  `dictionary_present`/`dictionary` and keeping min/max/count/sum exact;
+  the fold fails a part only once no dictionary is left to drop and it is
+  still over the ceiling. `FoldReport::column_stats_dictionaries_dropped`
+  reports how many dictionaries a fold cleared this way. Objects are keyed
+  by the content hash of their own bytes rather than the part's hash, so
+  two folds that recompute a byte-identical part but hit different
+  segment-fetch outcomes cannot collide on a key naming bytes that were
+  never stored there; the v3 object is built and bound-checked before the
+  part's own `.csnap` is written, so a refused part leaves no orphaned
+  `.csnap` behind. The degrade loop tracks each dropped dictionary's exact
+  byte contribution instead of re-measuring the whole part per drop, so a
+  part needing tens of thousands of drops still finishes. An incremental
+  fold also skips the v3 baseline fetch for any old part it is not
+  genuinely re-deriving, cutting one object GET per untouched sealed part
+  on every incremental fold. `ravel-maintain`'s unreferenced-object sweep
+  now carries every part's field-7 key into its referenced-key set;
+  without that, a v3 object outlived only by the sealed part naming it
+  would have crossed the protection horizon and been swept from under it.
+
+- **`ravel-cli catalog fold --json`, and full column-statistics visibility
+  in `catalog fold` and `catalog inspect`** (issue #1598). `catalog
+  fold`'s human report used to print only 10 of `FoldReport`'s
+  then-23 fields, silently dropping counters such as
+  `column_stats_dictionaries_dropped`; it now renders every field, and
+  `--json` emits the whole struct as a JSON document (the store
+  selection, `signal`, and `seal_margin` ride along as extra top-level
+  keys rather than being lost). `catalog inspect` prints each
+  column-statistics reference (HEAD fields 11 and 13, and the new
+  per-part field 7) as `key=... size=...`, or an explicit `ABSENT`
+  marker, so an omitted line and an unset field are no longer
+  indistinguishable. A new `ravel-cli inspect cstat <key>` decodes a
+  `.cstat` object's envelope and header without decompressing its body,
+  so an object whose declared uncompressed length exceeds the decode
+  ceiling still yields every header field and an over-ceiling verdict
+  instead of an error; under the ceiling it goes on to list each
+  column's `dictionary_present`. `FoldReport::put_requests` previously
+  undercounted: three of the six fold PUT call sites only incremented on
+  success or `AlreadyExists`, so a store-side error on an
+  otherwise-issued PUT went uncounted even though the object may have
+  been durably written as an orphan; all six sites now increment
+  unconditionally once the request resolves.
+
+- **`ravel_declared_stats_drops_observed_total`,
+  `ravel_catalog_fold_stamped_records_total`, and
+  `ravel_catalog_fold_stamped_entries_total` for ADR-0873 declared-column
+  statistics coverage** (issue #1747). The per-carrier drop tally existed
+  only as an unrendered crate-internal counter, and the fold reported
+  nothing about how many commit records it read with statistics stamps or
+  how many snapshot entries it wrote carrying them, so a deployment
+  transitioning to statistics stamping had no figure to confirm the
+  rollout was actually reaching the snapshot. The drop family (labeled by
+  `carrier`: `commit-record`, `compaction-part`, `snapshot-entry`,
+  `cstat`) renders in every mode, including `maintain`; the coverage pair
+  renders only in a mode that can fold at all, by either the background
+  loop or the on-demand admin route, and covers snapshot entries built
+  from both commit-record and compaction-part carriage.
+  `docs/guides/observability.md` ships two alerts:
+  `RavelFoldStampCoverageShortfall`,
+  firing when the fold reads more stamped records than it writes stamped
+  entries over an hour, and `RavelFoldStampCoverageMissing`, firing on
+  `absent()` of the coverage family while log flushes are still
+  happening, since a fold that predates these counters cannot emit them.
+
+- **`FoldReport::refold_hours_reconciled`, printed by `ravel-cli`'s fold
+  report** (issue #1763). The targeted re-fold pass added for issue #526
+  counted the hours it reconciled only in a test-only thread-local, with
+  no way for an operator to read the number. The count is now a
+  `FoldReport` field, always zero on a no-op fold regardless of what a
+  `RefoldRequest` named, since a no-op fold returns before reaching the
+  targeted pass.
+
+- **A structured OTLP log body (an array or a map) is now stored instead of
+  being rejected, and every admission-layer rejection reason is now counted**
+  (issues #1308, #1309). Normalization is admission layer 3, but its
+  decisions were invisible to operators: a delta-temporality metric or a
+  too-old log record was reported to the sender through OTLP partial success
+  and then dropped with no counter movement, and on the OTAP surface a fully
+  rejected batch left no trace at all beyond the missing points.
+  `ravel_admission_rejected_total`'s reason label now classifies every
+  rejection as skew or structural, so a tenant switching transport between
+  OTLP and OTAP sees the same figures. Separately, a structured log body
+  converts to canonical JSON text (map keys ordered by the canonical
+  attribute ordering already used for stream identity, duplicate keys kept
+  and ordered by encoded value, array order preserved, bytes as lowercase
+  hex, non-finite doubles as `"NaN"`, `"+Inf"`, or `"-Inf"`) rather than
+  being rejected outright; two exports of the same body always produce
+  byte-identical stored text. A string-table-reference body is still
+  rejected, since no string table travels with the export request and the
+  referenced text is not reachable. Delta-temporality metrics are still
+  rejected too: converting them needs a running total held between
+  requests, which a disposable compute process cannot keep, so a
+  collector-side `deltatocumulative` processor ahead of `batch` is the
+  supported path, and the quickstart collector config now ships that way.
+  Two review fixes landed alongside the conversion: a log record that was
+  stored with an oversized attribute dropped, but no whole record rejected,
+  previously reported nothing on the partial-success response, reading as a
+  fully clean write; it now reports the drop even though the rejected-record
+  count is correctly zero. And a request whose structured body was large
+  enough to make conversion itself costly was, before conversion ran under a
+  running byte budget, measured re-encoding a comparator on every duplicate
+  key it compared; a body built to maximize that cost previously cost
+  about 16 seconds of one core and built a 44 MB `String` for a 412 KB
+  gzip request the size limit was about to reject anyway.
+
+- **PromQL binary operators (`+`, `-`, `*`, `/`, comparisons) now work
+  between two native-histogram series, matching the exact operator set
+  Prometheus supports rather than refusing every histogram pairing with an
+  error** (issue #1700). Arithmetic between differently-shaped histograms
+  needed reconciliation this crate did not have: two operands at different
+  exponential scales were combined bucket-index-to-bucket-index without
+  first aligning scale, silently merging unrelated value ranges, and two
+  custom-bucket histograms with different bounds, or two exponential
+  histograms with different zero thresholds, were treated as unalignable
+  and dropped, when Prometheus actually reconciles both onto a common
+  layout before combining. Both gaps are now closed: a scale mismatch is
+  down-converted to the coarser scale before merging, mismatched
+  custom-bucket bounds are re-bucketed onto their intersection, and
+  mismatched zero thresholds widen to the larger one, folding the buckets
+  it swallows into the zero count, matching Prometheus' own reconciliation.
+  A genuinely unalignable pair, one exponential and one custom-buckets
+  operand, still drops the sample, now carrying the same warning text
+  Prometheus' own evaluator emits rather than Ravel-authored wording. Two
+  further correctness bugs surfaced during that work: a merge on the
+  equal-threshold fast path, the common case, was deleting any bucket that
+  merely straddled the zero threshold instead of keeping it, so a
+  histogram added to itself could answer with no buckets at all and
+  silently lose its count; and a zero threshold recorded as NaN sent the
+  reconciliation routine into a comparison that never terminates, hanging
+  the query thread until the process restarted. Both are fixed, and the
+  NaN case is now also refused before it can reach storage: an exponential
+  histogram's `zero_threshold` that is NaN, infinite, or negative is
+  rejected at normalization on both the OTLP and Remote Write surfaces,
+  through one shared predicate, closing the root cause rather than only
+  the query-side symptom.
+
+- **The in-flight-flush and flush-permit-wait gauges are now rendered for
+  every ingest signal, not only metrics** (issue #1741). The log and span
+  ingest pipelines moved their flush-permit acquire off the shard actor
+  alongside the metrics pipeline, but the gauges that make a stalled permit
+  wait visible, `ravel_ingest_in_flight_flushes` and the new
+  `ravel_ingest_flush_permit_wait_seconds_total`, were rendered only inside
+  a metrics-only code path. A logs-only or spans-only process therefore
+  rendered no sample for either gauge at all, even though a real (and
+  possibly zero) value existed for it. Both are now flat fields rendered
+  for every `{mode, signal}` combination.
+
+- **A process-wide memory budget now bounds SQL execution and the fetch layer
+  together, with three new `/metrics` gauges** (issues #1170, #1254).
+  `QueryEngine` and `SqlExecutor` share one `Arc<MemoryBudget>`: every RSEG
+  `ensure_ranges` coalesced read, every RLOG block-range and whole-object
+  fetch, and every RSPAN whole-object fetch reserves the bytes its GET will
+  materialize before issuing it, for the reservation's whole lifetime, and a
+  SQL statement's own pooled reservation draws on the same counter. A
+  fetch-side refusal fails typed as `FetchMemoryExhausted { requested,
+  reserved, limit }`, mapped to the frozen gRPC `BudgetExceeded` code rather
+  than `Unavailable`: `Unavailable` is this codebase's re-dispatch-and-run-
+  locally class, so mapping a budget refusal to it re-dispatched the refused
+  slice to another worker and then ran it on the coordinator, amplifying the
+  load the budget exists to shed. `ravel_memory_budget_bytes` (the resolved
+  ceiling, `u64::MAX` meaning unlimited), `ravel_memory_reserved_bytes` by
+  `{component="sql"|"fetch"}`, and `ravel_memory_handoff_overlap_bytes` are
+  now on `/metrics`. Two startup defects in the derived budget were closed
+  alongside this: a host where memory could not be measured (any non-Linux
+  host) used to derive a budget of `0` instead of unlimited, and a
+  `--cache-max-bytes`/`--catalog-cache-max-bytes` combination landing at or
+  above the derived budget used to be accepted rather than refused; both
+  used to leave `MemoryBudget::new(0)` in place, which refuses every real
+  SQL or fetch reservation while a statement that reserves nothing (`SELECT
+  1`) kept answering.
+
+- **`stats.io` on both the SQL and PromQL JSON responses now reports
+  `unfoldedRecordsServedFromCache`, the count of commit records a query's
+  resolve served from the resolve cache instead of fetching** (issues #1199,
+  #1219). The two engines share one `QueryIoShape`, so the field is read
+  from `QueryAccountingSnapshot::commit_record_cache_hits` at the resolve
+  site rather than inferred from a pooled counter, and a query that runs
+  both a metrics and a log lane sums the field across both lanes' resolves,
+  each of which runs its own resolve serially. This is a record count, not a
+  segment count: the resolve's listing window is padded by
+  `max_ingest_lag_ns` and always runs to the current hour, so a resolve can
+  prewarm commit-record buckets a query's own time range never touches; the
+  figure is meant as the numerator of a cold-resolve fraction, not a segment
+  tally.
+
+- **`/api/v1/sql`'s JSON response now carries `stats.phases` and `stats.io`,
+  the same per-phase (resolve/plan/probe/scan) I/O accounting the PromQL
+  endpoints already report** (issue #1367). The SQL executor's internal
+  accounting seam is retyped from one pooled `QueryAccounting` handle to a
+  `PhaseAccounting` split, and a new `sql_io_shape` helper derives dependency
+  depth, list-page depth, service batches and plan classification the same
+  way the PromQL engine's `io_shape_for_resolve` does. `RavelTableProvider`
+  and `LogsTableProvider` (the metrics and logs tables) carry the phase
+  split through to their scan operators; spans, alerts and audit stay on the
+  pre-existing pooled accounting for now. Flight SQL constructs no
+  `SqlOutcome` and has no stats envelope to extend, and the Arrow-IPC
+  encoding of `/api/v1/sql` carries no stats at all, matching its existing
+  behavior for the accounting and estimate fields it already omits: this is
+  the one shipping surface that gains the new fields.
+
+- **A SQL page planner turns a `SELECT` into a resumable, keyset-paginated
+  statement, as internal plumbing for the paging tools landing on top of it**
+  (issues #1374, #1571). `page_plan` is a pure text-to-text rewrite: given a
+  statement and an optional resume position, it returns the statement to run
+  next, the effective `ORDER BY`, and whether that ordering is a total order.
+  The samples table gets a total order for free (each scan emits one winner
+  per `(series_id, ts)`, appended as a deterministic tiebreak); the RLOG- and
+  RSPAN-backed tables have no row identity under at-least-once ingest, so no
+  tiebreak is appended and the plan reports why instead of claiming an
+  ordering the scan can't back up. Every unsafe shape is a typed refusal
+  rather than a silently wrong page: a statement carrying its own `LIMIT`,
+  `OFFSET`, `FETCH`, `TOP`, a pipe operator, `ORDER BY ALL`, an order term
+  that isn't a column reference or isn't projected, an explicit `NULLS
+  FIRST`/`NULLS LAST` or `WITH FILL`, an order term the statement text can't
+  prove `NOT NULL` on the queried table (a keyset comparison against `NULL`
+  selects no rows, so those rows would silently never appear on any page), a
+  resume tuple whose arity doesn't match the ordering terms, and a
+  non-finite float in a resume value. `SqlOutcome` also now carries the
+  three resolve inputs a cursor pins (ADR-1374 decision 5): the target
+  signal, the typed attribute column set the query resolved, and the
+  erasure
+  predicates pending in the snapshot it read, each read off the successful
+  attempt's own snapshot so a retry can't substitute another attempt's
+  values. As of this release nothing in `ravel-server` or `ravel-mcp` calls
+  `page_plan` yet; it is tested directly and awaits its caller in a later
+  wave.
+
+- **A native MCP (Model Context Protocol) adapter is available behind the
+  off-by-default `mcp` build feature and a `--mcp` runtime flag, serving nine
+  tools over `POST /mcp`** (issue #1379, ADR-1374 decision 9). The new
+  `ravel-mcp` crate ships `ravel_capabilities`, `ravel_describe_data`,
+  `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`,
+  `ravel_query_promql`, `ravel_search_logs`, `ravel_get_trace` and
+  `ravel_analyze_timeseries`; the `mcp` feature implies `sql`, since four of
+  the nine tools execute SQL through the query service. Every tool response
+  is bounded before it reaches the wire: cursors are opaque, MAC'd,
+  self-describing tokens bound to the call that minted them, envelope cells
+  are sized by their serialized length rather than by field count, and a
+  compact text rendering is capped at 20 rows and 64 KiB with every caller
+  string escaped and control characters stripped. `ravel-sql` gained a
+  `pin-codec` feature so the cursor codec can reuse `FlightTicket`,
+  `TicketKey` and `SegmentPin`'s keyed-MAC pattern without linking Arrow
+  Flight.
+
+- **A hex-string `trace_id` literal now plans, alongside the existing
+  `X'...'` byte-literal form** (issue #1709). The traces guide documents
+  looking up a trace by its 32-character hex string, but comparing the
+  `FixedSizeBinary(16)` `trace_id` column against a `Utf8` literal failed
+  type coercion, so the documented query returned a planning error and only
+  the byte-literal spelling worked. A new expression planner rewrites a
+  `trace_id` comparison against a 32-character hex literal (case-insensitive,
+  either operand order) into the binary form for both `=` and `!=`; a
+  literal of the wrong length or containing a non-hex character is left
+  alone and still fails to plan, rather than silently matching nothing.
+
+- **The spans table gains a structured `events` column,
+  `List<Struct{ts_unix_nano, name, attrs}>`, decoded from the RSPAN v4 event
+  columns instead of requiring callers to decode `_events_raw` protobuf by
+  hand** (issue #1710). Event attributes use the same label-map type as the
+  rest of the schema. Projections that exclude `events` still take the
+  columnar fast path, and pushdown ignores the column. `_events_raw` stays
+  for compatibility, and span links remain hex-attribute-only until a
+  follow-up lands. The JSON output encoder gained `List` and `Struct` cases
+  to render it, since the column is reachable from both the HTTP and Flight
+  surfaces.
+
+- **A SQL query over the samples table now warns in the response when it
+  silently excluded native-histogram data** (issue #1738). The samples
+  table's value column is a non-nullable `Float64` with no way to carry a
+  native histogram, so a histogram sample never became a row: a `COUNT(*)`
+  on a tenant that ingests native histograms was short by the whole
+  histogram population, answered with HTTP 200 and no indication, and on a
+  histogram-only tenant the answer was `0`. The JSON success body now
+  carries a top-level `warnings` array of strings (omitted when empty, the
+  same convention the PromQL endpoints already use), populated from
+  `SqlOutcome::warnings` and sourced from a count the scalar fetch already
+  produces for free while filtering histogram-kind series out of its
+  results. Two surfaces still can't carry it: an Arrow-IPC response has no
+  envelope to put a warning in, and a statement executed through the
+  distributed scan lane counts nothing, because the worker that dropped the
+  series streams rows rather than its own counters back to the coordinator.
+  The samples table's column count is unchanged; this makes an existing
+  exclusion visible, it does not narrow it further.
+
+- **The log fetcher's assembly-buffer pool now reports the live (in-flight)
+  buffer set on top of the pool's existing idle-retention figures** (issue
+  #1771). `AssemblyBufferStats` described only what the pool retains between
+  reads; nothing described what a running scan currently holds, which is the
+  figure a memory question actually needs (under the byte-minimal fetch
+  policy, a query holds one object-sized buffer per in-flight ranged read).
+  New `live_bytes` and `peak_live_bytes` fields are charged when a buffer is
+  acquired and released when it is returned, before the pool's retention
+  bounds decide whether to keep it or drop it, so a buffer that gets dropped
+  rather than pooled still leaves the live set. Charging is by the buffer's
+  resident length rather than its requested length: a reused buffer keeps
+  the length of the largest object it has ever served, and those bytes are
+  held whether or not the current read addresses all of them.
+
+- **`ravel_maintain_l0_records_pending` and
+  `ravel_maintain_objects_deleted_total`
+  render on `/metrics`** (issue #1729). The compaction scan and the retention
+  sweep previously reported these figures to tracing only, so an operator
+  could not see how much L0 compaction work was queued, or how many objects
+  maintenance had actually deleted, without reading logs on every process.
+  `ravel_maintain_l0_records_pending` is now published by `signal`, summed
+  across every bucket this process owns and republished once per
+  maintenance cycle (default 300 seconds) after the cycle has covered all
+  of them, so a mid-cycle scrape reads the previous cycle's complete total
+  rather than a partial sum; a bucket the cadence memo
+  skipped for being safely below threshold still contributes its last-known
+  record count, so the buckets an operator most needs to watch cannot silently
+  drop out of the total. `ravel_maintain_objects_deleted_total` is published
+  by `kind`, one series per `SweepReport` count (including
+  `kind="quarantine_reaped"`). The troubleshooting guide documents both, and
+  says that a dip in the pending gauge is not corroborated by
+  `ravel_maintain_units_stalled`: that gauge only moves for a per-unit failure
+  repeated past its stall threshold, and the paths that remove the most
+  records from the pending total (a tenant skipped whole-tick for a failed
+  legal-hold refresh, or by the provisioning or shard-generation check) never
+  reach per-unit accounting, so `units_stalled` can sit at zero while the
+  pending population moves for an unrelated reason.
+
+- **The process memory budget now exposes gauges on `/metrics`, and startup
+  refuses a container the budget cannot fit** (issues #1255, #1395).
+  `ravel_memory_budget_bytes` renders the resolved ceiling (`u64::MAX` meaning
+  unlimited), `ravel_memory_reserved_bytes` by component (`sql`, `fetch`), and
+  `ravel_memory_handoff_overlap_bytes`; `component="fetch"` renders 0 for now,
+  since nothing yet charges the fetch layer against this budget. The budget
+  itself is now derived from the cgroup-effective memory ceiling minus a fixed
+  overhead reserve, not raw `MemTotal`, so a container capped below the host's
+  total memory is sized correctly rather than against memory it can never use.
+  A process whose derived budget cannot cover its resolved cache ceilings now
+  refuses to start with a typed `MemoryBudgetExceeded` error naming the
+  shortfall, instead of starting and letting the caches or the SQL executor
+  exceed the container's real limit later.
+
+- **`--disable-cache` now passes the memory budget startup check** (issue
+  #1436). The check previously compared the fetcher and catalog cache ceilings
+  against the derived budget without accounting for `--disable-cache`, so a
+  host with cache limits set above the budget was refused even though it
+  builds no cache at all, and any container whose effective memory sat at or
+  below the overhead reserve derived a 0 budget that no flag value could
+  satisfy, including `--disable-cache` itself. The check now recognizes that
+  `--disable-cache` builds neither the fetcher cache nor the catalog byte
+  cache, so the full budget is available to the shared SQL and fetch
+  accounting and the container starts.
+
+- **A new MCP (Model Context Protocol) surface can be mounted on the query-
+  serving listeners, behind its own feature and flag** (issue #1381). `--mcp`
+  opts a build carrying the `mcp` cargo feature into serving `POST /mcp`;
+  `--mcp-allowed-origins` is a mandatory origin allowlist (an empty list is
+  accepted only on a loopback listener, and fails startup on any other
+  address); `--mcp-max-body-bytes` caps the request body (default 1 MiB) and
+  refuses a value of 0. The route runs the same tenant resolution, origin
+  check, and body cap as the HTTP query surfaces before anything reaches the
+  protocol layer, and each tool call is billed through the same admission
+  permit, deadline clamp, cost record, usage guard, audit submission, partial-
+  result gate, and error redaction as an HTTP query. Starting the process with
+  `--mcp` under `--mode gateway` or `--mode maintain` now fails at startup,
+  naming the flag and the mode, instead of silently mounting nothing. Of the
+  nine catalogued tools, only `ravel_capabilities` has a body today; the other
+  eight return a typed `NotShipped` protocol error naming the tool, and
+  `ravel_capabilities` itself reports which tools are actually served
+  (`tools.enabled`) separately from the full catalog (`tools.catalogued`). A
+  JSON integer above `i64::MAX` returned from a tool call (an unsigned 64-bit
+  counter) now renders as an exact-digit string cell rather than a lossy float
+  cell, matching the string-precision treatment integer and timestamp cells
+  already get. A `finish` response now names `visibility.snapshot_id`,
+  `visibility.watermark_hour`, `ids.query_id`, or `ids.audit_ref` in its
+  `warnings` list when the underlying operation left that field unmeasured,
+  rather than rendering an empty string a caller cannot distinguish from a
+  genuinely empty value. A malformed MCP budget argument is now refused rather
+  than silently defaulted, and `row_cap_hit` together with the produced row
+  count now survive through to `finish` instead of being dropped along the
+  way.
+
+- **A `--max-ingest-lag` flag replaces the hardcoded 2h ingest admission
+  bound** (issue #1682). The value drives both the catalog listing window and
+  the OTLP, OTAP, Remote Write, and span-surface admission bounds together, so
+  the two can never be set inconsistently: the listing window widens first and
+  the admission bound is derived from it. Startup validates the configured
+  window against the ADR-0019 retention floor and refuses a lag that would
+  outrun retention, and refuses a bound that admits data wider than the
+  catalog can list. This lets a deployment replay telemetry older than 2h
+  after an outage or a bulk import, which the previous hardcoded bound
+  rejected outright with `Rejection::TooOld` on every ingest surface.
+
+- **A `--tenant-token-file` flag loads static bearer tokens from a file
+  instead of the command line** (issue #1706). The file source strips a
+  leading UTF-8 byte-order mark before parsing, and an empty or comment-only
+  file parses to an empty map with no startup error. In the same change, a
+  malformed token line (missing `=`, or an empty tenant after the split) no
+  longer echoes the offending pair back into the error message: for the file
+  source that text is the bearer token itself, and the previous error text
+  printed the secret straight into the process's stderr log on the most likely
+  operator mistake, a Secret mounted with the token alone and no `=TENANT`.
+
+- **The operator now detects the cluster's Kubernetes minor version and gates
+  the preStop `SleepAction` on it** (issue #1714). Kubernetes reports
+  `PodLifecycleSleepAction` (KEP-3960) as beta and enabled by default from
+  1.30, not GA from 1.32 as first assumed; the floor is now minor version 30.
+  A cluster below the floor gets `KubernetesVersionUnsupported` and no preStop
+  hook rendered, rather than a field the API server silently drops or rejects.
+  An unreadable version check (a transient API error) fails open and logs once
+  rather than flapping the condition.
+
+- **A separate admission class bounds federated fragment resolves** (issue
+  #1722). `--max-inflight-federated-resolves` (default 8) caps this new
+  "Resolve" class independently of the existing `--max-inflight-fragments`
+  (default 32), which continues to bound the "Pinned" class alone, so a burst
+  of federated resolves can no longer starve pinned fragment reads of their
+  own permits.
+
+- **The Kubernetes operator now renders default CPU and memory requests when a
+  `RavelCluster` spec omits them** (issue #1726). Gateway and maintain pods
+  default to 100m CPU and 256Mi memory; query pods default to 200m CPU and
+  512Mi memory. A spec that sets its own requests is unaffected.
+
+- **A new CRD field, `spec.gateway.maxInflightFlushes`, renders `--max-
+  inflight-flushes` on the gateway Deployment** (issue #1743). This is the
+  per-shard cross-tenant flush isolation bound: without it, an operator-
+  managed cluster was stuck at the server's compiled-in default of 1, so one
+  tenant's stalled flush could block every co-resident tenant's flush on that
+  shard. The field is gateway-only, since ingest and its flush isolation only
+  run under `--mode gateway`; when unset, nothing is rendered and the cluster
+  keeps the server's own default. A value of 0 is refused, matching the
+  server's own refusal of `--max-inflight-flushes 0` as a flush deadlock.
+
+- **New maintenance-safety and admission-reconciliation counters and gauges
+  are exported on `/metrics`** (issue #1762).
+  `ravel_maintain_orphans_quarantined_total`,
+  `ravel_maintain_orphans_quarantine_refused_total`, and
+  `ravel_maintain_quarantine_reaped_total` (all labelled by mode and signal)
+  report what each sweep pass did to orphaned data, figures the sweep already
+  computed but the exporter did not read.
+  `ravel_admission_reconciliation_cycle_duration_seconds`,
+  `ravel_admission_reconciliation_siblings_observed`, and
+  `ravel_admission_reconciliation_stale_keys_skipped` (labelled by mode alone,
+  since one cycle reconciles every tenant the process tracks) report the last
+  completed reconciliation cycle and can fall between scrapes;
+  `ravel_admission_reconciliation_keys_reaped_total` accumulates across cycles
+  instead.
+
+- **Alerting pipeline metrics are exported on `/metrics`** (issue #532). Six
+  cumulative quantities (rules evaluated, rules failed, records written,
+  repeats queued, notifications delivered, notifications failed) become
+  counters labelled by mode, and the three mutually-exclusive per-tick
+  outcomes (history unavailable, lease not held, lease unavailable) collapse
+  into one `ravel_alert_ticks_total` counter split by outcome alongside the
+  evaluated case. `ravel_alert_last_tick_completed_timestamp_seconds` stamps
+  on every tick, including one that skipped evaluation because a peer holds
+  the lease, so only its age signals a stalled loop. The whole family is
+  omitted unless this process built an evaluator. Because the evaluator spawns
+  one task per tenant but every task stamps the same process-global gauge, a
+  dead evaluator for one tenant stays hidden as long as any other tenant on
+  the process keeps ticking; this is a process-wide signal, not a per-tenant
+  one.
+
 ### Changed
 
 - **The quickstart and CI object store moved from MinIO to RustFS, and the
@@ -595,6 +1104,110 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   held since ADR-0069 landed. No decision and no code changed; bounding the
   loop belongs with the ADR-0069 follow-up.
 
+- **`LIMIT` now pushes into the logs scan instead of stopping at a
+  `LocalLimitExec` DataFusion inserts above it** (issue #362). A previous
+  attempt at this added an internal row-count stop inside the scan and
+  measured no effect, because DataFusion's `LimitPushdown` already inserts a
+  per-partition limit node above any scan that doesn't implement `fetch()`,
+  and that node already stopped polling the scan. `LogsScanExec` now
+  implements `fetch()`/`with_fetch()`, so `LimitPushdown` pushes the limit
+  into the scan and removes the extra plan node per partition instead of
+  leaving the scan's own bookkeeping unused. The per-partition fetch is a
+  bound each partition may stop at on its own; the query's real limit across
+  all partitions is still enforced above it, so no partition returns fewer
+  rows than its share.
+
+- **Reading one attribute through `attrs['k']` no longer costs 50x-220x the
+  CPU of reading the same value through a typed attribute column of the
+  same name**
+  (issues #913, #1768). The literal keys referenced through `attrs[...]` in
+  the projection and in residual predicates are now collected up front, and
+  when nothing in the plan needs the whole attributes map, only those keys'
+  columns (plus `attrs_raw`) are resolved and built directly as `Utf8`,
+  instead of selecting every dynamic column's pages, rebuilding a
+  `Vec<(String, AttrValue)>` map per row, and materializing a full
+  `Map(Utf8, Utf8)` column that `get_field` then read one key out of. On the
+  measurement quoted in the commit (40 objects, 200,000 rows, 33 record
+  attributes), an equality statement went from 1070.7 ms to 4.8 ms and from
+  84,691 to 3,531 stored page bytes decoded. The rewrite only narrows which
+  columns resolve, never what a query returns: a bare `attrs` reference,
+  `SELECT *`, an aggregate argument, a grouping set, a projected filter, or
+  any plan node the rewrite doesn't recognise all keep the whole-map row
+  path, and a per-key column still renders the map form's value, including
+  the ADR-0090 decision 7 case where a non-`Str` value under a `Str`
+  declaration renders as text through the map but `NULL` through the
+  typed attribute column. This is a CPU-only change: the shipped fetch
+  policy reads
+  whole objects regardless of projection, so no wire byte or GET count
+  changes.
+
+- **The catalog now accepts only v3 per-part `.cstat` column-statistics
+  objects; the v1 and v2 whole-object decode paths are retired** (issue
+  #1600, ADR-1413 decision 6). `column_stats_resolve.rs` and `catalog.rs`
+  drop the v2-then-v1 fallback ladder and the declared-entry-count coverage
+  comparison entirely: a covered part whose per-part reference is absent,
+  not found, or undecodable is now scanned directly rather than falling back
+  to a whole-object read, with the existing warn-once and
+  `column_stats_decode_refusals` counter still firing on that path.
+  `SnapshotHead`'s whole-object v1/v2 reference fields become reserved in
+  `proto/ravel/catalog.proto`, matching the fold no longer publishing either
+  form. The v2 encoder is retained but gated to test code, since it is still
+  useful for exercising header/envelope-mismatch and decode-refusal paths
+  without a second production code path per version.
+
+- **Orphan garbage collection now quarantines a candidate instead of deleting
+  it, and runs on the full-sweep cadence instead of every maintain tick**
+  (issues #528, #1734). Previously, a data object whose commit record was lost
+  out of band (a bucket lifecycle rule, a prefix delete, a persistent LIST
+  omission) was deleted outright at the orphan horizon (about 25 hours) with
+  no recovery window, and a loss small enough to stay under
+  `orphan_breaker_min_count` and `orphan_breaker_max_ratio` never tripped the
+  mass-orphan breaker that exists to catch exactly this. A candidate is now
+  moved to a `quarantine/<original key>/q<timestamp>` copy first, and the live
+  key is deleted only after the copy succeeds, so a crash between the two
+  steps can never destroy the only copy. The copy is physically deleted only
+  after a second, independent horizon, `quarantine_horizon_ns` (default 7
+  days), giving an operator a real window to notice and recover before data is
+  gone for good. `ravel_maintain_orphans_present` (the existing mass-orphan
+  gauge) now also counts a candidate whose quarantine copy failed, since a
+  refused quarantine leaves the object live and is exactly the store-fault
+  case the gauge exists to surface; new `orphans_quarantined`,
+  `orphans_quarantine_refused` and `quarantine_reaped` counters make the event
+  itself visible, each logged at warn level on any nonzero count.
+  Because listing the whole L0 data prefix on every tick (every 300 seconds by
+  default) was the single most expensive thing a maintain tick did, and it
+  answers a question that changes slowly, orphan candidate selection, the
+  quarantine reaper, and the mass-orphan breaker check now all run together on
+  the same full-sweep cadence (6 hours by default, `interior_reverify_ns`)
+  rather than on every tick. Gating the two together this way opened a gap of
+  its own: a tick that skips selection never evaluates the breaker either, so
+  it reads as "not tripped" and would have let the reaper run through a live
+  incident on every skipped tick; the reaper is now chained to run only on a
+  pass that actually ran selection and found the breaker clear, so a record
+  loss that widens past the breaker's thresholds days after it started still
+  holds its earliest quarantined copies rather than reaping them on the next
+  skipped tick. Both gauges now hold their last completed-pass value across a
+  skipped tick rather than reporting zero, and the per-tick sweep log line and
+  both gauges say which pass kind produced them, so a tick that skipped
+  selection no longer logs `orphans=0` in a way that reads as a measurement.
+  `docs/deletion-and-gc.md` and ADR-0058 describe the quarantine mechanism,
+  its horizon, and the incident runbook's restore-from-quarantine step
+  normatively.
+
+- **The object-store conformance suite now refuses a bucket qualified under an
+  older, smaller probe set** (issue #1302). The suite grew from four probes to
+  eight, but `CONFORMANCE_SUITE_VERSION` had stayed at 1, so a bucket
+  qualified under the old four-probe suite still read as a current pass on
+  startup while the four newer properties were never checked.
+  `CONFORMANCE_SUITE_VERSION` is now 2, and the once-per-bucket re-record rule
+  relaxes to once-per-suite-version, so `ravel-cli store qualify` overwrites a
+  below-floor record with a current pass instead of leaving startup
+  permanently refused. Startup also now compares the record's
+  `backend_identity` against the connecting backend's own, warning (not
+  refusing) on a mismatch: the identity is endpoint-derived, so an endpoint
+  rename or a path-style/virtual-host switch changes it with no actual backend
+  change underneath.
+
 ### Fixed
 
 - **The shipped Maintain IAM template now grants the delete the dead-worker
@@ -828,18 +1441,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`t/*/catalog/<signal>/snap/*`, `t/*/catalog/<signal>/idx/*`) that the
   unreferenced-catalog sweep physically removes once they are unreferenced,
   aged past the protection horizon, and unleased. IAM's explicit Deny
-  overrides any Allow for the actions it names, so on a deployment running
-  the shipped template every sweep pass was refused on its first delete:
-  catalog garbage, including any unreferenced snapshot or index object
+  overrides any Allow for the actions it names, and the template's
+  `ListBucket` prefixes did not admit the catalog `snap/` and `idx/` paths at
+  all, so on a deployment running the shipped template every sweep pass was
+  refused at its first listing, before any delete was attempted: catalog
+  garbage, including any unreferenced snapshot or index object
   holding an erased subject's value, was never reclaimed. The deny is now
   narrowed to the catalog HEAD pointer alone (`t/*/catalog/*/HEAD`), the one
   catalog object the sweep never deletes, and `MaintainDelete` now grants
-  delete on `snap/` and `idx/` keys to match what the sweep already does. A
+  delete on `snap/` and `idx/` keys to match what the sweep already does. The
+  template also gains the reads the sweep needs before it can delete:
+  `MaintainList`'s `s3:prefix` adds `t/*/catalog/*/snap/*` and
+  `t/*/catalog/*/idx/*`, and `MaintainRead` adds `t/*/catalog/*/HEAD`,
+  `t/*/catalog/*/snap/*` and `t/*/catalog/*/idx/*`. A
   new pinning test asserts both directions: HEAD stays denied, and a snap
   key and an idx key built from the same key constructors the sweep uses are
   deletable. This changes a shipped IAM template: an operator running
   `maintain.json` from before this change must re-apply it. Until they do,
-  the sweep keeps failing its first delete every pass, exactly as before.
+  every sweep pass is refused at its `ListBucket`, exactly as before.
 - **Four axis and description issues in the standalone Grafana dashboard are
   fixed** (issue #1962). "Workers and units" and "Declared-stat stamp
   coverage" carried `"fieldConfig": {"defaults": {}, "overrides": []}`, so
@@ -935,6 +1554,790 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`ravel_promql::complexity_guard::parse_guarded`), each pinned as a literal
   count so a silently-empty extractor fails loudly rather than passing over
   nothing. No shipped rule changed.
+
+- **f64 range predicates in `ravel-logseg` no longer prune a block that
+  carries a NaN value** (issue #1699). Under the `total_cmp` order the
+  skip index's min/max stats and the SQL layer's numeric-range predicate
+  both use for `f64`, a `+NaN` row sorts above every finite value and a
+  `-NaN` row sorts below every finite value, so a half-open range arm
+  like `[x, inf)` or `(-inf, x]` can be satisfied by a NaN row that a
+  block's finite `[min, max]` stat says nothing about. `stat_disjoint`
+  ignored the block's `has_nan` flag entirely and could prune such a
+  block, dropping a matching row from a range-scanned query. It now
+  declines to prune whenever an f64 stat has `has_nan` set, before
+  applying the bounds test; this is deliberately coarser than necessary
+  (it declines both arm directions, since the flag does not record which
+  sign of NaN was present) but always sound.
+
+- **The read cache's single-flight `get_or_fetch` path no longer blocks a
+  runtime worker thread on disk I/O** (issue #1702). The tiered disk
+  cache read and wrote files with `std::fs`, called directly from the
+  async single-flight path, so every disk hit and every disk fill on that
+  path occupied a tokio worker for the length of the file operation,
+  starving unrelated queries and ingest work sharing the runtime. The
+  calls now run under `spawn_blocking`; a join error is treated as a
+  cache miss on read and a dropped fill on write, never a panic, and the
+  synchronous entry points keep their signatures.
+
+- **Disk-cache entries and directories, and SQL spill scratch directories,
+  are now created owner-only instead of at the ambient umask** (issue
+  #1708). Neither `ravel-cache`'s disk read cache nor `ravel-sql`'s spill
+  scratch set a file mode, so on a node running at the common umask
+  default of 0022, cache entries (raw, unencrypted segment bytes under a
+  filename carrying the tenant hash) and their shard/namespace
+  directories were world-readable and world-listable, and per-query spill
+  directories were world-listable. Cache inserts now create shard
+  directories at mode 0700 and entry files at mode 0600; SQL spill
+  scratch directories are created at mode 0700. A node upgraded in place
+  also had a namespace root and shard directories an older build already
+  created at the ambient umask: on startup, the cache now narrows the
+  namespaced root and each shard directory it walks to owner-only and
+  each live entry it seeds to owner read-write, without touching anything
+  above the namespace or an operator-created root. This does not reach a
+  pre-namespace cache tree left over from before the per-instance
+  namespace layout; `docs/guides/caching.md` points at the existing
+  `reclaim-legacy --apply` command to remove one.
+
+- **A stalled flush no longer stalls every co-resident tenant on the same
+  shard** (issues #1292, #1641). A shard actor acquired the
+  `--max-inflight-flushes` permit on the actor task itself, before spawning
+  the flush. At the default bound of one permit, a flush stalled retrying a
+  slow object-store PUT held the only permit, which parked the actor's
+  whole event loop: the channel stopped draining, the age-flush tick
+  stopped firing, and finished flushes stopped being reaped. Because object
+  keys are tenant-prefixed and S3 throttles per key prefix, one tenant being
+  throttled by the store stalled every other tenant sharing that shard,
+  including their age-triggered flushes, with no data lost but no
+  availability either. Fixed first for the metrics shard actor, then for
+  logs and spans, by acquiring the permit inside the spawned flush task
+  instead: the actor now returns the moment it spawns a flush, so a stalled
+  flush parks only its own task. Backpressure at the permit bound now comes
+  from the process-wide ingest byte budget instead of from the actor
+  blocking, since a flush holds its byte charge from the moment it leaves
+  the actor. `--max-inflight-flushes` is documented as the per-shard flush
+  isolation control it is: raising it lets healthy tenants keep flushing
+  while one key prefix is being throttled.
+
+- **A shard actor that dies and is respawned no longer silently halves
+  ingest capacity forever, and the process now reacts to it** (issue
+  #1299). A metrics shard actor whose flush task panicked left its channel
+  closed, so every later write routed to that shard failed for the rest of
+  the process lifetime with no signal to the orchestrator. The router now
+  respawns a dead shard actor with a fresh writer identity, up to a bound
+  of 3 respawns, and once that budget is exhausted the next death condemns
+  the shard: `/readyz` turns unhealthy and Kubernetes replaces the pod,
+  which is the only recovery left for a shard that cannot come back in
+  process. A respawn restores write capacity but not the dead actor's
+  buffered rows, which were never acknowledged and so are lost within the
+  documented at-least-once contract, and the write that observed the death
+  still gets a retryable error so the client retries onto the fresh actor.
+  Three follow-on corrections shipped with it: the respawn budget is now a
+  decaying allowance rather than a process-lifetime count, so a shard that
+  fails once an hour is no longer condemned on its fourth outage regardless
+  of how far apart those outages are; the shard's monotonic clock floor
+  used to detect backwards clock steps (per-shard, not per-writer, so it
+  survives the writer identity changing) is now carried across a respawn
+  instead of resetting to zero, so the guarantee it provides holds for the
+  shard's whole process lifetime rather than resetting on every respawn;
+  and a readiness-registration bug that held an extra reference to the
+  ingest router was fixed, which had silently prevented shard actors from
+  being joined during every graceful shutdown.
+
+- **The log and span ingest pipelines now condemn a shard and shed the pod
+  on its first dead actor, matching the metrics pipeline** (issue #1691).
+  Unlike the metrics pipeline, the log and span routers never respawn a
+  dead shard actor, so its first death is already permanent; before this
+  change only the metrics pipeline reported that condemnation to
+  `/readyz` and to a `shards_condemned` counter, so a permanently dead log
+  or span shard kept serving errors with its pod still in the Kubernetes
+  Service rotation. Both pipelines now expose the same readiness signal and
+  counter the metrics pipeline already had, so Kubernetes sheds the pod as
+  soon as either shard actor dies for good.
+
+- **A flush queued behind a stalled tenant no longer has its abandonment
+  deadline silently spent by the wait** (issue #1739). A flush's
+  abandonment deadline was pinned when the flush opened, before it waited
+  for the shard's flush-concurrency permit. At the default
+  `--max-inflight-flushes` of 1, a tenant whose object-store writes were
+  slow held the shard's only permit, so a co-resident tenant's flush queued
+  behind it spent its whole deadline sitting in that queue; if the stall
+  outlasted `--max-flush-lifetime`, every flush that had opened during it
+  was abandoned before it ever attempted a store write, dropping rows that
+  had already been acknowledged to the client in buffered mode, with no
+  crash and no store error. The deadline is now re-derived from the moment
+  the permit is actually granted, so a flush that queues behind a stall
+  gets its full flush lifetime for its own store calls once it holds a
+  permit; a flush already past its deadline before it even reaches the
+  queue is abandoned there without taking a permit. The abandonment counter
+  is also now split by cause: `ravel_ingest_abandoned_queue_deadline_total`
+  counts a flush abandoned while queued for a permit, separately from
+  abandonments after a permit was held and the store calls themselves
+  failed.
+
+- **The flush trigger no longer over- or under-charges the object it is
+  about to write, and the per-buffer memory ceiling now scales with a
+  smaller configured budget** (issue #1305). The size-based flush trigger
+  compared a buffer's in-memory footprint, which counts a fixed struct
+  overhead behind every label or attribute, against `target_bytes`, so a
+  buffer of many small series could accumulate several times
+  `target_bytes` of real payload before it was ever charged with reaching
+  the target: a nominal 8 MiB target fired at a small fraction of that in
+  actual object bytes. The trigger now estimates the object's own size (a
+  fixed per-series and per-record term, one copy of label and attribute
+  text per series, no struct overhead) so the written object lands at or
+  under the configured target instead of drifting over it. Separately, the
+  per-buffer memory backstop that exists to flush before one tenant's
+  buffer can exhaust process memory was a flat 64 MiB constant justified as
+  an eighth of the 512 MiB default `--max-ingest-buffer-bytes` ceiling. On
+  a process started with a smaller ceiling, one label-heavy buffer could
+  fill to the full 64 MiB and consume the entire configured budget by
+  itself, shedding every other tenant's writes with HTTP 429 while the
+  backstop itself never triggered. The backstop now scales down with a
+  configured ceiling below the default, so it can no longer exceed the
+  budget it exists to protect.
+
+- **A backward host clock step across a graceful shutdown or rolling
+  restart no longer destroys already-acknowledged buffered rows** (issue
+  #1307). The commit record's creation timestamp, the primary key of
+  query-time duplicate resolution, was range-checked but never
+  order-checked against a shard's previous flush, so an NTP step backward
+  could let a stale write outrank the correction that was meant to replace
+  it. A per-writer monotonic floor was added to keep each shard's
+  timestamps non-decreasing within one process lifetime, but the flush a
+  large backward step could not absorb was refused by dropping its
+  tenant's entire buffered rows outright, including rows already
+  acknowledged to the client in buffered mode; if that refusal landed
+  during a graceful shutdown or a channel close, those rows were destroyed
+  with the actor exiting right behind it. The refusal is now retryable
+  rather than terminal: a flush that crosses the absorption bound
+  re-anchors the floor and re-inserts its buffer instead of dropping it, so
+  the next trigger retries it against the corrected floor, and the
+  shutdown drain itself now retries over fresh snapshots until every
+  tenant's buffer empties or a bounded number of passes is exhausted. Only
+  a clock that keeps regressing across every one of those passes can still
+  leave residue at teardown; that narrow remaining case is what
+  `ravel_ingest_flush_all_residue_tenants_total` reports.
+
+- **An OTLP Remote Write request's decompressed size is now charged against
+  the ingest byte budget** (issue #1419). The process-wide ingest byte
+  budget is meant to bound the transient memory ingest inflates during
+  decompression, but only the OTLP HTTP gzip path charged it: a Remote
+  Write request could snappy-decompress up to 64 MiB with nothing charged
+  against any ceiling, so as many concurrent requests as
+  `--max-inflight-ingest-requests` allows could each inflate that far
+  outside every configured budget. The handler now reads the exact
+  decompressed size from the snappy block's own header and charges it
+  before allocating, so the charge matches what is actually allocated
+  rather than the request's compressed size or its wire-size cap; a
+  request already over the wire-size cap still gets rejected before it
+  takes a charge, and a request the budget cannot admit is shed with a
+  retryable response before its output buffer exists. OTLP gRPC and the
+  OTAP zstd payload remain outside this ceiling; the codec that inflates
+  them cannot be intercepted before the fact, and the documentation now
+  says so plainly instead of claiming coverage it does not have.
+
+- **A `RavelCluster` upgrade with `spec.gateway.maxInflightFlushes` set
+  above the queued-flush cap no longer crash-loops every gateway pod**
+  (issue #1642). The server refused to start when `--max-inflight-flushes`
+  exceeded `--max-queued-flushes` (default 8), but the operator CRD exposes
+  `maxInflightFlushes` with no corresponding field for the queue cap, so an
+  already-running cluster configured above 8 would fail every gateway pod
+  on upgrade with no custom-resource edit able to recover it. Startup now
+  raises the effective queue cap to match the configured permit count
+  instead of refusing, logging a warning that names both values.
+
+- **OTLP no longer allocates unbounded memory exploding a wide classic
+  histogram, closing a memory-exhaustion vector** (issue #1681). One
+  histogram data point with N explicit bucket boundaries normalizes into
+  roughly N+3 points, each copying the point's full label set, and nothing
+  bounded N: a single request under the existing wire-size limit, holding
+  a handful of histograms whose bucket-boundary lists filled the body,
+  could explode into on the order of a million and a half points and
+  allocate accordingly before any per-tenant series limit had a chance to
+  run. A data point with more than 160 explicit bucket boundaries (an
+  order of magnitude above what real exporters emit) is now rejected before
+  any per-bucket allocation happens, and the total point count a request
+  would explode into is also compared against the per-request data-point
+  limit before that allocation, closing the remaining case of many
+  small-but-numerous histograms in one request.
+
+- **The OTAP gRPC metrics surface gained the same histogram-explosion cap
+  OTLP already has, closing the same memory-exhaustion vector on that
+  surface** (issue #1753). OTAP exploded a classic histogram the same way
+  OTLP does but carried neither of OTLP's two bounds: a single very wide
+  histogram on the OTAP surface could exhaust process memory in a way the
+  equivalent OTLP request would already have rejected. OTAP now applies the
+  same per-point bucket-count cap and the same post-explosion
+  per-request total check OTLP applies, verified by a differential test
+  that both surfaces now reject the same over-cap and over-total requests
+  identically. Three related exemplar-accounting gaps closed alongside it:
+  a request rejected for exceeding the exploded-point total had its
+  exemplars decoded before that check ran, so the rejection discarded
+  them without ever counting them as dropped; the check now runs before
+  exemplar decode, so that path has nothing left to discard uncounted. A
+  second rejection, on raw wire bucket count, never decoded exemplars at
+  all and so could not count them by the same means; it now derives the
+  dropped count from the columnar payload's own row count instead of
+  decoding. And a third payload type, exponential-histogram data points,
+  was missing from the dropped-exemplar count entirely on the path that
+  rejects them as unsupported. All three OTAP rejection paths now report
+  dropped exemplars with the same fidelity OTLP does.
+
+- **The ingest router no longer forwards a client-supplied identity header
+  to the upstream store when the mTLS header has been renamed away from
+  its default** (issue #1704). The router trusted a client-supplied
+  identity header for tenant resolution with no certificate verification
+  of its own, so any client could set that header and pick its own tenant.
+  The router now refuses `--mtls-enabled` outright rather than installing
+  an unverified mTLS resolver into its shared chain (a dedicated mTLS
+  listener able to isolate the resolver safely does not exist yet;
+  `--tenant-token` and `--oidc-issuer`/`--oidc-jwks-url` are the supported
+  alternatives), and it strips the client-supplied identity header from
+  every forwarded request on both the HTTP and gRPC paths before dialing
+  the upstream. That strip initially covered only the header's default
+  name: a deployment that renamed it via `--mtls-header` still forwarded
+  the client-supplied value upstream untouched, reopening the same
+  spoofing gap on exactly the deployments that had customized the header.
+  The configured header name, not just the default one, is now resolved
+  once and stripped under every key source. An operator who set a custom
+  `--mtls-header` should upgrade to pick up the fix; routing selection by
+  the mTLS-subject key source is unaffected, since a client can already
+  choose its own shard by that mechanism today and that is unchanged.
+
+- **Admission reconciliation's read cost no longer grows without bound as
+  processes come and go** (issue #1679). A per-`(tenant, signal)` admission
+  cycle lists a snapshot prefix and reads every key in it to enforce a
+  fleet-wide series cap; the prefix gained one key per process that had
+  ever run and nothing ever removed one, so the read cost grew with every
+  process that had ever existed. Past a few thousand stale keys a
+  reconciliation cycle took longer than its own staleness window, every
+  sibling snapshot read as stale, and each process silently fell back to
+  enforcing the whole fleet cap on its own, with every listing and read
+  still succeeding and no counter to show it happening. A stale key is now
+  skipped without a read once its last-modified time is already past the
+  staleness window, and a key past a wider horizon is deleted from the same
+  listing, bounding both the reads and the listing itself. The same fix
+  shape was applied to the maintenance worker heartbeat registry, which
+  had the identical unbounded-growth defect one prefix over.
+
+- **A `SELECT labels` result that a stock 4 MiB Arrow Flight client could
+  not read past about a dozen distinct series now fits well past that**
+  (issue #1519). `RsegDedupExec` keeps each deduplicated winner row as a
+  one-row slice of its source batch; slicing a `DictionaryArray` rewrites
+  only the key run and retains the whole source dictionary values buffer, so
+  concatenating ~1024 such one-row slices per flush appended every slice's
+  full dictionary, and the labels dictionary grew with the row count rather
+  than the distinct-series count. The flushed batch's labels column is now
+  rebuilt so its dictionary holds only the distinct label sets its surviving
+  rows actually reference, with rows re-keyed to the compacted entries: one
+  entry per distinct series in the batch regardless of how many rows
+  reference it. A test over the real scan-to-dedup pipeline pins the
+  flushed dictionary's length to the distinct label-set count rather than
+  the row count, and asserts the largest single Arrow IPC body (25 series
+  over 60,000 rows) fits inside the 4 MiB Flight default.
+
+- **A transient labels-dictionary blowup during dedup flush, and repeated
+  per-row rebuild work, are both closed** (issue #1582), following up on
+  #1519's per-flush dictionary compaction. `concat_batches` still
+  transiently materialized the full blown-up dictionary before that
+  per-flush compaction ran, measured at 350,192,304 bytes peak on a
+  many-series corpus; each one-row slice is now compacted in `finalize()`
+  before it is pushed to the pending output, so `concat_batches` only ever
+  sees at-most-one-entry dictionaries and the measured peak drops to
+  853,232 bytes (410x). `DedupStream::finalize` also memoizes its per-row
+  labels-dictionary rebuild by the source dictionary's values pointer plus
+  key, so consecutive winner rows from the same upstream batch and the same
+  dictionary key reuse the already-built array instead of rebuilding a
+  bit-identical one; the memo compares the values array by pointer as well
+  as by key; because a new upstream batch renumbers its own dictionary from
+  zero, a key-only memo would have relabeled one series' rows with
+  another's.
+
+- **A per-tenant bytes-scanned or S3-request budget check on the three
+  shipping SQL execution paths (`plan_pinned`, `plan_pinned_distributed`,
+  `worker_fragment_stream`) no longer quadruple-counts the same bytes and
+  refuses queries after a quarter of their real budget** (issue #1665).
+  `RsegScanExec`'s budget checks read a reduction that sums four
+  `PhaseAccounting` phase snapshots, which is only correct when the four
+  phases are independent handles; those three paths instead build the
+  handle with `pooled_over`, whose four phases are clones of one shared
+  counter, so the same reduction read that one counter four times. A shared
+  flag set once at construction now lets a new `pooled_snapshot()` method
+  pick the correct reduction (the resolve phase's own snapshot when
+  aliased, the existing summed reduction otherwise), so every caller reading
+  an aliased handle's total is correct by construction rather than by
+  remembering which constructor built it.
+
+- **Three ways to bypass the SQL complexity guard that aborts the process on
+  an over-bound statement are closed** (issue #1678), hardening the guard
+  that issue #1760 (below) later made impossible to skip entirely by
+  construction. A `/*! ... */` MySQL-style hint comment was scanned as an
+  ordinary comment and skipped, so eleven characters of wrapping hid an
+  arbitrarily long operator chain: `SELECT 1/*! +1 x2000 */` scored 7 while
+  the tokenizer actually produced 4,003 tokens from it. The scan now gives
+  the hint region its own mode that counts every non-whitespace character
+  inside it and enters no sub-mode of its own (an earlier fix that made it
+  fall through to ordinary counting mode reopened the same bypass through a
+  line comment inside the hint body). Separately, the switch from counting
+  characters to counting tokens undercounted a digit-then-word sequence like
+  `1AND` as one alphanumeric run costing one unit for two tokens, which
+  halved the guard's effective bound on a boolean chain: `SELECT 1 + AND 1`
+  repeated 998 times scored exactly 1,000 units and built a 998-level parse
+  tree, next to the roughly 1,050-1,080 levels at which the planner aborts
+  on a 2 MiB thread. A digit run now stops at the first non-digit; a run
+  starting with a letter or `_` still consumes alphanumerics, since `a1` is
+  one identifier. Finally, the audit redaction path (`redact`, used when
+  `--audit-text` is left at its default of `redacted`) parsed and walked
+  caller text with no complexity guard at all, so a 64 KiB statement that
+  `validate` had already rejected as too complex still reached `redact` and
+  aborted the process there; `redact` now runs the same guard `validate`
+  does before it parses.
+
+- **`DistributedScanExec` no longer fails an entire statement for the whole
+  `3 * H` staleness window because one assigned worker is dead but still
+  registered** (issue #1684). Each scan slice now runs the same three-step
+  sequence the PromQL lane's routing fetcher already uses: the assigned
+  worker, exactly one re-dispatch to a different location, then a
+  coordinator-local read of the same slice ticket (`worker_fragment` over
+  the ticket's pinned segments against the same object store, which is
+  byte-identical to the remote result it replaces) before finally returning
+  a typed `SqlError::Execution` naming the last cause. Each attempt is
+  probed for its first batch before the partition emits anything, so a
+  fallback can never feed the coordinator's merge a second run of the same
+  rows, and `SliceFallbackCounters` counts a re-dispatch and a
+  coordinator-local read as separate figures. The coordinator's own record
+  is also dropped from the SQL worker roster, since it always serves its
+  own slices through the local path and dispatching one to itself over
+  Flight was a wasted hop.
+
+- **A federated coordinator that can resolve more than one local tenant can
+  no longer leak one tenant's remote series to another** (issue #1295).
+  Federation held one remote credential per process with no way to say which
+  local tenant it belonged to, so on a coordinator serving more than one
+  local tenant (two or more `--tenant-token` values, or any dynamic resolver
+  such as `--dev-insecure-tenant-header`, `--oidc-issuer`, or
+  `--mtls-enabled`), every local tenant's metric selectors and discovery
+  calls fanned out to the remotes under that single shared credential: each
+  local tenant received the remote tenant's series, and the remote tenant's
+  data reached whichever local tenant happened to ask. `--remote-cluster`
+  now takes a tenant key naming the one local tenant whose queries may use
+  that remote's credential, and `Federation::fetch` selects remotes by the
+  caller's tenant before dispatch, so an unmapped local tenant presents no
+  credential and is answered from local data alone; an unkeyed
+  `--remote-cluster` spec is refused at startup on any coordinator that can
+  resolve more than one local tenant, naming the offending clusters and the
+  remedy. A follow-up closed the same leak on the alerting path: the
+  multi-tenant check originally counted only distinct `--tenant-token`
+  values, missing that `--alert-rules-file` starts one evaluator per tenant
+  against the same shared engine with no incoming request to carry a tenant
+  key, so a single-token deployment with a second tenant's alert rules read
+  as single-tenant and let that tenant's rules evaluate against the remote
+  tenant's series. Both checks now read the union of the token-derived
+  tenants and the alert-rules file's tenant keys.
+
+- **Every parse of caller text in `ravel-sql` now runs the pre-parse
+  complexity guard, because one function does both** (issue #1760),
+  matching what issue #1817 already did on the PromQL side. Three functions
+  in the crate built their own parser over caller text: `validate`, the
+  audit redactor (`redact`), and the page planner (`page_plan`'s
+  `parse_query`). Only two of the three ran the guard by convention: the
+  redactor gained its call in a review round (issue #1678, above), and the
+  page planner had never had one, resting on the unenforced assumption that
+  `validate` had already accepted the same text first. `parse_guarded` is
+  now the crate's only parse of caller text: it runs the complexity check
+  and then builds the parser, so `validate`, `redact` and `page_plan` all go
+  through it and a fourth entry point cannot reach the parser without the
+  guard in front of it. A new gate script,
+  `scripts/guards/check-guarded-sql-parse.sh`, refuses any mention of a SQL
+  parser front end under `crates/ravel-sql/src/` outside that one function.
+
+- **Nine PromQL evaluator code paths that used to abort the whole process on
+  an ordinary query shape now return a typed error instead** (issue #1701).
+  A parsed tenant query could reach an `unreachable!()` arm for: an unknown
+  aggregator token, an aggregate whose inner expression evaluates to a
+  non-vector, a missing or wrongly-typed `limitk`/`count_values` parameter, a
+  binary operator whose operands are neither both scalar nor both vector, a
+  `ManyToMany` vector match on a non-set operator, and a matrix-typed
+  function argument reaching a non-matrix AST node - each on the mistaken
+  assumption that promql-parser's own type checking had already ruled the
+  shape out. Each arm now returns `Error::Unsupported` naming the operator
+  or type, with a test built from a synthetic AST the parser cannot
+  currently produce, demonstrating the arm panics if reverted. A follow-up
+  found one more gap in the same area: `eval_binary` dispatches "if
+  `is_comparison(op)` then `apply_cmp` else `apply_arith`", so a
+  `Scalar/Scalar` or `Scalar/Vector` expression using `and`, `or`, or
+  `unless` reached `apply_arith`'s fallback and aborted, because nothing in
+  Ravel (only promql-parser's own `check_ast`, which sits on a caret version
+  range) narrowed those shapes out. `eval_binary` now checks the operator's
+  class before dispatching on operand types, rejecting a set operator over
+  scalar operands with a typed error before the scalar-handling functions
+  run; `Vector/Vector` set operators keep their existing path unchanged. A
+  new guard script, `scripts/guards/check-promql-unreachable.sh`, requires
+  every remaining `unreachable!()` under `crates/ravel-promql/src` to name
+  the check that narrows it out of reach.
+
+- **A log segment scan with one overflowing `attrs_raw` block no longer
+  drops the rest of its partition's block list onto the slower row-decode
+  path** (issue #1769). Blocks past a block whose attributes overflow the
+  per-object dynamic-column budget used to stay on the row path for the
+  remainder of the scan, even blocks with no overflow at all, because the
+  scan only knew how to reopen the segment once and commit to row mode from
+  there. `LogSegmentScan` now falls back for the offending block only and
+  resumes columnar decoding after it, since its columnar and row cursor-
+  advance paths already share one primitive. The narrowing is bounded
+  rather than unconditional: a tenant with more than about a hundred
+  distinct declared attribute names has overflow in most blocks of an
+  object, and reopening once per block would cost quadratic redecode work
+  on exactly the tenants already slowest on this path, so after two
+  consecutive fallbacks with no clean block in between, the scan commits the
+  rest of the partition's list to the row path in one reopen, capping any
+  one segment at two reopens regardless of its block count.
+
+- **A log lane query's reported `segments_pruned` and `segments_fetched`
+  figures are now derived from the actual set of segments each fetch
+  touched, instead of being summed or maxed across a query's plans** (issue
+  #1228). The log lane's `stats.segments_pruned` first silently
+  under-reported because `prefetch` discarded the count `fetch_log_series`
+  already computed per plan and substituted the catalog resolve's own
+  figure, which is structurally always `0` for this lane (the resolve
+  passes no name filter to prune against). Summing each plan's own pruned
+  count fixed that but introduced a double-count: every plan in a log lane
+  re-walks the same resolved segment list under the same padded window, so
+  a segment one plan pruned could be exactly the segment another plan
+  fetched, and a two-plan query where each plan pruned the other's segment
+  reported `pruned=2, fetched=1` over a 2-segment snapshot that had pruned
+  nothing. `fetch_log_series` now reports which segments it fetched as
+  indexes into the shared segment slice; the log lane unions these indexes
+  across its plans and derives `segments_fetched` as the union's size and
+  `segments_pruned` as the remainder, so the two figures sum to the
+  resolved segment count by construction for any plan count, saturating at
+  zero to stay fail-closed if a future caller passes a subslice.
+
+- **A wide tenant's per-segment column statistics could silently disable
+  pruning for every query, and are now split into one bounded object per
+  snapshot part instead of one growing-without-bound object per tenant**
+  (issues #1413, #1483, ADR-1413). The prior `.cstat` object held every
+  `ColumnStatsSegment` record for a whole (tenant, signal) as one compressed
+  frame, decoded whole to serve any part of it, and refused to inflate
+  anything over a 256 MiB safety ceiling. On a measured 104-column,
+  703-segment tenant the object decoded to a body of 2,000,102,795 bytes,
+  7.5x that ceiling: the decode was refused, the refusal was silently
+  degraded to "no column statistics for this tenant", and every query on it
+  fell back to a full scan (7,645 GETs for a single-column `COUNT(*)` where
+  statistics would have pruned). The fold now emits one per-part `.cstat`
+  object alongside each part, referenced from the part's own
+  `SnapshotPartRef`, so decoding one part's statistics costs only that
+  part's bytes; an over-ceiling part degrades (drops to an unpruned scan for
+  that part only) instead of refusing the whole tenant's statistics. Issue
+  #1483 closed a gap in the migration window between the old and new
+  format: the reader treated any successful v2 (whole-object) fetch as
+  answering every segment and stopped consulting v1, but a published v2
+  object can legitimately omit a segment its fold couldn't build
+  statistics for, so a part v2 omitted with no v3 object yet got no
+  statistics at all and scanned silently. The reader now tracks the parts
+  still needing a fallback explicitly and only clears that list once the
+  entries v2 actually decoded meet or exceed the entry count the snapshot
+  HEAD declares.
+
+- **Age-based retention now counts selective-erasure rewrite records, not
+  only L0 commit records and compaction records** (issues #1313, #1321). A
+  bucket's newest-event computation and its physical delete sweep both read
+  only two of the three record kinds a bucket can hold, so an
+  ADR-0064 rewrite record was invisible to both. Once the rewrite's own
+  superseded inputs were swept, the rewrite record became the only live
+  record the bucket held (its durable steady state, since compaction and
+  migration both decline a bucket carrying one), so expiry evaluation saw no
+  records at all and treated the bucket as never expired: the retention
+  window stopped applying to it permanently. If such a bucket was tombstoned
+  before its inputs were swept, the physical sweep deleted every other
+  record but left the rewrite record behind, so the verifying listing found
+  residue on every pass and the sweep outcome stayed `SweptPartial` forever,
+  with the tombstone never deleted. Expiry evaluation now decodes and
+  verifies every rewrite record it lists and folds its timestamp into the
+  same maximum as the other two kinds (a rewrite record with no surviving
+  parts, which the schema permits, contributes its own publish time rather
+  than pinning the bucket forever); the physical sweep deletes rewrite
+  records in the same pass, between compaction records and L0 data objects,
+  so the existing delete ordering and the tombstone-deleted-last invariant
+  are unchanged. The tombstone's recorded object count now includes rewrite
+  records too, so a rewrite-only bucket's audit evidence no longer reads as
+  a bucket that was never written to.
+
+- **A production panic in selective-erasure rewrite on an empty, never-
+  compacted L0 bucket is fixed** (issue #1410). A windowless erasure request
+  (one covering a whole series, with no time-range restriction) passed the
+  rewrite's overlap prefilter for every bucket with any live record, because
+  that filter short-circuits to true for a windowless request before it can
+  apply its usual empty-range check. Against a bucket with zero L0 commits
+  and nothing ever compacted, that left the rewrite build with an empty
+  input set and no superseded record to point to, which is a caller-contract
+  violation the code enforces with a panic. Any caller that fed the derived
+  set of not-yet-sealed hours into rewrite would panic on almost every
+  request, since that set is empty for most shards once sealed, making this
+  a live production path rather than an edge case. The rewrite now checks
+  for this one shape before it builds anything, and reports it the same way
+  it already reports a bucket with no overlapping request at all: nothing to
+  do, nothing written. No data was at risk; the defect was an availability
+  one, a panic instead of a no-op.
+
+- **The listing conformance suite now certifies both entry points a listing
+  call can use, and bounds every page-drain against a backend that never
+  terminates a listing** (issue #1448). The suite's key-ordering probe
+  drained its full pass through `list_after` only, and `list` and
+  `list_after` are separately implemented on a real backend (a native S3
+  client overrides each), so a backend whose `list` delivered keys out of
+  order, or re-delivered an earlier key across a page boundary, while its
+  `list_after` stayed correct, could pass qualification and then fail every
+  production catalog scan, which drains through `list`. The suite now runs
+  the ordering and distinct-set checks against a full pass through each
+  entry point, and every listing failure the suite reports now names which
+  one failed. Separately, the page-drain loop looped until a page carried no
+  continuation token, so a backend that kept returning the same token spun
+  forever, silently, because the existing de-duplication hid the repeat
+  without ever stopping it; every caller that drains a prefix, including
+  every catalog scan, inherited that risk. A drain now recognizes a repeated
+  continuation token as a spinning backend and returns a typed error rather
+  than looping, and is capped at 100,000 pages (100 million keys at the
+  contract's 1000-key page size) against a backend that keeps returning new
+  tokens without ever finishing. `docs/object-store-contract.md` documents
+  both entry points as judged on their raw delivery sequence and states the
+  new page and repeat bounds.
+
+- **The listing conformance suite's delete-visibility check now actually
+  exercises the `list_after` entry point it claims to test** (issue #1498).
+  The probe previously drained only `list` and asserted a deleted key was
+  absent there, so a backend whose `list_after` kept showing a deleted key
+  as present could still pass qualification: `list` and `list_after` are
+  separately implemented methods, and a delete visible through one but not
+  the other is a real defect the probe must catch on its own rather than
+  depend on which call a caller happens to use. The probe now drains both
+  and asserts the deleted key is absent from each; a new fixture whose
+  delete genuinely applies (so `get` and `list` see it gone) but whose
+  `list_after` still re-injects the deleted key proves the new half of the
+  check actually fails when it should, since the assertion could otherwise
+  read correct while no fixture in the suite ever reached it. Every
+  listing-drain failure the suite reports (a listing error, or a pager that
+  never terminates) now also names the entry point it happened on, matching
+  the ordering and distinct-set failures, which already did.
+
+- **Selective-erasure rewrite carries exemplars through its output, filtered
+  per record so an erased instant's exemplar is dropped exactly like its
+  sample** (issue #1512). A rewrite previously wrote every output segment
+  with no exemplars at all, silently dropping every exemplar in a rewritten
+  bucket, including exemplars belonging to series an erasure request never
+  touched; this went unnoticed because exemplars are not counted samples, so
+  the rewrite's own sample-count conservation check stayed clean regardless.
+  Exemplars are now carried into the output and matched one at a time
+  against the same per-record predicate the sample rows use: an exemplar
+  survives only if its own series has at least one surviving sample in the
+  output and no pending erasure request's window covers the exemplar's own
+  timestamp. This distinction matters because once a request's completion
+  record is written, its erasure request record is removed and no later
+  query-time filter applies, so this rewrite pass is the only place a
+  windowed request's exemplars are ever checked against the erasure window
+  they fall in; a series-level check alone (keep every exemplar on a series
+  with any surviving sample) would carry forward the value, trace ID, span
+  ID and attributes of an exemplar sitting inside an otherwise-erased
+  window. A series whose labels cannot be resolved during the rewrite now
+  drops the exemplar rather than keeps it, since an erasure path must favor
+  deletion over retention when it cannot verify a candidate. The rewrite
+  report now counts `exemplars_kept` and `exemplars_dropped` so this is
+  visible at the point of the rewrite rather than only inferable later.
+
+- **The maintenance loop (retention, compaction, and garbage collection) now
+  survives a panic and reports its own liveness, instead of silently dying
+  and leaving every maintenance metric frozen** (issue #1683). The loop ran
+  as a single spawned task with no restart and no completion signal of its
+  own; every maintenance gauge on `/metrics` is written only at the end of a
+  completed cycle, so a panic anywhere in the loop's discovery or sweep call
+  graph left the process Running and Ready while `tenants_maintained`,
+  `units_stalled`, and every safety gauge froze at their last healthy
+  values. Retention stopped deleting expired data, compaction stopped
+  folding, and the sweeper stopped reclaiming space, with nothing on
+  `/metrics` moving to say so until a query failed on stale or missing data,
+  potentially days later. The loop is now wrapped so a panicking cycle is
+  caught rather than taking the process down, counted on the new
+  `ravel_maintain_loop_panics_total`, and restarted after a backoff (1
+  second, doubling to a 60-second ceiling, reset whenever an attempt
+  completes at least one cycle, whether or not it later panics); a new gauge,
+  `ravel_maintain_last_cycle_completed_timestamp_seconds`, is stamped at the
+  end of every completed cycle, so its age, not its value, is the operator
+  signal that the loop itself has stopped making progress. `docs/guides/
+  observability.md` documents a `RavelMaintenanceLoopStalled` alert on the
+  gauge's age (staleness over 1800 seconds, six default 5-minute maintain
+  intervals) and a `RavelMaintenanceLoopCrashLooping` alert on a sustained
+  rate of panics (more than 3 in an hour, held 15 minutes), because a loop
+  that completes a cycle
+  between every panic re-stamps the liveness gauge and resets its own
+  backoff, so the gauge alone would stay quiet through that crash-loop
+  shape. A related no-full-sweep alert is gated on the process actually
+  owning at least one unit, so an empty cluster or a replica holding no
+  units under the current ownership split does not page for correctly
+  completing zero sweeps.
+
+- **The listing conformance suite's pagination probes now force a real
+  continuation-token boundary instead of passing on a fixed, small key
+  count** (issue #1695). `S3Store`'s declared page size does not change the
+  wire-level page size a real S3-compatible backend uses: each listing call
+  opens its own lazy stream, pulls at most the declared number of entries
+  off it, and drops the stream, so the backend's own continuation token
+  goes unfollowed only when the declared size is smaller than what one real
+  response actually carries. The suite's probes wrote a fixed handful of keys
+  and
+  accepted "more than one page" as proof of correct pagination, which an
+  in-memory backend could satisfy with a trailing empty page emitted purely
+  to mark the end of a listing, proving nothing about a real backend's
+  pagination at all. Both probes now write enough keys, relative to the
+  declared page size, to force at least two pages that actually carry
+  objects, and fail qualification naming the real page count otherwise.
+  `ravel-cli store qualify` gains a `--list-page-size` flag (default: the
+  production S3 page size) so a qualification run exercises a real boundary
+  against the store it is qualifying; a qualification run against the
+  default page size now leaves about 2,018 scratch objects behind rather
+  than a handful, which `docs/guides/kubernetes.md` and
+  `docs/object-store-contract.md` now state so an operator's cleanup sweep
+  sizes for the right number. The conformance suite version is unchanged:
+  this changes how existing probes size their input, not which properties
+  are checked, so no previously qualified store needs re-qualification.
+
+- **The quarantine reaper is now held for the full duration of a live
+  mass-orphan incident, and a legal hold now reaches a quarantined copy**
+  (issue #1748). The reaper previously ran on every pass regardless of
+  whether the mass-orphan breaker had tripped, so a record loss that grows
+  over days (quarantining a few objects early, then widening until the
+  breaker trips on every pass by day 7) still had its earliest quarantined
+  copies physically deleted at the first quarantine horizon, which is
+  exactly the permanence the quarantine mechanism exists to prevent, just
+  arriving one horizon later. The reaper is now skipped for the whole time
+  the breaker is tripped; a `force_orphan_gc` override is not a trip and
+  still reclaims for an operator who has made that call. Separately, a
+  legal hold on a tenant's data could not protect an object once it was
+  quarantined, because hold scopes and the hold check are both plain
+  prefix matches under `t/<tenant>/`, and a `quarantine/...` key never
+  matches that prefix; the reap now also checks the hold against the
+  recovered original key. `quarantine/` is a root-level key prefix alongside
+  `t/` and `sys/` that was named in no key-layout document, leaving an
+  operator writing a lifecycle rule or an IAM prefix policy with no
+  documented reason to include it; `docs/deletion-and-gc.md`'s incident
+  runbook also gained a restore-from-quarantine step, since the previous
+  procedure (reconstruct from the live prefix) reads nothing once an object
+  has been quarantined past the first horizon. Separately in this same
+  review round, `docs/query-engine.md`'s worked example of the derived
+  per-query S3 request budget is corrected from 48,200 to 15,800: the
+  48,200 figure used
+  a 500ms flush-cadence reference pair that a stock server, which ships a
+  2-second flush cadence, does not actually run at.
+
+- **A query coordinator's per-worker heartbeat key is now reaped, bounding a
+  cost that previously grew for the life of the deployment** (issue #1761).
+  A query-worker heartbeat key under `sys/query/workers/` was deleted only
+  on a graceful drain, so a worker lost to a panic, a kill, an
+  out-of-memory event, or a node loss left its key behind forever; the
+  coordinator's liveness check lists the whole prefix and pays one read per
+  key found, so the cost of a call made on every distributed query grew
+  with the total count of query workers that had ever run, not the count
+  currently alive. Liveness itself stayed correct throughout, since a stale
+  heartbeat is read as dead, so nothing failed loudly while the cost grew.
+  The liveness check now skips the extra read for a key the listing already
+  shows as older than the liveness window, and a key past the reap horizon
+  (twice that window, a clock-skew margin between the object store's clock
+  and the reader's, not a second independent duration) is deleted outright,
+  reusing the same shared predicates already shipped for the maintain and
+  admission worker sets. On a deployment running the shipped query IAM
+  template, this delete is currently denied
+  (the template grants no `s3:DeleteObject` at all), so the reap logs a
+  warning and the prefix does not shrink even though the extra-read savings
+  still apply; granting `s3:DeleteObject` on `sys/query/workers/*` to the
+  query role is required for the reap itself to take effect.
+
+- **A graceful shutdown no longer drops acknowledged, buffered rows, and an
+  overrun of `--shutdown-timeout` now fails the process instead of exiting
+  clean** (issue #1291). Two ordering defects previously lost buffered records
+  even though a drain ran: the router flush depended on an `Arc` unwrap that a
+  still-live sweep task's clone made fail silently, and the drain awaited
+  every open listener, under the same overall budget, before flushing at all,
+  so a slow client holding a connection open could exhaust the whole shutdown
+  budget before any flush ran. The flush now runs unconditionally before the
+  listener join, the listener join runs inside its own sub-budget (four fifths
+  of `--shutdown-timeout`), and an overrun of `--shutdown-timeout` now returns
+  an error and a non-zero exit rather than logging "shutdown complete" after
+  silently dropping the tail of the drain. This is a fix to the drain ordering
+  itself, distinct from the residual-tenant and overrun metrics already
+  covered under issue #1742. To keep the grace period ahead of the new drain's
+  worst case, the operator now sizes `terminationGracePeriodSeconds` on every
+  rendered `ravel-server` pod at 45 seconds (a 10 second preStop sleep plus
+  the server's pinned 32.5 second SIGTERM-to-exit worst case at shipped
+  defaults, plus headroom) and adds the preStop sleep itself, rather than
+  leaving Kubernetes' 30 second default in place.
+
+- **Flight SQL clients dialed the wrong listener** (issue #1296). The SQL
+  distributed lane now dials a query worker's dedicated Flight SQL endpoint (a
+  new `flight_sql_endpoint` field on the worker record) instead of the TLS-
+  only fragment listener, which never spoke the Flight SQL protocol.
+
+- **MCP cursors now pin the inputs a page was resolved from, not an
+  enumeration of the segments that resolution produced** (issues #1501,
+  #1529). Enumerating segments could push a token past its own bound and past
+  the 256 KiB response floor on a large range; the cursor now carries the
+  signal, the half-open event-time range, the minimum commit-token watermark,
+  the pending erasure predicates in force, the typed attribute column set, and
+  a keyset position, and is re-resolved deterministically on redemption. The
+  cursor now has its own 4 KiB bound, tracked separately from the shared
+  scalar allowance it previously competed with the plan and failure message
+  for; a cursor that would exceed its own bound is now an internal-error
+  condition rather than a silent drop with a warning, since only a server
+  defect can produce one. Redemption now also expires a cursor whose pinned
+  data a compaction has since taken apart, or whose signal and event-time
+  range now intersect an erasure predicate that came into force after the
+  cursor was minted (`cursor_expired`), keeping this distinct from
+  `cursor_invalid` for a tampered or wrong-tenant token. An envelope that
+  already carried a failure (`budget_exceeded`, `unavailable`) no longer has
+  that failure overwritten by the generic message an over-bound cursor
+  produces; the first, more specific failure is now preserved.
+  `CURSOR_VERSION` is 4; a cursor minted under an earlier version is refused.
+
+- **An MCP tool result can now carry a large unsigned 64-bit integer as an
+  exact integer cell** (issue #1525). The wire cell type was a 64-bit signed
+  integer, so a value above `i64::MAX` fell back to a string cell, giving an
+  unsigned column a different cell type from a signed one. The cell now
+  carries the union of the signed and unsigned 64-bit ranges, and only a
+  genuine float becomes a float cell.
+
+- **The MCP protection horizon is minted as a future instant** (issue #1560).
+  It was computed in the past, which made every cursor redemption's deadline
+  re-clamp against it fail immediately.
+
+- **OTLP metric writes that silently dropped informational data (histogram
+  min/max, exemplars, integer precision) now report that drop in the partial-
+  success response** (issue #1585). The partial-success gate previously keyed
+  off the rejected point count, and an informational drop rejects nothing, so
+  it took the `None` arm and discarded the `error_message` naming what was
+  dropped; a sender lost min/max on every write and saw a response identical
+  to a clean one. The gate now keys off whether anything was rejected at all,
+  so a `rejected_data_points` count of 0 can still carry a populated
+  `error_message`, which is what the OTLP proto reserves that field for.
+
+- **The quickstart deploy's MinIO images and OpenTelemetry Collector image
+  move off Docker Hub** (issue #1645). Docker Hub's anonymous pull allowance
+  is scoped by source IP and shared with every other project on a runner, so
+  an exhausted allowance failed the quickstart job with a message that pointed
+  at credentials rather than at the real limit. Eight MinIO references move to
+  quay.io (both images in `docker-compose/minio.yml`, `docker-
+  compose/ravel.yml`, `k8s/minio.yaml`, and `metricsbench/docker-compose.yml`,
+  plus the `mc` invocations in the chaos and demo scripts), preserving the
+  existing digest pins, which quay.io serves under the identical digest. The
+  Collector moves to the `ghcr.io` path the upstream project publishes it
+  under. Grafana's image stays on Docker Hub: no anonymous mirror was found on
+  `ghcr.io`, `quay.io`, or `public.ecr.aws`, so the quickstart job still makes
+  one anonymous Docker Hub pull, down from three.
+
+- **Every image the quickstart deploy compose files and Kubernetes manifests
+  pull is now pinned to a release tag plus an immutable digest** (issue
+  #1720). Across the two quickstart compose files, 8 image lines are scanned
+  and 6 require a digest (Ravel's own released image is exempt by exact
+  match); all 6 images referenced by the Kubernetes manifests are now pinned
+  the same way. A repo-wide check now scans both compose files and the
+  manifests so the two cannot drift apart unnoticed.
 
 ## [0.15.0] - 2026-09-08
 
