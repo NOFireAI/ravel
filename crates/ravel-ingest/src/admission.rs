@@ -92,28 +92,45 @@ pub struct AdmissionLimits {
 }
 
 impl AdmissionLimits {
-    pub const DEFAULT_MAX_ACTIVE_SERIES: u64 = 1_000_000;
-    pub const DEFAULT_MAX_ACTIVE_STREAMS: u64 = 1_000_000;
+    /// Per-tenant active-series cap, sized against the measured cost of the
+    /// two-epoch tracker rather than ADR-0051 section 2's original estimate.
+    ///
+    /// A live `HashSet` entry costs 35-56 bytes once hashbrown's
+    /// power-of-two table sizing at 7/8 load and allocator headroom are
+    /// counted, not the ~16 bytes the ADR assumed. The worst case is that
+    /// cost times the cap times 2 rotating epochs times 2 tracked signals
+    /// (series and log streams), so 200,000 bounds a fully active tenant's
+    /// tracker at 28,000,000 to 44,800,000 bytes (27-43 MiB) where
+    /// 1,000,000 would bound it at 140,000,000 to 224,000,000 bytes
+    /// (134-214 MiB), before multiplying across tenants and replicas.
+    /// `--limits-file` raises it per tenant where the memory is available.
+    pub const DEFAULT_MAX_ACTIVE_SERIES: u64 = 200_000;
+    /// Per-tenant active-log-stream cap. Same tracker, same arithmetic as
+    /// [`Self::DEFAULT_MAX_ACTIVE_SERIES`]; the two are the two signals the
+    /// worst case above multiplies by.
+    pub const DEFAULT_MAX_ACTIVE_STREAMS: u64 = 200_000;
     pub const DEFAULT_INGEST_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
     pub const DEFAULT_INGEST_BYTE_BURST: u64 = 64 * 1024 * 1024;
+    /// A token bucket's memory is two `u64`s regardless of the configured
+    /// rate, so the corrected per-entry cost has no bearing on this knob or
+    /// on [`Self::DEFAULT_SERIES_CREATION_BURST`]; both stand as ADR-0051
+    /// section 3 proposed them.
     pub const DEFAULT_SERIES_CREATION_RATE_PER_SEC: u64 = 10_000;
     pub const DEFAULT_SERIES_CREATION_BURST: u64 = 100_000;
 }
 
-/// ADR-0051 section 3's defaults, NOT what `services/ravel-server` ships.
+/// The one set of shipped admission defaults, for every caller.
 ///
-/// `DEFAULT_MAX_ACTIVE_SERIES` / `DEFAULT_MAX_ACTIVE_STREAMS` here are
-/// 1,000,000, the ADR's original figure, assuming ~16 bytes per tracked
-/// identity in the two-epoch `HashSet` tracker. Measurements put the
-/// real cost at 35-56 bytes per live entry (hashbrown's power-of-two
-/// table sizing plus allocator headroom), so at 1,000,000 the worst case
-/// (cap x bytes-per-entry x 2 rotating epochs x 2 tracked signals) is
-/// roughly 140-224 MiB per fully active tenant. `ravel-server` overrides
-/// both to 200,000 in its own shipped defaults
-/// (`services/ravel-server/src/config.rs`, `limits::shipped_defaults`),
-/// cutting that worst case to roughly 27-43 MiB, and does not construct
-/// this `Default` impl in its startup path. The two crates carrying
-/// different defaults is a known discrepancy, not yet reconciled.
+/// `services/ravel-server`'s `config::limits::shipped_defaults` returns this
+/// value rather than building its own literal, and its
+/// `shipped_defaults_are_the_library_default` test fails if that stops being
+/// true. Two constants that must agree, kept in agreement by remembering,
+/// drift silently; there is one number here instead.
+///
+/// The count caps are ADR-0051 section 3's knobs at a corrected figure (see
+/// [`AdmissionLimits::DEFAULT_MAX_ACTIVE_SERIES`]); the rate caps are the
+/// ADR's own. docs/guides/admission-limits.md carries the operator-facing
+/// arithmetic and per-tenant-count examples.
 impl Default for AdmissionLimits {
     fn default() -> Self {
         AdmissionLimits {
@@ -1061,6 +1078,70 @@ fn admit_batch<T: Eq + Hash + Copy>(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// The doc on [`AdmissionLimits::DEFAULT_MAX_ACTIVE_SERIES`] justifies the
+    /// cap with a worst-case byte figure, and a number that is only written
+    /// down is decoration. This asserts the arithmetic the doc states, so
+    /// changing the cap without restating the bound fails here.
+    ///
+    /// The worst case is cap x bytes-per-live-entry x 2 rotating epochs x 2
+    /// tracked signals, with the entry cost measured at 35-56 bytes (ADR-0051
+    /// section 2's corrected figure, not its original ~16).
+    #[test]
+    fn active_count_cap_bounds_the_tracker_at_the_documented_bytes() {
+        const MIN_BYTES_PER_ENTRY: u64 = 35;
+        const MAX_BYTES_PER_ENTRY: u64 = 56;
+        const EPOCHS: u64 = 2;
+        const SIGNALS: u64 = 2;
+
+        assert_eq!(AdmissionLimits::DEFAULT_MAX_ACTIVE_SERIES, 200_000);
+        assert_eq!(AdmissionLimits::DEFAULT_MAX_ACTIVE_STREAMS, 200_000);
+
+        let cap = AdmissionLimits::DEFAULT_MAX_ACTIVE_SERIES;
+        assert_eq!(cap * MIN_BYTES_PER_ENTRY * EPOCHS * SIGNALS, 28_000_000);
+        assert_eq!(cap * MAX_BYTES_PER_ENTRY * EPOCHS * SIGNALS, 44_800_000);
+
+        // The figure the superseded ADR default would have carried, kept so
+        // the 5x it represents is visible beside the one that shipped.
+        assert_eq!(
+            1_000_000 * MIN_BYTES_PER_ENTRY * EPOCHS * SIGNALS,
+            140_000_000
+        );
+        assert_eq!(
+            1_000_000 * MAX_BYTES_PER_ENTRY * EPOCHS * SIGNALS,
+            224_000_000
+        );
+    }
+
+    /// `Default` is the single source of truth for shipped limits (issue #23);
+    /// every field must come from the named constant rather than a literal
+    /// written inline, which is how a second set of numbers gets in.
+    #[test]
+    fn default_is_built_from_the_named_constants() {
+        let limits = AdmissionLimits::default();
+        assert_eq!(
+            limits.max_active_series,
+            CountLimit::Bounded(AdmissionLimits::DEFAULT_MAX_ACTIVE_SERIES)
+        );
+        assert_eq!(
+            limits.max_active_streams,
+            CountLimit::Bounded(AdmissionLimits::DEFAULT_MAX_ACTIVE_STREAMS)
+        );
+        assert_eq!(
+            limits.ingest_byte_rate,
+            RateLimit::Bounded {
+                per_sec: AdmissionLimits::DEFAULT_INGEST_BYTES_PER_SEC,
+                burst: AdmissionLimits::DEFAULT_INGEST_BYTE_BURST,
+            }
+        );
+        assert_eq!(
+            limits.series_creation_rate,
+            RateLimit::Bounded {
+                per_sec: AdmissionLimits::DEFAULT_SERIES_CREATION_RATE_PER_SEC,
+                burst: AdmissionLimits::DEFAULT_SERIES_CREATION_BURST,
+            }
+        );
+    }
 
     struct TestClock(AtomicI64);
 
