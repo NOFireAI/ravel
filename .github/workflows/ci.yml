@@ -286,8 +286,8 @@ jobs:
         run: scripts/guards/check-doc-figures.sh
       # The store-probe `0` explanation had been copied across the tree,
       # with four failed sweeps behind it (issue #1982). One canonical
-      # block, pointers everywhere else, and this guard refusing a new copy. Cases
-      # first, same reason as every other guard here.
+      # block, pointers everywhere else, and this guard refusing a new
+      # copy. Cases first, same reason as every other guard here.
       - name: Claim single-source guard cases (issue #1982)
         run: bash scripts/guards/check-claim-single-source.test.sh
       - name: Store-probe zero claim has one home (issue #1982)
