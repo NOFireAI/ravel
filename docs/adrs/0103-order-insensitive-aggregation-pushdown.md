@@ -19,7 +19,10 @@ per-worker distinct-group sets are all associative and commutative, so a
 worker-side partial plus a coordinator-side combine is exact *if* the
 partials are computed over a duplicate-free partition of the data — the
 qualifier this epic's design turns on. Order-sensitive aggregates
-(`sum`, `avg`, `stddev`, quantiles) are explicitly out of scope.
+(`sum`, `avg`, `stddev`, quantiles) are explicitly out of scope. This
+list does not distinguish the two aggregation axes PromQL has; the
+`_over_time` narrowing amendment below cuts it to the within-series,
+over-a-window shape and defers the cross-series operators.
 
 **The reason this isn't a small wire-format addition: a series can be
 duplicated across workers, and pushdown must not silently produce a
@@ -211,7 +214,9 @@ sign-of-zero handling stays consistent with every other typed-aggregate
 path in this codebase. For group enumeration: union the per-worker
 distinct series sets (a series belongs to exactly one worker under
 decision 1's eligibility gate, so this union has no overlaps to resolve
-— a real invariant to assert with a test, not assume).
+— a real invariant to assert with a test, not assume). The `_over_time`
+narrowing amendment below replaces the summing described here with a
+collect: no two workers ever hold a partial for the same series.
 
 ### 4. Planner integration: two independent gates, neither one reused wholesale from ADR-0094
 
@@ -349,7 +354,7 @@ flowchart TB
 
 ## Amendment: narrowed to single-step `_over_time` range functions; decision 3's combine is a collect, not a sum
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="Context|3. Coordinator-side combine" pointer="`_over_time` narrowing amendment" -->
 
 T1-T3 shipped the eligibility gate, the `PartialAggregate` wire frame, and
 worker-side partial computation exactly as decided above. Wiring a real

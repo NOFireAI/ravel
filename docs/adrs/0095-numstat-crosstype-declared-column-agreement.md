@@ -43,7 +43,9 @@ write-path logic never consulted. #333's fix
 (`writer.rs:753-791`, `record_level_winners`) computes, per record and per
 *indexed* name, the record-level cross-type winner: columnar entries sorted
 by type byte, then overflow entries sorted by `canonical_value_bytes`, take
-the last entry of the combined list. NumStat has no equivalent.
+the last entry of the combined list. NumStat has no equivalent. (That name
+and that line range are both stale today; the function-name amendment below
+maps every write-side name this ADR uses onto the shipped one.)
 
 That record-level winner is only half of what a reader actually sees,
 though. `merged_attrs` (`ravel-sql/src/rlog_attrs.rs`) seeds its result from
@@ -110,7 +112,8 @@ two-tier ordering (columnar by type byte, then overflow by
 `canonical_value_bytes`, last wins) as the single source of *record-level*
 winner resolution for both POSTINGS and NumStat. Do not write a second
 implementation of that order — a second copy is the exact kind of
-divergence that produced #333.
+divergence that produced #333. The shipped code reaches this same winner
+under different names; see the function-name amendment below.
 
 That record-level winner is not the whole answer by itself (see Context).
 Both POSTINGS and NumStat must resolve a name the same way
@@ -272,6 +275,8 @@ whenever a future ADR-0090 amendment adds declared f64 columns.
   (stream-attrs seed, then `record_level_winners` overlay, widened to
   `numstat_names`), reducing the chance of a third divergent
   reimplementation the next time a section needs merged-view resolution.
+  The function-name amendment below gives the shipped name for that
+  overlay.
 - Every existing RLOG object (trailer version 2) becomes unreadable once
   v3-only readers ship. No `maintain migrate` path exists for this
   transition. Convergence is retention expiry or re-ingestion, full stop.
@@ -299,9 +304,12 @@ flowchart TD
     SKIP -->|range may overlap| LOAD["block loaded, declared_column_array resolves via same winner rule"]
 ```
 
+The `record_level_winners` node above is named `StampScratch::finish` in the
+shipped writer; the function-name amendment below carries the full map.
+
 ## Amendment 2026-09-06: the write-side function names in this ADR (#1135)
 
-<!-- amendment-applies: none -->
+<!-- amendment-applies: sections="NumStat is blind to cross-type and overflow duplicates|1. Generalize the cross-type winner computation, seeded from the same layer merged_attrs uses|Consequences|Diagram" pointer="function-name amendment" -->
 
 This ADR names `record_level_winners` (Context, Decision 1, Consequences,
 and the diagram above) and cites `writer.rs:753-791`; it also names
