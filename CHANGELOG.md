@@ -340,9 +340,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ravel_memory_handoff_overlap_bytes` are now on `/metrics`. Two startup
   defects in the derived budget were closed alongside this: a host where memory
   could not be measured (any non-Linux host) used to derive a budget of `0`
-  instead of unlimited, and a `--cache-max-bytes`/`--catalog-cache-max-bytes`
-  combination landing at or above the derived budget used to be accepted rather
-  than refused; both used to leave `MemoryBudget::new(0)` in place, which
+  instead of unlimited, and a `--cache-max-bytes` value that, with the derived
+  catalog cache, landed at or above the derived budget used to be accepted
+  rather than refused; both used to leave `MemoryBudget::new(0)` in place, which
   refuses every real SQL or fetch reservation while a statement that reserves
   nothing (`SELECT 1`) kept answering.
 
@@ -403,21 +403,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wave.
 
 - **A native MCP (Model Context Protocol) adapter is available behind the
-  off-by-default `mcp` build feature and a `--mcp` runtime flag, serving nine
-  tools over `POST /mcp`** (issue #1379, ADR-1374 decision 9). The new
-  `ravel-mcp` crate ships `ravel_capabilities`, `ravel_describe_data`,
+  off-by-default `mcp` build feature and a `--mcp` runtime flag, exposing its
+  nine-tool catalog over `POST /mcp`** (issue #1379, ADR-1374 decision 9). The
+  new `ravel-mcp` crate ships `ravel_capabilities`, `ravel_describe_data`,
   `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`,
   `ravel_query_promql`, `ravel_search_logs`, `ravel_get_trace` and
-  `ravel_analyze_timeseries`; the `mcp` feature implies `sql`, since four of
-  the nine tools execute SQL through the query service. Every tool response
-  is bounded before it reaches the wire: cursors are opaque, MAC'd,
-  self-describing tokens bound to the call that minted them, envelope cells
-  are sized by their serialized length rather than by field count, and a
+  `ravel_analyze_timeseries` by name. Only `ravel_capabilities` has a body in
+  this release: the other eight answer every call with a typed `NotShipped`
+  protocol error naming the tool, and `ravel_capabilities` reports which tools
+  are served apart from the full catalog. The `mcp` feature implies `sql`, since
+  four of the nine tools are built to execute SQL through the query service.
+  Every tool response is bounded before it reaches the wire: cursors are opaque,
+  MAC'd, self-describing tokens bound to the call that minted them, envelope
+  cells are sized by their serialized length rather than by field count, and a
   compact text rendering is capped at 20 rows and 64 KiB with every caller
   string escaped and control characters stripped. `ravel-sql` gained a
-  `pin-codec` feature so the cursor codec can reuse `FlightTicket`,
-  `TicketKey` and `SegmentPin`'s keyed-MAC pattern without linking Arrow
-  Flight.
+  `pin-codec` feature so the cursor codec can reuse `FlightTicket`, `TicketKey`
+  and `SegmentPin`'s keyed-MAC pattern without linking Arrow Flight.
 
 - **A hex-string `trace_id` literal now plans, alongside the existing
   `X'...'` byte-literal form** (issue #1709). The traces guide documents
@@ -522,27 +524,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cache, so the full budget is available to the shared SQL and fetch
   accounting and the container starts.
 
-- **A new MCP (Model Context Protocol) surface can be mounted on the query-
-  serving listeners, behind its own feature and flag** (issue #1381). `--mcp`
-  opts a build carrying the `mcp` cargo feature into serving `POST /mcp`;
-  `--mcp-allowed-origins` is a mandatory origin allowlist (an empty list is
-  accepted only on a loopback listener, and fails startup on any other address);
-  `--mcp-max-body-bytes` caps the request body (default 1 MiB) and refuses a
-  value of 0. The route runs the same tenant resolution, origin check, and body
-  cap as the HTTP query surfaces before anything reaches the protocol layer, and
-  each tool call is billed through the same admission permit, deadline clamp,
-  cost record, usage guard, audit submission, partial-result gate, and error
-  redaction as an HTTP query. Starting the process with `--mcp` under `--mode
-  gateway` or `--mode maintain` now fails at startup, naming the flag and the
-  mode, instead of silently mounting nothing. `ravel_capabilities` reports which
-  tools are actually served (`tools.enabled`) separately from the full catalog
-  (`tools.catalogued`). A `finish` response now names `visibility.snapshot_id`,
-  `visibility.watermark_hour`, `ids.query_id`, or `ids.audit_ref` in its
-  `warnings` list when the underlying operation left that field unmeasured,
-  rather than rendering an empty string a caller cannot distinguish from a
-  genuinely empty value. A malformed MCP budget argument is now refused rather
-  than silently defaulted, and `row_cap_hit` together with the produced row
-  count now survive through to `finish` instead of being dropped along the way.
+- **A new MCP (Model Context Protocol) surface can be mounted on the
+  query-serving listeners, behind its own feature and flag** (issue #1381).
+  `--mcp` opts a build carrying the `mcp` cargo feature into serving `POST
+  /mcp`; `--mcp-allowed-origins` is a mandatory origin allowlist (an empty list
+  is accepted only on a loopback listener, and fails startup on any other
+  address); `--mcp-max-body-bytes` caps the request body (default 1 MiB) and
+  refuses a value of 0. The route runs the same tenant resolution, origin check,
+  and body cap as the HTTP query surfaces before anything reaches the protocol
+  layer, and each tool call is billed through the same admission permit,
+  deadline clamp, cost record, usage guard, audit submission, partial-result
+  gate, and error redaction as an HTTP query. Starting the process with `--mcp`
+  under `--mode gateway` or `--mode maintain` now fails at startup, naming the
+  flag and the mode, instead of silently mounting nothing. `ravel_capabilities`
+  reports which tools are actually served (`tools.enabled`) separately from the
+  full catalog (`tools.catalogued`). A `finish` response now names
+  `visibility.snapshot_id`, `visibility.watermark_hour`, `ids.query_id`, or
+  `ids.audit_ref` in its `warnings` list when the underlying operation left that
+  field unmeasured, rather than rendering an empty string a caller cannot
+  distinguish from a genuinely empty value. A malformed MCP budget argument is
+  now refused rather than silently defaulted, and `row_cap_hit` together with
+  the produced row count now survive through to `finish` instead of being
+  dropped along the way.
 
 - **A `--max-ingest-lag` flag replaces the hardcoded 2h ingest admission
   bound** (issue #1682). The value drives both the catalog listing window and
@@ -586,14 +589,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default to 100m CPU and 256Mi memory; query pods default to 200m CPU and
   512Mi memory. A spec that sets its own requests is unaffected.
 
-- **A new CRD field, `spec.gateway.maxInflightFlushes`, renders `--max-
-  inflight-flushes` on the gateway Deployment** (issue #1743). This is the
-  per-shard cross-tenant flush isolation bound: without it, an operator-
-  managed cluster was stuck at the server's compiled-in default of 1, so one
-  tenant's stalled flush could block every co-resident tenant's flush on that
-  shard. The field is gateway-only, since ingest and its flush isolation only
-  run under `--mode gateway`; when unset, nothing is rendered and the cluster
-  keeps the server's own default. A value of 0 is refused, matching the
+- **A new CRD field, `spec.gateway.maxInflightFlushes`, renders
+  `--max-inflight-flushes` on the gateway Deployment** (issue #1743). This is
+  the per-shard cross-tenant flush isolation bound: without it, an
+  operator-managed cluster was stuck at the server's compiled-in default of 1,
+  so one tenant's stalled flush could block every co-resident tenant's flush on
+  that shard. The field is gateway-only, since ingest and its flush isolation
+  only run under `--mode gateway`; when unset, nothing is rendered and the
+  cluster keeps the server's own default. A value of 0 is refused, matching the
   server's own refusal of `--max-inflight-flushes 0` as a flush deadlock.
 
 - **New maintenance-safety and admission-reconciliation counters and gauges
@@ -1859,30 +1862,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an aliased handle's total is correct by construction rather than by
   remembering which constructor built it.
 
-- **Three ways to bypass the SQL complexity guard that aborts the process on
-  an over-bound statement are closed** (issue #1678), hardening the guard
-  that issue #1760 (below) later made impossible to skip entirely by
-  construction. A `/*! ... */` MySQL-style hint comment was scanned as an
-  ordinary comment and skipped, so eleven characters of wrapping hid an
-  arbitrarily long operator chain: `SELECT 1/*! +1 x2000 */` scored 7 while
-  the tokenizer actually produced 4,003 tokens from it. The scan now gives
-  the hint region its own mode that counts every non-whitespace character
-  inside it and enters no sub-mode of its own (an earlier fix that made it
-  fall through to ordinary counting mode reopened the same bypass through a
-  line comment inside the hint body). Separately, the switch from counting
-  characters to counting tokens undercounted a digit-then-word sequence like
-  `1AND` as one alphanumeric run costing one unit for two tokens, which
-  halved the guard's effective bound on a boolean chain: `SELECT 1 + AND 1`
-  repeated 998 times scored exactly 1,000 units and built a 998-level parse
-  tree, next to the roughly 1,050-1,080 levels at which the planner aborts
-  on a 2 MiB thread. A digit run now stops at the first non-digit; a run
-  starting with a letter or `_` still consumes alphanumerics, since `a1` is
-  one identifier. Finally, the audit redaction path (`redact`, used when
-  `--audit-text` is left at its default of `redacted`) parsed and walked
-  caller text with no complexity guard at all, so a 64 KiB statement that
-  `validate` had already rejected as too complex still reached `redact` and
-  aborted the process there; `redact` now runs the same guard `validate`
-  does before it parses.
+- **Three ways to bypass the SQL complexity guard that aborts the process on an
+  over-bound statement are closed** (issue #1678), hardening the guard that
+  issue #1760 (below) later made impossible to skip entirely by construction. A
+  `/*! ... */` MySQL-style hint comment was scanned as an ordinary comment and
+  skipped, so five characters of wrapping hid an arbitrarily long operator
+  chain: `SELECT 1/*!` followed by `+1` 2,000 times and `*/` scored 7 while the
+  tokenizer actually produced 4,003 tokens from it. The scan now gives the hint
+  region its own mode that counts every non-whitespace character inside it and
+  enters no sub-mode of its own (an earlier fix that made it fall through to
+  ordinary counting mode reopened the same bypass through a line comment inside
+  the hint body). Separately, the switch from counting characters to counting
+  tokens undercounted a digit-then-word sequence like `1AND` as one alphanumeric
+  run costing one unit for two tokens, which halved the guard's effective bound
+  on a boolean chain: `SELECT 1` followed by `AND 1` 998 times scored exactly
+  1,000 units and built a 998-level parse tree, next to the roughly 1,050-1,080
+  levels at which the planner aborts on a 2 MiB thread. A digit run now stops at
+  the first non-digit; a run starting with a letter or `_` still consumes
+  alphanumerics, since `a1` is one identifier. Finally, the audit redaction path
+  (`redact`, used when `--audit-text` is left at its default of `redacted`)
+  parsed and walked caller text with no complexity guard at all, so a 64 KiB
+  statement that `validate` had already rejected as too complex still reached
+  `redact` and aborted the process there; `redact` now runs the same guard
+  `validate` does before it parses.
 
 - **`DistributedScanExec` no longer fails an entire statement for the whole
   `3 * H` staleness window because one assigned worker is dead but still
@@ -1967,22 +1969,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every remaining `unreachable!()` under `crates/ravel-promql/src` to name
   the check that narrows it out of reach.
 
-- **A log segment scan with one overflowing `attrs_raw` block no longer
-  drops the rest of its partition's block list onto the slower row-decode
-  path** (issue #1769). Blocks past a block whose attributes overflow the
-  per-object dynamic-column budget used to stay on the row path for the
-  remainder of the scan, even blocks with no overflow at all, because the
-  scan only knew how to reopen the segment once and commit to row mode from
-  there. `LogSegmentScan` now falls back for the offending block only and
-  resumes columnar decoding after it, since its columnar and row cursor-
-  advance paths already share one primitive. The narrowing is bounded
-  rather than unconditional: a tenant with more than about a hundred
-  distinct declared attribute names has overflow in most blocks of an
-  object, and reopening once per block would cost quadratic redecode work
-  on exactly the tenants already slowest on this path, so after two
-  consecutive fallbacks with no clean block in between, the scan commits the
-  rest of the partition's list to the row path in one reopen, capping any
-  one segment at two reopens regardless of its block count.
+- **A log segment scan with one overflowing `attrs_raw` block no longer drops
+  the rest of its partition's block list onto the slower row-decode path**
+  (issue #1769). Blocks past a block whose attributes overflow the per-object
+  dynamic-column budget used to stay on the row path for the remainder of the
+  scan, even blocks with no overflow at all, because the scan only knew how to
+  reopen the segment once and commit to row mode from there. `LogSegmentScan`
+  now falls back for the offending block only and resumes columnar decoding
+  after it, since its columnar and row cursor-advance paths already share one
+  primitive. The narrowing is bounded rather than unconditional: a tenant with
+  more than about a hundred distinct declared attribute names has overflow in
+  most blocks of an object, and reopening once per block would cost quadratic
+  redecode work on exactly the tenants already slowest on this path, so after
+  two consecutive fallbacks with no clean block in between, the scan commits the
+  rest of the partition's list to the row path in one reopen, capping any one
+  segment at two reopens regardless of its block count.
 
 - **A log lane query's reported `segments_pruned` and `segments_fetched`
   figures are now derived from the actual set of segments each fetch
@@ -2054,22 +2055,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   records too, so a rewrite-only bucket's audit evidence no longer reads as
   a bucket that was never written to.
 
-- **A production panic in selective-erasure rewrite on an empty, never-
-  compacted L0 bucket is fixed** (issue #1410). A windowless erasure request
-  (one covering a whole series, with no time-range restriction) passed the
-  rewrite's overlap prefilter for every bucket with any live record, because
-  that filter short-circuits to true for a windowless request before it can
-  apply its usual empty-range check. Against a bucket with zero L0 commits
-  and nothing ever compacted, that left the rewrite build with an empty
-  input set and no superseded record to point to, which is a caller-contract
-  violation the code enforces with a panic. Any caller that fed the derived
-  set of not-yet-sealed hours into rewrite would panic on almost every
-  request, since that set is empty for most shards once sealed, making this
-  a live production path rather than an edge case. The rewrite now checks
-  for this one shape before it builds anything, and reports it the same way
-  it already reports a bucket with no overlapping request at all: nothing to
-  do, nothing written. No data was at risk; the defect was an availability
-  one, a panic instead of a no-op.
+- **A production panic in selective-erasure rewrite on an empty, never-compacted
+  L0 bucket is fixed** (issue #1410). A windowless erasure request (one covering
+  a whole series, with no time-range restriction) passed the rewrite's overlap
+  prefilter for every bucket with any live record, because that filter
+  short-circuits to true for a windowless request before it can apply its usual
+  empty-range check. Against a bucket with zero L0 commits and nothing ever
+  compacted, that left the rewrite build with an empty input set and no
+  superseded record to point to, which is a caller-contract violation the code
+  enforces with a panic. Any caller that fed the derived set of not-yet-sealed
+  hours into rewrite would panic on almost every request, since that set is
+  empty for most shards once sealed, making this a live production path rather
+  than an edge case. The rewrite now checks for this one shape before it builds
+  anything, and reports it the same way it already reports a bucket with no
+  overlapping request at all: nothing to do, nothing written. No data was at
+  risk; the defect was an availability one, a panic instead of a no-op.
 
 - **The listing conformance suite now certifies both entry points a listing
   call can use, and bounds every page-drain against a backend that never
@@ -2260,8 +2260,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Flight SQL clients dialed the wrong listener** (issue #1296). The SQL
   distributed lane now dials a query worker's dedicated Flight SQL endpoint (a
-  new `flight_sql_endpoint` field on the worker record) instead of the TLS-
-  only fragment listener, which never spoke the Flight SQL protocol.
+  new `flight_sql_endpoint` field on the worker record) instead of the TLS-only
+  fragment listener, which never spoke the Flight SQL protocol.
 
 - **MCP cursors now pin the inputs a page was resolved from, not an
   enumeration of the segments that resolution produced** (issues #1501,
@@ -2296,14 +2296,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-clamp against it fail immediately.
 
 - **OTLP metric writes that silently dropped informational data (histogram
-  min/max, exemplars, integer precision) now report that drop in the partial-
-  success response** (issue #1585). The partial-success gate previously keyed
-  off the rejected point count, and an informational drop rejects nothing, so
-  it took the `None` arm and discarded the `error_message` naming what was
-  dropped; a sender lost min/max on every write and saw a response identical
-  to a clean one. The gate now keys off whether anything was rejected at all,
-  so a `rejected_data_points` count of 0 can still carry a populated
-  `error_message`, which is what the OTLP proto reserves that field for.
+  min/max, exemplars, integer precision) now report that drop in the
+  partial-success response** (issue #1585). The partial-success gate previously
+  keyed off the rejected point count, and an informational drop rejects nothing,
+  so it took the `None` arm and discarded the `error_message` naming what was
+  dropped; a sender lost min/max on every write and saw a response identical to
+  a clean one. The gate now keys off whether anything was rejected at all, so a
+  `rejected_data_points` count of 0 can still carry a populated `error_message`,
+  which is what the OTLP proto reserves that field for.
 
 - **The quickstart deploy's MinIO images and OpenTelemetry Collector image move
   off Docker Hub** (issue #1645). Docker Hub's anonymous pull allowance is
