@@ -68,9 +68,10 @@ pub struct TenantNormalizeRejects {
     /// rate. Normative description: docs/guides/observability.md.
     pub body_conversions_total: u64,
     /// Resource attributes outside the allowlist, dropped rather than turned
-    /// into labels (issue #116). Informational, like `body_conversions_total`:
-    /// the point that carried them was still admitted, so this must never be
-    /// read as, or folded into, a rejection reason. A tenant whose resources
+    /// into labels. Informational, like `body_conversions_total`: counted
+    /// before the series cap and the write, so not a count of stored points,
+    /// and this must never be read as, or folded into, a rejection reason. A
+    /// tenant whose resources
     /// carry high-cardinality attributes the allowlist does not cover shows up
     /// here; the count says nothing about which attribute, since key names are
     /// caller-controlled and unbounded and this crate does not label by them
@@ -113,9 +114,9 @@ impl NormalizeRejectMetrics {
     }
 
     /// Adds `count` dropped-outside-the-allowlist resource attributes to
-    /// `(tenant, signal)` (issue #116). Separate from [`Self::record`] for the
-    /// same reason [`Self::record_body_conversions`] is: this is not a
-    /// rejection and must not move a rejection reason.
+    /// `(tenant, signal)`. Separate from [`Self::record`] for the same
+    /// reason [`Self::record_body_conversions`] is: this is not a rejection
+    /// and must not move a rejection reason.
     pub fn record_resource_attrs_dropped(&self, tenant: &TenantId, signal: Signal, count: usize) {
         if count == 0 {
             return;
