@@ -699,6 +699,11 @@ impl Catalog {
                 "resolve_prefix_concurrency must be > 0",
             ));
         }
+        if config.resolve_prefix_concurrency > crate::config::MAX_RESOLVE_GET_CONCURRENCY {
+            return Err(CatalogError::InvalidConfig(
+                "resolve_prefix_concurrency exceeds MAX_RESOLVE_GET_CONCURRENCY",
+            ));
+        }
         // `byte_cache_max_bytes == 0` is the disabled sentinel:
         // build no byte cache at all rather than a zero-capacity one, so the
         // resolve path reads straight through the store with no RAM tier and no

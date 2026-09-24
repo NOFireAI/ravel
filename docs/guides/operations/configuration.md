@@ -1119,7 +1119,10 @@ concurrent query: prefix LISTs, commit-record GETs, snapshot-part GETs, and
 the postings and column-stats reads that go with them. Unset, it resolves to
 `clamp(Q * 128, 128, 4096)` held at an interim 1,024, where `Q` is
 `--max-concurrent-queries` when that flag bounds queries and the same
-`max(8, 2 x cores)` the flags above use when queries are unbounded. 128 is
+`max(8, 2 x cores)` the flags above use when queries are unbounded. That flag
+is the fleet-wide query ceiling, not a per-replica one, so with several
+replicas each one sizes its resolve ceiling for the whole fleet's queries and
+is correspondingly generous. 128 is
 what one shard-hour prefix sustains, so `Q` concurrent resolves over `Q`
 different shard-hours each get one prefix's worth. Worked examples:
 `--max-concurrent-queries 1` resolves to 128, `--max-concurrent-queries 4` to
