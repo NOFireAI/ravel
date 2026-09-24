@@ -187,8 +187,7 @@ pub async fn handle_export(
         .into_iter()
         .map(IngestExemplar::from)
         .collect();
-    let normalized = result.output;
-    let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    let mut normalized = result.output;
     // Layer 3's rejections, counted where they are observed rather than inside
     // the normalizer, which knows no tenant. Classified per point, so the
     // counter moves by exactly the normalization share of the
@@ -199,13 +198,23 @@ pub async fn handle_export(
         ravel_types::Signal::Metrics,
         NormalizeRejectCounts::from_metric_rejections(&normalized.rejected),
     );
-    // Informational, not an admission decision (issue #116): counted
-    // separately so it never moves the `reason` label above.
+    // Informational, not an admission decision: counted separately so it
+    // never moves the `reason` label above, and recorded to `/metrics` only.
+    // It must never reach the OTLP response, so strip it from `rejected`
+    // before anything downstream (the partial-success gate, the error
+    // message) reads that list. Every stock SDK resource carries
+    // `telemetry.sdk.*` attributes the default allowlist does not cover, so
+    // surfacing this to senders would flag nearly every clean export as
+    // partial.
     state.normalize_metrics.record_resource_attrs_dropped(
         &tenant,
         ravel_types::Signal::Metrics,
         ravel_otlp::resource_attrs_dropped_from_rejections(&normalized.rejected),
     );
+    normalized
+        .rejected
+        .retain(|r| !matches!(r, Rejection::ResourceAttributesDropped { .. }));
+    let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
 
     // Scalar and native-histogram points arrive in separate vectors; both
     // feed one ingest write so a request's points share a single receipt.
@@ -1251,6 +1260,93 @@ mod tests {
             outcome.response.partial_success
         );
         assert!(!outcome.tokens.is_empty(), "the points landed");
+    }
+
+    /// A resource carrying only stock-SDK attributes the default allowlist
+    /// does not cover (`telemetry.sdk.name`, `telemetry.sdk.language`,
+    /// `telemetry.sdk.version`, present on every export from every stock
+    /// OpenTelemetry SDK) is dropped from the labels but must never turn a
+    /// clean export into a partial success. The drop is informational and
+    /// visible only on `/metrics`.
+    #[tokio::test]
+    async fn resource_attrs_dropped_never_produces_partial_success() {
+        use opentelemetry_proto::tonic::common::v1::AnyValue;
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+            metric::Data as MetricData,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        fn string_kv(key: &str, value: &str) -> KeyValue {
+            KeyValue {
+                key: key.to_string(),
+                value: Some(AnyValue {
+                    value: Some(AnyValueVariant::StringValue(value.to_string())),
+                }),
+                ..Default::default()
+            }
+        }
+
+        let state = state();
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![
+                        string_kv("telemetry.sdk.name", "opentelemetry"),
+                        string_kv("telemetry.sdk.language", "rust"),
+                        string_kv("telemetry.sdk.version", "1.2.3"),
+                    ],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests".to_string(),
+                        data: Some(MetricData::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: BASE_TS_NS as u64,
+                                value: Some(NumberValue::AsDouble(1.0)),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request,
+            BASE_TS_NS,
+        )
+        .await
+        .expect("strict write publishes");
+
+        assert!(
+            outcome.response.partial_success.is_none(),
+            "dropped resource attributes alone must not produce a partial success, got: {:?}",
+            outcome.response.partial_success
+        );
+        assert!(!outcome.tokens.is_empty(), "the point landed");
+
+        let resource_attrs_dropped: u64 = state
+            .normalize_metrics
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.signal == Signal::Metrics)
+            .map(|row| row.resource_attrs_dropped_total)
+            .sum();
+        assert_eq!(
+            resource_attrs_dropped, 3,
+            "telemetry.sdk.name/language/version are each counted"
+        );
     }
 
     #[tokio::test]
