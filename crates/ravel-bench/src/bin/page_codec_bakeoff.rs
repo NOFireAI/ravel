@@ -818,7 +818,7 @@ fn resolved_dependency_version(crate_name: &str) -> String {
     // ravel-bench's own edge, not just any crate of this name in the graph:
     // find ravel-bench's node in the resolve graph and read the version its
     // dependency edge actually names. Package ids are opaque PackageIdSpec
-    // strings (e.g. `path+file:///.../ravel-bench#0.16.0`); resolve the id via
+    // strings (e.g. `path+file:///.../ravel-bench#0.16.1`); resolve the id via
     // the packages array by name rather than pattern-matching the id shape.
     let Some(bench_pkg_id) = packages
         .iter()
