@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ravel-bench` passes `clippy -D warnings` under `--all-features`**
+  (issue #1925). The `read_path_accounting` binary's `Backend` enum carried
+  an unboxed `S3Config` in its S3 variant next to a data-less variant, so
+  `clippy::large_enum_variant` failed the workspace build once
+  `--all-features` was in play. The field is now boxed, with no change in
+  behavior.
+
 ## [0.16.1] - 2026-09-25
 
 ### Fixed
