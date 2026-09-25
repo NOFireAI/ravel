@@ -291,14 +291,19 @@ chaos_rustfs_healthy() {
 # Run one AWS CLI command against the chaos store, in the pinned container,
 # with the chaos credentials. Arguments are the aws subcommand and its flags.
 chaos_aws() {
-  docker run --rm --network host \
-    -e "AWS_ACCESS_KEY_ID=${RAVEL_S3_ACCESS_KEY}" \
-    -e "AWS_SECRET_ACCESS_KEY=${RAVEL_S3_SECRET_KEY}" \
-    -e "AWS_DEFAULT_REGION=${RAVEL_S3_REGION}" \
-    -e AWS_EC2_METADATA_DISABLED=true \
-    "$CHAOS_AWS_CLI_IMAGE" \
-    --endpoint-url "$CHAOS_RUSTFS_ENDPOINT" \
-    "$@"
+  # Credentials are exported in a subshell and passed by name, so the secret
+  # never reaches the docker argv or docker inspect (the same rule as dr_aws).
+  (
+    export AWS_ACCESS_KEY_ID="${RAVEL_S3_ACCESS_KEY}"
+    export AWS_SECRET_ACCESS_KEY="${RAVEL_S3_SECRET_KEY}"
+    export AWS_DEFAULT_REGION="${RAVEL_S3_REGION}"
+    docker run --rm --network host \
+      -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+      -e AWS_EC2_METADATA_DISABLED=true \
+      "$CHAOS_AWS_CLI_IMAGE" \
+      --endpoint-url "$CHAOS_RUSTFS_ENDPOINT" \
+      "$@"
+  )
 }
 
 # Wait up to N attempts (1 s apart) for a predicate command to succeed.
@@ -331,8 +336,8 @@ rustfs_up() {
   fi
 
   log "ensuring bucket ${RAVEL_S3_BUCKET} exists"
-  # create-bucket is idempotent against RustFS, so this is safe on a reused
-  # data directory.
+  # The `|| true` covers a bucket left over on a reused data directory; the
+  # emptying step below then works on whichever bucket is there.
   chaos_aws s3api create-bucket --bucket "$RAVEL_S3_BUCKET" >/dev/null 2>&1 || true
 
   # Start every scenario on an empty store. The compose file bind-mounts
