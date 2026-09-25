@@ -324,9 +324,9 @@ aws s3api get-object-retention --bucket <primary> --key <protected-key> --versio
 Confirm in the replication output that `DeleteMarkerReplication` is `Enabled`
 (the mandate above), that the destination bucket is in a different account and
 region under a different `ReplicaKmsKeyID`, and, if you need a stated RPO,
-that RTC (`ReplicationTime`) is enabled. MinIO's bucket replication is
-equivalent for these purposes; use the `mc replicate` equivalents against a
-MinIO deployment.
+that RTC (`ReplicationTime`) is enabled. On an S3-compatible store that
+implements bucket replication, use that store's own replication
+configuration; the mandates above are what it has to satisfy.
 
 ## Restore procedure: the replica is a restore source, never a live failover target
 
@@ -472,9 +472,9 @@ Append a new row per rehearsal; keep prior rows as history.
 
 A separate process-kill evidence lane lives under `scripts/chaos/`, with one
 script per scenario and a shared library. Both scripts run the scenario
-end to end against a real MinIO, and both take `--check` (equivalently
+end to end against a real RustFS, and both take `--check` (equivalently
 `--dry-run`) to validate their structure and dependencies without starting
-MinIO, driving load, or issuing a real kill:
+RustFS, driving load, or issuing a real kill:
 
 | Script | Scenario | Pinned oracle |
 |---|---|---|
@@ -487,8 +487,8 @@ from 1 for an ordinary failure and from anything above 2 for a setup or usage
 error, so the distinction is legible in a rehearsal record.
 
 Record each real run here under the same discipline as the table above. A run
-without MinIO can only produce the `--check` result, which is not a rehearsal
-record: a real end-to-end run against MinIO is what fills a row.
+without RustFS can only produce the `--check` result, which is not a rehearsal
+record: a real end-to-end run against RustFS is what fills a row.
 
 ## Summary
 

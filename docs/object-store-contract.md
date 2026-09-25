@@ -139,7 +139,7 @@ trait honors cancellation by drop, so the query deadline (usually well under
 - Conditional-put failure maps by mode: under `CreateIfAbsent` a
   precondition failure surfaces as `AlreadyExists`; under `CasVersion` as
   `PreconditionFailed`. A conformance test asserts both against real S3
-  and MinIO (the memory oracle alone cannot catch a uniform mapping).
+  and RustFS (the memory oracle alone cannot catch a uniform mapping).
 - Concurrent conditional writes racing the same key may surface as a
   transient conflict; after retry the loser must land on
   `AlreadyExists`/`PreconditionFailed` per mode. A raced `CreateIfAbsent`
@@ -457,11 +457,11 @@ idempotency and identity discriminator, not a transport check.
 AWS S3 since Dec 2020 provides strong read-after-write and list
 consistency; S3 conditional writes (If-None-Match/If-Match) provide
 CreateIfAbsent and CAS. GCS: generation preconditions. Azure: etags +
-leases. MinIO supports the full mandatory set. Server-side upload checksums
+leases. RustFS supports the full mandatory set. Server-side upload checksums
 are reachable through `object_store`'s whole-client
 `with_checksum_algorithm` (SHA-256 / CRC64-NVME), which
 `S3HttpConfig::upload_integrity` opts into; SHA-256 is the broadly supported
-choice (AWS S3 and MinIO), CRC64-NVME needs a recent endpoint. The default is
+choice (AWS S3 and RustFS), CRC64-NVME needs a recent endpoint. The default is
 `Off`, so `S3Store` reports `upload_checksum: false` unless a mode is
 configured (see "Upload checksums").
 
@@ -663,7 +663,7 @@ This is a runtime, once-per-bucket check, not a replacement for the
 compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`
 is a development-time
 proof that each adapter *implementation* honors the trait, run in CI against
-all three backends including a real MinIO endpoint. `conformance.rs` is an
+all three backends including a real RustFS endpoint. `conformance.rs` is an
 operator-facing probe of one specific *deployment*, the actual configured
 endpoint and bucket, because the adapter can be correct while the vendor
 serving it is not (a misconfigured storage class, a proxy in front of the
@@ -1009,8 +1009,9 @@ ADR-0042 decision 3.
    scripted fault. This is a test primitive on the wrapper, not a general store
    capability, and its existence is not a claim that production code depends on
    completion order (it does not, per ADR-0059).
-3. `S3Store`: `object_store` crate adapter (AWS S3 + MinIO via endpoint
-   override), honoring every MUST above.
+3. `S3Store`: `object_store` crate adapter (AWS S3, plus an S3-compatible
+   endpoint such as RustFS via the endpoint override), honoring every MUST
+   above.
 
 ### Instrumentation decorator
 
@@ -1063,9 +1064,11 @@ run only against a live endpoint: the composite `"<digest>-<partcount>"` ETag,
 which proves the parts really went out as parts rather than being buffered into
 one PUT, and `put()`'s own threshold switch. The `S3Store` case is gated on
 `RAVEL_MINIO_URL`; the CI
-`object-store-contract` job (`.github/workflows/ci.yml`) stands up MinIO,
+`object-store-contract` job (`.github/workflows/ci.yml`) stands up RustFS,
 creates the bucket, sets that variable, and asserts the gated test executed
-rather than skipping. This job is required: S3 is the only durable backend,
+rather than skipping. The variable and the `minio_contract` test keep their
+names: they name the gate, not the vendor, and renaming them would break
+every checkout and CI lane that already sets them. This job is required: S3 is the only durable backend,
 so an adapter regression must fail CI.
 
 `crates/ravel-object-store/tests/s3_http_faults.rs` covers what neither the
@@ -1080,7 +1083,7 @@ succeeded. Because the endpoint records every request with a timestamp, the
 assertions are on what the server saw: a throttled GET/PUT is really re-sent, a
 403 is really sent once, the pause between attempts really grows, and a failed
 multipart upload really leaves no object at the key. No live endpoint and no
-Docker, so it runs in the default `cargo test`, unlike the MinIO-gated
+Docker, so it runs in the default `cargo test`, unlike the endpoint-gated
 assertions above.
 
 ### Per-tenant KMS routing decorator

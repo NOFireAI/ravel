@@ -29,7 +29,7 @@ original.
 
 The millisecond figures the harness prints **do not reproduce across hosts**:
 they depend on CPU, memory, and — by an order of magnitude — on the object-store
-backend (local filesystem vs MinIO vs S3). They do not reproduce across two
+backend (local filesystem vs RustFS vs S3). They do not reproduce across two
 instances of the same type either: issue #680 measured a 1.6x to 2x gap between
 two c6a.4xlarge boxes at identical settings. So the safe default is that only
 **ratios within one run** are comparable: query A versus query B, cold versus
@@ -52,7 +52,7 @@ pre-#677 multi-shard tenant numbers as a lower bound, not the dataset.
   `RAVEL_S3_ENDPOINT`, `RAVEL_S3_ACCESS_KEY_ID`, `RAVEL_S3_SECRET_ACCESS_KEY`,
   `RAVEL_S3_ALLOW_HTTP`, `RAVEL_S3_FORCE_PATH_STYLE`); point `ravel-cli` at the
   same store with its global `--store` flag. A ~100M-row load needs durable
-  storage, so this is the `s3` backend (real S3 or MinIO), not `memory`.
+  storage, so this is the `s3` backend (real S3 or RustFS), not `memory`.
 - The `sql-latency` cargo feature builds the harness; it is off by default.
 
 ## 1. Fetch the dataset (you run this, not this guide)

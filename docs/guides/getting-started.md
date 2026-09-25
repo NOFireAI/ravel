@@ -25,7 +25,7 @@ docker compose -f deploy/docker-compose/ravel.yml up -d
 
 That brings up five things, all from published images:
 
-- MinIO on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (console), plus a
+- RustFS on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (console), plus a
   one-shot that creates the `ravel-dev` bucket.
 - A one-shot that qualifies the store. `ravel-server` refuses to start against a
   bucket that carries no qualification record, and there is deliberately no
@@ -44,7 +44,7 @@ That brings up five things, all from published images:
 
 Every published port binds loopback (`127.0.0.1`) only, and every credential is
 a fixed development value (`demo-token`, and `ravel` / `ravel-dev-secret` for
-MinIO). None of it is for a network-reachable deployment.
+RustFS). None of it is for a network-reachable deployment.
 
 The compose file also sets `RAVEL_AUDIT_TOKEN_KEY` to a fixed development key
 so the audit trail can tokenize query text. Set your own 64-hex-character
@@ -63,7 +63,7 @@ server becomes ready.
 
 Ravel acknowledges those exports under strict acknowledgement: by the time the
 Collector's export call returns, the data object and its commit record are
-durably in MinIO. There is no separate flush to wait for. A query that carries
+durably in RustFS. There is no separate flush to wait for. A query that carries
 no commit token still depends on the catalog resolving a fresh listing, so allow
 a couple of scrape intervals before concluding that something is wrong.
 
@@ -193,7 +193,7 @@ To list what the stack actually wrote, see
 `demo/kill-and-recover.sh` ingests one export under strict acknowledgement,
 `SIGKILL`s the `ravel-server` container, replaces it with a fresh one, and reads
 the pre-kill sample back by its commit token. Nothing crosses the kill except
-what is in MinIO. See
+what is in RustFS. See
 [kill the server, keep the data](../../README.md#kill-the-server-keep-the-data).
 
 The claim it proves is specific to strict acknowledgement, which is the default.
@@ -209,7 +209,7 @@ normative for both.
 docker compose -f deploy/docker-compose/ravel.yml down
 ```
 
-`minio-data/` on your machine persists across runs, and the store-qualify
+`rustfs-data/` on your machine persists across runs, and the store-qualify
 one-shot is idempotent, so bringing the stack up again on the same directory is
 safe. Delete that directory to start from an empty store.
 
@@ -235,20 +235,20 @@ changing Ravel's code rather than evaluating it. The
 - Rust, pinned by [`rust-toolchain.toml`](../../rust-toolchain.toml) to 1.97.1
   (edition 2024). If you use `rustup`, it installs this version automatically
   the first time you run `cargo` in the repository.
-- Docker with `docker compose`, for the local MinIO stack.
+- Docker with `docker compose`, for the local RustFS stack.
 
-### Bring up MinIO
+### Bring up RustFS
 
 ```sh
-make minio
+make rustfs
 ```
 
-This runs `docker compose -f deploy/docker-compose/minio.yml up -d`
-([deploy/docker-compose/minio.yml](../../deploy/docker-compose/minio.yml)). It
-starts MinIO on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (web console),
+This runs `docker compose -f deploy/docker-compose/rustfs.yml up -d`
+([deploy/docker-compose/rustfs.yml](../../deploy/docker-compose/rustfs.yml)). It
+starts RustFS on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (web console),
 with credentials `ravel` / `ravel-dev-secret`, and a one-shot `createbucket`
-service that creates the `ravel-dev` bucket. Data lives in `./minio-data` on
-your machine. `make minio-down` stops the stack without deleting it.
+service that creates the `ravel-dev` bucket. Data lives in `./rustfs-data` on
+your machine. `make rustfs-down` stops the stack without deleting it.
 
 ### Run the demo
 
@@ -257,10 +257,10 @@ make demo
 ```
 
 `make demo` builds `ravel-server` and `ravel-cli` in release mode, then runs
-[scripts/demo.sh](../../scripts/demo.sh), which starts MinIO if it is not
+[scripts/demo.sh](../../scripts/demo.sh), which starts RustFS if it is not
 already up, creates the bucket, generates a fresh OTLP metrics export with
 current timestamps, starts `ravel-server --store s3` on `127.0.0.1:14318`
-(HTTP) and `127.0.0.1:14317` (gRPC) against MinIO, posts the export, captures
+(HTTP) and `127.0.0.1:14317` (gRPC) against RustFS, posts the export, captures
 the `x-ravel-commit-token`, and queries the series back with that token as
 `min_commit_token`.
 
