@@ -18,17 +18,17 @@ comparators.
 |---|---|---|---|---|
 | `prometheus` | Reference PromQL engine, pinned to v3.13.1 (the same version ADR-0927 uses as the correctness oracle) | **Local-disk TSDB.** Ack = in-memory head + on-disk WAL. Not object storage. | `http://127.0.0.1:9090/api/v1/write` | `http://127.0.0.1:9090/api/v1/query` |
 | `victoriametrics` | Single-node VictoriaMetrics, accepts Prometheus remote write natively | **Local-disk storage.** Ack = local storage write. Not object storage. | `http://127.0.0.1:8428/api/v1/write` | `http://127.0.0.1:8428/prometheus/api/v1/query` |
-| `mimir` | Grafana Mimir monolithic (`-target=all`); the ADR-0927 object-storage-native PromQL system | **Object storage (S3).** Ack = local WAL; blocks ship to S3 (MinIO here) later. See caveat below. | `http://127.0.0.1:9009/api/v1/push` | `http://127.0.0.1:9009/prometheus/api/v1/query` |
+| `mimir` | Grafana Mimir monolithic (`-target=all`); the ADR-0927 object-storage-native PromQL system | **Object storage (S3).** Ack = local WAL; blocks ship to S3 (RustFS here) later. See caveat below. | `http://127.0.0.1:9009/api/v1/push` | `http://127.0.0.1:9009/prometheus/api/v1/query` |
 
-Supporting services: `minio` (S3 backend for Mimir) and `createbuckets` (a
-one-shot that creates Mimir's buckets and then exits).
+Supporting services: `rustfs` (S3 backend for Mimir) and `createbuckets` (a
+one-shot AWS CLI container that creates Mimir's buckets and then exits).
 
 ### Storage architecture is not interchangeable
 
 Prometheus and VictoriaMetrics persist to **local disk**. Mimir is
 **object-storage-native** and writes its durable blocks to S3 — but in this stack
-S3 is provided by **MinIO**, which is local-disk-backed and charges no
-per-request fees. Per ADR-0927 decision 10 (ADR-0075 decision 3), a MinIO result
+S3 is provided by **RustFS**, which is local-disk-backed and charges no
+per-request fees. Per ADR-0927 decision 10 (ADR-0075 decision 3), a RustFS result
 is valid for correctness and CI only and is **never a publishable performance or
 cost result**; a real-S3 substrate is required for that, exactly as Ravel's own
 publishable numbers require real S3. Each service block in
@@ -79,7 +79,7 @@ plus the quickstart compose files issue #1720 added: every `FROM`/`ARG` base
 image in the root `Dockerfile` and `Dockerfile.prebuilt`, every `uses:` action
 reference under `.github/workflows/` and `.github/actions/`, and every
 `image:` reference in `deploy/docker-compose/ravel.yml` and
-`deploy/docker-compose/minio.yml`. All six categories run in one invocation
+`deploy/docker-compose/rustfs.yml`. All six categories run in one invocation
 and each is checked against its own expected count:
 
 - **Compose images** (this directory): every image reference carries an
@@ -93,7 +93,7 @@ and each is checked against its own expected count:
   composite action carries a 40-hex commit SHA pin, and the number of
   references equals the expected count.
 - **Quickstart compose images** (`deploy/docker-compose/ravel.yml` and
-  `deploy/docker-compose/minio.yml`): every `image:` reference except the two
+  `deploy/docker-compose/rustfs.yml`): every `image:` reference except the two
   `${RAVEL_IMAGE:-...}` references in `ravel.yml` (Ravel's own released
   image, excluded by exact match) carries an `@sha256:` digest, and both the
   total image-line count (8, across both files) and the pin-required count
@@ -129,7 +129,7 @@ This check runs in CI, wired into the `doc-scripts` job in
 
 Every digest below is the multi-arch manifest-list digest reported by the
 named tag's own registry. The recipe differs by registry, so the two below
-are not interchangeable: substituting a quay.io repo path into the Docker
+are not interchangeable: substituting a ghcr.io repo path into the Docker
 Hub URL (or vice versa) resolves nothing.
 
 **`prom/prometheus`, `victoriametrics/victoria-metrics`, and `grafana/mimir`**
@@ -142,25 +142,29 @@ curl -sI -H "Authorization: Bearer $TOKEN" \
   | grep -i docker-content-digest
 ```
 
-**`quay.io/minio/minio` and `quay.io/minio/mc`** (see deploy/README.md for why
-the MinIO pair lives on quay.io) resolve with quay's own v2 API instead: quay
-issues a bearer token from a separate auth endpoint rather than accepting one
-minted for Docker Hub.
+**`ghcr.io/rustfs/rustfs` and `public.ecr.aws/aws-cli/aws-cli`** (see
+deploy/README.md for why the object store and its client live off Docker Hub)
+each issue a bearer token from their own auth endpoint rather than accepting
+one minted for Docker Hub, so the recipe is the same shape with a different
+token URL per registry.
 
 This is written as two curl steps rather than a one-liner so the token is
 carried over by hand instead of captured into a shell variable.
 
 ```sh
 # 1. Get a bearer token scoped to the repo, and read the token field out
-#    of the JSON it prints.
-curl -s "https://quay.io/v2/auth?service=quay.io&scope=repository:minio/minio:pull" \
+#    of the JSON it prints. For the AWS CLI image the token URL is
+#    https://public.ecr.aws/token/?service=public.ecr.aws&scope=repository:aws-cli/aws-cli:pull
+curl -s "https://ghcr.io/token?service=ghcr.io&scope=repository:rustfs/rustfs:pull" \
   | jq -r .token
 
-# 2. HEAD the manifest list, pasting that token in place of <TOKEN> below,
-#    with the manifest-list Accept header.
+# 2. HEAD the manifest list, pasting that token in place of <TOKEN> below.
+#    RustFS publishes an OCI image index, so the Accept header names that
+#    media type; the AWS CLI image publishes a Docker manifest list and takes
+#    application/vnd.docker.distribution.manifest.list.v2+json instead.
 curl -sI -H "Authorization: Bearer <TOKEN>" \
-  -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
-  https://quay.io/v2/minio/minio/manifests/RELEASE.2025-04-08T15-41-24Z \
+  -H "Accept: application/vnd.oci.image.index.v1+json" \
+  https://ghcr.io/v2/rustfs/rustfs/manifests/1.0.0 \
   | grep -i docker-content-digest
 
 # 3. The docker-content-digest response header is the pinned digest.
@@ -171,25 +175,26 @@ curl -sI -H "Authorization: Bearer <TOKEN>" \
 | `prom/prometheus` | `v3.13.1` | `sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893` |
 | `victoriametrics/victoria-metrics` | `v1.115.0` | `sha256:d8ac3a1776c8a9beead8bbd42a489c82249b1bfe9071dfd4813f34ebe36354bb` |
 | `grafana/mimir` | `2.14.2` | `sha256:2d3912435771d356ec03ae4729fb584b4d76a5f035d9dda40b563a55bb6760e3` |
-| `quay.io/minio/minio` | `RELEASE.2025-04-08T15-41-24Z` | `sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b` |
-| `quay.io/minio/mc` | `RELEASE.2025-04-08T15-39-49Z` | `sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952` |
+| `ghcr.io/rustfs/rustfs` | `1.0.0` | `sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff` |
+| `public.ecr.aws/aws-cli/aws-cli` | `2.37.2` | `sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed` |
 
 The tag is kept in each `image:` reference alongside the digest for human
 readability; the digest is what pins the run.
 
-### Pins shared with deploy/docker-compose/ravel.yml and minio.yml (issue #1720)
+### Pins shared with deploy/docker-compose/ravel.yml and rustfs.yml (issue #1720)
 
 The two quickstart compose files (`deploy/docker-compose/ravel.yml` and
-`deploy/docker-compose/minio.yml`) are scanned by the same script as its
-fourth category (see above), so their pins are recorded here too. The MinIO
-pair is the exact same tag and digest this directory already uses above,
-and is identical across both quickstart files (`minio.yml` is `ravel.yml`'s
-standalone MinIO mirror); the other two are `ravel.yml`-only.
+`deploy/docker-compose/rustfs.yml`) are scanned by the same script as its
+fourth category (see above), so their pins are recorded here too. The RustFS
+and AWS CLI pair is the exact same tag and digest this directory already uses
+above, and is identical across both quickstart files (`rustfs.yml` is
+`ravel.yml`'s standalone object-store mirror); the other two are
+`ravel.yml`-only.
 
 | Image | Tag | Digest |
 |---|---|---|
-| `quay.io/minio/minio` | `RELEASE.2025-04-08T15-41-24Z` | `sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b` |
-| `quay.io/minio/mc` | `RELEASE.2025-04-08T15-39-49Z` | `sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952` |
+| `ghcr.io/rustfs/rustfs` | `1.0.0` | `sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff` |
+| `public.ecr.aws/aws-cli/aws-cli` | `2.37.2` | `sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed` |
 | `ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib` | `0.160.0` | `sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6` |
 | `grafana/grafana` | `13.2.2` | `sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0` |
 

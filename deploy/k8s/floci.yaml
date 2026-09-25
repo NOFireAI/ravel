@@ -6,7 +6,7 @@
 # ephemeral filesystem, has no persistent volume, and accepts any credentials
 # without verifying request signatures. Nothing here is suitable for a real
 # deployment; production points `spec.storage.s3.endpoint` at real S3 or a real
-# MinIO and supplies real credentials.
+# S3-compatible store and supplies real credentials.
 #
 # The `ravel-system` Namespace is not defined here on purpose. It is created by
 # deploy/k8s/operator/operator.yaml (and by scripts/kind-up.sh before either
@@ -126,8 +126,8 @@ spec:
       targetPort: s3
 ---
 # Bucket creation, mirroring the `createbucket` sidecar in
-# deploy/docker-compose/minio.yml. floci needs no `mc` and no SigV4 signing
-# (it accepts any credentials and does not verify signatures), so a plain
+# deploy/docker-compose/rustfs.yml. floci needs no S3 client and no SigV4
+# signing (it accepts any credentials and does not verify signatures), so a plain
 # CreateBucket PUT with curl is enough -- the same approach the
 # object-store-contract CI job uses.
 apiVersion: batch/v1

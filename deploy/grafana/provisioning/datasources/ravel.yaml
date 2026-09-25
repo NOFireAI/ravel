@@ -7,7 +7,7 @@
 #
 # SECURITY: the bearer token below is a fixed development credential
 # (`demo-token`, matching ravel-server's --tenant-token in the compose file). It
-# is checked in on purpose, in the same class as the MinIO dev secret; it is not
+# is checked in on purpose, in the same class as the RustFS dev secret; it is not
 # for any network-reachable deployment.
 apiVersion: 1
 
