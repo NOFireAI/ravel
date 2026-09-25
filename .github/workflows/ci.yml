@@ -1302,8 +1302,8 @@ jobs:
               public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
               --endpoint-url http://localhost:9000 s3api create-bucket --bucket ravel-object-store-test || rc=$?
             if [ "$rc" -ne 125 ]; then exit "$rc"; fi
-            echo "AWS CLI container exited 125 on attempt $attempt; retrying"
-            sleep $((attempt * 15))
+            echo "AWS CLI container exited 125 on attempt $attempt"
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 15)); fi
           done
           exit 125
       # The contract suite's S3 case is gated on RAVEL_MINIO_URL; set it (and
@@ -1492,8 +1492,8 @@ jobs:
               public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
               --endpoint-url http://localhost:9000 s3api create-bucket --bucket ravel-object-store-test || rc=$?
             if [ "$rc" -ne 125 ]; then exit "$rc"; fi
-            echo "AWS CLI container exited 125 on attempt $attempt; retrying"
-            sleep $((attempt * 15))
+            echo "AWS CLI container exited 125 on attempt $attempt"
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 15)); fi
           done
           exit 125
       # minio_ingest_read_smoke is gated on RAVEL_MINIO_URL, same convention
@@ -2193,6 +2193,24 @@ jobs:
           docker build --file Dockerfile.prebuilt --target server \
             --tag "$RAVEL_IMAGE" "$ctx"
           rm -rf "$ctx"
+      - name: Pull the compose stack's registry images
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          # ECR Public throttles unauthenticated pulls per source IP (see
+          # deploy/README.md), so the registry images are pulled here with
+          # backoff rather than left to `up`, where a throttled pull reads as
+          # a bring-up failure. qualify and ravel-server are omitted: they run
+          # the image the previous step built locally.
+          for attempt in 1 2 3 4 5; do
+            if docker compose -f "$COMPOSE_FILE" pull rustfs createbucket otel-collector grafana; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              echo "compose pull failed on attempt $attempt; retrying"
+              sleep $((attempt * 15))
+            fi
+          done
+          exit 1
       - name: Bring up the compose stack
         if: steps.filter.outputs.run == 'true'
         run: docker compose -f "$COMPOSE_FILE" up -d

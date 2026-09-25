@@ -39,7 +39,7 @@ use ravel_types::TenantId;
 const TOKEN: &str = "testtoken";
 // quay.io mirror of prom/prometheus:v3.0.0, digest-pinned: Docker Hub's
 // anonymous pull allowance is per-IP and shared across every project on a
-// runner (see ci.yml's MinIO/floci steps), so an unauthenticated pull there
+// runner (see ci.yml's RustFS/floci steps), so an unauthenticated pull there
 // fails unpredictably on a shared nightly runner; quay.io does not share that
 // allowance. The pin checker at
 // deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh only

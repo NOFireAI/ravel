@@ -98,8 +98,8 @@ jobs:
               public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
               --endpoint-url http://localhost:9000 s3api create-bucket --bucket metricsbench || rc=$?
             if [ "$rc" -ne 125 ]; then exit "$rc"; fi
-            echo "AWS CLI container exited 125 on attempt $attempt; retrying"
-            sleep $((attempt * 15))
+            echo "AWS CLI container exited 125 on attempt $attempt"
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 15)); fi
           done
           exit 125
       - name: Run the MetricsBench ci profile against RustFS
