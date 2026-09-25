@@ -4,7 +4,7 @@
 # The harness restores a replica bucket into an empty bucket with writers
 # stopped, runs the reconciliation and verification checks the restore
 # checklist in docs/guides/disaster-recovery.md names, and only then lets
-# ravel-server start. It is backend agnostic: MinIO in CI, real S3 when the
+# ravel-server start. It is backend agnostic: RustFS in CI, real S3 when the
 # environment points it there.
 #
 # This file is sourced, never executed. Every entry point under scripts/dr/
@@ -15,7 +15,7 @@
 # refuses when any of them is unset. A default bucket name is a recursive
 # delete aimed at whatever bucket happens to bear that name in the account the
 # credentials belong to, and a default credential pair silently turns a
-# real-S3 misconfiguration into a run against someone's dev MinIO or the
+# real-S3 misconfiguration into a run against someone's dev RustFS or the
 # reverse.
 #
 # Environment:
@@ -70,12 +70,9 @@
 #                        that publishes no snapshot HEAD is a failure.
 #   DR_LOG_DIR           Where logs and the pre-registered figures live.
 #                        Default <repo>/.gate-logs/dr (gitignored).
-#   DR_MC                Path to an `mc` binary. When unset the scripts run
-#                        the digest-pinned mc image under docker.
-#   DR_MC_IMAGE          The mc image reference, digest pinned.
-#   DR_MC_HOST_URL       Escape hatch: the whole MC_HOST_dr URL, built by the
-#                        caller. When DR_SESSION_TOKEN is set this URL must
-#                        carry a session-token component or startup refuses.
+#   DR_AWS               Path to an `aws` binary. When unset the scripts run
+#                        the digest-pinned AWS CLI image under docker.
+#   DR_AWS_CLI_IMAGE     The AWS CLI image reference, digest pinned.
 #   DR_HTTP_ADDR         host:port the seeding server listens on for HTTP.
 #   DR_GRPC_ADDR         host:port the seeding server listens on for gRPC.
 #
@@ -85,11 +82,12 @@
 # DR_TENANT_TOKEN, DR_TENANT_HASH_MODE (with DR_TENANT_HASH_KEY_FILE when
 # keyed), DR_TENANT_KMS_CONFIG and DR_ADMIN_CREDENTIAL_FILE.
 #
-# Credentials are never placed in a command line. mc receives them through an
-# MC_HOST_<alias> variable in the environment (for the containerised mc, via a
-# bare `-e NAME` so the value never appears in the container's argv), and
-# ravel-cli and ravel-server receive them through RAVEL_S3_ACCESS_KEY /
-# RAVEL_S3_SECRET_KEY / RAVEL_S3_SESSION_TOKEN.
+# Credentials are never placed in a command line. The AWS CLI receives them
+# through AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN in the
+# environment (for the containerised client, via a bare `-e NAME` so the value
+# never appears in the container's argv), and ravel-cli and ravel-server
+# receive them through RAVEL_S3_ACCESS_KEY / RAVEL_S3_SECRET_KEY /
+# RAVEL_S3_SESSION_TOKEN.
 
 # shellcheck shell=bash
 
@@ -112,10 +110,10 @@ DR_TENANT_KMS_CONFIG="${DR_TENANT_KMS_CONFIG:-}"
 DR_ADMIN_CREDENTIAL_FILE="${DR_ADMIN_CREDENTIAL_FILE:-}"
 DR_FOLD_SEAL_MARGIN_WAITED="${DR_FOLD_SEAL_MARGIN_WAITED:-0}"
 DR_LOG_DIR="${DR_LOG_DIR:-${DR_ROOT_DIR}/.gate-logs/dr}"
-DR_MC="${DR_MC:-}"
-# quay.io rather than Docker Hub: Docker Hub's anonymous pull allowance is
+DR_AWS="${DR_AWS:-}"
+# ECR Public rather than Docker Hub: Docker Hub's anonymous pull allowance is
 # per-IP and shared across every project on a runner.
-DR_MC_IMAGE="${DR_MC_IMAGE:-quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727}"
+DR_AWS_CLI_IMAGE="${DR_AWS_CLI_IMAGE:-public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed}"
 DR_HTTP_ADDR="${DR_HTTP_ADDR:-127.0.0.1:8480}"
 DR_GRPC_ADDR="${DR_GRPC_ADDR:-127.0.0.1:8481}"
 
@@ -234,7 +232,6 @@ dr_init() {
   mkdir -p "${DR_LOG_DIR}"
   dr_require_buckets
   dr_require_credentials
-  dr_assert_mc_can_carry_session_token
   case "${DR_TENANT_HASH_MODE}" in
     unkeyed | keyed) ;;
     "")
@@ -288,8 +285,7 @@ when one of them is unset.
                      catalog seal margin out
   DR_LOG_DIR         logs and pre-registered figures, default
                      <repo>/.gate-logs/dr
-  DR_MC / DR_MC_IMAGE       an mc binary, or the digest-pinned mc image
-  DR_MC_HOST_URL     escape hatch: the whole MC_HOST_dr URL
+  DR_AWS / DR_AWS_CLI_IMAGE  an aws binary, or the digest-pinned AWS CLI image
   DR_HTTP_ADDR / DR_GRPC_ADDR  listen addresses for the seeding server
 
 A real S3 run needs: DR_ENDPOINT="" plus DR_REGION, DR_BUCKET_PRIMARY,
@@ -407,97 +403,62 @@ dr_ns_not_after() {
 }
 
 # ---------------------------------------------------------------------------
-# mc: the one backend-agnostic S3 tool. Same invocations against MinIO and
-# against real S3; only the MC_HOST_dr URL differs.
+# The AWS CLI: the one backend-agnostic S3 tool. Same invocations against
+# RustFS and against real S3; only --endpoint-url differs.
 # ---------------------------------------------------------------------------
 
 dr_have_command() { command -v "$1" >/dev/null 2>&1; }
 
-# Percent-encode one value for the userinfo part of a URL. A secret access key
-# routinely contains `/` and `+`, and an unencoded `/` truncates the host: the
-# URL then names a different endpoint entirely, with no error to read.
-dr_urlencode() {
-  local LC_ALL=C
-  local s="$1" out="" i c
-  for ((i = 0; i < ${#s}; i++)); do
-    c="${s:i:1}"
-    case "${c}" in
-      [a-zA-Z0-9._~-]) out+="${c}" ;;
-      *) out+="$(printf '%%%02X' "'${c}")" ;;
-    esac
-  done
-  printf '%s\n' "${out}"
-}
-
-# Refuse at startup when a session token is set and the mc credential path in
-# use cannot carry it. MC_HOST_<alias> carries temporary credentials as
-# `scheme://<key>:<secret>:<token>@host`; a caller-supplied DR_MC_HOST_URL
-# with only two components would send the STS key pair with no token, and
-# every mc call would 403 while the ravel binaries (which get the token
-# through RAVEL_S3_SESSION_TOKEN) succeeded.
-dr_assert_mc_can_carry_session_token() {
-  [[ -n "${DR_SESSION_TOKEN}" ]] || return 0
-  [[ -n "${DR_MC_HOST_URL:-}" ]] || return 0
-  local url="${DR_MC_HOST_URL}" userinfo colons
-  if [[ "${url}" != *"@"* ]]; then
-    dr_die "${DR_EX_USAGE}" \
-      "DR_SESSION_TOKEN is set but DR_MC_HOST_URL carries no credentials at all; it must be scheme://<key>:<secret>:<session-token>@host"
-  fi
-  userinfo="${url#*://}"
-  userinfo="${userinfo%%@*}"
-  colons="${userinfo//[^:]/}"
-  if [[ "${#colons}" -ne 2 ]]; then
-    dr_die "${DR_EX_USAGE}" \
-      "DR_SESSION_TOKEN is set but DR_MC_HOST_URL has no session-token component; it must be scheme://<key>:<secret>:<session-token>@host"
-  fi
-}
-
-# The alias URL. Credentials go in here and this value is never echoed.
-dr_mc_host_url() {
-  if [[ -n "${DR_MC_HOST_URL:-}" ]]; then
-    printf '%s\n' "${DR_MC_HOST_URL}"
-    return 0
-  fi
-  local host scheme access secret token
+# Run one aws command. Prefers an aws on PATH, falls back to the digest-pinned
+# image under docker with --network host so a RustFS published on localhost is
+# reachable. DR_ENDPOINT empty means real S3, where no --endpoint-url is passed
+# and the client resolves the regional endpoint itself.
+dr_aws() {
+  local args=()
   if [[ -n "${DR_ENDPOINT}" ]]; then
-    scheme="${DR_ENDPOINT%%://*}"
-    host="${DR_ENDPOINT#*://}"
-  else
-    scheme="https"
-    host="s3.${DR_REGION}.amazonaws.com"
+    args=(--endpoint-url "${DR_ENDPOINT}")
   fi
-  access="$(dr_urlencode "${DR_ACCESS_KEY}")"
-  secret="$(dr_urlencode "${DR_SECRET_KEY}")"
-  if [[ -n "${DR_SESSION_TOKEN}" ]]; then
-    token="$(dr_urlencode "${DR_SESSION_TOKEN}")"
-    printf '%s://%s:%s:%s@%s\n' "${scheme}" "${access}" "${secret}" "${token}" "${host}"
-  else
-    printf '%s://%s:%s@%s\n' "${scheme}" "${access}" "${secret}" "${host}"
-  fi
+  (
+    # Exported inside a subshell: the client sees the credentials, the rest of
+    # the harness does not, and they never appear in any argv. The bare
+    # `-e NAME` form passes each value through from this environment for the
+    # same reason.
+    export AWS_ACCESS_KEY_ID="${DR_ACCESS_KEY}"
+    export AWS_SECRET_ACCESS_KEY="${DR_SECRET_KEY}"
+    export AWS_DEFAULT_REGION="${DR_REGION}"
+    export AWS_EC2_METADATA_DISABLED=true
+    local passthrough=(
+      -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY
+      -e AWS_DEFAULT_REGION -e AWS_EC2_METADATA_DISABLED
+    )
+    # An empty AWS_SESSION_TOKEN is not an absent one: the signer then sends an
+    # empty x-amz-security-token and every call 403s, so the variable is only
+    # set when there is a token to carry.
+    if [[ -n "${DR_SESSION_TOKEN}" ]]; then
+      export AWS_SESSION_TOKEN="${DR_SESSION_TOKEN}"
+      passthrough+=(-e AWS_SESSION_TOKEN)
+    fi
+    if [[ -n "${DR_AWS}" ]] || dr_have_command aws; then
+      exec "${DR_AWS:-aws}" "${args[@]}" "$@"
+    fi
+    exec docker run --rm --interactive --network host \
+      "${passthrough[@]}" "${DR_AWS_CLI_IMAGE}" "${args[@]}" "$@"
+  )
 }
 
-# Run one mc command against the `dr` alias. Prefers an mc on PATH, falls back
-# to the digest-pinned image under docker with --network host so a MinIO
-# published on localhost is reachable.
-dr_mc() {
-  local url
-  url="$(dr_mc_host_url)"
-  if [[ -n "${DR_MC}" ]] || dr_have_command mc; then
-    local bin="${DR_MC:-mc}"
-    MC_HOST_dr="${url}" "${bin}" --no-color "$@"
-    return $?
-  fi
-  # The bare `-e MC_HOST_dr` form passes the value from this process's
-  # environment; the credential never appears in the container's argv.
-  MC_HOST_dr="${url}" docker run --rm --interactive --network host \
-    -e MC_HOST_dr "${DR_MC_IMAGE}" --no-color "$@"
-}
-
-dr_mc_available() {
-  if [[ -n "${DR_MC}" ]] || dr_have_command mc; then
+dr_aws_available() {
+  if [[ -n "${DR_AWS}" ]] || dr_have_command aws; then
     return 0
   fi
   dr_have_command docker
+}
+
+# Split one `--output text` list result into one value per line. A list query
+# prints its values tab separated, one line per response page, and the literal
+# `None` for a page that matched nothing; no key this harness addresses is
+# named `None`, so dropping it is unambiguous.
+dr_text_list_lines() {
+  tr '\t' '\n' <<<"$1" | awk 'NF > 0 && $0 != "None" { print }'
 }
 
 # Drop every key the harness or the tooling it drives wrote from a listing:
@@ -522,24 +483,27 @@ dr_strip_noncorpus_keys() {
 # the callers filter by prefix themselves.
 dr_list_keys() {
   local bucket="$1" listing names
-  listing="$(dr_mc ls --recursive "dr/${bucket}/")" || return 1
-  names="$(awk 'NF > 0 { print $NF }' <<<"${listing}")"
+  listing="$(dr_aws s3api list-objects-v2 --bucket "${bucket}" \
+    --query 'Contents[].Key' --output text)" || return 1
+  names="$(dr_text_list_lines "${listing}")"
   dr_strip_noncorpus_keys "${names}"
 }
 
 # Every key in a bucket INCLUDING noncurrent versions and delete markers. The
-# emptiness assertions use this one: `mc rm --recursive` on a versioned bucket
+# emptiness assertions use this one: a recursive delete on a versioned bucket
 # writes delete markers and leaves every prior version in place, so a listing
 # of current versions alone reports an emptied-looking bucket that still holds
 # all of its data (and `maintain verify-custody --versioning-aware` will find
-# it). Falls back to the current-version listing when the backend rejects
-# `--versions`.
+# it). Falls back to the current-version listing when the backend does not
+# implement ListObjectVersions.
 dr_list_all_versions() {
   local bucket="$1" listing names
-  if ! listing="$(dr_mc ls --recursive --versions "dr/${bucket}/" 2>/dev/null)"; then
-    listing="$(dr_mc ls --recursive "dr/${bucket}/")" || return 1
+  if ! listing="$(dr_aws s3api list-object-versions --bucket "${bucket}" \
+    --query '[Versions[].Key, DeleteMarkers[].Key][]' --output text 2>/dev/null)"; then
+    listing="$(dr_aws s3api list-objects-v2 --bucket "${bucket}" \
+      --query 'Contents[].Key' --output text)" || return 1
   fi
-  names="$(awk 'NF > 0 { print $NF }' <<<"${listing}")"
+  names="$(dr_text_list_lines "${listing}")"
   dr_strip_noncorpus_keys "${names}"
 }
 
@@ -553,14 +517,14 @@ dr_count_lines() {
 # ---------------------------------------------------------------------------
 
 dr_bucket_exists() {
-  dr_mc ls "dr/$1/" >/dev/null 2>&1
+  dr_aws s3api head-bucket --bucket "$1" >/dev/null 2>&1
 }
 
 dr_write_bucket_marker() {
   local bucket="$1"
   printf '{"rehearsal": "ravel-dr", "bucket": "%s", "created_at_unix_ns": %s}\n' \
     "${bucket}" "$(dr_now_ns)" \
-    | dr_mc pipe "dr/${bucket}/${DR_BUCKET_MARKER_KEY}" >/dev/null
+    | dr_aws s3 cp - "s3://${bucket}/${DR_BUCKET_MARKER_KEY}" >/dev/null
 }
 
 # True when the bucket carries a rehearsal marker this harness wrote FOR THIS
@@ -568,7 +532,7 @@ dr_write_bucket_marker() {
 # a marker copied in from somewhere else does not authorise a delete here.
 dr_bucket_marker_present() {
   local bucket="$1" body
-  body="$(dr_mc cat "dr/${bucket}/${DR_BUCKET_MARKER_KEY}" 2>/dev/null)" || return 1
+  body="$(dr_aws s3 cp "s3://${bucket}/${DR_BUCKET_MARKER_KEY}" - 2>/dev/null)" || return 1
   [[ "${body}" == *'"rehearsal": "ravel-dr"'* ]] || return 1
   [[ "${body}" == *"\"bucket\": \"${bucket}\""* ]] || return 1
   return 0
@@ -583,8 +547,32 @@ dr_ensure_bucket() {
     return 0
   fi
   dr_log "creating bucket ${bucket} in region ${DR_REGION}"
-  dr_mc mb --region "${DR_REGION}" "dr/${bucket}" >/dev/null || return 1
+  # S3 outside us-east-1 rejects a CreateBucket that carries no matching
+  # LocationConstraint, and us-east-1 rejects one that carries any.
+  if [[ "${DR_REGION}" == "us-east-1" ]]; then
+    dr_aws s3api create-bucket --bucket "${bucket}" >/dev/null || return 1
+  else
+    dr_aws s3api create-bucket --bucket "${bucket}" \
+      --create-bucket-configuration "LocationConstraint=${DR_REGION}" \
+      >/dev/null || return 1
+  fi
   dr_write_bucket_marker "${bucket}"
+}
+
+# Delete every object version and delete marker in a bucket, one DeleteObject
+# per version. `aws s3 rm --recursive` is the current-version path only: on a
+# versioned bucket it writes a delete marker per key and leaves the data, which
+# is exactly the state dr_reset_bucket's after-count refuses.
+dr_delete_all_versions() {
+  local bucket="$1" listing key version_id
+  listing="$(dr_aws s3api list-object-versions --bucket "${bucket}" \
+    --query '[Versions[].[Key,VersionId], DeleteMarkers[].[Key,VersionId]][]' \
+    --output text)" || return 1
+  while IFS=$'\t' read -r key version_id; do
+    [[ -n "${key}" && "${key}" != "None" ]] || continue
+    dr_aws s3api delete-object --bucket "${bucket}" --key "${key}" \
+      --version-id "${version_id}" >/dev/null || return 1
+  done <<<"${listing}"
 }
 
 # Empty a bucket. Refuses unless the bucket carries this harness's creation
@@ -611,10 +599,10 @@ dr_reset_bucket() {
   count="$(dr_count_lines "${listing}")"
   printf 'dr-reset: bucket=%s objects_to_delete=%s (all versions)\n' "${bucket}" "${count}"
   dr_log "emptying bucket ${bucket} (${count} object version(s))"
-  if ! dr_mc rm --recursive --force --versions "dr/${bucket}/" \
+  if ! dr_delete_all_versions "${bucket}" \
     >"${DR_LOG_DIR}/reset-${bucket}.log" 2>&1; then
-    dr_log "versioned delete refused by the backend; retrying without --versions"
-    dr_mc rm --recursive --force "dr/${bucket}/" \
+    dr_log "versioned delete refused by the backend; retrying on current versions"
+    dr_aws s3 rm "s3://${bucket}" --recursive \
       >>"${DR_LOG_DIR}/reset-${bucket}.log" 2>&1 \
       || dr_die "${DR_EX_PRECONDITION}" "could not empty ${bucket}"
   fi
@@ -900,7 +888,7 @@ dr_dry_run_common() {
   printf '  tenant hash mode: %s\n' "${DR_TENANT_HASH_MODE}"
   printf '  credentials: from DR_ACCESS_KEY / DR_SECRET_KEY (not shown)\n'
   if [[ -n "${DR_SESSION_TOKEN}" ]]; then
-    printf '  session token: set (mc receives it in the MC_HOST_dr URL)\n'
+    printf '  session token: set (the client receives it in AWS_SESSION_TOKEN)\n'
   else
     printf '  session token: not set\n'
   fi
@@ -908,10 +896,10 @@ dr_dry_run_common() {
   printf '  reconciled marker key: %s\n' "${DR_MARKER_KEY}"
   printf '  restore-start stamp key: %s\n' "${DR_RESTORE_START_KEY}"
   printf '  bucket creation marker key: %s\n' "${DR_BUCKET_MARKER_KEY}"
-  if dr_mc_available; then
-    printf '  OK    mc available (binary on PATH or docker for the pinned image)\n'
+  if dr_aws_available; then
+    printf '  OK    aws available (binary on PATH or docker for the pinned image)\n'
   else
-    printf '  WARN  no mc and no docker: a real run cannot reach the buckets\n'
+    printf '  WARN  no aws and no docker: a real run cannot reach the buckets\n'
   fi
   if dr_ravel_binaries_available; then
     printf '  OK    ravel binaries runnable (prebuilt or via cargo)\n'

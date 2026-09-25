@@ -91,12 +91,12 @@ RESTORE_START_FILE="${DR_LOG_DIR}/restore-start.json"
 # is the ordinary "the restore checks have not passed yet" case rather than an
 # error to report as a failure of this script.
 fetch_marker() {
-  dr_mc cat "dr/${DR_BUCKET_REPLICA}/${DR_MARKER_KEY}" \
+  dr_aws s3 cp "s3://${DR_BUCKET_REPLICA}/${DR_MARKER_KEY}" - \
     >"${MARKER_FILE}" 2>"${DR_LOG_DIR}/start-marker-fetch.log"
 }
 
 fetch_restore_start() {
-  dr_mc cat "dr/${DR_BUCKET_REPLICA}/${DR_RESTORE_START_KEY}" \
+  dr_aws s3 cp "s3://${DR_BUCKET_REPLICA}/${DR_RESTORE_START_KEY}" - \
     >"${RESTORE_START_FILE}" 2>"${DR_LOG_DIR}/start-restore-start-fetch.log"
 }
 
@@ -127,7 +127,7 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   else
     printf '  would: start ravel-server in the foreground on %s\n' "${DR_HTTP_ADDR}"
   fi
-  if dr_mc_available && fetch_marker; then
+  if dr_aws_available && fetch_marker; then
     printf '  marker present, names bucket: %s\n' "$(marker_field bucket || printf '<unreadable>')"
   else
     printf '  no marker reachable: a real run would refuse with exit 10\n'
@@ -135,8 +135,8 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   exit 0
 fi
 
-dr_mc_available || dr_die "${DR_EX_PRECONDITION}" \
-  "no mc binary and no docker: cannot read the reconciled marker"
+dr_aws_available || dr_die "${DR_EX_PRECONDITION}" \
+  "no aws binary and no docker: cannot read the reconciled marker"
 dr_ravel_binaries_available || dr_die "${DR_EX_PRECONDITION}" \
   "no ravel-server and no cargo: cannot start"
 

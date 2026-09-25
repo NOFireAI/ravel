@@ -188,8 +188,8 @@ cli() {
 
 # --- preconditions -------------------------------------------------------
 
-dr_mc_available || dr_die "${DR_EX_PHASE_PRECONDITION}" \
-  "no mc binary and no docker: cannot reach the object store"
+dr_aws_available || dr_die "${DR_EX_PHASE_PRECONDITION}" \
+  "no aws binary and no docker: cannot reach the object store"
 dr_ravel_binaries_available || dr_die "${DR_EX_PHASE_PRECONDITION}" \
   "no ravel-cli and no cargo: cannot verify"
 
@@ -224,9 +224,10 @@ dr_export_s3_env "${DR_BUCKET_REPLICA}"
 # bucket.
 
 RESTORE_START_NS="$(dr_now_ns)"
-dr_mc rm --force "dr/${DR_BUCKET_REPLICA}/${DR_MARKER_KEY}" \
+dr_aws s3api delete-object --bucket "${DR_BUCKET_REPLICA}" --key "${DR_MARKER_KEY}" \
   >"${DR_LOG_DIR}/marker-clear.log" 2>&1 || true
-if dr_mc stat "dr/${DR_BUCKET_REPLICA}/${DR_MARKER_KEY}" >/dev/null 2>&1; then
+if dr_aws s3api head-object --bucket "${DR_BUCKET_REPLICA}" --key "${DR_MARKER_KEY}" \
+  >/dev/null 2>&1; then
   dr_die "${DR_EX_PHASE_PRECONDITION}" \
     "the previous reconciled marker at ${DR_BUCKET_REPLICA}/${DR_MARKER_KEY} is still present after the delete; a restore cannot run with a stale marker in the target"
 fi
@@ -236,7 +237,7 @@ fi
   printf '  "bucket": "%s",\n' "${DR_BUCKET_REPLICA}"
   printf '  "restore_started_at_unix_ns": %s\n' "${RESTORE_START_NS}"
   printf '}\n'
-} | dr_mc pipe "dr/${DR_BUCKET_REPLICA}/${DR_RESTORE_START_KEY}" \
+} | dr_aws s3 cp - "s3://${DR_BUCKET_REPLICA}/${DR_RESTORE_START_KEY}" \
   >"${DR_LOG_DIR}/restore-start-write.log" 2>&1
 printf '%s\n' "${RESTORE_START_NS}" >"${DR_LOG_DIR}/dr-restore-started-at"
 printf 'restore-check: restore_start_ns=%s (previous marker cleared from %s)\n' \
@@ -636,8 +637,9 @@ marker_body="$(
   printf '  "canary_decoded_samples": %s\n' "${CANARY_DECODED_SAMPLES}"
   printf '}\n'
 )"
-printf '%s\n' "${marker_body}" | dr_mc pipe "dr/${DR_BUCKET_REPLICA}/${DR_MARKER_KEY}" \
-  >"${DR_LOG_DIR}/marker-write.log" 2>&1
+printf '%s\n' "${marker_body}" \
+  | dr_aws s3 cp - "s3://${DR_BUCKET_REPLICA}/${DR_MARKER_KEY}" \
+    >"${DR_LOG_DIR}/marker-write.log" 2>&1
 printf '%s\n' "${marker_ns}" >"${DR_LOG_DIR}/dr-marker-written-at"
 
 printf 'restore-check: all %s checks passed; reconciled marker written to %s/%s\n' \

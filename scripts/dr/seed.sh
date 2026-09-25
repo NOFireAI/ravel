@@ -168,8 +168,8 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   exit 0
 fi
 
-dr_mc_available || dr_die "${DR_EX_PRECONDITION}" \
-  "no mc binary and no docker: cannot reach the object store"
+dr_aws_available || dr_die "${DR_EX_PRECONDITION}" \
+  "no aws binary and no docker: cannot reach the object store"
 dr_ravel_binaries_available || dr_die "${DR_EX_PRECONDITION}" \
   "no ravel-server/ravel-cli and no cargo: cannot seed"
 
