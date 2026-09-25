@@ -217,7 +217,7 @@ pub struct StoreArgs {
     /// command writes and reads, plus the credentials signing those requests,
     /// in the clear; the command refuses that combination unless this flag
     /// says the operator meant it. A loopback `http://` endpoint (the local
-    /// MinIO every development launcher here points at) needs no flag, and an
+    /// RustFS every development launcher here points at) needs no flag, and an
     /// `https://` endpoint is unaffected. Same flag, env var, and rule as
     /// ravel-server's.
     // Same rule literally, not by convention: both binaries call
