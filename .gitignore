@@ -9,7 +9,7 @@
 **/*.rs.bk
 *.profraw
 .DS_Store
-/minio-data
+/rustfs-data
 /examples/otlp_metrics_fixture.pb
 __pycache__/
 /.superpowers/
