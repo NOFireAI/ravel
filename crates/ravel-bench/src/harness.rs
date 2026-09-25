@@ -185,9 +185,10 @@ pub fn store_and_metrics_from_env(
 /// Whether a request against `kind`'s backend is billed: false on
 /// `MemoryStore` and on any store behind a configured endpoint (a local
 /// RustFS reached over `RAVEL_S3_ENDPOINT`; ADR-0927 decision 10 is exactly
-/// this -- RustFS is valid for correctness, conformance and CI, never for a
-/// performance or cost claim, because removing per-request fees is what
-/// makes a request-count defect invisible), true only for real S3 with no
+/// this -- a local S3-compatible endpoint is valid for correctness,
+/// conformance and CI, never for a performance or cost claim, because
+/// removing per-request fees is what makes a request-count defect
+/// invisible), true only for real S3 with no
 /// endpoint override. The one place every `--store`-driven bin derives this,
 /// rather than re-deriving it from `StoreKind` alone.
 pub fn backend_bills_requests(kind: StoreKind) -> bool {
