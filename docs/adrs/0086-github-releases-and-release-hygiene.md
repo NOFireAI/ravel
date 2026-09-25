@@ -227,6 +227,9 @@ from other Rust projects already knows.
 Notes are produced with GitHub's own generated notes (the merged pull requests
 since the previous tag) as the base. When `CHANGELOG.md` contains a section for
 the version being released, that section is prepended above the generated list.
+When the whole body would exceed GitHub's release-body limit, the section is
+reduced to its entry headlines; see the amendment 2026-09-25: the release-body
+budget.
 
 Reading the changelog as the sole source was rejected on evidence: it documents
 `0.9.0` and nothing since, so this process would have produced three empty
@@ -428,6 +431,30 @@ cold-cache coverage run hit its forty-minute timeout, the run concluded
 either having the gate consult required-job outcomes rather than the run
 conclusion, or stopping `coverage` from setting that conclusion. Neither
 belongs in this epic.
+
+## Amendment 2026-09-25: the release-body budget
+
+<!-- amendment-applies: sections="Decision 5: release notes are auto-generated, with the changelog section prepended when it exists" pointer="amendment 2026-09-25: the release-body budget" -->
+
+GitHub refuses a release whose body is over 125,000 characters. The v0.16.0
+tag published its images and then failed at `gh release create` with that
+error: its `CHANGELOG.md` section alone was 165,435 characters, against 19,003
+for 0.15.0, so no Release exists for v0.16.0.
+
+Decision 5 now carries a budget. The job composes the notes as before and
+measures them in bytes, which never undercount characters, against 120,000.
+Over budget, the changelog section keeps its headings and each entry's bold
+headline, and a link to the full section in the tagged `CHANGELOG.md` follows
+them; the generated list and the downloads text are unchanged. If the notes
+are still over budget after that, the job fails with both sizes before any
+Release call, rather than with a 422 after the assets are built.
+
+Headlines rather than truncation, because a cut section silently drops
+whichever entries sort last, and the headline of every entry still says what
+shipped. The failure stays closed at the second threshold, unlike decision 5's
+missing-section case, because a body that cannot fit even as headlines has
+outgrown the limit in the generated list or in the headlines themselves, and
+no fallback here can repair that without discarding content silently.
 
 ## Rejected alternatives
 

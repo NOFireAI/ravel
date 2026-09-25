@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A release whose changelog section is too long for a GitHub release body
+  now publishes with that section's entry headlines instead of failing**
+  (ADR-0086, amendment 2026-09-25). The v0.16.0 tag published its images, then
+  its release job failed at `gh release create` with "body is too long (maximum
+  is 125000 characters)": the 0.16.0 section alone is 165,435 characters, so
+  v0.16.0 has no GitHub Release. `publish-images.yml` now measures the composed
+  notes against a 120,000-byte budget. Over it, the section keeps its headings
+  and each entry's bold headline, followed by a link to the full section in the
+  tagged `CHANGELOG.md`; the generated pull request list and the downloads text
+  are unchanged. If the notes still do not fit, the job fails with both sizes
+  before it creates the Release.
+
 ## [0.16.0] - 2026-09-25
 
 ### Added

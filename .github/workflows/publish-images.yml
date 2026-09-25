@@ -837,7 +837,8 @@ jobs:
       # the previous tag) are the base, with the matching CHANGELOG.md section
       # from the TAGGED TREE prepended when one exists. An absent section is a
       # ::notice::, never a failure: a release that fails closed on a
-      # documentation lapse is a release that gets cut by hand instead.
+      # documentation lapse is a release that gets cut by hand instead. The
+      # body budget below is the ADR's 2026-09-25 amendment.
       - name: Compose release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -867,9 +868,13 @@ jobs:
             echo "::notice::CHANGELOG.md in the tagged tree has no [$VERSION] section; releasing with generated notes only (ADR-0086 decision 5)"
           fi
 
-          {
-            if [[ -n "$changelog" ]]; then
-              printf '%s\n\n' "$changelog"
+          # GitHub refuses a release body over 125,000 characters. The budget is
+          # counted in bytes, which never undercount characters, and leaves
+          # headroom for the API's own accounting.
+          budget=120000
+          compose() {
+            if [[ -n "$1" ]]; then
+              printf '%s\n\n' "$1"
             fi
             printf '%s\n\n' "$generated"
             sed -e "s|@CERT_IDENTITY@|$CERT_IDENTITY|" \
@@ -928,7 +933,41 @@ jobs:
           `.debug/`), which is the name inside the archive. Do not rename the extracted
           `.debug` files.
           NOTES_TAIL
-          } > "$NOTES"
+          }
+          compose "$changelog" > "$NOTES"
+
+          # A section too long to fit keeps its headings and each entry's bold
+          # headline, which may wrap over several lines, and links to the full
+          # entries in the tagged CHANGELOG.md.
+          full=$(wc -c < "$NOTES")
+          if [[ -n "$changelog" && "$full" -gt "$budget" ]]; then
+            headlines="$(awk '
+              /^#/ { print; print ""; next }
+              cap {
+                line = $0; sub(/^[ \t]+/, "", line)
+                buf = buf " " line
+                if ((p = index(line, "**")) > 0) {
+                  print substr(buf, 1, length(buf) - length(line) + p + 1); cap = 0
+                }
+                next
+              }
+              /^- \*\*/ {
+                rest = substr($0, 5)
+                if ((p = index(rest, "**")) > 0) { print substr($0, 1, 4 + p + 1) }
+                else { buf = $0; cap = 1 }
+                next
+              }
+              /^- / { print }
+            ' <<<"$changelog")"
+            headlines+=$'\n\n'"The full entries are in [CHANGELOG.md](https://github.com/$REPO/blob/$TAG/CHANGELOG.md) at this tag."
+            compose "$headlines" > "$NOTES"
+            echo "::notice::the full release notes were $full bytes, over the $budget-byte budget; the CHANGELOG section is reduced to its entry headlines"
+          fi
+          size=$(wc -c < "$NOTES")
+          if [[ "$size" -gt "$budget" ]]; then
+            echo "::error::the release notes are $size bytes, over the $budget-byte budget even with the CHANGELOG section reduced to headlines"
+            exit 1
+          fi
           cat "$NOTES"
 
       # Decision 1: gh, not an action, so the Release is created by the same
