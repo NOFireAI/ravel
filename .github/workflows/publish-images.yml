@@ -843,6 +843,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_HOST: ${{ github.server_url }}
+          SERVER_URL: ${{ github.server_url }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
           CERT_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/publish-images.yml@${{ github.ref }}
@@ -938,12 +939,22 @@ jobs:
 
           # A section too long to fit keeps its headings and each entry's bold
           # headline, which may wrap over several lines, and links to the full
-          # entries in the tagged CHANGELOG.md.
+          # entries in the tagged CHANGELOG.md. A headline whose closing ** is
+          # missing is cut back to its first line at the next blank line,
+          # entry or heading, or after six lines, and reported, so it can
+          # neither swallow the entry after it nor carry its body in.
           full=$(wc -c < "$NOTES")
+          reduced=false
           if [[ -n "$changelog" && "$full" -gt "$budget" ]]; then
-            headlines="$(awk '
-              /^#/ { print; print ""; next }
+            unclosed="$RUNNER_TEMP/unclosed-headlines"
+            headlines="$(awk -v unclosed="$unclosed" '
+              function flush() {
+                if (cap) { print first; print substr(first, 1, 100) > unclosed; cap = 0 }
+              }
+              /^#/ { flush(); print; print ""; next }
+              /^- / { flush() }
               cap {
+                if ($0 ~ /^[ \t]*$/ || ++held > 6) { flush(); next }
                 line = $0; sub(/^[ \t]+/, "", line)
                 buf = buf " " line
                 if ((p = index(line, "**")) > 0) {
@@ -954,18 +965,27 @@ jobs:
               /^- \*\*/ {
                 rest = substr($0, 5)
                 if ((p = index(rest, "**")) > 0) { print substr($0, 1, 4 + p + 1) }
-                else { buf = $0; cap = 1 }
+                else { buf = $0; first = $0; held = 0; cap = 1 }
                 next
               }
               /^- / { print }
+              END { flush() }
             ' <<<"$changelog")"
-            headlines+=$'\n\n'"The full entries are in [CHANGELOG.md](https://github.com/$REPO/blob/$TAG/CHANGELOG.md) at this tag."
+            if [[ -s "$unclosed" ]]; then
+              sed 's/^/::warning::CHANGELOG entry headline with no closing **: /' "$unclosed"
+            fi
+            headlines+=$'\n\n'"The full entries are in [CHANGELOG.md]($SERVER_URL/$REPO/blob/$TAG/CHANGELOG.md) at this tag."
             compose "$headlines" > "$NOTES"
+            reduced=true
             echo "::notice::the full release notes were $full bytes, over the $budget-byte budget; the CHANGELOG section is reduced to its entry headlines"
           fi
           size=$(wc -c < "$NOTES")
           if [[ "$size" -gt "$budget" ]]; then
-            echo "::error::the release notes are $size bytes, over the $budget-byte budget even with the CHANGELOG section reduced to headlines"
+            if [[ "$reduced" == true ]]; then
+              echo "::error::the release notes are $size bytes, over the $budget-byte budget even with the CHANGELOG section reduced to headlines"
+            else
+              echo "::error::the release notes are $size bytes, over the $budget-byte budget; no CHANGELOG section was reduced, so the size is in the generated pull request list"
+            fi
             exit 1
           fi
           cat "$NOTES"
