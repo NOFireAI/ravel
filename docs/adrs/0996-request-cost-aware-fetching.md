@@ -695,3 +695,12 @@ divergence between `cost-based` and `byte-minimal` is entirely the
 saturated rate inside `resolve_cost_based_rate`, not the scalar's
 magnitude, so rescaling it changes nothing about which shape
 `cost-based` selects at this profile.
+
+## Amendment (2026-09-26, ADR-2014): a fetch policy derived from a loopback endpoint
+
+<!-- amendment-applies: none reason="alternative 6 stands: no billing shape or cost profile is derived from an endpoint; this records that ADR-2014 derives a fetch policy from endpoint locality, which alternative 6 did not consider, and retires no wording" -->
+
+ADR-2014 makes `byte-minimal` the default fetch policy when the S3 endpoint is
+loopback. That derives a policy from where the store is, not a price from what
+the endpoint might bill: the stamped cost profile is unchanged, and the policy's
+source is logged as `derived-loopback-endpoint`.
