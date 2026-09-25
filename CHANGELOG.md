@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-25
+
 ### Fixed
 
 - **A release whose changelog section is too long for a GitHub release body
