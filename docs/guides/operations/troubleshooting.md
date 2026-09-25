@@ -232,8 +232,9 @@ quickest way to tell this apart from data that was never written.
    confirms sealed commits the snapshot does not know about.
 2. Delete the tenant's HEAD object for the affected signal,
    `t/<tenant_hash_hex>/catalog/<signal>/HEAD`. There is no `ravel-cli`
-   subcommand for this; use the store's own tooling (`mc rm` against MinIO,
-   `aws s3 rm` against S3). Deleting HEAD is safe: an absent HEAD means "no
+   subcommand for this; use the store's own tooling (`aws s3 rm`, with
+   `--endpoint-url` against RustFS or any other S3-compatible store).
+   Deleting HEAD is safe: an absent HEAD means "no
    snapshot yet", and the next fold rebuilds one from a full listing rather than
    failing.
 3. Run `ravel-cli catalog fold --tenant <name> --shards <n> --signal <signal>`,

@@ -68,19 +68,19 @@ therefore refuses an `http://` endpoint whose host is not loopback unless
 
 - `http://127.0.0.1:9000`, `http://localhost:9000`, `http://[::1]:9000`:
   allowed with no flag. The traffic never leaves the host.
-- `http://minio:9000`, `http://minio.ravel-system.svc:9000`, or any other
+- `http://rustfs:9000`, `http://rustfs.ravel-system.svc:9000`, or any other
   name or address on the network: refused unless the flag is passed. A
   container or a pod reaches its object store over the network, never over
-  loopback, so a plaintext in-cluster MinIO or floci needs the flag even
+  loopback, so a plaintext in-cluster RustFS or floci needs the flag even
   though the traffic stays inside the cluster.
 - `https://...`: unaffected, and the flag does nothing.
-- `minio:9000`, or any endpoint written with no scheme: refused at startup.
+- `rustfs:9000`, or any endpoint written with no scheme: refused at startup.
   An endpoint that begins with neither `https://` nor `http://` is not a
   usable URL, so the refusal quotes the endpoint as it was written and asks
   for the scheme. `--s3-allow-http` does not accept it: the flag chooses
   between TLS and plaintext, and an endpoint with no scheme has asked for
   neither. The scheme itself is matched without regard to case, so
-  `HTTPS://minio:9000` is an `https` endpoint.
+  `HTTPS://rustfs:9000` is an `https` endpoint.
 
 `ravel-cli` applies the same rule from the same code, with the same
 `--s3-allow-http` flag and `RAVEL_S3_ALLOW_HTTP` variable. It ships in the
@@ -100,7 +100,7 @@ Prefer terminating TLS at the object store over setting the flag. The flag is
 for a development backend that speaks no TLS, not for a production one whose
 certificate is inconvenient.
 
-MinIO, for local development (loopback, so no flag):
+RustFS, for local development (loopback, so no flag):
 
 ```sh
 --store s3 --s3-endpoint http://127.0.0.1:9000 --s3-bucket ravel-dev \
@@ -188,8 +188,8 @@ can read, overwrite or delete anything in the bucket. Scoping the credential to
 the job the process actually does means a leaked credential can only do what
 that job legitimately does, and only one of the four can delete anything.
 
-This is enforced entirely at the storage backend's own policy layer (AWS IAM, or
-MinIO policies for development and CI). Ravel's code plays no part in it: there
+This is enforced entirely at the storage backend's own policy layer (AWS IAM,
+or whatever policy layer an S3-compatible store exposes). Ravel's code plays no part in it: there
 is no in-process authorization check and no change to the `RAVEL_S3_*` contract.
 You provision a narrower credential per role and attach the policy.
 
@@ -333,28 +333,19 @@ delete allow and the completion deny never overlap.
 Add `t/*/*/del/*` to the Query and Maintain `ListBucket` prefix conditions as
 well, and add the completion deny to all four policy documents.
 
-### MinIO
+### S3-compatible stores
 
-MinIO's policy language is the same JSON, verbatim: the same actions, the same
-`arn:aws:s3:::<bucket>/<prefix>` resources, the same explicit `Deny` semantics.
-Load the files directly:
+The four documents under `deploy/iam/` are ordinary S3 policy JSON: the same
+actions, the same `arn:aws:s3:::<bucket>/<prefix>` resources, the same explicit
+`Deny` semantics. A store that exposes an S3-compatible policy layer takes them
+unchanged; load them with that store's own administrative tooling, and attach
+one credential per role.
 
-```sh
-# one policy document per role, straight from deploy/iam/
-mc admin policy create myminio ravel-gateway  deploy/iam/gateway.json
-mc admin policy create myminio ravel-query    deploy/iam/query.json
-mc admin policy create myminio ravel-maintain deploy/iam/maintain.json
-mc admin policy create myminio ravel-admin    deploy/iam/admin.json
-
-# one MinIO user per role, each attached to its policy
-mc admin user add myminio gateway-key  gateway-secret
-mc admin policy attach myminio ravel-gateway --user gateway-key
-# ...repeat for query, maintain, admin
-```
-
-The local kind environment provisions MinIO with a single shared credential
-across all pods, deliberately. The per-role split is a production hardening and
-the development environment does not need it.
+The local development and CI object store here is RustFS, provisioned with a
+single shared credential across every process, deliberately: the per-role split
+is a production hardening, and neither environment needs it. Ravel does not
+depend on any store-specific admin API, so nothing in this repository drives
+one.
 
 ## Encrypting objects with SSE-KMS
 

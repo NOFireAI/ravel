@@ -14,7 +14,7 @@
 #      prove nothing, so the process gets no chance to run any code at all;
 #   3. remove the dead container and start a fresh one, so the replacement comes
 #      up with an empty container filesystem and the only surviving state is
-#      what is in MinIO;
+#      what is in RustFS;
 #   4. query the ingested sample back, passing the captured token as
 #      `min_commit_token`.
 #
@@ -26,7 +26,7 @@
 # asserts the response status and content, never the process exit code alone.
 #
 # It assumes the compose stack is ALREADY UP (same contract as
-# demo/walkthrough.sh and scripts/check-readme-commands.sh); bringing MinIO,
+# demo/walkthrough.sh and scripts/check-readme-commands.sh); bringing RustFS,
 # ravel-server, the collector, and Grafana up is
 # `docker compose -f deploy/docker-compose/ravel.yml up -d`'s job.
 #
@@ -156,7 +156,7 @@ field_len_delimited() {
 }
 
 # The metric name carries a per-run suffix, and that is what keeps the final
-# assertion from being vacuous. `minio-data/` is deliberately reused across runs
+# assertion from being vacuous. `rustfs-data/` is deliberately reused across runs
 # (ADR-0081 Consequences), so a fixed name would let a PREVIOUS run's surviving
 # sample satisfy this run's query even if this run's write were lost. A name no
 # earlier run can have written means the sample the query finds is the one this
@@ -264,7 +264,7 @@ log "$SERVICE is dead (exit $SIGKILL_EXIT_CODE, killed by SIGKILL)"
 # starts from the image with an empty container filesystem. Restarting the same
 # container would leave any local state intact and would weaken the claim: the
 # point is that the replacement process shares nothing with the dead one except
-# the MinIO bucket.
+# the RustFS bucket.
 
 log "removing the dead container (discards its filesystem) and starting a fresh one"
 compose rm --force --stop "$SERVICE"

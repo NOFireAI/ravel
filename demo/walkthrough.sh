@@ -7,7 +7,7 @@
 # query does not return the ingested series.
 #
 # It assumes the compose stack is ALREADY UP (same contract as
-# scripts/check-readme-commands.sh); bringing MinIO, ravel-server, the collector,
+# scripts/check-readme-commands.sh); bringing RustFS, ravel-server, the collector,
 # and Grafana up is `docker compose -f deploy/docker-compose/ravel.yml up -d`'s
 # job. Run this after the stack is healthy.
 #

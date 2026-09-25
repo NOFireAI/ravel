@@ -128,6 +128,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The quickstart and CI object store moved from MinIO to RustFS, and the
+  `mc` client to the AWS CLI** (issue #2001). MinIO withdrew anonymous access
+  to its public images on 2026-09-24, from Docker Hub and quay.io alike, so
+  every compose file, Kubernetes manifest and CI job that started MinIO failed
+  at `docker run` with `unauthorized`, and a mirror is no fix because the
+  images cannot be pulled without credentials at all. The object store is now
+  `ghcr.io/rustfs/rustfs:1.0.0`, the S3 client is
+  `public.ecr.aws/aws-cli/aws-cli:2.37.2`, and both stay pinned by digest;
+  neither registry applies Docker Hub's per-IP anonymous pull allowance. An
+  operator running the old quickstart compose file should stop the stack
+  (`docker compose -f deploy/docker-compose/ravel.yml down`), pull the current
+  files, rename the data directory from `minio-data/` to `rustfs-data/` (or
+  delete it to start from an empty store, since the store-qualify one-shot is
+  idempotent either way), and bring the stack back up; the endpoint, bucket
+  name and development credentials are unchanged, so nothing else in a local
+  configuration moves. `make minio` and `make minio-down` are now `make
+  rustfs` and `make rustfs-down`, `deploy/docker-compose/minio.yml` is
+  `deploy/docker-compose/rustfs.yml`, `deploy/k8s/minio.yaml` is
+  `deploy/k8s/rustfs.yaml`, and `RAVEL_FAKE_S3_BACKEND=minio` is
+  `RAVEL_FAKE_S3_BACKEND=rustfs`. The `RAVEL_MINIO_*` variables that gate the
+  object-store contract test, and the `minio_contract` test name itself, keep
+  their names: they name the gate rather than the vendor, and every checkout
+  and lane that sets them would otherwise break.
+
 - **The shipped admission defaults are now one value, `ravel-ingest`'s
   `AdmissionLimits::default()`, instead of two that had drifted** (issue #23).
   **No deployment's effective limits move.** A shipped `ravel-server` already

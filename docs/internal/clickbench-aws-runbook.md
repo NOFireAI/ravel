@@ -49,7 +49,7 @@ echo "bucket: $BUCKET"
 ```
 
 Ravel reaches the bucket with an access key rather than the instance role, so
-the same credentials work unchanged against MinIO or any other S3-compatible
+the same credentials work unchanged against RustFS or any other S3-compatible
 store.
 
 ```sh
