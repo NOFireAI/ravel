@@ -29,11 +29,14 @@ services:
       # credentials above.
       AWS_EC2_METADATA_DISABLED: "true"
     # A signed S3 call fails until RustFS is serving, so the until-loop is the
-    # readiness wait. The image's entrypoint is the `aws` binary itself, so
-    # running more than one command needs an explicit shell.
+    # readiness wait; the service exits 0 only once the bucket exists. The
+    # image's entrypoint is the `aws` binary itself, so running more than one
+    # command needs an explicit shell.
     entrypoint: >
       /bin/sh -c "
       until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
       echo 'waiting for rustfs'; sleep 1;
       done &&
-      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ravel-dev || true"
+      { aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ravel-dev ||
+        aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ravel-dev; } &&
+      aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ravel-dev"
