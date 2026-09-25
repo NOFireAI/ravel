@@ -479,7 +479,7 @@ pub struct Cli {
     /// and a plaintext endpoint on the network carries every object this
     /// process writes and reads, plus the credentials signing those requests,
     /// in the clear; startup refuses that combination unless this flag says
-    /// the operator meant it. A loopback `http://` endpoint (the local MinIO
+    /// the operator meant it. A loopback `http://` endpoint (the local RustFS
     /// every development launcher here points at) needs no flag, and an
     /// `https://` endpoint is unaffected.
     #[arg(long, env = "RAVEL_S3_ALLOW_HTTP")]
