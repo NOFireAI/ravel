@@ -158,7 +158,7 @@ QUICKSTART_EXPECTED_PINNED_COUNT=6
 # rather than a third-party one: excluded from category 4 by exact string
 # match, not by pattern, so a typo'd variable reference does not silently
 # slip through as "exempt".
-RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.16.0}'
+RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.16.1}'
 
 # Category 5 scans every workflow under .github/workflows, the same glob
 # category 3 uses for action refs. A fixed file list would leave a workflow
