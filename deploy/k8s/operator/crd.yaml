@@ -491,7 +491,7 @@
                         "properties": {
                           "allowHttp": {
                             "default": false,
-                            "description": "Accept a plaintext `http://` `endpoint` whose host is not loopback\n(`--s3-allow-http`). A pod never reaches its object store over\nloopback, so an in-cluster MinIO or floci addressed by Service name\nneeds this. Without it the operator refuses to render the cluster at\nall: the `RavelCluster` gets a `Degraded` condition with reason\n`PlaintextS3Endpoint` naming this field, and no Deployment, Service, or\nqualification Job is created, rather than moving telemetry and S3\ncredentials across the cluster network in the clear. The same rule\ngoverns the operator's own S3 client (the one that reconciles\n`sys/auth` and applies `shardOverrides`), the rendered server\ncontainers, and the `ravel-cli store qualify` Job, all from one\ndecision. Setting it re-runs store qualification, because it changes\nwhether that check can reach the store. Leave false (the default) for\nany `https://` endpoint and for real AWS S3: there it is inert, since\nan `https://` endpoint never permits a downgrade.",
+                            "description": "Accept a plaintext `http://` `endpoint` whose host is not loopback\n(`--s3-allow-http`). A pod never reaches its object store over\nloopback, so an in-cluster RustFS or floci addressed by Service name\nneeds this. Without it the operator refuses to render the cluster at\nall: the `RavelCluster` gets a `Degraded` condition with reason\n`PlaintextS3Endpoint` naming this field, and no Deployment, Service, or\nqualification Job is created, rather than moving telemetry and S3\ncredentials across the cluster network in the clear. The same rule\ngoverns the operator's own S3 client (the one that reconciles\n`sys/auth` and applies `shardOverrides`), the rendered server\ncontainers, and the `ravel-cli store qualify` Job, all from one\ndecision. Setting it re-runs store qualification, because it changes\nwhether that check can reach the store. Leave false (the default) for\nany `https://` endpoint and for real AWS S3: there it is inert, since\nan `https://` endpoint never permits a downgrade.",
                             "type": "boolean"
                           },
                           "bucket": {
@@ -512,7 +512,7 @@
                             "type": "object"
                           },
                           "endpoint": {
-                            "description": "Custom endpoint (`--s3-endpoint`) for S3-compatible backends such as\nMinIO or floci. Omit for real AWS S3.",
+                            "description": "Custom endpoint (`--s3-endpoint`) for S3-compatible backends such as\nRustFS or floci. Omit for real AWS S3.",
                             "nullable": true,
                             "type": "string"
                           },

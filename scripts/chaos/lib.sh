@@ -4,9 +4,9 @@
 #
 # This lane is deliberately NOT part of ravel-sim and is NOT run in PR CI
 # (ADR-0077 section 4, "Rejected alternatives / Running the chaos lane in
-# PR CI"). It drives real binaries, a real MinIO, real multi-threaded
-# runtime, a real clock, and a real `kill -9`. Executors have no MinIO and
-# must not run it end to end; an orchestrator with MinIO runs it later and
+# PR CI"). It drives real binaries, a real object store, real multi-threaded
+# runtime, a real clock, and a real `kill -9`. Executors have no object store
+# and must not run it end to end; an orchestrator with one runs it later and
 # records the result in the ADR-0077 section 3 rehearsal-record discipline.
 #
 # The oracle is PINNED by ADR-0077 section 4 (the harness implements it, it
@@ -57,13 +57,16 @@ chaos_takeover_bound_seconds() {
 }
 
 # ---------------------------------------------------------------------------
-# MinIO / server / tenancy configuration (mirrors scripts/demo.sh).
+# Object store / server / tenancy configuration (mirrors scripts/demo.sh).
 # ---------------------------------------------------------------------------
 
-CHAOS_MINIO_COMPOSE="${CHAOS_MINIO_COMPOSE:-deploy/docker-compose/minio.yml}"
-CHAOS_MINIO_ENDPOINT="${CHAOS_MINIO_ENDPOINT:-http://127.0.0.1:9000}"
+CHAOS_RUSTFS_COMPOSE="${CHAOS_RUSTFS_COMPOSE:-deploy/docker-compose/rustfs.yml}"
+CHAOS_RUSTFS_ENDPOINT="${CHAOS_RUSTFS_ENDPOINT:-http://127.0.0.1:9000}"
+# Pinned by tag and digest, from a registry that applies no per-IP anonymous
+# pull allowance; see deploy/README.md.
+CHAOS_AWS_CLI_IMAGE="${CHAOS_AWS_CLI_IMAGE:-public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed}"
 
-export RAVEL_S3_ENDPOINT="${RAVEL_S3_ENDPOINT:-$CHAOS_MINIO_ENDPOINT}"
+export RAVEL_S3_ENDPOINT="${RAVEL_S3_ENDPOINT:-$CHAOS_RUSTFS_ENDPOINT}"
 export RAVEL_S3_BUCKET="${RAVEL_S3_BUCKET:-ravel-chaos}"
 export RAVEL_S3_REGION="${RAVEL_S3_REGION:-us-east-1}"
 export RAVEL_S3_ACCESS_KEY="${RAVEL_S3_ACCESS_KEY:-ravel}"
@@ -154,25 +157,25 @@ print_oracle_summary() {
 
 # Tools a real end-to-end run needs. Absent tools are reported by
 # check_dependencies but, by default, do not fail --check: --check proves the
-# script is well-formed in an environment with no MinIO. Set
+# script is well-formed in an environment with no object store. Set
 # CHAOS_CHECK_STRICT=1 (orchestrator side, where the tools must exist) to make
 # any absent real-run dependency fail the check.
 CHAOS_REAL_RUN_TOOLS=(curl docker jq)
 
-# The MinIO client is looked up as either `mc` on PATH or the mc container
+# The S3 client is looked up as either `aws` on PATH or the AWS CLI container
 # image used by scripts/demo.sh; check_dependencies reports which was found.
 chaos_have_command() {
   command -v "$1" >/dev/null 2>&1
 }
 
-# Report whether a MinIO client is reachable, without starting anything.
-chaos_minio_client_available() {
-  if chaos_have_command mc; then
+# Report whether an S3 client is reachable, without starting anything.
+chaos_s3_client_available() {
+  if chaos_have_command aws; then
     return 0
   fi
   if chaos_have_command docker; then
-    # demo.sh drives mc via `docker run quay.io/minio/mc`; docker presence is the
-    # gate for that path. We do not pull the image here (that would touch the
+    # demo.sh drives the AWS CLI via `docker run`; docker presence is the gate
+    # for that path. We do not pull the image here (that would touch the
     # network); we only report the capability exists.
     return 0
   fi
@@ -191,11 +194,11 @@ chaos_ravel_binaries_available() {
   return 1
 }
 
-# Validate structure and dependencies WITHOUT starting MinIO, driving load,
-# or issuing any kill. Returns 0 when the script is structurally well-formed;
-# returns nonzero only on a structural defect, or on any missing real-run
-# tool when CHAOS_CHECK_STRICT=1. Absent real-run tools are reported as
-# WARN (not FAIL) by default so --check passes in a MinIO-less executor.
+# Validate structure and dependencies WITHOUT starting the object store,
+# driving load, or issuing any kill. Returns 0 when the script is structurally
+# well-formed; returns nonzero only on a structural defect, or on any missing
+# real-run tool when CHAOS_CHECK_STRICT=1. Absent real-run tools are reported
+# as WARN (not FAIL) by default so --check passes in a store-less executor.
 check_dependencies() {
   local strict="${CHAOS_CHECK_STRICT:-0}"
   local defects=0
@@ -245,10 +248,10 @@ check_dependencies() {
     fi
   done
 
-  if chaos_minio_client_available; then
-    echo "  OK    MinIO client path available (mc or docker)"
+  if chaos_s3_client_available; then
+    echo "  OK    S3 client path available (aws or docker)"
   else
-    echo "  WARN  no MinIO client (mc) and no docker: a real run cannot manage MinIO"
+    echo "  WARN  no S3 client (aws) and no docker: a real run cannot manage the store"
     warnings=$(( warnings + 1 ))
   fi
 
@@ -277,14 +280,27 @@ check_dependencies() {
 }
 
 # ---------------------------------------------------------------------------
-# MinIO startup / teardown helpers (real-run only).
+# RustFS startup / teardown helpers (real-run only).
 # ---------------------------------------------------------------------------
 
-CHAOS_STARTED_MINIO=0
+CHAOS_STARTED_RUSTFS=0
 
-chaos_minio_healthy() {
+chaos_rustfs_healthy() {
   curl --silent --fail --max-time 2 \
-    "${CHAOS_MINIO_ENDPOINT}/minio/health/live" >/dev/null 2>&1
+    "${CHAOS_RUSTFS_ENDPOINT}/health" >/dev/null 2>&1
+}
+
+# Run one AWS CLI command against the chaos store, in the pinned container,
+# with the chaos credentials. Arguments are the aws subcommand and its flags.
+chaos_aws() {
+  docker run --rm --network host \
+    -e "AWS_ACCESS_KEY_ID=${RAVEL_S3_ACCESS_KEY}" \
+    -e "AWS_SECRET_ACCESS_KEY=${RAVEL_S3_SECRET_KEY}" \
+    -e "AWS_DEFAULT_REGION=${RAVEL_S3_REGION}" \
+    -e AWS_EC2_METADATA_DISABLED=true \
+    "$CHAOS_AWS_CLI_IMAGE" \
+    --endpoint-url "$CHAOS_RUSTFS_ENDPOINT" \
+    "$@"
 }
 
 # Wait up to N attempts (1 s apart) for a predicate command to succeed.
@@ -303,39 +319,33 @@ chaos_wait_for() {
   return 1
 }
 
-# Bring MinIO up (idempotent) and ensure the bucket + store qualification
+# Bring RustFS up (idempotent) and ensure the bucket + store qualification
 # exist. Mirrors scripts/demo.sh so a real run matches the demo's known-good
 # startup. Never called in --check mode.
-minio_up() {
-  if chaos_minio_healthy; then
-    log "MinIO already running at ${CHAOS_MINIO_ENDPOINT}"
+rustfs_up() {
+  if chaos_rustfs_healthy; then
+    log "RustFS already running at ${CHAOS_RUSTFS_ENDPOINT}"
   else
-    log "starting MinIO via docker compose"
-    docker compose -f "$CHAOS_MINIO_COMPOSE" up -d
-    CHAOS_STARTED_MINIO=1
-    chaos_wait_for "MinIO to become healthy" 30 chaos_minio_healthy || return 1
+    log "starting RustFS via docker compose"
+    docker compose -f "$CHAOS_RUSTFS_COMPOSE" up -d
+    CHAOS_STARTED_RUSTFS=1
+    chaos_wait_for "RustFS to become healthy" 30 chaos_rustfs_healthy || return 1
   fi
 
   log "ensuring bucket ${RAVEL_S3_BUCKET} exists"
-  # quay.io, not Docker Hub: Docker Hub's anonymous pull allowance is per-IP
-  # and shared across every project on a runner, so an unauthenticated pull
-  # from there fails unpredictably.
-  docker run --rm --network host \
-    -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
-    quay.io/minio/mc:latest mb -p "local/${RAVEL_S3_BUCKET}" >/dev/null 2>&1 || true
+  # create-bucket is idempotent against RustFS, so this is safe on a reused
+  # data directory.
+  chaos_aws s3api create-bucket --bucket "$RAVEL_S3_BUCKET" >/dev/null 2>&1 || true
 
   # Start every scenario on an empty store. The compose file bind-mounts
-  # ../../minio-data, so `docker compose down` leaves the objects on the host
+  # ../../rustfs-data, so `docker compose down` leaves the objects on the host
   # and the next scenario, or a re-run of this one, inherits them. Why that
   # breaks the takeover oracles rather than merely being untidy: see
-  # `assert_single_tenant_universe` below. Emptied through mc rather than rm
-  # because the container writes the host directory as root. RAVEL_S3_BUCKET
-  # defaults to a chaos-only bucket.
+  # `assert_single_tenant_universe` below. Emptied through the S3 API rather
+  # than rm because the container writes the host directory as root.
+  # RAVEL_S3_BUCKET defaults to a chaos-only bucket.
   log "emptying bucket ${RAVEL_S3_BUCKET} so this scenario starts clean"
-  docker run --rm --network host \
-    -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
-    quay.io/minio/mc:latest rm --recursive --force "local/${RAVEL_S3_BUCKET}" \
-    >/dev/null 2>&1 || true
+  chaos_aws s3 rm "s3://${RAVEL_S3_BUCKET}" --recursive >/dev/null 2>&1 || true
 
   # ADR-0050 EC7: a non-Memory store refuses to serve until `sys/qualification`
   # exists, and there is no bootstrap-and-continue path. Qualify before any
@@ -361,14 +371,16 @@ minio_up() {
 # passes with no takeover having happened.
 #
 # Two things keep that from happening, and they are not interchangeable.
-# `minio_up` empties the bucket so the precondition holds. This function
+# `rustfs_up` empties the bucket so the precondition holds. This function
 # asserts that it did, because the violated-precondition case is a PASS rather
 # than an error and nothing else would mark it.
+#
+# `aws s3 ls` on a prefix prints one `PRE <name>/` line per child prefix, so
+# the trailing-slash count below is the tenant count, exactly as it was under
+# the equivalent `mc ls`.
 assert_single_tenant_universe() {
   local listing count
-  listing="$(docker run --rm --network host \
-    -e "MC_HOST_local=http://${RAVEL_S3_ACCESS_KEY}:${RAVEL_S3_SECRET_KEY}@127.0.0.1:9000" \
-    quay.io/minio/mc:latest ls "local/${RAVEL_S3_BUCKET}/t/" 2>/dev/null)" || {
+  listing="$(chaos_aws s3 ls "s3://${RAVEL_S3_BUCKET}/t/" 2>/dev/null)" || {
     oracle_bad "single_tenant_universe" "could not list t/ in ${RAVEL_S3_BUCKET}"
     return 1
   }
@@ -382,12 +394,12 @@ assert_single_tenant_universe() {
   return 0
 }
 
-# Tear MinIO down only if this library started it.
-minio_down() {
-  if [[ "$CHAOS_STARTED_MINIO" -eq 1 ]]; then
-    log "stopping MinIO"
-    docker compose -f "$CHAOS_MINIO_COMPOSE" down >/dev/null 2>&1 || true
-    CHAOS_STARTED_MINIO=0
+# Tear RustFS down only if this library started it.
+rustfs_down() {
+  if [[ "$CHAOS_STARTED_RUSTFS" -eq 1 ]]; then
+    log "stopping RustFS"
+    docker compose -f "$CHAOS_RUSTFS_COMPOSE" down >/dev/null 2>&1 || true
+    CHAOS_STARTED_RUSTFS=0
   fi
 }
 
@@ -622,7 +634,7 @@ query_series_visible() {
 # Each is a separate, independently testable function. Each returns 0 on the
 # assertion holding and records via oracle_ok; on failure it records via
 # oracle_bad (naming the assertion) and returns nonzero. None of them starts
-# MinIO or drives load: they read the post-kill/post-restart world the
+# RustFS or drives load: they read the post-kill/post-restart world the
 # scenario scripts set up.
 # ===========================================================================
 

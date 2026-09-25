@@ -31,8 +31,8 @@
 # record is published.
 #
 # --check / --dry-run validates structure and dependencies WITHOUT starting
-# MinIO, spawning workers, or issuing a real kill. That is the only proof
-# available with no MinIO; a real run is the orchestrator's job.
+# RustFS, spawning workers, or issuing a real kill. That is the only proof
+# available with no object store; a real run is the orchestrator's job.
 #
 # Gate-shell discipline: see scripts/chaos/lib.sh header.
 set -euo pipefail
@@ -69,11 +69,12 @@ usage() {
 Usage: kill-maintain-worker.sh [--check|--dry-run] [--help]
 
   --check, --dry-run   Validate structure and dependencies only. Does NOT
-                       start MinIO, spawn workers, or issue a real kill -9.
+                       start RustFS, spawn workers, or issue a real kill -9.
   --help               Show this help.
 
-With no flag, runs the full scenario against a real MinIO with two maintain
-workers (orchestrator-only; executors have no MinIO and must use --check).
+With no flag, runs the full scenario against a real RustFS with two maintain
+workers (orchestrator-only; executors have no object store and must use
+--check).
 
 A failure of this scenario is RELEASE-BLOCKING (ADR-0077 section 4); the
 script exits 2 and names the failed pinned oracle assertion(s).
@@ -101,7 +102,7 @@ if [[ "$MODE" == "check" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Real run (orchestrator, with MinIO). Executors must not reach here.
+# Real run (orchestrator, with RustFS). Executors must not reach here.
 # ---------------------------------------------------------------------------
 
 WORKER_A_PID=""
@@ -121,7 +122,7 @@ cleanup() {
     fi
   done
   rm -f "$WORKER_A_LOG" "$WORKER_B_LOG" "$INGEST_LOG" "$FIXTURE_PATH"
-  minio_down
+  rustfs_down
 }
 trap cleanup EXIT
 
@@ -165,8 +166,8 @@ ingest_reachable() {
     "http://${INGEST_HTTP}/api/v1/query?query=up" >/dev/null 2>&1
 }
 
-log "bringing up MinIO and qualifying the store"
-minio_up
+log "bringing up RustFS and qualifying the store"
+rustfs_up
 
 log "generating OTLP fixture"
 cargo run --quiet -p ravel-server --example gen_otlp_fixture > "$FIXTURE_PATH"

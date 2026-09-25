@@ -20,15 +20,16 @@ server:
   grpc_server_max_recv_msg_size: 104857600
   grpc_server_max_send_msg_size: 104857600
 
-# Single connection to MinIO shared by every S3-backed storage below. DURABILITY:
-# this points Mimir's durable state at S3 (MinIO in this stack). See the
-# durability note beside the mimir service in docker-compose.yml and ADR-0927
-# decision 10: a MinIO result is a correctness result, not a publishable one.
+# Single connection to RustFS shared by every S3-backed storage below.
+# DURABILITY: this points Mimir's durable state at S3 (RustFS in this stack).
+# See the durability note beside the mimir service in docker-compose.yml and
+# ADR-0927 decision 10: a RustFS result is a correctness result, not a
+# publishable one.
 common:
   storage:
     backend: s3
     s3:
-      endpoint: minio:9000
+      endpoint: rustfs:9000
       insecure: true
       access_key_id: mimir
       secret_access_key: mimir-dev-secret

@@ -1,5 +1,5 @@
 # A minimal RavelCluster for local/dev use (ADR-0034 decision 6). Points at an
-# S3-compatible endpoint (MinIO/floci) and references three Secrets the
+# S3-compatible endpoint (RustFS/floci) and references three Secrets the
 # platform owner creates: one with keys accessKeyId/secretAccessKey, one whose
 # keys are tenant names and whose values are bearer tokens, and one with a
 # single key `key` holding the query-audit token key.
@@ -19,10 +19,10 @@ spec:
     s3:
       bucket: ravel
       region: us-east-1
-      endpoint: http://minio.ravel-system.svc:9000
+      endpoint: http://rustfs.ravel-system.svc:9000
       # The endpoint above is plaintext http:// to a Service name, which no
       # pod reaches over loopback, so the server refuses to start without
-      # this. It is here because the in-cluster MinIO speaks no TLS; a
+      # this. It is here because the in-cluster RustFS speaks no TLS; a
       # cluster whose object store has an https:// endpoint omits it.
       allowHttp: true
       credentialsSecretRef:
