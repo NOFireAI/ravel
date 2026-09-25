@@ -189,8 +189,8 @@ impl Compaction {
 /// beside the numbers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Provenance {
-    /// Object-store backend that actually ran: `"memory"`, `"minio"`, or
-    /// `"s3"`. The caller classifies it (a custom S3 endpoint is MinIO), since
+    /// Object-store backend that actually ran: `"memory"`, `"rustfs"`, or
+    /// `"s3"`. The caller classifies it (a custom S3 endpoint is RustFS), since
     /// the store is handed in already constructed.
     pub store_backend: String,
     /// Backend region, or the sentinel `"n/a"` for a backend with none

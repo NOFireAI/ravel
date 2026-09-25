@@ -1205,19 +1205,13 @@ jobs:
 
   # Runs the object-store contract suite (docs/object-store-contract.md)
   # against real S3-compatible endpoints: RustFS, and floci. Without this job
-  # the `minio_contract` and `floci_contract` tests in
+  # the `rustfs_contract` and `floci_contract` tests in
   # crates/ravel-object-store/tests/contract.rs early-return
-  # (RAVEL_MINIO_URL / RAVEL_FLOCI_URL unset), so the only durable backend
+  # (RAVEL_RUSTFS_URL / RAVEL_FLOCI_URL unset), so the only durable backend
   # Ravel ships against -- S3 -- gets zero CI coverage and an S3Store
   # regression passes green. This job is required: object
   # storage is the source of truth, so a break in the S3 adapter must fail
   # CI, not be waved through.
-  #
-  # The `RAVEL_MINIO_*` variables and the `minio_contract` test name are the
-  # crate's existing name for "the local S3-compatible endpoint" and are
-  # unchanged by the move off MinIO (issue #2001): renaming them is a
-  # workspace-wide Rust change with no behaviour in it. The values below point
-  # at RustFS.
   #
   # RustFS is launched with `docker run` rather than a GitHub Actions service
   # container because the image needs a data-directory argument, which the
@@ -1306,21 +1300,20 @@ jobs:
             if [ "$attempt" -lt 5 ]; then sleep $((attempt * 15)); fi
           done
           exit 125
-      # The contract suite's S3 case is gated on RAVEL_MINIO_URL; set it (and
+      # The contract suite's S3 case is gated on RAVEL_RUSTFS_URL; set it (and
       # the credentials/bucket the docker run above provisioned) so the gated
-      # test executes instead of skipping. The variable names are the crate's
-      # and predate the move to RustFS; see this job's header comment.
+      # test executes instead of skipping.
       - name: Run object-store contract suite against RustFS
         env:
-          RAVEL_MINIO_URL: http://localhost:9000
-          RAVEL_MINIO_BUCKET: ravel-object-store-test
-          RAVEL_MINIO_ACCESS_KEY: rustfsadmin
-          RAVEL_MINIO_SECRET_KEY: rustfsadmin
-          RAVEL_MINIO_REGION: us-east-1
+          RAVEL_RUSTFS_URL: http://localhost:9000
+          RAVEL_RUSTFS_BUCKET: ravel-object-store-test
+          RAVEL_RUSTFS_ACCESS_KEY: rustfsadmin
+          RAVEL_RUSTFS_SECRET_KEY: rustfsadmin
+          RAVEL_RUSTFS_REGION: us-east-1
         run: |
           set -o pipefail
-          # nextest equivalent of `--test contract minio_contract -- --exact`:
-          # `--test contract` selects the binary and `-E 'test(=minio_contract)'`
+          # nextest equivalent of `--test contract rustfs_contract -- --exact`:
+          # `--test contract` selects the binary and `-E 'test(=rustfs_contract)'`
           # matches that one test name exactly. `--no-capture` replaces libtest's
           # `--nocapture` so the guard's skip line still reaches stdout. nextest
           # writes its run summary to stderr, so 2>&1 keeps it in the tee'd file.
@@ -1329,21 +1322,21 @@ jobs:
           # of its summary line in ANSI escapes even when piped, which breaks
           # the pass-count grep below.
           cargo nextest run --locked -p ravel-object-store --test contract \
-            -E 'test(=minio_contract)' --no-capture --color never 2>&1 \
+            -E 'test(=rustfs_contract)' --no-capture --color never 2>&1 \
             | tee contract-output.txt
           # Prove the suite actually ran against RustFS rather than taking the
-          # RAVEL_MINIO_URL-unset early return. If the guard printed its skip
+          # RAVEL_RUSTFS_URL-unset early return. If the guard printed its skip
           # line, or nextest did not report exactly one passing test, fail the
           # job even though `cargo nextest` itself exited 0 on a clean skip.
-          if grep -q "skipping MinIO contract test" contract-output.txt; then
-            echo "::error::minio_contract skipped despite RAVEL_MINIO_URL set"
+          if grep -q "skipping RustFS contract test" contract-output.txt; then
+            echo "::error::rustfs_contract skipped despite RAVEL_RUSTFS_URL set"
             exit 1
           fi
           # nextest summary reads e.g. "1 test run: 1 passed, 0 skipped"
           # (singular "test" when exactly one ran), not libtest's
           # "test result: ok. 1 passed".
           if ! grep -qE "1 tests? run: 1 passed" contract-output.txt; then
-            echo "::error::minio_contract did not run (expected 1 passed)"
+            echo "::error::rustfs_contract did not run (expected 1 passed)"
             exit 1
           fi
       # floci: the fake-S3 backend ADR-0034 decision 8 gates here before the
@@ -1496,35 +1489,33 @@ jobs:
             if [ "$attempt" -lt 5 ]; then sleep $((attempt * 15)); fi
           done
           exit 125
-      # minio_ingest_read_smoke is gated on RAVEL_MINIO_URL, same convention
-      # as the contract suite's minio_contract; set it (and the
+      # rustfs_ingest_read_smoke is gated on RAVEL_RUSTFS_URL, same convention
+      # as the contract suite's rustfs_contract; set it (and the
       # credentials/bucket the docker run above provisioned) so the gated
-      # test executes instead of skipping. The variable and test names are the
-      # crate's and predate the move to RustFS; see object-store-contract's
-      # header comment.
+      # test executes instead of skipping.
       - name: Run end-to-end ingest+query smoke test against RustFS
         env:
-          RAVEL_MINIO_URL: http://localhost:9000
-          RAVEL_MINIO_BUCKET: ravel-object-store-test
-          RAVEL_MINIO_ACCESS_KEY: rustfsadmin
-          RAVEL_MINIO_SECRET_KEY: rustfsadmin
-          RAVEL_MINIO_REGION: us-east-1
+          RAVEL_RUSTFS_URL: http://localhost:9000
+          RAVEL_RUSTFS_BUCKET: ravel-object-store-test
+          RAVEL_RUSTFS_ACCESS_KEY: rustfsadmin
+          RAVEL_RUSTFS_SECRET_KEY: rustfsadmin
+          RAVEL_RUSTFS_REGION: us-east-1
         run: |
           set -o pipefail
           # Same invocation shape as object-store-contract's RustFS step; see
           # its comment for why --no-capture and --color never are needed
           # for the greps below.
           cargo nextest run --locked -p ravel-bench --test s3_e2e_smoke \
-            -E 'test(=minio_ingest_read_smoke)' --no-capture --color never 2>&1 \
+            -E 'test(=rustfs_ingest_read_smoke)' --no-capture --color never 2>&1 \
             | tee bench-smoke-output.txt
           # Prove the test actually ran against RustFS rather than taking the
-          # RAVEL_MINIO_URL-unset early return.
-          if grep -q "skipping MinIO ingest+read smoke test" bench-smoke-output.txt; then
-            echo "::error::minio_ingest_read_smoke skipped despite RAVEL_MINIO_URL set"
+          # RAVEL_RUSTFS_URL-unset early return.
+          if grep -q "skipping RustFS ingest+read smoke test" bench-smoke-output.txt; then
+            echo "::error::rustfs_ingest_read_smoke skipped despite RAVEL_RUSTFS_URL set"
             exit 1
           fi
           if ! grep -qE "1 tests? run: 1 passed" bench-smoke-output.txt; then
-            echo "::error::minio_ingest_read_smoke did not run (expected 1 passed)"
+            echo "::error::rustfs_ingest_read_smoke did not run (expected 1 passed)"
             exit 1
           fi
       - name: Stop RustFS

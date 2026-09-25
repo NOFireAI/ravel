@@ -15,6 +15,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--all-features` was in play. The field is now boxed, with no change in
   behavior.
 
+### Changed
+
+- **The remaining MinIO identifiers are renamed to RustFS** (issue #2008).
+  RustFS replaced MinIO as the object store used locally and in CI a while
+  ago, but several names had not caught up: the `RAVEL_MINIO_*` environment
+  variables are now `RAVEL_RUSTFS_*`, with no fallback to the old names, and
+  every test function, helper, module, constant, and fixture hostname that
+  said "minio" now says "rustfs", including the CI greps that gate on those
+  exact names. The bench report's backend label changes from `"minio"` to
+  `"rustfs"` in `sql_latency_bench`, and `read_path_accounting`'s `Backend`
+  enum variant is renamed from `Minio` to `RustFs`. Prose that names MinIO
+  as an example local or CI store is reworded to name RustFS instead; a
+  handful of sentences that made a specific behavioral claim about MinIO
+  with no equivalent proof for RustFS in this repository are reworded to be
+  store-neutral instead.
+
 ## [0.16.1] - 2026-09-25
 
 ### Fixed

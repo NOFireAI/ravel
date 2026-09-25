@@ -28,7 +28,7 @@
 //! lower bound on the crossover: ADR-0071's whole premise is that distribution
 //! pays off once real object-store latency and extra fetch NICs dominate, which
 //! a `MemoryStore`/loopback shape cannot exhibit. An object-store-backed
-//! crossover panel (real S3/MinIO, workers on separate hosts) is the explicit
+//! crossover panel (real S3, workers on separate hosts) is the explicit
 //! follow-up. The S3-request counts and bytes-moved, by
 //! contrast, are host-independent: ADR-0071 makes them identical to local
 //! execution for a scalar query, and this bench reports both so that invariant

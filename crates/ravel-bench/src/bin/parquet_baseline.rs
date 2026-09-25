@@ -20,7 +20,7 @@
 //! Report-only: this bin never changes library behavior, it only measures
 //! it. Gated on the `parquet-baseline` feature so the default build never
 //! compiles arrow/parquet (see Cargo.toml). Phase b (read-side GET
-//! accounting on MinIO) is a separate later task and is not started here.
+//! accounting on RustFS) is a separate later task and is not started here.
 //!
 //! Run: `cargo run -p ravel-bench --release --features parquet-baseline \
 //!   --bin parquet_baseline`

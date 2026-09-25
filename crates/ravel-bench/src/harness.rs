@@ -108,8 +108,8 @@ impl std::fmt::Display for StoreKind {
 /// `RAVEL_S3_REGION`, `RAVEL_S3_ENDPOINT` (optional), `RAVEL_S3_ACCESS_KEY_ID`,
 /// `RAVEL_S3_SECRET_ACCESS_KEY`, `RAVEL_S3_ALLOW_HTTP` (default false),
 /// `RAVEL_S3_FORCE_PATH_STYLE` (default true). Same convention as
-/// `ingest_bench`'s `--store s3`; not the `RAVEL_MINIO_*` convention used by
-/// `ravel-object-store`'s contract suite, which gates a fixed local MinIO
+/// `ingest_bench`'s `--store s3`; not the `RAVEL_RUSTFS_*` convention used by
+/// `ravel-object-store`'s contract suite, which gates a fixed local RustFS
 /// rather than configuring an arbitrary S3-compatible endpoint.
 ///
 /// `RAVEL_S3_AUTH=instance-role` (ADR-0106) selects
@@ -184,8 +184,8 @@ pub fn store_and_metrics_from_env(
 
 /// Whether a request against `kind`'s backend is billed: false on
 /// `MemoryStore` and on any store behind a configured endpoint (a local
-/// MinIO reached over `RAVEL_S3_ENDPOINT`; ADR-0927 decision 10 is exactly
-/// this -- MinIO is valid for correctness, conformance and CI, never for a
+/// RustFS reached over `RAVEL_S3_ENDPOINT`; ADR-0927 decision 10 is exactly
+/// this -- RustFS is valid for correctness, conformance and CI, never for a
 /// performance or cost claim, because removing per-request fees is what
 /// makes a request-count defect invisible), true only for real S3 with no
 /// endpoint override. The one place every `--store`-driven bin derives this,
@@ -320,7 +320,7 @@ mod tests {
                 StoreKind::S3,
                 lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
             ),
-            "S3 behind a configured endpoint (MinIO) must not report billing"
+            "S3 behind a configured endpoint (RustFS) must not report billing"
         );
         assert!(
             backend_bills_requests_from_lookup(StoreKind::S3, lookup(&[])),

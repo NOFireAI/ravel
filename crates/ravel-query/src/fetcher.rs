@@ -138,7 +138,7 @@ pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
 /// The crossover this constant guards is a round-trip-vs-bytes tradeoff, not a
 /// pure win: below the floor the whole object is small enough that a single GET
 /// beats one catalog GET plus the extra selective page-range GETs (each a fresh
-/// round trip: ~15-80 ms on S3, ~1-5 ms on loopback MinIO). Those
+/// round trip: ~15-80 ms on S3, ~1-5 ms on loopback RustFS). Those
 /// measurements are per-request latency and do NOT meter this specific
 /// within-segment crossover, so this floor is
 /// set conservatively rather than fit to a measured point (see

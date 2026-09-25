@@ -18,7 +18,7 @@
 //! through `get_opts` (the `object_store` trait routes `get`, `get_range`,
 //! and `get_ranges` through it by default, coalescing adjacent ranges first),
 //! so counting there captures the real, post-coalescing request count a live
-//! S3/MinIO backend would see. A `head` request (size probe) is counted
+//! S3 backend would see. A `head` request (size probe) is counted
 //! separately and never as a GET. "bytes transferred" is the length of the
 //! byte range each GET returned, summed.
 //!

@@ -3,7 +3,7 @@
 //! the same pattern `tests/catalog.rs` uses and for the same reason: a
 //! subprocess-per-invocation of the binary gets its own empty in-memory store,
 //! so a seed -> reconstruct -> resolve scenario cannot be built that way
-//! without a persistent S3/MinIO backend, unavailable here. `ravel_cli`'s lib
+//! without a persistent S3 backend, unavailable here. `ravel_cli`'s lib
 //! target exists for exactly this.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
