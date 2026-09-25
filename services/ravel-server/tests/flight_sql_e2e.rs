@@ -170,9 +170,8 @@ impl Rustfs {
         panic!("RustFS did not become ready within 30s");
     }
 
-    /// Create the bucket with a one-shot AWS CLI container. RustFS answers a
-    /// repeated `create-bucket` from the owning credentials with success, so a
-    /// re-run against a surviving volume does not fail.
+    /// Create the bucket with a one-shot AWS CLI container. The RustFS container
+    /// this harness starts has no volume, so the bucket never pre-exists.
     fn make_bucket(&self) {
         let status = Command::new("docker")
             .args([
