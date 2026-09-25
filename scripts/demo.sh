@@ -13,8 +13,8 @@ cd "$ROOT_DIR"
 
 RUSTFS_COMPOSE="deploy/docker-compose/rustfs.yml"
 RUSTFS_ENDPOINT="http://127.0.0.1:9000"
-# Pinned by tag and digest, from a registry that applies no per-IP anonymous
-# pull allowance; see deploy/README.md.
+# Pinned by tag and digest, from a registry outside Docker Hub's per-IP
+# anonymous pull allowance; see deploy/README.md.
 AWS_CLI_IMAGE="public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed"
 FIXTURE_PATH="examples/otlp_metrics_fixture.pb"
 

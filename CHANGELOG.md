@@ -136,7 +136,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   images cannot be pulled without credentials at all. The object store is now
   `ghcr.io/rustfs/rustfs:1.0.0`, the S3 client is
   `public.ecr.aws/aws-cli/aws-cli:2.37.2`, and both stay pinned by digest;
-  neither registry applies Docker Hub's per-IP anonymous pull allowance. An
+  neither registry shares Docker Hub's per-IP anonymous pull allowance, though
+  ECR Public throttles unauthenticated pulls per source IP on its own, so the
+  CI steps that pull the client retry a throttled pull with backoff. An
   operator running the old quickstart compose file should stop the stack
   (`docker compose -f deploy/docker-compose/ravel.yml down`), pull the current
   files, rename the data directory from `minio-data/` to `rustfs-data/` (or
