@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Cases for every_comparator_pins_an_image_digest.sh, focused on the fourth
 # category issue #1720 added: deploy/docker-compose/ravel.yml AND
-# deploy/docker-compose/minio.yml pin enforcement (minio.yml is ravel.yml's
-# standalone MinIO-and-bucket mirror and must stay pinned in lockstep).
+# deploy/docker-compose/rustfs.yml pin enforcement (rustfs.yml is ravel.yml's
+# standalone RustFS-and-bucket mirror and must stay pinned in lockstep).
 #
 # The script resolves every path it reads (Dockerfile, Dockerfile.prebuilt,
 # .github/workflows, .github/actions, deploy/metricsbench/docker-compose.yml,
@@ -60,8 +60,8 @@ new_tree() {
     "${dir}/deploy/metricsbench/docker-compose.yml"
   cp "${REPO_ROOT}/deploy/docker-compose/ravel.yml" \
     "${dir}/deploy/docker-compose/ravel.yml"
-  cp "${REPO_ROOT}/deploy/docker-compose/minio.yml" \
-    "${dir}/deploy/docker-compose/minio.yml"
+  cp "${REPO_ROOT}/deploy/docker-compose/rustfs.yml" \
+    "${dir}/deploy/docker-compose/rustfs.yml"
   cp -r "${REPO_ROOT}/deploy/k8s/." "${dir}/deploy/k8s/"
   cp "${SCRIPT}" \
     "${dir}/deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh"
@@ -121,27 +121,27 @@ mutate "${d}/deploy/docker-compose/ravel.yml" \
 check "a bare tag on grafana in ravel.yml fails naming the unpinned reference" \
   "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: grafana/grafana:latest'): grafana/grafana:latest"
 
-d="$(new_tree bare-tag-minio-ravel)"
+d="$(new_tree bare-tag-rustfs-ravel)"
 mutate "${d}/deploy/docker-compose/ravel.yml" \
-  's#image: quay\.io/minio/minio:RELEASE\.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b#image: quay.io/minio/minio:latest#'
-check "a bare tag on minio in ravel.yml fails naming the unpinned reference" \
-  "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: quay.io/minio/minio:latest'): quay.io/minio/minio:latest"
+  's#image: ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#image: ghcr.io/rustfs/rustfs:latest#'
+check "a bare tag on rustfs in ravel.yml fails naming the unpinned reference" \
+  "${d}" 1 "ravel.yml:$(line_of "${d}" deploy/docker-compose/ravel.yml 'image: ghcr.io/rustfs/rustfs:latest'): ghcr.io/rustfs/rustfs:latest"
 
-# --- a bare tag in minio.yml fails naming the line (issue #1720 fix round: --
-# --- minio.yml previously diverged from ravel.yml's pin with nothing to    --
+# --- a bare tag in rustfs.yml fails naming the line (issue #1720 fix round: -
+# --- the mirror previously diverged from ravel.yml's pin with nothing to   --
 # --- notice, because the guard never read it) -------------------------------
 
-d="$(new_tree bare-tag-minio-mirror)"
-mutate "${d}/deploy/docker-compose/minio.yml" \
-  's#image: quay\.io/minio/minio:RELEASE\.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b#image: quay.io/minio/minio:latest#'
-check "a bare tag on minio in minio.yml fails naming the unpinned reference" \
-  "${d}" 1 "minio.yml:$(line_of "${d}" deploy/docker-compose/minio.yml 'image: quay.io/minio/minio:latest'): quay.io/minio/minio:latest"
+d="$(new_tree bare-tag-rustfs-mirror)"
+mutate "${d}/deploy/docker-compose/rustfs.yml" \
+  's#image: ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#image: ghcr.io/rustfs/rustfs:latest#'
+check "a bare tag on rustfs in rustfs.yml fails naming the unpinned reference" \
+  "${d}" 1 "rustfs.yml:$(line_of "${d}" deploy/docker-compose/rustfs.yml 'image: ghcr.io/rustfs/rustfs:latest'): ghcr.io/rustfs/rustfs:latest"
 
-d="$(new_tree bare-tag-mc-mirror)"
-mutate "${d}/deploy/docker-compose/minio.yml" \
-  's#image: quay\.io/minio/mc:RELEASE\.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952#image: quay.io/minio/mc:latest#'
-check "a bare tag on mc in minio.yml fails naming the unpinned reference" \
-  "${d}" 1 "minio.yml:$(line_of "${d}" deploy/docker-compose/minio.yml 'image: quay.io/minio/mc:latest'): quay.io/minio/mc:latest"
+d="$(new_tree bare-tag-aws-cli-mirror)"
+mutate "${d}/deploy/docker-compose/rustfs.yml" \
+  's#image: public\.ecr\.aws/aws-cli/aws-cli:2\.37\.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed#image: public.ecr.aws/aws-cli/aws-cli:latest#'
+check "a bare tag on the AWS CLI in rustfs.yml fails naming the unpinned reference" \
+  "${d}" 1 "rustfs.yml:$(line_of "${d}" deploy/docker-compose/rustfs.yml 'image: public.ecr.aws/aws-cli/aws-cli:latest'): public.ecr.aws/aws-cli/aws-cli:latest"
 
 # A truncated digest must fail too: the regex requires exactly 64 hex chars,
 # not just the @sha256: substring.
@@ -171,21 +171,21 @@ mutate "${d}/deploy/docker-compose/ravel.yml" \
 check "an extra image line fails the total-count assertion" "${d}" 1 \
   "found 9 quickstart compose image references, expected exactly 8"
 
-# Removing an image line from minio.yml must be caught the same way: the
+# Removing an image line from rustfs.yml must be caught the same way: the
 # guard has to count across both quickstart files, not just ravel.yml.
-d="$(new_tree wrong-count-minio)"
-mutate "${d}/deploy/docker-compose/minio.yml" \
-  '/^    image: quay\.io\/minio\/mc:RELEASE/d'
-check "removing an image line from minio.yml fails the total-count assertion" \
+d="$(new_tree wrong-count-rustfs)"
+mutate "${d}/deploy/docker-compose/rustfs.yml" \
+  '/^    image: public\.ecr\.aws\/aws-cli\/aws-cli:/d'
+check "removing an image line from rustfs.yml fails the total-count assertion" \
   "${d}" 1 "found 7 quickstart compose image references, expected exactly 8"
 
-# A missing minio.yml must fail outright (missing file) and also drop the
+# A missing rustfs.yml must fail outright (missing file) and also drop the
 # combined count, not silently scan ravel.yml alone.
-d="$(new_tree missing-minio-file)"
-rm "${d}/deploy/docker-compose/minio.yml"
-check "a missing minio.yml fails naming the missing path" "${d}" 1 \
+d="$(new_tree missing-rustfs-file)"
+rm "${d}/deploy/docker-compose/rustfs.yml"
+check "a missing rustfs.yml fails naming the missing path" "${d}" 1 \
   "quickstart compose file not found at"
-check "a missing minio.yml also fails the total-count assertion" "${d}" 1 \
+check "a missing rustfs.yml also fails the total-count assertion" "${d}" 1 \
   "found 6 quickstart compose image references, expected exactly 8"
 
 # --- fifth category: docker run/pull/create image pins in workflow run: ----
@@ -195,9 +195,9 @@ check "a missing minio.yml also fails the total-count assertion" "${d}" 1 \
 # reference. This is the acceptance test for issue #1338.
 d="$(new_tree docker-run-image-with-tag-only-fails)"
 mutate "${d}/.github/workflows/ci.yml" \
-  's#quay\.io/minio/mc:RELEASE\.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727#quay.io/minio/mc:latest#'
+  's#public\.ecr\.aws/aws-cli/aws-cli:2\.37\.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed#public.ecr.aws/aws-cli/aws-cli:latest#'
 check "docker_run_image_with_tag_only_fails" "${d}" 1 \
-  "quay.io/minio/mc:latest"
+  "public.ecr.aws/aws-cli/aws-cli:latest"
 
 # The three shell-variable image references this static scan cannot resolve
 # ("$RAVEL_SERVER_IMAGE"/"$RAVEL_OPERATOR_IMAGE" in ci.yml and k8s-nightly.yml,
@@ -214,21 +214,21 @@ check "docker_run_variable_ref_is_exempt: exempt marker is used, not [UNPINNED]"
 # A docker run whose image argument sits on a backslash-continued line, not
 # the same physical line as "docker run", is still found: the scanner joins
 # continuation lines before matching. Mutating the digest on the
-# continuation line (metricsbench-nightly.yml's minio start spans lines
+# continuation line (metricsbench-nightly.yml's RustFS start spans lines
 # 67-71, with the image on line 71) must be caught and reported at the
 # invocation's start line, proving the join actually ran rather than the
 # image happening to be on the same line as "docker run".
 d="$(new_tree docker-run-with-line-continuation-is-scanned)"
 mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
-  's#quay\.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e#quay.io/minio/minio:latest#'
+  's#ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#ghcr.io/rustfs/rustfs:latest#'
 check "docker_run_with_line_continuation_is_scanned" "${d}" 1 \
-  "metricsbench-nightly.yml:67: quay.io/minio/minio:latest"
+  "metricsbench-nightly.yml:67: ghcr.io/rustfs/rustfs:latest"
 
 # Removing one docker-run invocation must fail the exact-count assertion,
 # not silently scan fewer references.
 d="$(new_tree docker-run-wrong-count)"
 mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
-  '/^          docker run --rm --network host --entrypoint sh \\$/,/^            quay\.io\/minio\/mc@sha256:/d'
+  '/^          docker run --rm --network host \\$/,/^            public\.ecr\.aws\/aws-cli\/aws-cli:2\.37\.2@sha256:/d'
 check "removing a docker run line fails the docker-run-image count assertion" \
   "${d}" 1 "found 17 docker run/pull/create image references, expected exactly 18"
 
@@ -275,10 +275,10 @@ check "docker_run_in_a_composite_action_is_scanned" "${d}" 1 \
 # it stood before this round (no k8s category at all), this mutation would
 # have gone entirely unnoticed.
 d="$(new_tree k8s_manifest_image_without_digest_fails)"
-mutate "${d}/deploy/k8s/minio.yaml" \
-  's#image: quay\.io/minio/minio:RELEASE\.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e#image: quay.io/minio/minio:latest#'
+mutate "${d}/deploy/k8s/rustfs.yaml" \
+  's#image: ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#image: ghcr.io/rustfs/rustfs:latest#'
 check "k8s_manifest_image_without_digest_fails" "${d}" 1 \
-  "minio.yaml:52: quay.io/minio/minio:latest"
+  "rustfs.yaml:51: ghcr.io/rustfs/rustfs:latest"
 
 # The two kind-loaded local tags (built and `kind load docker-image`d rather
 # than pulled from a registry) are exempt by exact string, not flagged
@@ -295,11 +295,11 @@ check "kind_local_tag_is_exempt: exempt marker is used, not [UNPINNED]" \
 
 # Removing a k8s manifest image line must fail both the total-count and the
 # pin-required-count assertions, not silently scan fewer references. Deleting
-# minio.yaml's (pin-required) minio image line drops the total from 6 to 5
+# rustfs.yaml's (pin-required) RustFS image line drops the total from 6 to 5
 # and the pin-required count from 4 to 3.
 d="$(new_tree k8s-wrong-count)"
-mutate "${d}/deploy/k8s/minio.yaml" \
-  '/^          image: quay\.io\/minio\/minio:RELEASE/d'
+mutate "${d}/deploy/k8s/rustfs.yaml" \
+  '/^          image: ghcr\.io\/rustfs\/rustfs:/d'
 check "removing a k8s manifest image line fails the k8s total-count assertion" \
   "${d}" 1 "found 5 k8s manifest image references, expected exactly 6"
 check "removing a k8s manifest image line also fails the k8s pin-required-count assertion" \

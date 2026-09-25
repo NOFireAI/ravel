@@ -5,7 +5,7 @@ name: interop-nightly
 #
 #   remote_write_prometheus_e2e.rs: real_prometheus_rw1_remote_write_is_queryable,
 #                                    real_prometheus_rw2_remote_write_is_queryable
-#   flight_sql_e2e.rs:               flight_sql_against_minio_returns_rows_and_isolates_tenants
+#   flight_sql_e2e.rs:               flight_sql_against_rustfs_returns_rows_and_isolates_tenants
 #   otap_collector_e2e.rs:           real_collector_otelarrow_export_is_queryable
 #
 # None of these run in ci.yml: each needs a real Docker daemon pulling a real
@@ -43,10 +43,10 @@ jobs:
     runs-on: ubuntu-latest
     # Every step below executes third-party code with the job's token in the
     # environment: dependency build scripts for the `flight-sql`/`otap`
-    # feature graph and three pulled Docker images (Prometheus, MinIO/mc, the
-    # OTel Collector Contrib distribution). `persist-credentials: false` on
-    # the checkout keeps that token out of .git/config where any of that code
-    # could read it.
+    # feature graph and four pulled Docker images (Prometheus, RustFS, the AWS
+    # CLI, the OTel Collector Contrib distribution). `persist-credentials:
+    # false` on the checkout keeps that token out of .git/config where any of
+    # that code could read it.
     permissions:
       contents: read
     # Cold feature build (flight-sql pulls in ravel-sql/datafusion, otap pulls
@@ -173,11 +173,11 @@ jobs:
 
           This lane runs the four \`#[ignore]\` Docker-backed interop tests
           under services/ravel-server/tests/ (remote_write_prometheus_e2e.rs's
-          two Prometheus remote-write tests, flight_sql_e2e.rs's MinIO Flight
+          two Prometheus remote-write tests, flight_sql_e2e.rs's RustFS Flight
           SQL test, otap_collector_e2e.rs's OTel Collector OTAP test) with
           \`cargo nextest run --run-ignored all\`, against pinned mirror
-          images (quay.io/prometheus/prometheus, quay.io/minio/minio,
-          quay.io/minio/mc,
+          images (quay.io/prometheus/prometheus, ghcr.io/rustfs/rustfs,
+          public.ecr.aws/aws-cli/aws-cli,
           ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib).
           A failure here means a real interop regression, an expired image
           pin, or a Docker/network problem on the runner.

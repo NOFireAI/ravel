@@ -1,0 +1,39 @@
+services:
+  # ghcr.io rather than Docker Hub: rationale in deploy/README.md. Pinned to
+  # a release tag plus an immutable @sha256: manifest digest (issue #1720),
+  # the same pin deploy/docker-compose/ravel.yml carries for the same image
+  # (ravel.yml documents this file as its RustFS mirror).
+  rustfs:
+    image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    # `server` is the default subcommand, so the data directory is the only
+    # required argument. The console port serves nothing until
+    # --console-enable is passed; with it, the UI is at /rustfs/console/.
+    command: ["--console-enable", "--console-address", ":9001", "/data"]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
+    volumes:
+      - ../../rustfs-data:/data
+  createbucket:
+    image: public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
+    depends_on: [rustfs]
+    environment:
+      AWS_ACCESS_KEY_ID: ravel
+      AWS_SECRET_ACCESS_KEY: ravel-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      # No IMDS on a developer laptop or a CI runner; without this the CLI
+      # spends its metadata timeout on every call before using the static
+      # credentials above.
+      AWS_EC2_METADATA_DISABLED: "true"
+    # A signed S3 call fails until RustFS is serving, so the until-loop is the
+    # readiness wait. The image's entrypoint is the `aws` binary itself, so
+    # running more than one command needs an explicit shell.
+    entrypoint: >
+      /bin/sh -c "
+      until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
+      echo 'waiting for rustfs'; sleep 1;
+      done &&
+      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ravel-dev || true"
