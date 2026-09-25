@@ -47,7 +47,8 @@ Two things this ADR does not claim, both refuted earlier in the investigation:
 
 ## Decision
 
-**Cost-first remains the default.** `cost-based` at the reference profile keeps
+**Cost-first remains the default** (on a loopback store it no longer is; see
+the loopback amendment below). `cost-based` at the reference profile keeps
 resolving to whole-object reads. A deployment that has not asked for anything
 else keeps the cheaper S3 bill, and the published stock ClickBench entry
 continues to reflect it.
@@ -97,7 +98,8 @@ bill while the benchmark shows what the engine can do.
 
 ## Rejected alternatives
 
-**Make `byte-minimal` the default.** It is the fast configuration and it needs no
+**Make `byte-minimal` the default** (adopted for loopback stores only; see the
+loopback amendment below). It is the fast configuration and it needs no
 new policy name. Rejected twice over: at the default concurrency it measured
 712.4 s against 525.0 s, 36% *worse*, so as a default it is a regression for
 anyone who does not also raise concurrency; and at the concurrency where it wins
@@ -144,3 +146,15 @@ and it does not make the resulting configuration safe.
   `cost_based_high_saturation_boundary_is_pinned`
   (`crates/ravel-query/src/config.rs:483,708`). This ADR adds a policy; it does
   not alter the existing ones.
+
+## Amendment (2026-09-26, ADR-2014): loopback stores default to byte-minimal
+
+<!-- amendment-applies: sections="Decision|Rejected alternatives" pointer="loopback amendment" -->
+
+The rejection of `byte-minimal` as a default rested on measurements against real
+S3. On a store reached over loopback, the cold path is bound by the local disk,
+and `byte-minimal` at the derived concurrency measured 31% faster cold and 68%
+faster hot than `cost-based` (#1463). ADR-2014 therefore makes `byte-minimal`
+the default when `--logs-fetch-policy` is not given and the S3 endpoint is
+loopback. For every other endpoint, cost-first stays the default exactly as
+decided above, and concurrency is unchanged everywhere.
