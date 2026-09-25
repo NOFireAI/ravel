@@ -16,7 +16,7 @@ target/
 # .gate-logs/ and .dd-tools/ inside the checkout (see .gitignore), and graft
 # keeps its regenerable graph cache in graft/; none of the three is read by
 # the build.
-minio-data/
+rustfs-data/
 .cache/
 .superpowers/
 .claude/

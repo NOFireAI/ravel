@@ -3,7 +3,7 @@
 # ALREADY-RUNNING stack and assert each block's documented outcome. This is the
 # executable side of ADR-0081 decision 5.
 #
-# This script does NOT bring up the stack. Bringing MinIO, ravel-server, the
+# This script does NOT bring up the stack. Bringing RustFS, ravel-server, the
 # collector, and Grafana up is the compose file's job and the CI job's job
 # (ticket #175); this script assumes they are already reachable and only checks
 # that the README's commands do what the README says.

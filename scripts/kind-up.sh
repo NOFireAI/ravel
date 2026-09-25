@@ -31,7 +31,7 @@
 #                             For CI (ADR-0034 decision 7), which builds the
 #                             binaries on the host with a warm cargo cache and
 #                             assembles the images itself.
-#   RAVEL_FAKE_S3_BACKEND     floci (default) or minio (ADR-0034 decision 8)
+#   RAVEL_FAKE_S3_BACKEND     floci (default) or rustfs (ADR-0034 decision 8)
 #   RAVEL_TENANT_NAME         tenant to provision (default demo-tenant)
 #   RAVEL_TENANT_TOKEN        its bearer token (default demo-token)
 set -euo pipefail
@@ -145,17 +145,18 @@ case "$BACKEND" in
     S3_ACCESS_KEY="test"
     S3_SECRET_KEY="test"
     ;;
-  minio)
-    BACKEND_MANIFEST="deploy/k8s/minio.yaml"
-    BACKEND_DEPLOYMENT="minio"
-    BACKEND_JOB="minio-create-bucket"
-    S3_ENDPOINT="http://minio.${NAMESPACE}.svc:9000"
-    # Same values as deploy/docker-compose/minio.yml and deploy/k8s/minio.yaml.
+  rustfs)
+    BACKEND_MANIFEST="deploy/k8s/rustfs.yaml"
+    BACKEND_DEPLOYMENT="rustfs"
+    BACKEND_JOB="rustfs-create-bucket"
+    S3_ENDPOINT="http://rustfs.${NAMESPACE}.svc:9000"
+    # Same values as deploy/docker-compose/rustfs.yml and
+    # deploy/k8s/rustfs.yaml.
     S3_ACCESS_KEY="ravel"
     S3_SECRET_KEY="ravel-dev-secret"
     ;;
   *)
-    die "RAVEL_FAKE_S3_BACKEND must be floci or minio, got '${BACKEND}'"
+    die "RAVEL_FAKE_S3_BACKEND must be floci or rustfs, got '${BACKEND}'"
     ;;
 esac
 
@@ -268,7 +269,7 @@ kubectl wait --namespace "$NAMESPACE" --for=condition=Available --timeout=300s \
 
 # ---- 6. RavelCluster ---------------------------------------------------------
 # Rendered here rather than applying deploy/k8s/examples/ravelcluster-dev.yaml
-# directly: that example is the documentation shape (a MinIO endpoint and a
+# directly: that example is the documentation shape (a RustFS endpoint and a
 # `ravel-server:latest` image tag), and this needs the endpoint of the backend
 # just deployed and the image tag just built. Every other field is kept
 # identical to the example on purpose, so the two do not drift in meaning.

@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test test-python test-hygiene doc-drift check-docs build minio minio-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap
+.PHONY: check fmt clippy test test-python test-hygiene doc-drift check-docs build rustfs rustfs-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap
 
 check: fmt clippy test
 
@@ -51,17 +51,17 @@ check-docs:
 build:
 	cargo build --workspace --release
 
-minio:
-	docker compose -f deploy/docker-compose/minio.yml up -d
+rustfs:
+	docker compose -f deploy/docker-compose/rustfs.yml up -d
 
-minio-down:
-	docker compose -f deploy/docker-compose/minio.yml down
+rustfs-down:
+	docker compose -f deploy/docker-compose/rustfs.yml down
 
 demo: build
 	./scripts/demo.sh
 
 # Container-first quickstart (ADR-0081): the whole stack from published images
-# -- MinIO, ravel-server, an OpenTelemetry Collector, and Grafana -- with no
+# -- RustFS, ravel-server, an OpenTelemetry Collector, and Grafana -- with no
 # cargo build. Override the pinned server image with RAVEL_IMAGE. This is the
 # documented first run; `demo` above stays the from-source contributor path.
 quickstart:
