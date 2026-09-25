@@ -181,13 +181,13 @@ jobs:
         run: scripts/kind-down.sh
 
   # ADR-0077 section 4's process-kill chaos-evidence lane. Deliberately not part
-  # of ravel-sim and not run in PR CI (it needs a real MinIO, real binaries, a
-  # real multi-threaded runtime, a real clock, and a real `kill -9`); this
-  # nightly workflow is its home. Both scenarios carry the release-blocking
-  # exit-code contract they declare themselves: scenario 1 exits nonzero on a
-  # strict-ack violation, scenario 2 exits 2 on any pinned-oracle failure (a
-  # release-blocking bug, not a flaky test). A nonzero exit from either script
-  # fails this job.
+  # of ravel-sim and not run in PR CI (it needs a real object store, real
+  # binaries, a real multi-threaded runtime, a real clock, and a real
+  # `kill -9`); this nightly workflow is its home. Both scenarios carry the
+  # release-blocking exit-code contract they declare themselves: scenario 1
+  # exits nonzero on a strict-ack violation, scenario 2 exits 2 on any
+  # pinned-oracle failure (a release-blocking bug, not a flaky test). A
+  # nonzero exit from either script fails this job.
   chaos:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -211,7 +211,7 @@ jobs:
         run: cargo build --release --locked -p ravel-server -p ravel-cli
       - name: Put the release binaries on PATH
         run: echo "${GITHUB_WORKSPACE}/target/release" >> "$GITHUB_PATH"
-      # Scenario 1: kill ingest mid-flush. The script brings up MinIO itself via
+      # Scenario 1: kill ingest mid-flush. The script brings up RustFS itself via
       # docker compose, qualifies the store, drives strict-ack load, SIGKILLs the
       # server mid-flush, restarts, and asserts the pinned oracle.
       # Each scenario gets its own tenant, so its custody and catalog
@@ -230,9 +230,9 @@ jobs:
           CHAOS_TENANT_NAME: chaos-maintain-worker
           CHAOS_TENANT_TOKEN: chaos-token-maintain-worker
         run: scripts/chaos/kill-maintain-worker.sh
-      - name: Dump MinIO logs on failure
+      - name: Dump RustFS logs on failure
         if: failure()
-        run: docker compose -f deploy/docker-compose/minio.yml logs --no-color || true
-      - name: Tear down MinIO
+        run: docker compose -f deploy/docker-compose/rustfs.yml logs --no-color || true
+      - name: Tear down RustFS
         if: always()
-        run: docker compose -f deploy/docker-compose/minio.yml down -v || true
+        run: docker compose -f deploy/docker-compose/rustfs.yml down -v || true

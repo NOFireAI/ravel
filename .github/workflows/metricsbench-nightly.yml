@@ -1,9 +1,9 @@
 name: metricsbench-nightly
 
-# Scheduled MetricsBench lane against MinIO (issue #939, ADR-0927).
+# Scheduled MetricsBench lane against RustFS (issue #939, ADR-0927).
 #
 # Replays the MetricsBench sample stream over Remote Write 1.0 into the
-# in-process Ravel path backed by a local MinIO object store, and uploads the
+# in-process Ravel path backed by a local RustFS object store, and uploads the
 # raw machine-readable JSON report as a build artifact so a diagnostic run is
 # reproducible from the command and environment that produced it.
 #
@@ -11,10 +11,10 @@ name: metricsbench-nightly
 # (cardinality/history/churn) plus the CI-sized `ci` profile (ADR-0927
 # decision 11). The comparable profiles range from 360,000,000 to
 # 1,728,000,000 samples and cannot run inside a GitHub-hosted runner, and
-# MinIO is explicitly NOT an acceptable substrate for a performance or cost
+# RustFS is explicitly NOT an acceptable substrate for a performance or cost
 # claim (ADR-0927 decision 10): removing per-request fees is exactly what
 # hides a request-count defect, so only the real-S3 lane (bench-s3.yml)
-# produces publishable numbers. This lane is a MinIO diagnostic/correctness
+# produces publishable numbers. This lane is a RustFS diagnostic/correctness
 # run, so it uses the `ci` profile, whose artifact carries its own
 # non-comparability marker.
 #
@@ -42,7 +42,7 @@ permissions:
   contents: read
 
 jobs:
-  metricsbench-minio:
+  metricsbench-rustfs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -60,43 +60,46 @@ jobs:
         run: |
           cargo build --release --locked -p ravel-bench \
             --bin metricsbench_ingest --bin metricsbench_report
-      - name: Start MinIO
+      - name: Start RustFS
         run: |
-          # quay.io rather than Docker Hub: rationale on ci.yml's
-          # object-store-contract "Start MinIO" step.
-          docker run -d --name minio \
+          # ghcr.io rather than Docker Hub: rationale on ci.yml's
+          # object-store-contract "Start RustFS" step.
+          docker run -d --name rustfs \
             -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
-      - name: Wait for MinIO to be live
+            -e RUSTFS_ACCESS_KEY=rustfsadmin \
+            -e RUSTFS_SECRET_KEY=rustfsadmin \
+            ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff /data
+      - name: Wait for RustFS to be live
         run: |
           for _ in $(seq 1 30); do
-            if curl -fsS http://localhost:9000/minio/health/live; then
-              echo "MinIO is live"
+            if curl -fsS http://localhost:9000/health; then
+              echo "RustFS is live"
               exit 0
             fi
             sleep 1
           done
-          echo "MinIO did not become healthy in time"
-          docker logs minio || true
+          echo "RustFS did not become healthy in time"
+          docker logs rustfs || true
           exit 1
       - name: Create the MetricsBench bucket
         run: |
-          docker run --rm --network host --entrypoint sh \
-            quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 -c "
-            mc alias set local http://localhost:9000 minioadmin minioadmin &&
-            mc mb -p local/metricsbench"
-      - name: Run the MetricsBench ci profile against MinIO
+          docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID=rustfsadmin \
+            -e AWS_SECRET_ACCESS_KEY=rustfsadmin \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            -e AWS_EC2_METADATA_DISABLED=true \
+            public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
+            --endpoint-url http://localhost:9000 s3api create-bucket --bucket metricsbench
+      - name: Run the MetricsBench ci profile against RustFS
         env:
           # The harness reads these RAVEL_S3_* vars
-          # (crates/ravel-bench/src/harness.rs). MinIO is an S3-compatible
+          # (crates/ravel-bench/src/harness.rs). RustFS is an S3-compatible
           # endpoint reached over plain HTTP in path-addressing mode.
           RAVEL_S3_BUCKET: metricsbench
           RAVEL_S3_REGION: us-east-1
           RAVEL_S3_ENDPOINT: http://localhost:9000
-          RAVEL_S3_ACCESS_KEY_ID: minioadmin
-          RAVEL_S3_SECRET_ACCESS_KEY: minioadmin
+          RAVEL_S3_ACCESS_KEY_ID: rustfsadmin
+          RAVEL_S3_SECRET_ACCESS_KEY: rustfsadmin
           RAVEL_S3_ALLOW_HTTP: "true"
           RAVEL_S3_FORCE_PATH_STYLE: "true"
           GITHUB_SHA: ${{ github.sha }}
@@ -110,7 +113,7 @@ jobs:
           ./target/release/metricsbench_ingest \
             --profile ci \
             --store s3 \
-            > metricsbench-minio-report.json
+            > metricsbench-rustfs-report.json
       - name: Report-schema gate rejects a malformed report (fail-closed)
         run: |
           # The existing report-schema validator (metricsbench_report render,
@@ -138,12 +141,12 @@ jobs:
             exit 1
           fi
           echo "report-schema gate rejected the malformed report as required (exit $code)"
-      - name: Upload the MetricsBench MinIO report
+      - name: Upload the MetricsBench RustFS report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: metricsbench-minio-report
-          path: metricsbench-minio-report.json
+          name: metricsbench-rustfs-report
+          path: metricsbench-rustfs-report.json
           retention-days: 90
-      - name: Stop MinIO
+      - name: Stop RustFS
         if: always()
-        run: docker rm -f minio || true
+        run: docker rm -f rustfs || true

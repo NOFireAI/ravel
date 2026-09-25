@@ -1,4 +1,4 @@
-//! End-to-end Flight SQL against a MinIO-backed `ravel-server` with a pinned
+//! End-to-end Flight SQL against a RustFS-backed `ravel-server` with a pinned
 //! arrow-flight SQL client.
 //!
 //! Every other Flight test in this workspace runs over `MemoryStore`. This one
@@ -6,7 +6,7 @@
 //! invariant), so an e2e that never touches S3 never proves the two-RPC flow
 //! survives a real bucket -- segment PUTs, commit-record CAS, catalog LIST
 //! fan-out, and the pinned `DoGet` re-fetch all going over the network to
-//! MinIO. The client is arrow-flight's own [`FlightSqlServiceClient`], the
+//! RustFS. The client is arrow-flight's own [`FlightSqlServiceClient`], the
 //! same driver an external BI tool would use, so the ticket it receives from
 //! `GetFlightInfo` and replays at `DoGet` is exercised exactly as a real client
 //! exercises it.
@@ -19,7 +19,7 @@
 //! `#[ignore]`d by default because it needs a Docker daemon reachable by the
 //! executing user (in the `docker` group or root, a usable
 //! `/var/run/docker.sock`) and the ability to pull or already have the pinned
-//! `minio/minio` and `minio/mc` images. Run explicitly with:
+//! RustFS and AWS CLI images. Run explicitly with:
 //!
 //! ```text
 //! cargo test -p ravel-server --features flight-sql --test flight_sql_e2e -- --ignored
@@ -57,64 +57,66 @@ use uuid::Uuid;
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// Small on purpose: `Catalog::resolve` issues one LIST per (shard,
 /// ingest-hour) pair across the window, so a wall-clock value would fan the
-/// listing out to hundreds of thousands of round trips against MinIO.
+/// listing out to hundreds of thousands of round trips against RustFS.
 const NOW_NS: i64 = 4 * NS_PER_HOUR;
 
 const QUERY: &str = "SELECT ts, value FROM samples ORDER BY ts";
 
-// Pinned images so the test is reproducible across runs. quay.io mirrors
-// (same tags ci.yml already runs against for the object-store contract
-// suite), digest-pinned: Docker Hub's anonymous pull allowance is per-IP and
-// shared across every project on a runner, so an unauthenticated pull there
-// fails unpredictably; quay.io does not share that allowance. The pin
-// checker at deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
-// only scans workflow YAML for image references, not Rust string consts, so
-// these digests are not covered by that check and must be refreshed by hand.
+// Pinned images so the test is reproducible across runs. ghcr.io and ECR
+// Public rather than Docker Hub, the same registries and the same digests
+// ci.yml pins for the object-store contract suite: Docker Hub's anonymous
+// pull allowance is per-IP and shared across every project on a runner, so an
+// unauthenticated pull there fails unpredictably, and those two registries do
+// not share that allowance. The pin checker at
+// deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh only
+// scans workflow YAML for image references, not Rust string consts, so these
+// digests are not covered by that check and must be refreshed by hand.
 // Resolved with:
-//   curl -sS "https://quay.io/v2/auth?service=quay.io&scope=repository:minio/minio:pull" \
+//   curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:rustfs/rustfs:pull" \
 //     | jq -r .token \
 //     | xargs -I{} curl -sS -D - -o /dev/null -H "Authorization: Bearer {}" \
-//         -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
-//         https://quay.io/v2/minio/minio/manifests/RELEASE.2025-04-08T15-41-24Z
-// (and the equivalent request against minio/mc for MC_IMAGE)
+//         -H "Accept: application/vnd.oci.image.index.v1+json" \
+//         https://ghcr.io/v2/rustfs/rustfs/manifests/1.0.0
+// (and the equivalent request against public.ecr.aws for AWS_CLI_IMAGE)
 //
-// MINIO_IMAGE is deliberately the release the compose files already run
-// (deploy/docker-compose/minio.yml, ravel.yml, deploy/metricsbench/
-// docker-compose.yml), not the newest one. This test starts the server with
-// `--console-address`, and those compose files are the only place in the tree
-// that flag is exercised, so pinning here to the same release keeps the flag
-// and the `/minio/health/ready` endpoint on a version something else already
-// runs. Moving this const forward means moving those together and checking the
-// flag still exists in the new release; a nightly lane going red on a server
-// argument is a false alarm about interop.
-const MINIO_IMAGE: &str = "quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b";
-const MC_IMAGE: &str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASSWORD: &str = "minioadmin";
+// RUSTFS_IMAGE is the release the compose files already run
+// (deploy/docker-compose/rustfs.yml, ravel.yml, deploy/metricsbench/
+// docker-compose.yml). Keeping them on one release keeps the server arguments
+// this test passes, and the `/health` endpoint it polls, on a version
+// something else already runs; a nightly lane going red on a server argument
+// is a false alarm about interop.
+const RUSTFS_IMAGE: &str = "ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff";
+const AWS_CLI_IMAGE: &str = "public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed";
+const RUSTFS_USER: &str = "rustfsadmin";
+const RUSTFS_PASSWORD: &str = "rustfsadmin";
 const BUCKET: &str = "ravel-flight-e2e";
-/// MinIO S3 API port, off the default 9000 to avoid colliding with a local
-/// MinIO a developer may already be running.
-const MINIO_PORT: u16 = 19900;
+/// RustFS S3 API port, off the default 9000 to avoid colliding with a local
+/// object store a developer may already be running. RustFS binds its console
+/// port whether or not the console is enabled, so `RUSTFS_PORT + 1` is moved
+/// off 9001 with it.
+const RUSTFS_PORT: u16 = 19900;
 
 const ACME_TOKEN: &str = "acme-token";
 const OTHER_TOKEN: &str = "other-token";
 
 // ---------------------------------------------------------------------------
-// MinIO container lifecycle
+// RustFS container lifecycle
 // ---------------------------------------------------------------------------
 
-/// A MinIO container plus the bucket the server writes into. Dropping it stops
-/// the container so a panicking test does not leak it.
-struct Minio {
+/// A RustFS container plus the bucket the server writes into. Dropping it
+/// stops the container so a panicking test does not leak it.
+struct Rustfs {
     container: String,
     endpoint: String,
 }
 
-impl Minio {
-    async fn start() -> Minio {
+impl Rustfs {
+    async fn start() -> Rustfs {
         let container = format!("ravel-flight-e2e-{}", std::process::id());
-        let endpoint = format!("http://127.0.0.1:{MINIO_PORT}");
+        let endpoint = format!("http://127.0.0.1:{RUSTFS_PORT}");
 
+        // `server` is the default subcommand, so the data directory is the
+        // only positional argument the image needs.
         let status = Command::new("docker")
             .args([
                 "run",
@@ -125,33 +127,33 @@ impl Minio {
                 "--name",
                 &container,
                 "-e",
-                &format!("MINIO_ROOT_USER={MINIO_USER}"),
+                &format!("RUSTFS_ACCESS_KEY={RUSTFS_USER}"),
                 "-e",
-                &format!("MINIO_ROOT_PASSWORD={MINIO_PASSWORD}"),
-                MINIO_IMAGE,
-                "server",
-                "/data",
+                &format!("RUSTFS_SECRET_KEY={RUSTFS_PASSWORD}"),
+                RUSTFS_IMAGE,
                 "--address",
-                &format!("127.0.0.1:{MINIO_PORT}"),
+                &format!("127.0.0.1:{RUSTFS_PORT}"),
                 "--console-address",
-                &format!("127.0.0.1:{}", MINIO_PORT + 1),
+                &format!("127.0.0.1:{}", RUSTFS_PORT + 1),
+                "/data",
             ])
             .status()
             .expect("docker must be runnable in an environment that executes this ignored test");
-        assert!(status.success(), "docker run failed to start MinIO");
+        assert!(status.success(), "docker run failed to start RustFS");
 
-        let minio = Minio {
+        let rustfs = Rustfs {
             container,
             endpoint,
         };
-        minio.wait_ready().await;
-        minio.make_bucket();
-        minio
+        rustfs.wait_ready().await;
+        rustfs.make_bucket();
+        rustfs
     }
 
-    /// Poll MinIO's readiness endpoint until it answers or the timeout passes.
+    /// Poll RustFS's health endpoint until it answers or the timeout passes.
+    /// It needs no credentials, so a failure here is never an auth problem.
     async fn wait_ready(&self) {
-        let url = format!("{}/minio/health/ready", self.endpoint);
+        let url = format!("{}/health", self.endpoint);
         let client = reqwest::Client::new();
         for _ in 0..60 {
             let ready = client
@@ -165,31 +167,41 @@ impl Minio {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        panic!("MinIO did not become ready within 30s");
+        panic!("RustFS did not become ready within 30s");
     }
 
-    /// Create the bucket with a one-shot `mc` container. `mc mb -p` is
-    /// idempotent, so a re-run against a surviving volume does not fail.
+    /// Create the bucket with a one-shot AWS CLI container. RustFS answers a
+    /// repeated `create-bucket` from the owning credentials with success, so a
+    /// re-run against a surviving volume does not fail.
     fn make_bucket(&self) {
-        let script = format!(
-            "mc alias set local {} {MINIO_USER} {MINIO_PASSWORD} && mc mb -p local/{BUCKET}",
-            self.endpoint,
-        );
         let status = Command::new("docker")
             .args([
                 "run",
                 "--rm",
                 "--network",
                 "host",
-                "--entrypoint",
-                "/bin/sh",
-                MC_IMAGE,
-                "-c",
-                &script,
+                "-e",
+                &format!("AWS_ACCESS_KEY_ID={RUSTFS_USER}"),
+                "-e",
+                &format!("AWS_SECRET_ACCESS_KEY={RUSTFS_PASSWORD}"),
+                "-e",
+                "AWS_DEFAULT_REGION=us-east-1",
+                // No IMDS on a CI runner or a developer laptop; without this
+                // the CLI spends its metadata timeout before falling back to
+                // the static credentials above.
+                "-e",
+                "AWS_EC2_METADATA_DISABLED=true",
+                AWS_CLI_IMAGE,
+                "--endpoint-url",
+                &self.endpoint,
+                "s3api",
+                "create-bucket",
+                "--bucket",
+                BUCKET,
             ])
             .status()
-            .expect("docker run mc");
-        assert!(status.success(), "mc failed to create the bucket");
+            .expect("docker run aws-cli");
+        assert!(status.success(), "aws-cli failed to create the bucket");
     }
 
     fn config(&self) -> S3Config {
@@ -197,8 +209,8 @@ impl Minio {
             bucket: BUCKET.to_string(),
             region: "us-east-1".to_string(),
             endpoint: Some(self.endpoint.clone()),
-            access_key_id: MINIO_USER.to_string(),
-            secret_access_key: MINIO_PASSWORD.to_string(),
+            access_key_id: RUSTFS_USER.to_string(),
+            secret_access_key: RUSTFS_PASSWORD.to_string(),
             allow_http: true,
             force_path_style: true,
             kms_key_id: None,
@@ -210,7 +222,7 @@ impl Minio {
     }
 }
 
-impl Drop for Minio {
+impl Drop for Rustfs {
     fn drop(&mut self) {
         let _ = Command::new("docker")
             .args(["stop", &self.container])
@@ -327,11 +339,11 @@ async fn client(grpc: &std::net::SocketAddr, token: &str) -> FlightSqlServiceCli
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires a Docker daemon reachable by this user and the pinned MINIO_IMAGE and MC_IMAGE images"]
-async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
-    let minio = Minio::start().await;
+#[ignore = "requires a Docker daemon reachable by this user and the pinned RUSTFS_IMAGE and AWS_CLI_IMAGE images"]
+async fn flight_sql_against_rustfs_returns_rows_and_isolates_tenants() {
+    let rustfs = Rustfs::start().await;
     let store: Arc<dyn ObjectStoreBackend> =
-        Arc::new(S3Store::new(minio.config()).expect("S3 store"));
+        Arc::new(S3Store::new(rustfs.config()).expect("S3 store"));
 
     let acme = TenantId::new("acme".to_string());
     let other = TenantId::new("other".to_string());
@@ -465,7 +477,7 @@ async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
     );
 
     running.shutdown().await.expect("graceful shutdown");
-    drop(minio);
+    drop(rustfs);
 }
 
 /// Unwrap the `tonic::Status` inside an arrow-flight client error, so the test

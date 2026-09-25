@@ -1,55 +1,68 @@
 # Container-first quickstart stack (ADR-0081 decisions 1-3).
 #
 # `docker compose -f deploy/docker-compose/ravel.yml up -d` brings up a full,
-# self-contained Ravel: MinIO as the S3-compatible object store, a one-shot that
+# self-contained Ravel: RustFS as the S3-compatible object store, a one-shot that
 # creates the bucket, a one-shot that qualifies the store, ravel-server pulled
 # from GHCR, an OpenTelemetry Collector generating real telemetry from the host,
 # and Grafana with a provisioned Ravel datasource. No Rust toolchain, no compile.
 #
 # SECURITY: every credential and token in this file is a fixed DEVELOPMENT value
-# (the MinIO `ravel`/`ravel-dev-secret` pair and the `demo-token` bearer token),
+# (the RustFS `ravel`/`ravel-dev-secret` pair and the `demo-token` bearer token),
 # and every published host port binds loopback (`127.0.0.1`) only. None of this
 # is for any deployment reachable from a network. The loopback prefixes are what
 # keep the checked-in bearer token off the reader's LAN (ADR-0081 decision 1); do
 # not drop them.
 services:
-  # MinIO and the bucket-creation one-shot mirror deploy/docker-compose/minio.yml
-  # exactly: same credentials, same `ravel-dev` bucket, same `minio-data/` host
+  # RustFS and the bucket-creation one-shot mirror deploy/docker-compose/rustfs.yml
+  # exactly: same credentials, same `ravel-dev` bucket, same `rustfs-data/` host
   # dir (gitignored, shared with that stack, and safe to reuse across runs).
-  # quay.io rather than Docker Hub: rationale in deploy/README.md.
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
-    command: server /data --console-address ":9001"
+  # ghcr.io rather than Docker Hub: rationale in deploy/README.md.
+  rustfs:
+    image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    # `server` is the default subcommand, so the data directory is the only
+    # required argument. The console port serves nothing until --console-enable
+    # is passed; with it, the UI is at /rustfs/console/.
+    command: ["--console-enable", "--console-address", ":9001", "/data"]
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     environment:
-      MINIO_ROOT_USER: ravel
-      MINIO_ROOT_PASSWORD: ravel-dev-secret
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
     volumes:
-      - ../../minio-data:/data
+      - ../../rustfs-data:/data
 
   createbucket:
-    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952
-    depends_on: [minio]
-    # `mc alias set` fails until MinIO is reachable, so the until-loop is the
+    image: public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
+    depends_on: [rustfs]
+    environment:
+      AWS_ACCESS_KEY_ID: ravel
+      AWS_SECRET_ACCESS_KEY: ravel-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      # No IMDS on a developer laptop or a CI runner; without this the CLI
+      # spends its metadata timeout on every call before using the static
+      # credentials above.
+      AWS_EC2_METADATA_DISABLED: "true"
+    # A signed S3 call fails until RustFS is serving, so the until-loop is the
     # readiness wait: this service completes successfully only once the bucket
-    # actually exists, which is what the qualify one-shot below depends on.
+    # actually exists, which is what the qualify one-shot below depends on. The
+    # image's entrypoint is the `aws` binary itself, so running more than one
+    # command needs an explicit shell.
     entrypoint: >
       /bin/sh -c "
-      until mc alias set local http://minio:9000 ravel ravel-dev-secret; do
-        echo 'waiting for minio'; sleep 1;
+      until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
+        echo 'waiting for rustfs'; sleep 1;
       done &&
-      mc mb -p local/ravel-dev || true"
+      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ravel-dev || true"
 
   # Store qualification (ADR-0050 section 6): ravel-server refuses to start on a
   # non-Memory store until `sys/qualification` is present, and there is
-  # deliberately no bootstrap-and-continue path for it. A freshly `mc mb`'d
+  # deliberately no bootstrap-and-continue path for it. A freshly created
   # bucket has no such record, so it must be written before the server starts.
   # The published image carries ravel-cli for exactly this (Dockerfile.prebuilt);
   # override the entrypoint to run it. `store qualify` is idempotent: on an
   # already-qualified bucket it reports the existing record and exits 0, so this
-  # tolerates a populated `minio-data/` across runs.
+  # tolerates a populated `rustfs-data/` across runs.
   qualify:
     image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.15.0}
     depends_on:
@@ -58,8 +71,8 @@ services:
     entrypoint: ["/usr/local/bin/ravel-cli"]
     command: ["--store", "s3", "store", "qualify"]
     environment:
-      RAVEL_S3_ENDPOINT: http://minio:9000
-      # minio is a compose service name, not loopback, so ravel-cli refuses
+      RAVEL_S3_ENDPOINT: http://rustfs:9000
+      # rustfs is a compose service name, not loopback, so ravel-cli refuses
       # this plaintext endpoint without the opt-in, exactly as the server does.
       RAVEL_S3_ALLOW_HTTP: "true"
       RAVEL_S3_BUCKET: ravel-dev
@@ -96,15 +109,15 @@ services:
       # A fresh bucket refuses to start unless a tenant-hash scheme is chosen
       # (services/ravel-server/src/tenancy.rs: keyed is the default, an
       # unspecified config is FreshBucketNeedsKey). The quickstart is an unkeyed
-      # dev bucket, so opt out explicitly. Safe on a reused minio-data/ too: an
+      # dev bucket, so opt out explicitly. Safe on a reused rustfs-data/ too: an
       # existing unkeyed marker validates against this, keyed would not.
       - "--tenant-hash-unkeyed"
     ports:
       - "127.0.0.1:4318:4318"
       - "127.0.0.1:4317:4317"
     environment:
-      RAVEL_S3_ENDPOINT: http://minio:9000
-      # The endpoint above is plaintext http:// to the `minio` service, which
+      RAVEL_S3_ENDPOINT: http://rustfs:9000
+      # The endpoint above is plaintext http:// to the `rustfs` service, which
       # is not loopback from inside this container, so startup refuses it
       # without this. The traffic never leaves the compose network; a
       # deployment reaching a real object store uses https:// instead.
@@ -140,7 +153,7 @@ services:
   # no telemetrygen is involved (#1334).
   otel-collector:
     # ghcr.io, not Docker Hub (otel/opentelemetry-collector-contrib): same
-    # anonymous-pull-allowance problem as the MinIO images above, and the
+    # anonymous-pull-allowance problem as the RustFS images above, and the
     # upstream project publishes this image to ghcr.io under a different
     # repo path (collector-releases, not collector-contrib).
     image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.160.0@sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6
@@ -163,7 +176,7 @@ services:
   # Grafana with a provisioned Prometheus-type datasource pointed at
   # ravel-server's /api/v1 surface, carrying the demo bearer token (ADR-0081
   # decision 1). The token lives in a checked-in provisioning file; it is a fixed
-  # development credential in the same class as the MinIO secret above.
+  # development credential in the same class as the RustFS secret above.
   #
   # Left on Docker Hub deliberately: no anonymous mirror was found elsewhere.
   # Checked (anonymous manifest HEAD for grafana/grafana:latest):

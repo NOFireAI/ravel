@@ -1,6 +1,6 @@
 name: dr-rehearsal
 
-# Disaster-recovery rehearsal against MinIO (issue #814).
+# Disaster-recovery rehearsal against RustFS (issue #814).
 #
 # Runs scripts/dr/rehearse.sh: seed a known corpus into bucket A through a
 # real ravel-server, mirror A into an empty bucket B, and run the custody,
@@ -10,7 +10,7 @@ name: dr-rehearsal
 # existed; three fault jobs prove it goes RED, each at the specific check its
 # fault targets rather than merely somewhere.
 #
-# This lane measures nothing publishable. MinIO removes the request fees and
+# This lane measures nothing publishable. RustFS removes the request fees and
 # the latency profile a real restore pays, so no RPO or RTO figure may be
 # derived from it; docs/guides/disaster-recovery.md holds both unmeasured
 # until a real rehearsal against real S3 produces them. What this lane proves
@@ -82,15 +82,15 @@ jobs:
       # name in the account the credentials belong to, and a default custody
       # declaration turns the custody check into one that cannot fail.
       #
-      # These are the values for the throwaway MinIO this job starts below. A
+      # These are the values for the throwaway RustFS this job starts below. A
       # real S3 run sets DR_ENDPOINT to the empty string and supplies its own
       # region, buckets and STS credentials (DR_SESSION_TOKEN included).
       DR_BUCKET_PRIMARY: ravel-dr-ci-primary
       DR_BUCKET_REPLICA: ravel-dr-ci-replica
-      DR_ACCESS_KEY: minioadmin
-      DR_SECRET_KEY: minioadmin
+      DR_ACCESS_KEY: rustfsadmin
+      DR_SECRET_KEY: rustfsadmin
       DR_TENANT_HASH_MODE: unkeyed
-      # `none` is a declaration, not a default: this throwaway MinIO deployment
+      # `none` is a declaration, not a default: this throwaway RustFS deployment
       # has no per-tenant KMS and no separate admin credential file.
       DR_TENANT_KMS_CONFIG: none
       DR_ADMIN_CREDENTIAL_FILE: none
@@ -126,27 +126,32 @@ jobs:
           cargo build --locked -p ravel-cli -p ravel-server
           cargo build --locked -p ravel-server --example gen_otlp_fixture
           echo "${GITHUB_WORKSPACE}/target/debug" >> "${GITHUB_PATH}"
-      - name: Start MinIO
+      - name: Start RustFS
         run: |
           # Docker Hub's anonymous pull allowance is per-IP and shared across
           # every project on a runner, so an unauthenticated pull there fails
-          # unpredictably; quay.io does not share that allowance.
-          docker run -d --name minio \
+          # unpredictably; ghcr.io does not share that allowance.
+          #
+          # `server` is the default subcommand, so /data is the whole command
+          # line. The console is left off: nothing here uses it.
+          docker run -d --name rustfs \
             -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
-      - name: Wait for MinIO to be live
+            -e RUSTFS_ACCESS_KEY=rustfsadmin \
+            -e RUSTFS_SECRET_KEY=rustfsadmin \
+            ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff /data
+      - name: Wait for RustFS to be live
         run: |
+          # /health on the S3 port, unauthenticated, so a 200 cannot be
+          # confused with a credential problem.
           for _ in $(seq 1 30); do
-            if curl -fsS http://localhost:9000/minio/health/live; then
-              echo "MinIO is live"
+            if curl -fsS http://localhost:9000/health; then
+              echo "RustFS is live"
               exit 0
             fi
             sleep 1
           done
-          echo "MinIO did not become healthy in time"
-          docker logs minio || true
+          echo "RustFS did not become healthy in time"
+          docker logs rustfs || true
           exit 1
 
       - name: Run the rehearsal
@@ -329,9 +334,9 @@ jobs:
           if [ -f "${pid_file}" ]; then
             kill "$(cat "${pid_file}")" 2>/dev/null || true
           fi
-      - name: Stop MinIO
+      - name: Stop RustFS
         if: always()
-        run: docker rm -f minio || true
+        run: docker rm -f rustfs || true
       - name: Upload the rehearsal logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
