@@ -4124,7 +4124,7 @@ mod tests {
     }
 
     /// Issue #1707: `ravel-server` refuses a plaintext `http://` endpoint
-    /// whose host is not loopback, and a pod's in-cluster MinIO or floci
+    /// whose host is not loopback, and a pod's in-cluster RustFS or floci
     /// Service is never loopback. `spec.storage.s3.allowHttp` is what renders
     /// the flag that accepts it, and it must render nothing at its `false`
     /// default so an https:// or real-AWS cluster is untouched.
