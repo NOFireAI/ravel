@@ -1491,7 +1491,8 @@ async fn rustfs_contract() {
 /// proposed as the fake backend for the kind development environment and the
 /// k8s CI lane. Whether its S3 implements Ravel's mandatory capability set
 /// and multipart is the open question this test answers; the ADR's fallback
-/// if it does not is RustFS, which is already proven in this repo's CI.
+/// if it does not is the local S3-compatible store already proven in this
+/// repo's CI (MinIO when the ADR was written, RustFS now).
 ///
 /// Gated on `RAVEL_FLOCI_URL` exactly like [`rustfs_contract`], so the suite
 /// skips cleanly wherever no floci is reachable. Optional overrides:
