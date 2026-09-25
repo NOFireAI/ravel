@@ -82,22 +82,22 @@ leaves the cluster running so you can look at it.
 | `RAVEL_SERVER_IMAGE` | `ravel-server:kind-dev` | Server image tag. |
 | `RAVEL_OPERATOR_IMAGE` | `ravel-operator:kind-dev` | Operator image tag. |
 | `RAVEL_SKIP_IMAGE_BUILD` | `0` | `1` skips `docker build` and uses the two tags as-is; they must already exist in the local docker daemon. This is how CI reuses host-built binaries. |
-| `RAVEL_FAKE_S3_BACKEND` | `floci` | `floci` or `minio`. |
+| `RAVEL_FAKE_S3_BACKEND` | `floci` | `floci` or `rustfs`. |
 | `RAVEL_TENANT_NAME` | `demo-tenant` | Tenant to provision. |
 | `RAVEL_TENANT_TOKEN` | `demo-token` | Its bearer token. |
 
 ### The fake S3 backend
 
-`deploy/k8s/floci.yaml` and `deploy/k8s/minio.yaml` are the same shape: a
+`deploy/k8s/floci.yaml` and `deploy/k8s/rustfs.yaml` are the same shape: a
 single-replica Deployment, a Service, and a bucket-create Job. The Job retries
 until the endpoint serves S3, creates the `ravel` bucket, and then verifies
 that it exists rather than assume the create took.
 
 floci is the default, gated by the `floci_contract` test in the object-store
 crate. That test runs the full object-store contract suite plus the mandatory
-capability and multipart probes against a real floci in CI. MinIO is the named
+capability and multipart probes against a real floci in CI. RustFS is the named
 fallback: if a floci
-release ever stops satisfying that contract, `RAVEL_FAKE_S3_BACKEND=minio`
+release ever stops satisfying that contract, `RAVEL_FAKE_S3_BACKEND=rustfs`
 switches the whole environment to the backend this repository has proven
 longest. Ravel maintains both manifests regardless of which one is the default.
 
@@ -483,7 +483,7 @@ anything is created: a plaintext `http://` `spec.storage.s3.endpoint` whose
 host is not loopback, with `spec.storage.s3.allowHttp` unset, reports
 `Degraded=True` with reason `PlaintextS3Endpoint` and a message naming the
 field to set. This is the upgrade state of a cluster that pointed at an
-in-cluster MinIO or floci by Service name before the endpoint rule changed:
+in-cluster RustFS or floci by Service name before the endpoint rule changed:
 set `allowHttp: true` to accept plaintext deliberately, or move the endpoint
 to `https://`.
 
@@ -578,7 +578,7 @@ the operator: there is no CRD field for it and no pod runs it. It is used only
 by out-of-band operator/CI invocations. See
 [the Admin credential](operations/deployment.md#the-admin-credential).
 
-The exact per-role AWS IAM policy JSON, the MinIO equivalent for dev/CI, and
+The exact per-role AWS IAM policy JSON, the RustFS equivalent for dev/CI, and
 the first-deployment bootstrap notes all live in one place:
 [storage credential roles](operations/configuration.md#storage-credential-roles).
 This section covers only the Kubernetes wiring.

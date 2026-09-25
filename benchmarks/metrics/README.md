@@ -88,7 +88,7 @@ never mistakes a non-comparable or unbilled run for a publishable result.
   `RAVEL_S3_ENDPOINT` is set; absent for `memory` regardless of the env var.
 - `backend_bills_requests`: true only for real S3 with no endpoint override
   (decision 10); false on `memory` and on any store behind a configured
-  endpoint, such as the nightly lane's local MinIO.
+  endpoint, such as the nightly lane's local RustFS.
 
 ## Determinism
 

@@ -17,7 +17,7 @@ make demo
 ```
 
 It builds `ravel-server` and `ravel-cli` in release mode from the current tree,
-starts `ravel-server --store s3` against the local MinIO stack, ingests one
+starts `ravel-server --store s3` against the local RustFS stack, ingests one
 generated OTLP export, and queries it back by commit token
 ([scripts/demo.sh](../../scripts/demo.sh)).
 

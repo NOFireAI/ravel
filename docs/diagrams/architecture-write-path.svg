@@ -29,7 +29,7 @@
   <text class="t" x="172" y="264">RSEG (metrics), RLOG (logs), RSPAN (spans); blake3 over the bytes</text>
   <path class="a" d="M450,276 L450,302"/>
   <rect class="g" x="160" y="304" width="580" height="62"/>
-  <text class="h" x="172" y="322">object store (S3 / MinIO; memory and fault-injecting in tests)</text>
+  <text class="h" x="172" y="322">object store (S3 / RustFS; memory and fault-injecting in tests)</text>
   <text class="t" x="172" y="338">1. data PUT (create-if-absent, upload checksum)</text>
   <text class="t" x="172" y="354">2. commit-record PUT (create-if-absent) -- the atomic publish</text>
   <path class="a" d="M450,366 L450,392"/>

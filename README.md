@@ -206,7 +206,7 @@ Two ingest limits are worth knowing before you point a sender at Ravel:
 
 ## Quickstart
 
-One command starts the whole stack from published images: MinIO for object
+One command starts the whole stack from published images: RustFS for object
 storage, `ravel-server`, an OpenTelemetry Collector that feeds it your host's own
 metrics, and Grafana with a provisioned Ravel datasource. No Rust toolchain, no
 compile.
@@ -278,7 +278,7 @@ It ingests one export under strict acknowledgement and captures the
 container, so the process cannot flush anything on its way out. It deletes that
 container, starts a fresh one with an empty filesystem, and reads the pre-kill
 sample back with `min_commit_token`. Nothing crosses the kill except what is in
-MinIO.
+RustFS.
 
 The script asserts every step and exits non-zero if the sample is absent or the
 token comes back unsatisfiable. A passing run is evidence, not a demonstration
@@ -288,7 +288,7 @@ quickstart.
 ### Security of the demo stack
 
 Every credential in [deploy/docker-compose/ravel.yml](deploy/docker-compose/ravel.yml)
-is a fixed development value: the `demo-token` bearer token and the MinIO
+is a fixed development value: the `demo-token` bearer token and the RustFS
 `ravel` / `ravel-dev-secret` pair. Every published host port binds loopback
 (`127.0.0.1`) only, so the checked-in token never fronts an ingest endpoint on
 your network. None of these values are for a deployment that a network can reach.
@@ -296,7 +296,7 @@ your network. None of these values are for a deployment that a network can reach
 ### Beyond the demo stack
 
 A real deployment points `--store s3` at any S3-compatible store, exactly as the
-quickstart points it at MinIO, and on EC2 it can drop static keys entirely with
+quickstart points it at RustFS, and on EC2 it can drop static keys entirely with
 `--s3-auth instance-role`. The [operations guide](docs/guides/operations.md)
 documents every storage flag, including temporary session tokens and a rotating
 credentials file.
