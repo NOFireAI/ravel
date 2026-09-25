@@ -47,6 +47,10 @@ resolve and sealed-segment fetches that do not scale with shards. An operator
 who sets `max_s3_requests` explicitly still gets exactly that value; the scaling
 applies only to the default.
 
+The span `per_shard_allowance` covers is no longer one open hour. It is the
+worst healthy unsealed tail plus the fold-stall alert window (ADR-1306
+amendment below).
+
 **2. The budget is derived from configuration, not hardcoded.** Because the
 per-shard cost is a function of `max_flush_delay`, deployments that trade ack
 latency for cost (a supported posture, and the only lever available without the
@@ -92,6 +96,8 @@ defeats its purpose.
 
 - A cold query over a busy tenant's open hour succeeds at the shipped defaults,
   at any shard count, which is what the sizing comment always claimed.
+  (See the ADR-1306 amendment below: that held for one hour of unsealed
+  data, and the unsealed tail reaches 2 h 20 m on a healthy fold.)
 - The relationship between flush cadence, shard count and query cost becomes
   explicit in one place instead of implicit across three files, so the next
   change to either input cannot silently invalidate the cap.
@@ -113,3 +119,40 @@ defeats its purpose.
 
 One tenant's open hour fanned across shards, the per-query cap drawn across the
 total, and the point where the shipped default stops fitting.
+
+## Amendment (ADR-1306, 2026-09-26): the budget covers the unsealed tail and the fold-stall alert window
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="ADR-1306 amendment" -->
+<!-- amendment-supersedes: phrase="at any shard count, which is what the sizing comment always claimed" pointer="ADR-1306 amendment" -->
+
+Decision 1 sized `per_shard_allowance` from one open hour. The span a
+recent-window query resolves is the unsealed tail, which is longer. The fold
+seals ingest hour `H` only `max_flush_lifetime + clock_skew_allowance +
+fold_safety_margin` after `H` ends, so a healthy tail swings between 1 h 20 m
+and 2 h 20 m at the defaults. When the fold stalls, the tail grows until the
+budget refuses cold queries with HTTP 422. At the one-hour sizing that refusal
+comes before the `RavelCatalogFoldStalled` alert fires.
+
+ADR-1306 replaces the one-hour span in decision 1 with
+
+    covered_span = (seal_margin + 1 h)
+                 + (seal_margin + FOLD_STALL_ALERT_FOR + ALERT_DELIVERY_SLACK)
+
+`seal_margin` is the sum of the three durations above, taken from the
+`CatalogConfig` the fold runs with. `FOLD_STALL_ALERT_FOR` is the shipped
+alert's 600 s `for:`, and `ALERT_DELIVERY_SLACK` is 300 s for scrape,
+evaluation and Alertmanager delay. At the defaults `covered_span` is
+14,100 s. The per-shard term also gains a measured
+`REQUESTS_PER_UNSEALED_FLUSH` factor, starting at 1.
+The shape of decision 1 is unchanged: a per-shard allowance times the shard
+count, plus the fixed overhead, with an explicit `--max-s3-requests` used
+verbatim. At 4 shards and a 2 s flush cadence the derived default goes from
+15,800 to 47,300 requests.
+
+The first Consequences bullet held only for one hour of unsealed data. Under
+ADR-1306 the claim becomes: no query is refused for fold lag before the
+fold-stall alert pages, and at the default `max_ingest_lag` no query whose
+range covers the last 50 minutes or less is refused for fold lag at all.
+Both hold at the measured per-flush cost. The remaining decisions and rejected alternatives stand as written.
+See ADR-1306 for the proof, the rejected alternatives, and the acceptance
+tests.
