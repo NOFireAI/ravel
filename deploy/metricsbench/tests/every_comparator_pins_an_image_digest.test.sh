@@ -228,7 +228,7 @@ check "docker_run_with_line_continuation_is_scanned" "${d}" 1 \
 # not silently scan fewer references.
 d="$(new_tree docker-run-wrong-count)"
 mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
-  '/^          docker run --rm --network host \\$/,/^            public\.ecr\.aws\/aws-cli\/aws-cli:2\.37\.2@sha256:/d'
+  '/^            docker run --rm --network host \\$/,/^              public\.ecr\.aws\/aws-cli\/aws-cli:2\.37\.2@sha256:/d'
 check "removing a docker run line fails the docker-run-image count assertion" \
   "${d}" 1 "found 17 docker run/pull/create image references, expected exactly 18"
 

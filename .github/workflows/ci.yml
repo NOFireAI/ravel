@@ -1287,16 +1287,25 @@ jobs:
           exit 1
       - name: Create the contract-suite bucket
         run: |
-          # ECR Public rationale: same anonymous-pull-allowance problem as
-          # ghcr.io solves for the server image above. The image's entrypoint
-          # is the `aws` binary, so this passes the subcommand directly.
-          docker run --rm --network host \
-            -e AWS_ACCESS_KEY_ID=rustfsadmin \
-            -e AWS_SECRET_ACCESS_KEY=rustfsadmin \
-            -e AWS_DEFAULT_REGION=us-east-1 \
-            -e AWS_EC2_METADATA_DISABLED=true \
-            public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
-            --endpoint-url http://localhost:9000 s3api create-bucket --bucket ravel-object-store-test
+          # ECR Public throttles unauthenticated pulls per source IP, and a
+          # throttled pull fails `docker run` with exit 125 ("toomanyrequests: Rate
+          # exceeded"). Retry that code alone, with backoff; any other exit is the
+          # create-bucket call itself and fails the step. The image's entrypoint is
+          # the `aws` binary, so this passes the subcommand directly.
+          for attempt in 1 2 3 4 5; do
+            rc=0
+            docker run --rm --network host \
+              -e AWS_ACCESS_KEY_ID=rustfsadmin \
+              -e AWS_SECRET_ACCESS_KEY=rustfsadmin \
+              -e AWS_DEFAULT_REGION=us-east-1 \
+              -e AWS_EC2_METADATA_DISABLED=true \
+              public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
+              --endpoint-url http://localhost:9000 s3api create-bucket --bucket ravel-object-store-test || rc=$?
+            if [ "$rc" -ne 125 ]; then exit "$rc"; fi
+            echo "AWS CLI container exited 125 on attempt $attempt; retrying"
+            sleep $((attempt * 15))
+          done
+          exit 125
       # The contract suite's S3 case is gated on RAVEL_MINIO_URL; set it (and
       # the credentials/bucket the docker run above provisioned) so the gated
       # test executes instead of skipping. The variable names are the crate's
@@ -1468,14 +1477,25 @@ jobs:
           exit 1
       - name: Create the bench-smoke bucket
         run: |
-          # ECR Public rationale: see object-store-contract's bucket step.
-          docker run --rm --network host \
-            -e AWS_ACCESS_KEY_ID=rustfsadmin \
-            -e AWS_SECRET_ACCESS_KEY=rustfsadmin \
-            -e AWS_DEFAULT_REGION=us-east-1 \
-            -e AWS_EC2_METADATA_DISABLED=true \
-            public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
-            --endpoint-url http://localhost:9000 s3api create-bucket --bucket ravel-object-store-test
+          # ECR Public throttles unauthenticated pulls per source IP, and a
+          # throttled pull fails `docker run` with exit 125 ("toomanyrequests: Rate
+          # exceeded"). Retry that code alone, with backoff; any other exit is the
+          # create-bucket call itself and fails the step. The image's entrypoint is
+          # the `aws` binary, so this passes the subcommand directly.
+          for attempt in 1 2 3 4 5; do
+            rc=0
+            docker run --rm --network host \
+              -e AWS_ACCESS_KEY_ID=rustfsadmin \
+              -e AWS_SECRET_ACCESS_KEY=rustfsadmin \
+              -e AWS_DEFAULT_REGION=us-east-1 \
+              -e AWS_EC2_METADATA_DISABLED=true \
+              public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
+              --endpoint-url http://localhost:9000 s3api create-bucket --bucket ravel-object-store-test || rc=$?
+            if [ "$rc" -ne 125 ]; then exit "$rc"; fi
+            echo "AWS CLI container exited 125 on attempt $attempt; retrying"
+            sleep $((attempt * 15))
+          done
+          exit 125
       # minio_ingest_read_smoke is gated on RAVEL_MINIO_URL, same convention
       # as the contract suite's minio_contract; set it (and the
       # credentials/bucket the docker run above provisioned) so the gated

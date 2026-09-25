@@ -108,6 +108,11 @@ those registries shares Docker Hub's allowance. Every file that does this
 points back to this note with a one-line comment instead of repeating the
 rationale.
 
+ECR Public does throttle unauthenticated pulls per source IP on its own
+terms, answering a burst with `toomanyrequests: Rate exceeded`, which
+`docker run` reports as exit 125. The CI steps that start the AWS CLI retry
+that exit code alone, with backoff.
+
 The object store used to be MinIO on quay.io. MinIO withdrew anonymous
 access to its public images on 2026-09-24, from Docker Hub and quay.io
 alike, so a mirror is no longer the fix: the images cannot be pulled without
