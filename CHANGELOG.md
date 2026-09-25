@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-25
+
 ### Fixed
 
 - **`ravel-bench` passes `clippy -D warnings` under `--all-features`**
