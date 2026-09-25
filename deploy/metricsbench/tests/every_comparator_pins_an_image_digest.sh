@@ -33,8 +33,8 @@
 #      .github/actions/*/*.yml -- excluding a local action (`uses: ./...`),
 #      which is repo-tracked code, not a fetched external action;
 #   4. every `image:` reference in the two quickstart compose files,
-#      deploy/docker-compose/ravel.yml and deploy/docker-compose/minio.yml
-#      (ravel.yml documents minio.yml as its MinIO-and-bucket mirror, so both
+#      deploy/docker-compose/ravel.yml and deploy/docker-compose/rustfs.yml
+#      (ravel.yml documents rustfs.yml as its RustFS-and-bucket mirror, so both
 #      must be scanned or the mirror can drift unpinned with nothing to
 #      notice) -- excluding the two `${RAVEL_IMAGE:-...}` references by exact
 #      match, since their default is Ravel's own released image (pinned by
@@ -50,7 +50,7 @@
 #      run`, `docker container create`) are matched too, as are global flags
 #      between `docker` and its subcommand. A backslash line continuation is
 #      joined before matching, since the image commonly sits on a line after
-#      the `docker run` token (ci.yml's MinIO and floci starts), and a line
+#      the `docker run` token (ci.yml's RustFS and floci starts), and a line
 #      inside a here-doc body (publish-images.yml's release-notes template,
 #      which contains a literal `docker pull ...` example for humans, not an
 #      invocation this job runs) is skipped. Every invocation on a logical
@@ -94,7 +94,7 @@ DEPLOY_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$DEPLOY_DIR/../.." && pwd)
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose.yml"
 RAVEL_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/ravel.yml"
-MINIO_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/minio.yml"
+RUSTFS_COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose/rustfs.yml"
 K8S_DIR="$REPO_ROOT/deploy/k8s"
 
 # The comparators ADR-0927 requires in the portable cross-engine lane. Each must
@@ -104,7 +104,7 @@ K8S_DIR="$REPO_ROOT/deploy/k8s"
 REQUIRED_COMPARATORS="prometheus victoriametrics mimir"
 
 # Exact number of `image:` references the committed deployment must contain:
-# prometheus, victoriametrics, minio, createbuckets, mimir. If a service is added
+# prometheus, victoriametrics, rustfs, createbuckets, mimir. If a service is added
 # or removed, update this number deliberately in the same change.
 COMPOSE_EXPECTED_IMAGE_COUNT=5
 
@@ -140,15 +140,16 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 WORKFLOW_EXPECTED_ACTION_COUNT=107
 
 # Exact number of `image:` lines across the two quickstart compose files:
-# ravel.yml's six (minio, createbucket (mc), qualify, ravel-server,
-# otel-collector, grafana) plus minio.yml's two (minio, createbucket (mc),
-# the same mirror pair under different service wiring). Update deliberately
+# ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
+# otel-collector, grafana) plus rustfs.yml's two (rustfs, createbucket
+# (aws-cli), the same mirror pair under different service wiring). Update
+# deliberately
 # if a service is added or removed from either file.
 QUICKSTART_EXPECTED_IMAGE_COUNT=8
 
 # Of those eight, the number that must carry a digest pin: every image except
 # the two `${RAVEL_IMAGE:-...}` references excluded below (both in
-# ravel.yml; minio.yml carries none). Update deliberately alongside
+# ravel.yml; rustfs.yml carries none). Update deliberately alongside
 # QUICKSTART_EXPECTED_IMAGE_COUNT.
 QUICKSTART_EXPECTED_PINNED_COUNT=6
 
@@ -168,14 +169,14 @@ RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.15.0}'
 # `docker pull`, or `docker create` invocation is added, removed, or
 # repointed at a different image inside one of their `run:` blocks. Raised
 # 17->18 when the dr-rehearsal workflow was added (issue #814): it starts one
-# MinIO container in a `run:` block. Its mc invocations live in
-# scripts/dr/lib.sh, outside this scan's scope, and are pinned by
-# DR_MC_IMAGE's own default there.
+# object-store container in a `run:` block. Its bucket-management invocations
+# live in scripts/dr/lib.sh, outside this scan's scope, and are pinned by
+# DR_AWS_CLI_IMAGE's own default there.
 RUN_IMAGE_EXPECTED_COUNT=18
 
 # Of those, the number that must carry a digest pin: every reference except
 # the three shell-variable exemptions below. Update deliberately alongside
-# RUN_IMAGE_EXPECTED_COUNT. Raised 11->12 with the dr-rehearsal MinIO run,
+# RUN_IMAGE_EXPECTED_COUNT. Raised 11->12 with the dr-rehearsal object-store run,
 # which is digest pinned.
 RUN_IMAGE_EXPECTED_PINNED_COUNT=12
 
@@ -207,8 +208,8 @@ RUN_IMAGE_VAR_REF_RESOLVED='"$ref"'
 # leave a manifest added tomorrow scanned by nothing, with no count
 # assertion to notice -- same rationale as category 5's `find` call.
 
-# Exact number of `image:` lines across every deploy/k8s manifest: minio.yaml
-# (minio, mc), floci.yaml (floci, curlimages/curl), and the two kind-loaded
+# Exact number of `image:` lines across every deploy/k8s manifest: rustfs.yaml
+# (rustfs, aws-cli), floci.yaml (floci, curlimages/curl), and the two kind-loaded
 # example/operator manifests below. Update deliberately if a manifest gains,
 # loses, or repoints an `image:` line.
 K8S_EXPECTED_IMAGE_COUNT=6
@@ -437,12 +438,12 @@ else
   fi
 fi
 
-# --- 4. Quickstart compose files (ravel.yml and minio.yml) -----------------
+# --- 4. Quickstart compose files (ravel.yml and rustfs.yml) ----------------
 
 echo
-echo "== quickstart compose image pins (deploy/docker-compose/{ravel,minio}.yml, issue #1720) =="
+echo "== quickstart compose image pins (deploy/docker-compose/{ravel,rustfs}.yml, issue #1720) =="
 
-for f in "$RAVEL_COMPOSE_FILE" "$MINIO_COMPOSE_FILE"; do
+for f in "$RAVEL_COMPOSE_FILE" "$RUSTFS_COMPOSE_FILE"; do
   if [ ! -f "$f" ]; then
     echo "FAIL: quickstart compose file not found at $f"
     fail=1
@@ -526,7 +527,7 @@ if [ "$workflow_scan_count" -gt 0 ]; then
   # A run: block is shell, not YAML, so a `docker run ...` line is scanned by
   # joining a trailing backslash continuation onto the next physical line
   # before matching (the image commonly lands on a later line than the
-  # `docker run` token itself: ci.yml's MinIO and floci starts). A line
+  # `docker run` token itself: ci.yml's RustFS and floci starts). A line
   # inside a here-doc body is skipped outright: publish-images.yml writes a
   # `docker pull ...` example into release notes for a human to read, which
   # is data this job emits, not a command this job runs. A `<<<` here-string
