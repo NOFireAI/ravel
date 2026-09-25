@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hermetic unit tests for scripts/check_readme_commands.py.
 
-No network, no docker, no MinIO: the extractor is tested against the fixture
+No network, no docker, no RustFS: the extractor is tested against the fixture
 markdown, and the evaluator is fed canned command results. The live command
 runner lives in check-readme-commands.sh and is deliberately not exercised here.
 

@@ -7,7 +7,8 @@ markdown file, extracts the fenced command blocks the reader is meant to run,
 and evaluates each block's declared expectation against a command result. The
 shell driver owns everything that touches a live stack (readiness waiting and
 running the commands); this module owns everything that can be unit tested with
-no network, no docker, and no MinIO. See scripts/test_check_readme_commands.py.
+no network, no docker, and no RustFS. See
+scripts/test_check_readme_commands.py.
 
 Marker convention (justification)
 ---------------------------------

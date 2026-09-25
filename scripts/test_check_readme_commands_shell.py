@@ -3,7 +3,7 @@
 
 Unlike test_check_readme_commands.py (which unit-tests the pure Python), these
 drive the whole shell script against a local stub HTTP server. They are still
-hermetic: no docker, no MinIO, no network beyond loopback. The stub stands in
+hermetic: no docker, no RustFS, no network beyond loopback. The stub stands in
 for the live stack so the status-capture and readiness-timeout behaviour can be
 exercised end to end.
 
