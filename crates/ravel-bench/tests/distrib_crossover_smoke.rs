@@ -79,7 +79,7 @@ async fn distributed_crossover_matches_local_over_memory_store() {
 /// `wall_ms_p99` and `coordinator_cpu_ms` -- is present and finite on the local
 /// panel and on every worker-count panel. This drives the real `run()` path the
 /// bin uses (not a helper in isolation) over a tiny in-process `MemoryStore`, so
-/// it runs in generic CI with no MinIO, and it is the gate that a new column
+/// it runs in generic CI with no RustFS, and it is the gate that a new column
 /// stays wired through `panel_report` into the serialized report.
 #[tokio::test]
 async fn crossover_reports_all_metric_columns() {

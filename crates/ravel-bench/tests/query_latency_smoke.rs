@@ -1,9 +1,9 @@
 //! Smoke tests for the `query_latency_bench` end-to-end PromQL query-latency
 //! path:
 //! `promql_instant_memory_smoke` and `promql_range_memory_smoke` always run
-//! against an in-process `MemoryStore`; `promql_instant_range_minio_smoke`
-//! runs the same path against a real MinIO endpoint, gated on
-//! `RAVEL_MINIO_URL` exactly like `minio_ingest_read_smoke` in
+//! against an in-process `MemoryStore`; `promql_instant_range_rustfs_smoke`
+//! runs the same path against a real RustFS endpoint, gated on
+//! `RAVEL_RUSTFS_URL` exactly like `rustfs_ingest_read_smoke` in
 //! tests/s3_e2e_smoke.rs -- same env var names, same skip-if-unset
 //! convention.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -73,27 +73,27 @@ async fn promql_range_memory_smoke() {
     );
 }
 
-/// Real MinIO conformance smoke test. Gated on `RAVEL_MINIO_URL` so the
-/// suite skips cleanly wherever no MinIO is reachable (e.g. this sandbox,
-/// most laptops, unconfigured CI runners) -- see `minio_ingest_read_smoke`
+/// Real RustFS conformance smoke test. Gated on `RAVEL_RUSTFS_URL` so the
+/// suite skips cleanly wherever no RustFS is reachable (e.g. this sandbox,
+/// most laptops, unconfigured CI runners) -- see `rustfs_ingest_read_smoke`
 /// in tests/s3_e2e_smoke.rs for the same gate.
 ///
-/// Optional overrides: `RAVEL_MINIO_BUCKET` (must already exist -- this
-/// crate does not create buckets), `RAVEL_MINIO_ACCESS_KEY`,
-/// `RAVEL_MINIO_SECRET_KEY`, `RAVEL_MINIO_REGION`.
+/// Optional overrides: `RAVEL_RUSTFS_BUCKET` (must already exist -- this
+/// crate does not create buckets), `RAVEL_RUSTFS_ACCESS_KEY`,
+/// `RAVEL_RUSTFS_SECRET_KEY`, `RAVEL_RUSTFS_REGION`.
 #[tokio::test]
-async fn promql_instant_range_minio_smoke() {
-    let Ok(url) = env::var("RAVEL_MINIO_URL") else {
-        println!("skipping MinIO instant/range query smoke test: RAVEL_MINIO_URL not set");
+async fn promql_instant_range_rustfs_smoke() {
+    let Ok(url) = env::var("RAVEL_RUSTFS_URL") else {
+        println!("skipping RustFS instant/range query smoke test: RAVEL_RUSTFS_URL not set");
         return;
     };
     let bucket =
-        env::var("RAVEL_MINIO_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
+        env::var("RAVEL_RUSTFS_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
     let access_key_id =
-        env::var("RAVEL_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
+        env::var("RAVEL_RUSTFS_ACCESS_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
     let secret_access_key =
-        env::var("RAVEL_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    let region = env::var("RAVEL_MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        env::var("RAVEL_RUSTFS_SECRET_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
+    let region = env::var("RAVEL_RUSTFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let allow_http = url.starts_with("http://");
 
     let config = S3Config {
@@ -117,14 +117,14 @@ async fn promql_instant_range_minio_smoke() {
 
     assert!(
         report.accepted_points > 0,
-        "promql_instant_range_minio_smoke must ingest a non-zero point count against real MinIO"
+        "promql_instant_range_rustfs_smoke must ingest a non-zero point count against real RustFS"
     );
     assert!(
         report.instant_matched_series > 0,
-        "promql_instant_range_minio_smoke must be able to query back at least one series via instant query against real MinIO"
+        "promql_instant_range_rustfs_smoke must be able to query back at least one series via instant query against real RustFS"
     );
     assert!(
         report.range_matched_series > 0,
-        "promql_instant_range_minio_smoke must be able to query back at least one series via range query against real MinIO"
+        "promql_instant_range_rustfs_smoke must be able to query back at least one series via range query against real RustFS"
     );
 }

@@ -2,8 +2,8 @@
 //! every `ObjectStoreBackend` implementation this crate ships: the memory
 //! oracle at its default page size and at a tiny one to force pagination,
 //! `FaultStore` wrapping the oracle with an empty plan (must be fully
-//! transparent), and -- gated on `RAVEL_MINIO_URL` / `RAVEL_FLOCI_URL` --
-//! `S3Store` against a real MinIO and against a real floci.
+//! transparent), and -- gated on `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` --
+//! `S3Store` against a real RustFS and against a real floci.
 //!
 //! This is an integration-test binary, a crate in its own right, so it
 //! inherits `[lints] workspace = true` (including `clippy::expect_used`
@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 /// Runs every contract assertion against `store`. Each assertion gets its
 /// own key sub-prefix under `root` so they can share one backend instance
-/// (and, for the MinIO case, one long-lived bucket) without colliding.
+/// (and, for the RustFS case, one long-lived bucket) without colliding.
 async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
     assert_satisfies_mandatory_capabilities(store);
     assert_create_if_absent_atomicity(store, &format!("{root}/create-if-absent/")).await;
@@ -60,7 +60,7 @@ async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
 /// synchronous check of the backend's static `capabilities()` declaration,
 /// run for every backend the suite exercises. The other function does live
 /// per-flag round trips against a real S3-compatible endpoint and is called
-/// only from the S3/MinIO/floci-specific tests.
+/// only from the S3/RustFS/floci-specific tests.
 fn assert_satisfies_mandatory_capabilities(store: &dyn ObjectStoreBackend) {
     let caps = store.capabilities();
     assert!(
@@ -522,7 +522,7 @@ async fn assert_mandatory_capabilities(store: &dyn ObjectStoreBackend, prefix: &
     // gap, so requiring it made the only durable backend unstartable
     // everywhere). `S3Store::capabilities()` is a constant of the adapter, not
     // a function of the endpoint, so this asserts the same thing for floci as
-    // it would for MinIO or real AWS S3. Written as an exact equality rather
+    // it would for RustFS or real AWS S3. Written as an exact equality rather
     // than `satisfies(..)` so movement in either direction -- a backend gaining
     // a capability or the adapter losing one -- fails here instead of passing
     // silently.
@@ -1256,7 +1256,7 @@ async fn instrumented_memory_store_contract() {
 /// also pins the default `S3Store`'s reported set to the mandatory set plus
 /// `multipart`, so the server's startup gate cannot start rejecting
 /// `--store s3` again.
-/// No `RAVEL_MINIO_URL` gate needed: `AmazonS3Builder::build` only
+/// No `RAVEL_RUSTFS_URL` gate needed: `AmazonS3Builder::build` only
 /// validates configuration, it never talks to the network.
 #[test]
 fn s3_store_reports_upload_checksum_unsupported() {
@@ -1295,7 +1295,7 @@ fn s3_store_reports_upload_checksum_unsupported() {
 /// line `S3Store::capabilities` returns for `upload_checksum` (hardcoded
 /// `false` before #863); reverting that one line to `false` fails this test.
 ///
-/// No `RAVEL_MINIO_URL` gate: `AmazonS3Builder::build` only validates config.
+/// No `RAVEL_RUSTFS_URL` gate: `AmazonS3Builder::build` only validates config.
 /// The on-the-wire proof that the header is actually attached lives in
 /// `tests/s3_http_faults.rs` (`put_attaches_server_verified_checksum_...`),
 /// which puts against a fake endpoint and asserts the recorded request headers.
@@ -1417,27 +1417,27 @@ fn s3_store_satisfies_maintain_mode_capabilities() {
     );
 }
 
-/// Real S3/MinIO conformance test (ADR-0010 §12: the memory oracle alone
+/// Real S3/RustFS conformance test (ADR-0010 §12: the memory oracle alone
 /// cannot catch a backend's conditional-put mapping). Gated on
-/// `RAVEL_MINIO_URL` so the suite skips cleanly wherever no MinIO is
+/// `RAVEL_RUSTFS_URL` so the suite skips cleanly wherever no RustFS is
 /// reachable (e.g. this sandbox, most laptops, unconfigured CI runners).
 ///
-/// Optional overrides: `RAVEL_MINIO_BUCKET` (must already exist -- this
-/// crate does not create buckets), `RAVEL_MINIO_ACCESS_KEY`,
-/// `RAVEL_MINIO_SECRET_KEY`, `RAVEL_MINIO_REGION`.
+/// Optional overrides: `RAVEL_RUSTFS_BUCKET` (must already exist -- this
+/// crate does not create buckets), `RAVEL_RUSTFS_ACCESS_KEY`,
+/// `RAVEL_RUSTFS_SECRET_KEY`, `RAVEL_RUSTFS_REGION`.
 #[tokio::test]
-async fn minio_contract() {
-    let Ok(url) = env::var("RAVEL_MINIO_URL") else {
-        println!("skipping MinIO contract test: RAVEL_MINIO_URL not set");
+async fn rustfs_contract() {
+    let Ok(url) = env::var("RAVEL_RUSTFS_URL") else {
+        println!("skipping RustFS contract test: RAVEL_RUSTFS_URL not set");
         return;
     };
     let bucket =
-        env::var("RAVEL_MINIO_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
+        env::var("RAVEL_RUSTFS_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
     let access_key_id =
-        env::var("RAVEL_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
+        env::var("RAVEL_RUSTFS_ACCESS_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
     let secret_access_key =
-        env::var("RAVEL_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    let region = env::var("RAVEL_MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        env::var("RAVEL_RUSTFS_SECRET_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
+    let region = env::var("RAVEL_RUSTFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let allow_http = url.starts_with("http://");
 
     let config = S3Config {
@@ -1491,9 +1491,9 @@ async fn minio_contract() {
 /// proposed as the fake backend for the kind development environment and the
 /// k8s CI lane. Whether its S3 implements Ravel's mandatory capability set
 /// and multipart is the open question this test answers; the ADR's fallback
-/// if it does not is MinIO, which is already proven in this repo's CI.
+/// if it does not is RustFS, which is already proven in this repo's CI.
 ///
-/// Gated on `RAVEL_FLOCI_URL` exactly like [`minio_contract`], so the suite
+/// Gated on `RAVEL_FLOCI_URL` exactly like [`rustfs_contract`], so the suite
 /// skips cleanly wherever no floci is reachable. Optional overrides:
 /// `RAVEL_FLOCI_BUCKET` (must already exist -- this crate does not create
 /// buckets), `RAVEL_FLOCI_ACCESS_KEY`, `RAVEL_FLOCI_SECRET_KEY`,
@@ -1536,7 +1536,7 @@ async fn floci_contract() {
         auth: Default::default(),
         instance_metadata_endpoint: None,
     };
-    // A small page size, as in `minio_contract`, so the pagination assertion
+    // A small page size, as in `rustfs_contract`, so the pagination assertion
     // exercises `list_with_offset` continuation against the real bucket.
     let store = S3Store::with_page_size(config, 2)
         .expect("S3Store::with_page_size must succeed with a valid config");

@@ -7,7 +7,7 @@
 //! `now`, the same pattern (and for the same reason) as `tests/catalog.rs` and
 //! `tests/catalog_signal.rs`: a subprocess-per-invocation of the binary gets
 //! its own empty in-memory store, so a fold -> fold -> fold sequence over one
-//! tenant cannot be built that way without a persistent S3/MinIO backend,
+//! tenant cannot be built that way without a persistent S3 backend,
 //! unavailable here. The one case that does need the real binary (the flag's
 //! rejection text, produced by clap, not by a library call) runs as a
 //! subprocess at the bottom of this file.

@@ -4,7 +4,7 @@
 //! compaction under the conservation gate, and leave no partial output visible.
 //!
 //! This is the in-process, deterministic analogue of ADR-0077 section 4's
-//! scenario 2 (`scripts/chaos/kill-maintain-worker.sh`, which needs real MinIO
+//! scenario 2 (`scripts/chaos/kill-maintain-worker.sh`, which needs real RustFS
 //! and a real `kill -9`). The takeover math (`ravel_fleet::worker_set`) was
 //! previously exercised only as a pure function; here it decides ownership over
 //! a real `compact_bucket` that a `FaultStore` fault interrupted, and the

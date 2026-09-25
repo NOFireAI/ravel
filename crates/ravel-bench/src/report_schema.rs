@@ -239,7 +239,7 @@ pub struct Hardware {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Backend {
-    /// `"memory"`, `"minio"`, or `"s3"`.
+    /// `"memory"`, `"rustfs"`, or `"s3"`.
     pub store_backend: String,
     /// Backend region, or the sentinel `"n/a"` for a backend with none, keeping
     /// the no-null contract.

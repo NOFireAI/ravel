@@ -3127,7 +3127,7 @@ mod tests {
                 s3: S3Spec {
                     bucket: "ravel-data".to_string(),
                     region: "eu-west-1".to_string(),
-                    endpoint: Some("http://minio:9000".to_string()),
+                    endpoint: Some("http://rustfs:9000".to_string()),
                     // A plaintext in-cluster endpoint is only renderable with
                     // `allowHttp` set: the baseline is a spec that renders, so
                     // the two travel together here.
@@ -3684,7 +3684,7 @@ mod tests {
         );
         assert_eq!(
             arg_value(&args, "--s3-endpoint").as_deref(),
-            Some("http://minio:9000")
+            Some("http://rustfs:9000")
         );
     }
 
@@ -4134,7 +4134,7 @@ mod tests {
         // with the field unset no longer renders at all (it is refused, see
         // `a_plaintext_endpoint_without_allow_http_is_refused_at_render_time`).
         let mut spec = base_spec();
-        spec.storage.s3.endpoint = Some("https://minio.example:9000".to_string());
+        spec.storage.s3.endpoint = Some("https://rustfs.example:9000".to_string());
         spec.storage.s3.allow_http = false;
         for deployment in [
             desired_gateway_deployment(&spec, "prod", &ctx()),
@@ -4174,7 +4174,7 @@ mod tests {
     #[test]
     fn a_plaintext_endpoint_without_allow_http_is_refused_at_render_time() {
         let mut spec = base_spec();
-        spec.storage.s3.endpoint = Some("http://minio:9000".to_string());
+        spec.storage.s3.endpoint = Some("http://rustfs:9000".to_string());
         spec.storage.s3.allow_http = false;
 
         let err = desired_objects(&spec, "prod", "default", &ctx())
@@ -4182,14 +4182,14 @@ mod tests {
         assert_eq!(
             err,
             RenderError::PlaintextS3Endpoint {
-                endpoint: "http://minio:9000".to_string(),
+                endpoint: "http://rustfs:9000".to_string(),
             }
         );
         let message = err.to_string();
         for needle in [
             "spec.storage.s3.endpoint",
             "spec.storage.s3.allowHttp",
-            "http://minio:9000",
+            "http://rustfs:9000",
         ] {
             assert!(
                 message.contains(needle),
@@ -4203,7 +4203,7 @@ mod tests {
         desired_objects(&spec, "prod", "default", &ctx())
             .expect("allowHttp true renders the plaintext endpoint");
         spec.storage.s3.allow_http = false;
-        spec.storage.s3.endpoint = Some("https://minio.example:9000".to_string());
+        spec.storage.s3.endpoint = Some("https://rustfs.example:9000".to_string());
         desired_objects(&spec, "prod", "default", &ctx())
             .expect("an https endpoint renders without the field");
 
@@ -4217,7 +4217,7 @@ mod tests {
         desired_objects(&spec, "prod", "default", &ctx()).expect("no endpoint renders unflagged");
     }
 
-    /// Issue #1911: an endpoint with no URL scheme (`minio:9000`) rendered
+    /// Issue #1911: an endpoint with no URL scheme (`rustfs:9000`) rendered
     /// cleanly and every container it produced died at its first S3 request,
     /// inside `object_store`'s signing, on a message naming neither the
     /// endpoint nor the field. The render refuses it instead, with its OWN
@@ -4234,7 +4234,7 @@ mod tests {
         let mut spec = base_spec();
         // A host name containing "http" is still schemeless: the check is a
         // prefix match on the scheme, not a substring search.
-        for endpoint in ["minio:9000", "my-http-proxy:9000"] {
+        for endpoint in ["rustfs:9000", "my-http-proxy:9000"] {
             for allow_http in [false, true] {
                 spec.storage.s3.endpoint = Some(endpoint.to_string());
                 spec.storage.s3.allow_http = allow_http;
@@ -4258,7 +4258,7 @@ mod tests {
         }
 
         // An upper-case scheme is a scheme (RFC 3986 section 3.1) and renders.
-        spec.storage.s3.endpoint = Some("HTTPS://minio.example:9000".to_string());
+        spec.storage.s3.endpoint = Some("HTTPS://rustfs.example:9000".to_string());
         spec.storage.s3.allow_http = false;
         desired_objects(&spec, "prod", "default", &ctx())
             .expect("an upper-case https scheme is valid and must render");
@@ -7164,7 +7164,7 @@ mod tests {
         assert_eq!(env_value("RAVEL_S3_REGION").as_deref(), Some("eu-west-1"));
         assert_eq!(
             env_value("RAVEL_S3_ENDPOINT").as_deref(),
-            Some("http://minio:9000")
+            Some("http://rustfs:9000")
         );
         // Credentials come from the shared Secret via secretKeyRef, never a
         // literal value in the pod spec.
@@ -7197,7 +7197,7 @@ mod tests {
         // The `false` half needs an https:// endpoint: a plaintext endpoint
         // with the field unset is refused at render time (finding 2).
         let mut spec = base_spec();
-        spec.storage.s3.endpoint = Some("https://minio.example:9000".to_string());
+        spec.storage.s3.endpoint = Some("https://rustfs.example:9000".to_string());
         spec.storage.s3.allow_http = false;
         let names_of = |job: &Job| -> Vec<String> {
             job.spec
@@ -7441,12 +7441,14 @@ mod tests {
     /// `resourceVersion` slot gained the same presence byte so an unresolved
     /// Secret (None) and a resolved empty version (Some("")) no longer collide,
     /// and again when `allowHttp` joined the hashed set (issue #1707), which
-    /// re-qualifies every existing cluster once on that upgrade.
+    /// re-qualifies every existing cluster once on that upgrade, and again
+    /// when `base_spec`'s endpoint fixture hostname changed (issue #2008),
+    /// which changes the hashed bytes with no change in behavior.
     #[test]
     fn qualify_job_input_hash_golden_is_stable_by_construction() {
         assert_eq!(
             qualify_job_input_hash(&base_spec(), Some("rv-golden")),
-            "ee998b075cf112dde8b42bdc959dbaaed8cd9b629864a0a51f3da2eb4516edde",
+            "fcce62c70486f6f3a53de345da901f44f3b5c5dac0799aa197c80ec1c43423f7",
         );
     }
 

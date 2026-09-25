@@ -24,10 +24,10 @@
 //! (ravel-object-store's trait) and [`CountingObjectStore`] for the async
 //! Parquet reader (the `object_store` crate's trait). GET count and bytes are
 //! backend-independent, so they are the primary deliverable whether this runs
-//! against MinIO or the in-process reference stores.
+//! against RustFS or the in-process reference stores.
 //!
 //! Backend selection: if the `RAVEL_S3_*` env vars are set and the endpoint
-//! is reachable, both paths run against it (MinIO);
+//! is reachable, both paths run against it (RustFS);
 //! otherwise both fall back to the in-process stores (MemoryStore for RSEG,
 //! `object_store::memory::InMemory` for Parquet) and wall times are labeled
 //! in-process. The chosen backend is printed in the header.
@@ -122,9 +122,11 @@ async fn main() {
 
 enum Backend {
     InProcess,
-    // A live MinIO/S3 backend was reachable. (Not expected on the fleet
+    // A live RustFS/S3 backend was reachable. (Not expected on the fleet
     // executor; kept so the same harness runs on target hardware.)
-    Minio(ravel_object_store::s3::S3Config),
+    // Boxed because S3Config (at least 224 bytes) is much larger than the
+    // data-less InProcess variant, which trips clippy::large_enum_variant.
+    RustFs(Box<ravel_object_store::s3::S3Config>),
 }
 
 async fn detect_backend() -> Backend {
@@ -135,7 +137,7 @@ async fn detect_backend() -> Backend {
     // bad creds, missing bucket), fall back to in-process.
     match ravel_object_store::s3::S3Store::new(config.clone()) {
         Ok(store) => match store.list_delimited("").await {
-            Ok(_) => Backend::Minio(config),
+            Ok(_) => Backend::RustFs(Box::new(config)),
             Err(e) => {
                 eprintln!("note: S3 endpoint configured but unreachable ({e}); using in-process");
                 Backend::InProcess
@@ -180,7 +182,7 @@ fn s3_config_from_env() -> Option<ravel_object_store::s3::S3Config> {
 fn backend_label(backend: &Backend) -> &'static str {
     match backend {
         Backend::InProcess => "in-process (MemoryStore / object_store InMemory)",
-        Backend::Minio(_) => "MinIO / S3",
+        Backend::RustFs(_) => "RustFS / S3",
     }
 }
 
@@ -192,7 +194,7 @@ fn print_header(backend: &Backend) {
         "  wall times         : {}",
         match backend {
             Backend::InProcess => "in-process (not network-representative)",
-            Backend::Minio(_) => "against live MinIO/S3",
+            Backend::RustFs(_) => "against live RustFS/S3",
         }
     );
     println!();
@@ -303,9 +305,9 @@ async fn rseg_store(
             store.reset();
             counting = store;
         }
-        Backend::Minio(config) => {
-            let inner =
-                ravel_object_store::s3::S3Store::new(config.clone()).expect("build s3 for rseg");
+        Backend::RustFs(config) => {
+            let inner = ravel_object_store::s3::S3Store::new(config.as_ref().clone())
+                .expect("build s3 for rseg");
             let store = CountingBackend::new(inner);
             handle = CountingHandle::Backend(store.counters());
             let store = Arc::new(store);
@@ -742,7 +744,7 @@ async fn parquet_store(
 ) {
     let inner: Arc<dyn ObjectStore> = match backend {
         Backend::InProcess => Arc::new(InMemory::new()),
-        Backend::Minio(config) => {
+        Backend::RustFs(config) => {
             // A second S3 client, this time through the object_store crate
             // directly, pointed at the same bucket/endpoint.
             Arc::new(build_os_s3(config))

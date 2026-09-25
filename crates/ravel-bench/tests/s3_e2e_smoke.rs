@@ -1,8 +1,8 @@
 //! Smoke tests for the `s3_e2e_bench` end-to-end ingest+query path:
 //! `memory_smoke` always
-//! runs against an in-process `MemoryStore`; `minio_ingest_read_smoke` runs
-//! the same path against a real MinIO endpoint, gated on `RAVEL_MINIO_URL`
-//! exactly like `minio_contract` in
+//! runs against an in-process `MemoryStore`; `rustfs_ingest_read_smoke` runs
+//! the same path against a real RustFS endpoint, gated on `RAVEL_RUSTFS_URL`
+//! exactly like `rustfs_contract` in
 //! crates/ravel-object-store/tests/contract.rs -- same env var names, same
 //! skip-if-unset convention -- not the `RAVEL_S3_*` convention
 //! `ravel_bench::harness` uses for the bin's own `--store s3` flag.
@@ -46,27 +46,27 @@ async fn memory_smoke() {
     );
 }
 
-/// Real MinIO conformance smoke test. Gated on `RAVEL_MINIO_URL` so the
-/// suite skips cleanly wherever no MinIO is reachable (e.g. this sandbox,
-/// most laptops, unconfigured CI runners) -- see `minio_contract` in
+/// Real RustFS conformance smoke test. Gated on `RAVEL_RUSTFS_URL` so the
+/// suite skips cleanly wherever no RustFS is reachable (e.g. this sandbox,
+/// most laptops, unconfigured CI runners) -- see `rustfs_contract` in
 /// crates/ravel-object-store/tests/contract.rs for the same gate.
 ///
-/// Optional overrides: `RAVEL_MINIO_BUCKET` (must already exist -- this
-/// crate does not create buckets), `RAVEL_MINIO_ACCESS_KEY`,
-/// `RAVEL_MINIO_SECRET_KEY`, `RAVEL_MINIO_REGION`.
+/// Optional overrides: `RAVEL_RUSTFS_BUCKET` (must already exist -- this
+/// crate does not create buckets), `RAVEL_RUSTFS_ACCESS_KEY`,
+/// `RAVEL_RUSTFS_SECRET_KEY`, `RAVEL_RUSTFS_REGION`.
 #[tokio::test]
-async fn minio_ingest_read_smoke() {
-    let Ok(url) = env::var("RAVEL_MINIO_URL") else {
-        println!("skipping MinIO ingest+read smoke test: RAVEL_MINIO_URL not set");
+async fn rustfs_ingest_read_smoke() {
+    let Ok(url) = env::var("RAVEL_RUSTFS_URL") else {
+        println!("skipping RustFS ingest+read smoke test: RAVEL_RUSTFS_URL not set");
         return;
     };
     let bucket =
-        env::var("RAVEL_MINIO_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
+        env::var("RAVEL_RUSTFS_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
     let access_key_id =
-        env::var("RAVEL_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
+        env::var("RAVEL_RUSTFS_ACCESS_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
     let secret_access_key =
-        env::var("RAVEL_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    let region = env::var("RAVEL_MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        env::var("RAVEL_RUSTFS_SECRET_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
+    let region = env::var("RAVEL_RUSTFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let allow_http = url.starts_with("http://");
 
     let config = S3Config {
@@ -90,10 +90,10 @@ async fn minio_ingest_read_smoke() {
 
     assert!(
         report.accepted_points > 0,
-        "minio_ingest_read_smoke must ingest a non-zero point count against real MinIO"
+        "rustfs_ingest_read_smoke must ingest a non-zero point count against real RustFS"
     );
     assert!(
         report.query_matched_series > 0,
-        "minio_ingest_read_smoke must be able to query back at least one series it just ingested"
+        "rustfs_ingest_read_smoke must be able to query back at least one series it just ingested"
     );
 }

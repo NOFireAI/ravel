@@ -2966,13 +2966,13 @@ mod tests {
     #[test]
     fn degraded_reason_names_the_plaintext_endpoint_field() {
         let (reason, message) = degraded_reason(&Error::Render(RenderError::PlaintextS3Endpoint {
-            endpoint: "http://minio:9000".to_string(),
+            endpoint: "http://rustfs:9000".to_string(),
         }));
         assert_eq!(reason, "PlaintextS3Endpoint");
         for needle in [
             "spec.storage.s3.endpoint",
             "spec.storage.s3.allowHttp",
-            "http://minio:9000",
+            "http://rustfs:9000",
         ] {
             assert!(
                 message.contains(needle),
@@ -2992,7 +2992,7 @@ mod tests {
     #[test]
     fn a_schemeless_endpoint_degrades_the_cluster_with_its_own_reason() {
         let mut spec = spec_with_affinity(None);
-        spec.storage.s3.endpoint = Some("minio:9000".to_string());
+        spec.storage.s3.endpoint = Some("rustfs:9000".to_string());
         spec.storage.s3.allow_http = false;
 
         let err = Error::Render(
@@ -3011,7 +3011,7 @@ mod tests {
         let degraded = find(&status.conditions, "Degraded");
         assert_eq!(degraded.status, "True");
         assert_eq!(degraded.reason, "SchemelessS3Endpoint");
-        for needle in ["spec.storage.s3.endpoint", "minio:9000", "https://"] {
+        for needle in ["spec.storage.s3.endpoint", "rustfs:9000", "https://"] {
             assert!(
                 degraded.message.contains(needle),
                 "the Degraded condition must name {needle}, got: {}",
@@ -3026,7 +3026,7 @@ mod tests {
 
         // A plaintext non-loopback endpoint keeps its own, different reason, so
         // the two misconfigurations are never reported as one.
-        spec.storage.s3.endpoint = Some("http://minio:9000".to_string());
+        spec.storage.s3.endpoint = Some("http://rustfs:9000".to_string());
         let (plaintext_reason, _) = degraded_reason(&Error::Render(
             s3_allow_http(&spec).expect_err("plaintext to a non-loopback host must refuse"),
         ));
@@ -3049,13 +3049,13 @@ mod tests {
             auth_store_config(&spec, "key".to_string(), "secret".to_string())
         };
 
-        let err = config_for(Some("http://minio:9000"), false)
+        let err = config_for(Some("http://rustfs:9000"), false)
             .expect_err("the operator's own client must refuse the shape its pods refuse");
         assert!(
             matches!(
                 err,
                 Error::Render(RenderError::PlaintextS3Endpoint { ref endpoint })
-                    if endpoint == "http://minio:9000"
+                    if endpoint == "http://rustfs:9000"
             ),
             "expected a typed plaintext-endpoint refusal, got: {err:?}"
         );
@@ -3079,7 +3079,7 @@ mod tests {
         );
         // The deliberate opt-in, and loopback, are the two plaintext cases.
         assert!(
-            config_for(Some("http://minio:9000"), true)
+            config_for(Some("http://rustfs:9000"), true)
                 .expect("allowHttp true accepts plaintext")
                 .allow_http
         );

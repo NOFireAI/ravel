@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Ravel object store contract, reference in-memory backend, fault-injecting wrapper, and S3/MinIO adapter."
+description = "Ravel object store contract, reference in-memory backend, fault-injecting wrapper, and S3 adapter."
 
 [dependencies]
 async-trait = { workspace = true }

@@ -36,7 +36,7 @@ const VISIBILITY_POLL_MAX_ROUNDS: u32 = 30;
 /// How often the in-flight depth sampler reads the per-shard gauge. Cheap: a
 /// single `Mutex<HashMap>` read of `IngestMetrics::in_flight_flushes_by_shard`
 /// per tick, no allocation on the flush path. 25 ms keeps ~40 samples/s, dense
-/// enough to catch a depth spike a MinIO/real-S3 flush (tens to hundreds of
+/// enough to catch a depth spike a RustFS/real-S3 flush (tens to hundreds of
 /// ms) holds open, without loading the actor.
 const DEPTH_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
 

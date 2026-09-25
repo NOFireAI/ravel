@@ -255,7 +255,7 @@ impl FakeS3 {
 
     /// An [`S3Store`] pointed at this endpoint through the existing
     /// [`S3Config::endpoint`] override. No new configuration surface: this is
-    /// the same field a MinIO deployment sets.
+    /// the same field a RustFS deployment sets.
     fn store(&self) -> S3Store {
         S3Store::new(self.config()).expect("a fake-endpoint S3Store must build")
     }

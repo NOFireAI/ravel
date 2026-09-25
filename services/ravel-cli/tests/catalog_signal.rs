@@ -5,7 +5,7 @@
 //! for the same reason) as `tests/catalog.rs`: a subprocess-per-invocation of
 //! the binary gets its own empty in-memory store, so a
 //! publish -> fold -> resolve scenario cannot be built that way without a
-//! persistent S3/MinIO backend, unavailable here.
+//! persistent S3 backend, unavailable here.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
