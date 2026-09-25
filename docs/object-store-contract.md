@@ -1063,12 +1063,10 @@ wrappers, and a real endpoint alike). Two multipart assertions are S3-shaped and
 run only against a live endpoint: the composite `"<digest>-<partcount>"` ETag,
 which proves the parts really went out as parts rather than being buffered into
 one PUT, and `put()`'s own threshold switch. The `S3Store` case is gated on
-`RAVEL_MINIO_URL`; the CI
+`RAVEL_RUSTFS_URL`; the CI
 `object-store-contract` job (`.github/workflows/ci.yml`) stands up RustFS,
 creates the bucket, sets that variable, and asserts the gated test executed
-rather than skipping. The variable and the `minio_contract` test keep their
-names: they name the gate, not the vendor, and renaming them would break
-every checkout and CI lane that already sets them. This job is required: S3 is the only durable backend,
+rather than skipping. This job is required: S3 is the only durable backend,
 so an adapter regression must fail CI.
 
 `crates/ravel-object-store/tests/s3_http_faults.rs` covers what neither the

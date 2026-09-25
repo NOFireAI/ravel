@@ -6,6 +6,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ravel-bench` passes `clippy -D warnings` under `--all-features`**
+  (issue #1925). The `read_path_accounting` binary's `Backend` enum carried
+  an unboxed `S3Config` in its S3 variant next to a data-less variant, so
+  `clippy::large_enum_variant` failed `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`. The build and tests were never affected;
+  only the lint gate failed. The field is now boxed, with no change in
+  behavior.
+
+### Changed
+
+- **The remaining MinIO identifiers are renamed to RustFS** (issue #2008).
+  The object store moved from MinIO to RustFS in 0.16.0 (#2002), which kept
+  the old names; they now match. The `RAVEL_MINIO_*` variables that gate the
+  S3 contract suite and the bench smoke tests are now `RAVEL_RUSTFS_*`, and
+  the old names are no longer read, so anyone running those suites locally
+  must rename them. The tests `minio_contract` and `minio_ingest_read_smoke`
+  are now `rustfs_contract` and `rustfs_ingest_read_smoke`, and CI's checks
+  that those tests really ran match the new names. `sql_latency_bench`
+  reports the backend label `"rustfs"` instead of `"minio"`, and
+  `read_path_accounting`'s `Backend::Minio` is `Backend::RustFs`. Test
+  fixture hostnames and doc comments follow; where a comment stated how
+  MinIO specifically behaved, it now makes a store-neutral statement
+  instead.
+
 ## [0.16.1] - 2026-09-25
 
 ### Fixed

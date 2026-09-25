@@ -1,9 +1,9 @@
 //! Smoke tests for the `concurrent_bench` readers-and-writers +
 //! cold/warm-cache path:
 //! `readers_writers_memory_smoke` always runs against an in-process
-//! `MemoryStore`; `readers_writers_minio_smoke` runs the same path against a
-//! real MinIO endpoint, gated on `RAVEL_MINIO_URL` exactly like
-//! `minio_ingest_read_smoke` in tests/s3_e2e_smoke.rs -- same env var names,
+//! `MemoryStore`; `readers_writers_rustfs_smoke` runs the same path against a
+//! real RustFS endpoint, gated on `RAVEL_RUSTFS_URL` exactly like
+//! `rustfs_ingest_read_smoke` in tests/s3_e2e_smoke.rs -- same env var names,
 //! same skip-if-unset convention.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -89,31 +89,31 @@ async fn readers_writers_memory_smoke() {
     );
 }
 
-/// Real MinIO conformance smoke test. Gated on `RAVEL_MINIO_URL` so the
-/// suite skips cleanly wherever no MinIO is reachable (e.g. this sandbox,
-/// most laptops, unconfigured CI runners) -- see `minio_ingest_read_smoke`
+/// Real RustFS conformance smoke test. Gated on `RAVEL_RUSTFS_URL` so the
+/// suite skips cleanly wherever no RustFS is reachable (e.g. this sandbox,
+/// most laptops, unconfigured CI runners) -- see `rustfs_ingest_read_smoke`
 /// in tests/s3_e2e_smoke.rs for the same gate.
 ///
-/// Optional overrides: `RAVEL_MINIO_BUCKET` (must already exist -- this
-/// crate does not create buckets), `RAVEL_MINIO_ACCESS_KEY`,
-/// `RAVEL_MINIO_SECRET_KEY`, `RAVEL_MINIO_REGION`.
+/// Optional overrides: `RAVEL_RUSTFS_BUCKET` (must already exist -- this
+/// crate does not create buckets), `RAVEL_RUSTFS_ACCESS_KEY`,
+/// `RAVEL_RUSTFS_SECRET_KEY`, `RAVEL_RUSTFS_REGION`.
 ///
 /// `flavor = "multi_thread"` for the same reason as
 /// `readers_writers_memory_smoke`: a single-threaded runtime starves the
 /// router's background flush task against this test's reader polling loop.
 #[tokio::test(flavor = "multi_thread")]
-async fn readers_writers_minio_smoke() {
-    let Ok(url) = env::var("RAVEL_MINIO_URL") else {
-        println!("skipping MinIO readers/writers smoke test: RAVEL_MINIO_URL not set");
+async fn readers_writers_rustfs_smoke() {
+    let Ok(url) = env::var("RAVEL_RUSTFS_URL") else {
+        println!("skipping RustFS readers/writers smoke test: RAVEL_RUSTFS_URL not set");
         return;
     };
     let bucket =
-        env::var("RAVEL_MINIO_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
+        env::var("RAVEL_RUSTFS_BUCKET").unwrap_or_else(|_| "ravel-object-store-test".to_string());
     let access_key_id =
-        env::var("RAVEL_MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
+        env::var("RAVEL_RUSTFS_ACCESS_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
     let secret_access_key =
-        env::var("RAVEL_MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    let region = env::var("RAVEL_MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        env::var("RAVEL_RUSTFS_SECRET_KEY").unwrap_or_else(|_| "rustfsadmin".to_string());
+    let region = env::var("RAVEL_RUSTFS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let allow_http = url.starts_with("http://");
 
     let s3_config = S3Config {
@@ -138,14 +138,14 @@ async fn readers_writers_minio_smoke() {
     for writer in &report.writers {
         assert!(
             writer.accepted_points > 0,
-            "writer {} must accept a non-zero point count against real MinIO",
+            "writer {} must accept a non-zero point count against real RustFS",
             writer.writer_id
         );
     }
     for reader in &report.readers {
         assert!(
             reader.non_empty_results > 0,
-            "reader {} must see a non-empty query result at least once against real MinIO",
+            "reader {} must see a non-empty query result at least once against real RustFS",
             reader.reader_id
         );
     }

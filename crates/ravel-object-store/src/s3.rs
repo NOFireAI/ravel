@@ -1,4 +1,4 @@
-//! S3 / MinIO adapter over the `object_store` crate's `AmazonS3` client
+//! S3 adapter over the `object_store` crate's `AmazonS3` client
 //! (ADR-0008). This module never leaks `object_store` types across the
 //! [`ObjectStoreBackend`] boundary; every conversion happens here.
 //!
@@ -232,7 +232,7 @@ pub enum S3AuthMode {
     InstanceRole,
 }
 
-/// Write-time upload-integrity mode for the S3 / MinIO adapter (#863).
+/// Write-time upload-integrity mode for the S3 adapter (#863).
 ///
 /// This selects whether `put()` attaches a server-verified checksum to the
 /// outgoing request so S3 verifies-or-rejects the bytes it received, rather
@@ -284,8 +284,8 @@ pub enum UploadIntegrity {
     #[default]
     Off,
     /// Attach `x-amz-checksum-crc64nvme` (CRC64-NVME, computed by
-    /// `object_store`). The cheaper of the two algorithms; supported by AWS S3
-    /// and recent MinIO, but not by every older S3-compatible endpoint.
+    /// `object_store`). The cheaper of the two algorithms; supported by AWS S3,
+    /// but not by every S3-compatible endpoint.
     Crc64Nvme,
     /// Attach `x-amz-checksum-sha256` (SHA-256, computed by `object_store`).
     /// The most broadly supported server-verified checksum, at the cost of a
@@ -310,23 +310,23 @@ impl UploadIntegrity {
     }
 }
 
-/// Explicit configuration for the S3 / MinIO adapter. No environment or
+/// Explicit configuration for the S3 adapter. No environment or
 /// credential-chain magic: every value that changes behavior is a field
 /// here so tests and production wiring are equally explicit.
 #[derive(Debug, Clone)]
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
-    /// Set for MinIO (or any other S3-compatible endpoint); left `None` to
+    /// Set for RustFS (or any other S3-compatible endpoint); left `None` to
     /// use AWS's regional endpoint.
     pub endpoint: Option<String>,
     pub access_key_id: String,
     pub secret_access_key: String,
-    /// Allow plain HTTP; needed for a local MinIO without TLS.
+    /// Allow plain HTTP; needed for a local RustFS without TLS.
     pub allow_http: bool,
     /// Path-style requests (`https://host/bucket/key`) instead of
-    /// virtual-hosted style (`https://bucket.host/key`); MinIO deployments
-    /// typically require this.
+    /// virtual-hosted style (`https://bucket.host/key`); local S3-compatible
+    /// deployments typically require this.
     pub force_path_style: bool,
     /// Per-tenant SSE-KMS key id for bring-your-own-key encryption
     /// (ADR-0042 decision 1). `Some(key)` makes [`S3Store::new`] call
@@ -747,7 +747,7 @@ fn client_options(http: &S3HttpConfig) -> ClientOptions {
         .with_http2_keep_alive_while_idle()
 }
 
-/// S3 / MinIO backend implementing [`ObjectStoreBackend`] over
+/// S3 backend implementing [`ObjectStoreBackend`] over
 /// `object_store`'s `AmazonS3` client.
 pub struct S3Store {
     store: AmazonS3,
@@ -1193,7 +1193,7 @@ fn typed_http_kind(
 /// dedicated typed variant). Every operation funnels its `Generic` errors here
 /// (via [`map_error_common`], and [`map_put_error`]/[`map_get_error`] which
 /// delegate to it), so this one function decides `Timeout` vs `Throttled` vs
-/// `Transient` for the whole S3/MinIO adapter.
+/// `Transient` for the whole S3 adapter.
 ///
 /// Two tiers, in order:
 ///
@@ -2205,7 +2205,7 @@ mod tests {
     }
 
     /// Issue #1911, at the one decision every binary routes through. An
-    /// endpoint written with no scheme (`minio:9000`) was accepted here and
+    /// endpoint written with no scheme (`rustfs:9000`) was accepted here and
     /// killed the process later, inside `object_store`'s request signing, on a
     /// message naming neither the endpoint nor the flag. It is refused here
     /// now, and the refusal quotes the endpoint and asks for a scheme.
@@ -2214,7 +2214,7 @@ mod tests {
     ///
     /// - a substring test for `"http"` rather than a prefix match accepts
     ///   `my-http-proxy:9000` (schemeless, and its host merely contains the
-    ///   word) and refuses `HTTPS://minio:9000` (a perfectly good URL);
+    ///   word) and refuses `HTTPS://rustfs:9000` (a perfectly good URL);
     /// - a refusal written in one binary's own startup path instead of here
     ///   leaves this test failing outright, which is what makes the other
     ///   binaries' tables meaningful rather than three copies of one rule.
@@ -2224,14 +2224,14 @@ mod tests {
     #[test]
     fn an_endpoint_without_a_scheme_is_refused() {
         for endpoint in [
-            "minio:9000",
+            "rustfs:9000",
             // WRONG-1: a substring test for "http" passes this one, whose host
             // name merely contains the word and which still has no scheme.
             "my-http-proxy:9000",
             "s3.example.com",
             // A scheme that is neither of the two, and the empty endpoint: both
             // are as unusable as a bare host:port.
-            "ftp://minio:9000",
+            "ftp://rustfs:9000",
             "",
         ] {
             let refusal = resolve_s3_allow_http(Some(endpoint), false).expect_err(
@@ -2265,7 +2265,7 @@ mod tests {
         // WRONG-1, the other half: an upper-case scheme is a scheme. RFC 3986
         // section 3.1 makes it case-insensitive, and refusing it would break a
         // working deployment.
-        for endpoint in ["HTTPS://minio:9000", "Https://minio:9000"] {
+        for endpoint in ["HTTPS://rustfs:9000", "Https://rustfs:9000"] {
             assert_eq!(
                 resolve_s3_allow_http(Some(endpoint), false),
                 Ok(false),
@@ -2294,14 +2294,14 @@ mod tests {
             );
         }
         assert_eq!(
-            resolve_s3_allow_http(Some("http://minio:9000"), false),
+            resolve_s3_allow_http(Some("http://rustfs:9000"), false),
             Err(S3EndpointRefusal::Plaintext(PlaintextS3Endpoint {
-                endpoint: "http://minio:9000".to_string(),
+                endpoint: "http://rustfs:9000".to_string(),
             })),
             "plaintext to a host on the network must keep its own refusal"
         );
         assert_eq!(
-            resolve_s3_allow_http(Some("http://minio:9000"), true),
+            resolve_s3_allow_http(Some("http://rustfs:9000"), true),
             Ok(true),
             "--s3-allow-http must still accept deliberate plaintext"
         );
@@ -2673,7 +2673,7 @@ mod tests {
 
     // --- Classification of Error::Generic ---
     //
-    // These pin the StoreError kind AND retryable() that the S3/MinIO
+    // These pin the StoreError kind AND retryable() that the S3
     // get/put/list error path produces for each representative error shape.
     // A future object_store bump that changes error text (tier 2) or the
     // typed HttpError API (tier 1) fails one of these loudly instead of

@@ -3,7 +3,7 @@
 //! `MemoryStore` (a subprocess per invocation, as `tests/segment_inspect.rs`
 //! uses, would give each `ravel-cli catalog ...` call its own empty
 //! in-memory store, making a chained fold -> inspect -> verify scenario
-//! impossible to construct without a persistent S3/MinIO backend).
+//! impossible to construct without a persistent S3 backend).
 
 pub mod catalog;
 pub mod cli_profiling;

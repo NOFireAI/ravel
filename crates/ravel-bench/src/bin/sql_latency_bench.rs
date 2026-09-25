@@ -372,7 +372,7 @@ impl From<CompactionArg> for Compaction {
 }
 
 /// Classify the store for the report: backend name, region, and endpoint. A
-/// custom S3 endpoint is MinIO; a bare S3 config is S3; `MemoryStore` has
+/// custom S3 endpoint is RustFS; a bare S3 config is S3; `MemoryStore` has
 /// neither region nor endpoint, so both carry the `"n/a"` sentinel.
 fn provenance_strings(store: StoreKind) -> (String, String, String) {
     match store {
@@ -386,7 +386,7 @@ fn provenance_strings(store: StoreKind) -> (String, String, String) {
                 .ok()
                 .filter(|e| !e.is_empty())
             {
-                Some(endpoint) => ("minio".to_string(), region, endpoint),
+                Some(endpoint) => ("rustfs".to_string(), region, endpoint),
                 None => ("s3".to_string(), region, "n/a".to_string()),
             }
         }

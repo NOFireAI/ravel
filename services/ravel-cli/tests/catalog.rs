@@ -3,7 +3,7 @@
 //! shared `MemoryStore` rather than as `segment_inspect.rs`'s subprocess
 //! pattern: each subprocess invocation of the binary gets its own empty
 //! `MemoryStore`, so a chained fold -> inspect -> verify scenario cannot be
-//! built that way without a persistent S3/MinIO backend, unavailable in this
+//! built that way without a persistent S3 backend, unavailable in this
 //! environment. `ravel_cli`'s lib target exists for exactly this reason.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]

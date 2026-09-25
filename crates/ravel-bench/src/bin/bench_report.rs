@@ -8,7 +8,7 @@
 //! records which backend actually ran, and `s3_requests.backend_bills_requests`
 //! records whether its requests are billed -- true only for real S3 with no
 //! `RAVEL_S3_ENDPOINT` override (`harness::backend_bills_requests`; a
-//! MinIO-backed S3 endpoint bills nothing, per ADR-0927 decision 10).
+//! RustFS-backed S3 endpoint bills nothing, per ADR-0927 decision 10).
 //!
 //! Provenance (`git_commit`, `toolchain`) is gathered here, not in the library:
 //! `git rev-parse HEAD` (overridable via `GITHUB_SHA`, which CI sets) and

@@ -1655,7 +1655,7 @@ mod tests {
     fn qualification_record_json_shape_is_stable() {
         let record = QualificationRecord {
             suite_version: 1,
-            backend_identity: "s3://ravel-test @ minio:9000".to_string(),
+            backend_identity: "s3://ravel-test @ rustfs:9000".to_string(),
             qualified_unix_ns: 1_700_000_000_000_000_000,
             passed_properties: vec![
                 "conditional_write_create_if_absent".to_string(),
@@ -1682,7 +1682,7 @@ mod tests {
         assert_eq!(obj["suite_version"], serde_json::json!(1));
         assert_eq!(
             obj["backend_identity"],
-            serde_json::json!("s3://ravel-test @ minio:9000")
+            serde_json::json!("s3://ravel-test @ rustfs:9000")
         );
         assert_eq!(
             obj["qualified_unix_ns"],
@@ -4341,7 +4341,7 @@ mod tests {
     /// error shapes -- timeout, throttle, a permanent failure, a not-found, and
     /// a conditional-write (CAS) conflict under each mode -- as observed through
     /// a backend the conformance harness parameterizes (`FaultStore` over the
-    /// `MemoryStore` oracle). The S3/MinIO adapter's own `Error::Generic`
+    /// `MemoryStore` oracle). The S3 adapter's own `Error::Generic`
     /// classification is pinned complementarily in `s3.rs`, where
     /// `object_store::Error` values can be constructed directly; together they
     /// cover both the shared taxonomy and the S3-specific mapping.

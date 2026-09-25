@@ -11359,7 +11359,7 @@ mod tests {
             cli(&argv)
         };
 
-        let err = s3(&["--s3-endpoint", "http://minio:9000"])
+        let err = s3(&["--s3-endpoint", "http://rustfs:9000"])
             .validate()
             .expect_err("plaintext to a non-loopback host must refuse startup");
         assert!(
@@ -11367,7 +11367,7 @@ mod tests {
             "names the flag that accepts it: {err}"
         );
 
-        s3(&["--s3-endpoint", "http://minio:9000", "--s3-allow-http"])
+        s3(&["--s3-endpoint", "http://rustfs:9000", "--s3-allow-http"])
             .validate()
             .expect("--s3-allow-http must accept a plaintext non-loopback endpoint");
         s3(&["--s3-endpoint", "http://127.0.0.1:9000"])
@@ -11381,7 +11381,7 @@ mod tests {
         // where it used to pass and kill the process later inside the S3
         // client's request signing. A host whose name contains "http" is
         // schemeless too; an upper-case scheme is a real scheme and passes.
-        for endpoint in ["minio:9000", "my-http-proxy:9000"] {
+        for endpoint in ["rustfs:9000", "my-http-proxy:9000"] {
             let err = s3(&["--s3-endpoint", endpoint])
                 .validate()
                 .expect_err("an endpoint with no scheme must refuse startup");
@@ -11396,14 +11396,14 @@ mod tests {
                 .validate()
                 .expect_err("--s3-allow-http must not accept a schemeless endpoint");
         }
-        s3(&["--s3-endpoint", "HTTPS://minio:9000"])
+        s3(&["--s3-endpoint", "HTTPS://rustfs:9000"])
             .validate()
             .expect("an upper-case https scheme is a scheme and must pass");
 
-        cli(&["--s3-endpoint", "http://minio:9000"])
+        cli(&["--s3-endpoint", "http://rustfs:9000"])
             .validate()
             .expect("--store memory must not consult the S3 endpoint");
-        cli(&["--s3-endpoint", "minio:9000"])
+        cli(&["--s3-endpoint", "rustfs:9000"])
             .validate()
             .expect("--store memory must not consult the S3 endpoint");
     }

@@ -102,7 +102,7 @@
 //!   scheme, path, or credentials.
 //! - `backend_bills_requests`: true only for real S3 with no endpoint
 //!   override (decision 10); false on `MemoryStore` and on any store behind a
-//!   configured endpoint, such as the nightly lane's local MinIO.
+//!   configured endpoint, such as the nightly lane's local RustFS.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -635,7 +635,7 @@ pub fn build_profile_record(
 
 /// The storage backend a run replayed against, and whether it bills for
 /// requests (ADR-0927 decision 10): named at the top level so a reader never
-/// mistakes a MinIO-backed `ci` run's request counts for a real S3 cost.
+/// mistakes a RustFS-backed `ci` run's request counts for a real S3 cost.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Substrate {
     /// The `--store` kind (`memory` or `s3`), as `StoreKind`'s `Display`.

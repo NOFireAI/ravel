@@ -798,16 +798,16 @@ mod tests {
 
         // Plaintext to a host on the network: refused, and the error names the
         // flag that accepts it.
-        let refusal = resolve_s3_allow_http(Some("http://minio:9000"), false)
+        let refusal = resolve_s3_allow_http(Some("http://rustfs:9000"), false)
             .expect_err("plaintext to a non-loopback host must be refused");
-        assert_eq!(refusal.endpoint(), "http://minio:9000");
+        assert_eq!(refusal.endpoint(), "http://rustfs:9000");
         let rendered = refusal.to_string();
         assert!(
             rendered.contains("--s3-allow-http"),
             "the refusal must name the flag that accepts it, got: {rendered}"
         );
         let err = build_store_error(
-            &s3_args("http://minio:9000", false),
+            &s3_args("http://rustfs:9000", false),
             "build_store must refuse plaintext to a non-loopback host",
         );
         assert!(
@@ -817,11 +817,11 @@ mod tests {
 
         // The same endpoint with the flag: accepted, and plaintext is on.
         assert_eq!(
-            resolve_s3_allow_http(Some("http://minio:9000"), true),
+            resolve_s3_allow_http(Some("http://rustfs:9000"), true),
             Ok(true),
             "--s3-allow-http must enable plaintext to a non-loopback host"
         );
-        build_store(&s3_args("http://minio:9000", true))
+        build_store(&s3_args("http://rustfs:9000", true))
             .expect("--s3-allow-http must let a plaintext non-loopback endpoint build");
 
         // Scheme and host name are case-insensitive, so an upper-case
@@ -834,7 +834,7 @@ mod tests {
             );
         }
         assert!(
-            resolve_s3_allow_http(Some("HTTP://minio:9000"), false).is_err(),
+            resolve_s3_allow_http(Some("HTTP://rustfs:9000"), false).is_err(),
             "an upper-case scheme must not skip the plaintext refusal"
         );
 
@@ -857,7 +857,7 @@ mod tests {
         // store-qualification Job hit as exit 101 from `ravel-cli store
         // qualify`. A host name containing "http" is still schemeless, and
         // `build_store` refuses both.
-        for endpoint in ["minio:9000", "my-http-proxy:9000"] {
+        for endpoint in ["rustfs:9000", "my-http-proxy:9000"] {
             let refusal = resolve_s3_allow_http(Some(endpoint), false)
                 .expect_err("a schemeless endpoint must be refused");
             assert_eq!(
@@ -884,7 +884,7 @@ mod tests {
         }
         // An upper-case scheme is a scheme, and must not be swept up with them.
         assert_eq!(
-            resolve_s3_allow_http(Some("HTTPS://minio:9000"), false),
+            resolve_s3_allow_http(Some("HTTPS://rustfs:9000"), false),
             Ok(false),
             "an upper-case https scheme is valid and must be accepted"
         );
