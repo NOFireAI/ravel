@@ -141,12 +141,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   CI steps that pull the client retry a throttled pull with backoff. An
   operator running the old quickstart compose file should stop the stack
   (`docker compose -f deploy/docker-compose/ravel.yml down`), pull the current
-  files, rename the data directory from `minio-data/` to `rustfs-data/` (or
-  delete it to start from an empty store, since the store-qualify one-shot is
-  idempotent either way), and bring the stack back up; the endpoint, bucket
-  name and development credentials are unchanged, so nothing else in a local
-  configuration moves. `make minio` and `make minio-down` are now `make
-  rustfs` and `make rustfs-down`, `deploy/docker-compose/minio.yml` is
+  files, and bring the stack back up. RustFS starts from an empty
+  `rustfs-data/`, and nothing here establishes that it can read a MinIO data
+  directory, so treat `minio-data/` as local development data to delete rather
+  than to rename; the store-qualify one-shot qualifies the fresh bucket. The
+  endpoint, bucket name and development credentials are unchanged, so nothing
+  else in a local configuration moves. `make minio` and `make minio-down` are
+  now `make rustfs` and `make rustfs-down`, `deploy/docker-compose/minio.yml` is
   `deploy/docker-compose/rustfs.yml`, `deploy/k8s/minio.yaml` is
   `deploy/k8s/rustfs.yaml`, and `RAVEL_FAKE_S3_BACKEND=minio` is
   `RAVEL_FAKE_S3_BACKEND=rustfs`. The `RAVEL_MINIO_*` variables that gate the
