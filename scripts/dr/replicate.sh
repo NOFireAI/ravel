@@ -141,7 +141,7 @@ dr_log "mirroring ${DR_BUCKET_PRIMARY} into ${DR_BUCKET_REPLICA}"
 # The qualification scratch prefix is excluded for the same reason it is
 # dropped from every count: a probe fixture left behind by `store qualify` is
 # tooling output, and a restore target holding it is not a copy of the corpus.
-dr_aws s3 sync --exclude "${DR_HARNESS_PREFIX}*" \
+dr_aws s3 cp --recursive --exclude "${DR_HARNESS_PREFIX}*" \
   --exclude "${DR_QUALIFY_SCRATCH_PREFIX}*" \
   "s3://${DR_BUCKET_PRIMARY}/" "s3://${DR_BUCKET_REPLICA}/" \
   >"${DR_LOG_DIR}/replicate-mirror.log" 2>&1

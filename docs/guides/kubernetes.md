@@ -98,8 +98,8 @@ crate. That test runs the full object-store contract suite plus the mandatory
 capability and multipart probes against a real floci in CI. RustFS is the named
 fallback: if a floci
 release ever stops satisfying that contract, `RAVEL_FAKE_S3_BACKEND=rustfs`
-switches the whole environment to the backend this repository has proven
-longest. Ravel maintains both manifests regardless of which one is the default.
+switches the whole environment to the backend the object-store-contract CI
+job runs the full contract suite against on every change. Ravel maintains both manifests regardless of which one is the default.
 
 Neither is suitable for anything but development. There is no persistent
 volume, so the bucket lives in the pod's ephemeral filesystem and is gone when

@@ -570,8 +570,10 @@ dr_delete_all_versions() {
     --output text)" || return 1
   while IFS=$'\t' read -r key version_id; do
     [[ -n "${key}" && "${key}" != "None" ]] || continue
+    # </dev/null: dr_aws's container path runs docker run --interactive, which
+    # would otherwise drain this loop's own here-string after the first key.
     dr_aws s3api delete-object --bucket "${bucket}" --key "${key}" \
-      --version-id "${version_id}" >/dev/null || return 1
+      --version-id "${version_id}" >/dev/null </dev/null || return 1
   done <<<"${listing}"
 }
 
