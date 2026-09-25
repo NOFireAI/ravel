@@ -333,42 +333,59 @@ check "credentials: an unset secret key is refused" \
     DR_SECRET_KEY=""
     dr_require_credentials' _ "${DR_LIB_PATH}")"
 
-# --- finding 2: the mc credential path carries a session token -------------
+# --- finding 2: the client credential path carries a session token ---------
 #
-# A secret access key routinely contains `/` and `+`. An unencoded `/` in the
-# userinfo truncates the host, so the URL names a different endpoint with no
-# error to read, and an STS credential with no session-token component 403s on
-# every mc call while the ravel binaries (which get the token through
-# RAVEL_S3_SESSION_TOKEN) succeed.
+# The AWS CLI receives its credentials through the environment and never in
+# argv, and an EMPTY AWS_SESSION_TOKEN is not the same as an absent one: the
+# signer then sends an empty x-amz-security-token and every call 403s while
+# the ravel binaries (which get the token through RAVEL_S3_SESSION_TOKEN)
+# succeed.
 
-check "credentials: a secret containing a slash is percent-encoded" \
-  "a%2Fb%2Bc%3Dd" "$(dr_urlencode 'a/b+c=d')"
-check "credentials: an unreserved value is left alone" \
-  "Abc-123._~" "$(dr_urlencode 'Abc-123._~')"
-check "credentials: the host URL carries a session token when one is set" \
-  "http://key:sec%2Fret:tok%2Fen@127.0.0.1:9000" \
-  "$(DR_MC_HOST_URL="" DR_ENDPOINT="http://127.0.0.1:9000" DR_ACCESS_KEY="key" \
-    DR_SECRET_KEY="sec/ret" DR_SESSION_TOKEN="tok/en" dr_mc_host_url)"
-check "credentials: with no session token the URL has two components" \
-  "http://key:sec%2Fret@127.0.0.1:9000" \
-  "$(DR_MC_HOST_URL="" DR_ENDPOINT="http://127.0.0.1:9000" DR_ACCESS_KEY="key" \
-    DR_SECRET_KEY="sec/ret" DR_SESSION_TOKEN="" dr_mc_host_url)"
-check "credentials: no endpoint means the regional S3 host" \
-  "https://key:sec@s3.eu-west-2.amazonaws.com" \
-  "$(DR_MC_HOST_URL="" DR_ENDPOINT="" DR_REGION="eu-west-2" DR_ACCESS_KEY="key" \
-    DR_SECRET_KEY="sec" DR_SESSION_TOKEN="" dr_mc_host_url)"
-check "credentials: a session token with a token-less DR_MC_HOST_URL is refused" \
-  "64" "$(rc_sub bash -c '
-    source "$1"
-    DR_SESSION_TOKEN="tok"
-    DR_MC_HOST_URL="https://key:secret@s3.amazonaws.com"
-    dr_assert_mc_can_carry_session_token' _ "${DR_LIB_PATH}")"
-check "credentials: a session token with a three-component URL is accepted" \
-  "0" "$(rc_sub bash -c '
-    source "$1"
-    DR_SESSION_TOKEN="tok"
-    DR_MC_HOST_URL="https://key:secret:tok@s3.amazonaws.com"
-    dr_assert_mc_can_carry_session_token' _ "${DR_LIB_PATH}")"
+# A stub client that reports its own argv and the credential variables that
+# reached it, so dr_aws is observable without a network call.
+AWS_STUB="$(mktemp)"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'printf "argv=%%s\\n" "$*"\n'
+  printf 'printf "token=%%s\\n" "${AWS_SESSION_TOKEN-<unset>}"\n'
+  printf 'printf "key=%%s\\n" "${AWS_ACCESS_KEY_ID-<unset>}"\n'
+  printf 'printf "region=%%s\\n" "${AWS_DEFAULT_REGION-<unset>}"\n'
+} >"${AWS_STUB}"
+chmod +x "${AWS_STUB}"
+
+# $1 endpoint, $2 region, $3 session token, $4 the field to read back.
+aws_probe() {
+  DR_AWS="${AWS_STUB}" DR_ENDPOINT="$1" DR_REGION="$2" DR_ACCESS_KEY="key" \
+    DR_SECRET_KEY="sec/ret" DR_SESSION_TOKEN="$3" \
+    dr_aws s3api list-buckets \
+    | awk -F= -v field="$4" '$1 == field { print $2 }'
+}
+
+check "credentials: a session token reaches the client when one is set" \
+  "tok/en" "$(aws_probe "http://127.0.0.1:9000" us-east-1 "tok/en" token)"
+check "credentials: with no session token the variable is unset, not empty" \
+  "<unset>" "$(aws_probe "http://127.0.0.1:9000" us-east-1 "" token)"
+check "credentials: the access key travels in the environment, not in argv" \
+  "key" "$(aws_probe "http://127.0.0.1:9000" us-east-1 "" key)"
+check "credentials: an endpoint override is passed to the client" \
+  "--endpoint-url http://127.0.0.1:9000 s3api list-buckets" \
+  "$(aws_probe "http://127.0.0.1:9000" us-east-1 "" argv)"
+check "credentials: an empty endpoint passes no override at all" \
+  "s3api list-buckets" "$(aws_probe "" eu-west-2 "" argv)"
+check "credentials: the region reaches the client" \
+  "eu-west-2" "$(aws_probe "" eu-west-2 "" region)"
+rm -f "${AWS_STUB}"
+
+# Every listing in the harness reads a `--output text` list query, which prints
+# its values tab separated, one line per response page, and the literal `None`
+# for a page that matched nothing. A split that kept either shape would count
+# a whole page as one key, or an empty bucket as one.
+check "listing: a tab-separated page becomes one key per line" \
+  "t/a
+t/b
+t/c" "$(dr_text_list_lines "$(printf 't/a\tt/b\nt/c\n')")"
+check "listing: a page that matched nothing contributes no key" \
+  "" "$(dr_text_list_lines "None")"
 
 # --- finding 6: the marker must post-date the restore it belongs to --------
 #
@@ -448,11 +465,8 @@ reset_probe() {
     DR_LOG_DIR="$(mktemp -d)"
     dr_bucket_marker_present() { return 0; }
     dr_write_bucket_marker() { return 0; }
-    # Records every delete the pass issues, so a case can assert none ran.
-    dr_mc() {
-      if [[ "${1:-}" == "rm" ]]; then printf 'rm\n' >>"${delete_log}"; fi
-      return 0
-    }
+    # Records every delete pass the reset issues, so a case can assert none ran.
+    dr_delete_all_versions() { printf 'delete\n' >>"${delete_log}"; return 0; }
     # Each command substitution is its own subshell, so the call count lives
     # in a file; a variable would reset on every call.
     dr_list_all_versions() {
@@ -484,12 +498,14 @@ check "reset: a failed listing after the delete refuses rather than proving empt
 # The reset's before and after counts go through the same exclusion as every
 # other count, so a bucket whose only remaining keys are the harness marker and
 # a qualification run's probe fixtures is PROVEN EMPTY rather than reported as
-# still holding objects. Both stubs below leave the real dr_list_all_versions
-# and dr_strip_noncorpus_keys in the path and stub only the mc call under them,
-# which is what makes this a test of the proof and not of a fake listing.
+# still holding objects. Both stubs below leave the real dr_list_all_versions,
+# dr_delete_all_versions and dr_strip_noncorpus_keys in the path and stub only
+# the client call under them, which is what makes this a test of the proof and
+# not of a fake listing.
 
 # Runs dr_reset_bucket against a bucket whose every listing returns $1 (one key
-# per line, as `mc ls` prints them) and prints "<exit code>:<delete commands>".
+# per line, as the text output prints them) and prints
+# "<exit code>:<delete-object calls>".
 reset_residue_probe() {
   local residue="$1" delete_log
   delete_log="$(mktemp)"
@@ -498,10 +514,10 @@ reset_residue_probe() {
     DR_LOG_DIR="$(mktemp -d)"
     dr_bucket_marker_present() { return 0; }
     dr_write_bucket_marker() { return 0; }
-    dr_mc() {
-      case "${1:-}" in
-        rm) printf 'rm\n' >>"${delete_log}" ;;
-        ls) printf '%s\n' "${residue}" ;;
+    dr_aws() {
+      case "${2:-}" in
+        delete-object) printf 'rm\n' >>"${delete_log}" ;;
+        list-object-versions | list-objects-v2) printf '%s\n' "${residue}" ;;
       esac
       return 0
     }
@@ -513,7 +529,7 @@ reset_residue_probe() {
 
 # shellcheck disable=SC2031  # read in the parent; the probe's subshell only stubs
 check "reset: a bucket holding only qualification probe keys is proven empty" \
-  "0:1" "$(reset_residue_probe \
+  "0:3" "$(reset_residue_probe \
     "sys/qualify/019265f4-0000-7000-8000-000000000001/list/key-0000
 sys/qualify/019265f4-0000-7000-8000-000000000001/order/a
 ${DR_BUCKET_MARKER_KEY}")"
@@ -522,7 +538,7 @@ ${DR_BUCKET_MARKER_KEY}")"
 # not because the emptiness check stopped looking.
 # shellcheck disable=SC2031
 check "reset: a corpus key surviving the delete still refuses" \
-  "${DR_EX_PRECONDITION}:1" "$(reset_residue_probe \
+  "${DR_EX_PRECONDITION}:2" "$(reset_residue_probe \
     "sys/qualify/019265f4-0000-7000-8000-000000000001/list/key-0000
 t/${TH}/m/l0/0000/${W}.7.00000000000000000001.aaaaaaaaaaaaaaaa.rseg")"
 
@@ -532,7 +548,7 @@ printf '\nlib.test.sh: %s passed, %s failed\n' "${PASSED}" "${FAILED}"
 if [[ "${FAILED}" -ne 0 ]]; then
   exit 1
 fi
-if [[ "${PASSED}" -lt 74 ]]; then
+if [[ "${PASSED}" -lt 75 ]]; then
   printf 'lib.test.sh: only %s cases ran; a suite that shrank silently is not a pass\n' \
     "${PASSED}" >&2
   exit 1

@@ -103,8 +103,8 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   exit 0
 fi
 
-dr_mc_available || dr_die "${DR_EX_PRECONDITION}" \
-  "no mc binary and no docker: cannot reach the object store"
+dr_aws_available || dr_die "${DR_EX_PRECONDITION}" \
+  "no aws binary and no docker: cannot reach the object store"
 
 expect_total="$(dr_expect DR_EXPECT_TOTAL_OBJECTS)"
 expect_data="$(dr_expect DR_EXPECT_DATA_OBJECTS)"
@@ -141,9 +141,9 @@ dr_log "mirroring ${DR_BUCKET_PRIMARY} into ${DR_BUCKET_REPLICA}"
 # The qualification scratch prefix is excluded for the same reason it is
 # dropped from every count: a probe fixture left behind by `store qualify` is
 # tooling output, and a restore target holding it is not a copy of the corpus.
-dr_mc mirror --overwrite --exclude "${DR_HARNESS_PREFIX}*" \
+dr_aws s3 sync --exclude "${DR_HARNESS_PREFIX}*" \
   --exclude "${DR_QUALIFY_SCRATCH_PREFIX}*" \
-  "dr/${DR_BUCKET_PRIMARY}/" "dr/${DR_BUCKET_REPLICA}/" \
+  "s3://${DR_BUCKET_PRIMARY}/" "s3://${DR_BUCKET_REPLICA}/" \
   >"${DR_LOG_DIR}/replicate-mirror.log" 2>&1
 
 source_keys="$(dr_list_keys "${DR_BUCKET_PRIMARY}")" || dr_die "${DR_EX_PRECONDITION}" \

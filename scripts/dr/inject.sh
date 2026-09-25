@@ -155,8 +155,8 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   exit 0
 fi
 
-dr_mc_available || dr_die "${DR_EX_PRECONDITION}" \
-  "no mc binary and no docker: cannot reach the object store"
+dr_aws_available || dr_die "${DR_EX_PRECONDITION}" \
+  "no aws binary and no docker: cannot reach the object store"
 
 keys="$(dr_list_keys "${DR_BUCKET_REPLICA}")" || dr_die "${DR_EX_PRECONDITION}" \
   "could not list ${DR_BUCKET_REPLICA}"
@@ -218,7 +218,8 @@ case "${FAULT}" in
     forged_identity="${writer}.${epoch}.${new_seq}"
     forged="${prefix}/${forged_identity}.cmt"
     dr_log "copying ${victim} to ${forged} (no data object behind it)"
-    dr_mc cp "dr/${DR_BUCKET_REPLICA}/${victim}" "dr/${DR_BUCKET_REPLICA}/${forged}" \
+    dr_aws s3 cp "s3://${DR_BUCKET_REPLICA}/${victim}" \
+      "s3://${DR_BUCKET_REPLICA}/${forged}" \
       >"${DR_LOG_DIR}/inject-${FAULT}.log" 2>&1
     injected_keys="${forged}"
     # custody-manifest prints the identities it could not pair to a data
@@ -238,8 +239,8 @@ case "${FAULT}" in
       "bucket ${DR_BUCKET_REPLICA} holds ${before_data} L0 data object(s), not the ${expect_data} that were replicated; injecting here would predict the wrong figure"
     dr_log "deleting ${victim} and its record ${paired}"
     {
-      dr_mc rm "dr/${DR_BUCKET_REPLICA}/${victim}"
-      dr_mc rm "dr/${DR_BUCKET_REPLICA}/${paired}"
+      dr_aws s3api delete-object --bucket "${DR_BUCKET_REPLICA}" --key "${victim}"
+      dr_aws s3api delete-object --bucket "${DR_BUCKET_REPLICA}" --key "${paired}"
     } >"${DR_LOG_DIR}/inject-${FAULT}.log" 2>&1
     injected_keys="${victim} ${paired}"
     # The object cannot be named by the phase that misses it (it is gone), so
@@ -256,7 +257,7 @@ case "${FAULT}" in
       "no commit record paired with ${victim}; bucket B was already inconsistent"
     dr_log "overwriting the body of ${victim} in place (key and record intact)"
     printf 'dr-rehearsal injected corruption: this object no longer parses as an RSEG\n' \
-      | dr_mc pipe "dr/${DR_BUCKET_REPLICA}/${victim}" \
+      | dr_aws s3 cp - "s3://${DR_BUCKET_REPLICA}/${victim}" \
         >"${DR_LOG_DIR}/inject-${FAULT}.log" 2>&1
     injected_keys="${victim}"
     # canary-query runs `maintain verify-custody` first, which prints
