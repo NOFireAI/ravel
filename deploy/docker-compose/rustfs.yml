@@ -9,6 +9,11 @@ services:
     # required argument. The console port serves nothing until
     # --console-enable is passed; with it, the UI is at /rustfs/console/.
     command: ["--console-enable", "--console-address", ":9001", "/data"]
+    # The image runs as uid 10001, and on a Linux host the bind-mounted
+    # rustfs-data/ below is created root-owned, so RustFS cannot write its
+    # disk there. Root in this dev-only container keeps the bind mount
+    # working the way it did for MinIO, which ran as root.
+    user: "0:0"
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -34,8 +39,11 @@ services:
     # command needs an explicit shell.
     entrypoint: >
       /bin/sh -c "
+      i=0;
       until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
-      echo 'waiting for rustfs'; sleep 1;
+        i=$$((i + 1));
+        if [ $$i -ge 120 ]; then echo 'rustfs did not answer a signed call in 120 s'; exit 1; fi;
+        echo 'waiting for rustfs'; sleep 1;
       done &&
       { aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ravel-dev ||
         aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ravel-dev; } &&
