@@ -162,13 +162,13 @@ pub struct S3Spec {
     pub region: String,
 
     /// Custom endpoint (`--s3-endpoint`) for S3-compatible backends such as
-    /// MinIO or floci. Omit for real AWS S3.
+    /// RustFS or floci. Omit for real AWS S3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 
     /// Accept a plaintext `http://` `endpoint` whose host is not loopback
     /// (`--s3-allow-http`). A pod never reaches its object store over
-    /// loopback, so an in-cluster MinIO or floci addressed by Service name
+    /// loopback, so an in-cluster RustFS or floci addressed by Service name
     /// needs this. Without it the operator refuses to render the cluster at
     /// all: the `RavelCluster` gets a `Degraded` condition with reason
     /// `PlaintextS3Endpoint` naming this field, and no Deployment, Service, or
@@ -759,7 +759,7 @@ pub struct ResourceRequirementsSpec {
 }
 
 /// Default gateway request when `spec.gateway.resources` is omitted (#1726).
-/// Sized to keep the `kind` dev lane -- three tiers plus MinIO and floci on
+/// Sized to keep the `kind` dev lane -- three tiers plus RustFS and floci on
 /// one node -- schedulable without every operator having to size it by hand.
 pub const GATEWAY_DEFAULT_CPU_REQUEST: &str = "100m";
 /// Companion to [`GATEWAY_DEFAULT_CPU_REQUEST`].

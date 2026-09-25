@@ -13,7 +13,7 @@
 #     partial object. Commit tokens are opaque base64, so there is no "one
 #     past the last ack" token to probe for; see the note in lib.sh.
 #
-# This is the exit criterion's "kill -9 mid-flush against MinIO with no
+# This is the exit criterion's "kill -9 mid-flush against RustFS with no
 # strict-ack violation" row (ADR-0077 section 4).
 #
 # MID-FLUSH TRIGGER (named explicitly, per the task): the counter
@@ -24,9 +24,10 @@
 # it rises, landing the kill inside the flush window.
 #
 # --check / --dry-run validates structure and dependencies WITHOUT starting
-# MinIO, driving load, or issuing a real kill. That is the only proof
-# available in an environment with no MinIO; a real end-to-end run is the
-# orchestrator's job (executors have no MinIO -- ADR-0077 section 4).
+# RustFS, driving load, or issuing a real kill. That is the only proof
+# available in an environment with no object store; a real end-to-end run is
+# the orchestrator's job (executors have no object store -- ADR-0077
+# section 4).
 #
 # Gate-shell discipline: see scripts/chaos/lib.sh header.
 set -euo pipefail
@@ -53,11 +54,11 @@ usage() {
 Usage: kill-ingest-flush.sh [--check|--dry-run] [--help]
 
   --check, --dry-run   Validate structure and dependencies only. Does NOT
-                       start MinIO, drive load, or issue a real kill -9.
+                       start RustFS, drive load, or issue a real kill -9.
   --help               Show this help.
 
-With no flag, runs the full scenario against a real MinIO (orchestrator-only;
-executors have no MinIO and must use --check).
+With no flag, runs the full scenario against a real RustFS (orchestrator-only;
+executors have no object store and must use --check).
 EOF
 }
 
@@ -79,7 +80,7 @@ if [[ "$MODE" == "check" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Real run (orchestrator, with MinIO). Executors must not reach here.
+# Real run (orchestrator, with RustFS). Executors must not reach here.
 # ---------------------------------------------------------------------------
 
 SERVER_PID=""
@@ -92,7 +93,7 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
   fi
   rm -f "$SERVER_LOG" "$FIXTURE_PATH"
-  minio_down
+  rustfs_down
 }
 trap cleanup EXIT
 
@@ -115,8 +116,8 @@ server_reachable() {
     "${BASE_URL}/api/v1/query?query=up" >/dev/null 2>&1
 }
 
-log "bringing up MinIO and qualifying the store"
-minio_up
+log "bringing up RustFS and qualifying the store"
+rustfs_up
 
 log "generating OTLP fixture"
 cargo run --quiet -p ravel-server --example gen_otlp_fixture > "$FIXTURE_PATH"

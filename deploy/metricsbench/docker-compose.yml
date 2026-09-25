@@ -24,11 +24,12 @@
 # DURABILITY AND STORAGE ARCHITECTURE differ per system and are NOT
 # interchangeable. Prometheus and VictoriaMetrics here persist to a local-disk
 # TSDB. Mimir is object-storage-native and writes its blocks to S3 (backed by
-# MinIO in this stack). Per ADR-0927 decision 10 (ADR-0075 decision 3), MinIO
-# removes per-request fees and is therefore valid ONLY for correctness and CI,
-# never for a publishable performance or cost claim. A local-disk or MinIO
-# result here is never an S3-equivalent result; each service block below states
-# its own durability so the distinction is readable without the ADR open.
+# RustFS in this stack). Per ADR-0927 decision 10 (ADR-0075 decision 3), a
+# local S3-compatible store removes per-request fees and is therefore valid
+# ONLY for correctness and CI, never for a publishable performance or cost
+# claim. A local-disk or RustFS result here is never an S3-equivalent result;
+# each service block below states its own durability so the distinction is
+# readable without the ADR open.
 #
 # SECURITY: every credential here is a fixed local-development value and every
 # published port binds loopback (127.0.0.1) only. Nothing here is for a
@@ -124,24 +125,25 @@ services:
           memory: 4g
 
   # --- Object storage for the object-storage-native comparator -----------
-  # MinIO backing Mimir's S3 blocks storage. NOTE (ADR-0927 decision 10): MinIO
-  # is local-disk-backed and free of per-request fees, so any Mimir figure taken
-  # against this MinIO is a correctness/functional result, NOT a publishable
-  # cost or performance result. A real-S3 substrate is required for that, exactly
-  # as Ravel's own publishable lane requires real S3.
-  # quay.io rather than Docker Hub: rationale in deploy/README.md. The
-  # digest is content-addressed and identical on quay.io, so the pin below is
-  # preserved, not weakened.
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
-    command: server /data --console-address ":9001"
+  # RustFS backing Mimir's S3 blocks storage. NOTE (ADR-0927 decision 10):
+  # RustFS is local-disk-backed and free of per-request fees, so any Mimir
+  # figure taken against it is a correctness/functional result, NOT a
+  # publishable cost or performance result. A real-S3 substrate is required for
+  # that, exactly as Ravel's own publishable lane requires real S3.
+  # ghcr.io rather than Docker Hub: rationale in deploy/README.md.
+  rustfs:
+    image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    # `server` is the default subcommand, so the whole command line is the
+    # data directory. The console listens on 9001 regardless; publishing it
+    # keeps the previous stack's browsable view of the blocks bucket.
+    command: /data
     ports:
       - "127.0.0.1:9101:9001"
     environment:
-      MINIO_ROOT_USER: mimir
-      MINIO_ROOT_PASSWORD: mimir-dev-secret
+      RUSTFS_ACCESS_KEY: mimir
+      RUSTFS_SECRET_KEY: mimir-dev-secret
     volumes:
-      - minio-data:/data
+      - rustfs-data:/data
     deploy:
       resources:
         limits:
@@ -149,18 +151,26 @@ services:
           memory: 2g
 
   createbuckets:
-    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952
-    depends_on: [minio]
+    image: public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
+    depends_on: [rustfs]
+    environment:
+      AWS_ACCESS_KEY_ID: mimir
+      AWS_SECRET_ACCESS_KEY: mimir-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
     # Mimir's `all` target opens blocks, ruler and alertmanager storage; create
-    # all three buckets so a fresh MinIO does not stall Mimir startup. The
+    # all three buckets so a fresh store does not stall Mimir startup. The
     # until-loop is the readiness wait: this one-shot exits 0 only once the
-    # buckets exist, which mimir depends_on below.
+    # buckets exist, which mimir depends_on below. create-bucket is idempotent
+    # against RustFS, so a rerun on an existing volume still exits 0.
     entrypoint: >
       /bin/sh -c "
-      until mc alias set local http://minio:9000 mimir mimir-dev-secret; do
-        echo 'waiting for minio'; sleep 1;
+      until aws --endpoint-url http://rustfs:9000 s3api list-buckets; do
+        echo 'waiting for rustfs'; sleep 1;
       done &&
-      mc mb -p local/mimir-blocks local/mimir-ruler local/mimir-alertmanager"
+      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket mimir-blocks &&
+      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket mimir-ruler &&
+      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket mimir-alertmanager"
 
   # --- Mimir (object-storage-native PromQL system) -----------------------
   # Grafana Mimir in monolithic mode (-target=all): a single process running the
@@ -171,7 +181,7 @@ services:
   # DURABILITY AND STORAGE ARCHITECTURE: the distributor accepts Remote Write at
   # /api/v1/push; the ingester holds recent samples in an in-memory head with a
   # local write-ahead log, then the compactor ships compacted TSDB blocks to S3
-  # (MinIO here). So an ack is a local-WAL guarantee and the S3 copy appears
+  # (RustFS here). So an ack is a local-WAL guarantee and the S3 copy appears
   # LATER, after block upload. This ack-vs-object-storage-visibility gap is a
   # material difference from Ravel's strict-mode Remote Write, where a 2xx means
   # the data object and commit record are already durable in object storage
@@ -205,5 +215,5 @@ services:
 volumes:
   prometheus-data:
   victoriametrics-data:
-  minio-data:
+  rustfs-data:
   mimir-data:

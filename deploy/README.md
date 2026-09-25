@@ -93,7 +93,7 @@ draw data in your deployment: a name that renders here may still carry no
 series for a label combination a panel splits on, or for a family behind a
 setting your processes leave off.
 
-## Why MinIO and the OpenTelemetry Collector are not pulled from Docker Hub
+## Why the object store and the OpenTelemetry Collector are not pulled from Docker Hub
 
 Docker Hub's anonymous pull allowance is per source IP and shared across
 every project on a runner. A public image still fails to pull with "pull
@@ -101,38 +101,44 @@ access denied ... may require 'docker login'" once that shared allowance is
 exhausted, which reads like a permissions problem rather than a rate limit.
 
 Where an anonymous mirror exists on another registry, this directory pulls
-from there instead: MinIO's images from `quay.io/minio/...`, and the
-OpenTelemetry Collector from
-`ghcr.io/open-telemetry/opentelemetry-collector-releases/...`. Neither
-registry shares Docker Hub's allowance. Every file that does this points
-back to this note with a one-line comment instead of repeating the
+from there instead: the object store from `ghcr.io/rustfs/rustfs`, its
+client from `public.ecr.aws/aws-cli/aws-cli`, and the OpenTelemetry Collector
+from `ghcr.io/open-telemetry/opentelemetry-collector-releases/...`. None of
+those registries shares Docker Hub's allowance. Every file that does this
+points back to this note with a one-line comment instead of repeating the
 rationale.
+
+The object store used to be MinIO on quay.io. MinIO withdrew anonymous
+access to its public images on 2026-09-24, from Docker Hub and quay.io
+alike, so a mirror is no longer the fix: the images cannot be pulled without
+credentials at all. RustFS replaced it, and the `mc` client was replaced by
+the AWS CLI at the same time.
 
 An image left on Docker Hub in this directory (for example `grafana/grafana`
 in `docker-compose/ravel.yml`) carries its own comment naming the other
 registries checked and why none of them had a usable copy.
 
-## Pinned image digests (docker-compose/ravel.yml and docker-compose/minio.yml)
+## Pinned image digests (docker-compose/ravel.yml and docker-compose/rustfs.yml)
 
 Every third-party image in the two quickstart compose files is pinned to a
 release tag plus an immutable `@sha256:` manifest digest (issue #1720), the
-same convention `deploy/metricsbench/` uses. `docker-compose/minio.yml` is
-`docker-compose/ravel.yml`'s standalone MinIO-and-bucket mirror (same
-credentials, same `ravel-dev` bucket), so it carries the identical MinIO
-pins. The MinIO pair reuses the exact pins already resolved for
+same convention `deploy/metricsbench/` uses. `docker-compose/rustfs.yml` is
+`docker-compose/ravel.yml`'s standalone object-store-and-bucket mirror (same
+credentials, same `ravel-dev` bucket), so it carries the identical RustFS
+pins. The RustFS and AWS CLI pair reuses the exact pins already resolved for
 `deploy/metricsbench/docker-compose.yml`; see that directory's README for
 the resolution recipe per registry.
 
 | Image | Registry | Tag | Digest |
 |---|---|---|---|
-| `minio/minio` | quay.io | `RELEASE.2025-04-08T15-41-24Z` | `sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b` |
-| `minio/mc` | quay.io | `RELEASE.2025-04-08T15-39-49Z` | `sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952` |
+| `rustfs/rustfs` | ghcr.io | `1.0.0` | `sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff` |
+| `aws-cli/aws-cli` | public.ecr.aws | `2.37.2` | `sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed` |
 | `open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib` | ghcr.io | `0.160.0` | `sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6` |
 | `grafana/grafana` | docker.io | `13.2.2` | `sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0` |
 
 `deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh` enforces
 this: every `image:` line in `docker-compose/ravel.yml` and
-`docker-compose/minio.yml`, except the two `${RAVEL_IMAGE:-...}` references
+`docker-compose/rustfs.yml`, except the two `${RAVEL_IMAGE:-...}` references
 in `ravel.yml`, must carry a digest, checked in CI's `doc-scripts` job.
 `deploy/k8s`'s four registry images carry digests too, checked by the same
 job. The two locally built placeholders there (`ravel-server`,
