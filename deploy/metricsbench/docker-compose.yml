@@ -133,10 +133,11 @@ services:
   # ghcr.io rather than Docker Hub: rationale in deploy/README.md.
   rustfs:
     image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
-    # `server` is the default subcommand, so the whole command line is the
-    # data directory. The console listens on 9001 regardless; publishing it
-    # keeps the previous stack's browsable view of the blocks bucket.
-    command: /data
+    # `server` is the default subcommand, so the command line is the data
+    # directory plus the console flags; the console serves nothing until
+    # --console-enable is passed. Publishing it keeps the previous stack's
+    # browsable view of the blocks bucket.
+    command: ["--console-enable", "--console-address", ":9001", "/data"]
     ports:
       - "127.0.0.1:9101:9001"
     environment:
@@ -161,16 +162,18 @@ services:
     # Mimir's `all` target opens blocks, ruler and alertmanager storage; create
     # all three buckets so a fresh store does not stall Mimir startup. The
     # until-loop is the readiness wait: this one-shot exits 0 only once the
-    # buckets exist, which mimir depends_on below. create-bucket is idempotent
-    # against RustFS, so a rerun on an existing volume still exits 0.
+    # buckets exist, which mimir depends_on below. Each bucket is created only
+    # if head-bucket does not find it, so a rerun on the kept rustfs-data
+    # volume still exits 0 whatever RustFS answers to a repeated CreateBucket.
     entrypoint: >
       /bin/sh -c "
       until aws --endpoint-url http://rustfs:9000 s3api list-buckets; do
         echo 'waiting for rustfs'; sleep 1;
       done &&
-      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket mimir-blocks &&
-      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket mimir-ruler &&
-      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket mimir-alertmanager"
+      for b in mimir-blocks mimir-ruler mimir-alertmanager; do
+        aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket $$b ||
+        aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket $$b || exit 1;
+      done"
 
   # --- Mimir (object-storage-native PromQL system) -----------------------
   # Grafana Mimir in monolithic mode (-target=all): a single process running the
