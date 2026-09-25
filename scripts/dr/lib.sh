@@ -439,10 +439,10 @@ dr_aws() {
       passthrough+=(-e AWS_SESSION_TOKEN)
     fi
     if [[ -n "${DR_AWS}" ]] || dr_have_command aws; then
-      exec "${DR_AWS:-aws}" "${args[@]}" "$@"
+      exec "${DR_AWS:-aws}" ${args[@]+"${args[@]}"} "$@"
     fi
     exec docker run --rm --interactive --network host \
-      "${passthrough[@]}" "${DR_AWS_CLI_IMAGE}" "${args[@]}" "$@"
+      "${passthrough[@]}" "${DR_AWS_CLI_IMAGE}" ${args[@]+"${args[@]}"} "$@"
   )
 }
 
