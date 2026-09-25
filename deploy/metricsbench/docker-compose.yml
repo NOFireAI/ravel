@@ -167,7 +167,7 @@ services:
     # volume still exits 0 whatever RustFS answers to a repeated CreateBucket.
     entrypoint: >
       /bin/sh -c "
-      until aws --endpoint-url http://rustfs:9000 s3api list-buckets; do
+      until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
         echo 'waiting for rustfs'; sleep 1;
       done &&
       for b in mimir-blocks mimir-ruler mimir-alertmanager; do

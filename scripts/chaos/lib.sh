@@ -162,17 +162,15 @@ print_oracle_summary() {
 # any absent real-run dependency fail the check.
 CHAOS_REAL_RUN_TOOLS=(curl docker jq)
 
-# The S3 client is looked up as either `aws` on PATH or the AWS CLI container
-# image used by scripts/demo.sh; check_dependencies reports which was found.
+# The S3 client is always the pinned AWS CLI container image scripts/demo.sh
+# also uses, so check_dependencies only needs docker.
 chaos_have_command() {
   command -v "$1" >/dev/null 2>&1
 }
 
 # Report whether an S3 client is reachable, without starting anything.
 chaos_s3_client_available() {
-  if chaos_have_command aws; then
-    return 0
-  fi
+  # chaos_aws always runs the pinned AWS CLI image, so docker is the only path.
   if chaos_have_command docker; then
     # demo.sh drives the AWS CLI via `docker run`; docker presence is the gate
     # for that path. We do not pull the image here (that would touch the
@@ -249,7 +247,7 @@ check_dependencies() {
   done
 
   if chaos_s3_client_available; then
-    echo "  OK    S3 client path available (aws or docker)"
+    echo "  OK    S3 client path available (docker)"
   else
     echo "  WARN  no S3 client (aws) and no docker: a real run cannot manage the store"
     warnings=$(( warnings + 1 ))

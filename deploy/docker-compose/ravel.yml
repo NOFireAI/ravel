@@ -53,7 +53,9 @@ services:
       until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do
         echo 'waiting for rustfs'; sleep 1;
       done &&
-      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ravel-dev || true"
+      { aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ravel-dev ||
+        aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ravel-dev; } &&
+      aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ravel-dev"
 
   # Store qualification (ADR-0050 section 6): ravel-server refuses to start on a
   # non-Memory store until `sys/qualification` is present, and there is

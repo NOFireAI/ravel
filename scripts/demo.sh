@@ -77,9 +77,9 @@ else
 fi
 
 log "ensuring bucket ${RAVEL_S3_BUCKET} exists"
-# create-bucket is idempotent against RustFS, so a rerun on an existing volume
-# still exits 0; the `|| true` covers the store being reachable but refusing
-# for some other reason, which the qualify step below then reports properly.
+# The `|| true` covers a bucket that already exists on a kept volume, and a
+# store that is reachable but refusing for another reason, which the qualify
+# step below then reports properly.
 docker run --rm --network host \
   -e "AWS_ACCESS_KEY_ID=${RAVEL_S3_ACCESS_KEY}" \
   -e "AWS_SECRET_ACCESS_KEY=${RAVEL_S3_SECRET_KEY}" \
