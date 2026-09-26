@@ -896,6 +896,37 @@ The catalog is resolved once, at one snapshot, and every object the export
 reads comes from that resolution. A compaction or a flush that lands while the
 export is running does not change what it writes.
 
+Garbage collection is the exception. The snapshot names objects; it does not
+hold them. If a GC pass deletes an object this snapshot already named -- one a
+compaction superseded shortly before the export started, say -- the export's
+GET of it fails with not-found and the whole export fails with that error. It
+does not retry and it does not skip the object, because skipping would write a
+file missing records with nothing in the output to say so. Rerun the export:
+the fresh resolve will not name the deleted object.
+
+### Memory: the window is held whole
+
+Every record in the window is decoded and held in memory before the first row
+is written, because the output is sorted by event time. Peak memory is
+proportional to the window's record count, not to the output file's batch
+size, and there is no spill to disk. Export a wide range as several narrower
+windows; the half-open bound is what makes that safe to do.
+
+### The listing window and a server with a raised ingest lag
+
+The catalog lists ingest-hour buckets from `--start` minus `max_ingest_lag`
+forward, and `export` defaults that to the same 2 hours the server defaults
+to. A deployment running `ravel-server --max-ingest-lag` above the default
+accepts records whose event time sits further behind their ingest hour than
+the default reaches back, so an export left on the default would not list the
+bucket those records landed in, and would report a clean, short result.
+
+Nothing on the bucket records what the server was configured with, so pass it:
+`--max-ingest-lag` takes the same humantime duration the server's flag does.
+`--max-flush-lifetime` is the matching override for the seal margin the
+resolve uses to skip folded history, the same flag `catalog fold` and
+`maintain compact-tenant` offer. On a default deployment neither is needed.
+
 ### Exported rows are sorted by event time
 
 Rows are written in event-time order regardless of the order the underlying
@@ -944,5 +975,10 @@ Three things to know before treating a round trip as lossless:
 
 `--shards` is the tenant's configured shard count, the same value a load of
 that tenant uses, and the tenant's durable provisioning record supplies the
-real per-hour shard generations on top of it. `--parquet` names the output
-path and overwrites it if it exists.
+real per-hour shard generations on top of it.
+
+`--parquet` names the output path and replaces it if it exists, but only once
+the export has finished. The rows go to a temporary file beside the target and
+are renamed over it after the Parquet writer closes, so an export that fails
+part-way leaves the previous file exactly as it was rather than a truncated
+one with no footer. The temporary file is removed on every failure path.

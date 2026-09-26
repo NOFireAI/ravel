@@ -25,9 +25,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carrying every record attribute no typed column covers. `--signal` has no
   default and today accepts only `logs`; `metrics` and `spans` are refused
   with the bulk-import follow-up each one waits on, because an exported file
-  no command can load back is not an export. The ingest guide's bulk-export
-  section covers the round-trip caveats, including `ts_unit` truncation and
-  the fact that `load` does not read `attrs_map_column` back.
+  no command can load back is not an export. `--parquet` is replaced only
+  once the export finishes, by renaming a temporary file written beside it,
+  so a failed export leaves an existing file untouched. `--max-ingest-lag`
+  and `--max-flush-lifetime` pass the deployment's own catalog window through
+  when it differs from the defaults. The whole window is decoded into memory
+  before the first row is written, so a wide range wants several narrower
+  exports. The ingest guide's bulk-export section covers that and the
+  round-trip caveats, including `ts_unit` truncation and the fact that `load`
+  does not read `attrs_map_column` back. Export costs `ravel-cli` a normal
+  dependency on `ravel-query`, which is what sharing the query path's
+  exclusion rules rather than copying them is worth (ADR-1751 amendment,
+  2026-09-26).
 
 ## [0.18.0] - 2026-09-26
 
