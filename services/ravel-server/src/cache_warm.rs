@@ -82,11 +82,12 @@ pub async fn warm_cache(
     cache: ReadCache,
     clock: &dyn Clock,
     get_limiter: Arc<ravel_query::GetLimiter>,
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 ) {
     let now_ns = clock.now_ns();
     match tokio::time::timeout(
         WARM_DEADLINE,
-        warm_cache_inner(store, catalog, cache, now_ns, get_limiter),
+        warm_cache_inner(store, catalog, cache, now_ns, get_limiter, memory_budget),
     )
     .await
     {
@@ -107,6 +108,7 @@ async fn warm_cache_inner(
     cache: ReadCache,
     now_ns: i64,
     get_limiter: Arc<ravel_query::GetLimiter>,
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 ) {
     let started = tokio::time::Instant::now();
     let tenants = match ravel_maintain::discover_tenants(store.as_ref()).await {
@@ -119,12 +121,17 @@ async fn warm_cache_inner(
 
     // ADR-1195: shares the process-wide `GetLimiter` rather than a private
     // pool, same as every other fetcher this process constructs.
+    // Issue #1255: a warm fetch decodes the part it reads into a buffer the
+    // pass holds until the fetch returns, so it reserves against the same
+    // process-wide `MemoryBudget` a query's fetch does.
     let metrics_fetcher = SegmentFetcher::new(store.clone())
         .with_cache(cache.clone())
-        .with_get_limiter(get_limiter.clone());
+        .with_get_limiter(get_limiter.clone())
+        .with_memory_budget(memory_budget.clone());
     let logs_fetcher = LogSegmentFetcher::new(store)
         .with_cache(cache)
-        .with_get_limiter(get_limiter);
+        .with_get_limiter(get_limiter)
+        .with_memory_budget(memory_budget);
 
     let mut total_parts_warmed: usize = 0;
     for tenant in tenants {
@@ -532,6 +539,7 @@ mod tests {
             })
             .expect("push log record");
         let bytes = writer.finish().expect("finish RLOG object");
+        let object_size = bytes.len() as u64;
 
         let content_hash = [0x5au8; 32];
         let data_key = keys::data_key(
@@ -560,7 +568,7 @@ mod tests {
             writer_id,
             writer_epoch: epoch,
             writer_seq: seq,
-            object_size: 0,
+            object_size,
             content_hash,
             sample_count: 1,
             series_count: 1,
@@ -626,6 +634,7 @@ mod tests {
             ReadCache::Ram(cache.clone()),
             &FixedClock(now),
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .await;
 
@@ -633,6 +642,46 @@ mod tests {
             !cache.is_empty(),
             "warming a tenant with a real recent metric part must populate the cache"
         );
+    }
+
+    /// Issue #1255: the warm pass reserves against the budget it is handed. A
+    /// log part's fetch reserves the whole object before its GET, so a 1-byte
+    /// budget refuses it and nothing reaches the cache, while an unlimited
+    /// budget over the same store warms it. Drop the logs fetcher's
+    /// `.with_memory_budget` call in `warm_cache_inner` and the refused pass
+    /// warms the part anyway. The fixture is logs only, so this does not cover
+    /// the metrics fetcher's call.
+    #[tokio::test]
+    async fn warm_pass_reserves_against_the_budget_it_is_handed() {
+        let memory = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let now = now_ns();
+        publish_log_segment(&memory, tenant, now).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+
+        for (limit, entries) in [(1, 0), (u64::MAX, 1)] {
+            let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+            let cache = Arc::new(Cache::new(CacheLimits::new(
+                16 * 1024 * 1024,
+                1024,
+                1024 * 1024,
+            )));
+            warm_cache(
+                store.clone(),
+                catalog_for(store.clone()),
+                ReadCache::Ram(cache.clone()),
+                &FixedClock(now),
+                Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+                budget.clone(),
+            )
+            .await;
+            assert_eq!(
+                cache.len(),
+                entries,
+                "a {limit}-byte budget: the log part is warmed only when the budget admits it"
+            );
+            assert_eq!(budget.reserved(), 0, "the pass releases what it reserved");
+        }
     }
 
     /// Issue #1233: a tenant whose only parts are ~48h old must still get
@@ -773,6 +822,7 @@ mod tests {
             ReadCache::Ram(cache.clone()),
             &FixedClock(now_ns()),
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .await;
 
@@ -803,6 +853,7 @@ mod tests {
             ReadCache::Ram(cache.clone()),
             &FixedClock(now_ns()),
             Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .await;
 
@@ -1216,6 +1267,7 @@ mod tests {
                 ReadCache::Ram(cache),
                 &FixedClock(now_ns()),
                 Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
             )
             .await;
         });
@@ -1253,6 +1305,7 @@ mod tests {
                 ReadCache::Ram(cache),
                 &FixedClock(now_ns()),
                 Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
             )
             .await;
         });

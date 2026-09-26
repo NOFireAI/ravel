@@ -622,6 +622,13 @@ pub struct FragmentService {
     /// `Unlimited` bytes: a directly-constructed service (tests, benches)
     /// honours the wire budget verbatim, as before.
     engine: ravel_query::EngineConfig,
+    /// The process-wide memory accountant (ADR-1170) every slice's
+    /// `SegmentFetcher` reserves against, wired by `lib.rs` through
+    /// [`with_memory_budget`](FragmentService::with_memory_budget) to the same
+    /// instance the PromQL engine and SQL executor use. Lives beside `engine`
+    /// outside the `Arc` for the same reason. Defaults to
+    /// `MemoryBudget::unlimited()`.
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 struct FragmentServiceInner {
@@ -684,6 +691,7 @@ impl FragmentService {
             // `with_role`.
             role: FragmentListenerRole::Combined,
             engine: ravel_query::EngineConfig::default(),
+            memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         }
     }
 
@@ -699,6 +707,22 @@ impl FragmentService {
             inner: self.inner.clone(),
             role: self.role,
             engine,
+            memory_budget: self.memory_budget.clone(),
+        }
+    }
+
+    /// Return a clone of this service whose slices' `SegmentFetcher`s reserve
+    /// against `budget`, sharing the same `FragmentServiceInner`. Called once
+    /// by `lib.rs` with the process-wide budget, before any listener or the
+    /// coordinator's no-hop local path takes a clone, so a worker's fetches
+    /// draw down that worker process's own budget (issue #1255).
+    #[must_use]
+    pub fn with_memory_budget(&self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        FragmentService {
+            inner: self.inner.clone(),
+            role: self.role,
+            engine: self.engine,
+            memory_budget: budget,
         }
     }
 
@@ -715,6 +739,7 @@ impl FragmentService {
             inner: self.inner.clone(),
             role,
             engine: self.engine,
+            memory_budget: self.memory_budget.clone(),
         }
     }
 
@@ -970,7 +995,8 @@ impl FragmentService {
             }
         };
         let mut fetcher = SegmentFetcher::new(self.inner.store.clone())
-            .with_get_limiter(self.inner.get_limiter.clone());
+            .with_get_limiter(self.inner.get_limiter.clone())
+            .with_memory_budget(self.memory_budget.clone());
         if let Some(cache) = &self.inner.cache {
             fetcher = fetcher.with_cache(cache.clone());
         }

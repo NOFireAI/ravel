@@ -2286,7 +2286,8 @@ pub async fn start(
             metrics.clone(),
             get_limiter.clone(),
         )
-        .with_engine_config(engine_config);
+        .with_engine_config(engine_config)
+        .with_memory_budget(process_memory_budget.clone());
         // When this process runs a dedicated TLS fragment listener (ADR-0071
         // amendment decision 1), its coordinator dials remote workers' TLS
         // fragment endpoints: pin the operator CA and verify the fixed
@@ -2884,6 +2885,7 @@ pub async fn start(
                 cache.clone(),
                 &SystemClock,
                 get_limiter.clone(),
+                process_memory_budget.clone(),
             )
             .await;
         }

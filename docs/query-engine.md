@@ -639,27 +639,42 @@ The fetch layer reserves the bytes a GET will materialize on a shared
 reservation for as long as the fetched buffer lives. `QueryEngine` holds one
 `Arc<MemoryBudget>` and, through `QueryEngine::with_memory_budget`, wires it to
 the two fetchers it owns: the RSEG metrics fetcher (`fetcher`) and the RLOG log
-fetcher (`log_fetcher`), exactly as it shares one `GetLimiter`. Two fetch paths
-draw on their own default budget, not this shared one, and so are not yet
-bounded by a finite process budget:
-
-- **RSPAN.** `QueryEngine` owns no span fetcher, so `with_memory_budget` reaches
-  none; each `SpanSegmentFetcher` reserves against its own
-  `MemoryBudget::unlimited()`.
-- **The SQL query path.** `build_sql_state` (`services/ravel-server/src/query.rs`)
-  constructs its metrics, logs, and span fetchers with `with_get_limiter` but
-  not `with_memory_budget`, so they reserve against their default unlimited
-  budgets too.
+fetcher (`log_fetcher`), exactly as it shares one `GetLimiter`.
 
 `QueryEngine::new` defaults to `MemoryBudget::unlimited()`. `ravel-server`
 replaces it: `build_app_state` (`services/ravel-server/src/query.rs`) calls
 `with_memory_budget` with the process-wide budget described under
 "Process-wide memory budget (ADR-1170)" below, the same `Arc<MemoryBudget>`
-instance `build_sql_state` hands to its `SqlExecutor`. So a PromQL query's RSEG
-and RLOG fetches and the SQL executor's per-tenant accountants draw down one
+instance `build_sql_state` hands to its `SqlExecutor`. `ravel-server` hands the
+same instance to two more fetch paths:
+
+- **Distributed fragments.** Under `--distributed-query`, a PromQL metrics
+  fetch runs through `FragmentService` (`services/ravel-server/src/distrib.rs`),
+  which builds one RSEG `SegmentFetcher` per slice. `start` wires the process
+  budget into that service with `FragmentService::with_memory_budget`, so a
+  slice a remote worker serves reserves against that worker process's budget,
+  and a slice the coordinator runs on its own no-hop local path reserves
+  against the coordinator's. A refusal ends the slice with a `BudgetExceeded`
+  status, which the coordinator folds back into the typed
+  `FetchMemoryExhausted`.
+- **Cache warmup.** The startup warm pass (`cache_warm::warm_cache`) builds its
+  own RSEG and RLOG fetchers and wires the process budget into both: a warm
+  fetch decodes the part it reads into a buffer held until the fetch returns,
+  so it holds memory beyond the cache insert. A refused warm fetch is skipped
+  like any other warm failure.
+
+So a PromQL query's RSEG and RLOG fetches, on the local or the distributed
+path, the warm pass, and the SQL executor's per-tenant accountants draw down one
 limit, and a PromQL fetch that needs more than what the SQL side and other
-fetches leave free is refused. The RSPAN fetcher and the SQL path's own
-fetchers listed above still reserve against their private unlimited budgets.
+fetches leave free is refused.
+
+One set of fetchers still draws on its own default budget, not this shared one,
+and so is not yet bounded by a finite process budget: the SQL query path's.
+`build_sql_state` (`services/ravel-server/src/query.rs`) constructs its RSEG
+metrics, RLOG logs, and RSPAN span fetchers with `with_get_limiter` but not
+`with_memory_budget`, so each reserves against its own
+`MemoryBudget::unlimited()`. It is the only RSPAN fetcher `ravel-server`
+builds.
 
 Reservation sites, each taken **before** its GET, with the guard's lifetime
 tied to the buffer it accounts for:
