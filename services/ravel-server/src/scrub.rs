@@ -856,15 +856,22 @@ async fn run_shard_tick(
         let exhausted = give_up && std::mem::replace(&mut first_unit, false);
         let outcome = unit_targets(store, &unit).await;
         requests = requests.saturating_add(outcome.gets);
+        // A hold starts when the marker has not been held on this position
+        // before: it moved this tick, or it has not been held since it last
+        // moved.
+        let hold_starts = cursor.held_ticks == 0;
         if outcome.retry() && !exhausted {
             // Leave the marker where it is: this unit is retried next tick.
+            if hold_starts {
+                log_unreadable_in_held_unit(tenant, signal, shard, &outcome.unreadable, &[], &[]);
+            }
             unit_held = true;
             break;
         }
         requests = requests.saturating_add(
             (outcome.targets.len() as u64).saturating_mul(SCRUB_REQUESTS_PER_OBJECT),
         );
-        let Some(verdicts) = verify_slice(
+        let verdicts = match verify_slice(
             store,
             clock,
             tenant,
@@ -875,11 +882,24 @@ async fn run_shard_tick(
             exhausted,
         )
         .await
-        else {
-            // An object read failed retryably: the whole unit, findings
-            // included, is retried next tick, so nothing is counted twice.
-            unit_held = true;
-            break;
+        {
+            Ok(verdicts) => verdicts,
+            Err(found) => {
+                // An object read failed retryably: the whole unit, findings
+                // included, is retried next tick, so nothing is counted twice.
+                if hold_starts {
+                    log_unreadable_in_held_unit(
+                        tenant,
+                        signal,
+                        shard,
+                        &outcome.unreadable,
+                        &outcome.targets,
+                        &found,
+                    );
+                }
+                unit_held = true;
+                break;
+            }
         };
         if exhausted {
             tracing::error!(
@@ -942,11 +962,12 @@ async fn run_shard_tick(
 /// Verify one unit's objects. Split out of [`run_shard_tick`] so verification
 /// runs inside the walk, where its requests are charged to the tick's budget.
 ///
-/// Returns each object's result in slice order, or `None` as soon as one
-/// object's GET fails with a retryable error: the caller then holds the marker
-/// behind the unit and the next tick verifies all of it again. When
-/// `exhausted` (the unit has used up its held ticks) every object is tried
-/// once and a retryable failure is returned in place like any other result.
+/// Returns each object's result in slice order, or, as soon as one object's
+/// GET fails with a retryable error, `Err` with the results of the objects
+/// before it: the caller then holds the marker behind the unit and the next
+/// tick verifies all of it again. When `exhausted` (the unit has used up its
+/// held ticks) every object is tried once and a retryable failure is returned
+/// in place like any other result.
 #[allow(clippy::too_many_arguments)]
 async fn verify_slice(
     store: &dyn ObjectStoreBackend,
@@ -957,7 +978,7 @@ async fn verify_slice(
     slice: &[SliceEntry],
     covering_postings: Option<ravel_maintain::CoveringPostings<'_>>,
     exhausted: bool,
-) -> Option<Vec<ScrubResult>> {
+) -> Result<Vec<ScrubResult>, Vec<ScrubResult>> {
     let mut verdicts = Vec::with_capacity(slice.len());
     for entry in slice {
         // The structural + content tiers always run (footer crc re-verify, then
@@ -985,11 +1006,43 @@ async fn verify_slice(
                 object_key = %entry.target.object_key, detail = %detail,
                 "scrub: retryable read error; unit held, retried next tick"
             );
-            return None;
+            return Err(verdicts);
         }
         verdicts.push(verdict);
     }
-    Some(verdicts)
+    Ok(verdicts)
+}
+
+/// Log what a held unit found unreadable, on the tick its hold starts. None of
+/// it is counted until the unit is consumed, and the ticks that retry the unit
+/// log none of it again, so each unreadable record or object is logged once
+/// per hold here and once more, at error, when it is counted.
+fn log_unreadable_in_held_unit(
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    records: &[UnreadableRecord],
+    slice: &[SliceEntry],
+    found: &[ScrubResult],
+) {
+    for record in records {
+        tracing::warn!(
+            tenant = %tenant.to_hex(), signal = ?signal, shard, record_key = %record.key,
+            level = record.level.as_str(), reason = record.reason.as_str(),
+            error = %record.error,
+            "scrub: record unreadable in a held unit; counted once the unit is consumed"
+        );
+    }
+    for (entry, verdict) in slice.iter().zip(found) {
+        if let ScrubResult::Unreadable { detail, reason } = verdict {
+            tracing::warn!(
+                tenant = %tenant.to_hex(), signal = ?signal, shard,
+                object_key = %entry.target.object_key, level = entry.level.as_str(),
+                reason = reason.as_str(), detail = %detail,
+                "scrub: object unreadable in a held unit; counted once the unit is consumed"
+            );
+        }
+    }
 }
 
 /// Record the anomalies among one consumed unit's verification results.
@@ -1430,6 +1483,12 @@ fn note_record_get_failure(
                     reason,
                     error: err.to_string(),
                 });
+            } else {
+                tracing::warn!(
+                    key = %key, error = %err, reason = reason.as_str(),
+                    "scrub: {what} GET failed with a non-retryable error; lineage selection \
+                     runs without it this tick"
+                );
             }
         }
     }

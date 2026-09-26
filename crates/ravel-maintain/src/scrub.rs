@@ -219,7 +219,10 @@ fn get_failure(what: &str, err: StoreError) -> ScrubResult {
 /// found or [`ScrubResult::Clean`].
 ///
 /// `clock` stamps the detection time on the operational log emitted for each
-/// anomaly; it carries no scheduling state and does not influence the verdict.
+/// corruption anomaly; it carries no scheduling state and does not influence
+/// the verdict. A [`ScrubResult::Unreadable`] or [`ScrubResult::ReadError`] is
+/// left to the caller to log: only the caller knows whether the object will
+/// be retried, and so whether a log line now would repeat on every retry.
 pub async fn scrub_one_object(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -241,10 +244,7 @@ pub async fn scrub_one_object(
     // reader error is real corruption.
     match verify_structure(store, key, signal).await {
         Ok(()) => {}
-        Err(StructuralOutcome::Read(result)) => {
-            log_unreadable(clock, key, &result);
-            return result;
-        }
+        Err(StructuralOutcome::Read(result)) => return result,
         Err(StructuralOutcome::Corrupt(detail)) => {
             tracing::warn!(
                 object_key = key,
@@ -271,11 +271,7 @@ pub async fn scrub_one_object(
     };
     let full = match store.get(key, GetRange::Full).await {
         Ok(got) => got,
-        Err(err) => {
-            let result = get_failure("full-object", err);
-            log_unreadable(clock, key, &result);
-            return result;
-        }
+        Err(err) => return get_failure("full-object", err),
     };
     let actual = *blake3::hash(full.data.as_ref()).as_bytes();
     if actual != expected {
@@ -306,19 +302,6 @@ pub async fn scrub_one_object(
     }
 
     ScrubResult::Clean
-}
-
-/// Log an [`ScrubResult::Unreadable`] outcome the way the other anomalies are
-/// logged; any other result is left to the caller.
-fn log_unreadable(clock: &dyn Clock, key: &str, result: &ScrubResult) {
-    if let ScrubResult::Unreadable { detail, .. } = result {
-        tracing::warn!(
-            object_key = key,
-            detected_unix_ns = clock.now_ns(),
-            detail = %detail,
-            "scrub: object unreadable (non-retryable store error)"
-        );
-    }
 }
 
 /// Structural-tier outcome: a failed GET, already classified by
