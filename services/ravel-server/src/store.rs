@@ -306,7 +306,8 @@ impl ObjectStoreBackend for SharedKmsStore {
 /// Re-exported here for `Cli::validate` and [`build_store`], the two callers in
 /// this crate.
 pub use ravel_object_store::s3::{
-    PlaintextS3Endpoint, S3EndpointRefusal, SchemelessS3Endpoint, resolve_s3_allow_http,
+    PlaintextS3Endpoint, S3EndpointRefusal, SchemelessS3Endpoint, is_loopback_endpoint,
+    resolve_s3_allow_http,
 };
 
 /// The argument error for `--s3-auth instance-role` combined with an inline

@@ -968,12 +968,25 @@ pub struct Cli {
     /// `request-minimal` reads every object whole in one covering GET (the
     /// cost-preferring shape where transfer is free and the bill is requests);
     /// `byte-minimal` is ADR-0904's behaviour, ranged reads wherever they save
-    /// more bytes than a request costs; `cost-based` (the default) derives the
-    /// rate from `--store-cost-profile`, which at the reference intra-region
-    /// profile means request-minimal behaviour; `latency-first` (issue #1196)
-    /// resolves the byte quantities exactly as `byte-minimal` does. Read at
-    /// startup only: the running engine never changes its own policy, so the
-    /// stamped effective policy describes the whole process lifetime.
+    /// more bytes than a request costs; `cost-based` derives the rate from
+    /// `--store-cost-profile`, which at the reference intra-region profile
+    /// means request-minimal behaviour; `latency-first` (issue #1196) resolves
+    /// the byte quantities exactly as `byte-minimal` does. Read at startup
+    /// only: the running engine never changes its own policy, so the stamped
+    /// effective policy describes the whole process lifetime.
+    ///
+    /// Unset, the default is no longer always `cost-based` (ADR-2014): a
+    /// `--store s3` deployment whose `--s3-endpoint` is loopback (`localhost`
+    /// or a loopback IPv4/IPv6 literal) defaults to `byte-minimal` instead,
+    /// because on a local store the cold path is disk-bound rather than
+    /// network-bound and whole-object reads there measured 31% slower cold
+    /// and 68% slower hot on the ClickBench reference machine. Every other
+    /// unset case keeps `cost-based`, exactly as before. An explicit flag
+    /// always wins, including an explicit `cost-based` on a loopback endpoint.
+    /// [`crate::config::Cli::resolve_logs_fetch_policy`] is the one place this
+    /// is decided; the resolved policy's source (`flag`, `default`, or
+    /// `derived-loopback-endpoint`) is on the `logs fetch policy resolved`
+    /// startup log line.
     ///
     /// `latency-first` is an intent, not a tuning constant: it says spend
     /// requests to save wall time, and carries no concurrency default of its
@@ -995,8 +1008,8 @@ pub struct Cli {
     /// measured concurrency is not yet bounded by a process-wide budget (see
     /// #1170 and #1007), so raising concurrency without watching process
     /// memory can end in an out-of-memory kill instead of a faster query.
-    #[arg(long = "logs-fetch-policy", value_enum, default_value_t = LogsFetchPolicyArg::CostBased)]
-    pub logs_fetch_policy: LogsFetchPolicyArg,
+    #[arg(long = "logs-fetch-policy", value_enum)]
+    pub logs_fetch_policy: Option<LogsFetchPolicyArg>,
 
     /// Path to a TOML `StoreCostProfile` (ADR-0996 decision 1): this
     /// deployment's object-store prices, in integer nanodollars per request
@@ -2047,6 +2060,12 @@ pub struct QueryBudgets {
     /// resolved into the two byte quantities above by
     /// [`Self::logs_fetch_resolution`].
     pub logs_fetch_policy: ravel_query::LogsFetchPolicy,
+    /// Where [`Self::logs_fetch_policy`] came from (ADR-2014):
+    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`], [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`],
+    /// or [`LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT`], from
+    /// [`Cli::resolve_logs_fetch_policy`]. Carried only for
+    /// [`Self::logs_fetch_stamp`]; it plays no part in the resolution itself.
+    pub logs_fetch_policy_source: &'static str,
     /// The active store cost profile (ADR-0996 decision 1), from
     /// `--store-cost-profile` or the reference profile. Read only by the
     /// cost-based rate derivation; no price reaches the fetch layer.
@@ -2075,6 +2094,7 @@ impl Default for QueryBudgets {
             logs_block_range_threshold: None,
             logs_request_cost_bytes: None,
             logs_fetch_policy: ravel_query::LogsFetchPolicy::default(),
+            logs_fetch_policy_source: LOGS_FETCH_POLICY_SOURCE_DEFAULT,
             store_cost_profile: StoreCostProfile::reference(),
             logs_max_fetch_run_bytes: ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
             mcp: McpConfig::default(),
@@ -2115,6 +2135,7 @@ impl QueryBudgets {
         let resolved = self.logs_fetch_resolution();
         LogsFetchStamp {
             policy: self.logs_fetch_policy.as_str(),
+            policy_source: self.logs_fetch_policy_source,
             profile: self.store_cost_profile.name.clone(),
             request_cost_bytes: resolved.request_cost_bytes,
             request_cost_source: match self.logs_request_cost_bytes {
@@ -2184,6 +2205,17 @@ pub const REQUEST_COST_SOURCE_EXPLICIT_FLAG: &str = "explicit-flag";
 /// `--logs-fetch-policy` derived the rate.
 pub const REQUEST_COST_SOURCE_POLICY: &str = "policy";
 
+/// [`LogsFetchStamp::policy_source`] when `--logs-fetch-policy` was given
+/// explicitly (ADR-2014). Wins over every derivation, including on a loopback
+/// endpoint.
+pub const LOGS_FETCH_POLICY_SOURCE_FLAG: &str = "flag";
+/// [`LogsFetchStamp::policy_source`] when the flag was unset and no
+/// loopback-endpoint derivation applied: `cost-based`, exactly as ADR-1196.
+pub const LOGS_FETCH_POLICY_SOURCE_DEFAULT: &str = "default";
+/// [`LogsFetchStamp::policy_source`] when the flag was unset, `--store` is
+/// `s3`, and `--s3-endpoint` is loopback (ADR-2014): `byte-minimal`.
+pub const LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT: &str = "derived-loopback-endpoint";
+
 /// The effective logs fetch configuration a process resolved at startup, the
 /// provenance stamp of ADR-0996 decision 2.
 ///
@@ -2194,8 +2226,13 @@ pub const REQUEST_COST_SOURCE_POLICY: &str = "policy";
 /// the operator reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogsFetchStamp {
-    /// `--logs-fetch-policy` as the operator spelled it.
+    /// `--logs-fetch-policy` as the operator spelled it, or the effective
+    /// policy `--logs-fetch-policy` resolved to when it was not given.
     pub policy: &'static str,
+    /// Where [`Self::policy`] came from (ADR-2014):
+    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`], [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`],
+    /// or [`LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT`].
+    pub policy_source: &'static str,
     /// The active profile's name, from `--store-cost-profile` or the reference
     /// profile.
     pub profile: String,
@@ -2259,6 +2296,7 @@ impl LogsFetchStamp {
     pub fn emit(&self) {
         tracing::info!(
             policy = self.policy,
+            policy_source = self.policy_source,
             profile = %self.profile,
             request_cost_bytes = self.request_cost_bytes,
             request_cost_source = self.request_cost_source,
@@ -4416,6 +4454,43 @@ impl Cli {
         })
     }
 
+    /// Resolve `--logs-fetch-policy` and its provenance (ADR-2014). The one
+    /// place this decision is made: [`Self::query_budgets`] is its only
+    /// caller, and both the engine-bound policy and the startup stamp
+    /// ([`QueryBudgets::logs_fetch_stamp`]) come from the `QueryBudgets` it
+    /// fills, so neither can independently re-derive a different answer.
+    ///
+    /// An explicit `--logs-fetch-policy` always wins, including an explicit
+    /// `cost-based` on a loopback endpoint ([`LOGS_FETCH_POLICY_SOURCE_FLAG`]).
+    /// Unset, `--store s3` with an `--s3-endpoint` that
+    /// [`ravel_object_store::s3::is_loopback_endpoint`] accepts derives
+    /// `byte-minimal` ([`LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT`]);
+    /// every other unset case keeps `cost-based`
+    /// ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]), exactly as ADR-1196. Gated on
+    /// `--store s3` for the same reason [`Self::validate`]'s plaintext check
+    /// is: a stray exported `RAVEL_S3_ENDPOINT` must not change behaviour for
+    /// a `--store memory` start. Concurrency is untouched either way (ADR-2014
+    /// decision 3): this only selects [`LogsFetchPolicyArg::ByteMinimal`], the
+    /// intent, never a `--fetch-concurrency`/`--store-get-concurrency` value.
+    pub fn resolve_logs_fetch_policy(&self) -> (LogsFetchPolicyArg, &'static str) {
+        if let Some(policy) = self.logs_fetch_policy {
+            return (policy, LOGS_FETCH_POLICY_SOURCE_FLAG);
+        }
+        let loopback = matches!(self.store, StoreKind::S3)
+            && self
+                .s3_endpoint
+                .as_deref()
+                .is_some_and(crate::store::is_loopback_endpoint);
+        if loopback {
+            (
+                LogsFetchPolicyArg::ByteMinimal,
+                LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT,
+            )
+        } else {
+            (LogsFetchPolicyArg::CostBased, LOGS_FETCH_POLICY_SOURCE_DEFAULT)
+        }
+    }
+
     /// The ADR-0088 query budgets and the ADR-0996 logs fetch configuration,
     /// sourced from the CLI flags. `main` threads this into
     /// [`crate::ServerConfig::query_budgets`], and [`crate::start`] folds it
@@ -4436,6 +4511,7 @@ impl Cli {
         &self,
         resolved: &ResolvedPerformanceDefaults,
     ) -> anyhow::Result<QueryBudgets> {
+        let (logs_fetch_policy, logs_fetch_policy_source) = self.resolve_logs_fetch_policy();
         Ok(QueryBudgets {
             fetch_concurrency: resolved.fetch_concurrency,
             store_get_concurrency: resolved.store_get_concurrency,
@@ -4447,7 +4523,8 @@ impl Cli {
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
             logs_block_range_threshold: self.logs_block_range_threshold,
             logs_request_cost_bytes: self.logs_request_cost_bytes,
-            logs_fetch_policy: self.logs_fetch_policy.policy(),
+            logs_fetch_policy: logs_fetch_policy.policy(),
+            logs_fetch_policy_source,
             store_cost_profile: self.resolve_store_cost_profile()?,
             logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
             mcp: McpConfig {

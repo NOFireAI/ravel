@@ -540,6 +540,31 @@ pub fn resolve_s3_allow_http(
     }))
 }
 
+/// Whether `endpoint` names this host: an `http://` or `https://` URL (the
+/// scheme match is case-insensitive, same as [`resolve_s3_allow_http`]) whose
+/// authority is `localhost`, a loopback IPv4 literal, or the loopback IPv6
+/// literal (ADR-2014). A schemeless endpoint is `false`, not an error: unlike
+/// [`resolve_s3_allow_http`] this has no flag to refuse toward, and a caller
+/// deriving a default from locality treats "not a recognizable loopback URL"
+/// the same as "not loopback".
+///
+/// Calls the same [`is_loopback_authority`] predicate `resolve_s3_allow_http`
+/// uses, rather than a second copy of the host rule: a name that merely
+/// resolves to loopback is not loopback here either, and the authority is cut
+/// at the same `/`, `?`, `#` boundaries so `http://s3.example.com?x=@localhost`
+/// is not loopback here either.
+pub fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let lowercased = endpoint.to_ascii_lowercase();
+    let rest = if lowercased.starts_with("https://") {
+        &endpoint["https://".len()..]
+    } else if lowercased.starts_with("http://") {
+        &endpoint["http://".len()..]
+    } else {
+        return false;
+    };
+    is_loopback_authority(rest)
+}
+
 /// Whether the authority beginning `rest` (everything after `http://`) names
 /// this host. Accepts `localhost`, a loopback IPv4 or IPv6 literal, and the
 /// bracketed IPv6 form a URL authority requires; anything else, including a
@@ -2305,6 +2330,47 @@ mod tests {
             Ok(true),
             "--s3-allow-http must still accept deliberate plaintext"
         );
+    }
+
+    /// ADR-2014: `is_loopback_endpoint` is `resolve_s3_allow_http`'s own
+    /// loopback branch, exposed standalone for a caller (the server's
+    /// `--logs-fetch-policy` default) that has no `allow_http_flag` and must
+    /// not refuse anything, only classify.
+    #[test]
+    fn is_loopback_endpoint_matches_the_shared_authority_predicate() {
+        for endpoint in [
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "HTTP://LOCALHOST:9000",
+            "http://[::1]:9000",
+            "https://127.0.0.1:9000",
+            // The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+            "http://127.9.9.9:9000",
+        ] {
+            assert!(
+                is_loopback_endpoint(endpoint),
+                "{endpoint} must be classified as loopback"
+            );
+        }
+
+        for endpoint in [
+            "http://s3.example.com",
+            // A host name that merely CONTAINS a loopback literal as a label
+            // is not loopback: it resolves on the network, wherever that
+            // resolution lands.
+            "http://127.0.0.1.example.com:9000",
+            // The authority ends at '?': matching to the first '@' or the end
+            // of the string would read "localhost" here as the host.
+            "http://s3.example.com?x=@localhost",
+            // Schemeless: not a usable URL, so not loopback either.
+            "127.0.0.1:9000",
+            "https://s3.us-east-1.amazonaws.com",
+        ] {
+            assert!(
+                !is_loopback_endpoint(endpoint),
+                "{endpoint} must not be classified as loopback"
+            );
+        }
     }
 
     fn test_config() -> S3Config {
