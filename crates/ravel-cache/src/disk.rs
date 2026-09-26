@@ -2410,7 +2410,7 @@ mod tests {
 
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
 
-        crate::test_support::run_with_watchdog(
+        ravel_test_support::run_with_watchdog(
             WATCHDOG_BOUND,
             || {
                 format!(
@@ -2428,7 +2428,7 @@ mod tests {
                 rt.block_on(async {
                     let (began_tx, mut began_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
                     let tmp = TempDir::new().unwrap();
-                    let clock = Arc::new(crate::test_support::ParkOnFirstArmedCall::new(
+                    let clock = Arc::new(ravel_test_support::ParkOnFirstArmedCall::new(
                         move || began_tx.send(()).unwrap(),
                         release_rx,
                     ));
