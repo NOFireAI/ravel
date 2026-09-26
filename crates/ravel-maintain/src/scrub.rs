@@ -486,9 +486,11 @@ impl ScrubBudget {
 pub struct TickPlan {
     /// The caps this tick runs under.
     pub budget: ScrubBudget,
-    /// The rotation's allotted length in seconds: the scrub period `P`, or the
-    /// operator's retention window when that is shorter (an object deleted
-    /// before the rotation reaches it is never verified at all).
+    /// The rotation's allotted length in seconds: the scrub period `P`, or
+    /// half the operator's retention window when that is shorter. An object
+    /// deleted before the rotation reaches it is never verified at all, and a
+    /// rotation as long as the retention window reaches its oldest objects at
+    /// about the age they expire.
     pub rotation_secs: u64,
     /// Entries this tick would have had to consume for the rotation to reach
     /// the end of the listing by its deadline.
@@ -676,8 +678,10 @@ impl ScrubCursor {
     }
 
     /// This tick's plan (ADR-1686 decision 3, amended). The rotation is
-    /// allotted `min(period_secs, retention_secs)`, since an object deleted by
-    /// retention before the walk reaches it is never verified at all. What is
+    /// allotted `min(period_secs, retention_secs / 2)`, since an object
+    /// deleted by retention before the walk reaches it is never verified at
+    /// all, and the oldest-first walk would reach each object at about its
+    /// expiry age if it were allotted the whole retention window. What is
     /// left to cover is divided by the ticks left before that deadline, so a
     /// rotation that has fallen behind speeds up instead of running forever:
     /// on the last tick before the deadline the whole remainder is budgeted.
@@ -697,7 +701,7 @@ impl ScrubCursor {
     ) -> TickPlan {
         let tick_secs = tick_secs.max(1);
         let rotation_secs = match retention_secs {
-            Some(retention) => period_secs.max(1).min(retention.max(1)),
+            Some(retention) => period_secs.max(1).min((retention / 2).max(1)),
             None => period_secs.max(1),
         };
         let deadline_ticks = rotation_secs.div_ceil(tick_secs).max(1);
@@ -1354,15 +1358,16 @@ mod tests {
     }
 
     #[test]
-    fn a_rotation_never_runs_longer_than_the_configured_retention() {
+    fn a_rotation_finishes_inside_half_the_configured_retention() {
         // P = 7 days but retention is 24 hours: an object older than 24 hours
         // is deleted, so a rotation that takes longer than that leaves objects
-        // unscrubbed for their whole life. The rotation must finish inside
-        // `retention / tick` = 24 ticks.
+        // unscrubbed for their whole life. A rotation allotted the whole
+        // retention window reaches the oldest objects at about the age they
+        // expire, so it is allotted half: `retention / 2 / tick` = 12 ticks.
         let period_secs = 7 * 86_400;
         let tick_secs = 3_600;
         let retention_secs = 24 * 3_600;
-        let deadline_ticks = retention_secs / tick_secs;
+        let deadline_ticks = retention_secs / 2 / tick_secs;
         let keys = entry_keys(100);
         let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
         let mut ticks = 0u64;
@@ -1384,21 +1389,42 @@ mod tests {
         }
         assert!(
             cursor.last_commit_key.is_none(),
-            "a rotation sized only by P = {period_secs}s did not finish inside the \
-             {retention_secs}s retention window ({deadline_ticks} ticks)"
+            "the rotation did not finish inside half the {retention_secs}s retention \
+             window ({deadline_ticks} ticks)"
         );
         assert_eq!(
-            ticks, 20,
-            "100 entries at ceil(100 * 3600 / 86400) = 5 a tick"
+            ticks, 12,
+            "100 entries at ceil(100 * 3600 / 43200) = 9 a tick"
         );
     }
 
     #[test]
+    fn the_rotation_window_is_the_period_capped_at_half_the_retention() {
+        let cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let day = 86_400;
+        let window = |period: u64, retention: Option<u64>| {
+            cursor.plan_tick(period, 3_600, retention, 0).rotation_secs
+        };
+        assert_eq!(window(7 * day, None), 7 * day, "no retention caps nothing");
+        assert_eq!(window(7 * day, Some(30 * day)), 7 * day);
+        assert_eq!(window(7 * day, Some(14 * day)), 7 * day);
+        assert_eq!(window(7 * day, Some(10 * day)), 5 * day);
+        assert_eq!(
+            window(7 * day, Some(7 * day)),
+            7 * day / 2,
+            "a period equal to retention would reach each object as it expires"
+        );
+        assert_eq!(window(7 * day, Some(day)), day / 2);
+        assert_eq!(window(7 * day, Some(1)), 1, "never below one second");
+    }
+
+    #[test]
     fn a_rotation_that_cannot_finish_by_its_deadline_reports_behind() {
-        // 100 entries, retention 24 hours, tick 1 hour, and the walk has
-        // consumed nothing 23 hours in: one tick is left and it would have to
-        // take all 100 entries, five times the catch-up ceiling of
-        // 4 * ceil(100 * 3600 / 86400) = 20.
+        // 100 entries, retention 24 hours (a 12-hour rotation window), tick 1
+        // hour, and the walk has consumed nothing 23 hours in: past the
+        // deadline one tick is left and it would have to take all 100
+        // entries, well past the catch-up ceiling of
+        // 4 * ceil(100 * 3600 / 43200) = 36.
         let period_secs = 7 * 86_400;
         let tick_secs = 3_600;
         let retention_secs = 24 * 3_600;
@@ -1410,15 +1436,15 @@ mod tests {
             Some(retention_secs),
             23 * tick_secs as i64 * 1_000_000_000,
         );
-        assert_eq!(plan.rotation_secs, retention_secs);
+        assert_eq!(plan.rotation_secs, retention_secs / 2);
         assert_eq!(plan.needed_entries, 100);
-        assert_eq!(plan.budget.max_entries, 20);
+        assert_eq!(plan.budget.max_entries, 36);
         assert!(plan.behind);
 
         // The same rotation at its start is on schedule and not behind.
         let on_schedule = cursor.plan_tick(period_secs, tick_secs, Some(retention_secs), 0);
-        assert_eq!(on_schedule.needed_entries, 5);
-        assert_eq!(on_schedule.budget.max_entries, 5);
+        assert_eq!(on_schedule.needed_entries, 9);
+        assert_eq!(on_schedule.budget.max_entries, 9);
         assert!(!on_schedule.behind);
     }
 }

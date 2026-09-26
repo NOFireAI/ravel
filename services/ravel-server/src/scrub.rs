@@ -54,7 +54,7 @@
 //!    walk. Recounting whole hours catches a commit from every writer, not
 //!    only from one whose id sorts above the keys already listed.
 //! 3. Plan the tick ([`ScrubCursor::plan_tick`]): the rotation is allotted
-//!    `min(P, retention window)` and what is left to cover is divided by the
+//!    `min(P, retention window / 2)` and what is left to cover is divided by the
 //!    ticks remaining before that deadline, bounded by
 //!    [`ravel_maintain::SCRUB_MAX_CATCHUP`] times the sustained rate. A plan
 //!    past that ceiling is `behind`: the rotation cannot finish in time, which
@@ -89,7 +89,7 @@
 //! 7. Persist the cursor with the marker on the last entry consumed. When the
 //!    listing ended past the marker, the rotation rolls over instead: the
 //!    marker clears and the next rotation is counted afresh, completing a full
-//!    rotation over the shard within `min(P, retention window)` whenever the
+//!    rotation over the shard within `min(P, retention window / 2)` whenever the
 //!    shard's commit rate stays inside the catch-up ceiling.
 //!
 //! # Why Maintain-mode only
@@ -470,10 +470,10 @@ pub async fn run_cycle(
     let clock = WallClock;
     for tenant in &outcome.maintained {
         // A rotation must not outlive the data it verifies: an object retention
-        // deletes before the walk reaches it is never verified at all. The
+        // deletes before the walk reaches it is never verified at all. Half the
         // tenant's own window (ADR-0019) caps the rotation length below the
-        // configured scrub period; `None` means unlimited retention, which caps
-        // nothing.
+        // configured scrub period (`ScrubCursor::plan_tick` halves it); `None`
+        // means unlimited retention, which caps nothing.
         let retention_secs = retention.and_then(|cfg| cfg.window_for(tenant)).map(|ns| {
             let secs = ns / 1_000_000_000;
             u64::try_from(secs).unwrap_or(u64::MAX).max(1)

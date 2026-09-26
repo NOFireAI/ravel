@@ -304,6 +304,15 @@ A larger corpus or a shorter `P` costs proportionally more read bandwidth, and
 The default is `7d`. A zero or unparseable duration fails startup rather than
 rotating in a tight loop.
 
+A tenant with a retention window gets a shorter rotation when half that window
+is shorter than `P`: the rotation is allotted `min(P, retention / 2)`. The walk
+goes oldest hour first, so a rotation as long as the retention window would
+reach each object at about the age retention deletes it; half the window
+reaches every object by about half its retained life, while the rotation keeps
+pace. A 7-day
+retention with the default `P` therefore rotates every 3.5 days, at twice the
+read bandwidth the formula above gives for `P`.
+
 This is the one scheduled task whose cost scales with data volume rather than
 metadata volume, so size `P` against the corpus you actually have, and watch
 `ravel_scrub_cursor_position` to confirm rotations keep pace. That gauge and the

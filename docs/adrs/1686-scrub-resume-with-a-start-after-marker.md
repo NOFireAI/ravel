@@ -206,8 +206,8 @@ flowchart TD
   and what the operator guide's sizing formula
   (`docs/guides/operations/maintenance.md:279-297`) already states. A tick
   also pays a LIST-only tail count and a rotation can be capped below
-  `--scrub-period` by the tenant's retention window: see the 2026-09-26
-  amendment below.
+  `--scrub-period` by half the tenant's retention window: see the
+  2026-09-26 amendment below.
 - The rotation order changes from data-object key order to commit key order,
   which is ingest-hour order. Corruption is still found within one period;
   which slice finds it changes.
@@ -279,11 +279,15 @@ record for an hour sealed well before; the walk still verifies it, it is
 only missing from the estimate.
 
 **A rotation is sized by a deadline, and the deadline is the shorter of the
-period and the tenant's retention window.** An object retention deletes
+period and half the tenant's retention window.** An object retention deletes
 before the walk reaches it is never verified at all, so a rotation must not
-outlive the data it verifies. The rotation window is `min(--scrub-period,
-RetentionConfig::window_for(tenant))`, and `None` (unlimited retention) caps
-nothing. Within that window a tick takes `ceil(remaining entries / ticks
+outlive the data it verifies. Capping it at the whole retention window is not
+enough: the walk goes oldest hour first, so a rotation as long as the window
+reaches each object at about the age retention deletes it, and most of a
+retention-capped tenant would expire unverified. The rotation window is
+`min(--scrub-period, RetentionConfig::window_for(tenant) / 2)`, so a
+rotation that keeps pace reaches every object by about half its retained
+life, and `None` (unlimited retention) caps nothing. Within that window a tick takes `ceil(remaining entries / ticks
 remaining)`, floored at the sustained rate `ceil(estimated * tick /
 rotation)` so an early tick never coasts, and capped at `SCRUB_MAX_CATCHUP`
 (4) times that sustained rate so one late tick cannot ask for the whole
