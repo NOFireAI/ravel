@@ -153,6 +153,11 @@ The first Consequences bullet held only for one hour of unsealed data. Under
 ADR-1306 the claim becomes: no query is refused for fold lag before the
 fold-stall alert pages, and at the default `max_ingest_lag` no query whose
 range covers the last 50 minutes or less is refused for fold lag at all.
-Both hold at the measured per-flush cost. The remaining decisions and rejected alternatives stand as written.
+Both hold at the measured per-flush cost, and only per signal lane and per
+fleet-wide fold. They do not cover a query with both a metrics and a log
+selector, which spends one budget across two unsealed tails, or a single
+tenant whose fold is stuck while its signal's fleet-wide gauge stays fresh,
+so the stall alert never fires; ADR-1306's Consequences carry both. The
+remaining decisions and rejected alternatives stand as written.
 See ADR-1306 for the proof, the rejected alternatives, and the acceptance
 tests.

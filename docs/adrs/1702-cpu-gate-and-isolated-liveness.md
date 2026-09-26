@@ -57,7 +57,7 @@ in ravel-ingest. About 37 of them are on query or catalog paths.
 
 The write side has the same shape. The metrics flush calls
 `SegmentWriter::write_histograms_with_exemplars` inline
-(`crates/ravel-ingest/src/shard.rs:538`). That call does zstd
+(`crates/ravel-ingest/src/shard.rs:539`). That call does zstd
 (`ravel-segment/src/writer.rs:1709`) and blake3 (`writer.rs:783`). The log
 and span flushes do the same (`log_shard.rs:643-658`,
 `span_shard.rs:287-291`). OTAP decode (`ravel-otap/src/stream.rs:226`,
@@ -194,10 +194,17 @@ rule on thread placement.
    runtime stores the injected clock's time into an atomic once per second.
    The dedicated listener reads its age. `/healthz` there returns 503 when
    the age exceeds 60 s, so a deadlocked main runtime is still restarted.
-   `/readyz` there returns 503 when the age exceeds 10 s, or when any of
-   today's four flags says not ready. A merely busy node keeps ticking,
-   because decode no longer holds the workers. So it stays in the Service,
-   and overload is handled by admission control, not by the probe. The
+   `/readyz` there does not read the heartbeat: it returns 503 only when
+   one of today's four flags says not ready. Work that stays on the
+   workers (decision 12) can still delay the heartbeat on a busy node, so
+   readiness must not depend on it: a busy node stays in the Service, and
+   overload is handled by admission control, not by the probe. Liveness
+   uses the heartbeat because only a stall far past any single unit of
+   on-worker work means the runtime is stuck. PromQL evaluation, which is
+   synchronous and never yields, runs on the read gate (task 7) so it
+   cannot hold a worker for that long. Whether 60 s is safe against what
+   remains on the workers is measured, not assumed: the saturation bench
+   (task 11) asserts it before the operator default flips (task 12). The
    main-router copies of `/healthz` and `/readyz` keep today's behavior.
 
 10. **The operator probes the health port behind a CRD field.** A new
@@ -211,8 +218,10 @@ rule on thread placement.
 
 11. **Metrics show queueing.** Per gate (`gate="read"|"write"`):
     `ravel_cpu_gate_permits`, `ravel_cpu_gate_running`,
-    `ravel_cpu_gate_queued`, `ravel_cpu_gate_wait_seconds_total` and
-    `ravel_cpu_gate_run_seconds_total` with matching `_count` counters, and
+    `ravel_cpu_gate_queued`, the sum and count pairs
+    `ravel_cpu_gate_wait_seconds_sum` / `ravel_cpu_gate_wait_seconds_count`
+    and `ravel_cpu_gate_run_seconds_sum` / `ravel_cpu_gate_run_seconds_count`
+    (the `_seconds_sum` / `_seconds_count` shape the server already uses), and
     `ravel_cpu_gate_abandoned_total`. Per call site:
     `ravel_cpu_gate_jobs_total{gate,site}`, where `site` is a static string
     set at the call. The gate measures with an injected monotonic clock.
@@ -223,21 +232,26 @@ rule on thread placement.
     No metric needs `tokio_unstable`.
 
 12. **What the gate does not cover.** DataFusion operator CPU (sort,
-    aggregate, join), PromQL evaluation CPU and tonic's own gzip codec still
-    run on workers. The isolated health listener is the backstop for them.
+    aggregate, join) and tonic's own gzip codec still run on workers.
+    PromQL evaluation does not: its evaluator functions are synchronous with
+    no yield points (`crates/ravel-promql/src/aggregate.rs`, `binop.rs`), so
+    one evaluation over up to 10,000,000 samples could hold a worker, and it
+    runs on the read gate instead. The isolated health listener is the
+    backstop for what remains.
     A later ADR can move them if the busy metrics show they matter.
 
 ```mermaid
 flowchart LR
     subgraph health [health thread: current_thread runtime]
-        H["/healthz, /readyz on :4316"]
+        H["/healthz on :4316"]
+        RZ["/readyz on :4316: four flags only"]
         HB{heartbeat age}
         H --> HB
     end
     subgraph workers [main runtime workers]
         R[HTTP and gRPC handlers]
         F[fetch awaits, GET limiter]
-        Q[DataFusion operators, PromQL eval]
+        Q[DataFusion operators]
         T[heartbeat task, ticks every 1 s]
         FL[shard flush tasks]
     end
@@ -246,11 +260,12 @@ flowchart LR
         GW[write gate: max 1, cores / 2]
     end
     subgraph blocking [tokio blocking pool threads]
-        D[section, block and part decode]
+        D[section, block and part decode, PromQL eval]
         E[flush encode, blake3, OTAP and OTLP decode]
         IO[disk cache get, insert, age sweep]
     end
     K[kubelet probes] --> H
+    K --> RZ
     T -. stores clock time .-> HB
     R --> F --> GR --> D
     FL --> GW
@@ -302,8 +317,9 @@ flowchart LR
 - **Readiness on the main runtime only.** A saturated node would drop out
   of the Service. When every replica saturates at once, the Service has no
   endpoints and clients get refused connections instead of slow answers.
-  The heartbeat gives readiness the one signal a probe should carry: the
-  runtime still schedules tasks.
+  The dedicated listener keeps readiness answering while the workers are
+  busy, and the heartbeat drives liveness only, so a busy fleet stays in
+  the Service and a stuck runtime is still restarted.
 
 - **A TCP socket probe.** The kernel completes the handshake from the
   listen backlog, so the probe passes even with a deadlocked runtime. It
@@ -372,8 +388,10 @@ change, shown by reverting the change under test.
    completes and the watchdog panics. Second test
    `liveness_fails_after_heartbeat_stall`: with an injected clock and a
    parked main runtime, `/healthz` is 200 at 59 s of heartbeat age and 503
-   at 61 s, and `/readyz` is 200 at 9 s and 503 at 11 s. The mutation that
-   drops the heartbeat check keeps both at 200 and fails the test.
+   at 61 s, while `/readyz` stays 200 at 61 s because its four flags say
+   ready. The mutation that drops the heartbeat check keeps `/healthz` at
+   200 and fails the test; the mutation that makes `/readyz` read the
+   heartbeat turns it 503 and fails the test.
 3. **Operator probe field** (`ravel-operator`). Adds
    `spec.probes.dedicatedHealthPort`. Acceptance test
    `probes_render_on_health_port_when_enabled`: with the field `true`, the
@@ -407,10 +425,13 @@ change, shown by reverting the change under test.
    `ravel_cpu_gate_jobs_total` for each catalog site by the exact expected
    count, and `ravel_cpu_gate_inline_total` stays at 0. With any one wrap
    removed, that site's count reads 0.
-7. **Query fetchers on the read gate** (`ravel-query`): `decode_selected`
-   and `decode_sparse_catalog` in `fetcher.rs`, and the LogQL and span
-   fetcher paths. Acceptance test: the same floor-0 per-site counter test
-   over a fixture RSEG, RLOG and RSPAN object.
+7. **Query fetchers and PromQL evaluation on the read gate**
+   (`ravel-query`, `ravel-promql`): `decode_selected` and
+   `decode_sparse_catalog` in `fetcher.rs`, the LogQL and span fetcher
+   paths, and each PromQL evaluation. Acceptance tests: the same floor-0
+   per-site counter test over a fixture RSEG, RLOG and RSPAN object, and
+   `promql_evaluation_runs_through_the_read_gate`, which counts one gate job
+   per evaluated query.
 8. **Logs and spans scan decode state** (`ravel-sql`). Adds the decode
    state to `LogScan` and the spans scan. Acceptance test
    `log_scan_yields_while_a_block_decodes`: with the gate job parked, a
@@ -435,9 +456,14 @@ change, shown by reverting the change under test.
     per core while probing the health listener every 100 ms. It asserts
     that every probe answered and that the probe count is exactly the
     expected count. It also asserts that the maximum probe latency sits
-    inside a band written on #1702 before the first run. It is advisory,
-    like the other bench lanes.
+    inside a band written on #1702 before the first run. A second scenario
+    runs concurrent PromQL and SQL queries, one per core, and asserts that
+    `ravel_health_heartbeat_age_seconds` stays under a bound written on
+    #1702 before the first run and well below the 60 s liveness threshold.
+    Both are advisory, like the other bench lanes.
 12. **Flip the operator default** to `dedicatedHealthPort: true` one
-    release after task 3 ships. Acceptance test: the default-render test
+    release after task 3 ships, and only once task 11's second scenario has
+    run inside its bound; if it has not, the 60 s liveness threshold is
+    revisited first. Acceptance test: the default-render test
     from task 3 expects 4316 and the `--listen-health` argument, and the
     release notes carry the image requirement.

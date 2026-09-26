@@ -35,10 +35,10 @@ bucket overlapping `[range.start - max_ingest_lag, now + clock_skew_allowance]`
 (`docs/catalog-and-mvcc.md:1058-1061`), with `max_ingest_lag` at 2 h. Every
 unsealed commit record in that window is listed and GET-decoded
 (`docs/catalog-and-mvcc.md:1096-1103`). So a last-5-minutes query touches up to
-3 h 05 m of tail, and a wider query touches all of it. The per-process record
+3 h 10 m of tail, and a wider query touches all of it. The per-process record
 cache would absorb repeated resolves, but at the defaults it is clamped to
 25,000 entries against an uncapped estimate of 129,600
-(`crates/ravel-catalog/src/config.rs:15-24`). A busy tenant's tail does not
+(`crates/ravel-catalog/src/config.rs:27`). A busy tenant's tail does not
 fit, so "cold" is the normal case, not the rare one.
 
 The budget counts every pooled request, resolve included. It is checked after
@@ -116,7 +116,8 @@ Two related facts bound what any fix here can promise:
    tail then grows one second per second. The page arrives by
    `T + lag_allowance`, when the tail is at most `covered_span`. So a budget
    that covers `covered_span` cannot refuse a query for fold lag before the
-   page. The proof needs two conditions and nothing else:
+   page, for a query that resolves one signal lane. Per signal lane, the
+   proof needs two conditions and nothing else:
    - each unsealed flush costs at most `REQUESTS_PER_UNSEALED_FLUSH` requests
      per shard (decision 4), and
    - the query's requests that do not scale with flushes fit the fixed
