@@ -15,27 +15,36 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stops once the tick's budget is filled; the rotation rolls over when the
   listing runs out. The budget is a pair of caps, one on listing entries and
   one on requests, recomputed every tick from what the walk has actually
-  observed: a rotation with no predecessor opens with one LIST-only count, and
-  entries appended after it began are added to that count as the walk meets
-  them. The per-tick entry cap is the share needed to reach the rotation's
-  deadline, floored at the shard's sustained commit rate and capped at four
-  times that rate. The deadline is the smaller of `--scrub-period` and the
-  tenant's retention window, so a rotation cannot outlive the data it verifies;
-  a shard committing faster than four times its sustained rate increments
-  `ravel_scrub_behind_total{signal}` and logs the entries per tick the deadline
-  needs beside the number the tick is allowed, with the deadline itself. Every
-  listed entry and every GET attempt is charged against the budget, and a unit
-  whose record GET failed does not move the marker past it, so the next tick
-  retries that unit. A compaction record that lands in an hour the marker has
-  already passed is still judged against that whole hour, and a tick whose
-  cursor GET fails for any reason other than `NotFound` is skipped with the
-  stored cursor left alone. The cursor gains serde-default fields, so a cursor
-  from an older build still loads; its position is discarded and the next tick
-  starts a fresh rotation. `ravel_scrub_cursor_position` is now a fraction of
-  listing entries rather than of data objects. Every object the walk reaches is
-  still verified once per rotation; a unit retried after a failed GET is the
-  only one a rotation fetches twice, and a record committed behind the marker
-  waits for the next rotation.
+  observed: every rotation opens with one LIST-only count of the shard's
+  entries, and every later tick recounts the last two ingest hours the previous
+  count met, plus anything after them, and adds their growth, so a commit from
+  any writer on the shard is counted. The per-tick entry cap is the share
+  needed to reach the rotation's deadline, floored at the rotation's sustained
+  rate and capped at four times that rate. The deadline is the smaller of
+  `--scrub-period` and half the tenant's retention window, so a rotation that
+  keeps pace reaches each object by about half its retained life. When the entries per
+  tick the deadline needs exceed four times the sustained rate, the tick
+  increments `ravel_scrub_behind_total{signal}` and logs the entries per tick
+  needed beside the number allowed, with the deadline and the period. Every
+  listing page the walk draws and every record GET attempt is charged against
+  the request cap; the LIST-only count passes are not. A unit where a record or
+  object GET failed with a retryable error (throttled, timeout, transient) does
+  not move the marker past it and counts nothing from it, so the next tick
+  retries the whole unit. A record or object GET that fails with any other
+  error except not-found is a finding, counted on
+  `ravel_scrub_checksum_mismatch_total`, and the marker moves on, so one
+  unreadable record cannot pin the rotation. A compaction record that lands in
+  an hour the marker has already passed is still judged against that whole
+  hour, and a tick whose cursor GET fails for any reason other than `NotFound`
+  is skipped with the stored cursor left alone. The cursor gains serde-default
+  fields, so a cursor from an older build still loads; its position is
+  discarded and the next tick starts a fresh rotation.
+  `ravel_scrub_cursor_position` is now a fraction of listing entries rather
+  than of data objects. Every object the walk reaches is still verified once per
+  rotation, except that a retried unit's records and objects are fetched again,
+  and the hour re-list that judges a late compaction record GETs that hour's
+  compaction and rewrite records already consumed a second time. A record committed behind the marker waits for
+  the next rotation.
 
 ## [0.18.0] - 2026-09-26
 
