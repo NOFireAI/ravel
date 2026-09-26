@@ -48,8 +48,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an hour the marker has already passed is still judged against that whole
   hour, and a tick whose cursor GET fails for any reason other than `NotFound`
   is skipped with the stored cursor left alone. The cursor gains serde-default
-  fields, so a cursor from an older build still loads; its position is
-  discarded and the next tick starts a fresh rotation.
+  fields, so a cursor from an earlier release loads with defaults and its
+  progress restarts: the next tick starts a fresh rotation. During a
+  mixed-version rolling upgrade each version's cursor write drops the other's
+  new fields, so the rotation restarts each time a shard's ownership flips
+  between versions; nothing is corrupted and the cursor stays in object
+  storage. A retention window whose half fits in one tick makes every tick a
+  full rotation, including the LIST-only count of the whole commit prefix,
+  whose cost is not charged against the budget.
   `ravel_scrub_cursor_position` is now a fraction of listing entries rather
   than of data objects. Every object the walk reaches is still verified once per
   rotation, except that a retried unit's records and objects are fetched again,

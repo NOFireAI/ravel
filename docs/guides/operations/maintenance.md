@@ -346,7 +346,10 @@ reach each object at about the age retention deletes it; half the window
 reaches every object by about half its retained life, while the rotation keeps
 pace. A 7-day
 retention with the default `P` therefore rotates every 3.5 days, at twice the
-read bandwidth the formula above gives for `P`.
+read bandwidth the formula above gives for `P`. A retention window shorter than
+a tick (more precisely, one whose half fits in a single tick) makes every tick
+a full rotation, including the LIST-only count of the whole commit prefix that
+opens it, and that count's cost is not charged against the tick's budget.
 
 This is the one scheduled task whose cost scales with data volume rather than
 metadata volume, so size `P` against the corpus you actually have, and watch
@@ -354,6 +357,16 @@ metadata volume, so size `P` against the corpus you actually have, and watch
 three scrubber anomaly counters are catalogued in
 [the observability guide](../observability.md); the alarms that matter are in
 [troubleshooting](troubleshooting.md).
+
+### Cursor compatibility across builds
+
+A cursor written by an earlier release (0.18.0 or before) loads with defaults
+for every field it lacks, and its progress restarts: the next tick opens a
+fresh rotation from the head of the shard. During a mixed-version rolling upgrade, each version's cursor
+write drops the fields only the other version knows, so the rotation restarts
+each time a shard's ownership flips between versions. Nothing is corrupted, the
+cursor stays in object storage throughout, and once every maintain process runs
+one version the rotation proceeds normally.
 
 ### It needs no policy change
 
