@@ -73,19 +73,22 @@
 //!    page, every record GET attempt, and
 //!    [`ravel_maintain::SCRUB_REQUESTS_PER_OBJECT`] per object verified count
 //!    against the request cap, so a tick whose GETs all fail still stops.
-//! 5. A unit whose record GET failed with a retryable store error
-//!    ([`StoreError::is_retryable`]: `Throttled`, `Timeout`, `Transient`) is
-//!    not consumed: the marker stays behind it and the tick ends, so the next
-//!    tick retries it rather than skipping its objects for a whole rotation.
-//!    Every other failure moves the marker on. A record GET that fails with an
-//!    error retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`,
-//!    and every other kind but `NotFound`) is counted on
-//!    `ravel_scrub_checksum_mismatch_total` at the level of the objects the
-//!    record names; a record that is `NotFound` (deleted after it was listed)
-//!    or fails to decode is logged and skipped.
-//! 6. Verify each object via
+//! 5. Verify each object via
 //!    [`scrub_one_object`](ravel_maintain::scrub_one_object) and record any
 //!    anomaly on the metrics counters below.
+//! 6. A unit where any GET, of a record or of an object it names, failed with
+//!    a retryable store error ([`StoreError::is_retryable`]: `Throttled`,
+//!    `Timeout`, `Transient`) is not consumed: nothing it found is counted,
+//!    the marker stays behind it and the tick ends, so the next tick retries
+//!    the whole unit rather than skipping its objects for a whole rotation.
+//!    Every other failure moves the marker on. A GET that fails with an error
+//!    retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`, and
+//!    every other kind but `NotFound`) is counted on
+//!    `ravel_scrub_checksum_mismatch_total`, at the object's level or, for a
+//!    record, at the level of the objects it names. A record or object that
+//!    is `NotFound` (deleted after it was listed), a record that fails to
+//!    decode, and an object whose check hit an input inconsistency are logged
+//!    and skipped.
 //! 7. Persist the cursor with the marker on the last entry consumed. When the
 //!    listing ended past the marker, the rotation rolls over instead: the
 //!    marker clears and the next rotation is counted afresh, completing a full
@@ -134,9 +137,10 @@
 //!
 //! Like the library it drives, this task detects and alarms; it never repairs
 //! (ADR-0059 consequences; there is no redundant copy to repair a corrupt
-//! segment from, ADR-0058). A [`ScrubResult::ReadError`] is a transient store
-//! or decode failure, not corruption: it is logged and retried on a later tick,
-//! never counted as an anomaly.
+//! segment from, ADR-0058). A [`ScrubResult::ReadError`] is a retryable store
+//! error, a missing object, or a decode inconsistency, not corruption: it is
+//! logged and never counted as an anomaly, and only the retryable kind holds
+//! the marker for a retry on the next tick.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -215,9 +219,10 @@ fn level_index(level: ScrubLevel) -> usize {
 /// `tenant_hash` label (ADR-0044 section 4 blocks per-tenant series on the
 /// unauthenticated `/metrics` route).
 ///
-/// Structural corruption and a content-hash mismatch are both at-rest integrity
-/// failures of the same data object, so both increment
-/// `checksum_mismatch`; a [`ScrubResult::ReadError`] is transient and increments
+/// Structural corruption, a content-hash mismatch, and an object or record the
+/// store refuses with an error retrying cannot clear
+/// ([`ScrubResult::Unreadable`]) are all at-rest integrity failures, so all
+/// increment `checksum_mismatch`; a [`ScrubResult::ReadError`] increments
 /// nothing. `checksum_mismatch` also carries a [`ScrubLevel`] dimension
 /// (`l0`/`l1`/`rewrite`, [`level_index`]): the postings tier only ever runs
 /// against L0 objects, so `postings_disagreement` stays signal-only.
@@ -773,6 +778,25 @@ async fn run_shard_tick(
             unit_held = true;
             break;
         }
+        requests = requests.saturating_add(
+            (outcome.targets.len() as u64).saturating_mul(SCRUB_REQUESTS_PER_OBJECT),
+        );
+        let Some(verdicts) = verify_slice(
+            store,
+            clock,
+            tenant,
+            signal,
+            shard,
+            &outcome.targets,
+            covering_postings,
+        )
+        .await
+        else {
+            // An object GET failed retryably: the whole unit, findings
+            // included, is retried next tick, so nothing is counted twice.
+            unit_held = true;
+            break;
+        };
         for (key, level, error) in &outcome.unreadable {
             tracing::error!(
                 tenant = %tenant.to_hex(), signal = ?signal, shard, record_key = %key,
@@ -782,6 +806,7 @@ async fn run_shard_tick(
             );
             metrics.record_checksum_mismatch(signal, *level);
         }
+        record_verdicts(tenant, signal, shard, &outcome.targets, verdicts, metrics);
         let bytes = outcome.targets.iter().fold(0u64, |sum, entry| {
             sum.saturating_add(entry.target.object_size)
         });
@@ -790,20 +815,6 @@ async fn run_shard_tick(
             cursor.consume(last, entries, bytes);
         }
         slice_entries = slice_entries.saturating_add(entries);
-        requests = requests.saturating_add(
-            (outcome.targets.len() as u64).saturating_mul(SCRUB_REQUESTS_PER_OBJECT),
-        );
-        verify_slice(
-            store,
-            clock,
-            tenant,
-            signal,
-            shard,
-            &outcome.targets,
-            covering_postings,
-            metrics,
-        )
-        .await;
     }
     let rotation_complete = !listing_failed && !unit_held && listing.ended();
 
@@ -821,9 +832,12 @@ async fn run_shard_tick(
     persist_cursor(store, tenant, signal, shard, &cursor).await;
 }
 
-/// Verify one unit's objects and record any anomaly. Split out of
-/// [`run_shard_tick`] so verification runs inside the walk, where its requests
-/// are charged to the tick's budget.
+/// Verify one unit's objects. Split out of [`run_shard_tick`] so verification
+/// runs inside the walk, where its requests are charged to the tick's budget.
+///
+/// Returns each object's result in slice order, or `None` as soon as one
+/// object's GET fails with a retryable error: the caller then holds the marker
+/// behind the unit and the next tick verifies all of it again.
 #[allow(clippy::too_many_arguments)]
 async fn verify_slice(
     store: &dyn ObjectStoreBackend,
@@ -833,11 +847,9 @@ async fn verify_slice(
     shard: u32,
     slice: &[SliceEntry],
     covering_postings: Option<ravel_maintain::CoveringPostings<'_>>,
-    metrics: &ScrubMetrics,
-) {
+) -> Option<Vec<ScrubResult>> {
+    let mut verdicts = Vec::with_capacity(slice.len());
     for entry in slice {
-        let key = &entry.target.object_key;
-        let level = entry.level;
         // The structural + content tiers always run (footer crc re-verify, then
         // whole-object blake3 vs the recorded content hash). The postings tier
         // runs additionally when `covering_postings` is `Some`: the object's
@@ -846,12 +858,42 @@ async fn verify_slice(
         // only ever cover L0 commit records (an L1/rewrite part's covering
         // ordinal is not meaningfully defined), so L1 and rewrite targets never
         // get the postings tier regardless of whether it loaded this tick.
-        let postings_for_object = if level == ScrubLevel::L0 {
+        let postings_for_object = if entry.level == ScrubLevel::L0 {
             covering_postings
         } else {
             None
         };
-        match scrub_one_object(store, clock, &entry.record, postings_for_object).await {
+        let verdict = scrub_one_object(store, clock, &entry.record, postings_for_object).await;
+        if let ScrubResult::ReadError {
+            detail,
+            retryable: true,
+        } = &verdict
+        {
+            tracing::warn!(
+                tenant = %tenant.to_hex(), signal = ?signal, shard,
+                object_key = %entry.target.object_key, detail = %detail,
+                "scrub: retryable read error; unit held, retried next tick"
+            );
+            return None;
+        }
+        verdicts.push(verdict);
+    }
+    Some(verdicts)
+}
+
+/// Record the anomalies among one consumed unit's verification results.
+fn record_verdicts(
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    slice: &[SliceEntry],
+    verdicts: Vec<ScrubResult>,
+    metrics: &ScrubMetrics,
+) {
+    for (entry, verdict) in slice.iter().zip(verdicts) {
+        let key = &entry.target.object_key;
+        let level = entry.level;
+        match verdict {
             ScrubResult::Clean => {}
             ScrubResult::ChecksumMismatch { .. } => {
                 tracing::error!(
@@ -869,6 +911,15 @@ async fn verify_slice(
                 );
                 metrics.record_checksum_mismatch(signal, level);
             }
+            ScrubResult::Unreadable { detail } => {
+                tracing::error!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
+                    level = level.as_str(), detail = %detail,
+                    "scrub: object unreadable at rest (non-retryable store error); counted as \
+                     a checksum mismatch"
+                );
+                metrics.record_checksum_mismatch(signal, level);
+            }
             ScrubResult::PostingsDisagreement { name, ordinal } => {
                 tracing::error!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
@@ -877,13 +928,15 @@ async fn verify_slice(
                 );
                 metrics.record_postings_disagreement(signal);
             }
-            ScrubResult::ReadError { detail } => {
-                // Transient store/decode failure: retried next tick, never an
-                // anomaly (a throttle or timeout must not read as bit rot).
+            ScrubResult::ReadError { detail, .. } => {
+                // A missing object or an input/decode inconsistency: a retry
+                // would hit it again, and it is not bit rot either. The
+                // retryable kind never reaches here; `verify_slice` holds the
+                // unit on it.
                 tracing::warn!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
                     detail = %detail,
-                    "scrub: transient read error; retried next tick"
+                    "scrub: read error, not a finding; object skipped until the next rotation"
                 );
             }
         }
@@ -3719,6 +3772,150 @@ mod tests {
                 data_keys[3].clone()
             ],
             "the objects before and after the unreadable record are verified"
+        );
+    }
+
+    /// Run one tick over eight one-object commit records with `fault` on
+    /// every GET of the third record's data object, and return the store, the
+    /// listing, the data keys in listing order, and the metrics.
+    async fn tick_with_data_object_fault(
+        fault: ravel_object_store::fault::ScriptedFault,
+    ) -> (
+        Arc<MemoryStore>,
+        Arc<ravel_object_store::fault::FaultStore<Arc<MemoryStore>>>,
+        Vec<ravel_object_store::ObjectMeta>,
+        Vec<String>,
+        ScrubMetrics,
+    ) {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule};
+
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let mut data_keys = Vec::new();
+        for seq in 1..=8u64 {
+            data_keys.push(publish_segment(&memory, seq, &["cpu"]).await);
+        }
+        let tenant_hash = tenant().hash();
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(listed.len(), 8, "eight commit records");
+        let faulted = Arc::new(FaultStore::new(
+            memory.clone(),
+            FaultPlan::empty()
+                .with_rule(Rule::new(Op::Get, fault).with_key_contains(data_keys[2].clone())),
+        ));
+        let clock = ravel_maintain::FixedClock::new(500_001 * NS_PER_HOUR);
+        let metrics = ScrubMetrics::default();
+        // Four entries a tick (`ceil(8 / 2)` over a two-tick rotation).
+        run_shard_tick(
+            faulted.as_ref(),
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            2,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+        (memory, faulted, listed, data_keys, metrics)
+    }
+
+    /// A data-object GET that fails with a retryable error holds the marker
+    /// behind its unit, exactly as a failed record GET does, so the object is
+    /// retried next tick instead of going unverified for a whole rotation.
+    #[tokio::test]
+    async fn a_retryable_data_object_get_error_holds_the_marker() {
+        use ravel_object_store::fault::{FaultKind, Op, ScriptedFault};
+
+        let (memory, faulted, listed, _, metrics) = tick_with_data_object_fault(
+            ScriptedFault::Transient("scrub: injected data-object GET fault".to_string()),
+        )
+        .await;
+        assert_eq!(
+            faulted.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the injected fault must have fired exactly once"
+        );
+        let tenant_hash = tenant().hash();
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[1].key.as_str()),
+            "the marker must stop behind the unit whose object GET failed"
+        );
+        assert_eq!(cursor.rotation_entries_visited, 2);
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0,
+            "a retryable GET fault is never an anomaly"
+        );
+
+        // With the fault cleared, the retried unit is consumed and verified.
+        let clock = ravel_maintain::FixedClock::new(500_001 * NS_PER_HOUR);
+        run_shard_tick(
+            memory.as_ref(),
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            2,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[5].key.as_str())
+        );
+        assert_eq!(cursor.rotation_entries_visited, 6);
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
+    }
+
+    /// A data-object GET that fails with an error retrying cannot clear is a
+    /// finding, counted as a checksum mismatch at the object's level, and the
+    /// marker moves past its unit in the same tick.
+    #[tokio::test]
+    async fn a_permanent_data_object_get_error_is_a_finding() {
+        use ravel_object_store::fault::{FaultKind, Op, ScriptedFault};
+
+        let (memory, faulted, listed, _, metrics) = tick_with_data_object_fault(
+            ScriptedFault::Permanent("scrub: injected data-object GET fault".to_string()),
+        )
+        .await;
+        assert_eq!(
+            faulted.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "the structural tier's footer GET fails and nothing else is tried"
+        );
+        let tenant_hash = tenant().hash();
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[3].key.as_str()),
+            "the marker moves past the unreadable object in the same tick"
+        );
+        assert_eq!(cursor.rotation_entries_visited, 4);
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            1,
+            "the unreadable object is exactly one finding"
         );
     }
 

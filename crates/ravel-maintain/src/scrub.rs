@@ -46,8 +46,8 @@
 //! this module's job is detection and alarming (the metrics wiring lands in the
 //! follow-up task), exactly as ADR-0059's consequences state.
 
-use ravel_catalog::{PostingsLimits, decode_postings, fetch_segment_names};
-use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_catalog::{PostingsBuildError, PostingsLimits, decode_postings, fetch_segment_names};
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::catalog::v1::SnapshotEntry;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{FooterOutcome, ReaderLimits};
@@ -89,10 +89,11 @@ pub struct CoveringPostings<'a> {
 }
 
 /// The outcome of scrubbing one object. Anomalies (structural corruption,
-/// checksum mismatch, postings disagreement) are distinguished from a
-/// [`ScrubResult::ReadError`], which is a transient store or decode failure and
-/// is deliberately *not* a corruption finding: a throttle or a timeout must not
-/// be counted as bit rot.
+/// checksum mismatch, postings disagreement, an object the store refuses to
+/// return) are distinguished from a [`ScrubResult::ReadError`], which is a
+/// retryable store error, a missing object, or an input/decode inconsistency,
+/// and is deliberately *not* a corruption finding: a throttle or a timeout
+/// must not be counted as bit rot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScrubResult {
     /// Every requested check passed.
@@ -121,13 +122,43 @@ pub enum ScrubResult {
         /// This object's ordinal in the covered-entry list.
         ordinal: u64,
     },
-    /// A transient store error or an input/decode inconsistency prevented the
-    /// scrub. Not a corruption finding; the cursor should retry it on a later
-    /// tick rather than alarm.
+    /// A store error retrying can clear, a missing object, or an input/decode
+    /// inconsistency prevented the scrub. Not a corruption finding.
     ReadError {
         /// What went wrong, rendered for reporting.
         detail: String,
+        /// The error was a retryable store error
+        /// ([`StoreError::is_retryable`]: throttled, timeout, transient) on a
+        /// GET of this object, so the cursor should hold its place and retry
+        /// the object on a later tick. `false` for `NotFound` (retention
+        /// deleted the object after it was listed) and for every input or
+        /// decode inconsistency, which a retry would only hit again.
+        retryable: bool,
     },
+    /// A GET of the object itself (the footer probe, the footer range chase,
+    /// or the whole-object read) failed with a store error retrying cannot
+    /// clear: anything but `NotFound` and the retryable kinds, such as
+    /// `Permanent`, `AccessDenied` or `Corrupted`. The object cannot be
+    /// verified, now or later, so this is a finding like a checksum mismatch.
+    Unreadable {
+        /// The failed GET and its error, rendered for reporting.
+        detail: String,
+    },
+}
+
+/// Classify a failed GET of the object under scrub: a retryable error or
+/// `NotFound` is a [`ScrubResult::ReadError`], anything else is
+/// [`ScrubResult::Unreadable`].
+fn get_failure(what: &str, err: StoreError) -> ScrubResult {
+    let detail = format!("{what} GET failed: {err}");
+    if err.is_retryable() || matches!(err, StoreError::NotFound) {
+        ScrubResult::ReadError {
+            detail,
+            retryable: err.is_retryable(),
+        }
+    } else {
+        ScrubResult::Unreadable { detail }
+    }
 }
 
 /// Scrub one object identified by its commit record (ADR-0059 decision 4's
@@ -148,16 +179,20 @@ pub async fn scrub_one_object(
         Err(_) => {
             return ScrubResult::ReadError {
                 detail: format!("commit record carries unknown signal {}", record.signal),
+                retryable: false,
             };
         }
     };
     let key = record.object_key.as_str();
 
-    // Tier 1: structural. A store error is a ReadError; a reader error is real
-    // corruption.
+    // Tier 1: structural. A store error is classified by `get_failure`; a
+    // reader error is real corruption.
     match verify_structure(store, key, signal).await {
         Ok(()) => {}
-        Err(StructuralOutcome::Read(detail)) => return ScrubResult::ReadError { detail },
+        Err(StructuralOutcome::Read(result)) => {
+            log_unreadable(clock, key, &result);
+            return result;
+        }
         Err(StructuralOutcome::Corrupt(detail)) => {
             tracing::warn!(
                 object_key = key,
@@ -178,15 +213,16 @@ pub async fn scrub_one_object(
                     "commit record content_hash is {} bytes, expected 32",
                     record.content_hash.len()
                 ),
+                retryable: false,
             };
         }
     };
     let full = match store.get(key, GetRange::Full).await {
         Ok(got) => got,
         Err(err) => {
-            return ScrubResult::ReadError {
-                detail: format!("full-object GET failed: {err}"),
-            };
+            let result = get_failure("full-object", err);
+            log_unreadable(clock, key, &result);
+            return result;
         }
     };
     let actual = *blake3::hash(full.data.as_ref()).as_bytes();
@@ -213,17 +249,30 @@ pub async fn scrub_one_object(
                 );
                 return ScrubResult::PostingsDisagreement { name, ordinal };
             }
-            Err(detail) => return ScrubResult::ReadError { detail },
+            Err(result) => return result,
         }
     }
 
     ScrubResult::Clean
 }
 
-/// Structural-tier outcome: a store/read failure to retry, or genuine
-/// corruption to alarm.
+/// Log an [`ScrubResult::Unreadable`] outcome the way the other anomalies are
+/// logged; any other result is left to the caller.
+fn log_unreadable(clock: &dyn Clock, key: &str, result: &ScrubResult) {
+    if let ScrubResult::Unreadable { detail } = result {
+        tracing::warn!(
+            object_key = key,
+            detected_unix_ns = clock.now_ns(),
+            detail = %detail,
+            "scrub: object unreadable (non-retryable store error)"
+        );
+    }
+}
+
+/// Structural-tier outcome: a failed GET, already classified by
+/// [`get_failure`], or genuine corruption to alarm.
 enum StructuralOutcome {
-    Read(String),
+    Read(ScrubResult),
     Corrupt(String),
 }
 
@@ -241,7 +290,7 @@ async fn verify_structure(
     let probe = store
         .get(key, GetRange::Suffix(FOOTER_PROBE_BYTES))
         .await
-        .map_err(|err| StructuralOutcome::Read(format!("footer suffix GET failed: {err}")))?;
+        .map_err(|err| StructuralOutcome::Read(get_failure("footer suffix", err)))?;
     let total = probe.total_size;
 
     match signal {
@@ -265,9 +314,7 @@ async fn verify_structure_rseg(
             let tail = store
                 .get(key, GetRange::Range(offset, offset + len))
                 .await
-                .map_err(|err| {
-                    StructuralOutcome::Read(format!("footer range GET failed: {err}"))
-                })?;
+                .map_err(|err| StructuralOutcome::Read(get_failure("footer range", err)))?;
             match ravel_segment::open_from_suffix(&tail.data, total, limits)
                 .map_err(|err| StructuralOutcome::Corrupt(format!("RSEG footer: {err}")))?
             {
@@ -294,9 +341,7 @@ async fn verify_structure_rlog(
             let tail = store
                 .get(key, GetRange::Range(offset, offset + len))
                 .await
-                .map_err(|err| {
-                    StructuralOutcome::Read(format!("footer range GET failed: {err}"))
-                })?;
+                .map_err(|err| StructuralOutcome::Read(get_failure("footer range", err)))?;
             match ravel_logseg::open_from_suffix(&tail.data, total)
                 .map_err(|err| StructuralOutcome::Corrupt(format!("RLOG footer: {err}")))?
             {
@@ -311,37 +356,43 @@ async fn verify_structure_rlog(
 
 /// Run the postings tier. Returns `Ok(None)` when the postings' claims agree
 /// with this object's true name set, `Ok(Some((name, ordinal)))` on the first
-/// false negative, or `Err(detail)` on a read/decode inconsistency (classified
-/// by the caller as a [`ScrubResult::ReadError`], never a corruption finding).
+/// false negative, or `Err` with a [`ScrubResult::ReadError`] on a read or
+/// decode failure, never a corruption finding: the content tier has already
+/// verified the object's bytes by then. The error is retryable only when the
+/// re-derivation's own store read failed retryably.
 async fn check_postings(
     store: &dyn ObjectStoreBackend,
     record: &CommitRecord,
     signal: Signal,
     covering: &CoveringPostings<'_>,
-) -> Result<Option<(String, u64)>, String> {
+) -> Result<Option<(String, u64)>, ScrubResult> {
+    let inconsistent = |detail: String| ScrubResult::ReadError {
+        detail,
+        retryable: false,
+    };
     let limits = PostingsLimits {
         max_postings_bytes: covering.max_postings_bytes,
     };
     let decoded = decode_postings(covering.bytes, &limits, covering.part_blake3)
-        .map_err(|err| format!("covering postings failed to decode: {err}"))?;
+        .map_err(|err| inconsistent(format!("covering postings failed to decode: {err}")))?;
 
     // Locate this object's ordinal in the concatenated covered-entry list.
     let ordinal = match self_ordinal(covering.covered_entries, record) {
         Some(index) => index as u64,
         None => {
-            return Err(
+            return Err(inconsistent(
                 "this object's entry was not found among the covering postings' covered entries"
                     .to_string(),
-            );
+            ));
         }
     };
     let entry = &covering.covered_entries[ordinal as usize];
 
     let tenant_hash: [u8; 16] = record.tenant_hash.as_slice().try_into().map_err(|_| {
-        format!(
+        inconsistent(format!(
             "commit record tenant_hash is {} bytes, expected 16",
             record.tenant_hash.len()
-        )
+        ))
     })?;
     let tenant = TenantHash(tenant_hash);
 
@@ -349,7 +400,10 @@ async fn check_postings(
     // wrote the postings did (shared function, ADR-0059 decision 3).
     let mut true_names: Vec<String> = fetch_segment_names(store, &tenant, signal, entry)
         .await
-        .map_err(|err| format!("re-deriving segment names failed: {err}"))?
+        .map_err(|err| ScrubResult::ReadError {
+            retryable: matches!(&err, PostingsBuildError::Store(store) if store.is_retryable()),
+            detail: format!("re-deriving segment names failed: {err}"),
+        })?
         .into_iter()
         .collect();
     // Deterministic order so the reported disagreement is stable.
@@ -948,6 +1002,76 @@ mod tests {
             }
             other => panic!("expected ChecksumMismatch, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_object_get_failure_is_classified_by_whether_a_retry_can_clear_it() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let memory = std::sync::Arc::new(MemoryStore::new());
+        let clock = FixedClock::new(0);
+        let record = publish_metric_segment(&memory, Uuid::new_v4(), 1, &["cpu"]).await;
+        let faulted = |fault: ScriptedFault| {
+            FaultStore::new(
+                memory.clone(),
+                FaultPlan::empty()
+                    .with_rule(Rule::new(Op::Get, fault).with_key_contains(&record.object_key)),
+            )
+        };
+
+        let transient = faulted(ScriptedFault::Transient("injected".to_string()));
+        let result = scrub_one_object(&transient, &clock, &record, None).await;
+        assert!(
+            matches!(
+                result,
+                ScrubResult::ReadError {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "a transient GET error is retried, got {result:?}"
+        );
+        assert_eq!(transient.fault_count(Op::Get, FaultKind::Transient), 1);
+
+        let throttled = faulted(ScriptedFault::Throttled { retry_after_ms: 5 });
+        let result = scrub_one_object(&throttled, &clock, &record, None).await;
+        assert!(
+            matches!(
+                result,
+                ScrubResult::ReadError {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "a throttled GET is retried, got {result:?}"
+        );
+        assert_eq!(throttled.fault_count(Op::Get, FaultKind::Throttled), 1);
+
+        let permanent = faulted(ScriptedFault::Permanent("injected".to_string()));
+        let result = scrub_one_object(&permanent, &clock, &record, None).await;
+        assert!(
+            matches!(result, ScrubResult::Unreadable { .. }),
+            "a permanent GET error is a finding, got {result:?}"
+        );
+        assert_eq!(permanent.fault_count(Op::Get, FaultKind::Permanent), 1);
+
+        memory
+            .delete(&record.object_key)
+            .await
+            .expect("delete object");
+        let result = scrub_one_object(&memory, &clock, &record, None).await;
+        assert!(
+            matches!(
+                result,
+                ScrubResult::ReadError {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "a missing object is neither retried nor a finding, got {result:?}"
+        );
     }
 
     #[tokio::test]
