@@ -65,7 +65,10 @@
 //! fails the slice with `BAD_DATA`. A record that is missing, unreadable,
 //! fails verification, or disagrees with the identity fails the slice with
 //! `UNSUPPORTED`, which makes the coordinator run the whole query locally
-//! through its own catalog resolve. Neither ever reads another object instead.
+//! through its own catalog resolve. A record GET that fails with a retryable
+//! store error is [`ResolveIdentityError::RecordUnavailable`] and fails the
+//! slice with `UNAVAILABLE`, which makes the coordinator re-dispatch that one
+//! slice. None of them ever reads another object instead.
 //!
 //! Cross-cluster federation is the exception, and stays one: a resolve-scope
 //! request is authoritative on the remote cluster, which resolves its OWN
@@ -123,7 +126,12 @@ pub enum ResolveIdentityError {
     /// No record exists at the key the identity reconstructs.
     #[error("record {key} for the pinned segment was not found")]
     RecordMissing { key: String },
-    /// The record at the reconstructed key could not be read.
+    /// The record GET failed with a retryable store error (throttled, timed
+    /// out, or transient). Another worker, or a later attempt, can read it.
+    #[error("record {key} for the pinned segment is unavailable: {reason}")]
+    RecordUnavailable { key: String, reason: String },
+    /// The record at the reconstructed key could not be read, for a reason a
+    /// retry would not change.
     #[error("record {key} for the pinned segment could not be read: {reason}")]
     RecordRead { key: String, reason: String },
     /// The record read back does not decode, fails its own validation, is not
@@ -143,13 +151,15 @@ impl ResolveIdentityError {
         }
     }
 
-    /// The wire status this failure fails its slice with. Every record failure
-    /// is `UNSUPPORTED`, which makes the coordinator run the whole query
-    /// locally through its own catalog resolve.
+    /// The wire status this failure fails its slice with. A retryable record
+    /// GET error is `UNAVAILABLE`, which makes the coordinator re-dispatch that
+    /// one slice. Every other record failure is `UNSUPPORTED`, which makes it
+    /// run the whole query locally through its own catalog resolve.
     pub fn status_code(&self) -> pb::status::Code {
         match self {
             ResolveIdentityError::Invalid { .. } => pb::status::Code::BadData,
             ResolveIdentityError::Unknown { .. } => pb::status::Code::SnapshotInvalidated,
+            ResolveIdentityError::RecordUnavailable { .. } => pb::status::Code::Unavailable,
             ResolveIdentityError::RecordMissing { .. }
             | ResolveIdentityError::RecordRead { .. }
             | ResolveIdentityError::RecordInvalid { .. }
@@ -258,6 +268,10 @@ impl ReconstructingSegmentResolver {
             }
             Err(StoreError::NotFound) => Err(ResolveIdentityError::RecordMissing {
                 key: key.to_string(),
+            }),
+            Err(err) if err.is_retryable() => Err(ResolveIdentityError::RecordUnavailable {
+                key: key.to_string(),
+                reason: err.to_string(),
             }),
             Err(err) => Err(ResolveIdentityError::RecordRead {
                 key: key.to_string(),
@@ -2088,6 +2102,44 @@ mod reconstruct_tests {
         };
         assert_eq!(key, &l0_key());
         assert_eq!(err.status_code(), pb::status::Code::Unsupported);
+    }
+
+    /// A retryable store error on the record GET is `UNAVAILABLE`, so the
+    /// coordinator re-dispatches that one slice instead of running the whole
+    /// query locally. Each of the three retryable kinds is checked, and each
+    /// fault is proven to have fired.
+    #[tokio::test]
+    async fn a_retryable_record_get_error_is_unavailable() {
+        let cases = [
+            (
+                ScriptedFault::Transient("blip".into()),
+                FaultKind::Transient,
+            ),
+            (ScriptedFault::Timeout, FaultKind::Timeout),
+            (
+                ScriptedFault::Throttled { retry_after_ms: 5 },
+                FaultKind::Throttled,
+            ),
+        ];
+        for (scripted, kind) in cases {
+            let inner = store_with_l0().await;
+            let fault = Arc::new(FaultStore::new(
+                inner,
+                FaultPlan::empty().with_rule(Rule::new(Op::Get, scripted)),
+            ));
+            let (err, gets) = refusal(fault.clone(), &l0_identity()).await;
+            assert_eq!(fault.fault_count(Op::Get, kind), 1, "{kind:?} fired");
+            assert_eq!(gets, 1, "{kind:?}: one record GET");
+            let ResolveIdentityError::RecordUnavailable { key, .. } = &err else {
+                panic!("{kind:?}: expected RecordUnavailable, got {err:?}");
+            };
+            assert_eq!(key, &l0_key());
+            assert_eq!(
+                err.status_code(),
+                pb::status::Code::Unavailable,
+                "{kind:?}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

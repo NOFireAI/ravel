@@ -847,7 +847,10 @@ impl FragmentService {
     /// read: records and the objects they name are immutable, and the
     /// coordinator's pins name them directly. A record that is missing, fails
     /// verification, or disagrees with the identity fails the slice as
-    /// `Unsupported`, and the coordinator runs the query locally.
+    /// `Unsupported`, and the coordinator runs the query locally; a retryable
+    /// store error on the record GET fails it as `Unavailable`, and the
+    /// coordinator re-dispatches that slice. Record GETs draw from this
+    /// process's GET limiter.
     ///
     /// Returns `None` for a tenant hash we cannot decode or a signal other than
     /// metrics. The delegate service rejects both with the same typed status
@@ -4228,6 +4231,44 @@ mod tests {
             "{}",
             response.status_message
         );
+    }
+
+    /// A transient store error on the commit-record GET answers `Unavailable`,
+    /// the status the coordinator answers by re-dispatching this one slice,
+    /// not `Unsupported` and a whole-query local run.
+    #[tokio::test]
+    async fn pinned_l0_with_transient_record_get_error_is_unavailable() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+        let (store, tenant_hash, seg, _) = pinned_l0("l0-transient").await;
+        let commit_key = published_commit_key(tenant_hash);
+        let fault = Arc::new(FaultStore::new(
+            store,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Transient("blip".into()))
+                    .with_key_contains(commit_key.clone()),
+            ),
+        ));
+        let service = pinned_service(fault.clone(), 4 * HOUR_NS);
+        let response = service
+            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert_eq!(
+            response.status,
+            pb::status::Code::Unavailable,
+            "{}",
+            response.status_message
+        );
+        assert!(
+            response.status_message.contains(&commit_key),
+            "{}",
+            response.status_message
+        );
+        assert_eq!(response.series_returned, 0, "no rows");
+        assert!(response.scalar.is_empty(), "no frames");
     }
 
     /// A commit record whose bytes do not decode fails the fragment locally.

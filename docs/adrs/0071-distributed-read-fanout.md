@@ -159,7 +159,9 @@ segment's own commit, compaction, or rewrite record, not its catalog.
 - Bad pinned record (the pinned-record amendment below): a pinned segment's
   own record is missing, unreadable, fails verification, or disagrees with
   the identity the coordinator shipped. The worker fails the slice
-  `Unsupported` and the coordinator runs the whole query locally.
+  `Unsupported` and the coordinator runs the whole query locally. A retryable
+  store error on that record's GET is `Unavailable` instead, and takes the
+  worker-unreachable path above for that one slice.
 
 ## Security
 
@@ -1635,8 +1637,11 @@ objects were all still readable.
 3. **A bad pinned record runs the query locally.** A record that is missing,
    unreadable, fails verification, or disagrees with the identity fails the
    slice `Unsupported`, and the coordinator runs the whole query locally
-   through its own catalog resolve. A structurally malformed identity is
-   `BadData`. Neither reads another object in place of the one pinned.
+   through its own catalog resolve. A record GET that fails with a retryable
+   store error (throttled, timed out, or transient) fails the slice
+   `Unavailable` instead, so only that slice is re-dispatched, as for a lost
+   worker. A structurally malformed identity is `BadData`. None of these reads
+   another object in place of the one pinned.
 
 4. **Request count.** A worker issues one record GET per pinned L0 segment,
    one per pinned L1 part, and two for an L1 part only a rewrite record
