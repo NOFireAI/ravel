@@ -40,30 +40,47 @@
 //! The content tier walks the shard with a start-after marker (ADR-1686), so a
 //! tick's LIST and GET count depends on its budget, not on the corpus size:
 //!
-//! 1. Load this shard's persisted [`ScrubCursor`]. When it has no entry count
-//!    for the current rotation (the first rotation, the one after a completed
-//!    rotation, or a cursor an older build wrote), count the entries under the
-//!    commit shard prefix with a LIST-only pass and open a rotation.
-//! 2. Size the per-tick budget from the configured scrub period `P`: the
-//!    previous rotation's bytes ([`ravel_maintain::per_tick_byte_budget`]),
-//!    or, in a rotation with no predecessor, `ceil(count * tick / P)` listing
-//!    entries ([`ravel_maintain::per_tick_entry_budget`]).
-//! 3. List strictly after the cursor's marker and consume entries until the
-//!    budget is filled. A commit record is a unit on its own; the compaction
+//! 1. Load this shard's persisted [`ScrubCursor`]. A cursor GET that fails for
+//!    any reason other than `NotFound` skips the tick and leaves the stored
+//!    cursor alone, since starting over would discard the rotation's progress
+//!    on a transient fault. When the cursor has no entry count for the current
+//!    rotation (the first rotation, the one after a completed rotation, or a
+//!    cursor an older build wrote), count the entries under the commit shard
+//!    prefix with a LIST-only pass and open a rotation.
+//! 2. Otherwise count the entries appended past the rotation's tail mark with
+//!    a LIST-only pass and add them to the rotation's estimate, so a shard
+//!    that keeps committing cannot outrun the walk.
+//! 3. Plan the tick ([`ScrubCursor::plan_tick`]): the rotation is allotted
+//!    `min(P, retention window)` and what is left to cover is divided by the
+//!    ticks remaining before that deadline, bounded by
+//!    [`ravel_maintain::SCRUB_MAX_CATCHUP`] times the sustained rate. A plan
+//!    past that ceiling is `behind`: the rotation cannot finish in time, which
+//!    increments `ravel_scrub_behind_total` and logs both numbers.
+//! 4. List strictly after the cursor's marker and consume entries until either
+//!    cap of the plan's budget is filled, verifying each unit's objects as the
+//!    walk reaches them. A commit record is a unit on its own; the compaction
 //!    records, rewrite records, and tombstone of an hour, which sort after
 //!    every commit record under that hour, form one unit with the rest of the
-//!    hour, so the lineage filter above always sees an hour's whole set.
+//!    hour, and when an earlier tick already consumed part of that set the
+//!    unit re-lists the hour so lineage selection still sees all of it.
 //!    Decoding a unit yields the objects it names ([`ScrubTarget`]s), each
 //!    with the record to verify it against and its
 //!    [`ravel_maintain::ScrubLevel`]. The level lives beside the target alone,
-//!    so the label a mismatch is counted under has one owner.
-//! 4. Verify each object in the slice via
+//!    so the label a mismatch is counted under has one owner. Every listing
+//!    page, every record GET attempt, and
+//!    [`ravel_maintain::SCRUB_REQUESTS_PER_OBJECT`] per object verified count
+//!    against the request cap, so a tick whose GETs all fail still stops.
+//! 5. A unit whose record GET failed with a transient store error is not
+//!    consumed: the marker stays behind it and the tick ends, so the next tick
+//!    retries it rather than skipping its objects for a whole rotation.
+//! 6. Verify each object via
 //!    [`scrub_one_object`](ravel_maintain::scrub_one_object) and record any
 //!    anomaly on the metrics counters below.
-//! 5. Persist the cursor with the marker on the last entry consumed. When the
+//! 7. Persist the cursor with the marker on the last entry consumed. When the
 //!    listing ended past the marker, the rotation rolls over instead: the
-//!    marker clears and the rotation's bytes size the next one, completing a
-//!    full rotation over the shard in about `P`.
+//!    marker clears and the next rotation is counted afresh, completing a full
+//!    rotation over the shard within `min(P, retention window)` whenever the
+//!    shard's commit rate stays inside the catch-up ceiling.
 //!
 //! # Why Maintain-mode only
 //!
@@ -118,7 +135,10 @@ use std::time::Duration;
 use ravel_commit::keys;
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::ScrubCursor;
-use ravel_maintain::{Clock, ScrubLevel, ScrubResult, ScrubTarget, WorkerSet, scrub_one_object};
+use ravel_maintain::{
+    Clock, RetentionConfig, SCRUB_REQUESTS_PER_OBJECT, ScrubLevel, ScrubResult, ScrubTarget,
+    WorkerSet, scrub_one_object,
+};
 use ravel_object_store::{
     DrainStep, GetRange, MAX_LIST_PAGES, ObjectStoreBackend, PageToken, PutOptions, StoreError,
     drain_pages,
@@ -218,6 +238,12 @@ pub struct ScrubMetrics {
     /// commit shard prefix, per signal (denominator of the cursor-position
     /// gauge).
     rotation_total: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Shard ticks whose rotation could not finish inside its allotted window
+    /// at the catch-up ceiling, per signal. `ravel_scrub_behind_total`: a
+    /// nonzero rate means the configured scrub period is too short for the
+    /// shard's commit rate, or the retention window is shorter than one
+    /// rotation, and some objects will expire unverified.
+    rotation_behind: [AtomicU64; MAINTAINED_SIGNALS.len()],
 }
 
 impl ScrubMetrics {
@@ -235,6 +261,12 @@ impl ScrubMetrics {
 
     pub fn seal_divergence_mismatched(&self, signal: Signal) -> u64 {
         self.seal_divergence_mismatched[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Shard ticks that reported a rotation which cannot finish inside its
+    /// allotted window, for `signal`.
+    pub fn rotation_behind(&self, signal: Signal) -> u64 {
+        self.rotation_behind[signal_index(signal)].load(Ordering::Relaxed)
     }
 
     /// Fraction of the current rotation covered so far for `signal`, in
@@ -267,6 +299,10 @@ impl ScrubMetrics {
 
     fn record_seal_divergence_mismatched(&self, signal: Signal, count: u64) {
         self.seal_divergence_mismatched[signal_index(signal)].fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_rotation_behind(&self, signal: Signal) {
+        self.rotation_behind[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_cursor_position(&self, signal: Signal, covered: u64, total: u64) {
@@ -321,6 +357,7 @@ impl ScrubTask {
 /// tenant scoping. Returns immediately; the task runs until
 /// [`ScrubTask::shutdown`]. The first cycle sleeps a full (jittered) interval
 /// before its first read, so co-started replicas do not scrub in lockstep.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
     restrict: Vec<TenantHash>,
@@ -328,6 +365,7 @@ pub fn spawn(
     shard_count: u32,
     metrics: Arc<ScrubMetrics>,
     worker: Arc<WorkerSet>,
+    retention: Arc<RetentionConfig>,
 ) -> ScrubTask {
     let restrict = if restrict.is_empty() {
         None
@@ -379,6 +417,7 @@ pub fn spawn(
                 metrics.as_ref(),
                 worker.as_ref(),
                 &live_set,
+                Some(retention.as_ref()),
             )
             .await;
         }
@@ -405,6 +444,7 @@ pub async fn run_cycle(
     metrics: &ScrubMetrics,
     worker: &WorkerSet,
     live_set: &[Uuid],
+    retention: Option<&RetentionConfig>,
 ) {
     let outcome = match discover_and_restrict(store, restrict).await {
         Ok(outcome) => outcome,
@@ -419,6 +459,15 @@ pub async fn run_cycle(
 
     let clock = WallClock;
     for tenant in &outcome.maintained {
+        // A rotation must not outlive the data it verifies: an object retention
+        // deletes before the walk reaches it is never verified at all. The
+        // tenant's own window (ADR-0019) caps the rotation length below the
+        // configured scrub period; `None` means unlimited retention, which caps
+        // nothing.
+        let retention_secs = retention.and_then(|cfg| cfg.window_for(tenant)).map(|ns| {
+            let secs = ns / 1_000_000_000;
+            u64::try_from(secs).unwrap_or(u64::MAX).max(1)
+        });
         for signal in MAINTAINED_SIGNALS {
             // Resolve the covering name-postings object once per (tenant,
             // signal) per tick: postings cover a whole snapshot
@@ -482,6 +531,7 @@ pub async fn run_cycle(
                     shard,
                     period_secs,
                     tick_secs,
+                    retention_secs,
                     covering.as_ref(),
                     metrics,
                 )
@@ -584,12 +634,13 @@ async fn scan_shards(
 
 /// One content-tier tick over one `(tenant, signal, shard)` (ADR-1686): load
 /// the shard's persisted cursor, open a rotation with a LIST-only entry count
-/// when it needs one, walk the commit shard prefix from the cursor's
-/// start-after marker until the per-tick budget is filled, verify each object
-/// the walk sliced, and persist the advanced cursor. The walk never builds the
-/// whole corpus: it lists and GETs only the entries this tick consumes, plus
-/// at most one partial page. Every store error is logged and the tick is
-/// retried next cycle; nothing here mutates durable data.
+/// when it needs one or count the tail's appends when it does not, plan the
+/// tick against the rotation's deadline, then walk the commit shard prefix
+/// from the cursor's start-after marker, verifying each unit's objects as the
+/// walk reaches them, until either cap of the plan's budget is filled. The
+/// walk never builds the whole corpus: it lists and GETs only the entries this
+/// tick consumes, plus at most one partial page. Every store error is logged
+/// and the tick is retried next cycle; nothing here mutates durable data.
 #[allow(clippy::too_many_arguments)]
 async fn run_shard_tick(
     store: &dyn ObjectStoreBackend,
@@ -599,6 +650,7 @@ async fn run_shard_tick(
     shard: u32,
     period_secs: u64,
     tick_secs: u64,
+    retention_secs: Option<u64>,
     covering: Option<&ravel_catalog::LoadedCoveringPostings>,
     metrics: &ScrubMetrics,
 ) {
@@ -613,10 +665,12 @@ async fn run_shard_tick(
         }
     };
 
-    let mut cursor = load_cursor(store, tenant, signal, shard, clock.now_ns()).await;
+    let Some(mut cursor) = load_cursor(store, tenant, signal, shard, clock.now_ns()).await else {
+        return;
+    };
     if cursor.needs_entry_count() {
-        match count_entries(store, &prefix).await {
-            Ok(total) => cursor.start_rotation(total, clock.now_ns()),
+        match count_entries_after(store, &prefix, None).await {
+            Ok((total, tail)) => cursor.start_rotation(total, tail, clock.now_ns()),
             Err(err) => {
                 tracing::warn!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
@@ -625,44 +679,37 @@ async fn run_shard_tick(
                 return;
             }
         }
-    }
-
-    // Consume the listing in units until the budget is filled. The marker
-    // advances past each unit whether or not its records decoded, so one bad
-    // record cannot pin the rotation.
-    let budget = cursor.tick_budget(period_secs, tick_secs);
-    let mut listing = MarkerListing::new(store, &prefix, cursor.last_commit_key.clone());
-    let mut slice: Vec<SliceEntry> = Vec::new();
-    let mut slice_entries = 0u64;
-    let mut slice_bytes = 0u64;
-    let mut listing_failed = false;
-    while !budget.is_filled(slice_entries, slice_bytes) {
-        let unit = match next_unit(&mut listing).await {
-            Ok(Some(unit)) => unit,
-            Ok(None) => break,
+    } else {
+        // Entries committed since the rotation opened are part of what this
+        // rotation has to cover; counting them each tick is what keeps a shard
+        // that keeps committing from growing its tail as fast as the walk
+        // consumes it. A count failure only leaves the estimate where it was,
+        // so the tick still runs on the entries already observed.
+        match count_entries_after(store, &prefix, cursor.rotation_tail_key.as_deref()).await {
+            Ok((appended, tail)) => cursor.observe_appended(appended, tail),
             Err(err) => {
                 tracing::warn!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
-                    "scrub: LIST of commit records failed; scrubbing the slice so far, resumed \
-                     next tick"
+                    "scrub: LIST-only tail count failed; sizing this tick from the entries \
+                     already observed"
                 );
-                listing_failed = true;
-                break;
             }
-        };
-        let targets = unit_targets(store, &unit).await;
-        let bytes = targets.iter().fold(0u64, |sum, entry| {
-            sum.saturating_add(entry.target.object_size)
-        });
-        let entries = unit.len() as u64;
-        if let Some(last) = unit.into_iter().next_back() {
-            cursor.consume(last, entries, bytes);
         }
-        slice_entries = slice_entries.saturating_add(entries);
-        slice_bytes = slice_bytes.saturating_add(bytes);
-        slice.extend(targets);
     }
-    let rotation_complete = !listing_failed && listing.ended();
+
+    let plan = cursor.plan_tick(period_secs, tick_secs, retention_secs, clock.now_ns());
+    if plan.behind {
+        tracing::error!(
+            tenant = %tenant.to_hex(), signal = ?signal, shard,
+            needed_entries_per_tick = plan.needed_entries,
+            budgeted_entries_per_tick = plan.budget.max_entries,
+            rotation_window_secs = plan.rotation_secs,
+            scrub_period_secs = period_secs,
+            "scrub: rotation cannot finish inside its window at the catch-up ceiling; some \
+             objects will expire unverified"
+        );
+        metrics.record_rotation_behind(signal);
+    }
 
     // Build the borrowing `CoveringPostings` once for this signal's tick from
     // the owned data loaded per (tenant, signal) in `run_cycle`.
@@ -677,7 +724,96 @@ async fn run_shard_tick(
         max_postings_bytes: ravel_catalog::DEFAULT_MAX_POSTINGS_BYTES,
     });
 
-    for entry in &slice {
+    // Consume the listing in units until either cap of the budget is filled,
+    // verifying each unit's objects before moving on so the verification GETs
+    // are charged to this tick's request cap rather than running unbounded
+    // after the walk. The marker advances past a unit whose records failed to
+    // DECODE (one bad record must not pin the rotation), but not past one
+    // whose records failed to GET: that is a transient fault, and skipping it
+    // would leave its objects unverified for a whole rotation.
+    let mut listing = MarkerListing::new(store, &prefix, cursor.last_commit_key.clone());
+    let mut slice_entries = 0u64;
+    let mut requests = 0u64;
+    let mut listing_failed = false;
+    let mut unit_get_failed = false;
+    while !plan.budget.is_filled(slice_entries, requests) {
+        let pages_before = listing.pages;
+        let unit = match next_unit(store, &mut listing).await {
+            Ok(Some(unit)) => unit,
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
+                    "scrub: LIST of commit records failed; scrubbing the slice so far, resumed \
+                     next tick"
+                );
+                listing_failed = true;
+                break;
+            }
+        };
+        requests = requests
+            .saturating_add((listing.pages - pages_before) as u64)
+            .saturating_add(unit.context_pages);
+        let outcome = unit_targets(store, &unit).await;
+        requests = requests.saturating_add(outcome.gets);
+        if outcome.get_failed {
+            // Leave the marker where it is: this unit is retried next tick.
+            unit_get_failed = true;
+            break;
+        }
+        let bytes = outcome.targets.iter().fold(0u64, |sum, entry| {
+            sum.saturating_add(entry.target.object_size)
+        });
+        let entries = unit.advance.len() as u64;
+        if let Some(last) = unit.advance.into_iter().next_back() {
+            cursor.consume(last, entries, bytes);
+        }
+        slice_entries = slice_entries.saturating_add(entries);
+        requests = requests
+            .saturating_add((outcome.targets.len() as u64).saturating_mul(SCRUB_REQUESTS_PER_OBJECT));
+        verify_slice(
+            store,
+            clock,
+            tenant,
+            signal,
+            shard,
+            &outcome.targets,
+            covering_postings,
+            metrics,
+        )
+        .await;
+    }
+    let rotation_complete = !listing_failed && !unit_get_failed && listing.ended();
+
+    // Cursor-position gauge (ADR-1686 decision 5): listing entries consumed
+    // this rotation over the rotation's estimated entry count. A completed
+    // rotation reads as full coverage before it rolls over.
+    let total = cursor.estimated_rotation_entries();
+    if rotation_complete {
+        metrics.record_cursor_position(signal, total, total);
+        cursor.complete_rotation(clock.now_ns());
+    } else {
+        metrics.record_cursor_position(signal, cursor.rotation_entries_visited, total);
+    }
+
+    persist_cursor(store, tenant, signal, shard, &cursor).await;
+}
+
+/// Verify one unit's objects and record any anomaly. Split out of
+/// [`run_shard_tick`] so verification runs inside the walk, where its requests
+/// are charged to the tick's budget.
+#[allow(clippy::too_many_arguments)]
+async fn verify_slice(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    slice: &[SliceEntry],
+    covering_postings: Option<ravel_maintain::CoveringPostings<'_>>,
+    metrics: &ScrubMetrics,
+) {
+    for entry in slice {
         let key = &entry.target.object_key;
         let level = entry.level;
         // The structural + content tiers always run (footer crc re-verify, then
@@ -730,19 +866,6 @@ async fn run_shard_tick(
             }
         }
     }
-
-    // Cursor-position gauge (ADR-1686 decision 5): listing entries consumed
-    // this rotation over the rotation's LIST-only count. A completed rotation
-    // reads as full coverage before it rolls over.
-    let total = cursor.rotation_total_entries.unwrap_or(0);
-    if rotation_complete {
-        metrics.record_cursor_position(signal, total, total);
-        cursor.complete_rotation(clock.now_ns());
-    } else {
-        metrics.record_cursor_position(signal, cursor.rotation_entries_visited, total);
-    }
-
-    persist_cursor(store, tenant, signal, shard, &cursor).await;
 }
 
 /// One object a tick's slice verifies: its key and size, the record
@@ -754,22 +877,34 @@ struct SliceEntry {
     level: ScrubLevel,
 }
 
-/// The LIST-only pass that opens a rotation (ADR-1686 decision 3): count every
-/// entry under the commit shard prefix, with no GETs.
-async fn count_entries(store: &dyn ObjectStoreBackend, prefix: &str) -> Result<u64, StoreError> {
+/// The LIST-only pass that opens a rotation and the one that counts a
+/// rotation's appends (ADR-1686 decision 3, amended): count every entry under
+/// the commit shard prefix strictly after `start_after`, with no GETs, and
+/// return the greatest key it saw so the next pass can resume from there.
+///
+/// `start_after` of `None` counts the whole prefix, which is what opening a
+/// rotation needs. A pass that finds nothing new returns `(0, None)`, leaving
+/// the caller's existing tail mark in place.
+async fn count_entries_after(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    start_after: Option<&str>,
+) -> Result<(u64, Option<String>), StoreError> {
     let mut count = 0u64;
+    let mut tail: Option<String> = None;
     drain_pages::<StoreError, _, _, _>(
         prefix,
-        None,
+        start_after,
         MAX_LIST_PAGES,
-        |_start_after, token| async move { store.list(prefix, token).await },
-        |_meta| {
+        |start, token| async move { store.list_after(prefix, start.as_deref(), token).await },
+        |meta| {
             count += 1;
+            tail = Some(meta.key);
             Ok(DrainStep::Continue)
         },
     )
     .await?;
-    Ok(count)
+    Ok((count, tail))
 }
 
 /// The commit shard prefix listed strictly after a start-after marker, one
@@ -865,17 +1000,47 @@ impl<'a> MarkerListing<'a> {
     }
 }
 
+/// One unit of listing entries the walk consumes, and the lineage context that
+/// unit's exclusions are resolved against.
+struct Unit {
+    /// Entries this unit consumes from the walk. The marker advances to the
+    /// last of them, and only these entries' records have their parts
+    /// expanded into scrub targets.
+    advance: Vec<String>,
+    /// Every compaction record, rewrite record, and tombstone under the same
+    /// ingest hour, including ones an earlier tick already consumed. Lineage
+    /// selection reads all of them; `advance` is a subset. For a commit-record
+    /// unit this is empty (a commit record carries no lineage of its own).
+    context: Vec<String>,
+    /// Listing pages the context re-list cost, charged to the tick's request
+    /// budget.
+    context_pages: u64,
+}
+
 /// The next unit of listing entries the walk consumes (ADR-1686 decisions 2
-/// and 6). An L0 commit record, or an entry whose shape is not recognized, is
-/// a unit on its own. The first compaction record, rewrite record, or
-/// tombstone of an hour starts a unit holding every remaining entry under that
-/// hour: those shapes all sort after every commit record under the hour, and
-/// the lineage filter needs the hour's whole set of them at once, since a
-/// tombstone, a superseding rewrite record, or an overlapping compaction record
-/// anywhere in the hour changes which parts are live. So the marker lands only
-/// on a commit record or on an hour's last entry, and a unit never splits a
-/// lineage set across ticks.
-async fn next_unit(listing: &mut MarkerListing<'_>) -> Result<Option<Vec<String>>, StoreError> {
+/// and 6, amended). An L0 commit record, or an entry whose shape is not
+/// recognized, is a unit on its own. The first compaction record, rewrite
+/// record, or tombstone of an hour starts a unit holding every remaining entry
+/// under that hour: those shapes all sort after every commit record under the
+/// hour, and the lineage filter needs the hour's whole set of them at once,
+/// since a tombstone, a superseding rewrite record, or an overlapping
+/// compaction record anywhere in the hour changes which parts are live. So the
+/// marker lands only on a commit record or on an hour's last entry, and a unit
+/// never splits a lineage set across ticks.
+///
+/// Sorting after the marker is not enough on its own. A compaction record can
+/// land in an hour the marker has already passed (a compactor publishing late,
+/// or a second compactor racing the first), and that record then forms a unit
+/// holding only itself, with its overlap rival left outside the unit. Overlap
+/// selection run on that one record makes it authoritative by default and a
+/// loser's parts get scrubbed, which the module docs say never happens. So
+/// when the marker lies inside the hour's own lineage set, the hour is listed
+/// again from its start and the whole set becomes the unit's `context`, while
+/// only the entries past the marker are consumed.
+async fn next_unit(
+    store: &dyn ObjectStoreBackend,
+    listing: &mut MarkerListing<'_>,
+) -> Result<Option<Unit>, StoreError> {
     let Some(first) = listing.pop().await? else {
         return Ok(None);
     };
@@ -883,32 +1048,121 @@ async fn next_unit(listing: &mut MarkerListing<'_>) -> Result<Option<Vec<String>
         keys::partition_bucket_entry(&first),
         Ok(keys::BucketEntry::CommitRecord(_)) | Err(_)
     ) {
-        return Ok(Some(vec![first]));
+        return Ok(Some(Unit {
+            advance: vec![first],
+            context: Vec::new(),
+            context_pages: 0,
+        }));
     }
     let hour_dir = match first.rfind('/') {
         Some(slash) => first[..=slash].to_string(),
-        None => return Ok(Some(vec![first])),
+        None => {
+            return Ok(Some(Unit {
+                advance: vec![first],
+                context: Vec::new(),
+                context_pages: 0,
+            }));
+        }
     };
-    let mut unit = vec![first];
+    let mut advance = vec![first];
     while let Some(next) = listing.peek().await? {
         if !next.starts_with(&hour_dir) {
             break;
         }
         if let Some(key) = listing.pop().await? {
-            unit.push(key);
+            advance.push(key);
         }
     }
-    Ok(Some(unit))
+
+    // The marker sits inside this hour's lineage set only when a previous tick
+    // consumed part of it: a marker on one of the hour's commit records, or on
+    // any key outside the hour, leaves the whole set here in `advance`.
+    let split = match listing.start_after.as_deref() {
+        Some(marker) => {
+            marker.starts_with(&hour_dir)
+                && !matches!(
+                    keys::partition_bucket_entry(marker),
+                    Ok(keys::BucketEntry::CommitRecord(_))
+                )
+        }
+        None => false,
+    };
+    if !split {
+        let context = advance.clone();
+        return Ok(Some(Unit {
+            advance,
+            context,
+            context_pages: 0,
+        }));
+    }
+
+    let mut context: Vec<String> = Vec::new();
+    let mut pages = 0u64;
+    let hour_prefix = hour_dir.as_str();
+    drain_pages::<StoreError, _, _, _>(
+        hour_prefix,
+        None,
+        MAX_LIST_PAGES,
+        |_start, token| {
+            pages += 1;
+            async move { store.list(hour_prefix, token).await }
+        },
+        |meta| {
+            if !matches!(
+                keys::partition_bucket_entry(&meta.key),
+                Ok(keys::BucketEntry::CommitRecord(_))
+            ) {
+                context.push(meta.key);
+            }
+            Ok(DrainStep::Continue)
+        },
+    )
+    .await?;
+    Ok(Some(Unit {
+        advance,
+        context,
+        context_pages: pages,
+    }))
+}
+
+/// What decoding one unit produced: the objects to verify, the GET attempts it
+/// made, and whether any of them failed transiently.
+struct UnitOutcome {
+    targets: Vec<SliceEntry>,
+    /// Record GET attempts, successful or not. Every attempt is charged to the
+    /// tick's request budget, since a failing GET costs a request and moves no
+    /// bytes.
+    gets: u64,
+    /// A record GET failed with something other than `NotFound`. The caller
+    /// leaves the marker behind this unit and retries it next tick, rather than
+    /// skipping objects it never verified. `NotFound` is excluded on purpose:
+    /// retention deleting a listed record is not a fault to retry, and pinning
+    /// the marker on it would stall the rotation for good.
+    get_failed: bool,
 }
 
 /// The objects one unit of listing entries names: the L0 data object behind
 /// every commit record, and every part of a compaction or rewrite record that
 /// is not superseded, not an overlap loser, and not in a tombstoned bucket.
 /// The commit record (for an L0 object) or the `CompactionPart` (for a part)
-/// carries the object's size (for the byte budget) and the content hash
-/// `scrub_one_object` re-verifies against. A record whose GET or decode fails
-/// is logged and names nothing this tick.
-async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<SliceEntry> {
+/// carries the object's size and the content hash `scrub_one_object`
+/// re-verifies against. A record whose decode fails is logged and names
+/// nothing this tick.
+///
+/// Exclusions are resolved over the unit's whole ingest-hour lineage set
+/// ([`Unit::context`]), which can hold records an earlier tick already
+/// consumed; parts are expanded only for the records in [`Unit::advance`], so
+/// no object is verified twice in one rotation.
+async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcome {
+    let mut gets = 0u64;
+    let mut get_failed = false;
+    let lineage: &[String] = if unit.context.is_empty() {
+        &unit.advance
+    } else {
+        &unit.context
+    };
+    let advancing: std::collections::HashSet<&str> =
+        unit.advance.iter().map(String::as_str).collect();
     // Retention's physical sweep deletes every object in a tombstoned bucket
     // (L0 commit records, L1 parts, rewrite parts) as one unit, but does not
     // do so atomically with the listing: a compaction/rewrite record can
@@ -917,7 +1171,7 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<Sl
     // so the second pass can skip their compaction/rewrite records rather
     // than racing a sweep that may delete their parts mid-tick.
     let mut tombstoned_hours: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for key in unit {
+    for key in lineage {
         if let Ok(keys::BucketEntry::Tombstone(parsed)) = keys::partition_bucket_entry(key) {
             tombstoned_hours.insert(parsed.ingest_hour_bucket);
         }
@@ -934,7 +1188,7 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<Sl
     let mut compaction_records: Vec<(String, ravel_proto::commit::v1::CompactionRecord)> =
         Vec::new();
     let mut rewrite_records: Vec<(String, ravel_proto::commit::v1::RewriteRecord)> = Vec::new();
-    for key in unit {
+    for key in lineage {
         // L0 commit records, and the L1/rewrite parts a compaction or
         // erasure-rewrite record supersedes them with, all name objects
         // `scrub_one_object` can verify (its API is commit-record based; L1
@@ -944,9 +1198,11 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<Sl
         // compile here rather than being silently swallowed.
         match keys::partition_bucket_entry(key) {
             Ok(keys::BucketEntry::CommitRecord(_)) => {
+                gets += 1;
                 let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
+                        get_failed |= !matches!(err, StoreError::NotFound);
                         tracing::warn!(
                             key = %key, error = %err,
                             "scrub: commit record GET failed; skipping this object this tick"
@@ -987,9 +1243,11 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<Sl
                 if tombstoned_hours.contains(&parsed.ingest_hour_bucket) {
                     continue;
                 }
+                gets += 1;
                 let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
+                        get_failed |= !matches!(err, StoreError::NotFound);
                         tracing::warn!(
                             key = %key, error = %err,
                             "scrub: compaction record GET failed; skipping this tick"
@@ -1013,9 +1271,11 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<Sl
                 if tombstoned_hours.contains(&parsed.ingest_hour_bucket) {
                     continue;
                 }
+                gets += 1;
                 let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
+                        get_failed |= !matches!(err, StoreError::NotFound);
                         tracing::warn!(
                             key = %key, error = %err,
                             "scrub: rewrite record GET failed; skipping this tick"
@@ -1099,7 +1359,8 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<Sl
     };
 
     for (record_key, rec) in &compaction_records {
-        if superseded.contains(record_key.as_str())
+        if !advancing.contains(record_key.as_str())
+            || superseded.contains(record_key.as_str())
             || losing_compaction_records.contains(record_key.as_str())
         {
             continue;
@@ -1134,7 +1395,7 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<Sl
     }
 
     for (record_key, rec) in &rewrite_records {
-        if superseded.contains(record_key.as_str()) {
+        if !advancing.contains(record_key.as_str()) || superseded.contains(record_key.as_str()) {
             continue;
         }
         for part in &rec.parts {
@@ -1166,7 +1427,11 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<Sl
         }
     }
 
-    out
+    UnitOutcome {
+        targets: out,
+        gets,
+        get_failed,
+    }
 }
 
 /// The persisted per-shard cursor's object key. Nested under the existing
@@ -1202,23 +1467,34 @@ struct PersistedCursor {
     rotation_total_entries: Option<u64>,
     #[serde(default)]
     rotation_entries_visited: u64,
+    #[serde(default)]
+    rotation_appended_entries: u64,
+    #[serde(default)]
+    rotation_tail_key: Option<String>,
 }
 
 /// Load this shard's persisted cursor, or a fresh one at the start of a
 /// rotation when none exists yet or it fails to decode (a decode failure is
 /// treated as "start over," never an anomaly: the cursor is advisory scheduling
 /// state, not durable data).
+///
+/// A GET that fails for any reason other than `NotFound` returns `None` and
+/// the caller skips the tick. Starting a fresh rotation there would rewind the
+/// marker to the head of the listing and drop the rotation's progress on a
+/// transient throttle, so a store having a bad minute would keep restarting
+/// the rotation instead of finishing one. `NotFound` is the only answer that
+/// really means there is no cursor.
 async fn load_cursor(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
     shard: u32,
     now_ns: i64,
-) -> ScrubCursor {
+) -> Option<ScrubCursor> {
     let key = cursor_key(tenant, signal, shard);
     match store.get(&key, GetRange::Full).await {
         Ok(got) => match serde_json::from_slice::<PersistedCursor>(&got.data) {
-            Ok(persisted) => ScrubCursor {
+            Ok(persisted) => Some(ScrubCursor {
                 tenant_hash: *tenant,
                 signal,
                 shard,
@@ -1228,22 +1504,25 @@ async fn load_cursor(
                 last_rotation_bytes: persisted.last_rotation_bytes,
                 rotation_total_entries: persisted.rotation_total_entries,
                 rotation_entries_visited: persisted.rotation_entries_visited,
-            },
+                rotation_appended_entries: persisted.rotation_appended_entries,
+                rotation_tail_key: persisted.rotation_tail_key,
+            }),
             Err(err) => {
                 tracing::warn!(
                     key = %key, error = %err,
                     "scrub: cursor decode failed; starting a fresh rotation for this shard"
                 );
-                ScrubCursor::new(*tenant, signal, shard, now_ns)
+                Some(ScrubCursor::new(*tenant, signal, shard, now_ns))
             }
         },
-        Err(StoreError::NotFound) => ScrubCursor::new(*tenant, signal, shard, now_ns),
+        Err(StoreError::NotFound) => Some(ScrubCursor::new(*tenant, signal, shard, now_ns)),
         Err(err) => {
             tracing::warn!(
                 key = %key, error = %err,
-                "scrub: cursor GET failed; starting a fresh rotation for this shard this tick"
+                "scrub: cursor GET failed; skipping this shard's tick and keeping the stored \
+                 cursor, retried next tick"
             );
-            ScrubCursor::new(*tenant, signal, shard, now_ns)
+            None
         }
     }
 }
@@ -1267,6 +1546,8 @@ async fn persist_cursor(
         last_rotation_bytes: cursor.last_rotation_bytes,
         rotation_total_entries: cursor.rotation_total_entries,
         rotation_entries_visited: cursor.rotation_entries_visited,
+        rotation_appended_entries: cursor.rotation_appended_entries,
+        rotation_tail_key: cursor.rotation_tail_key.clone(),
     };
     let bytes = match serde_json::to_vec(&persisted) {
         Ok(bytes) => bytes,

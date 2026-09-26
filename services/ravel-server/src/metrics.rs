@@ -3383,6 +3383,10 @@ pub struct ScrubSignalSnapshot {
     /// cursor has consumed so far for this signal, in `[0.0, 1.0]` (operator
     /// visibility into cadence).
     pub cursor_position: f64,
+    /// Shard ticks whose rotation could not finish inside its allotted window
+    /// at the catch-up ceiling for this signal: `ravel_scrub_behind_total`
+    /// (ADR-1686 amendment).
+    pub rotation_behind: u64,
 }
 
 /// One scrape's at-rest scrubber counters (ADR-0059 decisions 1, 3), per
@@ -3499,6 +3503,27 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
             "ravel_scrub_cursor_position",
             &labels(mode, signal.signal),
             signal.cursor_position,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_scrub_behind_total",
+        "Shard ticks whose content-tier rotation could not finish inside its allotted window at \
+         the catch-up ceiling, by signal (ADR-1686 amendment). The window is the configured \
+         --scrub-period P, or the tenant's retention window when that is shorter. A nonzero \
+         increase means the shard commits faster than the scrub can verify at P, so some objects \
+         will expire before they are ever verified; the log line beside it names both the \
+         entries-per-tick the rotation needed and the entries-per-tick it was budgeted. Raise \
+         the tick rate or shorten P.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_scrub_behind_total",
+            &labels(mode, signal.signal),
+            signal.rotation_behind,
         );
     }
 }
@@ -5480,6 +5505,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 seal_divergence_missing: metrics.seal_divergence_missing(signal),
                 seal_divergence_mismatched: metrics.seal_divergence_mismatched(signal),
                 cursor_position: metrics.cursor_position(signal),
+                rotation_behind: metrics.rotation_behind(signal),
             })
             .collect(),
     });
@@ -8318,6 +8344,7 @@ mod tests {
                     seal_divergence_missing: 3,
                     seal_divergence_mismatched: 4,
                     cursor_position: 0.5,
+                    rotation_behind: 7,
                 },
                 ScrubSignalSnapshot {
                     signal: Signal::Logs,
@@ -8326,6 +8353,7 @@ mod tests {
                     seal_divergence_missing: 0,
                     seal_divergence_mismatched: 0,
                     cursor_position: 0.0,
+                    rotation_behind: 0,
                 },
             ],
         };

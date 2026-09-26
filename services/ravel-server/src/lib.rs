@@ -3435,6 +3435,10 @@ pub async fn start(
             config.shard_count,
             metrics.clone(),
             maintain_worker.clone(),
+            // A rotation must not outlive the data it verifies (ADR-1686
+            // amendment): the tenant's retention window caps the rotation
+            // length below --scrub-period when it is shorter.
+            Arc::new(config.maintain.retention.clone()),
         ),
         _ => scrub::ScrubTask::none(),
     };
