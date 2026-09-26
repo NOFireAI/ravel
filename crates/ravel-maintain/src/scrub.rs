@@ -1350,18 +1350,18 @@ mod tests {
         assert_eq!(cursor.last_rotation_bytes, Some(100));
     }
 
-    /// The bound in the property below: a shard appending fewer entries per
-    /// tick than a tick's own sustained rate over the rotation.
+    /// Appends per tick in the property below: equal to the rotation's
+    /// sustained rate when it opens, `ceil(100 * 3600 / 604800)` = 1.
     const APPENDS_PER_TICK: usize = 1;
 
     #[test]
-    fn a_rotation_completes_while_the_shard_keeps_committing_below_the_bound() {
+    fn a_rotation_completes_while_the_shard_keeps_committing_at_the_sustained_rate() {
         // P = 7 days, tick = 1 hour, so a rotation is allotted 168 ticks. The
         // shard holds 100 entries when the rotation opens and appends
-        // `APPENDS_PER_TICK` more every tick, which is below the sustained rate
-        // the deadline demands (100 entries over 168 ticks is well under one
-        // entry per tick once the catch-up allowance applies). The rotation
-        // must still reach the end of the listing inside its 168 ticks.
+        // `APPENDS_PER_TICK` more every tick, the sustained rate at the start.
+        // The walk takes at least the sustained rate every tick, and that rate
+        // rises as the appends raise the estimate, so the rotation must still
+        // reach the end of the listing inside its 168 ticks.
         let period_secs = 7 * 86_400;
         let tick_secs = 3_600;
         let deadline_ticks = period_secs / tick_secs;

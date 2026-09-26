@@ -38,7 +38,9 @@
 //! lifecycle records.)
 //!
 //! The content tier walks the shard with a start-after marker (ADR-1686), so a
-//! tick's LIST and GET count depends on its budget, not on the corpus size:
+//! tick's LIST and GET count depends on its budget, not on the corpus size,
+//! except on the tick that opens a rotation: its LIST-only count (step 1)
+//! lists the whole commit shard prefix.
 //!
 //! 1. Load this shard's persisted [`ScrubCursor`]. A cursor GET that fails for
 //!    any reason other than `NotFound` skips the tick and leaves the stored
@@ -3671,6 +3673,167 @@ mod tests {
             metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
             0,
             "a transient GET fault is never an anomaly"
+        );
+    }
+
+    /// The request cap stops a tick whose entry cap is not yet filled: a
+    /// compaction record naming eight parts costs its record GET plus
+    /// `8 * SCRUB_REQUESTS_PER_OBJECT` requests, more than the whole tick's
+    /// cap, so the tick ends after three of its four allowed entries.
+    #[tokio::test]
+    async fn the_request_cap_binds_before_the_entry_cap_on_a_many_part_unit() {
+        use ravel_proto::commit::v1::CompactionPart;
+
+        let memory = Arc::new(MemoryStore::new());
+        let tenant_hash = tenant().hash();
+        publish_segment_at(&memory, 1, &["cpu"], 500_000).await;
+        publish_segment_at(&memory, 2, &["mem"], 500_000).await;
+        let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, 0, 500_000);
+        let compact_clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let outcome = ravel_maintain::compact_bucket(
+            memory.as_ref(),
+            &compact_clock,
+            &ravel_maintain::CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+            "two sealed L0 inputs must compact, got {outcome:?}"
+        );
+        for seq in 3..=7u64 {
+            publish_segment_at(&memory, seq, &["cpu"], 500_001).await;
+        }
+
+        // Rewrite the compaction record in place so it names eight parts, each
+        // a byte-correct copy of the one real part under its own key.
+        let hour_prefix = keys::commit_shard_hour_prefix(&tenant_hash, Signal::Metrics, 0, 500_000)
+            .expect("hour prefix");
+        let record_key = list_all(memory.as_ref(), &hour_prefix)
+            .await
+            .expect("list bucket")
+            .iter()
+            .map(|m| m.key.clone())
+            .find(|k| {
+                matches!(
+                    keys::partition_bucket_entry(k),
+                    Ok(keys::BucketEntry::CompactionRecord(_))
+                )
+            })
+            .expect("a compaction record was published");
+        let mut record = ravel_commit::record::decode_compaction(
+            &memory
+                .get(&record_key, GetRange::Full)
+                .await
+                .expect("get compaction record")
+                .data,
+        )
+        .expect("decode compaction record");
+        assert_eq!(record.parts.len(), 1);
+        let part = record.parts[0].clone();
+        let part_bytes = memory
+            .get(
+                &keys::reconstruct_l1_part_key(&record, &part).expect("part key"),
+                GetRange::Full,
+            )
+            .await
+            .expect("get part")
+            .data;
+        record.parts = (0..8u8)
+            .map(|index| CompactionPart {
+                part_index: u32::from(index),
+                first_series_id: vec![index; 16],
+                last_series_id: vec![index; 16],
+                ..part.clone()
+            })
+            .collect();
+        assert_eq!(
+            keys::compaction_record_key_for(&record).expect("record key"),
+            record_key,
+            "the parts do not move the record's key"
+        );
+        let mut part_keys = Vec::new();
+        for part in &record.parts {
+            let key = keys::reconstruct_l1_part_key(&record, part).expect("part key");
+            memory
+                .put(&key, part_bytes.clone(), PutOptions::default())
+                .await
+                .expect("put part copy");
+            part_keys.push(key);
+        }
+        memory
+            .put(
+                &record_key,
+                ravel_commit::record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite compaction record");
+
+        // Eight entries over a two-tick rotation: four entries and 32 requests.
+        let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let mut probe = ScrubCursor::new(tenant_hash, Signal::Metrics, 0, clock.now_ns());
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(
+            listed.len(),
+            8,
+            "seven commit records and one compaction record"
+        );
+        let mut opening = TailTally::default();
+        for meta in &listed {
+            opening.observe(&meta.key);
+        }
+        probe.start_rotation(&opening, clock.now_ns());
+        let plan = probe.plan_tick(2, 1, None, clock.now_ns());
+        assert_eq!(plan.budget.max_entries, 4);
+        assert_eq!(plan.budget.max_requests, 32);
+
+        let store = FullGetLog {
+            inner: memory.clone(),
+            full_gets: parking_lot::Mutex::new(Vec::new()),
+        };
+        let metrics = ScrubMetrics::default();
+        run_shard_tick(
+            &store,
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            2,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+
+        // One walk page, two commit records at `1 + 4` each, then the
+        // compaction unit at `1 + 8 * 4`: 44 requests, past the cap of 32
+        // with one of the four allowed entries unused.
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(cursor.rotation_entries_visited, 3);
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(record_key.as_str()),
+            "the tick stops on the compaction record, short of the entry cap"
+        );
+        let verified_parts = store
+            .full_gets
+            .lock()
+            .iter()
+            .filter(|key| part_keys.contains(key))
+            .count();
+        assert_eq!(verified_parts, 8, "every part of the unit is verified");
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0
         );
     }
 
