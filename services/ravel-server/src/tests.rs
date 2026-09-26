@@ -23,11 +23,16 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
+use ravel_cache::{Cache, CacheLimits};
 use ravel_ingest::{AdmissionController, AdmissionLimits, Clock, SystemClock};
+use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreMetrics};
-use ravel_query::http::StaticBearerTokenResolver;
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::http::{StaticBearerTokenResolver, TenantResolver};
+use ravel_query::{
+    FetchError, GetLimiter, LogSegmentFetcher, QueryAdmissionController, QueryConcurrencyLimit,
+    QueryError, ReadCache, SegmentFetcher,
+};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{SqlConfig, SqlExecutor, SqlRequest};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange};
@@ -39,6 +44,7 @@ use crate::metrics::{MetricsState, QueryAccountingMetrics};
 use crate::sql::{SqlState, router as sql_router};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
+const NS_PER_SEC: i64 = 1_000_000_000;
 /// Small on purpose, mirroring `tests/sql_endpoint.rs`: `Catalog::resolve`
 /// issues one LIST per (shard, ingest-hour) pair across the window, so a
 /// wall-clock value would fan out to hundreds of thousands of LISTs.
@@ -226,6 +232,213 @@ fn harness(
         metrics,
         executor,
     }
+}
+
+/// Real wall-clock nanoseconds. Unlike `NOW_NS` above, the raw PromQL HTTP
+/// handler's own `now_ns()` (`crates/ravel-query/src/http/handlers.rs`) is
+/// not injectable and always reads `SystemTime::now()`, so a PromQL fixture
+/// resolved through that handler must be anchored to real time rather than
+/// the small fixed `NOW_NS` the SQL tests above use.
+fn real_now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos() as i64
+}
+
+/// A splitmix64-derived `f64` in `[1.0, 2.0)`: fixed sign/exponent bits, a
+/// fully mixed 52-bit mantissa. Consecutive values share no exploitable
+/// structure, so neither Gorilla-style delta encoding nor RSEG's real
+/// zstd/lz4 compression can shrink the column much below its raw width. This
+/// is what lets a fixed sample count reliably force a segment's data object
+/// past `ravel_query`'s 512 KiB whole-object-read threshold, which a
+/// compressible or monotonic value sequence would not.
+fn high_entropy_value(i: u64) -> f64 {
+    let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    f64::from_bits((z & 0x000F_FFFF_FFFF_FFFF) | 0x3FF0_0000_0000_0000)
+}
+
+/// Samples span 150 real seconds ending 250 seconds before `now`, so a query
+/// `time` of `now - 300s` lands inside the covered range with margin on both
+/// sides regardless of scheduling jitter between publish and query.
+const LARGE_SEGMENT_SAMPLES: u64 = 150_000;
+const LARGE_SEGMENT_START_OFFSET_S: i64 = 400;
+const LARGE_SEGMENT_QUERY_OFFSET_S: i64 = 300;
+
+/// Publishes one real RSEG segment for `tenant`/`metric`, anchored relative
+/// to `now` (real wall-clock nanoseconds), with high-entropy sample values so
+/// its data object exceeds the 512 KiB whole-object-read threshold: only past
+/// that threshold does `ensure_ranges` reserve against the process memory
+/// budget at all, rather than reading the whole object in one unbudgeted GET.
+/// Asserts the threshold was really crossed rather than assuming it from the
+/// sample count.
+async fn publish_large_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, metric: &str, now: i64) {
+    let tenant_hash = tenant.hash();
+    let label_set = LabelSet::new(vec![Label {
+        name: "__name__".to_string(),
+        value: metric.to_string(),
+    }])
+    .expect("valid labels");
+    let series_id = SeriesId::compute(tenant, metric, &label_set).expect("series id");
+
+    let base_ts_ns = now - LARGE_SEGMENT_START_OFFSET_S * NS_PER_SEC;
+    let samples: Vec<Sample> = (0..LARGE_SEGMENT_SAMPLES)
+        .map(|i| Sample {
+            ts_ns: base_ts_ns + i as i64 * 1_000_000,
+            value: high_entropy_value(i),
+        })
+        .collect();
+
+    let series = vec![SeriesInput {
+        series_id,
+        labels: label_set,
+        samples,
+    }];
+
+    let writer_id = Uuid::from_u128(3_000);
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let written = SegmentWriter::write(
+        series,
+        identity,
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write segment");
+
+    let object_size = written.bytes.len() as u64;
+    assert!(
+        object_size > 512 * 1024,
+        "fixture must exceed the 512 KiB whole-object threshold to force a \
+         budgeted range read, got {object_size} bytes"
+    );
+
+    let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: now,
+        ingest_hour_bucket: hour_bucket,
+    })
+    .expect("valid commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// Builds the real PromQL `AppState` via `crate::query::build_app_state`
+/// (the same constructor `crate::start` calls), plus a `/metrics` router
+/// sharing one `Catalog` and the SAME `process_memory_budget` instance, so a
+/// PromQL memory-budget acceptance test exercises the actual server wiring
+/// rather than a hand-assembled `QueryEngine`.
+fn promql_harness(
+    store: Arc<dyn ObjectStoreBackend>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+    cache: Option<ReadCache>,
+) -> (ravel_query::http::AppState, Router, Router) {
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let query_accounting = Arc::new(QueryAccountingMetrics::new(HashSet::new()));
+    let tokens: HashMap<String, TenantId> =
+        HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
+    let tenant_resolver: Arc<dyn TenantResolver> =
+        Arc::new(StaticBearerTokenResolver::new(tokens));
+
+    let state = crate::query::build_app_state(
+        Arc::clone(&catalog),
+        Arc::clone(&store),
+        tenant_resolver,
+        cache,
+        ravel_query::EngineConfig::default(),
+        Arc::new(GetLimiter::new(8).expect("nonzero permits")),
+        Arc::clone(&query_accounting),
+        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+        None,
+        None,
+        None,
+        Arc::clone(&process_memory_budget),
+    );
+    let promql = ravel_query::http::router(state.clone());
+
+    let catalog_cache_metrics = catalog.byte_cache_metrics();
+    let metrics = crate::metrics::router(MetricsState {
+        mode: Mode::All,
+        store_metrics: Arc::new(StoreMetrics::default()),
+        ingest_router: None,
+        log_ingest_router: None,
+        span_ingest_router: None,
+        catalog,
+        tenant_discovery: None,
+        maintenance_safety: None,
+        maintenance_ownership: None,
+        merge_memory: None,
+        scrub: None,
+        cache_metrics: None,
+        cache_disk_metrics: None,
+        catalog_cache_metrics,
+        catalog_cache_disk_metrics: None,
+        admission: Arc::new(AdmissionController::new(
+            Arc::new(SystemClock),
+            AdmissionLimits::default(),
+        )),
+        reconcile_cycle: Arc::new(crate::admission_reconcile::ReconcileCycleMetrics::default()),
+        metrics_tenant_labels: false,
+        metrics_tenant_allowlist: Arc::new(HashSet::new()),
+        query_accounting,
+        ingest_concurrency: crate::ingest_concurrency::IngestConcurrencyController::shared(
+            crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+        ),
+        ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Unlimited,
+        ),
+        distrib: None,
+        durable_auth: None,
+        ingest_byte_metrics: std::sync::Arc::new(
+            crate::ingest_byte_metrics::IngestByteMetrics::new(),
+        ),
+        normalize_reject_metrics: std::sync::Arc::new(
+            crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
+        metadata_cache: None,
+        cache: None,
+        cache_max_bytes: 0,
+        catalog_cache_max_bytes: 0,
+        audit_pipeline: None,
+        process_memory_budget,
+        process_memory_budget_is_fallback: false,
+        can_fold: true,
+    });
+
+    (state, promql, metrics)
 }
 
 fn sql_body(query: &str) -> String {
@@ -452,5 +665,267 @@ async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_servin
         status,
         StatusCode::OK,
         "the process must keep answering after a refusal: {body}"
+    );
+}
+
+/// ACCEPTANCE TEST: a PromQL fetch whose real execution outgrows the
+/// ADR-1170 process-wide memory budget is refused typed
+/// (`FetchError::FetchMemoryExhausted`), and, through the real HTTP router,
+/// as `StatusCode::SERVICE_UNAVAILABLE`. This is the PromQL-path counterpart
+/// of `a_query_over_the_process_budget_is_refused_and_the_process_keeps_serving`
+/// above: it exercises `crate::query::build_app_state`'s
+/// `.with_memory_budget(process_memory_budget)` wiring, not a hand-built
+/// `QueryEngine`.
+///
+/// Notable divergence from the SQL path: PromQL redacts every fetch failure
+/// (including `FetchMemoryExhausted`) to `MSG_UNAVAILABLE` / HTTP 503
+/// (`crates/ravel-query/src/http/error.rs`), while the SQL path above answers
+/// 422 for the same underlying condition. Both are correct for their own
+/// error-mapping tables, but a caller cannot tell "process memory exhausted"
+/// apart from "the object store is down" on the PromQL surface the way it can
+/// on the SQL surface.
+///
+/// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
+/// `build_app_state` (services/ravel-server/src/query.rs). The typed check
+/// then fails: a query that opens no reservation at all never returns
+/// `FetchMemoryExhausted`, so the `match` falls to its `other => panic!`
+/// branch, e.g. `panic: expected FetchMemoryExhausted, got Ok(...)`.
+#[tokio::test]
+async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps_serving() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let now = real_now_ns();
+    publish_large_segment(store.as_ref(), &tenant, "big_gauge_budget", now).await;
+
+    // 4 KiB is far smaller than the >512 KiB column range this segment forces
+    // `ensure_ranges` to reserve in one all-or-nothing charge.
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * 1024));
+    let (state, promql, _metrics) = promql_harness(Arc::clone(&store), Arc::clone(&budget), None);
+    let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
+
+    // Typed check, direct against the real `build_app_state`-constructed
+    // engine.
+    let result = state
+        .engine
+        .instant(
+            tenant.hash(),
+            "big_gauge_budget",
+            query_time_s * 1000,
+            &[],
+            now,
+            Duration::from_secs(30),
+        )
+        .await;
+    match result {
+        Err(QueryError::Fetch(FetchError::FetchMemoryExhausted { limit, .. })) => {
+            assert_eq!(limit, 4 * 1024, "the refusal must name the configured limit");
+        }
+        other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+    }
+    assert_eq!(
+        budget.fetch_reserved(),
+        0,
+        "an all-or-nothing refusal leaves no charge on the shared counter"
+    );
+
+    // The same refusal, through the real HTTP router: distinct status from
+    // the SQL path's 422 for the same underlying condition (see doc comment
+    // above).
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/v1/query?query=big_gauge_budget&time={query_time_s}"
+        ))
+        .header(header::AUTHORIZATION, "Bearer acme-token")
+        .body(Body::empty())
+        .expect("build request");
+    let response = promql.clone().oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // The process keeps serving: a query resolving no segment at all (an
+    // unpublished metric) needs no reservation and still answers, through the
+    // SAME engine and the SAME exhausted budget.
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/v1/query?query=still_alive&time={query_time_s}"
+        ))
+        .header(header::AUTHORIZATION, "Bearer acme-token")
+        .body(Body::empty())
+        .expect("build request");
+    let response = promql.clone().oneshot(request).await.expect("oneshot");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the process must keep answering after a refusal"
+    );
+}
+
+/// ACCEPTANCE TEST: while a PromQL fetch's budgeted range GET is in flight,
+/// `ravel_memory_reserved_bytes{component="fetch"}` reads exactly the live
+/// `Reservation`'s size, both through the direct counter and through a real
+/// `/metrics` scrape, and both return to exactly 0 once the query completes.
+///
+/// A `FaultStore` holds every `Get` against the published segment's data key
+/// so the reservation is observable while `budget.fetch_reserved()` is
+/// nonzero; the segment's own unbudgeted footer read (which also matches the
+/// hold filter) is released without asserting on it, distinguished from the
+/// budgeted range read by `fetch_reserved() == 0` at that moment (the
+/// footer/suffix GET in `open_segment` issues no reservation at all).
+///
+/// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
+/// `build_app_state`. `budget.fetch_reserved()` then never leaves 0 even
+/// while a GET is held, so `observed` stays `false` for the whole query and
+/// the final `assert!(observed, ...)` fails.
+#[tokio::test]
+async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let tenant = TenantId::new("acme".to_string());
+    let now = real_now_ns();
+    publish_large_segment(store.as_ref(), &tenant, "big_gauge_gauge", now).await;
+
+    let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+    let (state, _promql, metrics) = promql_harness(Arc::clone(&store), Arc::clone(&budget), None);
+    let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
+
+    let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
+    let mut query = Box::pin(state.engine.instant(
+        tenant.hash(),
+        "big_gauge_gauge",
+        query_time_s * 1000,
+        &[],
+        now,
+        Duration::from_secs(30),
+    ));
+
+    let mut observed = false;
+    loop {
+        tokio::select! {
+            result = &mut query => {
+                assert!(
+                    observed,
+                    "the query completed before a budgeted GET was ever observed held"
+                );
+                let (_value, _coverage) = result.expect("query must succeed");
+                break;
+            }
+            () = gate.wait_until_held(1) => {
+                let held = gate.held_details();
+                let (id, _, _) = held[0];
+                let reserved = budget.fetch_reserved();
+                if reserved > 0 {
+                    observed = true;
+                    let scrape = scrape_metrics(&metrics).await;
+                    assert!(
+                        scrape.contains(&format!(
+                            "ravel_memory_reserved_bytes{{mode=\"all\",component=\"fetch\"}} {reserved}"
+                        )),
+                        "the fetch gauge must equal the live reservation ({reserved}):\n{scrape}"
+                    );
+                }
+                gate.release(id);
+            }
+        }
+    }
+
+    assert_eq!(
+        budget.fetch_reserved(),
+        0,
+        "the reservation must release once the query completes"
+    );
+    let scrape = scrape_metrics(&metrics).await;
+    assert!(
+        scrape.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"fetch\"} 0"),
+        "the fetch gauge must read back to 0 after completion:\n{scrape}"
+    );
+}
+
+/// ACCEPTANCE TEST: with an ADR-0046 read cache configured, a PromQL fetch's
+/// `Reservation` is marked handed off as soon as the cache takes its own copy
+/// of the fetched bytes (`Reservation::mark_handed_off`), so while the fetch
+/// is in flight `ravel_memory_handoff_overlap_bytes` reads EXACTLY the same
+/// value as the live fetch reservation (the whole reservation is handed off,
+/// never a partial amount), both through the direct counters and through a
+/// real `/metrics` scrape; both return to exactly 0 once the query completes.
+///
+/// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
+/// `build_app_state`. No reservation is ever opened, so `reserved` never
+/// exceeds 0 while held, `observed` stays `false`, and the final
+/// `assert!(observed, ...)` fails exactly as in the sibling gauge test above.
+#[tokio::test]
+async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetch_is_held() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let tenant = TenantId::new("acme".to_string());
+    let now = real_now_ns();
+    publish_large_segment(store.as_ref(), &tenant, "big_gauge_overlap", now).await;
+
+    let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+    let cache = ReadCache::Ram(Arc::new(Cache::new(CacheLimits::new(
+        4 * 1024 * 1024,
+        100,
+        4 * 1024 * 1024,
+    ))));
+    let (state, _promql, metrics) =
+        promql_harness(Arc::clone(&store), Arc::clone(&budget), Some(cache));
+    let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
+
+    let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
+    let mut query = Box::pin(state.engine.instant(
+        tenant.hash(),
+        "big_gauge_overlap",
+        query_time_s * 1000,
+        &[],
+        now,
+        Duration::from_secs(30),
+    ));
+
+    let mut observed = false;
+    loop {
+        tokio::select! {
+            result = &mut query => {
+                assert!(
+                    observed,
+                    "the query completed before a budgeted GET was ever observed held"
+                );
+                let (_value, _coverage) = result.expect("query must succeed");
+                break;
+            }
+            () = gate.wait_until_held(1) => {
+                let held = gate.held_details();
+                let (id, _, _) = held[0];
+                let reserved = budget.fetch_reserved();
+                if reserved > 0 {
+                    observed = true;
+                    let overlap = budget.handoff_overlap();
+                    assert_eq!(
+                        overlap, reserved,
+                        "a cache-configured fetch hands off its WHOLE reservation, so the \
+                         overlap must equal the live fetch reservation exactly"
+                    );
+                    let scrape = scrape_metrics(&metrics).await;
+                    assert!(
+                        scrape.contains(&format!(
+                            "ravel_memory_handoff_overlap_bytes{{mode=\"all\"}} {overlap}"
+                        )),
+                        "the overlap gauge must equal the live counter ({overlap}):\n{scrape}"
+                    );
+                }
+                gate.release(id);
+            }
+        }
+    }
+
+    assert_eq!(budget.fetch_reserved(), 0);
+    assert_eq!(
+        budget.handoff_overlap(),
+        0,
+        "the overlap must release once the fetch reservation drops"
+    );
+    let scrape = scrape_metrics(&metrics).await;
+    assert!(
+        scrape.contains("ravel_memory_handoff_overlap_bytes{mode=\"all\"} 0"),
+        "the overlap gauge must read back to 0 after completion:\n{scrape}"
     );
 }
