@@ -116,8 +116,8 @@ reject-unknown like commit tokens): request carries protocol version, query
 id, tenant hash, signal, scope (pinned segment identities, reconstructed and
 verified by the worker per the reconstruct-don't-trust rule: the worker
 rebuilds the key of each pinned segment's own commit record, or of an L1
-part's compaction or rewrite record, from the identity, GETs and verifies that
-record, and builds the segment ref from it; or resolve-mode matchers),
+segment's compaction or rewrite record, from the identity, GETs and verifies
+that record, and builds the segment ref from it; or resolve-mode matchers),
 matchers, padded window, the query's budgets (the whole budget, not a
 per-slice share; see the budget amendment below), absolute deadline,
 erasure predicates, and trace context. Response streams per-series frames
@@ -221,17 +221,17 @@ what a future aggregation-pushdown ADR would move. Network bytes to the
 coordinator are matcher-pruned, window-clipped decoded samples, bounded by
 the existing per-selector budgets; total S3 request count is local
 execution's plus the workers' record reads, which are one commit-record GET
-per pinned L0 segment, one compaction-record GET per pinned L1 part, and two
-GETs for a part only an erasure rewrite record describes (the compaction key
-misses first), each charged to the slice's reported cost (as of ADR-0096 a
-native-histogram or run-merged scalar query is served over the wire rather
-than falling back, so it no longer double-fetches; a version-skew fallback
-still pays both, with both folded into its reported cost), and instantaneous
-rate is capped by `max_parallel_slices` times the per-worker GET semaphore.
-Initial gate thresholds (distribute above 256 MiB estimated store bytes or 64
-segments) are set from the crossover benchmark before defaults freeze, and
-every later optimization (straggler hedging, slice rebalancing, limit hints)
-requires a benchmark demonstrating its value.
+per pinned L0 segment, one compaction-record GET per pinned L1 segment, and
+two GETs for an L1 segment only an erasure rewrite record describes (the
+compaction key misses first), each charged to the slice's reported cost (as
+of ADR-0096 a native-histogram or run-merged scalar query is served over the
+wire rather than falling back, so it no longer double-fetches; a version-skew
+fallback still pays both, with both folded into its reported cost), and
+instantaneous rate is capped by `max_parallel_slices` times the per-worker
+GET semaphore. Initial gate thresholds (distribute above 256 MiB estimated
+store bytes or 64 segments) are set from the crossover benchmark before
+defaults freeze, and every later optimization (straggler hedging, slice
+rebalancing, limit hints) requires a benchmark demonstrating its value.
 
 ## Operational model
 

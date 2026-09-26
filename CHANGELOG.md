@@ -17,17 +17,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the pinned segment's own record from the identity the coordinator shipped
   with the ADR-0010 key builders: the commit record for an L0 segment, and the
   compaction record (or, when none exists, the erasure rewrite record) for a
-  compacted L1 part. It GETs that one record, checks that the record's own
+  compacted L1 segment. It GETs that one record, checks that the record's own
   fields address the key it was read from, verifies the data-object key with
-  `verify_object_key` (or the L1 part-key reconstruction), and compares the
+  `verify_object_key` (or the L1 object-key reconstruction), and compares the
   full 32-byte content hash, the object size, and for L1 the full input-set
-  hash and part index against the identity. The segment ref it reads is built
-  from the verified record alone. A worker lists nothing and reads no manifest
-  on the intra-cluster fetch path; it issues one record GET per pinned L0
-  segment, one per pinned L1 part, and two for a part only a rewrite record
-  describes. A record that is missing, unreadable, fails verification, or
-  disagrees with the identity fails the fragment with `UNSUPPORTED`, and the
-  coordinator runs the query locally; a malformed identity is `BAD_DATA`.
+  hash and `part_index` against the identity. The segment ref it reads is
+  built from the verified record alone. A worker lists nothing and reads no
+  manifest on the intra-cluster fetch path; it issues one record GET per
+  pinned L0 segment, one per pinned L1 segment, and two for an L1 segment only
+  a rewrite record describes. A record that is missing, unreadable, fails
+  verification, or disagrees with the identity fails the fragment with
+  `UNSUPPORTED`, and the coordinator runs the query locally; a malformed
+  identity is `BAD_DATA`.
   Records and the objects they name are immutable, so the pinned read is
   unaffected by whatever the catalog says by then. The queryfrag wire and
   `PROTOCOL_VERSION` are unchanged, and cross-cluster federation is unchanged:
