@@ -62,6 +62,18 @@ not get a permit is shed immediately, never queued: HTTP 429 with
 `Retry-After`, gRPC `RESOURCE_EXHAUSTED`. Query, health, and `/metrics` are
 not covered.
 
+The permit is taken from the request head, before the request body is read or
+decoded, and the tenant credential is checked in the same place: on the HTTP
+surfaces by a middleware layer that runs ahead of the body extractor, and on
+the gRPC surfaces by a tower layer that runs before tonic reads a body frame.
+So a shed request costs this process the bytes of one request head, an
+unauthenticated caller cannot make it buffer a body or inflate a compressed
+one, and the ceiling bounds concurrent decode rather than following it. Both
+tonic listeners additionally cap HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` at
+the same configured value, so a single connection cannot open an unbounded
+number of streams whose state this process tracks before any of them reaches
+admission.
+
 Worst-case memory bound at the default: each in-flight request holds at most
 one decoded request body. The largest such body on any covered route is not
 Remote Write's 64 MiB post-decompression cap (`MAX_DECOMPRESSED_PAYLOAD_BYTES`)
