@@ -347,6 +347,10 @@ impl SpanIngestRouter {
                 self.mark_shard_dead(&set[shard as usize]);
                 return Err(SpanWriteError::ShardUnavailable);
             }
+            // The message is now in the shard's channel: count it as enqueued.
+            // The actor counts it processed when it pulls it, so
+            // enqueued-minus-processed is the shard's current queue depth.
+            self.metrics.record_shard_enqueued(shard);
         }
 
         if mode == WriteMode::Buffered {
