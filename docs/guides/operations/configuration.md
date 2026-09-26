@@ -532,23 +532,24 @@ ravel-server --store s3 --s3-bucket my-bucket --cache-dir /var/cache/ravel
 ```
 
 There is no separate capacity flag for the disk tier. Each tier is bounded by
-`--cache-max-bytes`, read once at startup with no live resize.
+that cache's own resolved RAM ceiling, read once at startup with no live
+resize.
 
-The fetcher cache and the catalog byte cache are two independent LRU caches.
-When `--cache-max-bytes` is **set**, both are bounded at that one value. When it
-is **unset**, the two derive separately from the process memory budget (see
-"Per-query budgets" below): the fetcher cache at 25% and the catalog byte
-cache at a smaller 5% (`7516192768` and `1503238553` on the 30 GB reference
-host), so deriving both cannot commit more than 30% of the budget between
-them. Startup refuses to start, rather than silently clamping, if an explicit
-`--cache-max-bytes` pushes the two resolved hard caps above the process
-memory budget. Both ceilings are LRU caps, not reservations: neither
-pre-allocates, each holds only the bytes it has admitted, and the sum of the
-two cache ceilings and the SQL memory pools (which derive from raw host
-memory, not the process memory budget) may exceed physical RAM by design (the
-caches fill only under a working set that large, and a SQL query aborts
-rather than growing past its own pool). `--disable-cache` turns both off and
-holds no read-cache memory.
+The fetcher cache and the catalog byte cache are two independent LRU caches
+with their own flags: `--cache-max-bytes` bounds the fetcher cache only, and
+`--catalog-cache-max-bytes` bounds the catalog byte cache only. Unset, the two
+derive separately from the process memory budget (see "Per-query budgets"
+below): the fetcher cache at 25% of it, or a larger 40% against a loopback
+`--s3-endpoint`, and the catalog byte cache always at a smaller 5%
+(`7516192768` and `1503238553` on the 30 GB reference host at the 25% share).
+Startup refuses to start, rather than silently clamping, if the two resolved
+hard caps together exceed the process memory budget. Both ceilings are LRU
+caps, not reservations: neither pre-allocates, each holds only the bytes it
+has admitted, and the sum of the two cache ceilings and the SQL memory pools
+(which derive from raw host memory, not the process memory budget) may
+exceed physical RAM by design (the caches fill only under a working set that
+large, and a SQL query aborts rather than growing past its own pool).
+`--disable-cache` turns both off and holds no read-cache memory.
 
 The disk tier is disposable by design. The directory is created lazily on first
 admission and is never required to exist. A missing, full or corrupt cache
@@ -1169,10 +1170,12 @@ shard-hour prefix, a snapshot's parts by the one directory they share, its
 postings and column stats by theirs, and a LIST by the prefix it lists. So
 raising this ceiling adds breadth across prefixes and never depth within one.
 
-Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
-25%, catalog byte cache a separate 5% ceiling, 256 MiB each if memory is
-unknown; an explicit flag bounds both at that one value) and
-`--gc-max-query-duration` (11 minutes). Memory is read from `/proc/meminfo`'s
+Two more settings are derived the same way: `--cache-max-bytes` (fetcher
+cache, 25% normally or 40% against a loopback `--s3-endpoint`) and
+`--catalog-cache-max-bytes` (catalog byte cache, always a separate 5%
+ceiling; 256 MiB each if memory is unknown) and `--gc-max-query-duration` (11
+minutes). Each cache flag bounds only its own cache; setting one never
+changes the other. Memory is read from `/proc/meminfo`'s
 `MemTotal` on Linux and is "unknown" everywhere else; cores come from the
 process's available parallelism, floored at 1. Percentages truncate.
 
@@ -1220,8 +1223,11 @@ setting, but the legacy `--fetch-concurrency` was set and its value is used),
 `derived` (computed from the host profile, or from a host-independent rule),
 `budget-carve` (a fixed share of `memory_budget_bytes` rather than of raw
 `MemTotal`, which is what the two cache ceilings resolve to on a host whose
-memory could be read), or `fallback` (no flag and no readable `MemTotal`, so
-the compiled-in constant is used). So `journalctl -u ravel-server | grep
+memory could be read), `budget-carve-loopback` (the fetcher cache's larger
+40% share, resolved instead of `budget-carve` when the store is `s3` against
+a loopback endpoint and `--cache-max-bytes` is unset), or `fallback` (no flag
+and no readable `MemTotal`, so the compiled-in constant is used). So
+`journalctl -u ravel-server | grep
 'performance default resolved'` answers "what is this process actually running
 with" without reading the unit file:
 
