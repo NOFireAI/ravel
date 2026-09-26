@@ -13,8 +13,9 @@
 //!
 //! - **Path agreement** (no erasure). The same corpus and projection run once
 //!   with no pending erasure (columnar when the projection excludes `attrs`,
-//!   ADR-0110 decision 3 clause a) and once forced onto the row path by a
-//!   no-match erasure predicate (which drains the row path yet removes nothing).
+//!   `events`, and `links`, ADR-0110 decision 3 clause a) and once forced onto
+//!   the row path by a no-match erasure predicate (which drains the row path
+//!   yet removes nothing).
 //!   The two `Vec<RecordBatch>` must be equal, boundaries included, and the path
 //!   metrics must confirm which path each run took.
 //! - **Erasure fallback agreement**. A pending erasure predicate that *does*
@@ -27,22 +28,25 @@
 //!   exercises the fallback in the differential rather than only in T3's unit
 //!   test.
 //!
-//! # The generator must carry attributes and events
+//! # The generator must carry attributes, events, and links
 //!
 //! Every generated span carries a `user_id` attribute (the erasure target axis)
 //! and most carry `service.name`, an extra dynamic attribute, and one or more
-//! events. That is deliberate and load-bearing: an attribute-free, event-free
-//! corpus makes both paths decode exactly the same pages, so `pages_skipped` is
-//! zero and the whole columnar-vs-row comparison is vacuous (the fast path skips
-//! nothing, so it is not exercising the code that differs from the row path). Do
-//! not "simplify" the generator to drop attributes or events.
+//! events and links. That is deliberate and load-bearing: an attribute-free,
+//! event-free, link-free corpus makes both paths decode exactly the same pages,
+//! so `pages_skipped` is zero and the whole columnar-vs-row comparison is
+//! vacuous (the fast path skips nothing, so it is not exercising the code that
+//! differs from the row path). Do not "simplify" the generator to drop
+//! attributes, events, or links.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use datafusion::arrow::array::{Array, Int64Array, ListArray, RecordBatch, StructArray};
+use datafusion::arrow::array::{
+    Array, FixedSizeBinaryArray, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::TaskContext;
@@ -55,15 +59,19 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::erasure::snapshot_pending_erasure_predicates;
 use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanQuery, SpanRecord, StatusCode};
-use ravel_sql::{SPAN_COL_ATTRS, SPAN_COL_EVENTS, SpanSegmentFetcher, SpansScanExec, spans_schema};
+use ravel_sql::{
+    SPAN_COL_ATTRS, SPAN_COL_EVENTS, SPAN_COL_LINKS, SpanSegmentFetcher, SpansScanExec,
+    spans_schema,
+};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([1u8; 16]);
-/// The public `spans` table has twelve columns (ADR-0041, plus `events` from
-/// issue #1710); a projection is any non-empty ordered subset of these indices.
-const SPAN_COL_COUNT: usize = 12;
+/// The public `spans` table has thirteen columns (ADR-0041, plus `events` and
+/// `links` from issue #1710); a projection is any non-empty ordered subset of
+/// these indices.
+const SPAN_COL_COUNT: usize = 13;
 /// The erasure target attribute. A span is erasable iff its merged attributes
 /// carry exactly this `key = value`, which `is_erased_span` matches against
 /// (ravel-query's erasure module), so the erased set is known at generation.
@@ -109,8 +117,10 @@ fn small_blocks() -> RspanConfig {
 /// (a nullable v3 column) and a dynamic attribute page are present in some rows
 /// and absent in others; `with_message` toggles the nullable `status_message`;
 /// `events` promotes an `_events_raw` blob into the nested event columns the
-/// fast path skips. `erasable` decides whether the row carries the erasure
-/// target attribute, so the survivor reference can be built at generation time.
+/// fast path skips. `links` likewise promotes a `_links_raw` blob into the
+/// nested link columns. `erasable` decides whether the row carries the
+/// erasure target attribute, so the survivor reference can be built at
+/// generation time.
 #[derive(Clone, Debug)]
 struct SpanSpec {
     trace: u8,
@@ -119,6 +129,7 @@ struct SpanSpec {
     service: Option<String>,
     http_method: Option<String>,
     events: usize,
+    links: usize,
     with_message: bool,
     erasable: bool,
 }
@@ -127,7 +138,7 @@ impl SpanSpec {
     /// Whether this span carries any attribute beyond the always-present
     /// `user_id`, i.e. a page the attrs-excluding fast path can skip.
     fn has_extra_attr(&self) -> bool {
-        self.service.is_some() || self.http_method.is_some() || self.events > 0
+        self.service.is_some() || self.http_method.is_some() || self.events > 0 || self.links > 0
     }
 }
 
@@ -143,11 +154,22 @@ fn arb_span() -> impl Strategy<Value = SpanSpec> {
         ])),
         prop::option::of(prop::sample::select(vec!["GET", "POST"])),
         0usize..3,     // events
+        0usize..3,     // links
         any::<bool>(), // with_message
         any::<bool>(), // erasable
     )
         .prop_map(
-            |(trace, span_id, start, service, http_method, events, with_message, erasable)| {
+            |(
+                trace,
+                span_id,
+                start,
+                service,
+                http_method,
+                events,
+                links,
+                with_message,
+                erasable,
+            )| {
                 SpanSpec {
                     trace,
                     span_id,
@@ -155,6 +177,7 @@ fn arb_span() -> impl Strategy<Value = SpanSpec> {
                     service: service.map(str::to_string),
                     http_method: http_method.map(str::to_string),
                     events,
+                    links,
                     with_message,
                     erasable,
                 }
@@ -168,7 +191,7 @@ fn arb_objects() -> impl Strategy<Value = Vec<Vec<SpanSpec>>> {
     prop::collection::vec(prop::collection::vec(arb_span(), 1..=4), 1..=3)
 }
 
-/// A projection is a non-empty ordered subset of the twelve column indices. The
+/// A projection is a non-empty ordered subset of the thirteen column indices. The
 /// permutation-then-prefix shape exercises both which columns are kept and the
 /// order they appear in, so column-order and null-placement wiring is covered.
 fn arb_projection() -> impl Strategy<Value = Vec<usize>> {
@@ -237,6 +260,41 @@ fn event_payload(index: usize) -> Vec<u8> {
     out
 }
 
+/// Length-delimited, hex-encoded `_links_raw` value: each link's wire-encoded
+/// `Span.Link` message prefixed with its uvarint length, concatenated and
+/// hex-encoded. This is the exact grammar `ravel_rspan::record::parse_links`
+/// splits on, so a non-empty blob sequence is always promoted into the nested
+/// link columns.
+///
+/// Each link carries a distinct `trace_id`/`span_id` (derived from `index`) and
+/// a distinct `trace_state`, so the differential assertion below can pin the
+/// exact multiset the generator wrote.
+fn links_raw_value(count: usize) -> String {
+    let mut raw = Vec::new();
+    for i in 0..count {
+        let payload = link_payload(i);
+        put_uvarint(&mut raw, payload.len() as u64);
+        raw.extend_from_slice(&payload);
+    }
+    let mut hex = String::with_capacity(raw.len() * 2);
+    for byte in raw {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// One `Span.Link` on the wire: `trace_id` (field 1, 16 bytes), `span_id`
+/// (field 2, 8 bytes), `trace_state` (field 3, string).
+fn link_payload(index: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let trace_id = [0xa0u8.wrapping_add(index as u8); 16];
+    let span_id = [0xb0u8.wrapping_add(index as u8); 8];
+    len_field(&mut out, 1, &trace_id);
+    len_field(&mut out, 2, &span_id);
+    len_field(&mut out, 3, format!("ls-{index}").as_bytes());
+    out
+}
+
 fn len_field(out: &mut Vec<u8>, field: u64, payload: &[u8]) {
     put_uvarint(out, (field << 3) | 2);
     put_uvarint(out, payload.len() as u64);
@@ -277,6 +335,9 @@ fn build_span(spec: &SpanSpec) -> SpanRecord {
     ));
     if spec.events > 0 {
         attrs.push(("_events_raw".to_string(), events_raw_value(spec.events)));
+    }
+    if spec.links > 0 {
+        attrs.push(("_links_raw".to_string(), links_raw_value(spec.links)));
     }
     SpanRecord {
         trace_id: [spec.trace; 16],
@@ -452,6 +513,7 @@ fn both_paths_agree_over_every_projection_subset() {
     let total = AtomicU64::new(0);
     let cases_with_extra_attr = AtomicU64::new(0);
     let cases_with_events = AtomicU64::new(0);
+    let cases_with_links = AtomicU64::new(0);
     let cases_with_erased_span = AtomicU64::new(0);
 
     let mut runner = TestRunner::new(ProptestConfig::with_cases(CASES));
@@ -459,6 +521,7 @@ fn both_paths_agree_over_every_projection_subset() {
         total.fetch_add(1, Ordering::Relaxed);
         let corpus_has_extra_attr = scn.objects.iter().flatten().any(SpanSpec::has_extra_attr);
         let corpus_has_events = scn.objects.iter().flatten().any(|s| s.events > 0);
+        let corpus_has_links = scn.objects.iter().flatten().any(|s| s.links > 0);
         let corpus_has_erased = scn.objects.iter().flatten().any(|s| s.erasable);
         if corpus_has_extra_attr {
             cases_with_extra_attr.fetch_add(1, Ordering::Relaxed);
@@ -466,13 +529,17 @@ fn both_paths_agree_over_every_projection_subset() {
         if corpus_has_events {
             cases_with_events.fetch_add(1, Ordering::Relaxed);
         }
+        if corpus_has_links {
+            cases_with_links.fetch_add(1, Ordering::Relaxed);
+        }
         if corpus_has_erased {
             cases_with_erased_span.fetch_add(1, Ordering::Relaxed);
         }
 
         let projection = scn.projection.clone();
-        let columnar_eligible =
-            !projection.contains(&SPAN_COL_ATTRS) && !projection.contains(&SPAN_COL_EVENTS);
+        let columnar_eligible = !projection.contains(&SPAN_COL_ATTRS)
+            && !projection.contains(&SPAN_COL_EVENTS)
+            && !projection.contains(&SPAN_COL_LINKS);
         let proj_schema: SchemaRef = Arc::new(
             spans_schema()
                 .project(&projection)
@@ -489,7 +556,8 @@ fn both_paths_agree_over_every_projection_subset() {
             let segments = materialize(&store, &scn.objects).await;
             let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
 
-            // No erasure: columnar when the projection excludes `attrs`.
+            // No erasure: columnar when the projection excludes `attrs`,
+            // `events`, and `links`.
             let columnar =
                 run_scan(Arc::clone(&store), segments.clone(), Some(projection.clone()), Vec::new())
                     .await;
@@ -515,7 +583,7 @@ fn both_paths_agree_over_every_projection_subset() {
                 if rows > 0 {
                     prop_assert!(
                         columnar.columnar_batches > 0,
-                        "a projection excluding attrs and events over a non-empty corpus must take the fast path (projection {:?})",
+                        "a projection excluding attrs, events, and links over a non-empty corpus must take the fast path (projection {:?})",
                         projection
                     );
                     prop_assert_eq!(
@@ -524,13 +592,13 @@ fn both_paths_agree_over_every_projection_subset() {
                         "the fast path must not fall back for projection {:?}",
                         projection
                     );
-                    // Attributes and/or events are present in the corpus, so the
-                    // attrs-excluding decode skips their pages: proof the
+                    // Attributes, events, and/or links are present in the corpus,
+                    // so the attrs-excluding decode skips their pages: proof the
                     // comparison is not vacuous when the corpus carries them.
                     if corpus_has_extra_attr {
                         prop_assert!(
                             columnar.pages_skipped > 0,
-                            "excluding attrs over a corpus with attribute/event pages must skip pages ({} decoded, {} skipped, projection {:?})",
+                            "excluding attrs over a corpus with attribute/event/link pages must skip pages ({} decoded, {} skipped, projection {:?})",
                             columnar.pages_decoded,
                             columnar.pages_skipped,
                             projection
@@ -551,13 +619,13 @@ fn both_paths_agree_over_every_projection_subset() {
                     );
                 }
             } else {
-                // Projecting `attrs` or `events` is ineligible, so both runs
-                // take the row path; the equality above still guards row-path
-                // determinism.
+                // Projecting `attrs`, `events`, or `links` is ineligible, so both
+                // runs take the row path; the equality above still guards
+                // row-path determinism.
                 if rows > 0 {
                     prop_assert!(
                         columnar.rowpath_batches > 0 && columnar.columnar_batches == 0,
-                        "a query projecting attrs or events must take the row path (projection {:?})",
+                        "a query projecting attrs, events, or links must take the row path (projection {:?})",
                         projection
                     );
                 }
@@ -609,6 +677,81 @@ fn both_paths_agree_over_every_projection_subset() {
                     actual,
                     expected,
                     "decoded event timestamps must match the generated corpus"
+                );
+            }
+
+            // The `links` column is decoded from the corpus, not just carried:
+            // pin its null count and the exact multiset of link trace ids and
+            // trace states against what the generator wrote.
+            if let Some(position) = projection.iter().position(|c| *c == SPAN_COL_LINKS) {
+                let batch = concat_run(&columnar, &proj_schema);
+                let links = batch
+                    .column(position)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("links column is a list");
+                let spans_with_links = scn
+                    .objects
+                    .iter()
+                    .flatten()
+                    .filter(|s| s.links > 0)
+                    .count();
+                prop_assert_eq!(
+                    links.len() - links.null_count(),
+                    spans_with_links,
+                    "non-null link lists must match the spans the generator gave links"
+                );
+
+                let mut expected_trace_ids: Vec<[u8; 16]> = scn
+                    .objects
+                    .iter()
+                    .flatten()
+                    .flat_map(|s| {
+                        (0..s.links).map(|i| [0xa0u8.wrapping_add(i as u8); 16])
+                    })
+                    .collect();
+                expected_trace_ids.sort_unstable();
+                let mut expected_trace_states: Vec<String> = scn
+                    .objects
+                    .iter()
+                    .flatten()
+                    .flat_map(|s| (0..s.links).map(|i| format!("ls-{i}")))
+                    .collect();
+                expected_trace_states.sort_unstable();
+
+                let items = links
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("link items are structs");
+                let trace_id_col = items
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("link trace_id is FixedSizeBinary");
+                let mut actual_trace_ids: Vec<[u8; 16]> = (0..trace_id_col.len())
+                    .map(|i| trace_id_col.value(i).try_into().expect("16-byte trace_id"))
+                    .collect();
+                actual_trace_ids.sort_unstable();
+                prop_assert_eq!(
+                    actual_trace_ids,
+                    expected_trace_ids,
+                    "decoded link trace ids must match the generated corpus"
+                );
+
+                let trace_state_col = items
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("link trace_state is Utf8");
+                let mut actual_trace_states: Vec<String> = (0..trace_state_col.len())
+                    .map(|i| trace_state_col.value(i).to_string())
+                    .collect();
+                actual_trace_states.sort_unstable();
+                prop_assert_eq!(
+                    actual_trace_states,
+                    expected_trace_states,
+                    "decoded link trace states must match the generated corpus"
                 );
             }
 
@@ -668,10 +811,11 @@ fn both_paths_agree_over_every_projection_subset() {
 
     let total = total.load(Ordering::Relaxed).max(1);
     eprintln!(
-        "spans_differential: {} cases; extra-attr {:.0}%, events {:.0}%, erased-span {:.0}%",
+        "spans_differential: {} cases; extra-attr {:.0}%, events {:.0}%, links {:.0}%, erased-span {:.0}%",
         total,
         100.0 * cases_with_extra_attr.load(Ordering::Relaxed) as f64 / total as f64,
         100.0 * cases_with_events.load(Ordering::Relaxed) as f64 / total as f64,
+        100.0 * cases_with_links.load(Ordering::Relaxed) as f64 / total as f64,
         100.0 * cases_with_erased_span.load(Ordering::Relaxed) as f64 / total as f64,
     );
 

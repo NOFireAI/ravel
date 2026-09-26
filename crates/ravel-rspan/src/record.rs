@@ -396,6 +396,138 @@ fn decode_any_value(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// The reserved attribute key whose value carries the span's links as a hex
+/// blob (`ravel_otlp::traces_normalize::ATTR_LINKS_RAW`), encoded exactly like
+/// [`EVENTS_RAW_KEY`]. Unlike events, a links value is never promoted into
+/// nested RSPAN columns: the segment format is a frozen contract, and adding a
+/// column for it needs an ADR. [`ravel_sql`] decodes this attribute directly
+/// at scan time instead, on every RSPAN version, so a value that is not a
+/// valid links blob simply stays an ordinary attribute, same as an
+/// unpromoted `_events_raw` value.
+pub const LINKS_RAW_KEY: &str = "_links_raw";
+
+/// One span link, decoded from the `_links_raw` blob. `attrs_blob` is the
+/// link's opaque serialized bytes (the whole OTLP `Span.Link` message);
+/// `trace_id`, `span_id`, and `trace_state` are projected out of it for
+/// columnar access, mirroring how [`SpanEvent`] projects `ts_ns`/`name` out of
+/// its own blob.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanLink {
+    pub trace_id: [u8; TRACE_ID_WIDTH],
+    pub span_id: [u8; SPAN_ID_WIDTH],
+    pub trace_state: String,
+    pub attrs_blob: Vec<u8>,
+}
+
+/// Parses a `_links_raw` attribute value into span links, or `None` when the
+/// value is not a valid links blob (invalid hex, malformed length-delimited
+/// framing, trailing bytes, zero links, or a link chunk
+/// [`scan_link_fields`] rejects). Unlike [`parse_events`], a single bad link
+/// fails the whole value rather than falling back to a zero-filled
+/// projection: `trace_id`/`span_id` are non-nullable columns, so a malformed
+/// or missing one has no safe in-band default, and the documented fallback
+/// for that case is `NULL` for the span's entire `links` value, not a
+/// fabricated row. The value is the hex encoding of a concatenation of
+/// length-delimited OTLP `Span.Link` messages
+/// (`ravel_otlp::traces_normalize::encode_blob`), and this splits on that
+/// self-describing framing alone, keeping each link's payload verbatim as
+/// `attrs_blob`.
+pub fn parse_links(value: &str) -> Option<Vec<SpanLink>> {
+    let bytes = hex_decode(value)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut links = Vec::new();
+    while pos < bytes.len() {
+        let len = get_uvarint(&bytes, &mut pos).ok()?;
+        let len = usize::try_from(len).ok()?;
+        let end = pos.checked_add(len)?;
+        let chunk = bytes.get(pos..end)?;
+        pos = end;
+        links.push(scan_link_fields(chunk)?);
+    }
+    if pos != bytes.len() || links.is_empty() {
+        return None;
+    }
+    Some(links)
+}
+
+/// `Span.Link.trace_id`, field 1 (length-delimited).
+const LINK_TRACE_ID_FIELD: u64 = 1;
+/// `Span.Link.span_id`, field 2 (length-delimited).
+const LINK_SPAN_ID_FIELD: u64 = 2;
+/// `Span.Link.trace_state`, field 3 (length-delimited).
+const LINK_TRACE_STATE_FIELD: u64 = 3;
+/// `Span.Link.attributes`, field 4 (repeated `KeyValue`).
+const LINK_ATTRIBUTES_FIELD: u64 = 4;
+
+/// Fallible scan of one serialized OTLP `Span.Link` for its `trace_id`
+/// (field 1), `span_id` (field 2), and `trace_state` (field 3). Unlike
+/// [`scan_event_ts_name`], this does not have a safe zero-filled default for
+/// `trace_id`/`span_id`: both are non-nullable fixed-width columns, so a
+/// missing or wrong-width `trace_id`/`span_id`, a non-UTF-8 `trace_state`, or
+/// trailing bytes `next_wire_field` could not explain (a truncated field
+/// partway through the chunk) all fail the whole link rather than silently
+/// keep a fabricated or partial value. `attrs_blob` remains the authoritative
+/// copy of whatever this rejects; the caller ([`parse_links`]) turns any
+/// rejection here into a `NULL` links value for the span, never a row of
+/// fabricated links.
+fn scan_link_fields(chunk: &[u8]) -> Option<SpanLink> {
+    let mut trace_id: Option<[u8; TRACE_ID_WIDTH]> = None;
+    let mut span_id: Option<[u8; SPAN_ID_WIDTH]> = None;
+    let mut trace_state = String::new();
+    let mut pos = 0usize;
+    while let Some((field, value)) = next_wire_field(chunk, &mut pos) {
+        match (field, value) {
+            (LINK_TRACE_ID_FIELD, WireField::Len(b)) if b.len() == TRACE_ID_WIDTH => {
+                let mut arr = [0u8; TRACE_ID_WIDTH];
+                arr.copy_from_slice(b);
+                trace_id = Some(arr);
+            }
+            (LINK_SPAN_ID_FIELD, WireField::Len(b)) if b.len() == SPAN_ID_WIDTH => {
+                let mut arr = [0u8; SPAN_ID_WIDTH];
+                arr.copy_from_slice(b);
+                span_id = Some(arr);
+            }
+            (LINK_TRACE_ID_FIELD, WireField::Len(_)) | (LINK_SPAN_ID_FIELD, WireField::Len(_)) => {
+                return None;
+            }
+            (LINK_TRACE_STATE_FIELD, WireField::Len(b)) => {
+                trace_state = std::str::from_utf8(b).ok()?.to_string();
+            }
+            _ => {}
+        }
+    }
+    if pos != chunk.len() {
+        return None;
+    }
+    Some(SpanLink {
+        trace_id: trace_id?,
+        span_id: span_id?,
+        trace_state,
+        attrs_blob: chunk.to_vec(),
+    })
+}
+
+/// Decodes one [`SpanLink`]'s `attrs_blob` into the link's own attribute
+/// pairs, in the order the sender encoded them. Mirrors [`event_attrs`]
+/// exactly, reading field 4 (repeated `KeyValue`) instead of field 3, and
+/// dropping the same unrepresentable `AnyValue` kinds.
+pub fn link_attrs(blob: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some((field, value)) = next_wire_field(blob, &mut pos) {
+        if field == LINK_ATTRIBUTES_FIELD
+            && let WireField::Len(kv) = value
+            && let Some(pair) = decode_key_value(kv)
+        {
+            out.push(pair);
+        }
+    }
+    out
+}
+
 /// Renders a `double_value` exactly as `ravel_otlp::promcompat::format_float`
 /// does, so the same number reads identically whether it arrived as a span
 /// attribute or as an event attribute. Duplicated rather than imported:
@@ -857,6 +989,84 @@ mod tests {
         assert_eq!(event_attrs(&[]), Vec::new());
     }
 
+    /// A well-formed `Span.Link` chunk: `trace_id` (field 1), `span_id`
+    /// (field 2), and, when non-empty, `trace_state` (field 3).
+    fn link_chunk(trace_id: &[u8], span_id: &[u8], trace_state: &str) -> Vec<u8> {
+        let mut out = len_field(0x0a, trace_id);
+        out.extend_from_slice(&len_field(0x12, span_id));
+        if !trace_state.is_empty() {
+            out.extend_from_slice(&len_field(0x1a, trace_state.as_bytes()));
+        }
+        out
+    }
+
+    #[test]
+    fn parse_links_round_trips_a_well_formed_link() {
+        let trace_id = [0x11u8; TRACE_ID_WIDTH];
+        let span_id = [0x22u8; SPAN_ID_WIDTH];
+        let chunk = link_chunk(&trace_id, &span_id, "congo=1");
+        let value = hex_encode(&frame(&chunk));
+
+        let links = parse_links(&value).expect("well-formed link parses");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].trace_id, trace_id);
+        assert_eq!(links[0].span_id, span_id);
+        assert_eq!(links[0].trace_state, "congo=1");
+        assert_eq!(links[0].attrs_blob, chunk);
+    }
+
+    #[test]
+    fn parse_links_rejects_wrong_width_trace_id() {
+        // A 3-byte trace_id (not TRACE_ID_WIDTH) must fail the whole link
+        // rather than zero-fill: a fabricated all-zero trace id is
+        // indistinguishable from a real one downstream.
+        let chunk = link_chunk(&[0xaa, 0xbb, 0xcc], &[0x22u8; SPAN_ID_WIDTH], "");
+        let value = hex_encode(&frame(&chunk));
+        assert!(
+            parse_links(&value).is_none(),
+            "a wrong-width trace_id must fail the link, never zero-fill it"
+        );
+    }
+
+    #[test]
+    fn parse_links_rejects_missing_span_id() {
+        // trace_id only, no span_id field at all.
+        let chunk = len_field(0x0a, &[0x11u8; TRACE_ID_WIDTH]);
+        let value = hex_encode(&frame(&chunk));
+        assert!(
+            parse_links(&value).is_none(),
+            "a missing span_id must fail the link, never zero-fill it"
+        );
+    }
+
+    #[test]
+    fn parse_links_rejects_truncated_field() {
+        // A valid trace_id, then a span_id tag claiming 8 bytes with only 3
+        // bytes actually following: next_wire_field cannot explain this, and
+        // scan_link_fields must not silently keep the partial scan.
+        let mut chunk = len_field(0x0a, &[0x11u8; TRACE_ID_WIDTH]);
+        chunk.push(0x12); // span_id tag
+        chunk.push(8); // claims length 8
+        chunk.extend_from_slice(&[1, 2, 3]); // only 3 bytes follow
+        let value = hex_encode(&frame(&chunk));
+        assert!(
+            parse_links(&value).is_none(),
+            "a truncated field must fail the link, never a partial scan"
+        );
+    }
+
+    #[test]
+    fn parse_links_rejects_non_utf8_trace_state() {
+        let mut chunk = len_field(0x0a, &[0x11u8; TRACE_ID_WIDTH]);
+        chunk.extend_from_slice(&len_field(0x12, &[0x22u8; SPAN_ID_WIDTH]));
+        chunk.extend_from_slice(&len_field(0x1a, &[0xff, 0xfe])); // invalid UTF-8
+        let value = hex_encode(&frame(&chunk));
+        assert!(
+            parse_links(&value).is_none(),
+            "non-UTF-8 trace_state must fail the link, never become an empty string"
+        );
+    }
+
     #[test]
     fn format_double_matches_the_prometheus_float_spelling() {
         assert_eq!(format_double(1.5), "1.5");
@@ -926,6 +1136,73 @@ mod proptests {
                 prop_assert_eq!(&ev.attrs_blob, p);
             }
             prop_assert_eq!(reconstruct_events_raw(&events), value);
+        }
+    }
+
+    /// One length-delimited protobuf field: tag byte, then length, then bytes.
+    fn len_field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        put_uvarint(&mut out, payload.len() as u64);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A well-formed `Span.Link` chunk: `trace_id` (field 1), `span_id`
+    /// (field 2), and, when non-empty, `trace_state` (field 3).
+    fn link_chunk(trace_id: &[u8; 16], span_id: &[u8; 8], trace_state: &str) -> Vec<u8> {
+        let mut out = len_field(0x0a, trace_id);
+        out.extend_from_slice(&len_field(0x12, span_id));
+        if !trace_state.is_empty() {
+            out.extend_from_slice(&len_field(0x1a, trace_state.as_bytes()));
+        }
+        out
+    }
+
+    proptest! {
+        /// parse_links never panics on an arbitrary string (untrusted attr
+        /// value).
+        #[test]
+        fn parse_links_never_panics(s in ".{0,200}") {
+            let _ = parse_links(&s);
+        }
+
+        /// Any list of well-formed link fields, framed as the ingest side
+        /// frames them, round-trips exactly through parse_links: every value
+        /// it accepts reconstructs the fields it was built from.
+        #[test]
+        fn arbitrary_valid_links_round_trip(
+            links in proptest::collection::vec(
+                (
+                    proptest::collection::vec(any::<u8>(), 16),
+                    proptest::collection::vec(any::<u8>(), 8),
+                    "[ -~]{0,12}",
+                ),
+                1..6,
+            )
+        ) {
+            let mut raw = Vec::new();
+            let mut chunks = Vec::new();
+            for (trace_id, span_id, trace_state) in &links {
+                let trace_id: [u8; 16] = trace_id.as_slice().try_into().unwrap();
+                let span_id: [u8; 8] = span_id.as_slice().try_into().unwrap();
+                let chunk = link_chunk(&trace_id, &span_id, trace_state);
+                put_uvarint(&mut raw, chunk.len() as u64);
+                raw.extend_from_slice(&chunk);
+                chunks.push(chunk);
+            }
+            let value = hex_encode(&raw);
+            let parsed = parse_links(&value).expect("well-formed links blob parses");
+            prop_assert_eq!(parsed.len(), links.len());
+            for (parsed_link, ((trace_id, span_id, trace_state), chunk)) in
+                parsed.iter().zip(links.iter().zip(chunks.iter()))
+            {
+                let trace_id: [u8; 16] = trace_id.as_slice().try_into().unwrap();
+                let span_id: [u8; 8] = span_id.as_slice().try_into().unwrap();
+                prop_assert_eq!(&parsed_link.trace_id, &trace_id);
+                prop_assert_eq!(&parsed_link.span_id, &span_id);
+                prop_assert_eq!(&parsed_link.trace_state, trace_state);
+                prop_assert_eq!(&parsed_link.attrs_blob, chunk);
+            }
         }
     }
 }

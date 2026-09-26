@@ -6,6 +6,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`spans.links` decodes span links into a structured, filterable column**
+  (issue #1710). Symmetric to `events`, it is built from the plain
+  `attrs["_links_raw"]` protobuf blob at scan time, on every RSPAN version,
+  since RSPAN is a frozen persistent format and promoting links into a
+  nested on-disk column would need an ADR and a version bump. NULL when a
+  span carries no link, or when its `_links_raw` value is malformed (bad
+  hex, bad framing, or a link chunk missing a well-formed `trace_id` or
+  `span_id`), never an empty list or a fabricated field. A query that
+  does not select `events` or `links` skips their decode entirely; both
+  columns turn off the columnar fast path when selected.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed

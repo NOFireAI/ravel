@@ -39,6 +39,7 @@ use datafusion::scalar::ScalarValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::span::Event as SpanEventProto;
+use opentelemetry_proto::tonic::trace::v1::span::Link as SpanLinkProto;
 use prost::Message as _;
 use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef, Snapshot};
 use ravel_commit::publish::RetryPolicy;
@@ -47,7 +48,7 @@ use ravel_commit::{keys, publish, record};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
-use ravel_rspan::record::EVENTS_RAW_KEY;
+use ravel_rspan::record::{EVENTS_RAW_KEY, LINKS_RAW_KEY};
 use ravel_rspan::{
     ObjectIdentity, RspanConfig, RspanWriter, ScanStats, SpanQuery, SpanRecord, StatusCode,
 };
@@ -646,6 +647,23 @@ fn find_spans_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<SpanQuery> {
     None
 }
 
+/// Find the `SpansScanExec` leaf node itself anywhere in `plan`'s tree (unlike
+/// `find_spans_scan`, which returns only the issued `SpanQuery`). Its own
+/// `ExecutionPlan::schema()` is the scan's actual output schema, independent
+/// of anything a wrapping node (a `ProjectionExec`) narrows above it.
+fn find_spans_scan_node(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    let any_ref: &dyn std::any::Any = plan.as_ref();
+    if any_ref.downcast_ref::<SpansScanExec>().is_some() {
+        return Some(Arc::clone(plan));
+    }
+    for child in plan.children() {
+        if let Some(scan) = find_spans_scan_node(child) {
+            return Some(scan);
+        }
+    }
+    None
+}
+
 /// Reduce `SELECT trace_id, span_id, start_ts, name FROM spans ...` output
 /// batches to the set of rows they contain, in that exact column order.
 /// Unlike `batches_to_rows` above, this does not assert the full public
@@ -748,6 +766,39 @@ async fn trace_id_hex_string_literal_plans_and_takes_the_trace_fast_path() {
     assert_eq!(
         string_rows, binary_rows,
         "the string and binary trace_id literal forms must return identical rows"
+    );
+}
+
+/// Issue #1710 fix round: a query ineligible for the columnar fast path
+/// (`attrs` is projected, forcing the row path, ADR-0110 decision 4) but
+/// which does not itself project `events` or `links` must not decode either.
+/// The scan leaf's own emitted schema is the proof: `build_row_batch` builds
+/// exactly one array per schema field (asserted by its own
+/// `debug_assert_eq!(schema.fields().len(), columns.len())`), and
+/// `events_column`/`links_column` (the expensive per-row protobuf-into-Arrow
+/// decode) run only for a `SPAN_COL_EVENTS`/`SPAN_COL_LINKS` index present in
+/// that schema. Before the provider pushed the real projection into the row
+/// path, it always built the full thirteen-column schema and relied on a
+/// `ProjectionExec` above the scan to drop the rest, so the leaf itself
+/// still decoded events and links on every row regardless.
+#[tokio::test]
+async fn ineligible_scan_skips_events_and_links_decode_when_not_projected() {
+    let mut record = span([0x11u8; 16], 0, 100, 110, "root");
+    record.attrs = vec![("svc".to_string(), "api".to_string())];
+    let executor = executor_with_spans(&[record]).await;
+
+    // `attrs` forces the row path (ineligible for the columnar fast path);
+    // `events`/`links` are not selected at all.
+    let plan = spans_physical_plan(&executor, "SELECT trace_id, attrs FROM spans").await;
+    let scan = find_spans_scan_node(&plan).expect("plan contains a SpansScanExec");
+    let schema = scan.schema();
+    let fields: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        fields,
+        vec!["trace_id", "attrs"],
+        "the scan leaf must emit exactly the projected columns, proving it built \
+         neither the events nor the links column for a query that selected \
+         neither"
     );
 }
 
@@ -1256,6 +1307,329 @@ async fn events_column_returns_structured_exception_event_and_filters_on_its_att
     );
 }
 
+/// One `opentelemetry.proto.trace.v1.Span.Link` with string-valued attributes,
+/// the shape an OTel SDK sends for a batching or fan-in span link.
+fn otlp_link(
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    trace_state: &str,
+    attrs: &[(&str, &str)],
+) -> SpanLinkProto {
+    SpanLinkProto {
+        trace_id: trace_id.to_vec(),
+        span_id: span_id.to_vec(),
+        trace_state: trace_state.to_string(),
+        attributes: attrs
+            .iter()
+            .map(|(k, v)| KeyValue {
+                key: (*k).to_string(),
+                value: Some(AnyValue {
+                    value: Some(AnyValueVariant::StringValue((*v).to_string())),
+                }),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// The `_links_raw` attribute value for `links`, built exactly as
+/// `ravel_otlp::traces_normalize::encode_blob` builds it at ingest:
+/// length-delimited protobuf messages concatenated, then hex-encoded.
+fn links_raw(links: &[SpanLinkProto]) -> String {
+    let mut raw = Vec::new();
+    for l in links {
+        l.encode_length_delimited(&mut raw).expect("encode link");
+    }
+    raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A span carrying `links` as its `_links_raw` attribute. Attribute keys stay
+/// strictly ascending (`_links_raw` < `svc`), which is what the RSPAN attrs
+/// codec requires.
+fn span_with_links(
+    trace: [u8; 16],
+    span_id: u8,
+    start: i64,
+    name: &str,
+    links: &[SpanLinkProto],
+) -> SpanRecord {
+    let mut record = span(trace, span_id, start, start + 10, name);
+    let mut attrs = vec![("svc".to_string(), "api".to_string())];
+    if !links.is_empty() {
+        attrs.insert(0, (LINKS_RAW_KEY.to_string(), links_raw(links)));
+    }
+    record.attrs = attrs;
+    record
+}
+
+/// Issue #1710 part B acceptance test: the `spans` table exposes span links as
+/// a structured `links` column, and a query can filter on a link's own
+/// attributes.
+///
+/// Both halves matter and are asserted separately:
+///
+/// - `SELECT links FROM spans` returns the decoded structure, not a hex blob:
+///   two links on the first span (distinct trace ids, span ids, trace states,
+///   and a link attribute each), and NULL (not an empty list) on the second
+///   span, which carried no links at all. The assertion goes through
+///   `QueryOutput::to_json`, same as the `events` acceptance test, so it
+///   proves the nested `List(Struct{..., FixedSizeBinary, FixedSizeBinary,
+///   Utf8, Map})` type serializes on the HTTP surface too.
+/// - `unnest(links)` plus a `WHERE` over a link attribute filters exactly.
+///
+/// Against the pre-fix code this test cannot even plan: `spans` had no
+/// `links` column.
+#[tokio::test]
+async fn links_column_returns_structured_links_and_filters_on_their_attrs() {
+    let t1 = [0x11u8; 16];
+    let t2 = [0x22u8; 16];
+    let linked_a = [0xaau8; 16];
+    let linked_b = [0xbbu8; 16];
+    let records = vec![
+        span_with_links(
+            t1,
+            0,
+            100,
+            "root",
+            &[
+                otlp_link(linked_a, [0xaau8; 8], "congo=1", &[("link.attr", "first")]),
+                otlp_link(linked_b, [0xbbu8; 8], "", &[("link.attr", "second")]),
+            ],
+        ),
+        span_with_links(t2, 0, 300, "unrelated", &[]),
+    ];
+    let executor = executor_with_spans(&records).await;
+
+    // Half one: the structured column itself, through the JSON encoder the
+    // HTTP surface uses. Ordering is the scan's advertised (trace_id, start_ts).
+    let sql = "SELECT name, links FROM spans ORDER BY name";
+    let outcome = executor
+        .execute(tenant().hash(), &sql_request(sql))
+        .await
+        .expect("SELECT links executes");
+
+    let batches = outcome.output.batches();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "two spans, two rows");
+
+    let links_field = batches[0].schema().field(1).clone();
+    assert_eq!(links_field.name(), "links");
+    assert_eq!(
+        links_field.data_type(),
+        ravel_sql::spans_schema()
+            .field(ravel_sql::SPAN_COL_LINKS)
+            .data_type(),
+        "the projected links column keeps the declared table type"
+    );
+
+    let linked_a_hex: String = linked_a.iter().map(|b| format!("{b:02x}")).collect();
+    let linked_b_hex: String = linked_b.iter().map(|b| format!("{b:02x}")).collect();
+    let json = outcome.output.to_json().expect("links encode to JSON");
+    assert_eq!(
+        json["columns"],
+        serde_json::json!([
+            {"name": "name", "type": "Utf8"},
+            {"name": "links", "type": links_field.data_type().to_string()},
+        ])
+    );
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([
+            [
+                "root",
+                [
+                    {
+                        "trace_id": linked_a_hex,
+                        "span_id": "aaaaaaaaaaaaaaaa",
+                        "trace_state": "congo=1",
+                        "attrs": {"link.attr": "first"},
+                    },
+                    {
+                        "trace_id": linked_b_hex,
+                        "span_id": "bbbbbbbbbbbbbbbb",
+                        "trace_state": "",
+                        "attrs": {"link.attr": "second"},
+                    },
+                ],
+            ],
+            ["unrelated", serde_json::Value::Null],
+        ]),
+        "links must decode field by field, and a span with no links must be \
+         NULL rather than an empty list"
+    );
+
+    // The raw attribute is still there: this column is a lossy projection of
+    // it, never a replacement.
+    let raw = executor
+        .execute(
+            tenant().hash(),
+            &sql_request("SELECT count(*) FROM spans WHERE attrs['_links_raw'] IS NOT NULL"),
+        )
+        .await
+        .expect("attrs['_links_raw'] still queryable");
+    assert_eq!(scalar_count(raw.output.batches()), 1);
+
+    // Half two: unnest plus a predicate over a link attribute.
+    for (sql, want, what) in [
+        (
+            "SELECT count(*) FROM (SELECT unnest(links) AS l FROM spans)",
+            2i64,
+            "two links across all spans",
+        ),
+        (
+            "SELECT count(*) FROM (SELECT unnest(links) AS l FROM spans) \
+             WHERE l['attrs']['link.attr'] = 'first'",
+            1,
+            "exactly one link carries link.attr = first",
+        ),
+        (
+            "SELECT count(*) FROM (SELECT unnest(links) AS l FROM spans) \
+             WHERE l['attrs']['link.attr'] = 'nonexistent'",
+            0,
+            "a non-matching link attribute value keeps nothing",
+        ),
+    ] {
+        let outcome = executor
+            .execute(tenant().hash(), &sql_request(sql))
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must execute: {e:?}"));
+        assert_eq!(
+            scalar_count(outcome.output.batches()),
+            want,
+            "{what} ({sql})"
+        );
+    }
+}
+
+/// Issue #1710: a malformed `_links_raw` value (garbage bytes, not a valid
+/// length-delimited protobuf framing) must not panic, and must fall back to
+/// the documented NULL, exactly like a span with no links at all. The raw
+/// attribute itself is untouched, so the caller can still see it.
+#[tokio::test]
+async fn links_column_treats_unparseable_links_raw_as_null() {
+    let t1 = [0x11u8; 16];
+    let mut record = span(t1, 0, 100, 110, "garbage-links");
+    record.attrs = vec![
+        (
+            LINKS_RAW_KEY.to_string(),
+            "not-hex-and-not-a-link".to_string(),
+        ),
+        ("svc".to_string(), "api".to_string()),
+    ];
+    let executor = executor_with_spans(&[record]).await;
+
+    let outcome = executor
+        .execute(tenant().hash(), &sql_request("SELECT links FROM spans"))
+        .await
+        .expect("query over a garbage _links_raw must not panic or error");
+    let json = outcome.output.to_json().expect("encodes to JSON");
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([[serde_json::Value::Null]]),
+        "an unparseable _links_raw value falls back to NULL, not an error or a panic"
+    );
+
+    let raw = executor
+        .execute(
+            tenant().hash(),
+            &sql_request("SELECT attrs['_links_raw'] FROM spans"),
+        )
+        .await
+        .expect("the raw attribute is still queryable");
+    let raw_json = raw.output.to_json().expect("encodes to JSON");
+    assert_eq!(
+        raw_json["rows"],
+        serde_json::json!([["not-hex-and-not-a-link"]]),
+        "the raw attribute value is untouched"
+    );
+}
+
+/// Issue #1710 fix round: three specific malformed `_links_raw` shapes that a
+/// naive scan would zero-fill or truncate into fabricated data instead of
+/// failing outright. Each must decode to NULL, exactly like the
+/// garbage-bytes case above, and reaches `scan_link_fields` (unlike that
+/// case, which fails earlier at hex decode).
+#[tokio::test]
+async fn links_column_treats_malformed_link_fields_as_null() {
+    /// One length-delimited protobuf field: tag byte, then a single-byte
+    /// length, then bytes. Test payloads are all well under 128 bytes.
+    fn len_field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(
+            payload.len() < 128,
+            "test payload too long for a 1-byte varint"
+        );
+        let mut out = vec![tag];
+        out.push(payload.len() as u8);
+        out.extend_from_slice(payload);
+        out
+    }
+    /// Frames link chunks as the ingest side frames them (a single-byte
+    /// varint length prefix per chunk) and hex-encodes the result.
+    fn frame(chunks: &[Vec<u8>]) -> String {
+        let mut raw = Vec::new();
+        for c in chunks {
+            assert!(c.len() < 128, "test chunk too long for a 1-byte varint");
+            raw.push(c.len() as u8);
+            raw.extend_from_slice(c);
+        }
+        raw.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    let t1 = [0x11u8; 16];
+
+    // A well-framed chunk whose trace_id is 3 bytes, not TRACE_ID_WIDTH.
+    let wrong_width_trace_id = {
+        let mut chunk = len_field(0x0a, &[0xaa, 0xbb, 0xcc]);
+        chunk.extend_from_slice(&len_field(0x12, &[0x22u8; 8]));
+        chunk
+    };
+    // A valid trace_id, then a span_id tag claiming length 8 with only 3
+    // bytes actually following.
+    let truncated_field = {
+        let mut chunk = len_field(0x0a, &[0x11u8; 16]);
+        chunk.push(0x12);
+        chunk.push(8);
+        chunk.extend_from_slice(&[1, 2, 3]);
+        chunk
+    };
+    // A valid trace_id and span_id, then a trace_state field of invalid
+    // UTF-8.
+    let non_utf8_trace_state = {
+        let mut chunk = len_field(0x0a, &[0x11u8; 16]);
+        chunk.extend_from_slice(&len_field(0x12, &[0x22u8; 8]));
+        chunk.extend_from_slice(&len_field(0x1a, &[0xff, 0xfe]));
+        chunk
+    };
+
+    for (what, chunk) in [
+        ("a 3-byte trace_id", wrong_width_trace_id),
+        (
+            "a field truncated part way through the chunk",
+            truncated_field,
+        ),
+        ("a non-UTF-8 trace_state", non_utf8_trace_state),
+    ] {
+        let mut record = span(t1, 0, 100, 110, "malformed-links");
+        record.attrs = vec![
+            (LINKS_RAW_KEY.to_string(), frame(&[chunk])),
+            ("svc".to_string(), "api".to_string()),
+        ];
+        let executor = executor_with_spans(&[record]).await;
+
+        let outcome = executor
+            .execute(tenant().hash(), &sql_request("SELECT links FROM spans"))
+            .await
+            .unwrap_or_else(|e| panic!("query over {what} must not panic or error: {e:?}"));
+        let json = outcome.output.to_json().expect("encodes to JSON");
+        assert_eq!(
+            json["rows"],
+            serde_json::json!([[serde_json::Value::Null]]),
+            "{what} must fall back to NULL, never a fabricated or partial link"
+        );
+    }
+}
+
 /// The single `count(*)` value in `batches`, which must hold exactly one row.
 fn scalar_count(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64 {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1639,6 +2013,133 @@ mod flight_reachability {
                 None,
             ],
             "the decoded event survives the Flight round trip, and an event-free span is null"
+        );
+    }
+
+    /// The Flight encoder carries the nested `links` type end to end, the
+    /// links sibling of `flight_sql_serializes_the_nested_events_column`
+    /// above: the batch that comes back over `DoGet` must carry the declared
+    /// column type and the decoded link, and a span with no links must arrive
+    /// null.
+    #[tokio::test]
+    async fn flight_sql_serializes_the_nested_links_column() {
+        let tenant = tenant_id("acme");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let no_specs: &[SegSpec] = &[];
+        let harness = Harness::build(Arc::clone(&store), &[(&tenant, no_specs)]).await;
+
+        let linked = [0xaau8; 16];
+        let with_link = super::span_with_links(
+            [0u8; 16],
+            0,
+            100,
+            "a-root",
+            &[super::otlp_link(
+                linked,
+                [0xaau8; 8],
+                "congo=1",
+                &[("link.attr", "first")],
+            )],
+        );
+        let without_link = super::span_with_links([1u8; 16], 0, 200, "b-root", &[]);
+        publish_spans_segment(harness.store.as_ref(), &tenant, &[with_link, without_link]).await;
+
+        let ticket = harness
+            .get_flight_info(
+                "acme",
+                "SELECT trace_id, links FROM spans ORDER BY trace_id",
+            )
+            .await
+            .expect("flight info");
+        let batches = harness.do_get("acme", &ticket).await.expect("do get");
+
+        /// One row's decoded `links` value: null, or the single link's trace
+        /// id, span id, trace state, and attribute pairs.
+        type DecodedLink = Option<([u8; 16], [u8; 8], String, Vec<(String, String)>)>;
+
+        let mut rows: Vec<DecodedLink> = Vec::new();
+        for batch in &batches {
+            assert_eq!(
+                batch.schema().field(1).data_type(),
+                ravel_sql::spans_schema()
+                    .field(ravel_sql::SPAN_COL_LINKS)
+                    .data_type(),
+                "the Flight stream carries the declared links type"
+            );
+            let links = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("links column is a list");
+            for i in 0..batch.num_rows() {
+                if links.is_null(i) {
+                    rows.push(None);
+                    continue;
+                }
+                let items = links.value(i);
+                let items = items
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("link items are structs");
+                assert_eq!(items.len(), 1, "the fixture span carries one link");
+                let trace_id: [u8; 16] = items
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("link trace_id is FixedSizeBinary(16)")
+                    .value(0)
+                    .try_into()
+                    .expect("16-byte trace id");
+                let span_id: [u8; 8] = items
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("link span_id is FixedSizeBinary(8)")
+                    .value(0)
+                    .try_into()
+                    .expect("8-byte span id");
+                let trace_state = items
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("link trace_state is Utf8")
+                    .value(0)
+                    .to_string();
+                let attrs = items
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<MapArray>()
+                    .expect("link attrs is a map");
+                let entries = attrs.value(0);
+                let keys = entries
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("map keys are Utf8");
+                let values = entries
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("map values are Utf8");
+                let pairs = (0..entries.len())
+                    .map(|k| (keys.value(k).to_string(), values.value(k).to_string()))
+                    .collect();
+                rows.push(Some((trace_id, span_id, trace_state, pairs)));
+            }
+        }
+
+        assert_eq!(
+            rows,
+            vec![
+                Some((
+                    linked,
+                    [0xaau8; 8],
+                    "congo=1".to_string(),
+                    vec![("link.attr".to_string(), "first".to_string())],
+                )),
+                None,
+            ],
+            "the decoded link survives the Flight round trip, and a link-free span is null"
         );
     }
 }
