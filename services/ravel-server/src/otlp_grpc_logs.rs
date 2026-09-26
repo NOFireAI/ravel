@@ -14,9 +14,7 @@ use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
 use crate::logs_ingest::LogIngestRequestError;
-use crate::otlp_grpc::{
-    admission_rejection_status, ingest_concurrency_shed_status, metadata_to_headers,
-};
+use crate::otlp_grpc::{admission_rejection_status, metadata_to_headers};
 use crate::otlp_http::{
     COMMIT_TOKEN_HEADER, GatewayState, idempotency_key_from_headers, now_ns,
     write_mode_from_headers,
@@ -39,11 +37,11 @@ impl LogsService for GrpcLogsService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        let _permit = self
-            .state
-            .ingest_concurrency
-            .try_admit()
-            .map_err(|_| ingest_concurrency_shed_status())?;
+        // See `otlp_grpc::export`: normally already taken by
+        // `GrpcIngestAdmissionLayer` on the request head (issue #1705), and
+        // taken here only on the direct-call path.
+        let _permit =
+            crate::ingest_admission::admit_grpc_request(&self.state.ingest_concurrency, &request)?;
 
         let headers = metadata_to_headers(request.metadata());
         let tenant = self

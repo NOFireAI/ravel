@@ -29,6 +29,7 @@ pub mod gc_config;
 pub mod health;
 pub mod idle_tenant_state;
 pub mod ingest;
+pub mod ingest_admission;
 pub mod ingest_byte_metrics;
 pub mod ingest_concurrency;
 pub mod lifecycle_refresh;
@@ -3130,8 +3131,25 @@ pub async fn start(
         // service shares the listener but is a query surface with no
         // byte-rate admission, so the layer is a no-op cost for it (an unread
         // extension).
+        //
+        // Two bounds are applied here rather than inside the handlers (issue
+        // #1705). `max_concurrent_streams` caps how many streams one
+        // connection may have open at once, so a client cannot make this
+        // process track an unbounded number of request heads. The admission
+        // layer then takes the process-wide in-flight permit for a unary OTLP
+        // export when its head arrives, so a request over the ceiling is
+        // refused RESOURCE_EXHAUSTED before tonic reads, decompresses or
+        // decodes its message; the handler behind it reuses that permit
+        // instead of taking a second. Both are sized from
+        // `--max-inflight-ingest-requests`, the existing ceiling, and the
+        // stream cap therefore also applies to the Flight SQL and fragment
+        // surfaces that share this listener.
         let grpc = tonic::transport::Server::builder()
+            .max_concurrent_streams(config.ingest_concurrency_limit.max_concurrent_streams())
             .layer(wire_byte_count::WireByteCountLayer)
+            .layer(ingest_admission::GrpcIngestAdmissionLayer::new(
+                ingest_concurrency.clone(),
+            ))
             .add_optional_service(metrics_service)
             .add_optional_service(logs_service)
             .add_optional_service(traces_service);
@@ -3218,7 +3236,13 @@ pub async fn start(
             let tls = tonic::transport::ServerTlsConfig::new()
                 .identity(identity)
                 .client_ca_root(tonic::transport::Certificate::from_pem(&fl.tls_ca_pem));
+            // The same per-connection stream cap the public gRPC listener
+            // takes (issue #1705). No ingest admission layer here: this
+            // listener serves only capability-authorized fragment fetches, a
+            // query surface, which must not consume ingest permits or count
+            // against the ingest shed counter.
             let server = tonic::transport::Server::builder()
+                .max_concurrent_streams(config.ingest_concurrency_limit.max_concurrent_streams())
                 .tls_config(tls)
                 .map_err(|e| anyhow::anyhow!("failed to configure fragment listener TLS: {e}"))?
                 .add_service(

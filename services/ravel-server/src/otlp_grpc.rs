@@ -68,11 +68,12 @@ impl MetricsService for GrpcMetricsService {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        let _permit = self
-            .state
-            .ingest_concurrency
-            .try_admit()
-            .map_err(|_| ingest_concurrency_shed_status())?;
+        // Normally already taken by `GrpcIngestAdmissionLayer` on the request
+        // head, before tonic read or decoded this message (issue #1705); this
+        // is the direct-call path, where nothing in front of the handler took
+        // one. Either way exactly one permit covers the request.
+        let _permit =
+            crate::ingest_admission::admit_grpc_request(&self.state.ingest_concurrency, &request)?;
 
         let headers = metadata_to_headers(request.metadata());
         let tenant = self
