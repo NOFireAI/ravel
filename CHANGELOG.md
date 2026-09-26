@@ -6,6 +6,40 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`ravel-cli export --signal logs` writes a tenant's stored logs back out to
+  a Parquet file `ravel-cli load` reads in** (ADR-1751, issue #1712). The
+  command takes the store and tenancy flags the other read commands take, plus
+  `--tenant`, an RFC 3339 `--start`/`--end` window, `--parquet` for the output
+  path, and the same `--mapping` TOML a load uses to decide which column each
+  field lands in. It resolves the catalog once, reads and decodes the RLOG
+  objects that snapshot names, and writes the rows sorted by event time. The
+  window is half-open, so exporting adjoining ranges writes no row twice and
+  drops none between them. Exclusion follows the query path rather than a
+  second copy of the rules: retention tombstones and compaction supersession
+  are already applied by the catalog resolve, and erasure predicates from that
+  same snapshot are handed to the segment fetcher, so a record a query cannot
+  see is a record the export does not write. The mapping's typed attribute
+  columns round-trip, and the optional `attrs_map_column` adds one map column
+  carrying every record attribute no typed column covers. `--signal` has no
+  default and today accepts only `logs`; `metrics` and `spans` are refused
+  with the bulk-import follow-up each one waits on, because an exported file
+  no command can load back is not an export. `--parquet` is replaced only
+  once the export finishes, by renaming a temporary file written beside it,
+  so a failed export leaves an existing file untouched; a path under `/dev`
+  or an existing directory is refused before anything is read.
+  `--max-ingest-lag` passes the deployment's own `ravel-server
+  --max-ingest-lag` through when it differs from the 2h default, and refuses
+  zero as the server does. The whole window is decoded into memory
+  before the first row is written, so a wide range wants several narrower
+  exports. The ingest guide's bulk-export section covers that and the
+  round-trip caveats, including `ts_unit` truncation and the fact that `load`
+  does not read `attrs_map_column` back. Export costs `ravel-cli` a normal
+  dependency on `ravel-query`, which is what sharing the query path's
+  exclusion rules rather than copying them is worth (ADR-1751 amendment,
+  2026-09-26).
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed

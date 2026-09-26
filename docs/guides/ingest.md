@@ -857,3 +857,145 @@ event range at resolve time, so unsorted input makes every subsequent query over
 the affected stream fetch the bulk-loaded objects regardless of the query's
 window. Sort input by event time before load where the mapping allows it. This
 is a performance recommendation, not a correctness requirement.
+
+## Bulk export (`ravel-cli export --signal logs`)
+
+`export` is the inverse of `load`: it reads a tenant's stored logs back out of
+object storage and writes them to a Parquet file, using the same `--mapping`
+TOML to decide which column each field lands in.
+
+```sh
+ravel-cli export --signal logs --tenant acme \
+  --start 2024-01-01T00:00:00Z --end 2024-01-02T00:00:00Z \
+  --parquet acme-day.parquet --mapping map.toml --shards 4
+```
+
+Run with the same mapping a load of that data used, it produces a file
+`ravel-cli load` reads back:
+
+```sh
+ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
+```
+
+**Logs only.** `--signal` has no default, and today it accepts only `logs`.
+`--signal metrics` and `--signal spans` are refused by name: bulk export for a
+signal is sequenced behind bulk import for that signal, neither metrics import
+nor spans import exists yet, and an exported file that no command can load back
+is not an export. The refusal says which missing piece each one waits on.
+
+### What the window means
+
+`--start` and `--end` are RFC 3339 instants and the window is **half-open**:
+a record is exported when its event time is at or after `--start` and strictly
+before `--end`. Exporting a day and then the next day with adjoining bounds
+therefore covers both days with no row written twice and none dropped between
+them. `--end` must be after `--start`; an empty window is refused rather than
+reported as a successful export of nothing.
+
+The catalog is resolved once, at one snapshot, and every object the export
+reads comes from that resolution. A compaction or a flush that lands while the
+export is running does not change what it writes.
+
+Garbage collection is the exception. The snapshot names objects; it does not
+hold them. If a GC pass deletes an object this snapshot already named -- one a
+compaction superseded shortly before the export started, say -- the export's
+GET of it fails with not-found and the whole export fails with that error. It
+does not retry and it does not skip the object, because skipping would write a
+file missing records with nothing in the output to say so. Rerun the export:
+the fresh resolve will not name the deleted object.
+
+### Memory: the window is held whole
+
+Every record in the window is decoded and held in memory before the first row
+is written, because the output is sorted by event time. Peak memory is
+proportional to the window's record count, not to the output file's batch
+size, and there is no spill to disk. Export a wide range as several narrower
+windows; the half-open bound is what makes that safe to do.
+
+### The listing window and a server with a raised ingest lag
+
+The catalog lists ingest-hour buckets from `--start` minus `max_ingest_lag`
+forward, and `export` defaults that to the same 2 hours the server defaults
+to. The reach-back is what finds the bucket of a record whose event time falls
+in a later ingest hour than the bucket it was written into: narrow it so that
+`--start` minus the lag no longer reaches that earlier hour, and the listing
+starts in the export window's own hour, so that bucket is never listed and the
+export reports a clean, short result.
+
+An export therefore has to resolve with the same value the server's own
+resolves use, or it answers a different window than a query over the same
+range does. Nothing on the bucket records what the server was configured with,
+so pass it: `--max-ingest-lag` takes the same humantime duration
+`ravel-server --max-ingest-lag` does, and refuses zero as the server does. On
+a default deployment it is not needed.
+
+### Exported rows are sorted by event time
+
+Rows are written in event-time order regardless of the order the underlying
+objects hold them in, which is the order a later load of the file wants anyway
+(see the sorting note above). The command prints `rows_written` along with how
+many segments it read and how many the catalog pruned, so a window that reached
+nothing says so instead of leaving an empty file unexplained.
+
+### Deleted data does not come back
+
+An export is not a back door around deletion. It reads through the same
+visibility rules a query does:
+
+- Records dropped by retention, and objects superseded by compaction, are
+  already absent from the snapshot the export resolves.
+- Subjects with an erasure request in flight are excluded from the decoded
+  records, by the same predicates the query path applies, so a subject erased
+  but not yet rewritten out of its objects is not exported.
+
+A row a query cannot see is a row the export does not write.
+
+### What round-trips and what does not
+
+Every field the mapping names round-trips: event time, body, severity number
+and text, trace and span ids, and each declared resource attribute and typed
+attribute column. A record that has no value for a mapped attribute key gets a
+null in that column, which a later load reads back as the same absent
+attribute. An attribute stored under a type the mapping does not declare for
+that key is refused by name rather than written as a null.
+
+Three things to know before treating a round trip as lossless:
+
+- **Only what the mapping names.** A resource or record attribute the mapping
+  does not declare is not in the output. Setting `attrs_map_column = "attrs"`
+  adds one `Map<Utf8, Utf8>` column holding every record attribute no typed
+  column already covers, stringified the way SQL stringifies `attrs['<key>']`.
+  That column is for reading the data elsewhere: `load` does not read it back,
+  so attributes that reach the file only through it do not survive a reload.
+- **`ts_unit` truncates.** The timestamp column is written in the unit the
+  mapping declares. A mapping with `ts_unit = "millis"` writes millisecond
+  values, and a reload of that file gets timestamps truncated to the
+  millisecond. Use `ts_unit = "nanos"` when the round trip has to be exact.
+- **Retention restarts on reload.** Loading an exported file is an ordinary
+  bulk load, so the reloaded records bucket by the new load's time, not by
+  their event time or their original ingest hour.
+
+`--shards` is the tenant's configured shard count, the same value a load of
+that tenant uses, and the tenant's durable provisioning record supplies the
+real per-hour shard generations on top of it.
+
+`--parquet` names the output path and replaces it if it exists, but only once
+the export has finished. The rows go to a temporary file beside the target,
+named `.<file name>.<pid>.<n>.tmp`, which is synced to disk and renamed over
+the target after the Parquet writer closes, and the directory is synced after
+the rename, so the replace survives a power loss. An export that fails
+part-way leaves the previous file exactly as it was rather than a truncated
+one with no footer. The temporary file is removed on every failure path the
+export returns from; a SIGINT or a panic mid-write leaves it behind.
+
+Because the replace is a rename rather than a write into the existing file:
+
+- A symlink at `--parquet` is itself replaced by the new file; the file it
+  pointed to is left unchanged.
+- The new file's mode comes from the default creation mode and your umask,
+  not from the file it replaces, and the old file's owner and ACLs are not
+  carried over.
+- The path must name a regular file in a writable directory. A path under
+  `/dev` (such as `/dev/stdout`), an existing directory, and any other
+  existing non-regular file are refused before the export reads anything
+  from object storage.
