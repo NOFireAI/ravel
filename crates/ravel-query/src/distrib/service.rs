@@ -2291,6 +2291,20 @@ mod reconstruct_tests {
         assert_record_invalid(&err, &key, "");
     }
 
+    /// A valid rewrite record for shard 8 stored at shard 7's rewrite key: its
+    /// input-set hash does not cover the shard, so only the key check refuses
+    /// it.
+    #[tokio::test]
+    async fn a_rewrite_record_for_another_bucket_is_record_invalid() {
+        let mut record = rewrite_record();
+        let key = rewrite_key(&record);
+        record.shard = 8;
+        let input_set_hash = record.input_set_hash.clone();
+        let store = store_with(vec![(key.clone(), record.encode_to_vec())]).await;
+        let (err, _) = refusal(store, &l1_identity(&input_set_hash, 1, 8193)).await;
+        assert_record_invalid(&err, &key, "mismatch");
+    }
+
     async fn store_with_compaction() -> Arc<dyn ObjectStoreBackend> {
         store_with(vec![(compaction_key(), compaction_record().encode_to_vec())]).await
     }
