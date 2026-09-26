@@ -101,6 +101,17 @@ it:
 | The survivor's next fold tick, `--fold-interval-secs` plus up to 10% jitter | 300 s + 30 s | 330 |
 | **Sum** | | **570** |
 
+570 s bounds the survivor's first fold tick over the pair. It is not always
+the tick that folds it. If the departed replica folded the pair just before it
+left, the pair's `HEAD` stays younger than `--fold-interval-secs` for 300 s
+after departure, and a survivor tick inside that span skips the pair as
+already fresh. The skipped tick came before the 300 s mark, and the survivor's
+next fold tick is at most 330 s (300 s plus 10% jitter) after it, so the
+re-fold lands within 300 + 330 = 630 s (10 min 30 s) of departure. A survivor
+tick at or after the 300 s mark folds the pair on that tick, inside the 570 s
+above. A fold earlier than just before departure only moves the 300 s mark
+earlier, so 630 s after departure bounds the re-fold in every case.
+
 The departed replica's heartbeat record stops being refreshed, but nothing
 reacts to that on its own: a survivor only drops it once it reads the record
 at more than `3 * H` old, and it reads on its own heartbeat cadence, which is

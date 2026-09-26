@@ -1131,7 +1131,7 @@ mod tests {
             }
         });
 
-        let ctx = loop_context(catalog.clone(), store, tenant, tick_hook);
+        let ctx = loop_context(catalog.clone(), store.clone(), tenant, tick_hook);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         // Small, fixed backoff so the paused-time advance drives the restart.
         let handle = tokio::spawn(run_supervisor(
@@ -1142,13 +1142,27 @@ mod tests {
             Duration::from_millis(10),
         ));
 
+        // The logs loop runs beside it on the same counters and never panics,
+        // so the per-signal assertion below has a live loop to hold at zero.
+        let mut logs_ctx = loop_context(catalog.clone(), store, tenant, Arc::new(|| {}));
+        logs_ctx.signal = Signal::Logs;
+        let (logs_shutdown_tx, logs_shutdown_rx) = oneshot::channel();
+        let logs_handle = tokio::spawn(run_supervisor(
+            logs_ctx,
+            logs_shutdown_rx,
+            Arc::clone(&metrics),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+
         let folded = advance_until(600, Duration::from_millis(100), || {
-            catalog.fold_cycles(Signal::Metrics) >= 1
+            catalog.fold_cycles(Signal::Metrics) >= 1 && catalog.fold_cycles(Signal::Logs) >= 1
         })
         .await;
         assert!(
             folded,
-            "the supervisor must restart the loop and a later tick must fold"
+            "the supervisor must restart the loop and a later tick must fold, and the logs \
+             loop must fold beside it"
         );
         assert!(
             !panic_armed.load(Ordering::SeqCst),
@@ -1177,7 +1191,9 @@ mod tests {
         );
 
         shutdown_tx.send(()).expect("send shutdown");
+        logs_shutdown_tx.send(()).expect("send logs shutdown");
         let _ = handle.await;
+        let _ = logs_handle.await;
     }
 
     /// Shutdown after a panic stops the loop and does not respawn it, and it is

@@ -22,8 +22,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leaving the fleet hands its pairs to the survivors within 570 s at the
   defaults: the 180 s liveness window, plus the survivor's next 60 s heartbeat
   tick, which is when it re-lists and recomputes the live set, plus its next
-  fold tick, 300 s with up to 10% jitter. The liveness window alone bounds
-  when the departure becomes visible, not when the pairs are folded again.
+  fold tick, 300 s with up to 10% jitter. That bounds the survivor's first
+  tick over a pair, not always its re-fold: a pair the departed replica
+  folded just before leaving keeps a `HEAD` younger than the 300 s fold
+  interval, a survivor tick before then skips it as fresh, and the next tick
+  is at most 330 s later, so the re-fold lands within 300 + 330 = 630 s of
+  departure. The liveness window alone bounds when the departure becomes
+  visible, not when the pairs are folded again.
   `--mode all` computes its live set as itself alone and keeps folding
   everything. `gateway` and `query` processes no longer fold on a timer. A
   `query` process keeps the on-demand `POST /api/v1/admin/fold` route, which
