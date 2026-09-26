@@ -877,17 +877,20 @@ mod tests {
         }
     }
 
+    /// The virtual instant of every tick a [`recording_hook`] saw, in order.
+    type TickLog = Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>;
+
+    /// A [`LoopContext::tick_hook`].
+    type TickHook = Arc<dyn Fn() + Send + Sync>;
+
     /// A tick hook that records the virtual instant of every tick it sees,
     /// then panics on the calls `panics_on` selects (1-based call numbers).
     fn recording_hook(
         panics_on: impl Fn(usize) -> bool + Send + Sync + 'static,
-    ) -> (
-        Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
-        Arc<dyn Fn() + Send + Sync>,
-    ) {
+    ) -> (TickLog, TickHook) {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let hook_calls = Arc::clone(&calls);
-        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let hook: TickHook = Arc::new(move || {
             let call = {
                 let mut calls = hook_calls.lock().expect("hook lock");
                 calls.push(tokio::time::Instant::now());
