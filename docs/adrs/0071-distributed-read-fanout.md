@@ -114,12 +114,9 @@ whole. That rule makes re-dispatch safe with no dedup bookkeeping.
 Protocol (new `proto/ravel/queryfrag.proto`, versioned from day 1,
 reject-unknown like commit tokens): request carries protocol version, query
 id, tenant hash, signal, scope (pinned segment identities, reconstructed and
-verified by the worker per the reconstruct-don't-trust rule: the worker
-rebuilds the key of each pinned segment's own commit record, or of an L1
-segment's compaction or rewrite record, from the identity, GETs and verifies
-that record, and builds the segment ref from it; or resolve-mode matchers),
-matchers, padded window, the query's budgets (the whole budget, not a
-per-slice share; see the budget amendment below), absolute deadline,
+verified by the worker per the reconstruct-don't-trust rule, or resolve-mode
+matchers), matchers, padded window, the query's budgets (the whole budget,
+not a per-slice share; see the budget amendment below), absolute deadline,
 erasure predicates, and trace context. Response streams per-series frames
 (labels once, then per-run timestamp deltas and value bits, preserving NaN
 payloads, -0.0, and the staleness marker) and ends with a summary frame
@@ -127,6 +124,10 @@ carrying the worker's accounting snapshot and typed status. This is a
 transient wire contract between processes, not a persistent format; no
 stored byte changes. The response oneof gained log-record and span frames
 under the log and span fan-out amendment below.
+
+How a worker turns a pinned segment identity into the segment it reads is
+decided by the pinned-record amendment below (issue #1721): it reads that
+segment's own commit, compaction, or rewrite record, not its catalog.
 
 ## Failure semantics
 
@@ -155,6 +156,10 @@ under the log and span fan-out amendment below.
   waiting on fragments that need the same permit pool.
 - Remote cluster down or slow: fail by default; with `skip_unavailable`,
   continue and mark, never silently.
+- Bad pinned record (the pinned-record amendment below): a pinned segment's
+  own record is missing, unreadable, fails verification, or disagrees with
+  the identity the coordinator shipped. The worker fails the slice
+  `Unsupported` and the coordinator runs the whole query locally.
 
 ## Security
 
@@ -219,19 +224,20 @@ Fetch and decode scale near-linearly in workers until coordinator-side
 evaluation or final aggregation dominates; that ceiling is explicit and is
 what a future aggregation-pushdown ADR would move. Network bytes to the
 coordinator are matcher-pruned, window-clipped decoded samples, bounded by
-the existing per-selector budgets; total S3 request count is local
-execution's plus the workers' record reads, which are one commit-record GET
-per pinned L0 segment, one compaction-record GET per pinned L1 segment, and
-two GETs for an L1 segment only an erasure rewrite record describes (the
-compaction key misses first), each charged to the slice's reported cost (as
-of ADR-0096 a native-histogram or run-merged scalar query is served over the
-wire rather than falling back, so it no longer double-fetches; a version-skew
-fallback still pays both, with both folded into its reported cost), and
-instantaneous rate is capped by `max_parallel_slices` times the per-worker
-GET semaphore. Initial gate thresholds (distribute above 256 MiB estimated
-store bytes or 64 segments) are set from the crossover benchmark before
-defaults freeze, and every later optimization (straggler hedging, slice
-rebalancing, limit hints) requires a benchmark demonstrating its value.
+the existing per-selector budgets; total S3 request count is identical to
+local execution (as of ADR-0096 a native-histogram or run-merged scalar query
+is served over the wire rather than falling back, so it no longer double-fetches;
+a version-skew fallback still pays both, with both folded into its reported
+cost), and instantaneous rate is capped by
+`max_parallel_slices` times the per-worker GET semaphore. Initial gate
+thresholds (distribute above 256 MiB estimated store bytes or 64 segments)
+are set from the crossover benchmark before defaults freeze, and every later
+optimization (straggler hedging, slice rebalancing, limit hints) requires a
+benchmark demonstrating its value.
+
+The request-count sentence above predates the workers' own record reads: the
+pinned-record amendment below states what those add, which GET semaphore they
+run under, and how they are charged.
 
 ## Operational model
 
@@ -1586,3 +1592,66 @@ the federation path where the caller is another cluster.
   rather than on trusting the budget the caller sent.
 - The per-segment budget check inside a slice is unchanged (ADR-0061
   decision 1): only the limit it compares against moved.
+
+## Amendment (2026-09-26): a worker resolves each pinned segment from its own record
+
+<!-- amendment-applies: sections="Architecture|Failure semantics|Performance" pointer="pinned-record amendment" -->
+
+Status: Accepted. Issue #1721.
+
+### Context
+
+A worker used to turn the coordinator's pinned identities back into segment
+refs by resolving its own catalog snapshot over the slice's event-time window
+and matching each identity by content hash. That re-resolve listed commit and
+compaction prefixes on every fragment request, and a compaction committed
+between the coordinator's resolve and the worker's fetch could drop a pinned
+L0 segment from the worker's snapshot, fail the slice `SnapshotInvalidated`,
+and cost a full coordinator re-resolve and re-dispatch, although the pinned
+objects were all still readable.
+
+### Decision
+
+1. **A pinned slice reads each segment's own record, never the catalog.**
+   For every shipped identity the worker rebuilds, with the ADR-0010 key
+   builders in `ravel_commit::keys`, the key of that segment's own durable
+   record: the commit record for an L0 segment, and for an L1 part the
+   compaction record, or the erasure rewrite record when no compaction record
+   exists at that key. It GETs that one record. It lists nothing and reads no
+   snapshot or manifest. The tenant and signal come from the request the
+   capability already authorized, never from the identity.
+
+2. **The record is verified before anything is built from it.** The record
+   must decode and pass its own validation; its own fields must reconstruct
+   the key it was read from; the data-object key is taken from
+   `verify_object_key` for an L0 record and rebuilt from the verified record
+   for an L1 part; and the full 32-byte content hash and the object size, plus
+   for L1 the full input-set hash and the part index, must equal the
+   identity's. The segment ref is then built from the verified record alone,
+   exactly as the catalog builds one. Records and the objects they name are
+   immutable, so what a pinned slice reads no longer depends on what the
+   catalog says when the fragment arrives.
+
+3. **A bad pinned record runs the query locally.** A record that is missing,
+   unreadable, fails verification, or disagrees with the identity fails the
+   slice `Unsupported`, and the coordinator runs the whole query locally
+   through its own catalog resolve. A structurally malformed identity is
+   `BadData`. Neither reads another object in place of the one pinned.
+
+4. **Request count.** A worker issues one record GET per pinned L0 segment,
+   one per pinned L1 part, and two for an L1 part only a rewrite record
+   describes (the compaction key misses first), on top of the data-object
+   reads local execution also issues.
+
+5. **Unchanged.** The `queryfrag` wire and `PROTOCOL_VERSION` are unchanged.
+   Cross-cluster federation is unchanged: a resolve-scope request still
+   resolves the remote cluster's own snapshot, and its identities are matched
+   against that snapshot.
+
+### Consequences
+
+- A compaction committed mid-query no longer fails an intra-cluster slice:
+  the pinned records and objects stay readable for the query's duration under
+  the `sys/gc` protection horizon the failure semantics above already rely on.
+- A worker's per-slice metadata cost is proportional to its pinned segment
+  count, not to the listing of the whole window.
