@@ -1183,8 +1183,8 @@ mod proptests {
             let mut raw = Vec::new();
             let mut chunks = Vec::new();
             for (trace_id, span_id, trace_state) in &links {
-                let trace_id: [u8; 16] = trace_id.as_slice().try_into().unwrap();
-                let span_id: [u8; 8] = span_id.as_slice().try_into().unwrap();
+                let trace_id: [u8; 16] = trace_id.as_slice().try_into().expect("strategy yields 16 bytes");
+                let span_id: [u8; 8] = span_id.as_slice().try_into().expect("strategy yields 8 bytes");
                 let chunk = link_chunk(&trace_id, &span_id, trace_state);
                 put_uvarint(&mut raw, chunk.len() as u64);
                 raw.extend_from_slice(&chunk);
@@ -1196,8 +1196,8 @@ mod proptests {
             for (parsed_link, ((trace_id, span_id, trace_state), chunk)) in
                 parsed.iter().zip(links.iter().zip(chunks.iter()))
             {
-                let trace_id: [u8; 16] = trace_id.as_slice().try_into().unwrap();
-                let span_id: [u8; 8] = span_id.as_slice().try_into().unwrap();
+                let trace_id: [u8; 16] = trace_id.as_slice().try_into().expect("strategy yields 16 bytes");
+                let span_id: [u8; 8] = span_id.as_slice().try_into().expect("strategy yields 8 bytes");
                 prop_assert_eq!(&parsed_link.trace_id, &trace_id);
                 prop_assert_eq!(&parsed_link.span_id, &span_id);
                 prop_assert_eq!(&parsed_link.trace_state, trace_state);
