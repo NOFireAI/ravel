@@ -274,6 +274,13 @@ pub fn build_catalog_for_server(
 /// `EngineConfig` whose `deadline` was validated against `sys/gc` in `main`, so
 /// the engine that actually enforces the deadline uses the validated value
 /// rather than an independent `EngineConfig::default()`.
+///
+/// `process_memory_budget` is the SAME `Arc<ravel_memory::MemoryBudget>`
+/// instance [`build_sql_state`] wires into its `SqlExecutor` (ADR-1170
+/// decisions 1/3/4): one process-wide accountant shared by the PromQL and
+/// SQL/Flight SQL paths, so a fetch this engine issues and a reservation
+/// `SqlExecutor` makes both draw down the same limit rather than each
+/// enforcing its own independent ceiling.
 #[allow(clippy::too_many_arguments)]
 pub fn build_app_state(
     catalog: Arc<Catalog>,
@@ -287,8 +294,11 @@ pub fn build_app_state(
     distributed: Option<Arc<ravel_query::distrib::Distributed>>,
     federation: Option<Arc<ravel_query::distrib::Federation>>,
     metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
 ) -> AppState {
-    let mut engine = QueryEngine::new(catalog, store, engine_config).with_get_limiter(get_limiter);
+    let mut engine = QueryEngine::new(catalog, store, engine_config)
+        .with_get_limiter(get_limiter)
+        .with_memory_budget(process_memory_budget);
     if let Some(cache) = cache {
         engine = engine.with_cache(cache);
     }
@@ -584,6 +594,7 @@ mod catalog_cache_tests {
             None,
             None,
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         );
         assert_eq!(
             state.engine.config().max_bytes_scanned,

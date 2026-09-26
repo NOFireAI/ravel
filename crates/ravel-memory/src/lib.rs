@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct MemoryBudget {
     limit: u64,
     reserved: AtomicU64,
+    fetch_reserved: AtomicU64,
     handoff_overlap: AtomicU64,
 }
 
@@ -36,6 +37,7 @@ impl MemoryBudget {
         Self {
             limit,
             reserved: AtomicU64::new(0),
+            fetch_reserved: AtomicU64::new(0),
             handoff_overlap: AtomicU64::new(0),
         }
     }
@@ -64,6 +66,26 @@ impl MemoryBudget {
     /// [`note_handoff`]: MemoryBudget::note_handoff
     pub fn handoff_overlap(&self) -> u64 {
         self.handoff_overlap.load(Ordering::Acquire)
+    }
+
+    /// Bytes currently reserved through [`reserve`] (the fetch layer's RAII
+    /// `Reservation` API: `SegmentFetcher`, `LogSegmentFetcher`,
+    /// `SpanSegmentFetcher`), a subset of `reserved()`. `try_reserve` and
+    /// `reserve_unchecked` (the raw counter API SQL's `TenantMemoryAccountant`
+    /// uses exclusively) never touch this counter, so it never counts SQL's
+    /// share.
+    ///
+    /// [`reserve`]: MemoryBudget::reserve
+    pub fn fetch_reserved(&self) -> u64 {
+        self.fetch_reserved.load(Ordering::Acquire)
+    }
+
+    /// Bytes reserved by everything other than the fetch layer:
+    /// `reserved()` minus `fetch_reserved()`. The raw counter API is this
+    /// budget's only other reserver, so this is exactly SQL's share, without
+    /// SQL needing its own counter or any change to `ravel-sql`.
+    pub fn sql_reserved(&self) -> u64 {
+        self.reserved().saturating_sub(self.fetch_reserved())
     }
 
     /// Reserves `n` bytes if doing so would not exceed `limit`. On
@@ -181,12 +203,57 @@ impl MemoryBudget {
         }
     }
 
+    /// Grows `fetch_reserved` by `n`. Saturating add, mirroring
+    /// `reserve_unchecked`: called only from [`reserve`] right after
+    /// `try_reserve` already admitted `n` against `limit`, so saturation
+    /// here is unreachable in practice, not a silent-miscount path.
+    ///
+    /// [`reserve`]: MemoryBudget::reserve
+    fn note_fetch_reserved(&self, n: u64) {
+        let mut current = self.fetch_reserved.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_add(n);
+            match self.fetch_reserved.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Shrinks `fetch_reserved` by `n`. Saturating subtract, called only
+    /// from [`Reservation`]'s `Drop`.
+    fn clear_fetch_reserved(&self, n: u64) {
+        let mut current = self.fetch_reserved.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(n);
+            match self.fetch_reserved.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     /// Reserves `n` bytes and returns a guard that releases them on drop.
     /// Takes `self` as `&Arc<Self>` so the returned [`Reservation`] owns
     /// its own `Arc` clone and can travel with the buffer it accounts for
     /// across threads and tasks, rather than being tied to a borrow scope.
+    /// Also grows `fetch_reserved()` by `n`, since this RAII path is the
+    /// fetch layer's alone (see [`fetch_reserved`]'s doc comment).
+    ///
+    /// [`fetch_reserved`]: MemoryBudget::fetch_reserved
     pub fn reserve(self: &Arc<Self>, n: u64) -> Result<Reservation, MemoryExhausted> {
         self.try_reserve(n)?;
+        self.note_fetch_reserved(n);
         Ok(Reservation {
             budget: Arc::clone(self),
             size: n,
@@ -226,6 +293,7 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.budget.release(self.size);
+        self.budget.clear_fetch_reserved(self.size);
         if self.handed_off {
             self.budget.clear_handoff(self.size);
         }
@@ -416,6 +484,41 @@ mod tests {
     fn reservation_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Reservation>();
+    }
+
+    /// `fetch_reserved()` counts only the RAII path; `try_reserve` (SQL's
+    /// raw counter API) grows `reserved()` without moving it, so
+    /// `sql_reserved()` isolates SQL's share even though both reservers
+    /// share one `MemoryBudget`.
+    #[test]
+    fn fetch_reserved_counts_only_the_raii_path() {
+        let budget = Arc::new(MemoryBudget::new(200));
+        budget.try_reserve(50).expect("50 of 200 fits");
+        assert_eq!(budget.reserved(), 50);
+        assert_eq!(budget.fetch_reserved(), 0, "raw try_reserve is not fetch");
+        assert_eq!(budget.sql_reserved(), 50);
+
+        let guard = budget.reserve(30).expect("30 of 150 remaining fits");
+        assert_eq!(budget.reserved(), 80);
+        assert_eq!(
+            budget.fetch_reserved(),
+            30,
+            "reserve()'s RAII path must grow fetch_reserved by exactly its size"
+        );
+        assert_eq!(
+            budget.sql_reserved(),
+            50,
+            "the earlier try_reserve share must be unaffected by the new fetch reservation"
+        );
+
+        drop(guard);
+        assert_eq!(budget.reserved(), 50);
+        assert_eq!(
+            budget.fetch_reserved(),
+            0,
+            "dropping the Reservation must release fetch_reserved back to 0"
+        );
+        assert_eq!(budget.sql_reserved(), 50);
     }
 
     #[test]
