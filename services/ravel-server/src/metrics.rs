@@ -10475,11 +10475,17 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             })
         };
         // Cooperative polling only: every probe reads a metric the actor
-        // publishes, so no wall-clock wait decides anything here.
+        // publishes, so no wall-clock wait decides anything here. The real-clock
+        // bound only turns a regression that never reaches the state into a
+        // failure instead of a hang.
         async fn until(mut probe: impl FnMut() -> bool) {
-            while !probe() {
-                tokio::task::yield_now().await;
-            }
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !probe() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the probed ingest state was not reached within 30s");
         }
         let deferred = || {
             router
@@ -10562,10 +10568,14 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
 
     /// ADR-1692 acceptance test: a four-shard log router with three writes
     /// driven to one shard renders exactly four series per family through the
-    /// same `render()` the `/metrics` handler calls, idle shards at zero and
-    /// the busy shard at the exact enqueued and processed count.
+    /// same `render()` the `/metrics` handler calls, idle shards at zero in
+    /// all six families and the busy shard at its exact figures. The router
+    /// runs on a frozen injected clock, so every seconds family reads exactly
+    /// zero on the busy shard too rather than an unassertable wall-clock value.
     #[tokio::test]
     async fn metrics_render_one_series_per_configured_log_shard_idle_ones_included() {
+        use std::future::Future;
+        use std::pin::Pin;
         use std::time::Duration;
 
         use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -10574,12 +10584,25 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
         use opentelemetry_proto::tonic::resource::v1::Resource;
         use ravel_ingest::{
-            AdmissionController, AdmissionLimits, IngestConfig, SystemClock, WriteMode,
+            AdmissionController, AdmissionLimits, Clock, IngestConfig, SystemClock, WriteMode,
         };
         use ravel_object_store::ObjectStoreBackend;
         use ravel_object_store::memory::MemoryStore;
         use ravel_types::logstream::{AttrValue, log_stream_id};
         use ravel_types::{TenantId, shard_for_log};
+
+        /// Never advances, so every span the shard skew family times is zero.
+        struct FrozenClock(i64);
+
+        impl Clock for FrozenClock {
+            fn now_ns(&self) -> i64 {
+                self.0
+            }
+
+            fn sleep(&self, _dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                Box::pin(std::future::pending())
+            }
+        }
 
         use crate::logs_ingest::{LogIngestState, handle_export_logs};
         use crate::normalize_reject_metrics::NormalizeRejectMetrics;
@@ -10619,13 +10642,16 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
 
         let host = host_for_shard(BUSY_SHARD, SHARD_COUNT);
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        // `target_bytes: 1` size-flushes every write on arrival: the frozen
+        // clock never ages a buffer, and a strict write waits for its flush.
         let router = Arc::new(LogIngestRouter::new(
             IngestConfig {
                 shard_count: SHARD_COUNT,
+                target_bytes: 1,
                 ..IngestConfig::default()
             },
             store.clone(),
-            Arc::new(SystemClock),
+            Arc::new(FrozenClock(BASE_TS_NS)),
         ));
         let state = LogIngestState {
             router: router.clone(),
@@ -10681,11 +10707,16 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
 
         // Cooperative polling only: the actor records `messages_processed`
         // just after it sends the caller's ack, so waiting for the ack alone
-        // races the actor's own bookkeeping. No wall-clock wait.
+        // races the actor's own bookkeeping. The real-clock bound only turns a
+        // regression that never gets there into a failure instead of a hang.
         async fn until(mut probe: impl FnMut() -> bool) {
-            while !probe() {
-                tokio::task::yield_now().await;
-            }
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !probe() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the busy shard did not record every write within 30s");
         }
         until(|| {
             router
@@ -10752,38 +10783,40 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                  shard:\n{body}"
             );
         }
+        let sample = |family: &str, shard: u32, value: &str| {
+            body.matches(&format!(
+                "{family}{{mode=\"gateway\",signal=\"logs\",shard=\"{shard}\"}} {value}\n"
+            ))
+            .count()
+        };
         for shard in 0..SHARD_COUNT {
             if shard == BUSY_SHARD {
                 continue;
             }
+            for family in FAMILIES {
+                assert_eq!(
+                    sample(family, shard, "0"),
+                    1,
+                    "idle shard {shard} must render {family} at zero:\n{body}"
+                );
+            }
+        }
+        let writes = WRITES.to_string();
+        let busy: [(&str, &str); 6] = [
+            ("ravel_ingest_shard_messages_enqueued_total", &writes),
+            ("ravel_ingest_shard_messages_processed_total", &writes),
+            ("ravel_ingest_shard_queue_depth", "0"),
+            ("ravel_ingest_shard_on_actor_seconds_total", "0"),
+            ("ravel_ingest_shard_flush_permit_wait_seconds_total", "0"),
+            ("ravel_ingest_shard_off_actor_seconds_total", "0"),
+        ];
+        for (family, value) in busy {
             assert_eq!(
-                body.matches(&format!(
-                    "ravel_ingest_shard_messages_enqueued_total{{mode=\"gateway\",\
-                     signal=\"logs\",shard=\"{shard}\"}} 0"
-                ))
-                .count(),
+                sample(family, BUSY_SHARD, value),
                 1,
-                "idle shard {shard} must render zero enqueued:\n{body}"
+                "the busy shard must render {family} exactly {value}:\n{body}"
             );
         }
-        assert_eq!(
-            body.matches(&format!(
-                "ravel_ingest_shard_messages_enqueued_total{{mode=\"gateway\",\
-                 signal=\"logs\",shard=\"{BUSY_SHARD}\"}} {WRITES}"
-            ))
-            .count(),
-            1,
-            "the busy shard must render the exact enqueued count:\n{body}"
-        );
-        assert_eq!(
-            body.matches(&format!(
-                "ravel_ingest_shard_messages_processed_total{{mode=\"gateway\",\
-                 signal=\"logs\",shard=\"{BUSY_SHARD}\"}} {WRITES}"
-            ))
-            .count(),
-            1,
-            "the busy shard must render the exact processed count:\n{body}"
-        );
     }
 
     /// ADR-1692 decision 2: a shard index at or above `MAX_SHARD_COUNT` is
