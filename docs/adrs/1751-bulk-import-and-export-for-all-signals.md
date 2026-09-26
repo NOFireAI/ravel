@@ -158,6 +158,8 @@ flowchart LR
 - Export adds no dependency: `parquet` 59 and the decoders are already in
   `ravel-cli`. Load for metrics adds `ravel-otlp` limit types to the CLI's
   dependency set if they are not already reachable.
+  This first sentence did not survive implementation; see the export
+  dependency amendment below for what logs export actually cost.
 - Two Parquet writers now exist in the workspace's tooling (ravel-bench's
   baseline path and this one); they do not share code and are not required
   to.
@@ -172,3 +174,33 @@ flowchart LR
      metrics dedup test.
   4. Docs: docs/guides/ingest.md bulk section, a new export guide section,
      the generated CLI reference, and the mapping reference.
+
+## Amendment (2026-09-26): export does add a dependency, on ravel-query
+
+<!-- amendment-applies: sections="Consequences" pointer="export dependency amendment" -->
+
+Logs export (follow-up 3, issue #1712) shipped with `ravel-query` promoted
+from a dev-dependency of `ravel-cli` to a normal one, so the Consequences
+bullet saying export adds no dependency is wrong as written. `parquet` 59
+and the decoders were indeed already there; the fetch and visibility layer
+was not.
+
+The cost is not one crate. `ravel-query` brings `axum`, `tonic`,
+`promql-parser` and `ravel-promql` into `ravel-cli`'s normal build, none of
+which an operator running `export` needs for anything else. That was
+accepted deliberately, and the alternative is what makes it the right
+trade: the exclusion rules an export must honour are ADR-0064 selective
+erasure applied after fetch and after cache, plus the retention and
+compaction supersession `Catalog::resolve` applies. Reimplementing them
+inside `ravel-cli` would put a second copy of the deletion rules in the
+tree, free to drift from the one the query path uses. A drifted copy does
+not fail loudly: it writes a Parquet file holding records a query refuses
+to return, which is the exact failure ADR-0064 exists to prevent. Sharing
+`LogSegmentFetcher` and `snapshot_pending_erasure_predicates` with the
+query path is what makes "a record a query cannot see is a record the
+export does not write" a property of one implementation rather than a
+claim about two.
+
+If the build cost becomes a problem, the fix is to split the fetch and
+erasure layer out of `ravel-query` into a crate that does not carry the
+serving surfaces, not to give `ravel-cli` its own copy of the rules.
