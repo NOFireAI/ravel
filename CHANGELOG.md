@@ -14,10 +14,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   since RSPAN is a frozen persistent format and promoting links into a
   nested on-disk column would need an ADR and a version bump. NULL when a
   span carries no link, or when its `_links_raw` value is malformed (bad
-  hex, bad framing, or a link chunk missing a well-formed `trace_id` or
-  `span_id`), never an empty list or a fabricated field. A query that
-  does not select `events` or `links` skips their decode entirely; both
-  columns turn off the columnar fast path when selected.
+  hex, bad framing, a link chunk missing a well-formed `trace_id` or
+  `span_id`, a non-UTF-8 `trace_state`, or a `trace_id`, `span_id` or
+  `trace_state` field that is not a length-delimited value), never an empty list or a fabricated field; one
+  malformed link makes the span's whole `links` value NULL. Selecting
+  `events` or `links` turns off the columnar fast path. On a single node, a
+  query that selects neither never builds those columns; under distributed
+  execution each worker still builds both for every row it returns and the
+  coordinator drops them. A bare `SELECT count(*) FROM spans` now returns
+  the row count instead of failing with "must either specify a row count or
+  at least one column", with or without a pending erasure.
 
 ## [0.18.0] - 2026-09-26
 
