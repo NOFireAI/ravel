@@ -4645,6 +4645,73 @@ mod tests {
         assert_eq!(mismatch_total(&metrics), 0);
     }
 
+    /// A held unit counts nothing it found. The unit is a compaction record
+    /// naming two parts: part 1 always fails permanently, part 2 fails
+    /// transiently on the first tick only. The first tick finds part 1
+    /// unreadable and then holds on part 2, and must count neither. The retry
+    /// consumes the unit and counts part 1 exactly once.
+    #[tokio::test]
+    async fn a_held_multi_part_unit_counts_nothing_until_it_is_consumed() {
+        let memory = Arc::new(MemoryStore::new());
+        let (record_key, part_keys) = publish_many_part_compaction(&memory, 2).await;
+        for seq in 3..=7u64 {
+            publish_segment_at(&memory, seq, &["cpu"], 500_001).await;
+        }
+        let tenant_hash = tenant().hash();
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(listed.len(), 8, "seven commit records, one compaction");
+        assert_eq!(listed[2].key, record_key, "the compaction unit is third");
+
+        let (broken, flaky) = (part_keys[0].clone(), part_keys[1].clone());
+        let store = GetFaults::new(memory.clone(), move |key, earlier| {
+            if key == broken {
+                Some(StoreError::Permanent("injected part 1 fault".to_string()))
+            } else if key == flaky && earlier == 0 {
+                Some(StoreError::Transient("injected part 2 fault".to_string()))
+            } else {
+                None
+            }
+        });
+        let metrics = ScrubMetrics::default();
+
+        tick_eight(&store, &metrics).await;
+        assert_eq!(store.fired(), 2, "part 1 failed, then part 2 held the unit");
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[1].key.as_str()),
+            "the marker holds behind the compaction unit"
+        );
+        assert_eq!(cursor.held_ticks, 1);
+        assert_eq!(unreadable_total(&metrics), 0, "a held unit counts nothing");
+        assert_eq!(mismatch_total(&metrics), 0);
+
+        tick_eight(&store, &metrics).await;
+        assert_eq!(store.fired(), 3, "part 1 failed again, part 2 read clean");
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(cursor.held_ticks, 0);
+        assert!(
+            cursor.last_commit_key.as_deref() > Some(record_key.as_str()),
+            "the marker moves past the unit, got {:?}",
+            cursor.last_commit_key
+        );
+        assert_eq!(
+            metrics.unreadable(Signal::Metrics, ScrubLevel::L1, UnreadableReason::Permanent),
+            1,
+            "part 1 counts exactly once"
+        );
+        assert_eq!(unreadable_total(&metrics), 1);
+        assert_eq!(mismatch_total(&metrics), 0);
+    }
+
     /// `ravel_scrub_marker_held_ticks` reads the consecutive held ticks of
     /// the worst shard after each cycle.
     #[tokio::test]
