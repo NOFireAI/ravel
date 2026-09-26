@@ -47,9 +47,12 @@
 //!    rotation (the first rotation, the one after a completed rotation, or a
 //!    cursor an older build wrote), count the entries under the commit shard
 //!    prefix with a LIST-only pass and open a rotation.
-//! 2. Otherwise count the entries appended past the rotation's tail mark with
-//!    a LIST-only pass and add them to the rotation's estimate, so a shard
-//!    that keeps committing cannot outrun the walk.
+//! 2. Otherwise recount the rotation's tail window, the last two ingest hours
+//!    the previous count met and everything after them, with a LIST-only
+//!    pass, and add its growth to the rotation's estimate
+//!    ([`TailTally`]), so a shard that keeps committing cannot outrun the
+//!    walk. Recounting whole hours catches a commit from every writer, not
+//!    only from one whose id sorts above the keys already listed.
 //! 3. Plan the tick ([`ScrubCursor::plan_tick`]): the rotation is allotted
 //!    `min(P, retention window)` and what is left to cover is divided by the
 //!    ticks remaining before that deadline, bounded by
@@ -141,11 +144,11 @@ use std::time::Duration;
 
 use ravel_commit::keys;
 use ravel_ingest::{Clock as _, SystemClock};
-use ravel_maintain::ScrubCursor;
 use ravel_maintain::{
     Clock, RetentionConfig, SCRUB_REQUESTS_PER_OBJECT, ScrubLevel, ScrubResult, ScrubTarget,
     WorkerSet, scrub_one_object,
 };
+use ravel_maintain::{ScrubCursor, TailTally};
 use ravel_object_store::{
     DrainStep, GetRange, MAX_LIST_PAGES, ObjectStoreBackend, PageToken, PutOptions, StoreError,
     drain_pages,
@@ -677,7 +680,7 @@ async fn run_shard_tick(
     };
     if cursor.needs_entry_count() {
         match count_entries_after(store, &prefix, None).await {
-            Ok((total, tail)) => cursor.start_rotation(total, tail, clock.now_ns()),
+            Ok(tally) => cursor.start_rotation(&tally, clock.now_ns()),
             Err(err) => {
                 tracing::warn!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
@@ -692,8 +695,8 @@ async fn run_shard_tick(
         // that keeps committing from growing its tail as fast as the walk
         // consumes it. A count failure only leaves the estimate where it was,
         // so the tick still runs on the entries already observed.
-        match count_entries_after(store, &prefix, cursor.rotation_tail_key.as_deref()).await {
-            Ok((appended, tail)) => cursor.observe_appended(appended, tail),
+        match count_entries_after(store, &prefix, cursor.tail_count_start()).await {
+            Ok(tally) => cursor.observe_tail(&tally),
             Err(err) => {
                 tracing::warn!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
@@ -897,33 +900,31 @@ struct SliceEntry {
 }
 
 /// The LIST-only pass that opens a rotation and the one that counts a
-/// rotation's appends (ADR-1686 decision 3, amended): count every entry under
-/// the commit shard prefix strictly after `start_after`, with no GETs, and
-/// return the greatest key it saw so the next pass can resume from there.
+/// rotation's appends (ADR-1686 decision 3, amended): tally every entry under
+/// the commit shard prefix strictly after `start_after`, with no GETs.
 ///
 /// `start_after` of `None` counts the whole prefix, which is what opening a
-/// rotation needs. A pass that finds nothing new returns `(0, None)`, leaving
-/// the caller's existing tail mark in place.
+/// rotation needs. A tail count starts at the cursor's tail window
+/// ([`ScrubCursor::tail_count_start`]), so it lists the last two ingest hours
+/// the previous count met plus anything after them, never the whole prefix.
 async fn count_entries_after(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
     start_after: Option<&str>,
-) -> Result<(u64, Option<String>), StoreError> {
-    let mut count = 0u64;
-    let mut tail: Option<String> = None;
+) -> Result<TailTally, StoreError> {
+    let mut tally = TailTally::default();
     drain_pages::<StoreError, _, _, _>(
         prefix,
         start_after,
         MAX_LIST_PAGES,
         |start, token| async move { store.list_after(prefix, start.as_deref(), token).await },
         |meta| {
-            count += 1;
-            tail = Some(meta.key);
+            tally.observe(&meta.key);
             Ok(DrainStep::Continue)
         },
     )
     .await?;
-    Ok((count, tail))
+    Ok(tally)
 }
 
 /// The commit shard prefix listed strictly after a start-after marker, one
@@ -1566,7 +1567,9 @@ struct PersistedCursor {
     #[serde(default)]
     rotation_appended_entries: u64,
     #[serde(default)]
-    rotation_tail_key: Option<String>,
+    rotation_tail_dir: Option<String>,
+    #[serde(default)]
+    rotation_tail_entries: u64,
 }
 
 /// Load this shard's persisted cursor, or a fresh one at the start of a
@@ -1601,7 +1604,8 @@ async fn load_cursor(
                 rotation_total_entries: persisted.rotation_total_entries,
                 rotation_entries_visited: persisted.rotation_entries_visited,
                 rotation_appended_entries: persisted.rotation_appended_entries,
-                rotation_tail_key: persisted.rotation_tail_key,
+                rotation_tail_dir: persisted.rotation_tail_dir,
+                rotation_tail_entries: persisted.rotation_tail_entries,
             }),
             Err(err) => {
                 tracing::warn!(
@@ -1643,7 +1647,8 @@ async fn persist_cursor(
         rotation_total_entries: cursor.rotation_total_entries,
         rotation_entries_visited: cursor.rotation_entries_visited,
         rotation_appended_entries: cursor.rotation_appended_entries,
-        rotation_tail_key: cursor.rotation_tail_key.clone(),
+        rotation_tail_dir: cursor.rotation_tail_dir.clone(),
+        rotation_tail_entries: cursor.rotation_tail_entries,
     };
     let bytes = match serde_json::to_vec(&persisted) {
         Ok(bytes) => bytes,
@@ -3136,8 +3141,8 @@ mod tests {
     }
 
     /// Run `ticks` content-tier ticks over shard 0 of a corpus of `records`
-    /// one-series L0 segments, listed four entries per page, and return each
-    /// tick's `(LIST calls, GET calls)`.
+    /// one-series L0 segments, one per ingest hour, listed four entries per
+    /// page, and return each tick's `(LIST calls, GET calls)`.
     async fn per_tick_request_counts(
         records: u64,
         period_secs: u64,
@@ -3145,7 +3150,8 @@ mod tests {
     ) -> Vec<(u64, u64)> {
         let memory = Arc::new(MemoryStore::with_page_size(4));
         for seq in 1..=records {
-            publish_segment(&memory, seq, &["cpu"]).await;
+            let hour = 500_000 + u32::try_from(seq).expect("small seq");
+            publish_segment_at(&memory, seq, &["cpu"], hour).await;
         }
         let store = ravel_object_store::InstrumentedStore::new(memory.clone());
         let counters = store.metrics();
@@ -3181,9 +3187,9 @@ mod tests {
     /// and stops once its budget is spent, so over an unchanged corpus every
     /// tick after the first issues the same LIST and GET count whatever the
     /// corpus size. Both corpora run on a two-entry budget (`ceil(8 / 4)` and
-    /// `ceil(16 / 8)`), so a steady tick is two LISTs (the appended-entry tail
-    /// count, which finds nothing and ends in one page, and the walk's one
-    /// listing page) and, on GETs, one cursor GET plus per consumed record one
+    /// `ceil(16 / 8)`), so a steady tick is two LISTs (the tail count over the
+    /// last two ingest hours, whose two entries fit in one page, and the walk's
+    /// one listing page) and, on GETs, one cursor GET plus per consumed record one
     /// record GET and the scrub's footer and whole-object GETs: `1 + 2 * 3 =
     /// 7`. Only tick 1 differs, by the rotation's one LIST-only count:
     /// `ceil(N / 4)` full pages plus the empty page a full page's continuation
@@ -3426,7 +3432,8 @@ mod tests {
         assert_eq!(loaded.rotation_total_entries, None);
         assert_eq!(loaded.rotation_entries_visited, 0);
         assert_eq!(loaded.rotation_appended_entries, 0);
-        assert_eq!(loaded.rotation_tail_key, None);
+        assert_eq!(loaded.rotation_tail_dir, None);
+        assert_eq!(loaded.rotation_tail_entries, 0);
 
         let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
         let metrics = ScrubMetrics::default();
@@ -3488,7 +3495,11 @@ mod tests {
         // requests an entry, a cap of 32 requests.
         let clock = ravel_maintain::FixedClock::new(500_001 * NS_PER_HOUR);
         let mut probe = ScrubCursor::new(tenant_hash, Signal::Metrics, 0, clock.now_ns());
-        probe.start_rotation(8, Some(listed[7].key.clone()), clock.now_ns());
+        let mut opening = TailTally::default();
+        for meta in &listed {
+            opening.observe(&meta.key);
+        }
+        probe.start_rotation(&opening, clock.now_ns());
         let plan = probe.plan_tick(2, 1, None, clock.now_ns());
         assert_eq!(plan.budget.max_entries, 4);
         assert_eq!(plan.budget.max_requests, 32);
@@ -3851,8 +3862,10 @@ mod tests {
         };
         let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
         let metrics = ScrubMetrics::default();
-        // Five listing entries, one a tick: the two commit records, then the
-        // hour's compaction record, which leaves the marker on it.
+        // Five listing entries over a six-tick rotation, one a tick: the two
+        // commit records, then the hour's compaction record, which leaves the
+        // marker on it. The late record raises the estimate to six, still one
+        // entry a tick.
         for tick in 1..=3u64 {
             run_shard_tick(
                 &store,
@@ -3860,7 +3873,7 @@ mod tests {
                 &tenant_hash,
                 Signal::Metrics,
                 0,
-                5,
+                6,
                 1,
                 None,
                 None,
@@ -3902,7 +3915,7 @@ mod tests {
             &tenant_hash,
             Signal::Metrics,
             0,
-            5,
+            6,
             1,
             None,
             None,
@@ -3936,6 +3949,10 @@ mod tests {
             "the marker still advances past the entry it judged"
         );
         assert_eq!(cursor.rotation_entries_visited, 4);
+        assert_eq!(
+            cursor.rotation_appended_entries, 1,
+            "the late record lands in an hour the tail window still covers, so it is counted"
+        );
     }
 
     /// ADR-1686 amendment, decision 4: a cursor GET that fails for any reason
@@ -4104,11 +4121,15 @@ mod tests {
         };
 
         let cursor = tick(&store, memory.as_ref(), &clock, &tenant_hash, &metrics).await;
+        // Both records land in the hour the tail window covers, so both are
+        // counted, the one behind the marker included: the estimate can only
+        // overstate what is left to walk. Six entries over a five-tick
+        // rotation lift the budget to two a tick.
         assert_eq!(
-            cursor.rotation_appended_entries, 1,
-            "only the record that landed after the rotation's tail is an append"
+            cursor.rotation_appended_entries, 2,
+            "every record committed into the tail window is an append"
         );
-        assert_eq!(cursor.rotation_entries_visited, 3);
+        assert_eq!(cursor.rotation_entries_visited, 4);
 
         let mut ticks = 3;
         loop {
@@ -4119,7 +4140,7 @@ mod tests {
             }
             assert!(ticks < 10, "the rotation must finish");
         }
-        assert_eq!(ticks, 5, "five one-entry ticks cover the five entries");
+        assert_eq!(ticks, 4, "two one-entry ticks, then two entries and one");
 
         let mut first_rotation: Vec<String> = store
             .full_gets

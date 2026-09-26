@@ -532,16 +532,75 @@ pub struct ScrubCursor {
     pub rotation_total_entries: Option<u64>,
     /// Listing entries this rotation has consumed so far.
     pub rotation_entries_visited: u64,
-    /// Listing entries appended past `rotation_tail_key` since this rotation
-    /// began, counted by a LIST-only pass over the tail each tick. Added to
+    /// Listing entries appended since this rotation began, counted by a
+    /// LIST-only pass over the tail window each tick
+    /// ([`observe_tail`](Self::observe_tail)). Added to
     /// `rotation_total_entries` so the budget is sized from what the walk has
     /// actually observed rather than from a total that went stale the moment
     /// the rotation opened.
     pub rotation_appended_entries: u64,
-    /// The greatest key seen under the prefix when the appended-entry count
-    /// last ran. `None` means the prefix was empty then, so the next count
-    /// covers the whole prefix.
-    pub rotation_tail_key: Option<String>,
+    /// The directory (ingest hour) the tail window starts at: the
+    /// second-greatest hour directory the last count saw, or the only one.
+    /// `None` means the prefix was empty then, so the next count covers the
+    /// whole prefix.
+    pub rotation_tail_dir: Option<String>,
+    /// Entries in and after `rotation_tail_dir` when the last count ran.
+    pub rotation_tail_entries: u64,
+}
+
+/// The running tally of one LIST-only count pass over the commit shard prefix
+/// (ADR-1686 decision 3, amended): how many entries it saw, and how many of
+/// them fell in each of the two greatest directories (ingest hours) it met.
+///
+/// Every writer commits into the current hour, and a commit key is
+/// `<hour>/<writer_id>.<epoch>.<seq>.cmt`, so a new commit from a writer whose
+/// id sorts low lands below keys already listed in that hour. A count that only
+/// looks past the greatest key seen misses it. Counting the whole window from
+/// the start of its first directory, and comparing with the same window's
+/// count last time, catches every append into those hours whatever its writer.
+/// The window keeps the hour before the greatest one as well, so a commit that
+/// lands late in the previous hour after the next hour has begun is counted
+/// too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TailTally {
+    /// Entries the pass saw.
+    pub entries: u64,
+    last_dir: Option<String>,
+    last_dir_entries: u64,
+    prev_dir: Option<String>,
+    prev_dir_entries: u64,
+}
+
+impl TailTally {
+    /// Count one listed key. Keys must arrive in listing order.
+    pub fn observe(&mut self, key: &str) {
+        self.entries = self.entries.saturating_add(1);
+        let dir = match key.rfind('/') {
+            Some(slash) => &key[..=slash],
+            None => key,
+        };
+        if self.last_dir.as_deref() == Some(dir) {
+            self.last_dir_entries = self.last_dir_entries.saturating_add(1);
+        } else {
+            self.prev_dir = self.last_dir.replace(dir.to_string());
+            self.prev_dir_entries = self.last_dir_entries;
+            self.last_dir_entries = 1;
+        }
+    }
+
+    /// Where the next count starts and how many entries lie in and after it:
+    /// the second-greatest directory this pass met with both directories'
+    /// entries, or the only directory it met. `None` when it saw nothing.
+    pub fn window(&self) -> Option<(String, u64)> {
+        match (&self.prev_dir, &self.last_dir) {
+            (Some(prev), Some(_)) => Some((
+                prev.clone(),
+                self.prev_dir_entries.saturating_add(self.last_dir_entries),
+            )),
+            (None, Some(last)) => Some((last.clone(), self.last_dir_entries)),
+            _ => None,
+        }
+    }
 }
 
 impl ScrubCursor {
@@ -558,7 +617,8 @@ impl ScrubCursor {
             rotation_total_entries: None,
             rotation_entries_visited: 0,
             rotation_appended_entries: 0,
-            rotation_tail_key: None,
+            rotation_tail_dir: None,
+            rotation_tail_entries: 0,
         }
     }
 
@@ -567,27 +627,43 @@ impl ScrubCursor {
         self.rotation_total_entries.is_none()
     }
 
-    /// Open a rotation from the start of the prefix with the entry count its
-    /// LIST-only pass found and the greatest key that pass saw. Keeps
-    /// `last_rotation_bytes`, which reports the previous rotation's bandwidth.
-    pub fn start_rotation(&mut self, total_entries: u64, tail_key: Option<String>, now_ns: i64) {
+    /// Open a rotation from the start of the prefix with the tally of the
+    /// LIST-only pass over the whole prefix. Keeps `last_rotation_bytes`,
+    /// which reports the previous rotation's bandwidth.
+    pub fn start_rotation(&mut self, tally: &TailTally, now_ns: i64) {
         self.last_commit_key = None;
         self.rotation_started_unix_ns = now_ns;
         self.rotation_bytes_seen = 0;
-        self.rotation_total_entries = Some(total_entries);
+        self.rotation_total_entries = Some(tally.entries);
         self.rotation_entries_visited = 0;
         self.rotation_appended_entries = 0;
-        self.rotation_tail_key = tail_key;
+        let (dir, entries) = tally.window().map_or((None, 0), |(d, n)| (Some(d), n));
+        self.rotation_tail_dir = dir;
+        self.rotation_tail_entries = entries;
     }
 
-    /// Record `count` entries found past `rotation_tail_key` by this tick's
-    /// LIST-only tail count, and move the tail mark to `tail_key`. `count` is
-    /// the growth since the last tick, so the running total is every entry
-    /// appended since the rotation began.
-    pub fn observe_appended(&mut self, count: u64, tail_key: Option<String>) {
-        self.rotation_appended_entries = self.rotation_appended_entries.saturating_add(count);
-        if tail_key.is_some() {
-            self.rotation_tail_key = tail_key;
+    /// The start-after key of this tick's LIST-only tail count: the tail
+    /// window's directory, which sorts before every key inside it. `None`
+    /// counts the whole prefix.
+    pub fn tail_count_start(&self) -> Option<&str> {
+        self.rotation_tail_dir.as_deref()
+    }
+
+    /// Record this tick's tail count, a tally of every entry listed after
+    /// [`tail_count_start`](Self::tail_count_start). Its growth over the
+    /// window's count last time is what was appended since, and the window
+    /// moves to the directories this pass saw last. A window that shrank
+    /// (retention or a sweep deleted entries in it) counts no appends, which
+    /// can only overstate what is left to walk, never understate it.
+    pub fn observe_tail(&mut self, tally: &TailTally) {
+        let appended = tally.entries.saturating_sub(self.rotation_tail_entries);
+        self.rotation_appended_entries = self.rotation_appended_entries.saturating_add(appended);
+        match tally.window() {
+            Some((dir, entries)) => {
+                self.rotation_tail_dir = Some(dir);
+                self.rotation_tail_entries = entries;
+            }
+            None => self.rotation_tail_entries = 0,
         }
     }
 
@@ -667,7 +743,8 @@ impl ScrubCursor {
         self.rotation_total_entries = None;
         self.rotation_entries_visited = 0;
         self.rotation_appended_entries = 0;
-        self.rotation_tail_key = None;
+        self.rotation_tail_dir = None;
+        self.rotation_tail_entries = 0;
     }
 }
 
@@ -985,16 +1062,38 @@ mod tests {
         retention_secs: Option<u64>,
         now_ns: i64,
     ) -> Vec<String> {
+        walk_tick_planned(
+            cursor,
+            keys,
+            size,
+            period_secs,
+            tick_secs,
+            retention_secs,
+            now_ns,
+        )
+        .0
+    }
+
+    /// [`walk_tick_with_retention`], also returning the tick's plan.
+    fn walk_tick_planned(
+        cursor: &mut ScrubCursor,
+        keys: &[String],
+        size: u64,
+        period_secs: u64,
+        tick_secs: u64,
+        retention_secs: Option<u64>,
+        now_ns: i64,
+    ) -> (Vec<String>, TickPlan) {
         if cursor.needs_entry_count() {
-            cursor.start_rotation(keys.len() as u64, keys.last().cloned(), now_ns);
+            cursor.start_rotation(&tally(keys), now_ns);
         } else {
             // The LIST-only tail count the scheduled wrapper runs each tick:
-            // everything appended past the mark the last count left.
-            let appended = match &cursor.rotation_tail_key {
-                Some(tail) => keys.len() - keys.partition_point(|key| key <= tail),
-                None => keys.len(),
+            // every entry listed after the tail window's start.
+            let start = match cursor.tail_count_start() {
+                Some(dir) => keys.partition_point(|key| key.as_str() <= dir),
+                None => 0,
             };
-            cursor.observe_appended(appended as u64, keys.last().cloned());
+            cursor.observe_tail(&tally(&keys[start..]));
         }
         let plan = cursor.plan_tick(period_secs, tick_secs, retention_secs, now_ns);
         let start = match &cursor.last_commit_key {
@@ -1015,7 +1114,16 @@ mod tests {
         if index >= keys.len() {
             cursor.complete_rotation(now_ns);
         }
-        consumed
+        (consumed, plan)
+    }
+
+    /// The tally a LIST-only pass over `keys` produces.
+    fn tally(keys: &[String]) -> TailTally {
+        let mut tally = TailTally::default();
+        for key in keys {
+            tally.observe(key);
+        }
+        tally
     }
 
     fn entry_keys(n: usize) -> Vec<String> {
@@ -1048,7 +1156,7 @@ mod tests {
     #[test]
     fn a_completed_rotation_reports_its_bytes_and_sizes_the_next_by_entries() {
         let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-        cursor.start_rotation(4, Some("c/0000/d.cmt".to_string()), 1);
+        cursor.start_rotation(&tally(&entry_keys(4)), 1);
         // ceil(4 * 1 / 2) = 2 entries, the sustained rate over the count.
         assert_eq!(cursor.plan_tick(2, 1, None, 1).budget.max_entries, 2);
         cursor.consume("c/0000/a.cmt".to_string(), 3, 700);
@@ -1056,7 +1164,7 @@ mod tests {
         assert_eq!(cursor.rotation_bytes_seen, 700);
         cursor.complete_rotation(9);
         assert!(cursor.needs_entry_count());
-        cursor.start_rotation(4, Some("c/0000/d.cmt".to_string()), 10);
+        cursor.start_rotation(&tally(&entry_keys(4)), 10);
         // The next rotation is sized by entries, not by the 700 bytes the
         // previous one read: those are reported, never a budget.
         assert_eq!(cursor.plan_tick(2, 1, None, 10).budget.max_entries, 2);
@@ -1156,6 +1264,74 @@ mod tests {
         assert!(ticks <= deadline_ticks, "took {ticks} ticks");
     }
 
+    /// A commit key in the real layout's shape, `<hour>/<writer>.<epoch>.<seq>`.
+    fn writer_key(hour: u64, writer: &str, seq: u64) -> String {
+        format!("c/0000/{hour:06}/{writer}.1.{seq:08}.cmt")
+    }
+
+    #[test]
+    fn appends_from_writers_on_both_sides_of_the_tail_key_are_all_counted() {
+        // Two writers share the shard: `0a` sorts below `zz` inside every
+        // hour. Ticks fall mid-hour, so between two ticks each writer commits
+        // three records into the hour the last tick saw and three into the
+        // next hour. The `0a` records landing in the hour the last tick saw
+        // sort below that tick's greatest key, and a count that only looks
+        // above that key misses them. The rotation must either finish inside
+        // its 168 ticks or report that it cannot.
+        let period_secs = 7 * 86_400;
+        let tick_secs = 3_600;
+        let deadline_ticks = period_secs / tick_secs;
+        let writers = ["0a", "zz"];
+        let mut seq = [0u64; 2];
+        let mut keys: Vec<String> = Vec::new();
+        let mut commit = |keys: &mut Vec<String>, hour: u64, count: u64| {
+            for (index, writer) in writers.iter().enumerate() {
+                for _ in 0..count {
+                    keys.push(writer_key(hour, writer, seq[index]));
+                    seq[index] += 1;
+                }
+            }
+            keys.sort();
+        };
+        // 1,000 entries when the rotation opens, and twelve appended a tick:
+        // below the sustained rate `ceil(estimate / 168)` once the appends are
+        // counted, so an exact count finishes inside the deadline.
+        for hour in 0..100 {
+            commit(&mut keys, hour, 5);
+        }
+        let mut hour = 100;
+        commit(&mut keys, hour, 3);
+
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let mut ticks = 0u64;
+        let mut behind = 0u64;
+        let mut completed = false;
+        while ticks < deadline_ticks {
+            let now_ns = ticks as i64 * tick_secs as i64 * 1_000_000_000;
+            let (_, plan) =
+                walk_tick_planned(&mut cursor, &keys, 1, period_secs, tick_secs, None, now_ns);
+            ticks += 1;
+            if plan.behind {
+                behind += 1;
+            }
+            if cursor.last_commit_key.is_none() {
+                completed = true;
+                break;
+            }
+            commit(&mut keys, hour, 3);
+            hour += 1;
+            commit(&mut keys, hour, 3);
+        }
+        assert!(
+            completed || behind > 0,
+            "after {ticks} ticks the rotation neither finished nor reported behind: marker \
+             at {:?}, {} entries listed, estimate {}",
+            cursor.last_commit_key,
+            keys.len(),
+            cursor.estimated_rotation_entries()
+        );
+    }
+
     #[test]
     fn the_budget_follows_entries_appended_after_the_rotation_began() {
         // 10 entries when the rotation opens, P = 20 ticks: the sustained rate
@@ -1227,7 +1403,7 @@ mod tests {
         let tick_secs = 3_600;
         let retention_secs = 24 * 3_600;
         let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-        cursor.start_rotation(100, Some("c/0000/0099.cmt".to_string()), 0);
+        cursor.start_rotation(&tally(&entry_keys(100)), 0);
         let plan = cursor.plan_tick(
             period_secs,
             tick_secs,

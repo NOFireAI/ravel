@@ -121,7 +121,8 @@ pub use scan::{
 };
 pub use scrub::{
     CoveringPostings, SCRUB_MAX_CATCHUP, SCRUB_REQUESTS_PER_ENTRY, SCRUB_REQUESTS_PER_OBJECT,
-    ScrubBudget, ScrubCursor, ScrubLevel, ScrubResult, ScrubTarget, TickPlan, scrub_one_object,
+    ScrubBudget, ScrubCursor, ScrubLevel, ScrubResult, ScrubTarget, TailTally, TickPlan,
+    scrub_one_object,
 };
 pub use sweep::{
     CatalogSweepOutcome, ErasureRequestSweepOutcome, HeldBucket, IdemSweepOutcome, LeaseCheck,

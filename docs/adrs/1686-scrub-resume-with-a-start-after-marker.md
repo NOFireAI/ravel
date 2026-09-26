@@ -259,11 +259,24 @@ request. `per_tick_byte_budget` and `ScrubBudget::MaxObjects` are gone.
 `ScrubBudget` is now `{ max_entries, max_requests }` and
 `ScrubCursor::plan_tick` returns it with the numbers it came from. Every
 rotation opens with the LIST-only entry count decision 3 reserved for a first
-rotation, and every later tick adds a LIST-only count of the entries appended
-past the greatest key the previous count saw (`rotation_tail_key`). The
-rotation's expected size is therefore the opening count plus every append the
-walk has since observed, not a total that went stale the moment the rotation
-opened. A shard that keeps committing raises its own budget.
+rotation, and every later tick recounts the rotation's tail window with a
+LIST-only pass and adds the window's growth since the previous count. The
+window is the last two ingest-hour directories the previous count met
+(`rotation_tail_dir`, with their entry count in `rotation_tail_entries`) and
+everything after them. It is whole hours, not the keys past the greatest key
+seen, because a commit key is `<hour>/<writer_id>.<epoch>.<seq>.cmt`: with
+several writers on a shard, a commit from a writer whose id sorts low lands
+below keys already listed in the current hour, and a count that only looks
+past the greatest key misses it. The second hour catches a commit that lands
+late in the previous hour after the next one began. The rotation's expected
+size is therefore the opening count plus every append into the window since,
+not a total that went stale the moment the rotation opened, and a shard that
+keeps committing raises its own budget. An append behind the marker is
+counted too, although the walk will not reach it until the next rotation, so
+the estimate errs high. What the window does not see is an entry landing
+ahead of the marker in an hour older than the window, such as a compaction
+record for an hour sealed well before; the walk still verifies it, it is
+only missing from the estimate.
 
 **A rotation is sized by a deadline, and the deadline is the shorter of the
 period and the tenant's retention window.** An object retention deletes
