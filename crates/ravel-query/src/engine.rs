@@ -7078,9 +7078,9 @@ mod prefetch_tests {
     }
 
     /// Resolve every metrics segment currently published for `tenant_hash` over
-    /// a window around `BASE_NS`, so a worker's `SnapshotSegmentResolver` holds
-    /// exactly the refs the coordinator will pin. Reads the same provisioning
-    /// record the coordinator reads (generations included), so an ineligible
+    /// a window around `BASE_NS`, so the `SnapshotSegmentResolver` this test
+    /// builds holds exactly the refs the coordinator will pin. Reads the same
+    /// provisioning record the coordinator reads (generations included), so an ineligible
     /// two-generation setup still resolves both segments for the raw path.
     async fn resolve_metric_segments(
         store: Arc<MemoryStore>,

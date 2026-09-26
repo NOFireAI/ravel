@@ -3944,9 +3944,8 @@ mod tests {
             .expect("one published segment")
     }
 
-    /// The whole timestamp domain, wider than the event-time window a worker
-    /// resolves over. Used here only as the test oracle
-    /// (a full-window resolve) and to name a disjoint window.
+    /// The whole timestamp domain, used by the test oracle's own catalog
+    /// resolve so it sees every published segment.
     const FULL: TimeRange = TimeRange {
         start_ns: i64::MIN,
         end_ns: i64::MAX,
@@ -3972,15 +3971,21 @@ mod tests {
         }
     }
 
-    /// The worker resolves its content-hash resolver over the request's window,
-    /// not the whole history: a window disjoint from a pinned segment's event
-    /// range bounds the resolve away from it, so the pin no longer resolves and
-    /// the slice reports `SnapshotInvalidated`. A covering window (the segment's
-    /// own event envelope, what the coordinator ships) still finds it. Under the
-    /// old whole-history resolve the disjoint window would have found the segment
-    /// too, so this proves the resolve is bounded to the query window.
+    /// A pinned slice reads what the identity names, whatever the request window
+    /// says. The worker reconstructs each object key from the shipped identity
+    /// and resolves no catalog, so a window entirely disjoint from the pinned
+    /// segment's event range returns the same rows as the segment's own
+    /// envelope. Under the resolve this replaced, the disjoint window bounded
+    /// the catalog resolve away from the pin and the slice reported
+    /// `SnapshotInvalidated` with zero series.
+    ///
+    /// Flip-line proof: make [`FragmentService::build_resolver`] return a
+    /// [`SnapshotSegmentResolver`] over a `catalog.resolve` bounded to
+    /// `request.window_start_ns..request.window_end_ns` again. The disjoint run
+    /// then reports `SnapshotInvalidated` and its `series_returned` is 0, so
+    /// both assertions below fail.
     #[tokio::test]
-    async fn windowed_resolve_is_bounded_to_the_request_window() {
+    async fn pinned_slice_is_independent_of_the_request_window() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = ravel_types::TenantId::new("windowed-tenant".to_string());
         publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
@@ -3988,7 +3993,7 @@ mod tests {
         let seg = only_segment(&store, tenant.hash(), now).await;
         let service = pinned_service(store, now);
 
-        // Covering window = the segment's own event envelope: the pin resolves.
+        // The segment's own event envelope, which is what the coordinator ships.
         let envelope = TimeRange {
             start_ns: seg.min_event_ts_ns,
             end_ns: seg.max_event_ts_ns,
@@ -4000,35 +4005,38 @@ mod tests {
         assert_eq!(covering.status, pb::status::Code::Ok);
         assert_eq!(covering.series_returned, 1);
 
-        // A window entirely after the segment's event range: the resolve is
-        // bounded away from it, so the pin is not found.
+        // A window entirely after the segment's event range.
         let disjoint = TimeRange {
             start_ns: 3 * HOUR_NS,
             end_ns: 4 * HOUR_NS,
         };
-        let missed = service
+        let outside = service
             .run_local(pinned_over_window(tenant.hash(), &seg, disjoint))
             .await
             .expect("local run");
         assert_eq!(
-            missed.status,
-            pb::status::Code::SnapshotInvalidated,
-            "a window disjoint from the pin bounds the resolve away from it"
+            outside.status,
+            pb::status::Code::Ok,
+            "a window disjoint from the pin no longer bounds anything away from it"
+        );
+        assert_eq!(
+            outside.series_returned, covering.series_returned,
+            "the pin names the object, so the window cannot change what is read"
         );
     }
 
-    /// The narrowed windowed resolve loses no pinned segment: a slice over the
-    /// segment's event envelope returns byte-identical rows to the same slice
-    /// resolved over the whole history.
+    /// The window-independence of [`pinned_slice_is_independent_of_the_request_window`]
+    /// down to the rows: the same pin fetched under a window disjoint from the
+    /// segment's events returns byte-identical samples to the same pin fetched
+    /// under the segment's own envelope.
     ///
-    /// Flip-line proof: in [`FragmentService::build_resolver`], narrow the
-    /// `window` passed to `catalog.resolve(..)` so it drops the pin -- e.g.
-    /// change `end_ns: request.window_end_ns` to
-    /// `end_ns: request.window_start_ns.saturating_sub(1)`. The windowed run then
-    /// resolves to `SnapshotInvalidated` with zero rows while the full-window
-    /// oracle still returns the sample, so the row assertions below fail.
+    /// Flip-line proof: make [`FragmentService::build_resolver`] return a
+    /// [`SnapshotSegmentResolver`] over a `catalog.resolve` bounded to
+    /// `request.window_start_ns..request.window_end_ns` again. The disjoint run
+    /// then resolves nothing, reports `SnapshotInvalidated` with an empty
+    /// `scalar`, and every assertion below fails.
     #[tokio::test]
-    async fn windowed_fragment_returns_same_rows_as_full_window() {
+    async fn pinned_fragment_returns_same_rows_under_a_disjoint_window() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = ravel_types::TenantId::new("same-rows-tenant".to_string());
         publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
@@ -4043,18 +4051,26 @@ mod tests {
         let windowed = service
             .run_local(pinned_over_window(tenant.hash(), &seg, envelope))
             .await
-            .expect("windowed local run");
-        let full = service
-            .run_local(pinned_over_window(tenant.hash(), &seg, FULL))
+            .expect("envelope local run");
+        let disjoint = TimeRange {
+            start_ns: 3 * HOUR_NS,
+            end_ns: 4 * HOUR_NS,
+        };
+        let outside = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, disjoint))
             .await
-            .expect("full-window local run");
+            .expect("disjoint-window local run");
 
         assert_eq!(windowed.status, pb::status::Code::Ok);
-        assert_eq!(full.status, pb::status::Code::Ok);
-        assert_eq!(windowed.series_returned, full.series_returned);
-        assert_eq!(windowed.samples_returned, full.samples_returned);
-        assert_eq!(windowed.scalar.len(), full.scalar.len());
-        for (w, f) in windowed.scalar.iter().zip(full.scalar.iter()) {
+        assert_eq!(outside.status, pb::status::Code::Ok);
+        assert_eq!(windowed.series_returned, outside.series_returned);
+        assert_eq!(windowed.samples_returned, outside.samples_returned);
+        assert_eq!(windowed.scalar.len(), outside.scalar.len());
+        assert!(
+            !windowed.scalar.is_empty(),
+            "both runs must return rows for the comparison to mean anything"
+        );
+        for (w, f) in windowed.scalar.iter().zip(outside.scalar.iter()) {
             assert_eq!(w.series_id, f.series_id, "series id differs");
             assert_eq!(w.timestamps, f.timestamps, "timestamps differ");
             let wb: Vec<u64> = w.values.iter().map(|v| v.to_bits()).collect();

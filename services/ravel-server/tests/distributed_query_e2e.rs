@@ -2155,9 +2155,13 @@ impl ObjectStoreBackend for WorkerProbeStore {
                 if !self.armed.load(Ordering::SeqCst) {
                     break;
                 }
-                // Register the waiter before re-checking, so a release between
-                // the check and the await still wakes it.
+                // `enable()` registers the waiter now rather than at the first
+                // poll, so a release between the re-check below and the await
+                // still wakes it. This gate is released exactly once; a missed
+                // wake would park the fetch forever.
                 let notified = self.release.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if !self.armed.load(Ordering::SeqCst) {
                     break;
                 }
@@ -2380,14 +2384,9 @@ async fn compaction_between_resolve_and_fetch_returns_local_rows() {
         ..CompactorConfig::default()
     };
     let bucket = Bucket::new(tenant_hash, Signal::Metrics, 0, hour);
-    let outcome = compact_bucket(
-        backing.as_ref(),
-        &FixedClock::new(now),
-        &compactor,
-        &bucket,
-    )
-    .await
-    .expect("compacting the sealed bucket succeeds");
+    let outcome = compact_bucket(backing.as_ref(), &FixedClock::new(now), &compactor, &bucket)
+        .await
+        .expect("compacting the sealed bucket succeeds");
     match outcome {
         CompactionOutcome::Compacted { parts, .. } => assert_eq!(
             parts, 1,
@@ -2461,7 +2460,11 @@ async fn compaction_between_resolve_and_fetch_returns_local_rows() {
     let expected: Vec<(i64, u64)> = [5, 6, 7]
         .into_iter()
         .map(|m| (m, 1.0f64.to_bits()))
-        .chain([8, 9, 10, 11, 12].into_iter().map(|m| (m, 2.5f64.to_bits())))
+        .chain(
+            [8, 9, 10, 11, 12]
+                .into_iter()
+                .map(|m| (m, 2.5f64.to_bits())),
+        )
         .chain([20, 21, 22].into_iter().map(|m| (m, 1.0f64.to_bits())))
         .chain(
             [23, 24, 25, 26, 27]

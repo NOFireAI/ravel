@@ -1854,12 +1854,14 @@ mod tests {
         }
     }
 
-    /// ADR-0103 (epic #64): the protocol version is 4 now that the coordinator
-    /// sets `FetchRequest.partial_aggregate` live and `MergedSource` consumes
-    /// the reply -- see the doc comment on `PROTOCOL_VERSION`.
+    /// The protocol version is 5 (issue #1721): a worker reconstructs every
+    /// pinned object key from `SegmentIdentity` alone, so an identity from a
+    /// coordinator that predates the identity's `created_unix_ns`, event range
+    /// and counts must never reach one. See the doc comment on
+    /// `PROTOCOL_VERSION`.
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]

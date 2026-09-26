@@ -180,8 +180,8 @@ impl ReconstructingSegmentResolver {
             content_hash,
         )
         .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
-        let parsed =
-            keys::parse_data_key(&key).map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        let parsed = keys::parse_data_key(&key)
+            .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
         // The L0 key shape does not encode the ingest hour, so every component
         // it does encode is checked here and the hour rides on the identity.
         let expected = keys::ParsedDataKey {
@@ -1538,5 +1538,217 @@ fn map_span_fetch_error(err: SpanFetchError) -> (pb::status::Code, String) {
         SpanFetchError::FetchMemoryExhausted { .. } => {
             (pb::status::Code::BudgetExceeded, err.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod reconstruct_tests {
+    use super::*;
+
+    const WRITER_ID: &str = "8d9f0b8e-6f2a-4f4a-9a1e-2c3b4d5e6f70";
+
+    fn tenant() -> TenantHash {
+        ravel_types::TenantId::new("reconstruct-tenant".to_string()).hash()
+    }
+
+    fn resolver() -> ReconstructingSegmentResolver {
+        ReconstructingSegmentResolver::new(tenant(), Signal::Metrics)
+    }
+
+    /// A well-formed L0 identity, exactly what the coordinator encodes.
+    fn l0_identity() -> pb::SegmentIdentity {
+        pb::SegmentIdentity {
+            level: 0,
+            shard: 7,
+            ingest_hour_bucket: 481_000,
+            writer_id: WRITER_ID.to_string(),
+            writer_epoch: 3,
+            writer_seq: 11,
+            input_set_hash: Vec::new(),
+            part_index: 0,
+            content_hash: vec![0xABu8; 32],
+            object_size: 4096,
+            segment_format_version: 4,
+            created_unix_ns: 1_700_000_000_000_000_000,
+            min_event_ts_ns: 1_699_999_000_000_000_000,
+            max_event_ts_ns: 1_700_000_500_000_000_000,
+            sample_count: 120,
+            series_count: 4,
+        }
+    }
+
+    /// A well-formed L1 part identity.
+    fn l1_identity() -> pb::SegmentIdentity {
+        pb::SegmentIdentity {
+            level: 1,
+            writer_id: String::new(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            input_set_hash: vec![0x5Cu8; 32],
+            part_index: 2,
+            ..l0_identity()
+        }
+    }
+
+    /// Every rejection below must be [`ResolveIdentityError::Invalid`], which
+    /// the fragment service maps to the terminal `BAD_DATA` status: a bad
+    /// identity fails the fragment, it never reads some other object.
+    fn assert_invalid(identity: &pb::SegmentIdentity, what: &str) {
+        let err = resolver()
+            .resolve(identity)
+            .expect_err(&format!("{what} must be refused"));
+        assert!(
+            matches!(err, ResolveIdentityError::Invalid { .. }),
+            "{what} produced {err:?}, expected Invalid"
+        );
+        assert_eq!(
+            err.status_code(),
+            pb::status::Code::BadData,
+            "{what} must fail the fragment terminally"
+        );
+    }
+
+    #[test]
+    fn well_formed_l0_identity_reconstructs_its_object_key() {
+        let seg = resolver().resolve(&l0_identity()).expect("L0 resolves");
+        let expected = keys::data_key(
+            &tenant(),
+            Signal::Metrics,
+            7,
+            uuid::Uuid::parse_str(WRITER_ID).expect("a uuid"),
+            3,
+            11,
+            &[0xABu8; 32],
+        )
+        .expect("the key builds");
+        assert_eq!(seg.data_object_key, expected);
+        assert_eq!(seg.level, SegmentLevel::L0);
+        assert_eq!(seg.content_hash, [0xABu8; 32]);
+        assert_eq!(seg.object_size, 4096);
+        assert_eq!(seg.shard, 7);
+        assert_eq!(seg.ingest_hour_bucket, 481_000);
+        assert_eq!(seg.writer_epoch, 3);
+        assert_eq!(seg.writer_seq, 11);
+        assert_eq!(seg.segment_format_version, 4);
+        // The dedup total order leads with `created_unix_ns`, and the object's
+        // own footer cannot supply it for an L0 segment.
+        assert_eq!(seg.created_unix_ns, 1_700_000_000_000_000_000);
+        assert_eq!(seg.min_event_ts_ns, 1_699_999_000_000_000_000);
+        assert_eq!(seg.max_event_ts_ns, 1_700_000_500_000_000_000);
+        assert_eq!(seg.sample_count, 120);
+        assert_eq!(seg.series_count, 4);
+    }
+
+    #[test]
+    fn well_formed_l1_identity_reconstructs_its_part_key() {
+        let seg = resolver().resolve(&l1_identity()).expect("L1 resolves");
+        let expected = keys::l1_part_key(
+            &tenant(),
+            Signal::Metrics,
+            7,
+            481_000,
+            &hex::encode([0x5Cu8; 8]),
+            2,
+            &hex::encode([0xABu8; 8]),
+        )
+        .expect("the key builds");
+        assert_eq!(seg.data_object_key, expected);
+        assert_eq!(
+            seg.level,
+            SegmentLevel::L1 {
+                input_set_hash: [0x5Cu8; 32],
+                part_index: 2,
+            }
+        );
+    }
+
+    /// The same identity under a different tenant reconstructs a different key,
+    /// so a coordinator cannot name another tenant's object: the tenant comes
+    /// from the authenticated request, never from the identity.
+    #[test]
+    fn the_tenant_comes_from_the_resolver_not_the_identity() {
+        let other = ravel_types::TenantId::new("other-tenant".to_string()).hash();
+        let mine = resolver().resolve(&l0_identity()).expect("L0 resolves");
+        let theirs = ReconstructingSegmentResolver::new(other, Signal::Metrics)
+            .resolve(&l0_identity())
+            .expect("L0 resolves");
+        assert_ne!(mine.data_object_key, theirs.data_object_key);
+    }
+
+    #[test]
+    fn a_non_uuid_writer_id_is_refused() {
+        let mut identity = l0_identity();
+        identity.writer_id = "not-a-uuid".to_string();
+        assert_invalid(&identity, "a non-uuid writer_id");
+    }
+
+    #[test]
+    fn a_short_content_hash_is_refused() {
+        let mut identity = l0_identity();
+        identity.content_hash = vec![0xABu8; 31];
+        assert_invalid(&identity, "a 31-byte content hash");
+    }
+
+    #[test]
+    fn an_absent_content_hash_is_refused() {
+        let mut identity = l0_identity();
+        identity.content_hash = Vec::new();
+        assert_invalid(&identity, "an absent content hash");
+    }
+
+    /// The key shape formats the shard as four digits, so a shard outside that
+    /// range has no key at all; it must not be truncated into another shard's.
+    #[test]
+    fn an_out_of_range_shard_is_refused() {
+        let mut identity = l0_identity();
+        identity.shard = 10_000;
+        assert_invalid(&identity, "shard 10000");
+    }
+
+    #[test]
+    fn an_out_of_range_part_index_is_refused() {
+        let mut identity = l1_identity();
+        identity.part_index = 10_000;
+        assert_invalid(&identity, "part_index 10000");
+    }
+
+    #[test]
+    fn an_l1_identity_without_a_32_byte_input_set_hash_is_refused() {
+        let mut identity = l1_identity();
+        identity.input_set_hash = vec![0x5Cu8; 16];
+        assert_invalid(&identity, "a 16-byte L1 input_set_hash");
+    }
+
+    /// An L0 identity carrying L1 compaction fields is internally inconsistent:
+    /// one of the two readings names a different object, so neither is trusted.
+    #[test]
+    fn an_l0_identity_carrying_l1_fields_is_refused() {
+        let mut identity = l0_identity();
+        identity.input_set_hash = vec![0x5Cu8; 32];
+        assert_invalid(&identity, "an L0 identity with an input_set_hash");
+
+        let mut identity = l0_identity();
+        identity.part_index = 1;
+        assert_invalid(&identity, "an L0 identity with a part_index");
+    }
+
+    #[test]
+    fn an_unknown_level_is_refused() {
+        let mut identity = l0_identity();
+        identity.level = 2;
+        assert_invalid(&identity, "segment level 2");
+    }
+
+    /// A snapshot resolver miss is retryable, not terminal: the coordinator
+    /// re-resolves once and re-dispatches.
+    #[test]
+    fn a_snapshot_resolver_miss_is_snapshot_invalidated() {
+        let resolver = SnapshotSegmentResolver::new(std::iter::empty());
+        let err = resolver
+            .resolve(&l0_identity())
+            .expect_err("an empty snapshot resolves nothing");
+        assert!(matches!(err, ResolveIdentityError::Unknown { .. }));
+        assert_eq!(err.status_code(), pb::status::Code::SnapshotInvalidated);
     }
 }
