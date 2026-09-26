@@ -63,6 +63,11 @@ The issue computed 52 minutes of headroom from the first row. That is the best
 point in the hour. At the worst point in the hour the headroom is negative,
 with no fold lag at all.
 
+(The 2026-09-26 amendment below records the measured cost: 2 requests per
+flush inside the query's range, 14,400 per hour of tail at 4 shards and 2 s,
+so a cold wide query exhausts the tail's 10,800 at a 45-minute tail and is
+refused at every point in a healthy hour.)
+
 PR #1636 landed the fold-liveness metrics for this issue: per-signal
 `ravel_catalog_fold_cycles_total`, `ravel_catalog_fold_failures_total` and
 `ravel_catalog_fold_last_success_timestamp_seconds`
@@ -151,6 +156,8 @@ Two related facts bound what any fix here can promise:
    plus one data-object GET for a flush inside the query's event range), the
    constant becomes 2. The 3/2 headroom is not the lever for that; it stays the
    retry allowance ADR-0075 gave it.
+   (The 2026-09-26 amendment below records the measurement and sets the
+   constant at 2, for segments at or under the whole-object threshold.)
 
 5. **An explicit `--max-s3-requests` is still used verbatim.** Only the
    derived default changes, exactly as in ADR-0075 decision 1. The startup log
@@ -178,6 +185,10 @@ GETs. At the repository's own $0.40 per million GET-class price
 (`crates/ravel-types/src/cost_profile.rs:152`) that is $0.0189, against
 $0.0063 today.
 
+(The table and the cost above assume 1 request per flush. The 2026-09-26
+amendment below gives them at the measured 2: 26,150, 89,600, 174,200 and
+343,400, and $0.0358 for the 4-shard, 2 s query.)
+
 What a query can now rely on, at the modelled per-flush cost:
 
 - At the default `max_ingest_lag` of 2 h, a query whose range covers the last
@@ -190,10 +201,13 @@ What a query can now rely on, at the modelled per-flush cost:
   overhead reserved for requests outside the tail, it comes when the tail
   reaches 42,300 / 7,200 = 5 h 52 m. That is about 2 h 03 m after the alert
   fires.
+  (At the measured 2 requests per flush the 2026-09-26 amendment below gets
+  84,600 / 14,400, the same 5 h 52 m.)
 
 ```mermaid
 gantt
     title Worst case for the ordering, 4 shards, 2 s cadence, 1 request per flush
+    %% At the measured 2 per flush see the 2026-09-26 amendment below: the new budget still runs out at 14:52, today's never admits a wide query
     dateFormat HH:mm
     axisFormat %H:%M
     section Seal of hour H
@@ -219,6 +233,10 @@ fold has even stalled. The new budget runs out at 14:52, about 2 h 03 m after
 the alert fires. Both times reserve the 5,000 fixed overhead for requests
 outside the tail.
 
+(The 2026-09-26 amendment below recomputes these times at the measured 2
+requests per flush: the new budget still runs out at 14:52, and today's budget
+refuses a cold wide query throughout the healthy hour, not from 10:30.)
+
 ## Rejected alternatives
 
 - **Keep the budget and rely on the alert (option 3).** Lost because the alert
@@ -227,6 +245,9 @@ outside the tail.
   documented "422s during fold lag are expected" would describe an outage that
   pages after the users notice it. It would also leave the refusals at the top
   of every healthy hour unexplained.
+  (At the measured 2 requests per flush, the 2026-09-26 amendment below finds
+  today's budget refuses a cold wide query before any stall, at every point in
+  the hour.)
 
 - **Serve a partial result with a visible flag, or fall back to a slower path
   (option 2).** A partial result by default breaks the rule that approximation
@@ -266,6 +287,9 @@ outside the tail.
   It lost because the property the issue asks for would rest on a
   coincidence of constants. Decision 2 proves the ordering without touching
   the headroom.
+  (The 2026-09-26 amendment below corrects the 4 h 11 m: with the fixed
+  overhead reserved, as decision 2 does, this alternative refuses at a
+  3 h 30 m tail, before the page, at either per-flush cost.)
 
 - **Tighten the alert instead of widening the budget.** A 20-minute threshold
   would page before today's budget runs out at the best point in the hour. It
@@ -283,6 +307,8 @@ outside the tail.
   from 15,800 to 47,300 requests. It is still a fixed number computed from
   configuration, which is what ADR-0073 decision 3 asks for. A runaway query
   is still bounded.
+  (At the measured cost the 2026-09-26 amendment below gives 89,600, about
+  5.7x today's figure.)
 - The budget and the alert are now coupled. Raising the alert's threshold or
   its `for:` without raising `lag_allowance` breaks the ordering. Follow-up
   task 4 makes that a failing test rather than a review comment. A
@@ -303,6 +329,8 @@ outside the tail.
 - If task 1 measures `REQUESTS_PER_UNSEALED_FLUSH` at 2, every figure above
   doubles in its per-shard term. The 4-shard, 2 s budget would be 89,600.
   That is the honest cost, not headroom.
+  (Task 1 did measure 2; the 2026-09-26 amendment below records it, and that
+  the per-flush bound holds only under the whole-object threshold.)
 
 ### Follow-up tasks
 
@@ -334,6 +362,9 @@ Each task names the test that accepts it.
      and the new 47,300 admits it.
    - It asserts a runaway cost of three times the `covered_span` cost is still
      refused.
+   - (The 2026-09-26 amendment below gives the corrected acceptance figures
+     for `REQUESTS_PER_UNSEALED_FLUSH` = 2, and the flush-size decision this
+     task must also make.)
    - The existing `open_hour_at_default_shards_fits_the_derived_budget`,
      `budget_follows_flush_cadence` and `budget_scales_with_shard_count` keep
      passing unchanged.
@@ -402,3 +433,118 @@ Each task names the test that accepts it.
    ordering, the 50-minute window, the delivery slack, and the two uncovered
    cases above. The ADR-0075 amendment lands with this ADR's acceptance, and
    the `docs/adrs/README.md` index gains the ADR-1306 row.
+
+## Amendment (2026-09-26): REQUESTS_PER_UNSEALED_FLUSH is measured at 2
+
+<!-- amendment-applies: sections="Context|Decision|Rejected alternatives|Consequences|Follow-up tasks" pointer="2026-09-26 amendment" -->
+
+### The measurement
+
+Follow-up task 1 landed as
+`cold_recent_query_requests_per_unsealed_flush_by_phase`
+(`crates/ravel-query/tests/unsealed_flush_request_cost.rs`, PR #2019). On
+`MemoryStore`, with a fresh `Catalog` and engine per query, it reads each
+figure off the difference between two fixtures rather than assuming it:
+
+- A flush outside the query's event range costs 1 request: its commit-record
+  GET in resolve.
+- A flush inside the range costs 2: the commit-record GET and one
+  whole-object data GET in plan. Probe and scan issue nothing more for a
+  segment at or under the fetcher's 512 KiB whole-object threshold
+  (`DEFAULT_WHOLE_OBJECT_THRESHOLD`, `crates/ravel-query/src/fetcher.rs`).
+- Outside the tail a query costs 6 fixed requests (the `HEAD`, snapshot part
+  and postings GETs, one commit LIST per shard at 2 shards, one tombstone
+  LIST) plus 1 per sealed segment in range. Scaled to the 4-shard reference
+  deployment and 1,024 sealed segments that is 3 + 4 + 1 + 1,024 = 1,032,
+  inside the 5,000 fixed overhead. It is a floor for a small catalog (one
+  part, one postings object, one LIST page per shard), not a proof of decision
+  2's second condition.
+
+`REQUESTS_PER_UNSEALED_FLUSH` is 2, the in-range cost, as decision 4 said it
+would become. The formulas of decisions 1 and 2 stand unchanged.
+
+### Recomputed figures
+
+`covered_span` is still 14,100 s. With the constant at 2,
+`per_shard_allowance = ceil(14,100 s / max_flush_delay) x 2 x 3/2`:
+
+| Shards | `max_flush_delay` | Today | This decision, at 2 per flush |
+|---|---|---|---|
+| 1 | 2 s | 7,700 | 7,050 x 2 x 3/2 x 1 + 5,000 = 26,150 |
+| 4 | 2 s | 15,800 | 7,050 x 2 x 3/2 x 4 + 5,000 = 89,600 |
+| 8 | 2 s | 26,600 | 7,050 x 2 x 3/2 x 8 + 5,000 = 174,200 |
+| 4 | 500 ms | 48,200 | 28,200 x 2 x 3/2 x 4 + 5,000 = 343,400 |
+
+At 4 shards and 2 s a cold wide query spends 1,800 x 2 x 4 = 14,400 requests
+per hour of tail.
+
+- Today's budget leaves 10,800 for the tail, which a wide query exhausts at
+  10,800 / 14,400 = 45 minutes of tail. A healthy tail is never shorter than
+  1 h 20 m, where the query needs 19,200 and is refused by 8,400; at 2 h 20 m
+  it needs 33,600 and is refused by 22,800. Today's budget refuses a cold wide
+  query at every point in a healthy hour, not from 10:30 as the gantt chart
+  shows.
+- The new budget leaves 84,600 for the tail, exhausted at
+  84,600 / 14,400 = 5.875 h, or 5 h 52 m 30 s. Both sides of that division
+  doubled, so the refusal point is unchanged: 14:52 on the chart, 2 h 03 m
+  after the alert fires at 12:49 and 1 h 58 m after the page at 12:54.
+- A narrow query pays 1 per flush outside its range, so its figures only
+  improve. The 50-minute window depends on spans alone and is unchanged.
+- The "cover the healthy tail only" alternative gives
+  4,200 x 2 x 3/2 x 4 + 5,000 = 55,400 at 2 per flush. Its tail share is
+  50,400 / 14,400 = 3 h 30 m, the same as 25,200 / 7,200 at 1 per flush.
+  The 4 h 11 m in that entry divided the whole 30,200 by 7,200, counting the
+  fixed overhead as tail share. With the overhead reserved it refuses 25
+  minutes before the 3 h 55 m page at either cost, which strengthens its
+  rejection.
+
+At $0.40 per million GET-class requests the worst 4-shard, 2 s query now
+costs 89,600 x $0.40 / 1,000,000 = $0.0358, against $0.0063 today, about
+5.7x (89,600 / 15,800).
+
+### The proof holds only under the whole-object threshold
+
+The constant is a measured cost, not an upper bound. Decision 2's proof needs
+each unsealed flush to cost at most `REQUESTS_PER_UNSEALED_FLUSH` per shard,
+and it spends none of the 3/2 headroom on that. So the proof holds only while
+every unsealed flush stays at or under the 512 KiB whole-object threshold.
+Ingest does not guarantee that: `min_flush_bytes` is 256 KiB, and nothing
+caps a flush below the 8 MiB `target_bytes` size trigger.
+
+A segment just over the threshold, read for a matcher on the dense catalog
+path with one page range outside the footer tail, costs 4 cold requests
+(`open_segment` and `decode_selected` in `fetcher.rs`):
+
+1. the commit-record GET in resolve;
+2. the footer-tail GET, an absolute 64 KiB range at the end of the object;
+3. one catalog GET: LABEL_DICT, SERIES_IDS and SERIES_META sit contiguously
+   at the front of the object and coalesce into one range;
+4. one page-range GET.
+
+That is a lower bound for larger segments. Every further coalesced page run
+(runs more than 64 KiB apart) adds one GET, and a footer longer than 64 KiB
+adds a chase GET. No path costs fewer than 3: a page range inside the tail
+buffer, or a sparse object read whole after its footer, drops one GET but
+never the commit record or the footer read.
+
+Follow-up task 2 must therefore do one of two things: bound unsealed flush
+size at the whole-object threshold, or size the per-flush term for the
+above-threshold case. It should bound the flush size. The above-threshold
+cost grows with the page runs a query selects and has no ceiling of its own,
+so a sized term would be a guess or would need a bound of its own anyway. A
+size bound keeps the measured 2 exact and pinned by task 1's test. It makes a
+busy tenant flush more often, which is the size-trigger under-count the
+Consequences already name; task 2 should size the record count per
+shard-hour for that case in the same change.
+
+### Corrected task 2 acceptance figures
+
+`derived_budget_covers_healthy_tail_plus_stall_alert_window`:
+
+- pins `covered_span` at 14,100 s and the four budgets at 26,150, 89,600,
+  174,200 and 343,400 exactly;
+- asserts today's 15,800 refuses the tail at 2 h 20 m, which costs
+  4,200 x 2 x 4 = 33,600 requests at 4 shards and 2 s, and the new 89,600
+  admits it;
+- asserts a runaway cost of three times the `covered_span` cost,
+  3 x 7,050 x 2 x 4 = 169,200, is still refused by 89,600.
