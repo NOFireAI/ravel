@@ -570,15 +570,16 @@ pub struct Cli {
     )]
     pub tenant_kms_config: Option<PathBuf>,
 
-    /// Disables the per-(tenant, signal) background catalog fold task.
-    /// Folding is a pure optimization
+    /// Disables the per-(tenant, signal) background catalog fold task, which
+    /// runs in `--mode maintain` and `--mode all` ([`Mode::runs_scheduled_fold`])
+    /// and nowhere else. Folding is a pure optimization
     /// for query resolve cost; disabling it never changes query results, only
     /// their cost (ADR-0020).
     #[arg(long)]
     pub disable_fold: bool,
 
     /// How often each tenant's fold task wakes up to check for newly sealed
-    /// hours, in seconds.
+    /// hours, in seconds. Read only in the modes that run that task.
     #[arg(long, default_value_t = 300)]
     pub fold_interval_secs: u64,
 

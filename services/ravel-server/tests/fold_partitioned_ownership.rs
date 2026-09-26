@@ -388,10 +388,7 @@ async fn two_maintain_workers_fold_each_unit_exactly_once_and_the_non_owner_issu
     // discovery config read, which precedes any ownership decision
     // (`tenant_discovery::discover_and_restrict_by_lifecycle`). Zero LISTs of
     // the commit prefix, zero HEAD peeks, zero PUTs.
-    for (process, store, owned) in [
-        ("A", &a.store, &expected_a),
-        ("B", &b.store, &expected_b),
-    ] {
+    for (process, store, owned) in [("A", &a.store, &expected_a), ("B", &b.store, &expected_b)] {
         for tenant in &tenants {
             if owned.contains(tenant) {
                 continue;

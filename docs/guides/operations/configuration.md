@@ -33,16 +33,19 @@ mode does, silently.
 
 | Mode | Runs |
 |---|---|
-| `all` | Ingest (OTLP and Remote Write), the query API, the catalog fold, alert evaluation. No maintenance. |
-| `gateway` | Ingest and the catalog fold. |
-| `query` | The query API, the catalog fold, and alert evaluation. |
-| `maintain` | Compaction, retention, the sweeper and the at-rest scrubber. No ingest, no query API, no catalog fold. It still binds `--listen-http` for liveness, and it needs a backend that reports the `multipart` capability. |
+| `all` | Ingest (OTLP and Remote Write), the query API, the catalog fold over every tenant, alert evaluation. No maintenance. |
+| `gateway` | Ingest. No scheduled catalog fold. |
+| `query` | The query API, alert evaluation, and the on-demand fold route. No scheduled catalog fold. |
+| `maintain` | Compaction, retention, the sweeper, the at-rest scrubber, and the catalog fold over the tenants it owns. No ingest, no query API. It still binds `--listen-http` for liveness, and it needs a backend that reports the `multipart` capability. |
 
-The catalog fold runs in every mode except `maintain`. Every maintenance loop
-runs only in `maintain`. A deployment made of `all` processes alone therefore
-folds its catalog but never compacts, never applies retention and never deletes
-an object. Read [Maintenance](maintenance.md) before you decide you do not need
-a `maintain` process.
+The scheduled catalog fold runs in `maintain` and `all`; a `maintain` fleet
+divides it across replicas by ownership. Every maintenance
+loop runs only in `maintain`. A deployment made of `all` processes alone
+therefore folds its catalog but never compacts, never applies retention and
+never deletes an object, and a deployment made of `gateway` and `query`
+processes alone folds nothing on a timer. Read
+[Maintenance](maintenance.md) before you decide you do not need a `maintain`
+process.
 
 ## Storage backend and credentials
 

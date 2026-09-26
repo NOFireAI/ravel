@@ -1838,6 +1838,15 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     // signal renders every cycle, whether or not its loop is still alive, so a
     // loop that has died leaves its own series standing and going stale
     // instead of vanishing into an aggregate its siblings keep fresh.
+    //
+    // They render only in the modes that run the scheduled fold (ADR-1693
+    // decision 5). A gateway or query process no longer folds on a timer, so
+    // rendering its liveness gauge there would publish a series that is stale
+    // by construction and fire the fold-liveness alert on a healthy fleet.
+    if !mode.runs_scheduled_fold() {
+        return;
+    }
+
     fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
         [Label::Mode(mode), Label::Signal(signal)]
     }
@@ -7161,6 +7170,82 @@ mod tests {
             assert_eq!(
                 samples, 3,
                 "{family} must render one series per folded signal and no other:\n{body}"
+            );
+        }
+    }
+
+    /// The fold families render exactly in the modes that run the scheduled
+    /// fold (ADR-1693 decision 5). A gateway or query process folds only when
+    /// someone calls the on-demand route, so a liveness gauge there is stale by
+    /// construction and its age fires the fold-liveness alert on a healthy
+    /// fleet. The same snapshot is rendered in all four modes and the series
+    /// count is pinned per mode, so gating that dropped a mode that does fold
+    /// fails here too.
+    #[test]
+    fn fold_families_render_only_in_the_modes_that_fold() {
+        let snapshot = CatalogCountersSnapshot {
+            fold: [
+                CatalogFoldCounters {
+                    signal: Signal::Metrics,
+                    cycles: 41,
+                    failures: 3,
+                    last_success_unix_ns: 1_758_000_123_500_000_000,
+                },
+                CatalogFoldCounters {
+                    signal: Signal::Logs,
+                    cycles: 17,
+                    failures: 0,
+                    last_success_unix_ns: 1_700_000_000_500_000_000,
+                },
+                CatalogFoldCounters {
+                    signal: Signal::Spans,
+                    cycles: 0,
+                    failures: 9,
+                    last_success_unix_ns: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        for (mode, expected_series) in [
+            (Mode::All, 3),
+            (Mode::Maintain, 3),
+            (Mode::Gateway, 0),
+            (Mode::Query, 0),
+        ] {
+            let mut out = String::new();
+            render_catalog_family(&mut out, mode, &snapshot);
+            for family in [
+                "ravel_catalog_fold_cycles_total",
+                "ravel_catalog_fold_failures_total",
+                "ravel_catalog_fold_last_success_timestamp_seconds",
+            ] {
+                let samples = out
+                    .lines()
+                    .filter(|line| {
+                        line.strip_prefix(family)
+                            .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+                    })
+                    .count();
+                assert_eq!(
+                    samples, expected_series,
+                    "{family} must render {expected_series} series in {mode:?}:\n{out}"
+                );
+                assert_eq!(
+                    out.lines()
+                        .filter(|line| line.starts_with(&format!("# TYPE {family} ")))
+                        .count(),
+                    usize::from(expected_series > 0),
+                    "{family} must declare its TYPE only where it renders samples, in {mode:?}:\n{out}"
+                );
+            }
+
+            // The families ABOVE the fold block are mode-independent: the gate
+            // must skip only the fold families, not truncate the whole catalog
+            // block.
+            assert!(
+                out.contains("ravel_catalog_isolation_breach_total{"),
+                "the non-fold catalog families render in every mode, including {mode:?}:\n{out}"
             );
         }
     }

@@ -7007,9 +7007,10 @@ mod tests {
                 metrics: Arc::new(TenantDiscoveryMetrics::default()),
                 safety: Arc::new(MaintenanceSafetyMetrics::default()),
                 ownership,
-                worker,
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(clock.clone()),
+                live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
+                worker,
                 cycle_hook: Arc::new(|| {}),
             }
         };
@@ -7099,6 +7100,7 @@ mod tests {
         let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
             DEFAULT_STALLED_AFTER_INTERVALS,
         ));
+        let worker = Arc::new(solo_worker());
         let ctx = LoopContext {
             store,
             fallback_allow: None,
@@ -7109,9 +7111,10 @@ mod tests {
             metrics: Arc::clone(&metrics),
             safety: Arc::new(MaintenanceSafetyMetrics::default()),
             ownership: Arc::clone(&ownership),
-            worker: Arc::new(solo_worker()),
             rng: Arc::new(SystemRng),
             clock: Arc::new(clock),
+            live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
+            worker,
             cycle_hook,
         };
         (ctx, ownership, metrics)
@@ -7409,7 +7412,9 @@ mod tests {
             metrics,
             safety,
             ownership,
-            worker,
+            Arc::clone(&worker),
+            Arc::new(watch::channel(worker.solo_live_set()).0),
+            Arc::new(WallClock),
         ) {
             Err(ravel_maintain::GcConfigError::MaintainSkewUncovered {
                 clock_skew_allowance_ns,
@@ -7442,7 +7447,9 @@ mod tests {
             metrics,
             safety,
             ownership,
-            worker,
+            Arc::clone(&worker),
+            Arc::new(watch::channel(worker.solo_live_set()).0),
+            Arc::new(WallClock),
         )
         .expect("a horizon that covers the running sweeper's skew spawns normally");
         tasks.shutdown().await;

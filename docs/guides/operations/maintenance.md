@@ -9,8 +9,9 @@ never deletes one: its L0 segments accumulate unmerged, retention windows have
 no effect, and nothing reclaims storage. The quickstart is exactly such a
 deployment, by design.
 
-The catalog fold is the exception in the other direction: it runs in every mode
-except `maintain`.
+The catalog fold runs on a timer in `maintain` and in `all`, and in no other
+mode. A `gateway` or `query` process folds only when an operator calls
+`POST /api/v1/admin/fold`, which stays available in `all` and `query`.
 
 If you are wondering why nothing is being reclaimed, check for a `maintain`
 process before anything else.
@@ -73,16 +74,50 @@ listing path does not scale past roughly 10,000 commit records in one bucket, so
 a tenant whose fold has stalled behind a heavy load will feel it at query time
 before anything else goes wrong.
 
-`--disable-fold` turns the background task off. `--fold-interval-secs` (default
+### Which processes fold
+
+The scheduled fold runs in `maintain` and in `all`, and nowhere else.
+
+A `maintain` process folds only the `(tenant, signal)` pairs it owns, using the
+same rendezvous hash and the same heartbeat live set that distribute
+maintenance units. Scaling `maintain` from one replica to
+N therefore divides the fold work N ways instead of running N full copies of
+it, and a non-owner issues no request at all for a pair it does not own: it
+skips it before reading that pair's `HEAD`. Ownership is evaluated per tick, so
+a replica that leaves the fleet hands its pairs to the survivors within the
+liveness window (three heartbeat intervals, 180 s at defaults) with no
+operator action.
+
+A `maintain` process still serves no query surface. It folds because the fold
+is scheduled work over the same tenant list it already walks, and because the
+catalog it writes is read by the query processes.
+
+A `--mode all` process is a solo fleet of one: its live set is itself, so it
+owns and folds everything.
+
+`gateway` and `query` processes do not fold on a timer. They scale on request
+load, and an extra replica there used to mean another full copy of the fold.
+They keep the on-demand route (`POST /api/v1/admin/fold`, mounted in `all` and
+`query`), so a one-off fold by hand is still available.
+
+A deployment with neither a `maintain` nor an `all` process never folds on a
+timer, and its catalog stays unsealed until someone calls that route. Run at
+least one `maintain` process, which is the same advice the top of this page
+gives for compaction and retention.
+
+`--disable-fold` turns the scheduled task off. `--fold-interval-secs` (default
 300) controls only how often it wakes up to check for newly sealed hours; it has
-no bearing on when an hour becomes eligible to seal.
+no bearing on when an hour becomes eligible to seal. Both flags are accepted in
+every mode and take effect only where the scheduled fold runs.
 
 Disabling the fold has one monitoring consequence to know: the fold-liveness
 gauge (`ravel_catalog_fold_last_success_timestamp_seconds`) never advances past
 its `0` sentinel with no fold to stamp it, so the `RavelCatalogFoldStalled`
 alert in the observability guide pages about ten minutes after start. That is
 consistent with the unsealed span growing, but if you run a fleet with the fold
-intentionally off, drop that alert for it rather than leave it paging.
+intentionally off, drop that alert for it rather than leave it paging. A fleet
+with no folding process at all renders no fold series, and the same alert's
+`absent()` arm fires instead.
 
 ### The seal margin, and why it matters
 
