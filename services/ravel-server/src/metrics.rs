@@ -2117,14 +2117,17 @@ fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
 /// [`Label::MemoryComponent`]'s doc comment.
 ///
 /// `ravel_memory_handoff_overlap_bytes` is `MemoryBudget::handoff_overlap()`:
-/// bytes that are simultaneously held by a live fetch `Reservation` AND
-/// resident in the ADR-0046 read cache, because the fetcher marked that
-/// reservation handed off (`Reservation::mark_handed_off`) once the cache
-/// took its own independent copy of the same bytes. It counts double-booked
-/// bytes, not evicted or freed ones: a cache hit that never issues a fetch
-/// reserves nothing and contributes nothing here, and the figure returns to
-/// `0` as soon as the fetcher's `Reservation` (and thus its handoff) drops,
-/// whether or not the cache still holds the bytes.
+/// the summed sizes of live fetch `Reservation`s that a fetcher marked handed
+/// off (`Reservation::mark_handed_off`) because the bytes they cover are
+/// routed through the ADR-0046 read cache, a hit or a miss the cache admits,
+/// so the cache's own byte cap counts the same bytes the budget's
+/// `component="fetch"` share counts. Each marked reservation contributes its
+/// full size exactly once, from the mark until the reservation drops; a cache
+/// eviction in between does not lower it, and the drop clears it whether or
+/// not the cache still holds the bytes. It is a subset of
+/// `component="fetch"`, never added to the reserved total: the budget counts
+/// those bytes once, and this gauge says how many of them the cache cap
+/// counts too. It reads `0` when no read cache is configured.
 fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudgetSnapshot) {
     write_header(
         out,
@@ -2167,7 +2170,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_handoff_overlap_bytes",
-        "Bytes simultaneously held by a live fetch Reservation and resident in the ADR-0046 read cache (Reservation::mark_handed_off), i.e. double-booked across the two ledgers; 0 when no fetch reservation has been handed off to a cache.",
+        "Bytes of live fetch reservations marked handed off to the ADR-0046 read cache (Reservation::mark_handed_off), i.e. counted both by component=\"fetch\" and by the cache's own byte cap; each counts at full size from the mark until the reservation drops, regardless of cache eviction. A subset of component=\"fetch\", not an addition to it; 0 when no read cache is configured.",
         "gauge",
     );
     write_sample(

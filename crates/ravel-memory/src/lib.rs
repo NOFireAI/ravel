@@ -61,7 +61,14 @@ impl MemoryBudget {
         self.reserved.load(Ordering::Acquire)
     }
 
-    /// Bytes currently counted as handed off (see [`note_handoff`]).
+    /// Bytes currently counted as handed off (see [`note_handoff`]): the
+    /// summed sizes of live [`Reservation`]s on which
+    /// [`Reservation::mark_handed_off`] was called, each at its full size from
+    /// the mark until the reservation drops. The fetch layer marks a
+    /// reservation when the bytes it covers go through a consumer with its own
+    /// byte ledger (the read cache), so this is how much of `fetch_reserved()`
+    /// that other ledger also counts. It is a subset of `fetch_reserved()`,
+    /// never an addition to `reserved()`.
     ///
     /// [`note_handoff`]: MemoryBudget::note_handoff
     pub fn handoff_overlap(&self) -> u64 {

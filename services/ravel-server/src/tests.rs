@@ -19,11 +19,11 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
-use ravel_cache::{Cache, CacheLimits};
 use ravel_ingest::{AdmissionController, AdmissionLimits, Clock, SystemClock};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
@@ -275,7 +275,12 @@ const LARGE_SEGMENT_QUERY_OFFSET_S: i64 = 300;
 /// budget at all, rather than reading the whole object in one unbudgeted GET.
 /// Asserts the threshold was really crossed rather than assuming it from the
 /// sample count.
-async fn publish_large_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, metric: &str, now: i64) {
+async fn publish_large_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    metric: &str,
+    now: i64,
+) {
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {
         name: "__name__".to_string(),
@@ -370,8 +375,7 @@ fn promql_harness(
     let query_accounting = Arc::new(QueryAccountingMetrics::new(HashSet::new()));
     let tokens: HashMap<String, TenantId> =
         HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
-    let tenant_resolver: Arc<dyn TenantResolver> =
-        Arc::new(StaticBearerTokenResolver::new(tokens));
+    let tenant_resolver: Arc<dyn TenantResolver> = Arc::new(StaticBearerTokenResolver::new(tokens));
 
     let state = crate::query::build_app_state(
         Arc::clone(&catalog),
@@ -475,7 +479,10 @@ async fn fetch_reservation_steps(
             .await;
         match result {
             Ok(_) => {
-                assert!(!steps.is_empty(), "the oracle's 1-byte budget never refused");
+                assert!(
+                    !steps.is_empty(),
+                    "the oracle's 1-byte budget never refused"
+                );
                 return steps;
             }
             Err(QueryError::Fetch(FetchError::FetchMemoryExhausted {
@@ -774,7 +781,11 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
             reserved,
             limit,
         })) => {
-            assert_eq!(limit, 4 * 1024, "the refusal must name the configured limit");
+            assert_eq!(
+                limit,
+                4 * 1024,
+                "the refusal must name the configured limit"
+            );
             (requested, reserved)
         }
         other => panic!("expected FetchMemoryExhausted, got {other:?}"),
@@ -860,11 +871,12 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
 
 /// ACCEPTANCE TEST: while a PromQL fetch's budgeted range GET is in flight,
 /// `ravel_memory_reserved_bytes{component="fetch"}` reads exactly the live
-/// `Reservation`'s size, both through the direct counter and through a real
+/// reservations' total, both through the direct counter and through a real
 /// `/metrics` scrape, `component="sql"` reads 0, and both return to exactly 0
-/// once the query completes. The expected size comes from
-/// [`fetch_reservation_size`], the fetcher's own request for the same query,
-/// not from the counter under test.
+/// once the query completes. The query reserves in more than one step; every
+/// step total from [`fetch_reservation_steps`] must be observed held, in
+/// order, and nothing else. Those totals come from the fetcher's own typed
+/// refusals, not from the counter under test.
 ///
 /// A `FaultStore` holds every `Get` against the published segment's data key
 /// so the reservation is observable while `budget.fetch_reserved()` is
@@ -874,9 +886,10 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
 /// footer/suffix GET in `open_segment` issues no reservation at all).
 ///
 /// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
-/// `build_app_state`. `budget.fetch_reserved()` then never leaves 0 even
-/// while a GET is held, so `observed` stays `false` for the whole query and
-/// the final `assert!(observed, ...)` fails.
+/// `build_app_state`, and the oracle panics with "the oracle's 1-byte budget
+/// never refused". Make `MemoryBudget::sql_reserved` return `reserved()`
+/// instead, and the held scrape fails "a fetch reservation must not be
+/// counted under component=\"sql\"".
 #[tokio::test]
 async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
@@ -973,9 +986,10 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
 /// real `/metrics` scrape; both return to exactly 0 once the query completes.
 ///
 /// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
-/// `build_app_state`. No reservation is ever opened, so `reserved` never
-/// exceeds 0 while held, `observed` stays `false`, and the final
-/// `assert!(observed, ...)` fails exactly as in the sibling gauge test above.
+/// `build_app_state`, and the oracle panics as in the sibling gauge test
+/// above. Drop the `reservation.mark_handed_off()` call in
+/// `SegmentFetcher::ensure_ranges`, and the held check fails with the overlap
+/// at 0 against the first step's exact total.
 #[tokio::test]
 async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetch_is_held() {
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));

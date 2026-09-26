@@ -6,6 +6,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **PromQL fetches now reserve against the same process-wide memory budget
+  as SQL execution** (issue #1255). `ravel-server` hands the PromQL engine
+  the one `MemoryBudget` its SQL executor already uses, so an RSEG or RLOG
+  fetch for a PromQL query that needs more than the budget's remainder fails
+  with `FetchMemoryExhausted` (HTTP 503 on the PromQL API) instead of running
+  unbounded, and the next query is admitted as before. The `/metrics` gauges
+  now report real values: `ravel_memory_reserved_bytes{component="fetch"}` is
+  the bytes held by live fetch reservations, `component="sql"` is the rest of
+  the budget's reserved total rather than all of it, and
+  `ravel_memory_handoff_overlap_bytes` is the part of the fetch share that the
+  read cache's own byte cap also counts. The RSPAN fetcher and the SQL path's
+  own fetchers still reserve against private unlimited budgets.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed
