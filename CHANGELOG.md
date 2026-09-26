@@ -6,6 +6,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A PromQL alert rule raises one alert per matching series** (issue #117,
+  ADR-0117). A rule used to collapse its result vector into one alert with
+  the rule's labels; each series that satisfies the condition is now its own
+  alert, whose labels are the series labels without `__name__` overlaid by
+  the rule labels, and whose identity hashes those labels. A series that
+  stops matching resolves only its own alert. A rule matching more than 1000
+  series fails the tick with `TooManyAlerts`, and two series merging to one
+  label set fail it with `DuplicateAlertIdentity`; neither writes a record,
+  and both count in `ravel_alert_rules_failed_total`. A scalar query and a
+  SQL rule keep their existing single alert and identity. Two rules in one
+  tenant may no longer share a `rule_id`, even with different labels: such a
+  rules file now fails startup. Per-series rules over churning label sets
+  should wait for alert state pruning (#1438).
+
 ## [0.17.0] - 2026-09-25
 
 ### Fixed
