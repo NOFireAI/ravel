@@ -790,11 +790,13 @@ impl AlertEvaluator {
             // borrowable for the write path; it is put back before returning.
             let rules = std::mem::take(&mut self.rules);
             for rule in &rules {
-                match self.evaluate_rule(rule, &mut latest, now_ns).await {
-                    Ok(written) => {
-                        report.rules_evaluated += 1;
-                        report.records_written += written;
-                    }
+                let mut written = 0;
+                let result = self
+                    .evaluate_rule(rule, &mut latest, now_ns, &mut written)
+                    .await;
+                report.records_written += written;
+                match result {
+                    Ok(()) => report.rules_evaluated += 1,
                     Err(err) => {
                         report.rules_failed += 1;
                         if let Some(AlertError::TooManyAlerts { count, limit, .. }) =
@@ -1119,8 +1121,9 @@ impl AlertEvaluator {
     }
 
     /// Evaluate one rule: run its query, decide which series match, and write
-    /// a record for every alert whose state transitions. Returns how many
-    /// records were written.
+    /// a record for every alert whose state transitions. `written` counts each
+    /// record as it becomes durable, so a write that fails partway through the
+    /// rule's alerts still leaves the earlier ones counted.
     ///
     /// Each matched series is its own alert (ADR-0117 decisions 1 and 2), fed
     /// through [`evaluate_transition`] with its own prior record. An alert of
@@ -1134,7 +1137,8 @@ impl AlertEvaluator {
         rule: &Rule,
         latest: &mut HashMap<AlertId, AlertRecord>,
         now_ns: i64,
-    ) -> anyhow::Result<u32> {
+        written: &mut u32,
+    ) -> anyhow::Result<()> {
         let summary = self.run_query(rule, now_ns).await?;
         let matched = alert_instances(rule, &summary)?;
 
@@ -1149,7 +1153,6 @@ impl AlertEvaluator {
             .collect();
         absent.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
 
-        let mut written = 0;
         for (instance, met) in matched
             .iter()
             .map(|m| (m, true))
@@ -1161,10 +1164,10 @@ impl AlertEvaluator {
                 .write_transition(rule, instance, &transition, prior, latest)
                 .await?
             {
-                written += 1;
+                *written += 1;
             }
         }
-        Ok(written)
+        Ok(())
     }
 
     /// Write the record for one alert's transition, if `transition` warrants
@@ -1954,8 +1957,8 @@ pub fn parse_rules(text: &str) -> anyhow::Result<HashMap<TenantHash, Vec<Rule>>>
         let tenant = TenantId::new(&spec.tenant).hash();
         if !seen.insert((tenant, rule.rule_id.clone())) {
             anyhow::bail!(
-                "rules {:?} and {:?} share tenant {:?} and rule id; give each rule its own rule id",
-                rule.rule_id,
+                "rule id {:?} is used by more than one rule in tenant {:?}; rule ids must be \
+                 unique per tenant",
                 rule.rule_id,
                 spec.tenant
             );
@@ -2097,7 +2100,12 @@ mod tests {
              "condition": {"type": "threshold", "op": "gt", "value": 2}}
           ]
         }"#;
-        assert!(parse_rules(text).is_err());
+        let err = parse_rules(text).expect_err("a shared rule_id fails startup");
+        assert_eq!(
+            err.to_string(),
+            "rule id \"r\" is used by more than one rule in tenant \"a\"; rule ids must \
+             be unique per tenant"
+        );
 
         // Distinguishing labels do not separate them: resolution by absence
         // walks every alert carrying the rule_id (ADR-0117 decision 4), so
@@ -2113,8 +2121,8 @@ mod tests {
         let err = parse_rules(labelled).expect_err("a shared rule_id fails startup");
         assert_eq!(
             err.to_string(),
-            "rules \"r\" and \"r\" share tenant \"a\" and rule id; give each rule \
-             its own rule id"
+            "rule id \"r\" is used by more than one rule in tenant \"a\"; rule ids must \
+             be unique per tenant"
         );
 
         // The same rule_id in two tenants is two independent rules.
@@ -2380,6 +2388,17 @@ mod tick_tests {
         tenant: &TenantId,
         series: Vec<(LabelSet, Vec<(i64, f64)>)>,
     ) {
+        publish_series_at_seq(store, tenant, series, 1).await;
+    }
+
+    /// [`publish_series`] under an explicit writer seq, so a second segment in
+    /// one test does not collide with the first on its object and commit keys.
+    async fn publish_series_at_seq(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        series: Vec<(LabelSet, Vec<(i64, f64)>)>,
+        writer_seq: u64,
+    ) {
         let tenant_hash = tenant.hash();
         let series: Vec<SeriesInput> = series
             .into_iter()
@@ -2401,7 +2420,7 @@ mod tick_tests {
             shard: 0,
             writer_id: writer_id.to_string(),
             writer_epoch: 1,
-            writer_seq: 1,
+            writer_seq,
         };
         let written = SegmentWriter::write(
             series,
@@ -2419,7 +2438,7 @@ mod tick_tests {
             shard: 0,
             writer_id,
             writer_epoch: 1,
-            writer_seq: 1,
+            writer_seq,
             object_size: written.bytes.len() as u64,
             content_hash: written.summary.blake3,
             sample_count: written.summary.sample_count,
@@ -2733,7 +2752,7 @@ mod tick_tests {
 
         let mut latest = HashMap::new();
         let err = evaluator
-            .evaluate_rule(&threshold_rule(), &mut latest, NOW_NS)
+            .evaluate_rule(&threshold_rule(), &mut latest, NOW_NS, &mut 0)
             .await
             .expect_err("1001 matched series is over the cap");
         match err.downcast_ref::<AlertError>() {
@@ -2755,6 +2774,161 @@ mod tick_tests {
         assert_eq!(report.rules_failed, 1);
         assert_eq!(report.records_written, 0);
         assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 0);
+    }
+
+    /// A tick over three hot series that leaves three Firing records, returned
+    /// with the evaluator that wrote them and those records as read back.
+    async fn three_firing_alerts(
+        store: &Arc<dyn ObjectStoreBackend>,
+    ) -> (AlertEvaluator, Vec<AlertRecord>) {
+        let tenant = TenantId::new(TENANT).hash();
+        let mut evaluator = evaluator(Arc::clone(store), TestClock::at(NOW_NS));
+        assert_eq!(evaluator.run_tick().await.records_written, 3);
+        let records = read_alert_records(store.as_ref(), tenant).await;
+        let mut labels: Vec<(Vec<(String, String)>, AlertState)> = records
+            .iter()
+            .map(|r| (r.labels.clone(), r.state))
+            .collect();
+        labels.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            labels,
+            vec![
+                (instance_alert_labels("host-0000"), AlertState::Firing),
+                (instance_alert_labels("host-0001"), AlertState::Firing),
+                (instance_alert_labels("host-0002"), AlertState::Firing),
+            ]
+        );
+        (evaluator, records)
+    }
+
+    /// A rule whose query fails is not a rule that matched nothing: its three
+    /// Firing alerts are not resolved by absence. The tick writes zero Resolved
+    /// records and the stored history is exactly what it was.
+    #[tokio::test]
+    async fn a_failing_query_resolves_none_of_the_rules_firing_alerts() {
+        let store = store_with_hot_instances(3).await;
+        let tenant = TenantId::new(TENANT).hash();
+        let (mut evaluator, before) = three_firing_alerts(&store).await;
+
+        // A range-vector result is refused before the condition runs.
+        evaluator.rules = vec![Rule {
+            query: RuleQuery::Promql(format!("{METRIC}[5m]")),
+            ..threshold_rule()
+        }];
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.rules_evaluated, 0);
+        assert_eq!(report.rules_failed, 1);
+        assert_eq!(report.records_written, 0);
+
+        let after = read_alert_records(store.as_ref(), tenant).await;
+        let resolved = after
+            .iter()
+            .filter(|r| r.state == AlertState::Resolved)
+            .count();
+        assert_eq!(resolved, 0);
+        assert_eq!(after, before);
+    }
+
+    /// Three Firing alerts, then 998 more hot series arrive so the rule matches
+    /// 1001, one over the cap. The rule fails with `TooManyAlerts` and the three
+    /// alerts it already raised are not resolved: zero Resolved records, and the
+    /// stored history is exactly what it was.
+    #[tokio::test]
+    async fn a_rule_over_the_alert_cap_resolves_none_of_its_firing_alerts() {
+        let store = store_with_hot_instances(3).await;
+        let tenant = TenantId::new(TENANT).hash();
+        let (mut evaluator, before) = three_firing_alerts(&store).await;
+
+        let sample_ts = NOW_NS - 30 * NS_PER_SEC;
+        let more: Vec<(LabelSet, Vec<(i64, f64)>)> = (3..=ravel_alerting::MAX_ALERTS_PER_RULE)
+            .map(|i| {
+                (
+                    instance_label_set(&format!("host-{i:04}")),
+                    vec![(sample_ts, 1.0)],
+                )
+            })
+            .collect();
+        assert_eq!(more.len(), 998);
+        publish_series_at_seq(store.as_ref(), &TenantId::new(TENANT), more, 2).await;
+
+        let mut latest = evaluator.load_latest_records().await.expect("fold");
+        let err = evaluator
+            .evaluate_rule(&threshold_rule(), &mut latest, NOW_NS, &mut 0)
+            .await
+            .expect_err("1001 matched series is over the cap");
+        assert!(matches!(
+            err.downcast_ref::<AlertError>(),
+            Some(AlertError::TooManyAlerts {
+                count: 1001,
+                limit: 1000,
+                ..
+            })
+        ));
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.rules_evaluated, 0);
+        assert_eq!(report.rules_failed, 1);
+        assert_eq!(report.records_written, 0);
+
+        let after = read_alert_records(store.as_ref(), tenant).await;
+        let resolved = after
+            .iter()
+            .filter(|r| r.state == AlertState::Resolved)
+            .count();
+        assert_eq!(resolved, 0);
+        assert_eq!(after, before);
+    }
+
+    /// Five hot series and the third alert-record PUT fails: the rule fails,
+    /// but the two records written before the failure are durable, and the
+    /// tick counts exactly those two. The next tick writes the other three.
+    #[tokio::test]
+    async fn a_write_failing_mid_rule_counts_the_records_already_durable() {
+        let tenant = TenantId::new(TENANT).hash();
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert record write unavailable".into()),
+            )
+            .with_key_contains(format!("t/{}/a/l0/", tenant.to_hex()))
+            .with_occurrence(Occurrence::Nth(3)),
+        );
+        let fault = Arc::new(FaultStore::new(store_with_hot_instances(5).await, plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let metrics = Arc::new(AlertMetrics::default());
+        let mut evaluator = evaluator_with(
+            Arc::clone(&store),
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(fault.fault_count(Op::Put, FaultKind::Transient), 1);
+        assert_eq!(report.rules_evaluated, 0);
+        assert_eq!(report.rules_failed, 1);
+        assert_eq!(report.records_written, 2);
+        assert_eq!(metrics.records_written(), 2);
+        let mut durable: Vec<Vec<(String, String)>> = read_alert_records(store.as_ref(), tenant)
+            .await
+            .into_iter()
+            .map(|r| r.labels)
+            .collect();
+        durable.sort();
+        assert_eq!(
+            durable,
+            vec![
+                instance_alert_labels("host-0000"),
+                instance_alert_labels("host-0001"),
+            ]
+        );
+
+        let retry = evaluator.run_tick().await;
+        assert_eq!(retry.rules_evaluated, 1);
+        assert_eq!(retry.rules_failed, 0);
+        assert_eq!(retry.records_written, 3);
+        assert_eq!(metrics.records_written(), 5);
+        assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 5);
     }
 
     /// Three hot series fire three alerts. When one series stops reporting
@@ -3797,11 +3971,12 @@ mod tick_tests {
         );
 
         // Only now does A's in-flight tick reach its write.
+        let mut a_written = 0;
+        a.evaluate_rule(&rule, &mut a_latest, NOW_NS, &mut a_written)
+            .await
+            .expect("A publishes its transition");
         assert_eq!(
-            a.evaluate_rule(&rule, &mut a_latest, NOW_NS)
-                .await
-                .expect("A publishes its transition"),
-            1,
+            a_written, 1,
             "A writes the onset transition its tick decided at NOW"
         );
 
