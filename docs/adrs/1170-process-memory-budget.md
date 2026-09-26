@@ -446,7 +446,9 @@ SQL and fetch draw from the remainder through the accountant, with the
 per-tenant ceiling as the fairness bound within it. The sum of hard caps plus
 the shared remainder equals the budget by construction, and startup refuses a
 flag combination whose hard caps alone exceed it (the 2026-09-07 amendment
-below exempts `--disable-cache` from this refusal).
+below exempts `--disable-cache` from this refusal). On a loopback store the
+fetch cache takes a larger share, and `--cache-max-bytes` no longer sizes the
+catalog cache: see the loopback amendment below.
 
 The overhead reserve is a measured number, not a guess, and it is measured in
 a calibration run that is separate from, and frozen before, the acceptance
@@ -721,3 +723,13 @@ Still unreserved against this budget: the RSPAN fetcher and every fetcher
 `build_sql_state` constructs, which keep their private
 `MemoryBudget::unlimited()`. The M5 reserve calibration (#1256) remains open.
 
+## Amendment (2026-09-26, ADR-2023): a loopback fetch-cache share and a catalog cache sized on its own
+
+<!-- amendment-applies: sections="3. A static carve under one number" pointer="loopback amendment" -->
+
+Decision 3's 25% fetch-cache share stays for every deployment except one whose
+store is on loopback. There the fetch cache derives at a larger share, measured
+against the concurrent phase before it ships (ADR-2023, #2014).
+`--cache-max-bytes` bounds the fetch cache only; the catalog byte cache derives
+at its own share unless `--catalog-cache-max-bytes` sets it. The refusal of a
+combination whose caps exceed `memory_budget_bytes` is unchanged.
