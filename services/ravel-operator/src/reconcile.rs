@@ -4365,7 +4365,8 @@ mod tests {
             interval_secs: None,
         });
         assert_eq!(
-            desired_objects(&spec, "prod", "ravel", &ctx()).unwrap_err(),
+            desired_objects(&spec, "prod", "ravel", &ctx())
+                .expect_err("a gateway fold block must refuse the whole render"),
             RenderError::GatewayFoldUnsupported
         );
 
