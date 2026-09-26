@@ -12,17 +12,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ADR-0117). A rule used to collapse its result vector into one alert with
   the rule's labels; each series that satisfies the condition is now its own
   alert, whose labels are the series labels without `__name__` overlaid by
-  the rule labels, and whose identity hashes those labels. A series that
-  stops matching resolves only its own alert. A rule matching more than 1000
-  series fails the tick with `TooManyAlerts`, and two series merging to one
-  label set fail it with `DuplicateAlertIdentity`; neither writes a record,
-  and both count in `ravel_alert_rules_failed_total`. A scalar query and a
+  the rule labels, and whose identity hashes those labels. The Alertmanager
+  sink's `alertname` stays the rule id, or the rule's own `alertname` label
+  when it sets one; a series label named `alertname` never replaces it. A
+  series that stops matching resolves only its own alert, and
+  `repeat_interval` applies to each alert on its own. A rule matching more
+  than 1000 series fails the tick with `TooManyAlerts`, and two series
+  merging to one label set fail it with `DuplicateAlertIdentity`, whose
+  message names the label names and the colliding `alert_id` but no label
+  value; neither writes a record, and both count in
+  `ravel_alert_rules_failed_total`. A scalar query and a
   SQL rule keep their existing single alert and identity. Two rules in one
   tenant may no longer share a `rule_id`, even with different labels: such a
   rules file now fails startup. Per-series rules over churning label sets
-  should wait for alert state pruning (#1438). A rule whose write fails
-  partway through its alerts now counts the records already written in
-  `ravel_alert_records_written_total`.
+  should wait for alert state pruning (#1438). A new
+  `ravel_alert_undelivered_notifications` gauge reports how many
+  notifications wait for every sink to accept them; while a sink keeps
+  failing it grows by one for every alert identity that transitions. A rule
+  whose write fails partway through its alerts now counts the records
+  already written in `ravel_alert_records_written_total`.
 
   Upgrade notes:
   - Expect a notification burst on the first tick. A PromQL rule whose
@@ -43,6 +51,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A rules file in which two rules of one tenant share a `rule_id` now
     fails startup with `rule id "<id>" is used by more than one rule in
     tenant "<tenant>"`. Give each rule its own `rule_id` before upgrading.
+  - Repeat notifications multiply by the firing series. `repeat_interval`
+    now applies to each alert, so a rule with 500 firing series sends 500
+    repeat notifications per interval to every sink where it used to send
+    one. Raise `repeat_interval`, or set it to `0s`, on rules that match many
+    series.
 
 ## [0.18.0] - 2026-09-26
 

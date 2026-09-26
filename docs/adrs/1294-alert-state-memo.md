@@ -222,6 +222,9 @@ of how long it runs or how often its alerts flap; only churning the rule set or 
 rule's labels grows it, and only by the count of distinct identities that churn
 produces.
 
+That bound no longer holds for PromQL rules, whose identities are per series:
+see the per-series memo bound amendment below.
+
 Pruning that growth is deliberately out of scope here and is tracked as
 issue #1438. When it lands it is a versioned change, not an in-place edit, and it
 must keep these invariants:
@@ -453,3 +456,27 @@ within `alerting.rs`, so it is preferred here.
 - A new derived-object key prefix now exists under the alerts signal; a future
   memo-body change bumps the memo's own `format_version` and relies on the
   ignore-and-overwrite path rather than a record migration.
+
+## Amendment (2026-09-26): the memo grows by one entry per series a rule ever matched
+
+<!-- amendment-applies: sections="Memo growth and the retention contract (issue #1438)" pointer="per-series memo bound amendment" -->
+
+ADR-0117 made a PromQL rule raise one alert per matching series, with an
+identity that hashes the series labels (without `__name__`) overlaid by the
+rule labels. The growth bound in "Memo growth and the retention contract"
+assumed one identity per rule label set, so a fixed rule set had a memo fixed
+at the rule count. That no longer holds.
+
+The bound is now: the memo holds one entry per distinct alert identity that
+ever appeared in the tenant's transition history. For a PromQL rule that is one
+entry per distinct merged series label set the rule ever matched, up to
+`MAX_ALERTS_PER_RULE` (1000) live at once but with no limit on the retired
+ones. A scalar-valued PromQL rule and every SQL rule still contribute one
+entry per rule label set. A fixed rule set over a churning series label (a pod
+name, a request id) therefore grows the memo by one entry for every series that
+ever matched, however stable the rule set itself is.
+
+Nothing here changes the retention contract: the memo still carries every
+below-watermark identity, and pruning still waits on issue #1438 under the
+invariants listed in that section. ADR-0117 makes #1438 a precondition for
+per-series rules over churning label sets rather than an optimisation.
