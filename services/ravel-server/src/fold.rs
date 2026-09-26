@@ -743,8 +743,8 @@ mod tests {
     use ravel_catalog::CatalogConfig;
     use ravel_maintain::FixedClock;
     use ravel_maintain::worker_set::{DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY};
-    use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
     use ravel_types::TenantId;
 
     use super::*;

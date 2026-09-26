@@ -225,6 +225,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         process_memory_budget_is_fallback: false,
         can_fold: true,
+        fold_loop: Default::default(),
     });
 
     Surfaces {
@@ -642,6 +643,7 @@ mod flight {
             process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
             process_memory_budget_is_fallback: false,
             can_fold: true,
+            fold_loop: Default::default(),
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![
