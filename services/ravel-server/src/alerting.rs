@@ -614,7 +614,9 @@ pub struct AlertEvaluator {
     /// count. This is a suppressor, not the schedule: the schedule is derived
     /// from `record.ts_ns` plus the clock every tick, so losing this map
     /// (restart, lease failover) costs at most one extra send and never a
-    /// silence.
+    /// silence. Pruned after every repeat pass to the identities whose folded
+    /// latest record is still Firing, so it is bounded by the live firing
+    /// alerts rather than by every identity that ever fired.
     repeat_marks: HashMap<AlertId, (i64, u64)>,
     /// Set after the first tick that successfully reads alert history.
     /// `undelivered` is process-local, so a restart loses whatever was
@@ -834,6 +836,7 @@ impl AlertEvaluator {
             for rule in &rules {
                 self.queue_repeat_if_due(rule, &latest, now_ns, &mut report);
             }
+            self.prune_repeat_marks(&latest);
             self.rules = rules;
 
             // Refresh the derived state memo from the just-folded latest state
@@ -1120,6 +1123,17 @@ impl AlertEvaluator {
         report.repeats_queued += 1;
     }
 
+    /// Drop every repeat mark whose alert is no longer Firing in the folded
+    /// latest state. A mark only suppresses a repeat of a Firing record, and
+    /// losing one costs at most one extra send, so pruning it is safe.
+    fn prune_repeat_marks(&mut self, latest: &HashMap<AlertId, AlertRecord>) {
+        self.repeat_marks.retain(|alert_id, _| {
+            latest
+                .get(alert_id)
+                .is_some_and(|record| record.state == AlertState::Firing)
+        });
+    }
+
     /// Evaluate one rule: run its query, decide which series match, and write
     /// a record for every alert whose state transitions. `written` counts each
     /// record as it becomes durable, so a write that fails partway through the
@@ -1141,13 +1155,14 @@ impl AlertEvaluator {
     ) -> anyhow::Result<()> {
         let summary = self.run_query(rule, now_ns).await?;
         let matched = alert_instances(rule, &summary)?;
+        let matched_ids: HashSet<AlertId> = matched.iter().map(|m| m.alert_id).collect();
 
         let mut absent: Vec<AlertInstance> = latest
             .values()
             .filter(|r| {
                 r.rule_id == rule.rule_id
                     && matches!(r.state, AlertState::Pending | AlertState::Firing)
-                    && !matched.iter().any(|m| m.alert_id == r.alert_id)
+                    && !matched_ids.contains(&r.alert_id)
             })
             .map(AlertInstance::of_record)
             .collect();
@@ -3209,6 +3224,36 @@ mod tick_tests {
             (new_anchor, 1),
             "the mark re-anchored to the new episode's firing record"
         );
+    }
+
+    /// Pruning keeps the mark of an alert that is still Firing and drops the
+    /// marks of an alert that resolved and of an identity no longer folded at
+    /// all, so the map is bounded by the live firing alerts.
+    #[tokio::test]
+    async fn repeat_marks_are_pruned_to_the_firing_alerts() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let firing = repeat_rule(Some(Duration::from_secs(60)));
+        let firing_id = compute_alert_id(&firing.rule_id, &firing.labels);
+        let mut resolved = repeat_rule(Some(Duration::from_secs(60)));
+        resolved.rule_id = "resolved-rule".to_owned();
+        let resolved_id = compute_alert_id(&resolved.rule_id, &resolved.labels);
+        let gone_id = compute_alert_id("gone-rule", &[]);
+
+        let mut latest = latest_with(&firing, AlertState::Firing, NOW_NS);
+        latest.extend(latest_with(&resolved, AlertState::Resolved, NOW_NS));
+        ev.repeat_marks.insert(firing_id, (NOW_NS, 1));
+        ev.repeat_marks.insert(resolved_id, (NOW_NS, 2));
+        ev.repeat_marks.insert(gone_id, (NOW_NS, 3));
+
+        ev.prune_repeat_marks(&latest);
+
+        assert_eq!(
+            ev.repeat_marks.len(),
+            1,
+            "only the firing alert's mark stays"
+        );
+        assert_eq!(ev.repeat_marks[&firing_id], (NOW_NS, 1));
     }
 
     /// A backward clock step clamps the window to zero, so no repeat is queued
