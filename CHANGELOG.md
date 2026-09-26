@@ -28,7 +28,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at all, and must add a `maintain` process. `--disable-fold` and
   `--fold-interval-secs` are now refused at startup in `--mode gateway` and
   `--mode query` instead of being accepted and ignored, and the operator
-  renders them on the maintain tier: `spec.maintain.fold` replaces
+  renders them on the maintain Deployment: `spec.maintain.fold` replaces
   `spec.gateway.fold`, which is now refused with a `Degraded` condition
   (reason `GatewayFoldUnsupported`) naming the field that replaces it.
   `ravel_catalog_fold_last_success_timestamp_seconds` now renders only in the
