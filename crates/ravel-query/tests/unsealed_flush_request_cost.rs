@@ -29,8 +29,8 @@ use ravel_object_store::{
 };
 use ravel_promql::Value;
 use ravel_query::{
-    EngineConfig, QueryEngine, QueryPhase, QueryStats, REQUEST_BUDGET_FIXED_OVERHEAD,
-    REQUESTS_PER_UNSEALED_FLUSH,
+    DEFAULT_BUDGET_REFERENCE_SHARDS, EngineConfig, QueryEngine, QueryPhase, QueryStats,
+    REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH,
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
 use ravel_types::accounting::AccountedOp;
@@ -491,14 +491,19 @@ async fn cold_recent_query_requests_per_unsealed_flush_by_phase() {
         - wide_per_flush * shards * RECENT_PER_SHARD;
     assert_eq!(narrow_rest, rest);
 
-    // Scaled to the configured sealed-segment cap, the rest must fit the fixed
-    // overhead the budget reserves outside the tail. This is a lower bound: it
-    // holds sealed segments under the whole-object threshold, one snapshot part
-    // and one postings object, and 2 shards' LISTs.
+    // Scaled to the configured sealed-segment cap and to the 4-shard reference
+    // deployment's commit LISTs, the rest must fit the fixed overhead the
+    // budget reserves outside the tail. This is a floor for a small catalog,
+    // not a proof of ADR-1306's condition: it counts one snapshot part, one
+    // postings object, one LIST page per shard and sealed segments under the
+    // whole-object threshold, all of which a large catalog can exceed.
     let max_segments = EngineConfig::default().max_segments as u64;
-    let overhead_at_max_segments = rest + per_sealed_segment * max_segments;
+    let reference_shards = u64::from(DEFAULT_BUDGET_REFERENCE_SHARDS);
+    let rest_at_reference_shards = rest - shards + reference_shards;
+    let overhead_at_max_segments = rest_at_reference_shards + per_sealed_segment * max_segments;
     assert_eq!(max_segments, 1_024);
-    assert_eq!(overhead_at_max_segments, 1_030);
+    assert_eq!(reference_shards, 4);
+    assert_eq!(overhead_at_max_segments, 1_032);
     assert!(
         overhead_at_max_segments <= REQUEST_BUDGET_FIXED_OVERHEAD,
         "{overhead_at_max_segments} requests outside the tail at max_segments exceed \
