@@ -43,8 +43,10 @@
 //!
 //! `--start`/`--end` are a half-open event-time window `[start, end)`: a
 //! record at exactly `--end` is not exported. `LogQuery`'s own range is
-//! inclusive on both ends, so the fetch asks for `[start, end - 1]` and the
-//! half-open bound is re-applied here over the decoded rows.
+//! inclusive on both ends, so the fetch asks for `[start, end - 1]`
+//! ([`fetch_range_end_ns`]), and the half-open bound is applied a second time
+//! over the decoded rows ([`in_export_window`]) so the two spellings of the
+//! same bound cannot drift apart unnoticed.
 //!
 //! # Round-tripping through `ravel-cli load`
 //!
@@ -234,9 +236,7 @@ pub async fn export_logs(
 
     let predicates = snapshot_pending_erasure_predicates(&snapshot);
     let erasure_predicates = predicates.len();
-    // `LogQuery`'s range is inclusive on both ends; the export window is
-    // half-open, and the exact bound is re-applied over the decoded rows below.
-    let query = LogQuery::new(start_ns, end_ns.saturating_sub(1)).with_erasure(predicates);
+    let query = LogQuery::new(start_ns, fetch_range_end_ns(end_ns)).with_erasure(predicates);
     let fetcher = LogSegmentFetcher::new(Arc::clone(&store));
     let accounting = QueryAccounting::new();
 
@@ -257,7 +257,7 @@ pub async fn export_logs(
             records.extend(output.records);
         }
     }
-    records.retain(|record| record.ts_ns >= start_ns && record.ts_ns < end_ns);
+    records.retain(|record| in_export_window(record.ts_ns, start_ns, end_ns));
     records.sort_by_key(|record| record.ts_ns);
 
     let resource_by_stream = decode_resources(&records)?;
@@ -269,6 +269,33 @@ pub async fn export_logs(
         segments_pruned: snapshot.segments_pruned,
         erasure_predicates,
     })
+}
+
+/// The inclusive upper bound of the `LogQuery` range that covers the
+/// half-open export window `[start_ns, end_ns)`.
+///
+/// `LogQuery`'s range is inclusive on both ends and the RLOG reader applies it
+/// per row as well as per block, so this one subtraction is what keeps a
+/// record at exactly `--end` out of the fetch. `saturating_sub` leaves an
+/// `end_ns` of `i64::MIN` alone; `export_logs` has already refused an empty
+/// window by then, so no reachable call is at that bound.
+fn fetch_range_end_ns(end_ns: i64) -> i64 {
+    end_ns.saturating_sub(1)
+}
+
+/// Whether `ts_ns` falls inside the half-open export window
+/// `[start_ns, end_ns)`.
+///
+/// Applying this over the decoded rows is deliberately a second application
+/// of a bound the fetch already carries: [`fetch_range_end_ns`] gives the
+/// fetcher the same window in its own inclusive spelling, and its row filter
+/// is exact, so in the normal case this rejects nothing. The two spellings are
+/// what make the redundancy worth keeping -- an off-by-one introduced in
+/// either one is a silently widened window, and an inclusive `end - 1` in one
+/// crate and an exclusive `end` in another do not fail together. This is the
+/// half that can be checked directly, and the boundary cases below do.
+fn in_export_window(ts_ns: i64, start_ns: i64, end_ns: i64) -> bool {
+    ts_ns >= start_ns && ts_ns < end_ns
 }
 
 /// One decoded resource attribute set per distinct stream, so a stream's
@@ -311,7 +338,8 @@ fn write_parquet(
 ) -> anyhow::Result<u64> {
     let empty = build_batch(mapping, &[])?;
     let (tmp_path, file) = create_temp_output(out)?;
-    let rows_written = match write_batches(file, &empty, mapping, records, resource_by_stream, out) {
+    let rows_written = match write_batches(file, &empty, mapping, records, resource_by_stream, out)
+    {
         Ok(rows) => rows,
         Err(err) => {
             let _ = std::fs::remove_file(&tmp_path);
@@ -714,6 +742,23 @@ mod tests {
              spans behind bulk import for spans (ADR-1751 follow-up 2), which does not exist yet, \
              so an exported spans file could not be loaded back. Only --signal logs is supported."
         );
+    }
+
+    /// The window is half-open at both spellings of its end: the last
+    /// exportable nanosecond is `end_ns - 1`, and the fetch is asked for
+    /// exactly that as its inclusive bound.
+    #[test]
+    fn the_window_end_is_exclusive_at_the_nanosecond() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let end_ns = start_ns + 1_000;
+
+        assert!(in_export_window(start_ns, start_ns, end_ns));
+        assert!(in_export_window(end_ns - 1, start_ns, end_ns));
+        assert!(!in_export_window(end_ns, start_ns, end_ns));
+        assert!(!in_export_window(start_ns - 1, start_ns, end_ns));
+
+        assert_eq!(fetch_range_end_ns(end_ns), end_ns - 1);
+        assert_eq!(fetch_range_end_ns(i64::MIN), i64::MIN);
     }
 
     #[test]

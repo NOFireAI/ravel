@@ -379,6 +379,305 @@ async fn load_then_export_round_trips_logs_field_by_field() {
     assert!(!count.values().contains(&4));
 }
 
+/// The smallest mapping that still names a body, for fixtures whose subject
+/// is the window or the output file rather than the column set.
+const TS_BODY_MAPPING: &str = "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"body\"\n";
+
+/// Load `(ts, body)` rows into `tenant` under [`TS_BODY_MAPPING`].
+///
+/// `batch_rows` decides the object layout, which several tests below assert
+/// on: at `1`, the loader's default `--target-bytes 1` makes every row its
+/// own Strict flush and therefore its own RLOG object, so a segment-level
+/// bound is observable in `segments_read`. At a batch size covering every
+/// row, all rows land in one object and one block, so only a post-decode
+/// filter can separate them.
+async fn load_ts_body_rows(
+    store: &Arc<dyn ObjectStoreBackend>,
+    dir: &Path,
+    tenant: &str,
+    rows: &[(i64, &str)],
+    batch_rows: usize,
+    load_now_ns: i64,
+) -> std::path::PathBuf {
+    let source_pq = dir.join(format!("source-{tenant}-{load_now_ns}.parquet"));
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "ts".to_string(),
+            i64_col(rows.iter().map(|(ts, _)| *ts).collect()),
+        ),
+        (
+            "body".to_string(),
+            str_col(rows.iter().map(|(_, body)| *body).collect()),
+        ),
+    ])
+    .expect("batch");
+    write_parquet(&source_pq, &batch);
+    let report = load::load(
+        Arc::clone(store),
+        &source_pq,
+        tenant,
+        &mapping(TS_BODY_MAPPING),
+        1,
+        batch_rows,
+        None,
+        1,
+        load_now_ns,
+        Arc::new(FixedClock(load_now_ns)),
+    )
+    .await
+    .expect("load succeeds");
+    assert_eq!(report.rows_processed, rows.len() as u64);
+    source_pq
+}
+
+/// The `body` column of an exported file, in the order the file holds it.
+fn exported_bodies(path: &Path) -> Vec<String> {
+    let out = read_parquet(path);
+    let body = out
+        .column_by_name("body")
+        .expect("body")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("body is Utf8");
+    (0..body.len()).map(|i| body.value(i).to_string()).collect()
+}
+
+/// The exported `ts` column, in file order.
+fn exported_timestamps(path: &Path) -> Vec<i64> {
+    let out = read_parquet(path);
+    out.column_by_name("ts")
+        .expect("ts")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("ts is Int64")
+        .values()
+        .to_vec()
+}
+
+/// `[start, end)` is exact to the nanosecond at the end bound: a record at
+/// exactly `--end` is excluded and the one a nanosecond earlier is kept.
+///
+/// All three rows are loaded in one batch, so they share one object and one
+/// block. Block pruning therefore cannot separate them -- the fetch returns
+/// all three -- and only the post-decode `ts_ns < end_ns` filter can, which
+/// is what this pins. The sibling test below pins the fetch bound instead.
+#[tokio::test]
+async fn a_record_at_exactly_the_window_end_is_not_exported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let export_pq = dir.path().join("export.parquet");
+
+    let start_ns = BASE_NS;
+    let end_ns = BASE_NS + ONE_SEC_NS;
+    let load_now_ns = end_ns;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    load_ts_body_rows(
+        &store,
+        dir.path(),
+        "acme",
+        &[
+            (start_ns, "at-start"),
+            (end_ns - 1, "one-before-end"),
+            (end_ns, "at-end"),
+        ],
+        10_000,
+        load_now_ns,
+    )
+    .await;
+
+    let report = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        start_ns,
+        end_ns,
+        &mapping(TS_BODY_MAPPING),
+        &export_pq,
+        1,
+        export::CatalogWindow::default(),
+        load_now_ns,
+    )
+    .await
+    .expect("export succeeds");
+
+    assert_eq!(
+        report.segments_read, 1,
+        "the fixture must put all three rows in one object, or the post-decode filter is not \
+         what separates them"
+    );
+    assert_eq!(
+        report.rows_written, 2,
+        "the row at exactly --end is outside the half-open window"
+    );
+    assert_eq!(
+        exported_timestamps(&export_pq),
+        vec![start_ns, end_ns - 1],
+        "--start is included and --end - 1 is the last exportable nanosecond"
+    );
+    assert_eq!(
+        exported_bodies(&export_pq),
+        vec!["at-start".to_string(), "one-before-end".to_string()]
+    );
+}
+
+/// The half-open end reaches the fetch bound too, not only the filter over
+/// the decoded rows: an object holding nothing but a record at `--end` is
+/// never fetched.
+///
+/// `LogQuery`'s range is inclusive on both ends, so the export asks for
+/// `[start, end - 1]`. One row per object makes that `- 1` observable:
+/// without it the third object's block survives pruning, is fetched and
+/// decoded, and only then has its single row thrown away by the post-decode
+/// filter -- the same output file for one more GET and one more decode.
+/// `segments_pruned` is asserted alongside `segments_read` so the count means
+/// what it says: all three objects reached the fetcher, and the third was
+/// rejected there rather than never resolved.
+#[tokio::test]
+async fn an_object_holding_only_the_record_at_the_window_end_is_not_fetched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let export_pq = dir.path().join("export.parquet");
+
+    let start_ns = BASE_NS;
+    let end_ns = BASE_NS + ONE_SEC_NS;
+    let load_now_ns = end_ns;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    load_ts_body_rows(
+        &store,
+        dir.path(),
+        "acme",
+        &[
+            (start_ns, "at-start"),
+            (end_ns - 1, "one-before-end"),
+            (end_ns, "at-end"),
+        ],
+        1,
+        load_now_ns,
+    )
+    .await;
+
+    let report = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        start_ns,
+        end_ns,
+        &mapping(TS_BODY_MAPPING),
+        &export_pq,
+        1,
+        export::CatalogWindow::default(),
+        load_now_ns,
+    )
+    .await
+    .expect("export succeeds");
+
+    assert_eq!(
+        report.segments_pruned, 0,
+        "all three objects overlap the resolve range and reach the fetcher"
+    );
+    assert_eq!(
+        report.segments_read, 2,
+        "the object holding only the row at --end must not be fetched at all"
+    );
+    assert_eq!(report.rows_written, 2);
+    assert_eq!(exported_timestamps(&export_pq), vec![start_ns, end_ns - 1]);
+}
+
+/// A mid-export failure leaves an existing `--parquet` file byte-identical,
+/// and leaves no temporary file behind either.
+///
+/// The failure is a real one from this path: the data is loaded with `tag`
+/// declared `str`, and the export is asked for a mapping that declares the
+/// same key `i64`, which `build_batch` refuses by name on the first row. That
+/// is after the output file would have been opened, which is the whole point
+/// of the fixture.
+#[tokio::test]
+async fn a_failing_export_leaves_an_existing_output_file_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_pq = dir.path().join("source.parquet");
+    let export_pq = dir.path().join("export.parquet");
+
+    let load_mapping = mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"body\"\n\n\
+         [[attribute]]\nkey = \"tag\"\ncolumn = \"tag_col\"\ntype = \"str\"\n",
+    );
+    let export_mapping = mapping(
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"body\"\n\n\
+         [[attribute]]\nkey = \"tag\"\ncolumn = \"tag_col\"\ntype = \"i64\"\n",
+    );
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("ts".to_string(), i64_col(vec![BASE_NS])),
+        ("body".to_string(), str_col(vec!["only"])),
+        ("tag_col".to_string(), str_col(vec!["alpha"])),
+    ])
+    .expect("batch");
+    write_parquet(&source_pq, &batch);
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    load::load(
+        Arc::clone(&store),
+        &source_pq,
+        "acme",
+        &load_mapping,
+        1,
+        10_000,
+        None,
+        1,
+        BASE_NS,
+        Arc::new(FixedClock(BASE_NS)),
+    )
+    .await
+    .expect("load succeeds");
+
+    // A previous export's output, standing where the failing one will aim.
+    let previous = b"an earlier export, not this one".to_vec();
+    std::fs::write(&export_pq, &previous).expect("seed the existing output file");
+
+    let err = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        BASE_NS,
+        BASE_NS + ONE_SEC_NS,
+        &export_mapping,
+        &export_pq,
+        1,
+        export::CatalogWindow::default(),
+        BASE_NS + ONE_SEC_NS,
+    )
+    .await
+    .expect_err("a declared type the stored value does not match is refused");
+    assert_eq!(
+        err.to_string(),
+        "attribute \"tag\" is declared i64 in the mapping but the stored value is str; fix the \
+         mapping's type for this key, or drop the column and let attrs_map_column carry it"
+    );
+
+    assert_eq!(
+        std::fs::read(&export_pq).expect("the existing output file is still readable"),
+        previous,
+        "a failed export must not touch the file it was aiming at"
+    );
+
+    let left_behind: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("read the output directory")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name != "source.parquet" && name != "export.parquet")
+        .collect();
+    assert_eq!(
+        left_behind,
+        Vec::<String>::new(),
+        "the temporary file a failed export wrote into must be removed"
+    );
+}
+
 /// `--signal metrics` (and, by the same code path, `spans`) is refused by
 /// name rather than attempted: ADR-1751's follow-up order lands metrics load
 /// and spans load first, and export has nothing to round-trip either against

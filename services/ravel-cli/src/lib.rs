@@ -99,8 +99,8 @@ pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
 /// so the only rejections are an unparseable spelling and a value too large
 /// for `i64` nanoseconds.
 pub fn parse_max_ingest_lag_ns(s: &str) -> Result<i64, String> {
-    let dur = humantime::parse_duration(s)
-        .map_err(|e| format!("invalid --max-ingest-lag '{s}': {e}"))?;
+    let dur =
+        humantime::parse_duration(s).map_err(|e| format!("invalid --max-ingest-lag '{s}': {e}"))?;
     i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-ingest-lag '{s}' is too large"))
 }
 
