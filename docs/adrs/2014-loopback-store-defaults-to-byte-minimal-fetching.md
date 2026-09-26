@@ -117,3 +117,18 @@ machine state at boot. Locality is a stable property; bandwidth is not.
   `--logs-fetch-policy cost-based`, which always wins.
 - One more derived default is on the startup log, with its source, and the
   tests pin all three sources and that an explicit flag wins on loopback.
+- Measured one query at a time only. Under ten concurrent queries the default
+  cut throughput by about a factor of three on the reference machine, because
+  its block-granular cache did not fit the corpus: see the concurrency
+  amendment below.
+
+## Amendment (2026-09-26, ADR-2023): concurrency
+
+<!-- amendment-applies: sections="Consequences" pointer="concurrency amendment" -->
+
+The Consequences above were measured one query at a time. The ClickBench
+driver's concurrent phase (ten connections, one server) measured 0.123 queries
+per second under this default against 0.400 under `cost-based` on the same
+instance, and 0.320 with a fetch cache that held the corpus (#2014). ADR-2023
+keeps this default and sizes the fetch cache for a loopback store instead, and
+decouples the catalog cache from `--cache-max-bytes`.
