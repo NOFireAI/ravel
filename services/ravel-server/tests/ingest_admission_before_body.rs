@@ -445,21 +445,66 @@ async fn ingest_refuses_unauthenticated_before_reading_the_body() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// Issue #1705, the gRPC half: with the same process-wide ceiling saturated
-/// by in-flight HTTP exports, a gRPC export over it is refused
-/// `RESOURCE_EXHAUSTED` with the shared shed message, by the admission layer
-/// that runs before tonic decodes the request message.
-///
-/// The permit is taken by `GrpcIngestAdmissionLayer` on the request head;
-/// that the layer refuses without ever polling the request body is pinned by
-/// its own unit test in `services/ravel-server/src/ingest_admission.rs`,
-/// which is the only place that property is observable. What this case pins
-/// is that the layer is wired onto the production listener `ravel_server::start`
-/// builds, and that its refusal reaches a real client as the documented status.
-#[tokio::test]
-async fn grpc_refuses_overflow_with_resource_exhausted() {
-    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+const GRPC_METRICS_EXPORT: &str = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
+const GRPC_LOGS_EXPORT: &str = "/opentelemetry.proto.collector.logs.v1.LogsService/Export";
+const GRPC_TRACES_EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
+/// A message that is not a valid OTLP export request of any signal. Field 1 of
+/// `Export{Metrics,Logs,Trace}ServiceRequest` is a repeated, length-delimited
+/// message; this encodes field 1 as a varint, so prost refuses the frame with
+/// a wire-type error the moment tonic tries to decode it. A refusal that
+/// arrives as anything other than a decode error therefore came from
+/// something that ran before the decode.
+#[derive(Clone, PartialEq, prost::Message)]
+struct Undecodable {
+    #[prost(uint64, tag = "1")]
+    not_a_resource_list: u64,
+}
+
+/// Sends one `Undecodable` message as a unary gRPC call to `path` and returns
+/// the status it was refused with.
+async fn grpc_send_undecodable(
+    grpc_addr: SocketAddr,
+    path: &'static str,
+    bearer: Option<&str>,
+) -> tonic::Status {
+    let channel = tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))
+        .expect("valid endpoint uri")
+        .connect()
+        .await
+        .expect("gRPC client connects");
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.expect("channel ready");
+    let mut request = tonic::Request::new(Undecodable {
+        not_a_resource_list: 7,
+    });
+    if let Some(token) = bearer {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii metadata"),
+        );
+    }
+    grpc.unary::<Undecodable, Undecodable, _>(
+        request,
+        http::uri::PathAndQuery::from_static(path),
+        tonic_prost::ProstCodec::default(),
+    )
+    .await
+    .expect_err("an undecodable export is never accepted")
+}
+
+/// Issue #1705, the gRPC half of the ceiling: with the process-wide ceiling
+/// saturated by in-flight HTTP exports, a gRPC export over it is refused
+/// `RESOURCE_EXHAUSTED` with the shared shed message, even though its body is
+/// not a valid `ExportMetricsServiceRequest`.
+///
+/// The body is what makes this discriminating. A server that takes the permit
+/// inside the handler has to decode the message first, and this message does
+/// not decode, so it answers `INTERNAL` with a decode error and never reaches
+/// the ceiling; only a refusal decided on the request head can answer
+/// `RESOURCE_EXHAUSTED` here.
+#[tokio::test]
+async fn grpc_refuses_overflow_before_decoding_the_message() {
     const LIMIT: u64 = 2;
 
     let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
@@ -497,23 +542,13 @@ async fn grpc_refuses_overflow_with_resource_exhausted() {
         "every admitted request must have buffered its point, so all {LIMIT} permits are held"
     );
 
-    let mut grpc = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
-        .await
-        .expect("gRPC client connects");
-    let mut over_limit = tonic::Request::new(metrics_export_request("shed", ts_ns));
-    over_limit.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
-    );
-    let status = grpc
-        .export(over_limit)
-        .await
-        .expect_err("a gRPC export over the in-flight ceiling must be refused");
+    let status = grpc_send_undecodable(grpc_addr, GRPC_METRICS_EXPORT, Some(TOKEN)).await;
 
     assert_eq!(
         status.code(),
         tonic::Code::ResourceExhausted,
-        "gRPC overflow is RESOURCE_EXHAUSTED"
+        "an export over the ceiling is shed on its head, before the undecodable body is decoded: \
+         {status:?}"
     );
     assert_eq!(
         status.message(),
@@ -523,7 +558,7 @@ async fn grpc_refuses_overflow_with_resource_exhausted() {
     assert_eq!(
         scrape_counter(&client, &base, "ravel_ingest_concurrency_shed_total").await,
         1,
-        "the existing shed counter counts the gRPC refusal too, exactly once"
+        "the existing shed counter counts the gRPC refusal, exactly once"
     );
 
     drain_until_done(&gate, &held_tasks).await;
@@ -532,5 +567,158 @@ async fn grpc_refuses_overflow_with_resource_exhausted() {
         assert_eq!(response.status(), 200);
     }
 
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Issue #1705, gRPC authentication: an export carrying no credentials is
+/// refused `UNAUTHENTICATED`, with the message the handlers have always used,
+/// on all three OTLP gRPC services, even though its body does not decode.
+///
+/// A server that authenticates inside the handler decodes the message first
+/// and answers `INTERNAL` with a decode error instead, so an anonymous caller
+/// could make it decode arbitrary bytes.
+#[tokio::test]
+async fn grpc_refuses_unauthenticated_before_decoding_the_message() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_test_server(store, IngestConcurrencyLimit::Unlimited).await;
+    let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    for path in [GRPC_METRICS_EXPORT, GRPC_LOGS_EXPORT, GRPC_TRACES_EXPORT] {
+        let status = grpc_send_undecodable(grpc_addr, path, None).await;
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unauthenticated,
+            "{path}: no credentials is refused before the body is decoded: {status:?}"
+        );
+        assert_eq!(
+            status.message(),
+            "invalid or missing tenant credentials",
+            "{path}: the refusal keeps the message the handler returned"
+        );
+    }
+
+    assert_eq!(
+        scrape_counter(&client, &base, "ravel_ingest_concurrency_shed_total").await,
+        0,
+        "an authentication refusal is not a shed"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Issue #1705: an authenticated gRPC export through the real listener, with
+/// the ceiling at 1, is admitted and acknowledged, and the shed counter stays
+/// at exactly 0.
+///
+/// The admission layer takes the only permit on the request head. If the
+/// handler behind it did not see the layer's marker and took a permit of its
+/// own, the second `try_admit` on a ceiling of 1 would shed the request the
+/// layer had just admitted, and the counter would read 1.
+#[tokio::test]
+async fn grpc_authenticated_export_at_a_ceiling_of_one_is_charged_once() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_test_server(store, IngestConcurrencyLimit::Bounded(1)).await;
+    let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let mut grpc = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+    let mut request = tonic::Request::new(metrics_export_request("charged_once", now_ns()));
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+    let response = grpc
+        .export(request)
+        .await
+        .expect("an authenticated export under the ceiling is admitted");
+
+    assert_eq!(
+        response.into_inner().partial_success,
+        None,
+        "the single point was accepted whole"
+    );
+    assert_eq!(
+        scrape_counter(&client, &base, "ravel_ingest_concurrency_shed_total").await,
+        0,
+        "one request takes exactly one permit, so a ceiling of 1 sheds nothing"
+    );
+    assert_eq!(
+        scrape_counter(&client, &base, "ravel_ingest_buffered_items_total").await,
+        1,
+        "the admitted request's single point reached a shard buffer"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Issue #1705: the ingest ceiling does not throttle Flight SQL, which shares
+/// the gRPC listener. With the ceiling at 1, one Flight SQL stream is held
+/// open (a `DoPut` whose request stream never yields, so the server keeps
+/// waiting for its first message) and a second Flight SQL call on the same
+/// connection still completes.
+///
+/// A listener that advertised `SETTINGS_MAX_CONCURRENT_STREAMS` equal to the
+/// ingest ceiling would make the client queue the second stream behind the
+/// held one, and it would never be answered. The first `ListFlights` is a
+/// round trip that guarantees the client has applied the server's SETTINGS
+/// before the held stream opens.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn flight_sql_is_not_throttled_by_the_ingest_ceiling() {
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    use arrow_flight::{Criteria, FlightData};
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_test_server(store, IngestConcurrencyLimit::Bounded(1)).await;
+    let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))
+        .expect("valid endpoint uri")
+        .connect()
+        .await
+        .expect("Flight client connects");
+    let mut client = FlightServiceClient::new(channel);
+
+    let warm_up = client
+        .list_flights(Criteria::default())
+        .await
+        .expect_err("ListFlights is not implemented");
+    assert_eq!(warm_up.code(), tonic::Code::Unimplemented);
+
+    let mut held_client = client.clone();
+    let mut held = Box::pin(async move {
+        held_client
+            .do_put(futures::stream::pending::<FlightData>())
+            .await
+    });
+    for _ in 0..16 {
+        assert!(
+            futures::poll!(&mut held).is_pending(),
+            "the held DoPut waits for a first message that never comes"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.list_flights(Criteria::default()),
+    )
+    .await;
+    let status = second
+        .expect(
+            "a second Flight SQL stream on the connection was not answered within 20s, so it was \
+             queued behind the held one by a stream cap",
+        )
+        .expect_err("ListFlights is not implemented");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+    drop(held);
     running.shutdown().await.expect("graceful shutdown");
 }

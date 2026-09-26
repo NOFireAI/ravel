@@ -3133,17 +3133,21 @@ pub async fn start(
         // extension).
         //
         // The admission layer takes the process-wide in-flight permit for a
-        // unary OTLP export when its head arrives (issue #1705), so a request
-        // over the ceiling is refused RESOURCE_EXHAUSTED before tonic reads,
-        // decompresses or decodes its message; the handler behind it reuses
-        // that permit instead of taking a second. It leaves every other
-        // service on this listener alone, and no HTTP/2 stream cap is derived
-        // from the ingest ceiling: that setting is per connection, so it would
-        // throttle the Flight SQL and fragment surfaces sharing the listener.
+        // unary OTLP export when its head arrives (issue #1705), then
+        // authenticates the tenant, so a request over the ceiling is refused
+        // RESOURCE_EXHAUSTED, and one without credentials UNAUTHENTICATED,
+        // before tonic reads, decompresses or decodes its message; the handler
+        // behind it reuses that permit and tenant. It authenticates the OTAP
+        // stream's head the same way, without a permit (OTAP takes one per
+        // batch). It leaves every other service on this listener alone, and
+        // no HTTP/2 stream cap is derived from the ingest ceiling: that
+        // setting is per connection, so it would throttle the Flight SQL and
+        // fragment surfaces sharing the listener.
         let grpc = tonic::transport::Server::builder()
             .layer(wire_byte_count::WireByteCountLayer)
             .layer(ingest_admission::GrpcIngestAdmissionLayer::new(
                 ingest_concurrency.clone(),
+                config.tenant_resolver.clone(),
             ))
             .add_optional_service(metrics_service)
             .add_optional_service(logs_service)

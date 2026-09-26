@@ -44,11 +44,11 @@ impl TraceService for GrpcTraceService {
             crate::ingest_admission::admit_grpc_request(&self.state.ingest_concurrency, &request)?;
 
         let headers = metadata_to_headers(request.metadata());
-        let tenant = self
-            .state
-            .tenant_resolver
-            .resolve(&headers)
-            .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
+        let tenant = crate::ingest_admission::grpc_request_tenant(
+            self.state.tenant_resolver.as_ref(),
+            &request,
+            &headers,
+        )?;
         let mode = write_mode_from_headers(&headers);
 
         // Layer 2 (ADR-0051 section 2): byte rate applies uniformly to every

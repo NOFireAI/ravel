@@ -8,8 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **OTLP ingest now takes its in-flight permit and checks the tenant
-  credential before the request body is read or decoded** (issue #1705).
+- **OTLP and Remote Write ingest now take the in-flight permit and check the
+  tenant credential before the request body is read or decoded** (issue
+  #1705).
   Every ingest handler took the `--max-inflight-ingest-requests` permit and
   resolved the tenant as its first two statements, but on both transports
   those statements ran too late to bound anything: on the HTTP surfaces the
@@ -18,15 +19,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and on the gRPC surfaces the handler runs only after tonic has read and
   decoded the message. An unauthenticated caller could therefore make a
   process read and decode a full request body no matter how far over the
-  ceiling it was. Both decisions now happen on the request head, through
+  ceiling it was. For OTLP metrics, logs and traces on both transports and
+  for Remote Write, both decisions now happen on the request head, through
   middleware on the HTTP ingest routes and a tower layer on the gRPC
-  listener, so a refused request costs the bytes of one request head. No
-  HTTP/2 stream cap is derived from the ceiling, so the Flight SQL and
-  fragment listeners keep their previous stream limits. The ceiling, its
-  flag, and the
-  `ravel_ingest_concurrency_shed_total` counter are unchanged, and a refusal
-  keeps the status and body it had: 429 with `Retry-After` on HTTP, 401 for
-  bad credentials, `RESOURCE_EXHAUSTED` on gRPC.
+  listener, so a refused request costs the bytes of one request head. The
+  OTAP stream is only partly covered: the gRPC layer checks its credential
+  on the stream's head, before any frame is read, but its permit is still
+  taken per batch after tonic has decoded that batch's protobuf frame, so an
+  authenticated OTAP client over the ceiling still costs one decoded frame
+  per shed batch. No HTTP/2 stream cap is derived from the ceiling, so the
+  Flight SQL and fragment listeners keep their previous stream limits. The
+  ceiling, its flag, and the `ravel_ingest_concurrency_shed_total` counter
+  are unchanged, and a refusal keeps the status and message it had: 429 with
+  `Retry-After` and 401 for bad credentials on HTTP, `RESOURCE_EXHAUSTED`
+  and `UNAUTHENTICATED` ("invalid or missing tenant credentials") on gRPC.
 
 ## [0.17.0] - 2026-09-25
 

@@ -21,13 +21,17 @@
 //!   the tenant, and puts both results in the request's extensions for the
 //!   handler behind it.
 //! * [`GrpcIngestAdmissionLayer`] is the tonic counterpart, installed on the
-//!   gRPC listener's `Server::builder()`. It takes the permit when the request
-//!   head arrives, before tonic reads a single body frame.
+//!   gRPC listener's `Server::builder()`. For a unary OTLP export it takes the
+//!   permit and then resolves the tenant when the request head arrives,
+//!   before tonic reads a single body frame. For the OTAP stream it resolves
+//!   the tenant on the stream's head and takes no permit (see
+//!   [`OTAP_ARROW_METRICS_PATH`]).
 //!
-//! Both leave an [`IngestPermitHeld`] marker in the request's extensions, and
-//! every handler behind them takes its permit through
-//! [`admit_grpc_request`] (gRPC) or reads the resolved tenant out of an
-//! `Extension` (HTTP), so one request never charges the ceiling twice.
+//! Both leave an [`IngestPermitHeld`] marker and the resolved `TenantId` in
+//! the request's extensions. Every handler behind them takes its permit
+//! through [`admit_grpc_request`] and its tenant through
+//! [`grpc_request_tenant`] (gRPC), or reads the tenant out of an `Extension`
+//! (HTTP), so one request never charges the ceiling twice.
 //!
 //! The ceiling itself, its `0`-means-unlimited spelling, and the shed counter
 //! are unchanged: this is an ordering fix, so a refusal here is the same
@@ -39,10 +43,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use ravel_query::http::TenantResolver;
+use ravel_types::TenantId;
 use tonic::Status;
 use tonic::body::Body as TonicBody;
 use tower::{Layer, Service};
@@ -52,16 +57,20 @@ use crate::ingest_concurrency::{IngestConcurrencyController, IngestPermit};
 /// The gRPC service path prefix every unary OTLP ingest service shares
 /// (`opentelemetry.proto.collector.{metrics,logs,trace}.v1`).
 ///
-/// The gRPC listener also carries Flight SQL, the ADR-0071 fragment service,
-/// and (under `--otap`) the OTAP `ArrowMetricsService`, all of which this
-/// layer must leave alone. The first two are query surfaces with no ingest
-/// ceiling at all. OTAP is ingest, but it is a bidirectional *stream*: it
-/// takes one permit per `BatchArrowRecords` inside `otap_grpc::process_batch`
-/// rather than one for the whole connection, and a stream-lifetime permit
-/// taken here would pin a slot for as long as a client keeps the stream open.
-/// Its package is `opentelemetry.proto.experimental.arrow.v1`, outside this
-/// prefix, so the two schemes do not overlap.
+/// The gRPC listener also carries Flight SQL and the ADR-0071 fragment
+/// service, query surfaces with no ingest ceiling that this layer passes
+/// through untouched, and (under `--otap`) the OTAP stream at
+/// [`OTAP_ARROW_METRICS_PATH`], outside this prefix.
 const OTLP_UNARY_INGEST_PATH_PREFIX: &str = "/opentelemetry.proto.collector.";
+
+/// The OTAP `ArrowMetricsService` stream. The layer authenticates it on the
+/// stream's request head, before any `BatchArrowRecords` frame is read, but
+/// takes no permit for it: the stream takes one permit per batch inside
+/// `otap_grpc::process_batch`, after tonic has decoded that batch's protobuf
+/// frame and before its Arrow payloads are decoded. A stream-lifetime permit
+/// taken here would pin a slot for as long as a client keeps the stream open.
+const OTAP_ARROW_METRICS_PATH: &str =
+    "/opentelemetry.proto.experimental.arrow.v1.ArrowMetricsService/ArrowMetrics";
 
 /// Marks a request whose in-flight permit was already taken by the transport
 /// layer in front of the handler. The handler behind the layer must not take
@@ -150,23 +159,66 @@ pub(crate) fn admit_grpc_request<T>(
         .map_err(|_| crate::otlp_grpc::ingest_concurrency_shed_status())
 }
 
-/// A [`tower::Layer`] for the tonic ingest listener: takes the process-wide
-/// in-flight permit when a unary OTLP export's request head arrives, so a
-/// request over the ceiling is refused `RESOURCE_EXHAUSTED` without tonic
-/// ever reading, decompressing, or decoding its message.
+/// The tenant for a gRPC ingest request: the one [`GrpcIngestAdmissionLayer`]
+/// already authenticated from the request head, or, on the direct-call path
+/// where no layer ran, resolved here from `headers` (the request's metadata).
+pub(crate) fn grpc_request_tenant<T>(
+    resolver: &dyn TenantResolver,
+    request: &tonic::Request<T>,
+    headers: &HeaderMap,
+) -> Result<TenantId, Status> {
+    if let Some(tenant) = request.extensions().get::<TenantId>() {
+        return Ok(tenant.clone());
+    }
+    resolver
+        .resolve(headers)
+        .map_err(|_| crate::otlp_grpc::unauthenticated_status())
+}
+
+/// Resolves the tenant from a gRPC request head exactly as a handler resolves
+/// it from the decoded request's metadata: tonic builds that metadata from
+/// these same headers, and [`crate::otlp_grpc::metadata_to_headers`] is the
+/// same filter the handlers apply.
+fn grpc_head_tenant(
+    resolver: &dyn TenantResolver,
+    headers: &HeaderMap,
+) -> Result<TenantId, Status> {
+    let metadata = tonic::metadata::MetadataMap::from_headers(headers.clone());
+    resolver
+        .resolve(&crate::otlp_grpc::metadata_to_headers(&metadata))
+        .map_err(|_| crate::otlp_grpc::unauthenticated_status())
+}
+
+/// A [`tower::Layer`] for the tonic ingest listener. When a unary OTLP
+/// export's request head arrives it takes the process-wide in-flight permit
+/// and then authenticates the tenant, so a request over the ceiling is
+/// refused `RESOURCE_EXHAUSTED`, and one without valid credentials
+/// `UNAUTHENTICATED`, without tonic ever reading, decompressing, or decoding
+/// its message. The OTAP stream is authenticated the same way on its head,
+/// without a permit.
+///
+/// The ordering is the HTTP middleware's: the ceiling decides first, so a
+/// request over it is shed even when its credentials are also bad.
 ///
 /// Install it on the same `Server::builder()` as
 /// [`crate::wire_byte_count::WireByteCountLayer`]; it wraps whichever
-/// services are added after, and passes every non-OTLP-ingest path straight
+/// services are added after, and passes every non-ingest path straight
 /// through.
 #[derive(Clone)]
 pub struct GrpcIngestAdmissionLayer {
     controller: Arc<IngestConcurrencyController>,
+    resolver: Arc<dyn TenantResolver>,
 }
 
 impl GrpcIngestAdmissionLayer {
-    pub fn new(controller: Arc<IngestConcurrencyController>) -> Self {
-        GrpcIngestAdmissionLayer { controller }
+    pub fn new(
+        controller: Arc<IngestConcurrencyController>,
+        resolver: Arc<dyn TenantResolver>,
+    ) -> Self {
+        GrpcIngestAdmissionLayer {
+            controller,
+            resolver,
+        }
     }
 }
 
@@ -177,6 +229,7 @@ impl<S> Layer<S> for GrpcIngestAdmissionLayer {
         GrpcIngestAdmissionService {
             inner,
             controller: self.controller.clone(),
+            resolver: self.resolver.clone(),
         }
     }
 }
@@ -185,6 +238,7 @@ impl<S> Layer<S> for GrpcIngestAdmissionLayer {
 pub struct GrpcIngestAdmissionService<S> {
     inner: S,
     controller: Arc<IngestConcurrencyController>,
+    resolver: Arc<dyn TenantResolver>,
 }
 
 impl<S> Service<http::Request<TonicBody>> for GrpcIngestAdmissionService<S>
@@ -205,18 +259,36 @@ where
     }
 
     fn call(&mut self, req: http::Request<TonicBody>) -> Self::Future {
-        if !req.uri().path().starts_with(OTLP_UNARY_INGEST_PATH_PREFIX) {
+        let path = req.uri().path();
+        let unary = path.starts_with(OTLP_UNARY_INGEST_PATH_PREFIX);
+        if !unary && path != OTAP_ARROW_METRICS_PATH {
             return Box::pin(self.inner.call(req));
         }
-        let permit = match self.controller.try_admit() {
-            Ok(permit) => permit,
-            Err(_) => {
-                let response = grpc_shed_response();
+        let permit = if unary {
+            match self.controller.try_admit() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let response = grpc_shed_response();
+                    return Box::pin(async move { Ok(response) });
+                }
+            }
+        } else {
+            None
+        };
+        let (mut parts, body) = req.into_parts();
+        let tenant = match grpc_head_tenant(self.resolver.as_ref(), &parts.headers) {
+            Ok(tenant) => tenant,
+            Err(status) => {
+                // The permit, if one was taken, is released here with the
+                // unread body.
+                let response = status.into_http();
                 return Box::pin(async move { Ok(response) });
             }
         };
-        let (mut parts, body) = req.into_parts();
-        parts.extensions.insert(IngestPermitHeld);
+        if permit.is_some() {
+            parts.extensions.insert(IngestPermitHeld);
+        }
+        parts.extensions.insert(tenant);
         let future = self.inner.call(http::Request::from_parts(parts, body));
         Box::pin(async move {
             // Held for the whole inner call: the body read, tonic's decode,
@@ -239,13 +311,36 @@ fn grpc_shed_response() -> http::Response<TonicBody> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use http_body::{Body, Frame, SizeHint};
+    use ravel_query::http::StaticBearerTokenResolver;
 
     use super::*;
     use crate::ingest_concurrency::IngestConcurrencyLimit;
+
+    const TOKEN: &str = "t-acme";
+
+    fn resolver() -> Arc<dyn TenantResolver> {
+        Arc::new(StaticBearerTokenResolver::new(HashMap::from([(
+            TOKEN.to_string(),
+            TenantId::new("acme"),
+        )])))
+    }
+
+    fn layer(controller: &Arc<IngestConcurrencyController>) -> GrpcIngestAdmissionLayer {
+        GrpcIngestAdmissionLayer::new(controller.clone(), resolver())
+    }
+
+    /// The status a gRPC client decodes from a trailers-only refusal.
+    fn grpc_status_of(response: &http::Response<TonicBody>) -> (tonic::Code, String) {
+        let status =
+            Status::from_header_map(response.headers()).expect("a refusal carries grpc-status");
+        (status.code(), status.message().to_string())
+    }
 
     /// A request body that fails the test if anything polls it. The point of
     /// the layer is that a shed request's body is never read, and this is the
@@ -288,7 +383,7 @@ mod tests {
         }
 
         fn call(&mut self, _req: http::Request<TonicBody>) -> Self::Future {
-            panic!("the inner service must not be reached for a shed request");
+            panic!("the inner service must not be reached for a refused request");
         }
     }
 
@@ -297,6 +392,7 @@ mod tests {
     struct CountingInner {
         calls: Arc<AtomicUsize>,
         held_marker_seen: Arc<AtomicUsize>,
+        tenants_seen: Arc<Mutex<Vec<TenantId>>>,
     }
 
     impl Service<http::Request<TonicBody>> for CountingInner {
@@ -314,17 +410,37 @@ mod tests {
             if req.extensions().get::<IngestPermitHeld>().is_some() {
                 self.held_marker_seen.fetch_add(1, Ordering::SeqCst);
             }
+            if let Some(tenant) = req.extensions().get::<TenantId>() {
+                self.tenants_seen
+                    .lock()
+                    .expect("unpoisoned")
+                    .push(tenant.clone());
+            }
             Box::pin(async move { Ok(http::Response::new(TonicBody::empty())) })
         }
     }
 
-    fn poisoned_request(path: &str, polls: Arc<AtomicUsize>) -> http::Request<TonicBody> {
-        http::Request::builder()
+    fn poisoned_request(
+        path: &str,
+        polls: Arc<AtomicUsize>,
+        bearer: Option<&str>,
+    ) -> http::Request<TonicBody> {
+        let mut builder = http::Request::builder()
             .method(http::Method::POST)
-            .uri(path)
+            .uri(path);
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder
             .body(TonicBody::new(PoisonBody { polls }))
             .expect("request builds")
     }
+
+    const OTLP_EXPORT_PATHS: [&str; 3] = [
+        "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+        "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+    ];
 
     const EXPORT_PATH: &str = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export";
 
@@ -332,20 +448,23 @@ mod tests {
     /// without polling the request body once and without reaching the service
     /// behind it, so no part of the message is read, decompressed, or decoded.
     ///
+    /// The request carries no credentials, which pins the ordering too: the
+    /// ceiling decides before the credential check, as on HTTP.
+    ///
     /// Non-vacuity: move the `try_admit` call behind `self.inner.call(req)`
     /// and `UnreachableInner` panics; make the shed arm forward the request
-    /// instead of answering, and the poll counter is nonzero.
+    /// instead of answering, and the poll counter is nonzero; authenticate
+    /// before admitting and the status is UNAUTHENTICATED.
     #[tokio::test]
     async fn shed_request_answers_resource_exhausted_without_polling_the_body() {
         let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
         let _held = controller.try_admit().expect("the only permit");
 
-        let layer = GrpcIngestAdmissionLayer::new(controller.clone());
-        let mut service = layer.layer(UnreachableInner);
+        let mut service = layer(&controller).layer(UnreachableInner);
 
         let polls = Arc::new(AtomicUsize::new(0));
         let response = service
-            .call(poisoned_request(EXPORT_PATH, polls.clone()))
+            .call(poisoned_request(EXPORT_PATH, polls.clone(), None))
             .await
             .expect("the shed arm is infallible");
 
@@ -355,12 +474,11 @@ mod tests {
             "the shed request's body must never be polled"
         );
         assert_eq!(
-            response
-                .headers()
-                .get("grpc-status")
-                .map(|v| v.to_str().expect("ascii grpc-status")),
-            Some("8"),
-            "gRPC status 8 is RESOURCE_EXHAUSTED"
+            grpc_status_of(&response),
+            (
+                tonic::Code::ResourceExhausted,
+                "process in-flight ingest-request limit reached".to_string()
+            )
         );
         assert_eq!(
             controller.shed_total(),
@@ -370,23 +488,125 @@ mod tests {
     }
 
     /// An admitted request reaches the service behind the layer carrying the
-    /// `IngestPermitHeld` marker, which is what stops the handler taking a
-    /// second permit from the same ceiling.
+    /// `IngestPermitHeld` marker and the authenticated tenant, which is what
+    /// stops the handler taking a second permit or resolving a second time.
     #[tokio::test]
     async fn admitted_request_reaches_the_inner_service_marked_as_held() {
         let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
         let inner = CountingInner::default();
-        let mut service = GrpcIngestAdmissionLayer::new(controller.clone()).layer(inner.clone());
+        let mut service = layer(&controller).layer(inner.clone());
 
         let polls = Arc::new(AtomicUsize::new(0));
         let response = service
-            .call(poisoned_request(EXPORT_PATH, polls))
+            .call(poisoned_request(EXPORT_PATH, polls, Some(TOKEN)))
             .await
             .expect("infallible inner");
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
         assert_eq!(inner.held_marker_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *inner.tenants_seen.lock().expect("unpoisoned"),
+            vec![TenantId::new("acme")]
+        );
+        assert_eq!(controller.shed_total(), 0);
+    }
+
+    /// Issue #1705: an OTLP export without valid credentials is refused
+    /// UNAUTHENTICATED, with the handlers' message, without its body being
+    /// polled or the routes behind the layer being reached, and the permit it
+    /// took first is released rather than held for the refused request.
+    ///
+    /// Non-vacuity: drop the credential check from the layer and
+    /// `UnreachableInner` panics; hold the permit past the refusal and the
+    /// final `try_admit` fails.
+    #[tokio::test]
+    async fn unauthenticated_export_is_refused_without_polling_the_body() {
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
+        let mut service = layer(&controller).layer(UnreachableInner);
+
+        for path in OTLP_EXPORT_PATHS {
+            for bearer in [None, Some("not-a-token")] {
+                let polls = Arc::new(AtomicUsize::new(0));
+                let response = service
+                    .call(poisoned_request(path, polls.clone(), bearer))
+                    .await
+                    .expect("the refusal arm is infallible");
+
+                assert_eq!(
+                    grpc_status_of(&response),
+                    (
+                        tonic::Code::Unauthenticated,
+                        "invalid or missing tenant credentials".to_string()
+                    ),
+                    "{path} with {bearer:?}"
+                );
+                assert_eq!(polls.load(Ordering::SeqCst), 0, "{path} with {bearer:?}");
+            }
+        }
+
+        assert_eq!(
+            controller.shed_total(),
+            0,
+            "a credential refusal is not a shed"
+        );
+        let _permit = controller
+            .try_admit()
+            .expect("every refused request released its permit");
+    }
+
+    /// Issue #1705: the OTAP stream is authenticated on its head, before any
+    /// frame of it is read, and takes no permit there even with the ceiling
+    /// full: its permits are per batch, inside the handler.
+    ///
+    /// Non-vacuity: leave the OTAP path out of the layer and the unauthenticated
+    /// stream reaches `UnreachableInner`; take a permit for it and the
+    /// authenticated stream is shed against the held permit.
+    #[tokio::test]
+    async fn otap_stream_is_authenticated_on_its_head_without_a_permit() {
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
+        let _held = controller.try_admit().expect("the only permit");
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let response = layer(&controller)
+            .layer(UnreachableInner)
+            .call(poisoned_request(
+                OTAP_ARROW_METRICS_PATH,
+                polls.clone(),
+                None,
+            ))
+            .await
+            .expect("the refusal arm is infallible");
+        assert_eq!(
+            grpc_status_of(&response),
+            (
+                tonic::Code::Unauthenticated,
+                "invalid or missing tenant credentials".to_string()
+            )
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+
+        let inner = CountingInner::default();
+        let response = layer(&controller)
+            .layer(inner.clone())
+            .call(poisoned_request(
+                OTAP_ARROW_METRICS_PATH,
+                Arc::new(AtomicUsize::new(0)),
+                Some(TOKEN),
+            ))
+            .await
+            .expect("infallible inner");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            inner.held_marker_seen.load(Ordering::SeqCst),
+            0,
+            "the stream holds no permit from the layer"
+        );
+        assert_eq!(
+            *inner.tenants_seen.lock().expect("unpoisoned"),
+            vec![TenantId::new("acme")]
+        );
         assert_eq!(controller.shed_total(), 0);
     }
 
@@ -397,12 +617,12 @@ mod tests {
     async fn the_permit_is_released_when_the_request_completes() {
         let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
         let inner = CountingInner::default();
-        let mut service = GrpcIngestAdmissionLayer::new(controller.clone()).layer(inner.clone());
+        let mut service = layer(&controller).layer(inner.clone());
 
         for _ in 0..3 {
             let polls = Arc::new(AtomicUsize::new(0));
             service
-                .call(poisoned_request(EXPORT_PATH, polls))
+                .call(poisoned_request(EXPORT_PATH, polls, Some(TOKEN)))
                 .await
                 .expect("infallible inner");
         }
@@ -411,25 +631,26 @@ mod tests {
         assert_eq!(controller.shed_total(), 0);
     }
 
-    /// Flight SQL, the ADR-0071 fragment service, and OTAP share this
-    /// listener and must pass through untouched: none of them takes a permit
-    /// here, and OTAP in particular must keep taking one per batch inside its
-    /// own handler rather than one for the lifetime of a stream.
+    /// Flight SQL and the ADR-0071 fragment service share this listener and
+    /// must pass through untouched: no permit and no credential check here,
+    /// even with no credentials and the ceiling full. They authenticate in
+    /// their own handlers.
     #[tokio::test]
-    async fn non_otlp_paths_pass_through_without_taking_a_permit() {
+    async fn non_ingest_paths_pass_through_untouched() {
         let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
         let _held = controller.try_admit().expect("the only permit");
 
         let inner = CountingInner::default();
-        let mut service = GrpcIngestAdmissionLayer::new(controller.clone()).layer(inner.clone());
+        let mut service = layer(&controller).layer(inner.clone());
 
         for path in [
             "/arrow.flight.protocol.FlightService/DoGet",
-            "/opentelemetry.proto.experimental.arrow.v1.ArrowMetricsService/ArrowMetrics",
+            "/arrow.flight.protocol.FlightService/DoPut",
+            "/grpc.health.v1.Health/Check",
         ] {
             let polls = Arc::new(AtomicUsize::new(0));
             let response = service
-                .call(poisoned_request(path, polls))
+                .call(poisoned_request(path, polls, None))
                 .await
                 .expect("infallible inner");
             assert_eq!(
@@ -439,17 +660,56 @@ mod tests {
             );
         }
 
-        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             inner.held_marker_seen.load(Ordering::SeqCst),
             0,
             "a pass-through request is not marked as holding a permit"
         );
+        assert!(
+            inner.tenants_seen.lock().expect("unpoisoned").is_empty(),
+            "a pass-through request carries no tenant from the layer"
+        );
         assert_eq!(
             controller.shed_total(),
             0,
-            "no non-OTLP path is charged against the ingest ceiling, even when it is full"
+            "no non-ingest path is charged against the ingest ceiling, even when it is full"
         );
+    }
+
+    /// `grpc_request_tenant` reuses the tenant the layer authenticated and
+    /// resolves only on the direct-call path, refusing bad credentials there
+    /// with the same status the layer uses.
+    #[test]
+    fn grpc_request_tenant_reuses_the_layer_tenant() {
+        let resolver = resolver();
+        let no_credentials = HeaderMap::new();
+
+        let mut authenticated = tonic::Request::new(());
+        authenticated
+            .extensions_mut()
+            .insert(TenantId::new("from-layer"));
+        assert_eq!(
+            grpc_request_tenant(resolver.as_ref(), &authenticated, &no_credentials)
+                .expect("the layer's tenant"),
+            TenantId::new("from-layer")
+        );
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert(
+            "authorization",
+            format!("Bearer {TOKEN}").parse().expect("ascii header"),
+        );
+        let direct = tonic::Request::new(());
+        assert_eq!(
+            grpc_request_tenant(resolver.as_ref(), &direct, &bearer).expect("resolved here"),
+            TenantId::new("acme")
+        );
+
+        let status = grpc_request_tenant(resolver.as_ref(), &direct, &no_credentials)
+            .expect_err("no credentials on the direct-call path");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(status.message(), "invalid or missing tenant credentials");
     }
 
     /// `admit_grpc_request` takes a permit for a direct handler call and none
