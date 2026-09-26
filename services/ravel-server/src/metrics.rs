@@ -3413,7 +3413,8 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
         out,
         "ravel_scrub_checksum_mismatch_total",
         "Data objects that failed at-rest integrity re-verification (whole-object blake3 mismatch \
-         or footer/section crc failure), by signal and level (ADR-0059, issue #1686): \
+         or footer/section crc failure, or an object or record GET the store refused with an \
+         error retrying cannot clear), by signal and level (ADR-0059, issue #1686): \
          level=\"l0\" is an original ingested segment, level=\"l1\" a compaction output part, \
          level=\"rewrite\" a selective-erasure rewrite output part. Alert on increase() > 0: there \
          is no redundant copy to repair from, so a nonzero increase is corruption an operator \
@@ -3493,8 +3494,8 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
         "ravel_scrub_cursor_position",
         "Fraction of the current scrub rotation's commit shard listing entries the content-tier \
          cursor has consumed so far, by signal, in [0,1] (ADR-0059 decision 3, ADR-1686). A \
-         rotation completes in about the configured --scrub-period P; a value stuck near 0 \
-         means scrubbing is not keeping pace with P.",
+         rotation completes within --scrub-period P, or half the tenant's retention window when \
+         that is shorter; a value stuck near 0 means scrubbing is not keeping pace.",
         "gauge",
     );
     for signal in &snapshot.signals {
@@ -3509,13 +3510,17 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
     write_header(
         out,
         "ravel_scrub_behind_total",
-        "Shard ticks whose content-tier rotation could not finish inside its allotted window at \
-         the catch-up ceiling, by signal (ADR-1686 amendment). The window is the configured \
-         --scrub-period P, or the tenant's retention window when that is shorter. A nonzero \
-         increase means the shard commits faster than the scrub can verify at P, so some objects \
-         will expire before they are ever verified; the log line beside it names both the \
-         entries-per-tick the rotation needed and the entries-per-tick it was budgeted. Raise \
-         the tick rate or shorten P.",
+        "Shard ticks whose content-tier rotation cannot finish inside its window, by signal \
+         (ADR-1686 amendment): the entries the tick needed to reach the end of the listing by the \
+         deadline exceeded four times the rotation's sustained rate, the most one tick may take. \
+         The window is --scrub-period P, capped at half the tenant's retention window. Causes: a \
+         shard whose sustained commit rate is above four times the measured sustained rate; \
+         scrub cycles that take longer than a tick, so fewer ticks run than the window allows; \
+         or a marker held on a unit whose GETs keep failing with a retryable error. Changing P \
+         does not help with the first, since the needed rate and the ceiling both scale with \
+         1/window. A nonzero increase means some objects may expire before they are verified; \
+         the log line beside it names the entries per tick needed and allowed, the window, and \
+         P.",
         "counter",
     );
     for signal in &snapshot.signals {

@@ -253,11 +253,11 @@ pub struct ScrubMetrics {
     /// commit shard prefix, per signal (denominator of the cursor-position
     /// gauge).
     rotation_total: [AtomicU64; MAINTAINED_SIGNALS.len()],
-    /// Shard ticks whose rotation could not finish inside its allotted window
-    /// at the catch-up ceiling, per signal. `ravel_scrub_behind_total`: a
-    /// nonzero rate means the configured scrub period is too short for the
-    /// shard's commit rate, or the retention window is shorter than one
-    /// rotation, and some objects will expire unverified.
+    /// Shard ticks whose rotation cannot finish inside its window at the
+    /// catch-up ceiling, per signal. `ravel_scrub_behind_total`: a nonzero
+    /// rate means a sustained commit rate above the ceiling, cycles slower
+    /// than a tick, or a marker held on a unit that keeps failing retryably,
+    /// and some objects may expire unverified.
     rotation_behind: [AtomicU64; MAINTAINED_SIGNALS.len()],
 }
 
