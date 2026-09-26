@@ -1928,7 +1928,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
 /// rises; a family always present at zero would make those two cases read
 /// the same as a healthy idle fold. The gate asks whether this process can
 /// fold at all, by the background task or the on-demand route, rather than
-/// whether the mode permits one: a maintain process omits both families, and
+/// whether the mode permits one: a gateway process omits both families, and
 /// `--mode all --disable-fold` still renders them, because the admin fold
 /// route is mounted and a fold through it moves them. Those counters sit at
 /// zero until someone calls that route, which is the honest reading of a
@@ -5410,7 +5410,7 @@ pub struct MetricsState {
     /// into the same process-global totals, so either one opens the gate and
     /// only a process with neither omits the pair. Each single-route gate
     /// gets a different config wrong: following the mode alone leaves
-    /// `--mode gateway --disable-fold`, which can fold by neither route,
+    /// `--mode maintain --disable-fold`, which can fold by neither route,
     /// rendering both at a zero that never moves, reading as steady coverage
     /// instead of no fold at all; following the background task alone leaves
     /// `--mode all --disable-fold` rendering no family while an operator
