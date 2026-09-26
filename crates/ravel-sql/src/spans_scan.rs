@@ -260,8 +260,7 @@ impl SpansScanExec {
         }
         let full = spans_schema();
         // `Some(proj)` projects the schema so the scan emits the projected
-        // shape directly (ADR-0110 decision 4); `None` keeps the full schema
-        // and the provider's `ProjectionExec`.
+        // shape directly (ADR-0110 decision 4); `None` emits the full schema.
         let (schema, projection): (SchemaRef, Option<Arc<Vec<usize>>>) = match projection {
             Some(p) => {
                 for &i in &p {
@@ -493,9 +492,9 @@ struct ColumnarPartition {
 /// What one partition's fetch produced: either the columnar fast path's held
 /// blocks and ordering, or a row-path `Vec<SpanRow>` (the ineligible path, or
 /// an eligible one that fell back on an `attrs_raw` block). `projection` on the
-/// row variant is the pushed projection (`Some` on the eligible-fallback path,
-/// so the built batch matches the plan's projected schema; `None` on the
-/// ineligible path, where a `ProjectionExec` above the scan does the selection).
+/// row variant is the pushed projection, so the built batch matches the plan's
+/// schema: `Some` whenever the provider pushed one, `None` only for a scan built
+/// without a projection, which emits the full schema.
 enum Prepared {
     Rows {
         rows: Vec<SpanRow>,

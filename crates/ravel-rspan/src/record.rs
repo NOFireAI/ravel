@@ -400,7 +400,7 @@ fn decode_any_value(bytes: &[u8]) -> Option<String> {
 /// blob (`ravel_otlp::traces_normalize::ATTR_LINKS_RAW`), encoded exactly like
 /// [`EVENTS_RAW_KEY`]. Unlike events, a links value is never promoted into
 /// nested RSPAN columns: the segment format is a frozen contract, and adding a
-/// column for it needs an ADR. [`ravel_sql`] decodes this attribute directly
+/// column for it needs an ADR. `ravel-sql` decodes this attribute directly
 /// at scan time instead, on every RSPAN version, so a value that is not a
 /// valid links blob simply stays an ordinary attribute, same as an
 /// unpromoted `_events_raw` value.
@@ -466,7 +466,8 @@ const LINK_ATTRIBUTES_FIELD: u64 = 4;
 /// (field 1), `span_id` (field 2), and `trace_state` (field 3). Unlike
 /// [`scan_event_ts_name`], this does not have a safe zero-filled default for
 /// `trace_id`/`span_id`: both are non-nullable fixed-width columns, so a
-/// missing or wrong-width `trace_id`/`span_id`, a non-UTF-8 `trace_state`, or
+/// missing or wrong-width `trace_id`/`span_id`, any of the three fields sent
+/// with a wire type other than length-delimited, a non-UTF-8 `trace_state`, or
 /// trailing bytes `next_wire_field` could not explain (a truncated field
 /// partway through the chunk) all fail the whole link rather than silently
 /// keep a fabricated or partial value. `attrs_blob` remains the authoritative
@@ -490,11 +491,11 @@ fn scan_link_fields(chunk: &[u8]) -> Option<SpanLink> {
                 arr.copy_from_slice(b);
                 span_id = Some(arr);
             }
-            (LINK_TRACE_ID_FIELD, WireField::Len(_)) | (LINK_SPAN_ID_FIELD, WireField::Len(_)) => {
-                return None;
-            }
             (LINK_TRACE_STATE_FIELD, WireField::Len(b)) => {
                 trace_state = std::str::from_utf8(b).ok()?.to_string();
+            }
+            (LINK_TRACE_ID_FIELD | LINK_SPAN_ID_FIELD | LINK_TRACE_STATE_FIELD, _) => {
+                return None;
             }
             _ => {}
         }
@@ -1036,6 +1037,33 @@ mod tests {
         assert!(
             parse_links(&value).is_none(),
             "a missing span_id must fail the link, never zero-fill it"
+        );
+    }
+
+    #[test]
+    fn parse_links_rejects_missing_trace_id() {
+        // span_id only, no trace_id field at all.
+        let chunk = len_field(0x12, &[0x22u8; SPAN_ID_WIDTH]);
+        let value = hex_encode(&frame(&chunk));
+        assert_eq!(
+            parse_links(&value),
+            None,
+            "a missing trace_id must fail the link, never zero-fill it"
+        );
+    }
+
+    #[test]
+    fn parse_links_rejects_trace_state_with_wrong_wire_type() {
+        // trace_state (field 3) sent as a varint (tag 0x18) instead of a
+        // length-delimited string: there is no string to read, so the link
+        // fails rather than reading as an empty trace_state.
+        let mut chunk = link_chunk(&[0x11u8; TRACE_ID_WIDTH], &[0x22u8; SPAN_ID_WIDTH], "");
+        chunk.extend_from_slice(&[0x18, 0x05]);
+        let value = hex_encode(&frame(&chunk));
+        assert_eq!(
+            parse_links(&value),
+            None,
+            "a non-string trace_state must fail the link, never read as empty"
         );
     }
 

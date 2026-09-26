@@ -1714,6 +1714,41 @@ async fn links_column_treats_malformed_link_fields_as_null() {
     }
 }
 
+/// Issue #1710: one malformed link fails the span's whole `links` value. A
+/// span carrying one well-formed link followed by one whose `trace_id` is 3
+/// bytes reads as NULL, not as a one-element list holding the valid link.
+#[tokio::test]
+async fn links_column_is_null_when_any_link_is_malformed() {
+    let mut raw = Vec::new();
+    otlp_link([0xaau8; 16], [0xaau8; 8], "", &[("link.attr", "valid")])
+        .encode_length_delimited(&mut raw)
+        .expect("encode link");
+    // trace_id (tag 0x0a) of 3 bytes, then a well-formed span_id (tag 0x12).
+    let mut bad = vec![0x0a, 3, 0xaa, 0xbb, 0xcc, 0x12, 8];
+    bad.extend_from_slice(&[0x22u8; 8]);
+    raw.push(u8::try_from(bad.len()).expect("short chunk"));
+    raw.extend_from_slice(&bad);
+    let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+
+    let mut record = span([0x11u8; 16], 0, 100, 110, "mixed-links");
+    record.attrs = vec![
+        (LINKS_RAW_KEY.to_string(), hex),
+        ("svc".to_string(), "api".to_string()),
+    ];
+    let executor = executor_with_spans(&[record]).await;
+
+    let outcome = executor
+        .execute(tenant().hash(), &sql_request("SELECT links FROM spans"))
+        .await
+        .expect("SELECT links executes");
+    let json = outcome.output.to_json().expect("encodes to JSON");
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([[serde_json::Value::Null]]),
+        "one malformed link makes the whole links value NULL"
+    );
+}
+
 /// The single `count(*)` value in `batches`, which must hold exactly one row.
 fn scalar_count(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64 {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
