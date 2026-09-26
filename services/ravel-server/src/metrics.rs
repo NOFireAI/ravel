@@ -1759,6 +1759,13 @@ pub struct CatalogCountersSnapshot {
     pub isolation_breaches: u64,
     /// Fold liveness, one entry per signal the fold covers.
     pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
+    /// Supervisor restarts of each signal's fold loop, in
+    /// [`crate::fold::FOLD_SIGNALS`] order. Not a catalog counter: it is
+    /// sourced from [`crate::fold::FoldLoopMetrics`], which the supervisor in
+    /// `crate::fold` writes, so [`CatalogCountersSnapshot::from_catalog`]
+    /// leaves it zeroed and the scrape handler fills it in through
+    /// [`CatalogCountersSnapshot::with_fold_loop_restarts`].
+    pub fold_loop_restarts: [u64; crate::fold::FOLD_SIGNALS.len()],
 }
 
 impl Default for CatalogCountersSnapshot {
@@ -1768,6 +1775,7 @@ impl Default for CatalogCountersSnapshot {
             compaction_input_set_conflicts: 0,
             isolation_breaches: 0,
             fold: CatalogFoldCounters::zeroed_per_signal(),
+            fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
         }
     }
 }
@@ -1789,7 +1797,19 @@ impl CatalogCountersSnapshot {
                 failures: catalog.fold_failures(signal),
                 last_success_unix_ns: catalog.fold_last_success_unix_ns(signal),
             }),
+            fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
         }
+    }
+
+    /// Attaches the fold loops' supervisor restart tallies, which live on
+    /// [`crate::fold::FoldLoopMetrics`] rather than on the catalog: a restart
+    /// is a fact about the loop, not about any fold that ran.
+    pub fn with_fold_loop_restarts(
+        mut self,
+        restarts: [u64; crate::fold::FOLD_SIGNALS.len()],
+    ) -> Self {
+        self.fold_loop_restarts = restarts;
+        self
     }
 }
 
@@ -1909,6 +1929,29 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
             "ravel_catalog_fold_last_success_timestamp_seconds",
             &labels(mode, fold.signal),
             fold.last_success_unix_ns as f64 / 1e9,
+        );
+    }
+
+    // The loops' own crash record, under the same gate as the gauge above: a
+    // loop that is not scheduled cannot be restarted. Rendered beside the gauge
+    // because it is the figure the gauge cannot produce under a partitioned
+    // fold: a replica whose loop dies keeps heartbeating and so keeps its
+    // pairs, while its peers' gauges stay fresh and hold `max by (signal)`
+    // under the stalled threshold. Each sample is labelled from the same
+    // carried signal the gauge labels itself from, so the two families cannot
+    // disagree about which signal a sample belongs to.
+    write_header(
+        out,
+        "ravel_catalog_fold_loop_restarts_total",
+        "Fold loops the supervisor caught panicking and restarted in this process, by signal. Under a partitioned fold this is the only figure that moves while one replica's loop is crash-looping, because its peers keep the liveness gauge fresh.",
+        "counter",
+    );
+    for (fold, restarts) in snapshot.fold.iter().zip(snapshot.fold_loop_restarts) {
+        write_sample(
+            out,
+            "ravel_catalog_fold_loop_restarts_total",
+            &labels(mode, fold.signal),
+            restarts,
         );
     }
 }
@@ -5427,6 +5470,13 @@ pub struct MetricsState {
     /// `--mode all --disable-fold` rendering no family while an operator
     /// drives real coverage through the route it still mounts.
     pub can_fold: bool,
+    /// The process's one [`crate::fold::FoldLoopMetrics`], the same handle
+    /// `crate::fold::spawn` gives each signal's supervisor. Always present:
+    /// `crate::start` builds it in every mode, and in a mode that schedules no
+    /// fold it simply stays at zero. Read at scrape time for
+    /// `ravel_catalog_fold_loop_restarts_total`, which renders under the same
+    /// `Mode::runs_scheduled_fold` gate as the liveness gauge.
+    pub fold_loop: Arc<crate::fold::FoldLoopMetrics>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -5453,7 +5503,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ));
     }
 
-    let catalog_snapshot = CatalogCountersSnapshot::from_catalog(state.catalog.as_ref());
+    let catalog_snapshot = CatalogCountersSnapshot::from_catalog(state.catalog.as_ref())
+        .with_fold_loop_restarts(state.fold_loop.restarts());
 
     let maintain_snapshot =
         state

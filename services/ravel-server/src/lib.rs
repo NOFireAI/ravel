@@ -2336,6 +2336,12 @@ pub async fn start(
     // others it stays at the zero every counter starts from.
     let reconcile_cycle_metrics = Arc::new(admission_reconcile::ReconcileCycleMetrics::default());
 
+    // Built in every mode for the same reason, and handed to `fold::spawn`
+    // below in the modes that schedule a fold. In the others nothing restarts a
+    // loop that was never spawned, so it stays at the zero every counter starts
+    // from, and the render gate omits it anyway.
+    let fold_loop_metrics = Arc::new(fold::FoldLoopMetrics::default());
+
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
@@ -2385,6 +2391,7 @@ pub async fn start(
         // below read: `fold.enabled` plus the mode for the spawn gate, and
         // `Mode::mounts_on_demand_fold` for the route's mount gate.
         can_fold: config.folds_in_process(),
+        fold_loop: fold_loop_metrics.clone(),
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register
@@ -2944,6 +2951,7 @@ pub async fn start(
             maintain_worker.clone(),
             live_set_rx,
             maintain_clock.clone(),
+            fold_loop_metrics.clone(),
         )
     } else {
         fold::FoldTasks::none()

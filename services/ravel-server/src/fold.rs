@@ -32,9 +32,12 @@
 //! owned, and the behavior is byte-for-byte the unpartitioned fold
 //! (ADR-1693 decision 3).
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt;
 use ravel_catalog::Catalog;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_maintain::{Clock, MaintainError, RetentionConfig, WorkerSet};
@@ -63,6 +66,67 @@ impl Default for FoldTaskConfig {
         }
     }
 }
+
+/// Supervisor restarts of the per-signal fold loops, one counter per
+/// [`FOLD_SIGNALS`] entry, rendered as
+/// `ravel_catalog_fold_loop_restarts_total{signal}`.
+///
+/// The fold is partitioned across the maintain live set (ADR-1693 decision 1),
+/// and that is what makes this counter necessary rather than merely useful. A
+/// replica whose loop for one signal dies keeps heartbeating, so it stays in
+/// the live set, no peer takes over its pairs, and those pairs stay unfolded.
+/// `ravel_catalog_fold_last_success_timestamp_seconds` only moves on a
+/// successful [`Catalog::fold`], and the fold-stalled alert aggregates
+/// `max by (signal)` across the fleet, so the peers' fresh gauges hold that
+/// alert under its threshold while the stranded pairs go unsealed. This
+/// counter is the only figure that moves in that state.
+#[derive(Debug)]
+pub struct FoldLoopMetrics {
+    restarts: [AtomicU64; FOLD_SIGNALS.len()],
+}
+
+impl Default for FoldLoopMetrics {
+    fn default() -> Self {
+        FoldLoopMetrics {
+            restarts: FOLD_SIGNALS.map(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl FoldLoopMetrics {
+    /// Records one supervisor restart of `signal`'s loop. A signal outside
+    /// [`FOLD_SIGNALS`] has no counter and is ignored; no loop runs for one.
+    fn inc_restart(&self, signal: Signal) {
+        if let Some(slot) = FOLD_SIGNALS.iter().position(|entry| *entry == signal) {
+            self.restarts[slot].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// This signal's restart tally.
+    pub fn restarts_for(&self, signal: Signal) -> u64 {
+        FOLD_SIGNALS
+            .iter()
+            .position(|entry| *entry == signal)
+            .map_or(0, |slot| self.restarts[slot].load(Ordering::Relaxed))
+    }
+
+    /// Every signal's tally, in [`FOLD_SIGNALS`] order, for the scrape
+    /// handler to hand the renderer.
+    pub fn restarts(&self) -> [u64; FOLD_SIGNALS.len()] {
+        FOLD_SIGNALS.map(|signal| self.restarts_for(signal))
+    }
+}
+
+/// Backoff before the first restart after a panic. Doubles up to
+/// [`RESTART_BACKOFF_MAX`] across consecutive panics, and resets once an
+/// attempt completes at least one tick before dying, so a loop that hits a
+/// single transient panic restarts promptly while a crash-looping one is
+/// bounded rather than spinning. The same pair of bounds the maintenance
+/// supervisor uses ([`crate::maintain`]).
+const RESTART_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Ceiling for the panic-restart backoff.
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Handle to every spawned fold task, so shutdown can stop them cleanly
 /// (mirrors [`crate::Running`]'s listener shutdown handles).
@@ -194,6 +258,11 @@ pub struct FoldTickReport {
 ///
 /// `clock` is the maintain context's injected clock (decision 6), so a test
 /// that drives membership and folding advances one clock.
+///
+/// `loop_metrics` is the process's one [`FoldLoopMetrics`], shared with
+/// `/metrics`. Each signal's loop runs under [`run_supervisor`], which catches
+/// a panic in the tick body, counts a restart there, and respawns the loop
+/// after a bounded backoff.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     catalog: Arc<Catalog>,
@@ -204,6 +273,7 @@ pub fn spawn(
     worker: Arc<WorkerSet>,
     live_set: watch::Receiver<Vec<Uuid>>,
     clock: Arc<dyn Clock>,
+    loop_metrics: Arc<FoldLoopMetrics>,
 ) -> FoldTasks {
     if !config.enabled {
         return FoldTasks::none();
@@ -227,40 +297,42 @@ pub fn spawn(
     let mut handles = Vec::new();
     for signal in FOLD_SIGNALS {
         let (tx, rx) = oneshot::channel();
-        let catalog = catalog.clone();
-        let store = store.clone();
-        let fallback_allow = fallback_allow.clone();
-        let interval = config.fold_interval;
-        let rng = Arc::clone(&rng);
-        let retention = Arc::clone(&retention);
-        let worker = Arc::clone(&worker);
-        let live_set = live_set.clone();
-        let clock = Arc::clone(&clock);
-        let handle = tokio::spawn(async move {
-            run_loop(
-                catalog,
-                store,
-                signal,
-                fallback_allow,
-                folder_id,
-                interval,
-                rng,
-                retention,
-                worker,
-                live_set,
-                clock,
-                rx,
-            )
-            .await;
-        });
+        let ctx = LoopContext {
+            catalog: catalog.clone(),
+            store: store.clone(),
+            signal,
+            fallback_allow: fallback_allow.clone(),
+            folder_id,
+            interval: config.fold_interval,
+            rng: Arc::clone(&rng),
+            retention: Arc::clone(&retention),
+            worker: Arc::clone(&worker),
+            live_set: live_set.clone(),
+            clock: Arc::clone(&clock),
+            // Production has no test seam, so the per-tick hook is a no-op.
+            // Tests pass a closure that panics to exercise the supervisor.
+            tick_hook: Arc::new(|| {}),
+        };
+        let handle = tokio::spawn(run_supervisor(
+            ctx,
+            rx,
+            Arc::clone(&loop_metrics),
+            RESTART_BACKOFF_INITIAL,
+            RESTART_BACKOFF_MAX,
+        ));
         shutdown.push(tx);
         handles.push(handle);
     }
     FoldTasks { shutdown, handles }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_loop(
+/// Everything one fold-loop attempt needs, bundled so the supervisor can clone
+/// it and respawn a fresh attempt after a panic. Every field is cheap to clone
+/// (an `Arc`, a `Copy`, or a small owned value), and a fresh attempt carries no
+/// state from the one that died: a tick derives the tenant set and the live set
+/// from scratch.
+#[derive(Clone)]
+struct LoopContext {
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     signal: Signal,
@@ -272,60 +344,188 @@ async fn run_loop(
     worker: Arc<WorkerSet>,
     live_set: watch::Receiver<Vec<Uuid>>,
     clock: Arc<dyn Clock>,
+    /// Called once at the top of every tick body, inside the `catch_unwind`
+    /// boundary. A no-op in production; a test seam for driving a panic
+    /// through the supervisor.
+    tick_hook: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Why one supervised [`run_loop`] attempt returned.
+enum LoopExit {
+    /// The shutdown channel fired: the supervisor must stop, not restart.
+    Shutdown,
+    /// A tick body panicked and was caught. The supervisor restarts the loop.
+    Panicked,
+}
+
+/// The outcome of one [`run_loop`] attempt: why it ended, and how many ticks it
+/// completed first (so the supervisor can reset its backoff after a healthy
+/// run).
+struct LoopOutcome {
+    exit: LoopExit,
+    completed_ticks: u64,
+}
+
+/// Owns one signal's fold-loop `JoinHandle` and restarts a fresh attempt after
+/// a caught panic, so a panic anywhere in the discovery or fold call graph no
+/// longer leaves a Running/Ready maintain replica heartbeating with a dead fold
+/// loop for that signal.
+///
+/// Each attempt is a spawned [`run_loop`] whose tick body is guarded by
+/// `catch_unwind`, which returns [`LoopExit::Panicked`] rather than unwinding
+/// the task. The supervisor counts the restart on
+/// [`FoldLoopMetrics::inc_restart`], logs it at error level with the signal,
+/// backs off (bounded, [`RESTART_BACKOFF_INITIAL`]..=[`RESTART_BACKOFF_MAX`])
+/// and spawns the next attempt. A join error (a panic that escaped the guard,
+/// or an aborted task) is counted and restarted the same way, so the total
+/// never undercounts.
+///
+/// Shutdown stops the loop and never restarts it: on the oneshot the supervisor
+/// signals the current attempt, joins it, and returns. The backoff wait races
+/// the same receiver, so a drain arriving inside a 60 s backoff is observed at
+/// once rather than held behind it.
+async fn run_supervisor(
+    ctx: LoopContext,
     mut shutdown: oneshot::Receiver<()>,
+    metrics: Arc<FoldLoopMetrics>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
 ) {
+    let signal = ctx.signal;
+    let mut backoff = initial_backoff;
+    let mut pending_backoff: Option<Duration> = None;
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(jittered(interval, rng.as_ref())) => {}
-            _ = &mut shutdown => return,
+        if let Some(wait) = pending_backoff.take() {
+            tokio::select! {
+                _ = &mut shutdown => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
         }
 
-        // The latest set the maintenance heartbeat task published. Read once
-        // per tick so every pair in one tick is partitioned against one
-        // membership view, the same way the maintenance discovery cycle reads
-        // it (ADR-0065 decision 2).
-        let live = live_set.borrow().clone();
-        match run_tick(
-            catalog.as_ref(),
-            store.as_ref(),
-            signal,
-            fallback_allow.as_deref(),
-            folder_id,
-            interval,
-            retention.as_ref(),
-            worker.as_ref(),
-            &live,
-            clock.as_ref(),
-        )
-        .await
-        {
-            Ok(report) => {
-                if report.excluded > 0 {
-                    tracing::debug!(
-                        signal = ?signal,
-                        excluded = report.excluded,
-                        "catalog fold: flag restriction excluded discovered tenants"
-                    );
-                }
-                tracing::debug!(
-                    signal = ?signal,
-                    discovered = report.discovered,
-                    maintained = report.maintained,
-                    owned = report.owned.len(),
-                    folded = report.folded.len(),
-                    failed = report.failed.len(),
-                    skipped_fresh = report.skipped_fresh.len(),
-                    "catalog fold cycle complete"
-                );
+        let (attempt_tx, attempt_rx) = oneshot::channel();
+        let mut attempt = tokio::spawn(run_loop(ctx.clone(), attempt_rx));
+
+        tokio::select! {
+            _ = &mut shutdown => {
+                let _ = attempt_tx.send(());
+                let _ = attempt.await;
+                return;
             }
-            Err(err) => {
-                tracing::error!(
-                    signal = ?signal,
-                    error = %err,
-                    "catalog fold: tenant discovery failed; skipping this cycle entirely, retried next tick"
-                );
+            joined = &mut attempt => {
+                match joined {
+                    Ok(LoopOutcome { exit: LoopExit::Shutdown, .. }) => return,
+                    Ok(LoopOutcome { exit: LoopExit::Panicked, completed_ticks }) => {
+                        if completed_ticks > 0 {
+                            backoff = initial_backoff;
+                        }
+                        metrics.inc_restart(signal);
+                        tracing::error!(
+                            signal = ?signal,
+                            completed_ticks,
+                            backoff_ms = backoff.as_millis(),
+                            "catalog fold: loop task panicked; restarting after backoff \
+                             (see ravel_catalog_fold_loop_restarts_total)"
+                        );
+                    }
+                    Err(join_err) => {
+                        metrics.inc_restart(signal);
+                        tracing::error!(
+                            signal = ?signal,
+                            error = %join_err,
+                            backoff_ms = backoff.as_millis(),
+                            "catalog fold: loop task died outside the tick guard; restarting \
+                             after backoff (see ravel_catalog_fold_loop_restarts_total)"
+                        );
+                    }
+                }
+
+                pending_backoff = Some(backoff);
+                backoff = (backoff * 2).min(max_backoff);
             }
         }
+    }
+}
+
+/// One supervised attempt of one signal's fold loop. Ticks until either the
+/// shutdown channel fires (returns [`LoopExit::Shutdown`]) or a tick body
+/// panics and is caught (returns [`LoopExit::Panicked`]). The supervisor
+/// ([`run_supervisor`]) owns this task's handle and restarts it on a panic.
+async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> LoopOutcome {
+    let mut completed_ticks: u64 = 0;
+    let exit = loop {
+        tokio::select! {
+            _ = tokio::time::sleep(jittered(ctx.interval, ctx.rng.as_ref())) => {}
+            _ = &mut shutdown => break LoopExit::Shutdown,
+        }
+
+        // The whole tick body runs inside `catch_unwind` so a panic anywhere in
+        // the discovery or fold call graph is caught here and turned into a
+        // supervised restart rather than a silently dead loop on a replica that
+        // keeps heartbeating and so keeps its pairs. `AssertUnwindSafe` is
+        // honest: on a caught panic this attempt is discarded entirely and the
+        // supervisor spawns a fresh one, which re-derives both the tenant set
+        // and the live set from scratch.
+        let tick = AssertUnwindSafe(async {
+            // Test seam (a no-op in production).
+            (ctx.tick_hook)();
+
+            // The latest set the maintenance heartbeat task published. Read
+            // once per tick so every pair in one tick is partitioned against
+            // one membership view, the same way the maintenance discovery
+            // cycle reads it (ADR-0065 decision 2).
+            let live = ctx.live_set.borrow().clone();
+            match run_tick(
+                ctx.catalog.as_ref(),
+                ctx.store.as_ref(),
+                ctx.signal,
+                ctx.fallback_allow.as_deref(),
+                ctx.folder_id,
+                ctx.interval,
+                ctx.retention.as_ref(),
+                ctx.worker.as_ref(),
+                &live,
+                ctx.clock.as_ref(),
+            )
+            .await
+            {
+                Ok(report) => {
+                    if report.excluded > 0 {
+                        tracing::debug!(
+                            signal = ?ctx.signal,
+                            excluded = report.excluded,
+                            "catalog fold: flag restriction excluded discovered tenants"
+                        );
+                    }
+                    tracing::debug!(
+                        signal = ?ctx.signal,
+                        discovered = report.discovered,
+                        maintained = report.maintained,
+                        owned = report.owned.len(),
+                        folded = report.folded.len(),
+                        failed = report.failed.len(),
+                        skipped_fresh = report.skipped_fresh.len(),
+                        "catalog fold cycle complete"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(
+                        signal = ?ctx.signal,
+                        error = %err,
+                        "catalog fold: tenant discovery failed; skipping this cycle entirely, retried next tick"
+                    );
+                }
+            }
+        });
+
+        match tick.catch_unwind().await {
+            Ok(()) => completed_ticks = completed_ticks.saturating_add(1),
+            Err(_panic) => break LoopExit::Panicked,
+        }
+    };
+
+    LoopOutcome {
+        exit,
+        completed_ticks,
     }
 }
 
