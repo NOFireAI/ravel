@@ -92,12 +92,14 @@ pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
 /// Same humantime grammar as [`parse_max_flush_lifetime_ns`], naming the flag
 /// it belongs to in its errors. It mirrors ravel-server's `--max-ingest-lag`,
 /// whose parser lives in a crate ravel-cli does not depend on at build time,
-/// so the grammar is matched here rather than shared. Zero is accepted: it is
-/// the value that narrows the resolve's listing window to exactly the
-/// requested `--start`, which is a legitimate thing to ask of a tenant known
-/// to have no late arrivals. Negative values are unrepresentable in humantime,
-/// so the only rejections are an unparseable spelling and a value too large
-/// for `i64` nanoseconds.
+/// so the grammar is matched here rather than shared. Zero is accepted, as it
+/// is by the sibling `--max-flush-lifetime` flags: it narrows the resolve's
+/// listing window to start in `--start`'s own ingest hour, which is a
+/// deliberate thing to ask for, and is what
+/// `max_ingest_lag_decides_which_buckets_the_resolve_lists` exercises, rather
+/// than a value to reach for without a reason. Negative values are
+/// unrepresentable in humantime, so the only rejections are an unparseable
+/// spelling and a value too large for `i64` nanoseconds.
 pub fn parse_max_ingest_lag_ns(s: &str) -> Result<i64, String> {
     let dur =
         humantime::parse_duration(s).map_err(|e| format!("invalid --max-ingest-lag '{s}': {e}"))?;
