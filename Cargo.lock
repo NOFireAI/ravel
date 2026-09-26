@@ -5027,6 +5027,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "futures",
+ "hex",
  "humantime",
  "promql-parser",
  "proptest",

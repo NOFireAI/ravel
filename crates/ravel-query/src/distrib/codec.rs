@@ -1483,10 +1483,13 @@ pub fn decode_erasure(predicates: Vec<pb::ErasurePredicate>) -> Vec<ErasurePredi
 /// and verifies the fetched footer against this identity (ADR-0071
 /// reconstruct-don't-trust), so the coordinator never ships a trusted key.
 ///
-/// The reverse map (identity back to a full `SegmentRef`, which needs the
-/// `ravel-commit` key reconstruction) is not provided
-/// here; a worker resolves an identity to a ref by its content hash. See
-/// [`identity_content_hash`].
+/// The reverse map is not provided here: an identity carries only the durable
+/// key fields, so a full `SegmentRef` needs the segment's own commit (or
+/// compaction) record. The worker's
+/// [`ReconstructingSegmentResolver`](crate::distrib::service::ReconstructingSegmentResolver)
+/// rebuilds that record's key from the identity, GETs and verifies it, and
+/// builds the ref from the record; the identity's `segment_format_version` is
+/// not read there, since the record states the segment's own version.
 pub fn encode_segment_identity(seg: &SegmentRef) -> pb::SegmentIdentity {
     let (level, input_set_hash, part_index) = match &seg.level {
         SegmentLevel::L0 => (0u32, Vec::new(), 0u32),
