@@ -1495,6 +1495,85 @@ async fn links_column_treats_unparseable_links_raw_as_null() {
     );
 }
 
+/// Issue #1710 fix round: three specific malformed `_links_raw` shapes that a
+/// naive scan would zero-fill or truncate into fabricated data instead of
+/// failing outright. Each must decode to NULL, exactly like the
+/// garbage-bytes case above, and reaches `scan_link_fields` (unlike that
+/// case, which fails earlier at hex decode).
+#[tokio::test]
+async fn links_column_treats_malformed_link_fields_as_null() {
+    /// One length-delimited protobuf field: tag byte, then a single-byte
+    /// length, then bytes. Test payloads are all well under 128 bytes.
+    fn len_field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 128, "test payload too long for a 1-byte varint");
+        let mut out = vec![tag];
+        out.push(payload.len() as u8);
+        out.extend_from_slice(payload);
+        out
+    }
+    /// Frames link chunks as the ingest side frames them (a single-byte
+    /// varint length prefix per chunk) and hex-encodes the result.
+    fn frame(chunks: &[Vec<u8>]) -> String {
+        let mut raw = Vec::new();
+        for c in chunks {
+            assert!(c.len() < 128, "test chunk too long for a 1-byte varint");
+            raw.push(c.len() as u8);
+            raw.extend_from_slice(c);
+        }
+        raw.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    let t1 = [0x11u8; 16];
+
+    // A well-framed chunk whose trace_id is 3 bytes, not TRACE_ID_WIDTH.
+    let wrong_width_trace_id = {
+        let mut chunk = len_field(0x0a, &[0xaa, 0xbb, 0xcc]);
+        chunk.extend_from_slice(&len_field(0x12, &[0x22u8; 8]));
+        chunk
+    };
+    // A valid trace_id, then a span_id tag claiming length 8 with only 3
+    // bytes actually following.
+    let truncated_field = {
+        let mut chunk = len_field(0x0a, &[0x11u8; 16]);
+        chunk.push(0x12);
+        chunk.push(8);
+        chunk.extend_from_slice(&[1, 2, 3]);
+        chunk
+    };
+    // A valid trace_id and span_id, then a trace_state field of invalid
+    // UTF-8.
+    let non_utf8_trace_state = {
+        let mut chunk = len_field(0x0a, &[0x11u8; 16]);
+        chunk.extend_from_slice(&len_field(0x12, &[0x22u8; 8]));
+        chunk.extend_from_slice(&len_field(0x1a, &[0xff, 0xfe]));
+        chunk
+    };
+
+    for (what, chunk) in [
+        ("a 3-byte trace_id", wrong_width_trace_id),
+        ("a field truncated part way through the chunk", truncated_field),
+        ("a non-UTF-8 trace_state", non_utf8_trace_state),
+    ] {
+        let mut record = span(t1, 0, 100, 110, "malformed-links");
+        record.attrs = vec![
+            (LINKS_RAW_KEY.to_string(), frame(&[chunk])),
+            ("svc".to_string(), "api".to_string()),
+        ];
+        let executor = executor_with_spans(&[record]).await;
+
+        let outcome = executor
+            .execute(tenant().hash(), &sql_request("SELECT links FROM spans"))
+            .await
+            .unwrap_or_else(|e| panic!("query over {what} must not panic or error: {e:?}"));
+        let json = outcome.output.to_json().expect("encodes to JSON");
+        assert_eq!(
+            json["rows"],
+            serde_json::json!([[serde_json::Value::Null]]),
+            "{what} must fall back to NULL, never a fabricated or partial link"
+        );
+    }
+}
+
 /// The single `count(*)` value in `batches`, which must hold exactly one row.
 fn scalar_count(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64 {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
