@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The PromQL query path now reserves against the shared process memory
+  budget, closing the remaining gap in issue #1255.** `build_app_state`
+  wires the same `Arc<MemoryBudget>` `build_sql_state`'s `SqlExecutor`
+  already used into `QueryEngine::with_memory_budget`, so a PromQL fetch
+  that outgrows the remaining budget now fails with a typed
+  `FetchMemoryExhausted` error instead of running unbudgeted.
+  `ravel_memory_reserved_bytes{component="fetch"}` and
+  `ravel_memory_handoff_overlap_bytes` report the fetch layer's real,
+  non-double-counted reservations instead of a hardcoded `0`, and
+  `component="sql"` now reports only SQL's own share rather than the whole
+  budget.
+
 ## [0.17.0] - 2026-09-25
 
 ### Fixed

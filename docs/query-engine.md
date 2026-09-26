@@ -639,23 +639,34 @@ The fetch layer reserves the bytes a GET will materialize on a shared
 reservation for as long as the fetched buffer lives. `QueryEngine` holds one
 `Arc<MemoryBudget>` and, through `QueryEngine::with_memory_budget`, wires it to
 the two fetchers it owns: the RSEG metrics fetcher (`fetcher`) and the RLOG log
-fetcher (`log_fetcher`), exactly as it shares one `GetLimiter`. Two fetch paths
-draw on their own default budget, not this shared one, and so are not yet
-bounded by a finite process budget:
+fetcher (`log_fetcher`), exactly as it shares one `GetLimiter`.
+`services/ravel-server/src/query.rs`'s `build_app_state` (the PromQL/HTTP
+`AppState` builder) calls `with_memory_budget` with the process-wide
+`MemoryBudget` (ADR-1170) on every engine it constructs, so a PromQL fetch's
+reservation lands on the same shared instance `build_sql_state`'s
+`SqlExecutor` reserves against (below). Two fetch paths still draw on their
+own private default budget, unaffected by that wiring:
 
 - **RSPAN.** `QueryEngine` owns no span fetcher, so `with_memory_budget` reaches
   none; each `SpanSegmentFetcher` reserves against its own
   `MemoryBudget::unlimited()`.
-- **The SQL query path.** `build_sql_state` (`services/ravel-server/src/query.rs`)
-  constructs its metrics, logs, and span fetchers with `with_get_limiter` but
-  not `with_memory_budget`, so they reserve against their default unlimited
-  budgets too.
+- **The SQL query path's own fetchers.** `build_sql_state`
+  (`services/ravel-server/src/query.rs`) constructs its metrics, logs, and span
+  fetchers with `with_get_limiter` but not `with_memory_budget`, so those
+  fetchers still reserve against their own default unlimited budgets. The SQL
+  path is not unbounded, though: `build_sql_state` installs the SAME
+  process-wide `MemoryBudget` on the `SqlExecutor` itself via
+  `SqlExecutor::with_process_memory_budget`, so a SQL query's per-tenant
+  execution memory (`TenantMemoryAccountant`'s raw `try_reserve`/
+  `reserve_unchecked` counter API) still competes with PromQL's fetch
+  reservations for the same ceiling; only the SQL path's own fetch-layer GET
+  reservations are exempt.
 
-The default is `MemoryBudget::unlimited()`, and no server task installs a finite
-budget yet, so the accounting is inert everywhere today. Wiring a finite,
-process-shared budget into both the PromQL `AppState` builder and `build_sql_state`
-(the seam `with_memory_budget` exists for) is the follow-up that makes it
-enforcing; until then the reservations below run but never refuse.
+The default is `MemoryBudget::unlimited()`; a real process installs a finite
+one at startup (see "Process-wide memory budget (ADR-1170)" below) and shares
+the single `Arc` between `build_app_state` and `build_sql_state`, so the
+reservations below refuse once that ceiling is reached rather than only
+recording bytes.
 
 Reservation sites, each taken **before** its GET, with the guard's lifetime
 tied to the buffer it accounts for:
@@ -897,9 +908,11 @@ The `/metrics` endpoint exposes the budget's current state as three gauges,
 unconditionally in every mode: `ravel_memory_budget_bytes`,
 `ravel_memory_reserved_bytes{component="sql"|"fetch"}`
 (bytes currently reserved against the budget, split by which side reserved
-them), and `ravel_memory_handoff_overlap_bytes` (the bytes a handoff between
-components would double-count in the budget's accounting window; inactive,
-always `0`, until fetch handoff accounting reaches this budget).
+them), and `ravel_memory_handoff_overlap_bytes` (bytes simultaneously held by
+a live fetch `Reservation` and resident in the ADR-0046 read cache, because
+the fetcher marked that reservation handed off once the cache took its own
+independent copy of the same bytes; `0` when no fetch reservation is
+currently handed off).
 
 `ravel_memory_budget_bytes` is the ceiling of the shared accountant, which is
 the POST-carve remainder: the startup log's `memory_remainder_bytes`, not the
@@ -912,16 +925,17 @@ clamp keys off the budget's source alone, so an explicit cap on an unmeasured
 host still renders unlimited here while the real ceiling behind it is
 `u64::MAX` minus the two caps.
 
-`component="fetch"` always reads `0` today: only the SQL
-executor's per-tenant accountants reserve against this budget. The fetchers
-do have their own reservation and handoff accounting, but the server wires
-none of them to this instance, so neither gauge can move until that wiring
-lands. `component="sql"` is correspondingly the budget's whole reserved
-total rather than a component's share of it; the two coincide only while SQL
-is the sole reserver, and the split becomes real, rather than a relabelling,
-when decision 2 lands. Both are an honest gap rather than a bug: they exist now so a
-dashboard built against them does not need to change shape once the fetch
-layer starts reserving here.
+`component="fetch"` is `MemoryBudget::fetch_reserved()`: bytes currently held
+by a live `Reservation` opened through the RAII `reserve` path, which today
+means a PromQL fetch issued by an engine `build_app_state` constructed (the
+SQL path's own fetchers are not wired to this instance; see "Fetch-layer
+memory reservations" above). `component="sql"` is
+`MemoryBudget::sql_reserved()`, the total reserved minus `fetch_reserved()`,
+i.e. every reservation taken through the raw `try_reserve`/
+`reserve_unchecked` counter API (`SqlExecutor`'s per-tenant
+`TenantMemoryAccountant`s). The two counters are disjoint by construction,
+so they never double-count and always sum to the budget's whole reserved
+total.
 
 ### Catalog resolve GET concurrency
 
