@@ -32,9 +32,16 @@
 groups:
   - name: ravel-catalog-fold
     # RavelCatalogFoldStalled fires on any deployment where some signal has
-    # no fresh fold, which includes a fleet that never folds at all: an
-    # intentionally maintain-only fleet, or one running --disable-fold
-    # everywhere. Such a fleet must drop this rule or inhibit it.
+    # no fresh fold, which includes a fleet that never folds at all: a fleet
+    # running neither --mode maintain nor --mode all (the two modes that fold
+    # on a timer, ADR-1693), or one running --disable-fold everywhere. Such a
+    # fleet must drop this rule or inhibit it. A gateway-only or query-only
+    # fleet is in that class. Neither mode renders
+    # ravel_catalog_fold_last_success_timestamp_seconds, so the `absent()` arm
+    # is what fires there. A query process does render
+    # ravel_catalog_fold_cycles_total and _failures_total, for the on-demand
+    # `POST /api/v1/admin/fold` route it keeps; a gateway process folds by no
+    # route and emits no fold series at all.
     rules:
       - alert: RavelCatalogFoldStalled
         expr: |

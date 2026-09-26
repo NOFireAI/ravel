@@ -757,6 +757,45 @@ always safe for sealing.
 
 (ADR-0020.)
 
+## Who folds a tenant and signal (ADR-1693)
+
+The scheduled fold runs in two server modes: `maintain` and `all`. A `gateway`
+or `query` process runs no fold timer. A `query` process keeps the on-demand
+`POST /api/v1/admin/fold` route, which folds the tenant and signal the caller
+names regardless of ownership; a `gateway` process mounts no fold route at all
+and so cannot fold by any route, which was already true before ADR-1693.
+
+In `maintain`, a `(tenant, signal)` pair is folded by exactly one process at a
+time. The owner is the rendezvous-hash owner of the unit `(tenant_hash,
+signal, 0)` over the maintenance live set (ADR-0065 decision 1): the worker
+`w` in the live set maximizing `blake3(unit_key || w)`, ties broken toward the
+larger `process_id`. Shard `0` is a constant here, not a shard of the data: a
+fold covers a tenant and signal as a whole, so it is one unit rather than one
+per shard.
+
+The ownership test runs before every per-tenant read: before the pair's `HEAD`
+peek and before the `t/<hash>/config` record that decides whether the tenant is
+maintained. A non-owner therefore issues no request at all for a pair it does
+not own, which is what makes adding a `maintain` replica divide the fold's
+request cost rather than duplicate it. The one request a tick makes that is not
+attributable to a pair the process owns is the single delimited listing of `t/`
+that discovers which tenants exist, which is per signal and per tick rather
+than per tenant.
+
+During a membership transition the live sets of two processes can disagree for
+at most the liveness window plus one heartbeat, and both may fold the same
+pair. That is safe rather than merely tolerated: the fold's parts are
+content-addressed, so both processes write byte-identical objects, and the
+`HEAD` compare-and-swap after the work serializes the two publishes. The loser
+retries on its next tick and finds the pair already fresh. The overlap costs
+bounded duplicate reads and never a torn or forked catalog.
+
+A `--mode all` process publishes no heartbeat and computes its live set as
+itself alone, so it owns every unit and folds everything. Two `all` processes
+over one bucket therefore both fold everything; the CAS still serializes them,
+but the duplicate read cost is not bounded by a transition window. Run
+`maintain` replicas, not multiple `all` processes, when fold cost matters.
+
 ## Fold reconcile pass (ADR-0063 section 4)
 
 The incremental fold lists only the buckets for hours strictly after the

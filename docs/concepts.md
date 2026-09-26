@@ -420,8 +420,9 @@ expanded; other pages use them bare.
   published, not the act of publishing it, and compaction is a different
   operation on different objects.
 - **folder**: the background task that runs a fold for one (tenant,
-  signal); every mode except `maintain` runs one. Two folders that race are
-  serialized by the HEAD compare-and-swap.
+  signal); `maintain` and `all` run one, and a `maintain` process folds only
+  the pairs it owns. Two folders that race are serialized by the HEAD
+  compare-and-swap.
 - **garbage collection**: the umbrella term for removing data that is no
   longer needed, covering retention, erasure, and the sweep. The physical
   deletion step inside it is the sweep.

@@ -7,32 +7,44 @@
 //! task (`--disable-fold`) only changes query cost, never query results.
 //!
 //! One loop per [`FOLD_SIGNALS`] entry, not one per tenant: each tick
-//! re-enumerates tenants from storage
-//! ([`crate::tenant_discovery::discover_and_restrict_by_lifecycle`]) and folds
-//! every tenant the cycle discovers, narrowed by each tenant's durable
-//! lifecycle state and the flag fallback (ADR-0066 decision 6: a config record
-//! keeps a tenant in the set unconditionally regardless of its token, and no
-//! flag can exclude a config-recorded tenant). A tenant onboarded mid-run is
-//! folded starting the next tick with no restart.
+//! re-enumerates tenants from storage ([`ravel_maintain::discover_tenants`],
+//! one delimited listing of `t/`) and folds every tenant the cycle discovers,
+//! narrowed by ownership and then by each tenant's durable lifecycle state and
+//! the flag fallback (ADR-0066 decision 6: a config record keeps a tenant in
+//! the set unconditionally regardless of its token, and no flag can exclude a
+//! config-recorded tenant). A tenant onboarded mid-run is folded starting the
+//! next tick with no restart.
 //! A discovery failure skips that signal's whole cycle -- no tenant is folded
 //! -- and is retried next tick; it never falls back to an empty set, since
 //! fold is best-effort and a quiet failure here would look identical to
 //! "nothing new to fold."
+//!
+//! The scheduled fold is partitioned across the maintain live set (ADR-1693
+//! decision 1). Each tick gates a `(tenant, signal)` pair on
+//! [`WorkerSet::owns_unit`] over shard [`FOLD_UNIT_SHARD`], the same unit key
+//! the per-signal maintenance sweeps use, so the process that sweeps a pair's
+//! catalog objects is the process that folds it. The gate is pure computation
+//! over the discovery result and it runs before every per-tenant read, the
+//! lifecycle config record included, so a pair this process does not own costs
+//! zero requests. The per-tick cost of a pair nobody on this process owns is
+//! therefore its share of the one `t/` listing and nothing else.
+//! In `--mode all` the live set is the solo one (`{self}`), every pair is
+//! owned, and the behavior is byte-for-byte the unpartitioned fold
+//! (ADR-1693 decision 3).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use ravel_catalog::Catalog;
 use ravel_commit::rng::{RngSource, SystemRng};
-use ravel_ingest::{Clock, SystemClock};
-use ravel_maintain::RetentionConfig;
+use ravel_maintain::{Clock, MaintainError, RetentionConfig, WorkerSet};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_types::{Signal, TenantHash};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::tenant_discovery::discover_and_restrict_by_lifecycle;
+use crate::tenant_discovery::restrict_by_lifecycle;
 
 /// Default `fold_interval`: 5 minutes.
 pub const DEFAULT_FOLD_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -98,6 +110,45 @@ impl FoldTasks {
 /// and going stale rather than hiding behind its siblings.
 pub(crate) const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
+/// The shard whose rendezvous owner owns a whole `(tenant, signal)` pair's
+/// fold (ADR-1693 decision 1). The fold is per pair, not per shard, so it
+/// needs one shard to key the unit on; shard 0 is the convention the
+/// per-signal maintenance sweeps already use
+/// ([`crate::maintain`]), which is what makes the sweeper and the
+/// folder for a pair the same process.
+pub const FOLD_UNIT_SHARD: u32 = 0;
+
+/// What one tick did, per tenant, for one signal. Returned by [`run_tick`] so
+/// the partition is assertable (ADR-1693's acceptance test) rather than only
+/// visible in logs.
+///
+/// `discovered` counts the whole discovery result: discovery is per process
+/// and never gated on ownership (ADR-0065 decision 2), so both processes see
+/// every tenant. The three narrowings then apply in cost order: `owned` is the
+/// subset this process owns under the live set it was given, decided without
+/// any request, and `maintained`/`excluded` split `owned` by the lifecycle
+/// read that costs one request per tenant. `maintained` is exactly the set the
+/// remaining fields partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldTickReport {
+    /// Every tenant storage reported under `t/` this tick.
+    pub discovered: usize,
+    /// Discovered tenants whose `(tenant, signal, 0)` unit this process owns.
+    pub owned: Vec<TenantHash>,
+    /// `owned`, narrowed by lifecycle state and the flag fallback.
+    pub maintained: usize,
+    /// Owned tenants the flag restriction excluded.
+    pub excluded: usize,
+    /// Maintained tenants whose fold ran and returned a report.
+    pub folded: Vec<TenantHash>,
+    /// Maintained tenants whose fold returned an error. Logged and retried
+    /// next tick; never fails a query.
+    pub failed: Vec<TenantHash>,
+    /// Maintained tenants skipped because their HEAD was younger than the fold
+    /// interval, the cheap duplicate-work peek.
+    pub skipped_fresh: Vec<TenantHash>,
+}
+
 /// Spawns one fold loop per signal in [`FOLD_SIGNALS`], not one per tenant:
 /// each tick re-derives the tenant set from storage. [`run_loop`] is
 /// signal-generic; a new signal is added by extending that array, not by
@@ -133,12 +184,26 @@ pub(crate) const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Sig
 /// CLI flags with no durable `TenantConfig.retention_ns` record (ADR-0078).
 /// An unconfigured `RetentionConfig` resolves to `None` for every tenant, so
 /// this is inert when no retention flag is set.
+///
+/// `worker` and `live_set` are the process's one maintain [`WorkerSet`] and the
+/// live-set `watch` the maintenance heartbeat task publishes on (ADR-1693
+/// decision 1). Every tick reads the latest published set and folds only the
+/// pairs this process owns. In `Mode::All` nothing ever publishes on that
+/// channel, so the receiver holds the solo live set (`{self}`) for the life of
+/// the process and every pair is owned (decision 3).
+///
+/// `clock` is the maintain context's injected clock (decision 6), so a test
+/// that drives membership and folding advances one clock.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     fallback_allow: &[TenantHash],
     config: FoldTaskConfig,
     retention: Arc<RetentionConfig>,
+    worker: Arc<WorkerSet>,
+    live_set: watch::Receiver<Vec<Uuid>>,
+    clock: Arc<dyn Clock>,
 ) -> FoldTasks {
     if !config.enabled {
         return FoldTasks::none();
@@ -168,6 +233,9 @@ pub fn spawn(
         let interval = config.fold_interval;
         let rng = Arc::clone(&rng);
         let retention = Arc::clone(&retention);
+        let worker = Arc::clone(&worker);
+        let live_set = live_set.clone();
+        let clock = Arc::clone(&clock);
         let handle = tokio::spawn(async move {
             run_loop(
                 catalog,
@@ -178,6 +246,9 @@ pub fn spawn(
                 interval,
                 rng,
                 retention,
+                worker,
+                live_set,
+                clock,
                 rx,
             )
             .await;
@@ -198,6 +269,9 @@ async fn run_loop(
     interval: Duration,
     rng: Arc<dyn RngSource>,
     retention: Arc<RetentionConfig>,
+    worker: Arc<WorkerSet>,
+    live_set: watch::Receiver<Vec<Uuid>>,
+    clock: Arc<dyn Clock>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -206,52 +280,146 @@ async fn run_loop(
             _ = &mut shutdown => return,
         }
 
-        let outcome = match discover_and_restrict_by_lifecycle(
+        // The latest set the maintenance heartbeat task published. Read once
+        // per tick so every pair in one tick is partitioned against one
+        // membership view, the same way the maintenance discovery cycle reads
+        // it (ADR-0065 decision 2).
+        let live = live_set.borrow().clone();
+        match run_tick(
+            catalog.as_ref(),
             store.as_ref(),
+            signal,
             fallback_allow.as_deref(),
+            folder_id,
+            interval,
+            retention.as_ref(),
+            worker.as_ref(),
+            &live,
+            clock.as_ref(),
         )
         .await
         {
-            Ok(outcome) => outcome,
+            Ok(report) => {
+                if report.excluded > 0 {
+                    tracing::debug!(
+                        signal = ?signal,
+                        excluded = report.excluded,
+                        "catalog fold: flag restriction excluded discovered tenants"
+                    );
+                }
+                tracing::debug!(
+                    signal = ?signal,
+                    discovered = report.discovered,
+                    maintained = report.maintained,
+                    owned = report.owned.len(),
+                    folded = report.folded.len(),
+                    failed = report.failed.len(),
+                    skipped_fresh = report.skipped_fresh.len(),
+                    "catalog fold cycle complete"
+                );
+            }
             Err(err) => {
                 tracing::error!(
                     signal = ?signal,
                     error = %err,
                     "catalog fold: tenant discovery failed; skipping this cycle entirely, retried next tick"
                 );
-                continue;
             }
-        };
-        if outcome.excluded > 0 {
-            tracing::debug!(
-                signal = ?signal,
-                excluded = outcome.excluded,
-                "catalog fold: flag restriction excluded discovered tenants"
-            );
-        }
-
-        for tenant in outcome.maintained {
-            // The deployment-default retention window for this tenant, resolved
-            // per tick from the CLI-derived RetentionConfig (ADR-0078). The fold
-            // overlays the durable TenantConfig.retention_ns on top of it.
-            let default_retention_ns = retention.window_for(&tenant);
-            run_tenant_tick(
-                catalog.as_ref(),
-                store.as_ref(),
-                &tenant,
-                signal,
-                folder_id,
-                interval,
-                default_retention_ns,
-            )
-            .await;
         }
     }
 }
 
-/// One fold attempt for one tenant: the HEAD freshness peek, then
-/// [`Catalog::fold`] if it's stale. Split out from [`run_loop`] so discovery
-/// and the per-tenant fold logic stay independently readable.
+/// One fold cycle for one signal: re-enumerate tenants from storage, then fold
+/// every pair this process owns under `live_set` (ADR-1693 decision 1).
+///
+/// The ownership gate comes BEFORE every per-tenant read, the lifecycle config
+/// record included, so a pair this process does not own costs zero requests
+/// naming it. The tick's whole cost for such a pair is its share of the one
+/// delimited `t/` listing that discovery makes. A discovery failure returns the
+/// error rather than an empty set: fold is best-effort and a quiet failure here
+/// would look identical to "nothing new to fold."
+///
+/// Narrowing by ownership before the lifecycle read cannot change which pairs
+/// fold: ownership and the lifecycle restriction are independent predicates
+/// over the discovered set, so applying them in either order selects the same
+/// intersection.
+///
+/// Public for the same reason [`crate::maintain::run_tick`] is: a test drives
+/// one deterministic cycle with an injected clock and an explicit live set,
+/// instead of racing the background loop's timer.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tick(
+    catalog: &Catalog,
+    store: &dyn ObjectStoreBackend,
+    signal: Signal,
+    fallback_allow: Option<&[TenantHash]>,
+    folder_id: Uuid,
+    interval: Duration,
+    retention: &RetentionConfig,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    clock: &dyn Clock,
+) -> Result<FoldTickReport, MaintainError> {
+    let discovered = ravel_maintain::discover_tenants(store).await?;
+    let mut owned = Vec::new();
+    for tenant in &discovered {
+        if worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD) {
+            owned.push(*tenant);
+        } else {
+            tracing::trace!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                "catalog fold: not this process's unit under the current live set"
+            );
+        }
+    }
+    let (maintained, excluded) = restrict_by_lifecycle(store, &owned, fallback_allow).await;
+    let mut report = FoldTickReport {
+        discovered: discovered.len(),
+        owned,
+        maintained: maintained.len(),
+        excluded,
+        ..FoldTickReport::default()
+    };
+
+    for tenant in maintained {
+        // The deployment-default retention window for this tenant, resolved
+        // per tick from the CLI-derived RetentionConfig (ADR-0078). The fold
+        // overlays the durable TenantConfig.retention_ns on top of it.
+        let default_retention_ns = retention.window_for(&tenant);
+        match run_tenant_tick(
+            catalog,
+            store,
+            &tenant,
+            signal,
+            folder_id,
+            interval,
+            default_retention_ns,
+            clock,
+        )
+        .await
+        {
+            TenantTickOutcome::Folded => report.folded.push(tenant),
+            TenantTickOutcome::Failed => report.failed.push(tenant),
+            TenantTickOutcome::SkippedFresh => report.skipped_fresh.push(tenant),
+        }
+    }
+
+    Ok(report)
+}
+
+/// What one tenant's fold attempt did, so [`run_tick`] can report the exact
+/// partition instead of a bare count.
+enum TenantTickOutcome {
+    Folded,
+    Failed,
+    SkippedFresh,
+}
+
+/// One fold attempt for one tenant this process already owns: the HEAD
+/// freshness peek, then [`Catalog::fold`] if it's stale. Split out from
+/// [`run_tick`] so discovery, ownership and the per-tenant fold logic stay
+/// independently readable.
 #[allow(clippy::too_many_arguments)]
 async fn run_tenant_tick(
     catalog: &Catalog,
@@ -261,15 +429,16 @@ async fn run_tenant_tick(
     folder_id: Uuid,
     interval: Duration,
     default_retention_ns: Option<i64>,
-) {
-    let now_ns = SystemClock.now_ns();
+    clock: &dyn Clock,
+) -> TenantTickOutcome {
+    let now_ns = clock.now_ns();
     if head_fresh_enough(store, tenant, signal, interval, now_ns).await {
         tracing::debug!(
             tenant = %tenant.to_hex(),
             signal = ?signal,
             "catalog fold: HEAD already fresh, skipping this tick"
         );
-        return;
+        return TenantTickOutcome::SkippedFresh;
     }
 
     match catalog
@@ -292,6 +461,7 @@ async fn run_tenant_tick(
                 put_requests = report.put_requests,
                 "catalog fold complete"
             );
+            TenantTickOutcome::Folded
         }
         Err(err) => {
             tracing::warn!(
@@ -300,6 +470,7 @@ async fn run_tenant_tick(
                 error = %err,
                 "catalog fold failed; the index degrades to listing until a later fold succeeds"
             );
+            TenantTickOutcome::Failed
         }
     }
 }

@@ -266,19 +266,29 @@ an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.
 
 ### Catalog fold liveness (`ravel_catalog_fold_*`)
 
-Labels: `mode`, `signal`. All three families render in every mode, with one
-series per folded signal (`metrics`, `logs`, `spans`), but only the processes
-that actually fold ever move them. Two things stop the background fold loop:
-the `maintain` mode, which never spawns it, and `--disable-fold`, which
-returns no fold tasks in any mode. The on-demand fold route is mounted only
-in `all` and `query`. A `maintain` process, and any process run with
-`--disable-fold`, therefore reports zeros permanently.
+Labels: `mode`, `signal`. Which of the three a process renders follows from
+the routes by which that mode can fold, with one series per folded signal
+(`metrics`, `logs`, `spans`):
+
+- `maintain` and `all` run the scheduled fold and render all three.
+- `query` renders the two counters and no gauge. It folds only when someone
+  calls the on-demand `POST /api/v1/admin/fold` route it keeps, so an
+  on-demand fold's failures there are visible on `/metrics`, but nothing
+  makes such a fold recur and a liveness gauge would be stale by
+  construction on a healthy process.
+- `gateway` renders none of the three. It mounts no fold route at all and so
+  folds by neither route.
+
+The rule is the mode alone. `--disable-fold` still stops the loop inside a
+folding mode, which returns no fold tasks; such a process renders all three
+families and reports zeros permanently.
 
 The `ravel_catalog_fold_stamped_*` pair shares this prefix and is not part of
 this family. It is stamp coverage, documented under declared-column
-statistics below, and unlike the three liveness families it is omitted rather
-than rendered as zeros on any process that can fold by neither route -- a
-`maintain` process, and a `gateway` process run with `--disable-fold`.
+statistics below, and it follows a different rule: it is omitted rather than
+rendered as zeros on any process that can fold by neither route -- a
+`maintain` or `all` process run with `--disable-fold`, and a `gateway`
+process (which mounts no on-demand route either).
 
 The `signal` label is the family's per-signal keying, not a convenience. The
 fold runs as one independent task per signal, each with its own loop and no
@@ -338,10 +348,17 @@ page is checked against nothing; the shipped file's own annotations are.
 groups:
   - name: ravel-catalog-fold
     # RavelCatalogFoldStalled fires on any deployment where some signal has
-    # no fresh fold, which includes a fleet that never folds at all: an
-    # intentionally maintain-only fleet, or one running --disable-fold
-    # everywhere. Such a fleet must drop this rule or inhibit it; the state
-    # walkthrough below explains why that opt-out is deliberate.
+    # no fresh fold, which includes a fleet that never folds at all: a fleet
+    # running neither --mode maintain nor --mode all (the two modes that fold
+    # on a timer, ADR-1693), or one running --disable-fold everywhere. Such a
+    # fleet must drop this rule or inhibit it; the state walkthrough below
+    # explains why that opt-out is deliberate. A gateway-only or query-only
+    # fleet is in that class. Neither mode renders
+    # ravel_catalog_fold_last_success_timestamp_seconds, so the `absent()` arm
+    # is what fires there. A query process does render
+    # ravel_catalog_fold_cycles_total and _failures_total, for the on-demand
+    # `POST /api/v1/admin/fold` route it keeps; a gateway process folds by no
+    # route and emits no fold series at all.
     rules:
       - alert: RavelCatalogFoldStalled
         expr: |
@@ -385,11 +402,13 @@ groups:
 `max by (signal)`, not a bare `max()` and not a per-instance comparison. The
 grouping and the aggregation answer two different questions.
 
-The aggregation is fleet-wide because the fold loop skips its tick entirely
-when `HEAD` is already fresher than `fold_interval`. A replica whose peers are
-folding on schedule correctly does no folding of its own, and its own gauge is
-correctly stale; the fleet-wide maximum is the figure that answers "is this
-catalog being folded."
+The aggregation is fleet-wide because a replica legitimately folds only part
+of the fleet's work, or none of it. Each `maintain` process owns the
+tenant/signal pairs the rendezvous hash assigns it, so a pair it
+does not own is folded by a peer and never stamps its gauge, and the loop
+also skips its tick entirely when `HEAD` is already fresher than
+`fold_interval`. Either way a replica's own gauge can be correctly stale; the
+fleet-wide maximum is the figure that answers "is this catalog being folded."
 
 The grouping is by `signal` because there is no such thing as "the fold" to be
 alive or dead. There are three independent fold loops per process, one per
@@ -418,31 +437,28 @@ because there is no series to take one from; an alert from it renders an empty
 `{{ $labels.signal }}` and means the whole family stopped arriving, not that
 one signal stalled.
 
-Neither operand filters `mode`. Earlier revisions of this rule carried
-`mode!="maintain"` on both, and it is behaviour-neutral here: `render_catalog_family`
-runs in every mode, so a co-scraped `maintain` process contributes a permanent
-`0` to each signal's group, and `0` can never win a `max()` against any live
-gauge. Where the filter used to matter was a folding fleet that died beside a
-surviving `maintain` node, and the unfiltered form covers that state too, just
-through the other operand: the `0` is the only sample left in each group, so
-`time() - 0` clears any threshold and the staleness operand fires where the
-filtered form needed `absent()` to. Every state below is identical under both
-forms, so the rule carries the simpler expression. The filter also cannot be
-what makes an intentionally non-folding fleet quiet: such a fleet pages under
-both forms, for the reason in the opt-out paragraph below.
+Neither operand filters `mode`, and no `mode` filter would be correct.
+`maintain` is a folding mode: it runs the scheduled fold over the
+tenant/signal pairs the rendezvous hash assigns it, so its gauge is a live
+figure and an earlier `mode!="maintain"` filter would now discard the only
+fresh sample on a maintenance-only fleet. The modes that do not fold on a
+timer, `gateway` and `query`, render no fold series at all, so they cannot
+contribute a `0` that a filter would have to exclude either: the renderer
+does the mode selection, and the expression stays a plain aggregation over
+whatever series exist.
 
 The states, of the observed system rather than of the expression:
 
 | What the fleet is doing | Series at the scrape | Staleness operand | `absent()` operand | Alert |
 |---|---|---|---|---|
 | Nothing scraped at all | none | empty | fires | **fires** |
-| Only `maintain` nodes scraped, intentionally | 3, all `mode="maintain"` at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
-| Healthy folding fleet | 3 per process, all fresh | under threshold for all 3 signals | silent | silent |
-| Folding fleet scraped, every fold loop stalled | 3 per process, all stale | over threshold for all 3 signals | silent | **fires** |
-| Folding fleet dead, co-scraped `maintain` alive | 3, all `mode="maintain"` at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** |
-| One signal's loop dead, other two healthy | 3 per process; 2 fresh, 1 stale | over threshold for that one signal | silent | **fires** for that signal |
-| `--disable-fold` on every non-`maintain` process | 3 per process, all at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
-| Fleet whose tenants write only one signal | 3 per process, all fresh | under threshold for all 3 signals | silent | silent |
+| Only `gateway` and `query` nodes scraped, intentionally | none | empty | fires | **fires** (opt out) |
+| Healthy folding fleet | 3 per `maintain`/`all` process, all fresh | under threshold for all 3 signals | silent | silent |
+| Folding fleet scraped, every fold loop stalled | 3 per folding process, all stale | over threshold for all 3 signals | silent | **fires** |
+| Every `maintain` node dead, `gateway`/`query` nodes alive | none | empty | fires | **fires** |
+| One signal's loop dead, other two healthy | 3 per folding process; 2 fresh, 1 stale | over threshold for that one signal | silent | **fires** for that signal |
+| `--disable-fold` on every folding process | 3 per folding process, all at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
+| Fleet whose tenants write only one signal | 3 per folding process, all fresh | under threshold for all 3 signals | silent | silent |
 
 The last row is the one that would be a false page if the gauge tracked
 published snapshots rather than fold cycles. Every loop folds every discovered
@@ -453,18 +469,19 @@ ingesting only logs still has all three gauges fresh.
 Do any two rows produce identical telemetry while meaning different things?
 Yes, two pairs, and both are deliberate:
 
-- "Only `maintain` nodes scraped, intentionally" and "folding fleet dead,
-  co-scraped `maintain` alive" are byte-for-byte identical at the scrape: three
-  `mode="maintain"` series at `0` and nothing else. No arrangement of these
-  operands can tell an intended topology from a fleet-wide death, because the
-  dead processes' series are gone and absence carries no intent.
+- "Only `gateway` and `query` nodes scraped, intentionally" and "every
+  `maintain` node dead" are byte-for-byte identical at the scrape: no fold
+  series at all. No arrangement of these operands can tell an intended
+  topology from a fleet-wide death, because the dead processes' series are
+  gone and absence carries no intent.
 - "`--disable-fold` everywhere" and "every fold loop crashed before its first
   success" are likewise identical: every gauge at its `0` sentinel under a full
-  set of non-`maintain` series.
+  set of folding-mode series.
 
 Both pairs resolve the same way, and the rule fires loud on all four. A fleet
-that never folds -- maintain-only, or `--disable-fold` everywhere -- must opt
-out by dropping `RavelCatalogFoldStalled` or inhibiting it (the group comment
+that never folds -- one running neither `maintain` nor `all`, or
+`--disable-fold` everywhere -- must opt out by dropping
+`RavelCatalogFoldStalled` or inhibiting it (the group comment
 on the rule marks this). `--disable-fold` is documented elsewhere as a pure
 query-cost optimization, so an operator who sets it deliberately should expect
 this rule to page about ten minutes after start and should silence it as part

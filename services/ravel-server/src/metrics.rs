@@ -1838,6 +1838,17 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     // signal renders every cycle, whether or not its loop is still alive, so a
     // loop that has died leaves its own series standing and going stale
     // instead of vanishing into an aggregate its siblings keep fresh.
+    //
+    // The two counters render wherever a fold can run by either route
+    // (`Mode::renders_fold_counters`), so an on-demand fold's cycles and
+    // failures are visible on `/metrics` in the process that served it: a
+    // query process folds only through `POST /api/v1/admin/fold`, and
+    // `Catalog::fold` moves these counters whichever route called it. A
+    // gateway process folds by no route and renders no fold family at all.
+    if !mode.renders_fold_counters() {
+        return;
+    }
+
     fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
         [Label::Mode(mode), Label::Signal(signal)]
     }
@@ -1877,6 +1888,15 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     // succeeded since this process started, which is why the alert rule in
     // docs/guides/observability.md carries a `for:` long enough to cover a
     // freshly started process's first fold interval.
+    //
+    // Unlike the counters above it renders only where a fold runs on a
+    // SCHEDULE (ADR-1693 decision 5). Nothing makes an on-demand fold recur,
+    // so a gauge in a query process would age past the alert threshold on a
+    // healthy fleet and page for a fold nobody asked for.
+    if !mode.runs_scheduled_fold() {
+        return;
+    }
+
     write_header(
         out,
         "ravel_catalog_fold_last_success_timestamp_seconds",
@@ -1919,7 +1939,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
 /// rises; a family always present at zero would make those two cases read
 /// the same as a healthy idle fold. The gate asks whether this process can
 /// fold at all, by the background task or the on-demand route, rather than
-/// whether the mode permits one: a maintain process omits both families, and
+/// whether the mode permits one: a gateway process omits both families, and
 /// `--mode all --disable-fold` still renders them, because the admin fold
 /// route is mounted and a fold through it moves them. Those counters sit at
 /// zero until someone calls that route, which is the honest reading of a
@@ -5401,7 +5421,7 @@ pub struct MetricsState {
     /// into the same process-global totals, so either one opens the gate and
     /// only a process with neither omits the pair. Each single-route gate
     /// gets a different config wrong: following the mode alone leaves
-    /// `--mode gateway --disable-fold`, which can fold by neither route,
+    /// `--mode maintain --disable-fold`, which can fold by neither route,
     /// rendering both at a zero that never moves, reading as steady coverage
     /// instead of no fold at all; following the background task alone leaves
     /// `--mode all --disable-fold` rendering no family while an operator
@@ -7161,6 +7181,88 @@ mod tests {
             assert_eq!(
                 samples, 3,
                 "{family} must render one series per folded signal and no other:\n{body}"
+            );
+        }
+    }
+
+    /// The liveness gauge renders exactly in the modes that run the scheduled
+    /// fold (ADR-1693 decision 5): a gateway or query process folds only when
+    /// someone calls the on-demand route, so a gauge there is stale by
+    /// construction and its age fires the fold-liveness alert on a healthy
+    /// fleet. The two counters render one mode wider, wherever a fold can run
+    /// by either route, so an on-demand fold's failures are visible on
+    /// `/metrics` in the process that served it. A gateway folds by no route
+    /// and renders nothing. The same snapshot is rendered in all four modes
+    /// and the series count is pinned per family per mode, so gating that
+    /// dropped a mode that does fold fails here too.
+    #[test]
+    fn fold_families_render_only_in_the_modes_that_fold() {
+        let snapshot = CatalogCountersSnapshot {
+            fold: [
+                CatalogFoldCounters {
+                    signal: Signal::Metrics,
+                    cycles: 41,
+                    failures: 3,
+                    last_success_unix_ns: 1_758_000_123_500_000_000,
+                },
+                CatalogFoldCounters {
+                    signal: Signal::Logs,
+                    cycles: 17,
+                    failures: 0,
+                    last_success_unix_ns: 1_700_000_000_500_000_000,
+                },
+                CatalogFoldCounters {
+                    signal: Signal::Spans,
+                    cycles: 0,
+                    failures: 9,
+                    last_success_unix_ns: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        for (mode, expected_counters, expected_gauge) in [
+            (Mode::All, 3, 3),
+            (Mode::Maintain, 3, 3),
+            (Mode::Query, 3, 0),
+            (Mode::Gateway, 0, 0),
+        ] {
+            let mut out = String::new();
+            render_catalog_family(&mut out, mode, &snapshot);
+            for (family, expected_series) in [
+                ("ravel_catalog_fold_cycles_total", expected_counters),
+                ("ravel_catalog_fold_failures_total", expected_counters),
+                (
+                    "ravel_catalog_fold_last_success_timestamp_seconds",
+                    expected_gauge,
+                ),
+            ] {
+                let samples = out
+                    .lines()
+                    .filter(|line| {
+                        line.strip_prefix(family)
+                            .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+                    })
+                    .count();
+                assert_eq!(
+                    samples, expected_series,
+                    "{family} must render {expected_series} series in {mode:?}:\n{out}"
+                );
+                assert_eq!(
+                    out.lines()
+                        .filter(|line| line.starts_with(&format!("# TYPE {family} ")))
+                        .count(),
+                    usize::from(expected_series > 0),
+                    "{family} must declare its TYPE only where it renders samples, in {mode:?}:\n{out}"
+                );
+            }
+
+            // The families ABOVE the fold block are mode-independent: the gate
+            // must skip only the fold families, not truncate the whole catalog
+            // block.
+            assert!(
+                out.contains("ravel_catalog_isolation_breach_total{"),
+                "the non-fold catalog families render in every mode, including {mode:?}:\n{out}"
             );
         }
     }

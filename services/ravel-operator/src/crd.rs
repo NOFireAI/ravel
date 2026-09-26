@@ -215,8 +215,11 @@ pub struct GatewaySpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_secret_ref: Option<LocalSecretRef>,
 
-    /// Catalog fold tuning. Fold is a pure query-cost optimization and only
-    /// runs in the gateway tier, so it is a gateway-only field.
+    /// Retired by ADR-1693: the scheduled fold moved to the maintain tier, and
+    /// `ravel-server` now refuses either fold flag in `--mode gateway`. The
+    /// field is still parsed so a cluster that sets it gets a `Degraded`
+    /// condition naming `maintain.fold` instead of having its setting dropped
+    /// on the floor. Set `maintain.fold` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fold: Option<FoldSpec>,
 
@@ -254,7 +257,7 @@ pub struct GatewaySpec {
     /// It caps how many flushes a shard actor runs at once, so one tenant's
     /// stalled flush cannot block co-resident tenants beyond this many permits.
     /// Ingest runs only in the gateway tier (the query and maintain modes never
-    /// enter the ingest path), so this is a gateway-only field, like `fold`.
+    /// enter the ingest path), so this is a gateway-only field.
     /// Omit to keep `ravel-server`'s own default of 1 (today's non-pipelined
     /// behavior). The CRD schema enforces a minimum of 1 at admission:
     /// `ravel-server` rejects 0 as a flush deadlock.
@@ -633,6 +636,14 @@ pub struct MaintainSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
 
+    /// Catalog fold tuning, rendered onto this tier alone (ADR-1693). The
+    /// scheduled fold runs in `--mode maintain` and `--mode all`, so these are
+    /// the only replicas the flags reach; a `maintain` tier turned off by
+    /// `enabled: false` renders no fold flags because it renders no
+    /// Deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<FoldSpec>,
+
     /// Container resource requests/limits. Omit to render the default request
     /// of `100m` CPU / `256Mi` memory and no limits
     /// ([`MAINTAIN_DEFAULT_CPU_REQUEST`], [`MAINTAIN_DEFAULT_MEMORY_REQUEST`]).
@@ -659,6 +670,7 @@ impl Default for MaintainSpec {
             enabled: default_true(),
             replicas: default_replicas(),
             interval_secs: None,
+            fold: None,
             resources: None,
             credentials_secret_ref: None,
         }

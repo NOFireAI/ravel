@@ -27,11 +27,14 @@ folds, snapshots), the read path (snapshot resolution, pruning, segment
 fetch, caching), the two query engines (a PromQL evaluator and a
 DataFusion-based SQL engine), and maintenance (compaction, retention, the
 garbage-collection sweep, the integrity scrubber). Each mode enables a
-subset. `gateway` runs ingest and the catalog fold. `query` runs the read
-path, both engines, the fold, and alert-rule evaluation. `maintain` runs
-maintenance and nothing else. `all` is `gateway` plus `query` in one
-process; it does not run maintenance, so a deployment with no `maintain`
-process never compacts or deletes anything.
+subset. `gateway` runs ingest. `query` runs the read path, both engines, and
+alert-rule evaluation. `maintain` runs maintenance and the scheduled catalog
+fold, partitioned across its replicas by the same ownership rule maintenance
+units use (ADR-1693). `all` is `gateway` plus `query` in one process, plus
+the fold over everything; it does not run maintenance, so a deployment with
+no `maintain` process never compacts or deletes anything. A deployment with
+neither a `maintain` nor an `all` process never folds on a timer either,
+though `query` and `all` keep the on-demand fold route.
 
 The ingest surfaces are OTLP over HTTP and gRPC, Prometheus Remote Write,
 and OTAP behind a cargo feature. The query surfaces are the
