@@ -307,7 +307,13 @@ from what the rotation has observed:
 
 A GET that fails with a retryable error (throttled, timeout, transient), of a
 commit record or of an object it names, stops the tick with the marker behind
-that unit, and the next tick retries all of it. Any other GET error except
+that unit, and the next tick retries all of it. The hold is capped: after six
+consecutive held ticks on one position (six hours of tick cadence at the
+default one-hour tick, less when a short `--scrub-period` shrinks the tick),
+the next tick moves past the unit and counts each of its records and objects
+that still fails on `ravel_scrub_unreadable_total{reason="retry_exhausted"}`.
+`ravel_scrub_marker_held_ticks` reads the current count for the signal's worst
+shard. Any other GET error except
 not-found, and a record whose bytes do not decode, is counted once on
 `ravel_scrub_unreadable_total` (at the level of the object or record that
 failed, `reason="access_denied"` or `reason="permanent"`) and the marker moves

@@ -637,8 +637,10 @@ groups:
             is a key policy, bucket policy or credential fault on the maintain
             process and recurs every rotation until fixed; reason="permanent"
             is any other store error retrying cannot clear, or a record that
-            does not decode. The ERROR log line beside each count names the
-            key.
+            does not decode; reason="retry_exhausted" is a read that kept
+            failing retryably for six held ticks and once more, after which
+            the scrub moved past it. The ERROR log line beside each count
+            names the key.
           as_documented: >-
             The guide states this condition with no duration, so no for: is
             set.

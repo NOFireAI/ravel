@@ -3420,6 +3420,10 @@ pub struct ScrubSignalSnapshot {
     /// at the catch-up ceiling for this signal: `ravel_scrub_behind_total`
     /// (ADR-1686 amendment).
     pub rotation_behind: u64,
+    /// Consecutive ticks the worst shard of this signal has held its marker
+    /// on one unit whose GETs fail retryably, as of the last scrub cycle:
+    /// `ravel_scrub_marker_held_ticks`.
+    pub marker_held_ticks: u64,
 }
 
 /// One scrape's at-rest scrubber counters (ADR-0059 decisions 1, 3), per
@@ -3483,7 +3487,10 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
          read, and ravel_scrub_checksum_mismatch_total counts only bytes that were read and did \
          not match. reason=\"access_denied\" is a GET the store refused as access denied (a \
          bucket or key policy, or a credential fault); reason=\"permanent\" is any other GET \
-         error retrying cannot clear, or a record whose bytes do not decode. An object counts \
+         error retrying cannot clear, or a record whose bytes do not decode; \
+         reason=\"retry_exhausted\" is a GET that still failed with a retryable error after its \
+         unit held the marker for the maximum number of ticks (see \
+         ravel_scrub_marker_held_ticks), so the scrub moved past it. An object counts \
          once at its own level; a record counts once at the record's own level (l0 a commit \
          record, l1 a compaction record, rewrite a rewrite record) however many objects it \
          names, and those objects go unverified this rotation. An object or record deleted after \
@@ -3581,13 +3588,14 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
          (ADR-1686 amendment): the entries the tick needed to reach the end of the listing by the \
          deadline exceeded four times the rotation's sustained rate, the most one tick may take. \
          The window is --scrub-period P, capped at half the tenant's retention window. Causes: a \
-         shard whose sustained commit rate is above four times the measured sustained rate; \
-         scrub cycles that take longer than a tick, so fewer ticks run than the window allows; \
-         or a marker held on a unit whose GETs keep failing with a retryable error. Changing P \
-         does not help with the first, since the needed rate and the ceiling both scale with \
-         1/window. A nonzero increase means some objects may expire before they are verified; \
-         the log line beside it names the entries per tick needed and allowed, the window, and \
-         P.",
+         shard whose sustained commit rate is above four times the measured sustained rate, or \
+         scrub cycles that take longer than a tick, so fewer ticks run than the window allows. \
+         Changing P does not help with the first, since the needed rate and the ceiling both \
+         scale with 1/window. A marker held on a unit whose GETs keep failing retryably \
+         increments this only once the lost ticks push the needed rate past the ceiling, so it \
+         is not the signal for a held marker: ravel_scrub_marker_held_ticks is. A nonzero \
+         increase means some objects may expire before they are verified; the log line beside \
+         it names the entries per tick needed and allowed, the window, and P.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -3596,6 +3604,27 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
             "ravel_scrub_behind_total",
             &labels(mode, signal.signal),
             signal.rotation_behind,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_scrub_marker_held_ticks",
+        "Consecutive scrub ticks the worst shard of this signal has held its content-tier marker \
+         on one unit because a GET of it failed with a retryable error (throttled, timeout, \
+         transient), as of the last scrub cycle (ADR-1686 amendment). 0 when no shard is held. \
+         After 6 held ticks, six hours of tick cadence at the default one-hour tick, the next \
+         tick moves past the unit and counts each of its records and objects that still fail \
+         on ravel_scrub_unreadable_total{reason=\"retry_exhausted\"}. A value that keeps \
+         returning to 6 means the store keeps failing that shard's reads.",
+        "gauge",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_scrub_marker_held_ticks",
+            &labels(mode, signal.signal),
+            signal.marker_held_ticks,
         );
     }
 }
@@ -5590,6 +5619,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 seal_divergence_mismatched: metrics.seal_divergence_mismatched(signal),
                 cursor_position: metrics.cursor_position(signal),
                 rotation_behind: metrics.rotation_behind(signal),
+                marker_held_ticks: metrics.marker_held_ticks(signal),
             })
             .collect(),
     });
@@ -8451,6 +8481,7 @@ mod tests {
                     seal_divergence_mismatched: 4,
                     cursor_position: 0.5,
                     rotation_behind: 7,
+                    marker_held_ticks: 3,
                 },
                 ScrubSignalSnapshot {
                     signal: Signal::Logs,
@@ -8461,6 +8492,7 @@ mod tests {
                     seal_divergence_mismatched: 0,
                     cursor_position: 0.0,
                     rotation_behind: 0,
+                    marker_held_ticks: 0,
                 },
             ],
         };
@@ -8536,6 +8568,14 @@ mod tests {
                 .count(),
             18,
             "two signals by three levels by three reasons, zeros included"
+        );
+        assert!(
+            body.contains("ravel_scrub_marker_held_ticks{mode=\"maintain\",signal=\"metrics\"} 3"),
+            "missing marker_held_ticks gauge sample:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_scrub_marker_held_ticks gauge"),
+            "marker_held_ticks must carry a gauge TYPE header:\n{body}"
         );
         assert!(
             body.contains(

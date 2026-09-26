@@ -30,7 +30,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the request cap; the LIST-only count passes are not. A unit where a record or
   object GET failed with a retryable error (throttled, timeout, transient) does
   not move the marker past it and counts nothing from it, so the next tick
-  retries the whole unit. A record or object GET that fails with any other
+  retries the whole unit. That hold is capped at six consecutive held ticks on
+  one position, six hours of tick cadence at the default one-hour tick (at most
+  6.6 with the loop's start jitter): the tick after that moves past the unit
+  and counts each record or object that still fails retryably on
+  `ravel_scrub_unreadable_total{reason="retry_exhausted"}`, and the new gauge
+  `ravel_scrub_marker_held_ticks{signal}` reads the current held count of the
+  signal's worst shard. A record or object GET that fails with any other
   error except not-found, and a record whose bytes do not decode, is counted
   once on the new `ravel_scrub_unreadable_total{signal, level, reason}` (with
   `reason="access_denied"` or `reason="permanent"`, at the level of the object

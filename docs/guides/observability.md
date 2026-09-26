@@ -1461,11 +1461,12 @@ counters. These carry no `tenant_hash` label.
 | Metric | Meaning |
 |---|---|
 | `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), by signal and level. Only bytes that were read and did not match count here. |
-| `ravel_scrub_unreadable_total` | Objects and records the scrub could not read, and so could not verify, by signal, level, and reason. `reason="access_denied"` is a GET the store refused as access denied (a bucket or key policy, or a credential fault); `reason="permanent"` is any other GET error retrying cannot clear, or a record whose bytes do not decode. An object counts once at its own level; a record counts once at its own level (`l0` a commit record, `l1` a compaction record, `rewrite` a rewrite record) however many objects it names. An object or record deleted after it was listed is not counted. |
+| `ravel_scrub_unreadable_total` | Objects and records the scrub could not read, and so could not verify, by signal, level, and reason. `reason="access_denied"` is a GET the store refused as access denied (a bucket or key policy, or a credential fault); `reason="permanent"` is any other GET error retrying cannot clear, or a record whose bytes do not decode; `reason="retry_exhausted"` is a GET that still failed with a retryable error after its unit had held the marker for the maximum number of ticks, so the scrub moved past it. An object counts once at its own level; a record counts once at its own level (`l0` a commit record, `l1` a compaction record, `rewrite` a rewrite record) however many objects it names. An object or record deleted after it was listed is not counted. |
 | `ravel_scrub_postings_disagreement_total` | Objects whose covering name-postings object omitted a `__name__` the object really carries (a false negative), by signal. |
 | `ravel_scrub_seal_divergence_total` | Divergences between the folded snapshot and the re-listed sealed commit history, by signal and reason. |
 | `ravel_scrub_cursor_position` | Gauge. Fraction of the current scrub rotation's commit shard listing entries the content-tier cursor has consumed so far, by signal, in [0,1]. The unit is listing entries (commit, compaction, and rewrite records and tombstones), not data objects: one compaction record can name several parts. |
-| `ravel_scrub_behind_total` | Shard ticks whose content-tier rotation cannot finish inside its window (`--scrub-period`, capped at half the tenant's retention window), by signal: the entries the tick needed to reach the end of the listing by the deadline exceeded four times the rotation's sustained rate. Causes are a sustained commit rate above four times the measured sustained rate, scrub cycles slower than a tick, or a marker held on a unit whose GETs keep failing with a retryable error. A nonzero increase means some objects may expire before they are verified; the log line beside it names the entries per tick needed and allowed, the window, and the period. |
+| `ravel_scrub_behind_total` | Shard ticks whose content-tier rotation cannot finish inside its window (`--scrub-period`, capped at half the tenant's retention window), by signal: the entries the tick needed to reach the end of the listing by the deadline exceeded four times the rotation's sustained rate. Causes are a sustained commit rate above four times the measured sustained rate, or scrub cycles slower than a tick. A marker held on a unit whose GETs keep failing retryably increments it only once the lost ticks push the needed rate past the ceiling, so it is not the signal for a held marker; `ravel_scrub_marker_held_ticks` is. A nonzero increase means some objects may expire before they are verified; the log line beside it names the entries per tick needed and allowed, the window, and the period. |
+| `ravel_scrub_marker_held_ticks` | Gauge. Consecutive ticks the worst shard of the signal has held its content-tier marker on one unit because a GET of it failed with a retryable error (throttled, timeout, transient), as of the last scrub cycle; 0 when no shard is held. After 6 held ticks, six hours of tick cadence at the default one-hour tick, the next tick moves past the unit and counts each of its records and objects that still fail on `ravel_scrub_unreadable_total{reason="retry_exhausted"}`. |
 
 `ravel_scrub_checksum_mismatch_total` is the one to alert on for any increase:
 Ravel keeps no redundant copy to repair a corrupt object from, so a nonzero
@@ -1480,7 +1481,10 @@ still lists as live joins the same rotation an L0 segment does.
 Alert on any increase all the same, because what it counts stays unverified
 until a later rotation reads it, and an access denial, from a key policy, a
 bucket policy, or credentials the maintain process lost, recurs every rotation
-until it is fixed.
+until it is fixed. A `reason="retry_exhausted"` count follows a
+`ravel_scrub_marker_held_ticks` that climbed to 6: the store failed that unit's
+reads on six ticks in a row and again on the seventh, and the scrub moved past
+it rather than leave the rest of the shard unverified.
 
 The lineage filter applies to those output parts only, and it leaves out three
 shapes. A compaction or rewrite record that a later rewrite record names in

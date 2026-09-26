@@ -292,14 +292,27 @@ tick takes `ceil(remaining entries / ticks remaining)`, floored at the
 sustained rate `ceil(estimated * tick / rotation)` so an early tick never
 coasts, and capped at `SCRUB_MAX_CATCHUP`
 (4) times that sustained rate so one late tick cannot ask for the whole
-corpus at once. Termination: the walk consumes at least the sustained rate
-every tick, and the sustained rate is computed from the current estimate, so
-a shard appending fewer entries per tick than the sustained rate strictly
-closes the gap every tick and the rotation reaches the end of the listing
-inside its window. A shard appending faster than that cannot be caught, and
-that case is reported rather than hidden: when the needed rate exceeds the
-catch-up ceiling the tick logs both numbers with the rotation window and the
-configured period, and increments `ravel_scrub_behind_total{signal}`.
+corpus at once. Termination: every tick that does not hold its marker (see
+below) consumes at least the sustained rate, and the sustained rate is
+computed from the current estimate, so a shard appending fewer entries per
+tick than the sustained rate strictly closes the gap on every such tick and
+the rotation reaches the end of the listing inside its window. A tick that
+holds consumes less, possibly nothing, but a hold is capped: after
+`MAX_HELD_TICKS` (6) consecutive held ticks on one marker position the next
+tick consumes the unit whatever its GETs return, so no unit costs the walk
+more than seven ticks, and the ticks left before the deadline divide the
+remainder between them, up to the catch-up ceiling. The cap is what makes
+this argument hold for a unit whose error the store keeps reporting as
+retryable though it never clears, which would otherwise pin the shard for
+good, with unlimited retention as much as with any other. A shard appending
+faster than the sustained rate cannot be caught, and neither can a rotation
+that loses more ticks to holds than the ceiling can make up; both are
+reported rather than hidden: when the needed rate exceeds the catch-up
+ceiling the tick logs both numbers with the rotation window and the
+configured period, and increments `ravel_scrub_behind_total{signal}`. That
+counter does not report a hold as it happens, since a hold near the end of
+the listing or early in a rotation leaves the needed rate under the ceiling;
+`ravel_scrub_marker_held_ticks{signal}` does.
 
 **Requests are bounded, not just entries.** Every listing page the walk
 draws, every context page an hour re-list costs, and every record GET
@@ -326,6 +339,21 @@ whole-object read) follow the same rule: a retryable error holds the marker
 behind the unit, `NotFound` is skipped, and any other error is counted on
 `ravel_scrub_unreadable_total` at the object's level. A held unit counts
 nothing it found, since the next tick verifies all of it again.
+
+**A hold is capped.** The cursor persists `held_ticks`, the consecutive
+ticks that held the marker on its current position, reset whenever the
+marker moves, and `ravel_scrub_marker_held_ticks{signal}` reads the largest
+value any shard of the signal reported in the last cycle. Once it reaches
+`MAX_HELD_TICKS`, the next tick consumes that unit: it tries each of the
+unit's objects once, counts every record or object that still fails
+retryably once on `ravel_scrub_unreadable_total{reason="retry_exhausted"}`
+at its own level with an error log naming the unit, counts everything else
+it found as it would for any consumed unit, and moves on. `MAX_HELD_TICKS`
+is `6 h / DEFAULT_SCRUB_TICK` = 6. No tick is longer than
+`DEFAULT_SCRUB_TICK` (one hour), so a hold ends within six tick intervals of
+its first held tick: six hours of cadence, at most 6.6 with the loop's 10%
+start jitter, plus the time the cycles themselves take, and less when a
+short `--scrub-period` shrinks the tick.
 
 **A late record is judged against its whole hour.** Decision 4 sent every
 record that lands behind the marker to the next rotation. That is true only

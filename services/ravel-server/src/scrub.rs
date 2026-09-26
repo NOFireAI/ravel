@@ -83,6 +83,11 @@
 //!    `Timeout`, `Transient`) is not consumed: nothing it found is counted,
 //!    the marker stays behind it and the tick ends, so the next tick retries
 //!    the whole unit rather than skipping its objects for a whole rotation.
+//!    The cursor counts consecutive held ticks on one marker position
+//!    (`ravel_scrub_marker_held_ticks`), and once [`MAX_HELD_TICKS`] have held
+//!    the next tick stops retrying: it consumes the unit, tries each of its
+//!    objects once, and counts every record or object that still fails
+//!    retryably on `ravel_scrub_unreadable_total{reason="retry_exhausted"}`.
 //!    Every other failure moves the marker on. A GET that fails with an error
 //!    retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`, and
 //!    every other kind but `NotFound`), and a record whose bytes do not
@@ -188,6 +193,22 @@ pub const DEFAULT_SCRUB_PERIOD: Duration = Duration::from_secs(7 * 86_400);
 /// period), the tick shrinks to `P` so the whole corpus is covered in one tick.
 const DEFAULT_SCRUB_TICK: Duration = Duration::from_secs(3600);
 
+/// The longest a unit whose GETs keep failing retryably may hold the marker,
+/// counted in tick cadence: long enough to ride out a throttling storm or a
+/// regional store incident, and no more than half the rotation of a tenant
+/// that retains a day or more.
+const MAX_MARKER_HOLD: Duration = Duration::from_secs(6 * 3600);
+
+/// Consecutive held ticks on one marker position after which the next tick
+/// stops retrying the unit, moves past it, and counts every object in it that
+/// still failed as `reason="retry_exhausted"`. `MAX_MARKER_HOLD /
+/// DEFAULT_SCRUB_TICK` = 6: no tick is longer than `DEFAULT_SCRUB_TICK`, so a
+/// hold ends within six tick intervals of its first held tick, six hours of
+/// cadence at the default tick (at most 6.6 with the loop's 10% start jitter,
+/// plus the time the cycles themselves take) and less when a short
+/// `--scrub-period` shrinks the tick.
+pub const MAX_HELD_TICKS: u32 = (MAX_MARKER_HOLD.as_secs() / DEFAULT_SCRUB_TICK.as_secs()) as u32;
+
 /// Position of `signal` within [`MAINTAINED_SIGNALS`], and therefore within
 /// [`ScrubMetrics`]'s per-signal arrays. Exhaustive over the signals this task
 /// loops over; a signal from outside that set is a caller bug, matching
@@ -279,10 +300,14 @@ pub struct ScrubMetrics {
     rotation_total: [AtomicU64; MAINTAINED_SIGNALS.len()],
     /// Shard ticks whose rotation cannot finish inside its window at the
     /// catch-up ceiling, per signal. `ravel_scrub_behind_total`: a nonzero
-    /// rate means a sustained commit rate above the ceiling, cycles slower
-    /// than a tick, or a marker held on a unit that keeps failing retryably,
-    /// and some objects may expire unverified.
+    /// rate means a sustained commit rate above the ceiling or cycles slower
+    /// than a tick, and some objects may expire unverified. A held marker
+    /// reaches it only once the lost ticks push the needed rate past the
+    /// ceiling; `marker_held_ticks` is what reports a hold.
     rotation_behind: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// The most consecutive held ticks any shard of this signal reported in
+    /// the last cycle, per signal: `ravel_scrub_marker_held_ticks`.
+    marker_held_ticks: [AtomicU64; MAINTAINED_SIGNALS.len()],
 }
 
 impl ScrubMetrics {
@@ -311,6 +336,12 @@ impl ScrubMetrics {
     /// allotted window, for `signal`.
     pub fn rotation_behind(&self, signal: Signal) -> u64 {
         self.rotation_behind[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Consecutive held ticks on one marker position for the worst shard of
+    /// `signal` in the last cycle.
+    pub fn marker_held_ticks(&self, signal: Signal) -> u64 {
+        self.marker_held_ticks[signal_index(signal)].load(Ordering::Relaxed)
     }
 
     /// Fraction of the current rotation covered so far for `signal`, in
@@ -352,6 +383,11 @@ impl ScrubMetrics {
 
     fn record_rotation_behind(&self, signal: Signal) {
         self.rotation_behind[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_marker_held_ticks(&self, signal: Signal, held_ticks: u32) {
+        self.marker_held_ticks[signal_index(signal)]
+            .store(u64::from(held_ticks), Ordering::Relaxed);
     }
 
     fn record_cursor_position(&self, signal: Signal, covered: u64, total: u64) {
@@ -507,6 +543,7 @@ pub async fn run_cycle(
     };
 
     let clock = WallClock;
+    let mut worst_held = [0u32; MAINTAINED_SIGNALS.len()];
     for tenant in &outcome.maintained {
         // A rotation must not outlive the data it verifies: an object retention
         // deletes before the walk reaches it is never verified at all. Half the
@@ -572,7 +609,7 @@ pub async fn run_cycle(
                 if !worker.owns_unit(live_set, tenant, signal, shard) {
                     continue;
                 }
-                run_shard_tick(
+                let held = run_shard_tick(
                     store,
                     &clock,
                     tenant,
@@ -585,6 +622,8 @@ pub async fn run_cycle(
                     metrics,
                 )
                 .await;
+                let worst = &mut worst_held[signal_index(signal)];
+                *worst = (*worst).max(held.unwrap_or(0));
             }
             // Seal-divergence tier (ADR-0059 decision 2): once per
             // (tenant, signal) per tick, not per shard and not gated behind the
@@ -598,6 +637,9 @@ pub async fn run_cycle(
                 run_seal_divergence_tick(store, tenant, signal, metrics).await;
             }
         }
+    }
+    for signal in MAINTAINED_SIGNALS {
+        metrics.record_marker_held_ticks(signal, worst_held[signal_index(signal)]);
     }
 }
 
@@ -690,6 +732,9 @@ async fn scan_shards(
 /// walk never builds the whole corpus: it lists and GETs only the entries this
 /// tick consumes, plus at most one partial page. Every store error is logged
 /// and the tick is retried next cycle; nothing here mutates durable data.
+///
+/// Returns the cursor's consecutive held ticks after the tick, or `None` when
+/// the tick was skipped before it could walk.
 #[allow(clippy::too_many_arguments)]
 async fn run_shard_tick(
     store: &dyn ObjectStoreBackend,
@@ -702,7 +747,7 @@ async fn run_shard_tick(
     retention_secs: Option<u64>,
     covering: Option<&ravel_catalog::LoadedCoveringPostings>,
     metrics: &ScrubMetrics,
-) {
+) -> Option<u32> {
     let prefix = match keys::commit_shard_prefix(tenant, signal, shard) {
         Ok(prefix) => prefix,
         Err(err) => {
@@ -710,13 +755,11 @@ async fn run_shard_tick(
                 tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
                 "scrub: could not build commit shard prefix; skipping shard this tick"
             );
-            return;
+            return None;
         }
     };
 
-    let Some(mut cursor) = load_cursor(store, tenant, signal, shard, clock.now_ns()).await else {
-        return;
-    };
+    let mut cursor = load_cursor(store, tenant, signal, shard, clock.now_ns()).await?;
     if cursor.needs_entry_count() {
         match count_entries_after(store, &prefix, None).await {
             Ok(tally) => cursor.start_rotation(&tally, clock.now_ns()),
@@ -725,7 +768,7 @@ async fn run_shard_tick(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
                     "scrub: LIST-only entry count failed; rotation not started, retried next tick"
                 );
-                return;
+                return None;
             }
         }
     } else {
@@ -782,7 +825,11 @@ async fn run_shard_tick(
     // record or object that was not found or failed with an error retrying
     // cannot clear, and a record that failed to decode, move the marker on, so
     // one bad record cannot pin the rotation; those that were found but could
-    // not be read are counted as unreadable.
+    // not be read are counted as unreadable. A unit that has already held the
+    // marker for `MAX_HELD_TICKS` consecutive ticks is this tick's first unit,
+    // and it is consumed whatever its GETs return.
+    let give_up = cursor.held_ticks >= MAX_HELD_TICKS;
+    let mut first_unit = true;
     let mut listing = MarkerListing::new(store, &prefix, cursor.last_commit_key.clone());
     let mut slice_entries = 0u64;
     let mut requests = 0u64;
@@ -806,9 +853,10 @@ async fn run_shard_tick(
         requests = requests
             .saturating_add((listing.pages - pages_before) as u64)
             .saturating_add(unit.context_pages);
+        let exhausted = give_up && std::mem::replace(&mut first_unit, false);
         let outcome = unit_targets(store, &unit).await;
         requests = requests.saturating_add(outcome.gets);
-        if outcome.retry {
+        if outcome.retry() && !exhausted {
             // Leave the marker where it is: this unit is retried next tick.
             unit_held = true;
             break;
@@ -824,6 +872,7 @@ async fn run_shard_tick(
             shard,
             &outcome.targets,
             covering_postings,
+            exhausted,
         )
         .await
         else {
@@ -832,6 +881,25 @@ async fn run_shard_tick(
             unit_held = true;
             break;
         };
+        if exhausted {
+            tracing::error!(
+                tenant = %tenant.to_hex(), signal = ?signal, shard,
+                unit_key = %unit.advance.first().map(String::as_str).unwrap_or_default(),
+                held_ticks = cursor.held_ticks,
+                "scrub: unit held the marker for the maximum number of ticks; moving past it, \
+                 and what still failed retryably is counted as retry_exhausted"
+            );
+            for record in outcome.retried.iter().filter(|record| record.advancing) {
+                tracing::error!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard,
+                    record_key = %record.key, level = record.level.as_str(),
+                    error = %record.error,
+                    "scrub: record GET still failing retryably after the hold cap; counted as \
+                     retry_exhausted, the objects it names are not verified this rotation"
+                );
+                metrics.record_unreadable(signal, record.level, UnreadableReason::RetryExhausted);
+            }
+        }
         for record in &outcome.unreadable {
             tracing::error!(
                 tenant = %tenant.to_hex(), signal = ?signal, shard, record_key = %record.key,
@@ -851,6 +919,9 @@ async fn run_shard_tick(
         }
         slice_entries = slice_entries.saturating_add(entries);
     }
+    if unit_held {
+        cursor.hold();
+    }
     let rotation_complete = !listing_failed && !unit_held && listing.ended();
 
     // Cursor-position gauge (ADR-1686 decision 5): listing entries consumed
@@ -865,6 +936,7 @@ async fn run_shard_tick(
     }
 
     persist_cursor(store, tenant, signal, shard, &cursor).await;
+    Some(cursor.held_ticks)
 }
 
 /// Verify one unit's objects. Split out of [`run_shard_tick`] so verification
@@ -872,7 +944,9 @@ async fn run_shard_tick(
 ///
 /// Returns each object's result in slice order, or `None` as soon as one
 /// object's GET fails with a retryable error: the caller then holds the marker
-/// behind the unit and the next tick verifies all of it again.
+/// behind the unit and the next tick verifies all of it again. When
+/// `exhausted` (the unit has used up its held ticks) every object is tried
+/// once and a retryable failure is returned in place like any other result.
 #[allow(clippy::too_many_arguments)]
 async fn verify_slice(
     store: &dyn ObjectStoreBackend,
@@ -882,6 +956,7 @@ async fn verify_slice(
     shard: u32,
     slice: &[SliceEntry],
     covering_postings: Option<ravel_maintain::CoveringPostings<'_>>,
+    exhausted: bool,
 ) -> Option<Vec<ScrubResult>> {
     let mut verdicts = Vec::with_capacity(slice.len());
     for entry in slice {
@@ -903,6 +978,7 @@ async fn verify_slice(
             detail,
             retryable: true,
         } = &verdict
+            && !exhausted
         {
             tracing::warn!(
                 tenant = %tenant.to_hex(), signal = ?signal, shard,
@@ -963,11 +1039,23 @@ fn record_verdicts(
                 );
                 metrics.record_postings_disagreement(signal);
             }
+            ScrubResult::ReadError {
+                detail,
+                retryable: true,
+            } => {
+                // Only a unit that used up its held ticks gets here with a
+                // retryable error; otherwise `verify_slice` holds the unit.
+                tracing::error!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
+                    level = level.as_str(), detail = %detail,
+                    "scrub: object GET still failing retryably after the hold cap; counted as \
+                     retry_exhausted, not verified this rotation"
+                );
+                metrics.record_unreadable(signal, level, UnreadableReason::RetryExhausted);
+            }
             ScrubResult::ReadError { detail, .. } => {
                 // A missing object or an input/decode inconsistency: a retry
-                // would hit it again, and it is not bit rot either. The
-                // retryable kind never reaches here; `verify_slice` holds the
-                // unit on it.
+                // would hit it again, and it is not bit rot either.
                 tracing::warn!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
                     detail = %detail,
@@ -1242,17 +1330,34 @@ struct UnitOutcome {
     /// tick's request budget, since a failing GET costs a request and moves no
     /// bytes.
     gets: u64,
-    /// A record GET failed with a retryable error ([`StoreError::is_retryable`]:
-    /// throttled, timeout, transient). The caller leaves the marker behind this
-    /// unit and retries it next tick, rather than skipping objects it never
-    /// verified.
-    retry: bool,
+    /// Records whose GET failed with a retryable error
+    /// ([`StoreError::is_retryable`]: throttled, timeout, transient). Any
+    /// entry makes the caller leave the marker behind this unit and retry it
+    /// next tick, rather than skip objects it never verified.
+    retried: Vec<RetriedRecord>,
     /// Records of this unit's `advance` set that could not be read: a GET that
     /// failed with an error retrying cannot clear (anything but `NotFound` and
     /// the retryable kinds), or bytes that do not decode. Each counts once on
     /// `ravel_scrub_unreadable_total` once the unit is consumed, and the marker
     /// moves past it, so one unreadable record cannot pin the rotation.
     unreadable: Vec<UnreadableRecord>,
+}
+
+impl UnitOutcome {
+    /// Whether a record GET failed retryably, so the unit should be held.
+    fn retry(&self) -> bool {
+        !self.retried.is_empty()
+    }
+}
+
+/// One record whose GET failed retryably. `advancing` is false for a context
+/// record an earlier tick consumed: its failure holds the unit, since lineage
+/// selection needs it, but it is not this unit's to count.
+struct RetriedRecord {
+    key: String,
+    level: ScrubLevel,
+    advancing: bool,
+    error: String,
 }
 
 /// One record a unit could not read, counted at the record's own level.
@@ -1295,12 +1400,17 @@ fn note_record_get_failure(
     err: &StoreError,
     level: ScrubLevel,
     advancing: bool,
-    retry: &mut bool,
+    retried: &mut Vec<RetriedRecord>,
     unreadable: &mut Vec<UnreadableRecord>,
 ) {
     match classify_get_failure(err) {
         GetFailure::Retry => {
-            *retry = true;
+            retried.push(RetriedRecord {
+                key: key.to_string(),
+                level,
+                advancing,
+                error: err.to_string(),
+            });
             tracing::warn!(
                 key = %key, error = %err,
                 "scrub: {what} GET failed with a retryable error; unit held, retried next tick"
@@ -1366,7 +1476,7 @@ fn note_record_decode_failure(
 /// no object is verified twice in one rotation.
 async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcome {
     let mut gets = 0u64;
-    let mut retry = false;
+    let mut retried: Vec<RetriedRecord> = Vec::new();
     let mut unreadable: Vec<UnreadableRecord> = Vec::new();
     let lineage: &[String] = if unit.context.is_empty() {
         &unit.advance
@@ -1420,7 +1530,7 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                             &err,
                             ScrubLevel::L0,
                             advancing.contains(key.as_str()),
-                            &mut retry,
+                            &mut retried,
                             &mut unreadable,
                         );
                         continue;
@@ -1473,7 +1583,7 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                             &err,
                             ScrubLevel::L1,
                             advancing.contains(key.as_str()),
-                            &mut retry,
+                            &mut retried,
                             &mut unreadable,
                         );
                         continue;
@@ -1509,7 +1619,7 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                             &err,
                             ScrubLevel::Rewrite,
                             advancing.contains(key.as_str()),
-                            &mut retry,
+                            &mut retried,
                             &mut unreadable,
                         );
                         continue;
@@ -1666,7 +1776,7 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
     UnitOutcome {
         targets: out,
         gets,
-        retry,
+        retried,
         unreadable,
     }
 }
@@ -1710,6 +1820,8 @@ struct PersistedCursor {
     rotation_tail_dir: Option<String>,
     #[serde(default)]
     rotation_tail_entries: u64,
+    #[serde(default)]
+    held_ticks: u32,
 }
 
 /// Load this shard's persisted cursor, or a fresh one at the start of a
@@ -1746,6 +1858,7 @@ async fn load_cursor(
                 rotation_appended_entries: persisted.rotation_appended_entries,
                 rotation_tail_dir: persisted.rotation_tail_dir,
                 rotation_tail_entries: persisted.rotation_tail_entries,
+                held_ticks: persisted.held_ticks,
             }),
             Err(err) => {
                 tracing::warn!(
@@ -1789,6 +1902,7 @@ async fn persist_cursor(
         rotation_appended_entries: cursor.rotation_appended_entries,
         rotation_tail_dir: cursor.rotation_tail_dir.clone(),
         rotation_tail_entries: cursor.rotation_tail_entries,
+        held_ticks: cursor.held_ticks,
     };
     let bytes = match serde_json::to_vec(&persisted) {
         Ok(bytes) => bytes,
@@ -3574,6 +3688,7 @@ mod tests {
         assert_eq!(loaded.rotation_appended_entries, 0);
         assert_eq!(loaded.rotation_tail_dir, None);
         assert_eq!(loaded.rotation_tail_entries, 0);
+        assert_eq!(loaded.held_ticks, 0);
 
         let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
         let metrics = ScrubMetrics::default();
@@ -3761,22 +3876,23 @@ mod tests {
         );
     }
 
-    /// The request cap stops a tick whose entry cap is not yet filled: a
-    /// compaction record naming eight parts costs its record GET plus
-    /// `8 * SCRUB_REQUESTS_PER_OBJECT` requests, more than the whole tick's
-    /// cap, so the tick ends after three of its four allowed entries.
-    #[tokio::test]
-    async fn the_request_cap_binds_before_the_entry_cap_on_a_many_part_unit() {
+    /// Publish two L0 commit records into hour 500,000, compact them, and
+    /// rewrite the compaction record in place so it names `parts` parts, each
+    /// a byte-correct copy of the one real part under its own key. Returns the
+    /// compaction record's key and the part keys in part order.
+    async fn publish_many_part_compaction(
+        memory: &MemoryStore,
+        parts: u8,
+    ) -> (String, Vec<String>) {
         use ravel_proto::commit::v1::CompactionPart;
 
-        let memory = Arc::new(MemoryStore::new());
         let tenant_hash = tenant().hash();
-        publish_segment_at(&memory, 1, &["cpu"], 500_000).await;
-        publish_segment_at(&memory, 2, &["mem"], 500_000).await;
+        publish_segment_at(memory, 1, &["cpu"], 500_000).await;
+        publish_segment_at(memory, 2, &["mem"], 500_000).await;
         let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, 0, 500_000);
         let compact_clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
         let outcome = ravel_maintain::compact_bucket(
-            memory.as_ref(),
+            memory,
             &compact_clock,
             &ravel_maintain::CompactorConfig::default(),
             &bucket,
@@ -3787,15 +3903,10 @@ mod tests {
             matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
             "two sealed L0 inputs must compact, got {outcome:?}"
         );
-        for seq in 3..=7u64 {
-            publish_segment_at(&memory, seq, &["cpu"], 500_001).await;
-        }
 
-        // Rewrite the compaction record in place so it names eight parts, each
-        // a byte-correct copy of the one real part under its own key.
         let hour_prefix = keys::commit_shard_hour_prefix(&tenant_hash, Signal::Metrics, 0, 500_000)
             .expect("hour prefix");
-        let record_key = list_all(memory.as_ref(), &hour_prefix)
+        let record_key = list_all(memory, &hour_prefix)
             .await
             .expect("list bucket")
             .iter()
@@ -3825,7 +3936,7 @@ mod tests {
             .await
             .expect("get part")
             .data;
-        record.parts = (0..8u8)
+        record.parts = (0..parts)
             .map(|index| CompactionPart {
                 part_index: u32::from(index),
                 first_series_id: vec![index; 16],
@@ -3855,6 +3966,21 @@ mod tests {
             )
             .await
             .expect("overwrite compaction record");
+        (record_key, part_keys)
+    }
+
+    /// The request cap stops a tick whose entry cap is not yet filled: a
+    /// compaction record naming eight parts costs its record GET plus
+    /// `8 * SCRUB_REQUESTS_PER_OBJECT` requests, more than the whole tick's
+    /// cap, so the tick ends after three of its four allowed entries.
+    #[tokio::test]
+    async fn the_request_cap_binds_before_the_entry_cap_on_a_many_part_unit() {
+        let memory = Arc::new(MemoryStore::new());
+        let tenant_hash = tenant().hash();
+        let (record_key, part_keys) = publish_many_part_compaction(&memory, 8).await;
+        for seq in 3..=7u64 {
+            publish_segment_at(&memory, seq, &["cpu"], 500_001).await;
+        }
 
         // Eight entries over a two-tick rotation: four entries and 32 requests.
         let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
@@ -4396,6 +4522,157 @@ mod tests {
             cursor.last_commit_key.as_deref(),
             Some(listed[3].key.as_str())
         );
+    }
+
+    /// A unit whose GETs fail retryably on every attempt holds the marker for
+    /// exactly `MAX_HELD_TICKS` ticks. The tick after that stops retrying:
+    /// the marker moves past the unit and every object in it that still
+    /// failed counts once as `reason="retry_exhausted"`. The unit is a
+    /// compaction record naming three parts, two of which always time out.
+    #[tokio::test]
+    async fn a_unit_failing_retryably_every_tick_is_given_up_after_the_cap() {
+        let memory = Arc::new(MemoryStore::new());
+        let (record_key, part_keys) = publish_many_part_compaction(&memory, 3).await;
+        for seq in 3..=7u64 {
+            publish_segment_at(&memory, seq, &["cpu"], 500_001).await;
+        }
+        let tenant_hash = tenant().hash();
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(listed.len(), 8, "seven commit records, one compaction");
+        assert_eq!(listed[2].key, record_key, "the compaction unit is third");
+
+        let failing = [part_keys[0].clone(), part_keys[2].clone()];
+        let store = GetFaults::new(memory.clone(), move |key, _| {
+            failing
+                .iter()
+                .any(|failing| failing == key)
+                .then_some(StoreError::Timeout)
+        });
+        let metrics = ScrubMetrics::default();
+        assert_eq!(MAX_HELD_TICKS, 6);
+        for tick in 1..=MAX_HELD_TICKS {
+            tick_eight(&store, &metrics).await;
+            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+                .await
+                .expect("cursor loads");
+            assert_eq!(
+                cursor.last_commit_key.as_deref(),
+                Some(listed[1].key.as_str()),
+                "tick {tick} must hold the marker behind the compaction unit"
+            );
+            assert_eq!(cursor.held_ticks, tick);
+        }
+        assert_eq!(
+            store.fired(),
+            u64::from(MAX_HELD_TICKS),
+            "each held tick stops at the first failing part's footer GET"
+        );
+        assert_eq!(unreadable_total(&metrics), 0, "a held unit counts nothing");
+
+        tick_eight(&store, &metrics).await;
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(cursor.held_ticks, 0);
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[5].key.as_str()),
+            "the marker moves past the unit and on through the tick's budget"
+        );
+        assert_eq!(cursor.rotation_entries_visited, 6);
+        assert_eq!(
+            store.fired(),
+            u64::from(MAX_HELD_TICKS) + 2,
+            "the giving-up tick tries every part once"
+        );
+        assert_eq!(
+            metrics.unreadable(
+                Signal::Metrics,
+                ScrubLevel::L1,
+                UnreadableReason::RetryExhausted
+            ),
+            2,
+            "one count per part that still failed"
+        );
+        assert_eq!(unreadable_total(&metrics), 2);
+        assert_eq!(mismatch_total(&metrics), 0);
+    }
+
+    /// A unit that fails retryably twice and then reads clean holds for two
+    /// ticks, and the third tick consumes it: the held count returns to 0 and
+    /// nothing is counted unreadable.
+    #[tokio::test]
+    async fn a_unit_that_recovers_before_the_cap_resets_the_held_count() {
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let (listed, data_keys) = eight_record_shard(&memory).await;
+        let flaky = data_keys[2].clone();
+        let store = GetFaults::new(memory.clone(), move |key, earlier| {
+            (key == flaky && earlier < 2)
+                .then(|| StoreError::Transient("injected data-object GET fault".to_string()))
+        });
+        let metrics = ScrubMetrics::default();
+        let tenant_hash = tenant().hash();
+        for held in 1..=2u32 {
+            tick_eight(&store, &metrics).await;
+            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+                .await
+                .expect("cursor loads");
+            assert_eq!(
+                cursor.last_commit_key.as_deref(),
+                Some(listed[1].key.as_str())
+            );
+            assert_eq!(cursor.held_ticks, held);
+        }
+        tick_eight(&store, &metrics).await;
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            store.fired(),
+            2,
+            "the fault fired on the first two ticks only"
+        );
+        assert_eq!(cursor.held_ticks, 0);
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[5].key.as_str())
+        );
+        assert_eq!(unreadable_total(&metrics), 0);
+        assert_eq!(mismatch_total(&metrics), 0);
+    }
+
+    /// `ravel_scrub_marker_held_ticks` reads the consecutive held ticks of
+    /// the worst shard after each cycle.
+    #[tokio::test]
+    async fn the_held_ticks_gauge_follows_a_held_shard() {
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let (_, data_keys) = eight_record_shard(&memory).await;
+        let failing = data_keys[2].clone();
+        let store = GetFaults::new(memory.clone(), move |key, _| {
+            (key == failing).then_some(StoreError::Timeout)
+        });
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+        for cycle in 1..=2u64 {
+            run_cycle(
+                &store,
+                None,
+                1,
+                2,
+                1,
+                &metrics,
+                &worker,
+                &worker.solo_live_set(),
+                None,
+            )
+            .await;
+            assert_eq!(metrics.marker_held_ticks(Signal::Metrics), cycle);
+        }
+        assert_eq!(metrics.marker_held_ticks(Signal::Logs), 0);
     }
 
     /// ADR-1686 amendment, decision 3: a compaction record that lands in an
