@@ -88,9 +88,21 @@ impl MemoryBudget {
     }
 
     /// Bytes reserved by everything other than the fetch layer:
-    /// `reserved()` minus `fetch_reserved()`. The raw counter API is this
-    /// budget's only other reserver, so this is exactly SQL's share, without
+    /// `reserved()` minus `fetch_reserved()`, saturating. The raw counter API
+    /// is this budget's only other reserver, so this is SQL's share, without
     /// SQL needing its own counter or any change to `ravel-sql`.
+    ///
+    /// The two counters are separate atomics, not updated together. [`reserve`]
+    /// adds to `reserved` before `fetch_reserved`, and dropping a
+    /// [`Reservation`] clears `fetch_reserved` before `reserved`, so the
+    /// counters never hold a state that puts this below SQL's share. They sum
+    /// to the reserved total when no reservation is changing; during a change
+    /// this figure may briefly over-read by at most the size of the
+    /// reservation in flight. This method reads the two with separate loads,
+    /// so a fetch reservation made or dropped between them can also skew one
+    /// reading by its size, in either direction.
+    ///
+    /// [`reserve`]: MemoryBudget::reserve
     pub fn sql_reserved(&self) -> u64 {
         self.reserved().saturating_sub(self.fetch_reserved())
     }
@@ -299,8 +311,10 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.budget.release(self.size);
+        // The fetch share first, so `sql_reserved` can over-read here but
+        // never under-read.
         self.budget.clear_fetch_reserved(self.size);
+        self.budget.release(self.size);
         if self.handed_off {
             self.budget.clear_handoff(self.size);
         }

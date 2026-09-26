@@ -937,9 +937,16 @@ split its reserved total without double-counting. `component="fetch"` is
 `MemoryBudget::fetch_reserved()`, the bytes held by live `Reservation` guards
 (the fetch layer's RAII `reserve` API). `component="sql"` is
 `MemoryBudget::sql_reserved()`, the reserved total minus the fetch share,
-which is exactly what the SQL executor's per-tenant accountants hold through
-the raw `try_reserve`/`reserve_unchecked`/`release` API. The two samples sum
-to the budget's reserved total. A PromQL fetch that needs more than the
+which is what the SQL executor's per-tenant accountants hold through the raw
+`try_reserve`/`reserve_unchecked`/`release` API. The two counters are separate
+atomics: `reserve` adds to the total before the fetch share, and a dropped
+`Reservation` clears the fetch share before the total, so the counters never
+hold a state that puts the sql figure below SQL's share. The two samples sum to
+the budget's reserved total when no reservation is changing. During a change
+the sql figure may briefly over-read by at most the size of the reservation in
+flight, and because a scrape reads the two counters with separate loads, a
+reservation made or dropped between them can also make one reading low by its
+size. A PromQL fetch that needs more than the
 budget's remainder fails with `FetchMemoryExhausted`, which the PromQL HTTP
 API answers as 503 (the SQL path answers 422 for its own refusal); the
 refused query holds no reservation afterwards, so the next query is admitted

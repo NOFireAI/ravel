@@ -287,8 +287,11 @@ pub enum Label {
     /// construction (`ravel_memory::MemoryBudget` tracks fetch reservations
     /// separately from the total, so `sql_reserved` is the total minus
     /// `fetch_reserved`, never the total itself), so summing both samples
-    /// equals `ravel_memory_budget_bytes`'s `reserved` total with no
-    /// double-count. See [`MemoryComponent`]'s doc comment.
+    /// equals `MemoryBudget::reserved()` with no double-count when no
+    /// reservation is changing; during a change the `Sql` sample may briefly
+    /// be off by at most the size of the reservation in flight. That total
+    /// has no gauge of its own: `ravel_memory_budget_bytes` is the limit.
+    /// See [`MemoryComponent`]'s doc comment.
     MemoryComponent(MemoryComponent),
     /// Which fragment admission class a `ravel_distrib_fragment_*`
     /// sample belongs to (issue #1722): `Pinned`
@@ -2145,7 +2148,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_reserved_bytes",
-        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is TenantMemoryAccountant's raw-counter share, component=\"fetch\" is bytes held by a live ravel-query fetcher Reservation; the two are disjoint and sum to the budget's whole reserved total.",
+        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is TenantMemoryAccountant's raw-counter share, component=\"fetch\" is bytes held by a live ravel-query fetcher Reservation; the two are disjoint. They sum to the budget's reserved total when no reservation is changing; during a change the sql figure may briefly be off by at most the size of the reservation in flight.",
         "gauge",
     );
     write_sample(
@@ -5243,8 +5246,10 @@ pub struct IngestBufferBudgetSnapshot {
 /// snapshot, not a real process's; a real process's `limit` is never `0`
 /// (see [`render_memory_budget_family`]'s doc comment on the `u64::MAX`
 /// unlimited convention). `sql_reserved` and `fetch_reserved` are disjoint
-/// (`MemoryBudget::sql_reserved()`/`fetch_reserved()`) and sum to the whole
-/// budget's reserved total; there is no separate `reserved` field to keep in
+/// (`MemoryBudget::sql_reserved()`/`fetch_reserved()`); they sum to the
+/// budget's reserved total when no reservation is changing, and during a
+/// change `sql_reserved` may briefly be off by at most the size of the
+/// reservation in flight. There is no separate `reserved` field to keep in
 /// sync with them.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryBudgetSnapshot {
