@@ -73,9 +73,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ravel_alerting::{
-    AlertId, AlertRecord, AlertState, DEFAULT_REPEAT_INTERVAL, QueryResultSummary, Rule,
-    RuleCondition, RuleQuery, ThresholdOp, compute_alert_id, condition_met, evaluate_transition,
-    write_alert_record,
+    AlertError, AlertId, AlertInstance, AlertRecord, AlertState, DEFAULT_REPEAT_INTERVAL,
+    QueryResultSummary, Rule, RuleCondition, RuleQuery, StateTransition, ThresholdOp,
+    alert_instances, compute_alert_id, evaluate_transition, write_alert_record,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -600,7 +600,9 @@ pub struct AlertEvaluator {
     next_seq: u64,
     /// Transitions written but not yet accepted by every sink, keyed by
     /// `alert_id` so a newer transition supersedes an older undelivered one.
-    /// Bounded by the rule count.
+    /// Bounded by the folded alert identities: at most
+    /// [`ravel_alerting::MAX_ALERTS_PER_RULE`] live ones per rule, plus
+    /// resolutions of identities that stopped matching.
     undelivered: HashMap<AlertId, AlertNotification>,
     /// Per-alert duplicate suppressor for the repeat pass (ADR-0043 "repeat
     /// notifications while firing" amendment, decision 2): the
@@ -791,25 +793,38 @@ impl AlertEvaluator {
                 match self.evaluate_rule(rule, &mut latest, now_ns).await {
                     Ok(written) => {
                         report.rules_evaluated += 1;
-                        if written {
-                            report.records_written += 1;
-                        }
+                        report.records_written += written;
                     }
                     Err(err) => {
                         report.rules_failed += 1;
-                        tracing::warn!(
-                            tenant = %self.tenant.to_hex(),
-                            rule_id = %rule.rule_id,
-                            error = %err,
-                            "alert evaluation: rule failed; retried next tick"
-                        );
+                        if let Some(AlertError::TooManyAlerts { count, limit, .. }) =
+                            err.downcast_ref::<AlertError>()
+                        {
+                            tracing::warn!(
+                                tenant = %self.tenant.to_hex(),
+                                rule_id = %rule.rule_id,
+                                count,
+                                limit,
+                                "alert evaluation: rule failed with TooManyAlerts: it matched \
+                                 {count} series, over the limit of {limit} alerts per rule; no \
+                                 record written, retried next tick. Narrow the selector or \
+                                 aggregate"
+                            );
+                        } else {
+                            tracing::warn!(
+                                tenant = %self.tenant.to_hex(),
+                                rule_id = %rule.rule_id,
+                                error = %err,
+                                "alert evaluation: rule failed; retried next tick"
+                            );
+                        }
                     }
                 }
             }
             // Repeat pass (ADR-0043 "repeat notifications while firing"): after
             // rule evaluation, on the lease holder only, re-queue a notification
-            // for each rule whose folded latest record is still Firing and whose
-            // repeat window has advanced. This reads the same `latest` the loop
+            // for each of a rule's alerts whose folded latest record is still
+            // Firing and whose repeat window has advanced. This reads the same `latest` the loop
             // above updated on any transition, so a rule that just resolved this
             // tick folds to Resolved here and does not repeat. No durable record
             // is written for a repeat (decision 4 stands); it rides the existing
@@ -1001,9 +1016,11 @@ impl AlertEvaluator {
         }
     }
 
-    /// Re-queue a repeat notification for `rule` when its folded latest record
-    /// is still `Firing` and the current repeat window has not yet been queued
-    /// (ADR-0043 "repeat notifications while firing" amendment).
+    /// Re-queue a repeat notification for each alert of `rule` whose folded
+    /// latest record is still `Firing` and whose current repeat window has not
+    /// yet been queued (ADR-0043 "repeat notifications while firing"
+    /// amendment). A rule's alerts are the folded records carrying its
+    /// `rule_id`, one per identity (ADR-0117 decision 4).
     ///
     /// The window index is
     ///
@@ -1050,19 +1067,28 @@ impl AlertEvaluator {
         if interval.is_zero() {
             return;
         }
-        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
-        let Some(record) = latest.get(&alert_id) else {
-            return;
-        };
-        if record.state != AlertState::Firing {
-            return;
-        }
         // `.max(1)` guards against a zero interval_ns from an overflow saturation
         // (unreachable: the zero interval already returned above), keeping the
         // division well-defined.
         let interval_ns = i64::try_from(interval.as_nanos())
             .unwrap_or(i64::MAX)
             .max(1);
+        for (alert_id, record) in latest {
+            if record.rule_id == rule.rule_id && record.state == AlertState::Firing {
+                self.queue_repeat_for_alert(*alert_id, record, interval_ns, now_ns, report);
+            }
+        }
+    }
+
+    /// [`Self::queue_repeat_if_due`] for one firing alert.
+    fn queue_repeat_for_alert(
+        &mut self,
+        alert_id: AlertId,
+        record: &AlertRecord,
+        interval_ns: i64,
+        now_ns: i64,
+        report: &mut AlertEvalReport,
+    ) {
         let elapsed_ns = now_ns.saturating_sub(record.ts_ns).max(0);
         let window = (elapsed_ns / interval_ns) as u64;
         if window < 1 {
@@ -1092,21 +1118,66 @@ impl AlertEvaluator {
         report.repeats_queued += 1;
     }
 
-    /// Evaluate one rule: run its query, decide the condition, fold to the
-    /// prior record, and write a record if this is a transition. Returns
-    /// whether a record was written.
+    /// Evaluate one rule: run its query, decide which series match, and write
+    /// a record for every alert whose state transitions. Returns how many
+    /// records were written.
+    ///
+    /// Each matched series is its own alert (ADR-0117 decisions 1 and 2), fed
+    /// through [`evaluate_transition`] with its own prior record. An alert of
+    /// this rule that is Pending or Firing in `latest` and absent from the
+    /// matched set is fed `condition_met = false` and so resolves (decision 4).
+    /// A rule that matches more than [`ravel_alerting::MAX_ALERTS_PER_RULE`]
+    /// series, or two series that merge to one label set, fails before
+    /// anything is written, leaving its prior state untouched.
     async fn evaluate_rule(
         &mut self,
         rule: &Rule,
         latest: &mut HashMap<AlertId, AlertRecord>,
         now_ns: i64,
-    ) -> anyhow::Result<bool> {
-        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+    ) -> anyhow::Result<u32> {
         let summary = self.run_query(rule, now_ns).await?;
-        let met = condition_met(&rule.condition, &summary)?;
-        let prior = latest.get(&alert_id).cloned();
-        let transition = evaluate_transition(rule, prior.as_ref(), met, now_ns);
+        let matched = alert_instances(rule, &summary)?;
 
+        let mut absent: Vec<AlertInstance> = latest
+            .values()
+            .filter(|r| {
+                r.rule_id == rule.rule_id
+                    && matches!(r.state, AlertState::Pending | AlertState::Firing)
+                    && !matched.iter().any(|m| m.alert_id == r.alert_id)
+            })
+            .map(AlertInstance::of_record)
+            .collect();
+        absent.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+
+        let mut written = 0;
+        for (instance, met) in matched
+            .iter()
+            .map(|m| (m, true))
+            .chain(absent.iter().map(|a| (a, false)))
+        {
+            let prior = latest.get(&instance.alert_id).cloned();
+            let transition = evaluate_transition(rule, prior.as_ref(), met, now_ns);
+            if self
+                .write_transition(rule, instance, &transition, prior, latest)
+                .await?
+            {
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    /// Write the record for one alert's transition, if `transition` warrants
+    /// one, queue its notification, and fold it into `latest`. Returns whether
+    /// a record was written.
+    async fn write_transition(
+        &mut self,
+        rule: &Rule,
+        instance: &AlertInstance,
+        transition: &StateTransition,
+        prior: Option<AlertRecord>,
+        latest: &mut HashMap<AlertId, AlertRecord>,
+    ) -> anyhow::Result<bool> {
         if !transition.write_record {
             return Ok(false);
         }
@@ -1131,7 +1202,7 @@ impl AlertEvaluator {
         // would then re-transition from the same stale state every tick instead
         // of converging.
         //
-        // The transition decision above still uses the tick's own `now_ns`:
+        // The transition decision in `evaluate_rule` still uses the tick's own `now_ns`:
         // pending-duration elapse is a property of when the rule was evaluated,
         // not of when its record reached the store.
         let publish_ns = self.clock.now_ns();
@@ -1158,7 +1229,8 @@ impl AlertEvaluator {
         // tick actually consumed pass through here.
         let Some(bytes) = write_alert_record(
             rule,
-            &transition,
+            instance,
+            transition,
             prior.as_ref(),
             &[],
             stamp_ns,
@@ -1188,10 +1260,10 @@ impl AlertEvaluator {
 
         // The record is durable from here on; everything below is notification.
         self.undelivered.insert(
-            alert_id,
+            written.alert_id,
             AlertNotification::new(written.clone(), prior.as_ref()),
         );
-        latest.insert(alert_id, written);
+        latest.insert(written.alert_id, written);
         Ok(true)
     }
 
@@ -1661,12 +1733,14 @@ fn decode_single_record(bytes: &[u8]) -> anyhow::Result<AlertRecord> {
     Ok(AlertRecord::from_log_record(row)?)
 }
 
-/// Map a PromQL result onto the numeric summary a threshold condition tests.
+/// Map a PromQL result onto the numeric summary a threshold condition tests,
+/// keeping each series' labels: every matching series becomes its own alert
+/// (ADR-0117 decision 1).
 ///
-/// A scalar result is a one-element vector: `condition_met` asks whether *any*
-/// value satisfies the comparator, and a scalar has exactly one. A range vector
-/// or string is a rule-authoring error, surfaced rather than silently treated
-/// as "not firing".
+/// A scalar result is a one-element vector with an empty label set, so a rule
+/// over a scalar keeps the rule-labels-only alert identity. A range vector or
+/// string is a rule-authoring error, surfaced rather than silently treated as
+/// "not firing".
 ///
 /// Native-histogram elements are dropped: their `value` is a `0.0` placeholder
 /// (the real data is in the histogram), and comparing that against a threshold
@@ -1678,10 +1752,13 @@ fn promql_summary(value: PromqlValue) -> anyhow::Result<QueryResultSummary> {
             samples
                 .iter()
                 .filter(|s| s.histogram.is_none())
-                .map(|s| s.value)
+                .map(|s| (s.labels.clone(), s.value))
                 .collect(),
         )),
-        PromqlValue::Scalar(v) => Ok(QueryResultSummary::Numeric(vec![v])),
+        PromqlValue::Scalar(v) => Ok(QueryResultSummary::Numeric(vec![(
+            ravel_types::LabelSet::default(),
+            v,
+        )])),
         other => anyhow::bail!(
             "a PromQL alert rule must evaluate to an instant vector or a scalar, got {}",
             other.type_name()
@@ -2116,16 +2193,25 @@ mod tests {
         use ravel_types::LabelSet;
 
         let empty = LabelSet::new(Vec::new()).expect("empty label set");
+        let host = |instance: &str| {
+            LabelSet::new(vec![ravel_types::Label {
+                name: "instance".to_string(),
+                value: instance.to_string(),
+            }])
+            .expect("valid labels")
+        };
+        let host_a = host("a");
+        let host_b = host("b");
         let vector = PromqlValue::Vector(vec![
             InstantSample {
-                labels: empty.clone(),
+                labels: host_a.clone(),
                 ts_ns: 0,
                 orig_sample_ts_ns: 0,
                 value: 1.5,
                 histogram: None,
             },
             InstantSample {
-                labels: empty,
+                labels: host_b.clone(),
                 ts_ns: 0,
                 orig_sample_ts_ns: 0,
                 value: 2.5,
@@ -2134,13 +2220,14 @@ mod tests {
         ]);
         assert_eq!(
             promql_summary(vector).expect("vector summarizes"),
-            QueryResultSummary::Numeric(vec![1.5, 2.5])
+            QueryResultSummary::Numeric(vec![(host_a, 1.5), (host_b, 2.5)]),
+            "each series keeps its labels"
         );
 
         assert_eq!(
             promql_summary(PromqlValue::Scalar(7.0)).expect("scalar summarizes"),
-            QueryResultSummary::Numeric(vec![7.0]),
-            "a scalar is a one-value vector for condition purposes"
+            QueryResultSummary::Numeric(vec![(empty, 7.0)]),
+            "a scalar is a one-value vector with no series labels"
         );
 
         // A range vector or a string is a rule-authoring error, surfaced
@@ -2246,19 +2333,46 @@ mod tick_tests {
         tenant: &TenantId,
         samples: &[(i64, f64)],
     ) {
+        publish_series(store, tenant, vec![(label_set(METRIC), samples.to_vec())]).await;
+    }
+
+    /// `METRIC` with an `instance` label.
+    fn instance_label_set(instance: &str) -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: METRIC.to_string(),
+            },
+            Label {
+                name: "instance".to_string(),
+                value: instance.to_string(),
+            },
+        ])
+        .expect("valid labels")
+    }
+
+    /// [`publish_metric`] for several series in one segment, each with its own
+    /// label set and samples.
+    async fn publish_series(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        series: Vec<(LabelSet, Vec<(i64, f64)>)>,
+    ) {
         let tenant_hash = tenant.hash();
-        let labels = label_set(METRIC);
-        let series = vec![SeriesInput {
-            series_id: SeriesId::compute(tenant, METRIC, &labels).expect("series id"),
-            labels,
-            samples: samples
-                .iter()
-                .map(|(ts_ns, value)| Sample {
-                    ts_ns: *ts_ns,
-                    value: *value,
-                })
-                .collect(),
-        }];
+        let series: Vec<SeriesInput> = series
+            .into_iter()
+            .map(|(labels, samples)| SeriesInput {
+                series_id: SeriesId::compute(tenant, METRIC, &labels).expect("series id"),
+                labels,
+                samples: samples
+                    .iter()
+                    .map(|(ts_ns, value)| Sample {
+                        ts_ns: *ts_ns,
+                        value: *value,
+                    })
+                    .collect(),
+            })
+            .collect();
         let writer_id = Uuid::from_u128(9_001);
         let identity = SegmentIdentity {
             tenant_hash: tenant_hash.0,
@@ -2374,6 +2488,17 @@ mod tick_tests {
         sinks: Vec<AlertSink>,
         metrics: Arc<AlertMetrics>,
     ) -> AlertEvaluator {
+        evaluator_for_rules(store, clock, sinks, metrics, vec![threshold_rule()])
+    }
+
+    /// [`evaluator_with`] over an explicit rule set.
+    fn evaluator_for_rules(
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        sinks: Vec<AlertSink>,
+        metrics: Arc<AlertMetrics>,
+        rules: Vec<Rule>,
+    ) -> AlertEvaluator {
         let catalog =
             Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
         let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
@@ -2391,7 +2516,7 @@ mod tick_tests {
             },
             clock,
             TenantId::new(TENANT).hash(),
-            vec![threshold_rule()],
+            rules,
             &config,
         )
         .expect("build evaluator")
@@ -2507,6 +2632,71 @@ mod tick_tests {
             2,
             "history is unchanged; no runaway resolve records"
         );
+    }
+
+    // --- Per-series evaluation (ADR-0117) -------------------------------------
+
+    /// `n` series `cpu_usage{instance="host-NNNN"}` at 1.0, above the
+    /// threshold rule's 0.9, shortly before `NOW_NS`, plus two healthy series
+    /// at 0.1 that must raise nothing.
+    async fn store_with_hot_instances(n: usize) -> Arc<dyn ObjectStoreBackend> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let sample_ts = NOW_NS - 30 * NS_PER_SEC;
+        let mut series: Vec<(LabelSet, Vec<(i64, f64)>)> = (0..n)
+            .map(|i| {
+                (
+                    instance_label_set(&format!("host-{i:04}")),
+                    vec![(sample_ts, 1.0)],
+                )
+            })
+            .collect();
+        for healthy in ["idle-a", "idle-b"] {
+            series.push((instance_label_set(healthy), vec![(sample_ts, 0.1)]));
+        }
+        publish_series(store.as_ref(), &TenantId::new(TENANT), series).await;
+        store
+    }
+
+    fn instance_alert_labels(instance: &str) -> Vec<(String, String)> {
+        vec![
+            ("instance".to_string(), instance.to_string()),
+            ("severity".to_string(), "page".to_string()),
+        ]
+    }
+
+    /// One PromQL rule over ten hot series raises ten alerts: ten Firing
+    /// records, each carrying its own `instance` label next to the rule's
+    /// `severity`, `__name__` dropped, and ten distinct alert ids, each the
+    /// hash of the rule id and exactly that merged label set.
+    #[tokio::test]
+    async fn one_rule_over_ten_series_writes_ten_alert_records_with_distinct_ids() {
+        let store = store_with_hot_instances(10).await;
+        let tenant = TenantId::new(TENANT).hash();
+        let mut evaluator = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.rules_evaluated, 1);
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(report.records_written, 10);
+
+        let mut records = read_alert_records(store.as_ref(), tenant).await;
+        records.sort_by(|a, b| a.labels.cmp(&b.labels));
+        assert_eq!(records.len(), 10);
+        for (i, record) in records.iter().enumerate() {
+            let labels = instance_alert_labels(&format!("host-{i:04}"));
+            assert_eq!(record.state, AlertState::Firing);
+            assert_eq!(record.rule_id, "high-cpu");
+            assert_eq!(record.alert_id, compute_alert_id("high-cpu", &labels));
+            assert_eq!(record.labels, labels);
+        }
+        let distinct: std::collections::BTreeSet<AlertId> =
+            records.iter().map(|r| r.alert_id).collect();
+        assert_eq!(distinct.len(), 10);
+
+        // A second tick over the same data re-confirms all ten and writes
+        // nothing.
+        assert_eq!(evaluator.run_tick().await.records_written, 0);
+        assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 10);
     }
 
     /// `load_latest_records` must skip a `CompactionRecord` under the
@@ -3457,10 +3647,11 @@ mod tick_tests {
         );
 
         // Only now does A's in-flight tick reach its write.
-        assert!(
+        assert_eq!(
             a.evaluate_rule(&rule, &mut a_latest, NOW_NS)
                 .await
                 .expect("A publishes its transition"),
+            1,
             "A writes the onset transition its tick decided at NOW"
         );
 
