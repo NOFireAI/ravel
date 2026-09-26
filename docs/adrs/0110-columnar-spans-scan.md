@@ -158,6 +158,9 @@ existing row path runs unchanged:
   elsewhere in this ADR describes the shape at the time it was written;
   `crates/ravel-sql/src/spans_schema.rs` is the live list.
 
+  The rule now excludes the `links` column too; see the 2026-09-26 links
+  amendment at the end of this ADR.
+
 - **no pending selective-erasure predicate applies to the query.** This clause
   is load-bearing, not hygiene. `SpansScanExec` carries
   `erasure: Arc<Vec<ErasurePredicate>>` (ADR-0064 decision 2) and excludes rows
@@ -226,17 +229,11 @@ duration_ns` never touches the dynamic attribute pages, the `attrs_raw` page,
 or the four `COL_EVENT_*` pages, so their bytes are neither decompressed nor
 allocated, and `decode_events` never runs.
 
-Amended (issue #1710): the ineligible path also carries the projection into
-the scan now, rather than keeping a `ProjectionExec` above a scan built with
-no projection. `SpansScanExec`'s row-path batch builder already only builds
-the schema columns the pushed projection names, so a projection that excludes
-`events`/`links` skips their decode there too, not only on the fast path
-above. Only the union in the paragraph above (the fast-path-specific page
-skip) remains fast-path-only: the row path still fetches and decodes every
-RSPAN page of every scanned block regardless of projection (issue #669), the
-saving here is in never rebuilding the `events`/`links` Arrow columns from
-already-decoded attributes. The provider now has one projection behavior for
-both paths.
+The ineligible path keeps today's `ProjectionExec` wrapping unchanged, so the
+provider has one behavior per path and neither is a special case of the other.
+
+On single-node execution the ineligible path no longer wraps a
+`ProjectionExec`; see the 2026-09-26 links amendment at the end of this ADR.
 
 ### 5. The chosen path is observable
 
@@ -324,10 +321,11 @@ as follow-up work once the columnar path exists to carry it.
   differential proptest must run over both, and the eligibility rule must be
   asserted through the new metrics, or the two drift apart silently. This is
   the same cost ADR-0099 accepted for logs.
-- **The provider has one projection behavior.** Amended (issue #1710): both
-  eligible and ineligible queries carry the projection straight into the
-  scan; no path wraps a `ProjectionExec` above it. A test asserts the
-  scan leaf's own emitted schema for both.
+- **The provider has two projection behaviors.** Eligible queries carry the
+  projection into the scan; ineligible ones keep the `ProjectionExec`. A test
+  asserts the plan shape for both.
+  Single-node execution now has one projection behavior; see the 2026-09-26
+  links amendment below.
 - **No frozen format is touched.** Read path and query API only. No version
   bump, no writer change, no migration.
 - **`attrs`-projecting queries are unchanged.** The epic's win is on queries
@@ -346,3 +344,42 @@ as follow-up work once the columnar path exists to carry it.
 - **Follow-up left open:** dictionary types for `name` and `service_name` end
   to end, and the `attrs` map column itself, which would need a columnar
   attribute representation rather than a per-row map rebuild.
+
+## Amendment (2026-09-26): the links column and single-node projection pushdown (issue #1710)
+
+<!-- amendment-applies: sections="3. Direct Arrow construction, behind an explicit eligibility rule|4. Projection is pushed into page decoding, not applied above the scan|Consequences" pointer="2026-09-26 links amendment" -->
+
+Issue #1710 added a `links` column to the `spans` table,
+`List(Struct{trace_id, span_id, trace_state, attrs})`, decoded at scan time
+from the plain `_links_raw` attribute on every RSPAN version. RSPAN stores no
+nested link columns, and adding them would be a format change needing its own
+ADR and a version bump.
+
+Decision 3's eligibility rule now excludes `links` as well as `attrs` and
+`events`. The reason differs from `events`: `links` is not rebuilt from
+nested pages the fast path skips, but decoded from `_links_raw`, which only
+the row path's merged attribute map carries.
+
+Decision 4 changes for single-node execution. `SpansTableProvider::scan` now
+hands the projection to `SpansScanExec` on the ineligible path too, rather
+than building a full-schema scan and wrapping it in a `ProjectionExec`. The
+row-path batch builder builds only the projected columns, so a query that
+selects neither `events` nor `links` never builds those Arrow columns. The
+row path still fetches and decodes every RSPAN page of each scanned block
+regardless of projection (issue #669); the saving is only in not building the
+`events` and `links` columns, not in page decode. The page-skipping union of
+decision 4 remains fast-path-only. On single-node execution the provider
+therefore has one projection behavior, and a test asserts the scan leaf's own
+emitted schema on the ineligible path.
+
+Distributed execution is unchanged. A worker runs
+`SpansTableProvider::worker_fragment`, which builds the scan with no
+projection, so each worker decodes `events` and `links` for every row it
+returns; the coordinator receives the full public schema from the fan-out and
+wraps a `ProjectionExec` above it for the query's column selection. Carrying
+the projection into the worker fragment would need the fragment request to
+name the projected columns, which it does not today.
+
+A bare `count(*)` pushes an empty projection into the scan on both paths.
+Both batch builders carry the row count explicitly for that case, since a
+batch with no columns has nothing to infer it from.
