@@ -6,6 +6,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`ravel-server` defaults to `byte-minimal` logs fetching against a
+  loopback S3 endpoint** (ADR-2014). Unset, `--logs-fetch-policy` used to
+  always resolve to `cost-based`; now, a `--store s3` deployment whose
+  `--s3-endpoint` is loopback (`localhost` or a loopback IPv4/IPv6 literal)
+  resolves to `byte-minimal` instead, because on such a store the cold path
+  is disk-bound rather than network-bound and the whole-object reads
+  `cost-based` picks at the reference cost profile spend local disk I/O a
+  ranged read would have skipped. Measured on the ClickBench reference
+  machine (RustFS on loopback, 42 statements): cold wall-clock 1,720.4s to
+  1,186.6s, hot wall-clock 272.3s to 88.5s. An explicit `--logs-fetch-policy`
+  always wins, including an explicit `cost-based` on a loopback endpoint, and
+  a non-loopback `--s3-endpoint` (or `--store memory`) sees no change. The
+  resolved policy's source (`flag`, `default`, or
+  `derived-loopback-endpoint`) is now logged alongside the policy on the
+  `logs fetch policy resolved` startup line.
+
 ## [0.17.0] - 2026-09-25
 
 ### Fixed
