@@ -159,7 +159,17 @@ fn arb_span() -> impl Strategy<Value = SpanSpec> {
         any::<bool>(), // erasable
     )
         .prop_map(
-            |(trace, span_id, start, service, http_method, events, links, with_message, erasable)| {
+            |(
+                trace,
+                span_id,
+                start,
+                service,
+                http_method,
+                events,
+                links,
+                with_message,
+                erasable,
+            )| {
                 SpanSpec {
                     trace,
                     span_id,

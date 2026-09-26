@@ -1555,7 +1555,10 @@ async fn links_column_treats_malformed_link_fields_as_null() {
     /// One length-delimited protobuf field: tag byte, then a single-byte
     /// length, then bytes. Test payloads are all well under 128 bytes.
     fn len_field(tag: u8, payload: &[u8]) -> Vec<u8> {
-        assert!(payload.len() < 128, "test payload too long for a 1-byte varint");
+        assert!(
+            payload.len() < 128,
+            "test payload too long for a 1-byte varint"
+        );
         let mut out = vec![tag];
         out.push(payload.len() as u8);
         out.extend_from_slice(payload);
@@ -1601,7 +1604,10 @@ async fn links_column_treats_malformed_link_fields_as_null() {
 
     for (what, chunk) in [
         ("a 3-byte trace_id", wrong_width_trace_id),
-        ("a field truncated part way through the chunk", truncated_field),
+        (
+            "a field truncated part way through the chunk",
+            truncated_field,
+        ),
         ("a non-UTF-8 trace_state", non_utf8_trace_state),
     ] {
         let mut record = span(t1, 0, 100, 110, "malformed-links");
