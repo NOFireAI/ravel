@@ -952,8 +952,11 @@ pub struct Cli {
     ///
     /// The expert escape hatch of ADR-0996 decision 2: SET, it WINS over
     /// `--logs-fetch-policy`'s derived rate and the deployment keeps exactly
-    /// the ADR-0904 behaviour it had. UNSET, the policy derives the rate (at
-    /// the default `cost-based` policy, from the active store cost profile).
+    /// the ADR-0904 behaviour it had. UNSET, the policy derives the rate: under
+    /// `cost-based` (the unset policy, except against a loopback
+    /// `--s3-endpoint`) from the active store cost profile, and under
+    /// `byte-minimal` or `latency-first` (the unset policy on a loopback
+    /// endpoint, ADR-2014) as the compiled-in default.
     /// `Option`-typed for that reason: "the operator asked for this many bytes"
     /// and "nobody asked, use the compiled-in default" are different inputs to
     /// the resolution, and a `default_value_t` would erase the difference.
@@ -964,7 +967,8 @@ pub struct Cli {
     /// at startup into the byte quantities the fetch layer runs on
     /// (`--logs-request-cost-bytes` and `--logs-block-range-threshold`'s
     /// engine-side fields) by `ravel_query::resolve_logs_fetch`. Unset, it is
-    /// `cost-based`, or `byte-minimal` against a loopback `--s3-endpoint`.
+    /// `cost-based`, or `byte-minimal` with `--store s3` against a loopback
+    /// `--s3-endpoint`.
     ///
     /// `request-minimal` reads every object whole in one covering GET (the
     /// cost-preferring shape where transfer is free and the bill is requests);
@@ -9659,7 +9663,10 @@ mod tests {
         );
 
         // 3. no endpoint at all -> cost-based, default.
-        let no_endpoint = cli(&["--store", "s3"]);
+        // `--s3-endpoint` is env-backed: clear any ambient RAVEL_S3_ENDPOINT so
+        // this case asserts the absence it names.
+        let mut no_endpoint = cli(&["--store", "s3"]);
+        no_endpoint.s3_endpoint = None;
         assert_eq!(
             no_endpoint.resolve_logs_fetch_policy(),
             (

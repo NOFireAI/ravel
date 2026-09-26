@@ -219,9 +219,11 @@ struct Args {
     ///
     /// The default therefore measures the shape a stock server produces against
     /// a non-loopback S3 endpoint. A stock server whose `--s3-endpoint` is
-    /// loopback derives `byte-minimal` instead (ADR-2014); this bench has no
-    /// endpoint to derive from, so pass `--logs-fetch-policy byte-minimal` to
-    /// measure that server's shape in process. Before
+    /// loopback derives `byte-minimal` instead (ADR-2014). This bench does not
+    /// apply that derivation, even when `RAVEL_S3_ENDPOINT` is loopback: its
+    /// default stays explicit so a pass's shape never depends on the
+    /// environment, and `--logs-fetch-policy byte-minimal` measures that
+    /// server's shape in process. Before
     /// this flag existed the bench routed at a fixed 512 KiB threshold whatever
     /// the request cost said, so a full-scan statement range-read every object
     /// per block while the server read each one whole; pass `byte-minimal` to
