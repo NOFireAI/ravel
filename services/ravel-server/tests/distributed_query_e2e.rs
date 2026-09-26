@@ -370,7 +370,7 @@ async fn distributed_query_http_equals_local_http() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new(TENANT);
     let now = now_ns();
-    let record_key = publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+    publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
     let (start, end) = ((now - 15 * NS_PER_MIN) / NS_PER_SEC, now / NS_PER_SEC);
 
     // Server A distributes every query; server B is local-only. Same store,
@@ -403,53 +403,24 @@ async fn distributed_query_http_equals_local_http() {
     // byte-for-byte, so a real divergence in the fanned-out result still flips
     // this assertion.
     //
-    // The pooled GET totals are compared separately below, not byte-for-byte:
-    // the worker GETs each pinned L0 segment's own commit record to verify the
-    // shipped identity against it (ADR-0071 reconstruct-don't-trust), a request
-    // the local path does not repeat after its own resolve.
+    // The pooled GET totals are part of that comparison: the worker's GET of
+    // the pinned segment's own commit record is charged to neither the slice's
+    // accounting nor the query's budgets (ADR-0071 pinned-record amendment), so
+    // the distributed query's pooled accounting equals the local query's, that
+    // one extra GET not included.
     let strip_phases = |body: &serde_json::Value| -> serde_json::Value {
         let mut data = body["data"].clone();
-        let stats = data["stats"].as_object_mut().expect("stats is an object");
-        stats
+        data["stats"]
+            .as_object_mut()
+            .expect("stats is an object")
             .remove("phases")
             .expect("stats carries the per-phase cost split");
-        let accounting = stats["accounting"]
-            .as_object_mut()
-            .expect("stats carries pooled accounting");
-        accounting
-            .remove("s3GetRequests")
-            .expect("accounting carries GET requests");
-        accounting
-            .remove("s3GetBytes")
-            .expect("accounting carries GET bytes");
         data
     };
     assert_eq!(
         strip_phases(&distributed_body),
         strip_phases(&local_body),
         "distributed `data` must be byte-identical to local outside the per-phase cost attribution:\n  distributed={distributed_body}\n  local={local_body}"
-    );
-    // Exactly one extra GET, of exactly the one pinned segment's commit record.
-    let record_len = store
-        .get(&record_key, GetRange::Full)
-        .await
-        .expect("commit record is present")
-        .data
-        .len() as u64;
-    let get_total = |body: &serde_json::Value, field: &str| -> u64 {
-        body["data"]["stats"]["accounting"][field]
-            .as_u64()
-            .expect("GET totals are integers")
-    };
-    assert_eq!(
-        get_total(&distributed_body, "s3GetRequests"),
-        get_total(&local_body, "s3GetRequests") + 1,
-        "the worker GETs the one pinned L0 segment's commit record once"
-    );
-    assert_eq!(
-        get_total(&distributed_body, "s3GetBytes"),
-        get_total(&local_body, "s3GetBytes") + record_len,
-        "the extra GET moves exactly the commit record's bytes"
     );
     // Sanity: the query actually returned the published series, so the equality
     // above is not the trivial equality of two empty results.

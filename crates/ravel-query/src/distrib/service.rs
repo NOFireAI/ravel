@@ -55,6 +55,12 @@
 //! this fetch cannot change which object is read: records and the objects they
 //! name are immutable.
 //!
+//! Each record GET holds a permit of the same GET limiter the worker's
+//! data-object GETs use. Record GETs are not charged to the slice's
+//! accounting, so they count toward neither `max_bytes_scanned` nor
+//! `max_s3_requests` here or on the coordinator, and are not in the slice's
+//! reported cost.
+//!
 //! A structurally malformed identity is [`ResolveIdentityError::Invalid`] and
 //! fails the slice with `BAD_DATA`. A record that is missing, unreadable,
 //! fails verification, or disagrees with the identity fails the slice with
@@ -158,7 +164,9 @@ impl ResolveIdentityError {
 pub trait SegmentResolver: Send + Sync {
     /// The ref this identity names, or a typed refusal. A resolver never
     /// substitutes a different segment for one it cannot resolve. Any store
-    /// request it issues is charged to `accounting`, the slice's own.
+    /// request it issues is charged to `accounting`, which the caller picks:
+    /// the slice service passes a handle apart from the slice's own (see
+    /// `SeriesFetchService::resolve_pinned`).
     async fn resolve(
         &self,
         identity: &pb::SegmentIdentity,
@@ -227,7 +235,8 @@ impl ReconstructingSegmentResolver {
         }
     }
 
-    /// GET one record in full, charging the request and its bytes to the slice.
+    /// GET one record in full, charging the request and its bytes to
+    /// `accounting`.
     /// The GET holds a permit of the same limiter the data-object GETs draw
     /// from, and only around the store call.
     async fn get_record(
@@ -928,6 +937,26 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         )])
     }
 
+    /// Resolves a pinned slice's shipped identities to refs. A typed refusal
+    /// carries its own status (see [`ResolveIdentityError::status_code`]).
+    ///
+    /// The record GETs a resolver issues are charged to a handle of their own,
+    /// never to the slice's. The slice's accounting is what this worker and the
+    /// coordinator hold to `max_bytes_scanned` and `max_s3_requests`, and
+    /// local execution never issues these GETs, so charging them would fail a
+    /// query distributed that succeeds locally (ADR-0071 pinned-record
+    /// amendment). The summary carries one pooled snapshot with no phase
+    /// split, so they are not in the slice's reported cost either.
+    async fn resolve_pinned(
+        &self,
+        identities: &[pb::SegmentIdentity],
+    ) -> Result<Vec<SegmentRef>, SliceFailure> {
+        let records = QueryAccounting::new();
+        resolve_identities(self.resolver.as_ref(), identities, &records)
+            .await
+            .map_err(|err| SliceFailure::from((err.status_code(), err.to_string())))
+    }
+
     /// The Metrics slice path: resolve the pinned scope to refs, fetch each
     /// segment's scalar and histogram series, enforce the per-slice
     /// bytes-scanned budget, apply erasure, and stream one `SeriesFrame` per
@@ -960,19 +989,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         };
 
+        let segments = self.resolve_pinned(&identities).await?;
         // One fresh accounting handle per slice: the coordinator folds the
-        // returned snapshot into the query's aggregate (ADR-0071). Created
-        // before resolution so the record GETs a resolver issues are charged
-        // to the slice, including when resolution refuses an identity.
+        // returned snapshot into the query's aggregate (ADR-0071).
         let accounting = QueryAccounting::new();
-        // Resolve each ref from its shipped identity. The typed refusal carries
-        // its own status (see `ResolveIdentityError::status_code`).
-        let segments = resolve_identities(self.resolver.as_ref(), &identities, &accounting)
-            .await
-            .map_err(|err| {
-                SliceFailure::from((err.status_code(), err.to_string()))
-                    .with_spend(&accounting, &FetchStats::default())
-            })?;
 
         // Per-slice bytes-scanned budget, enforced per completed segment
         // exactly as the local path does (ADR-0061 decision 1).
@@ -1226,13 +1246,8 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         };
 
+        let segments = self.resolve_pinned(&identities).await?;
         let accounting = QueryAccounting::new();
-        let segments = resolve_identities(self.resolver.as_ref(), &identities, &accounting)
-            .await
-            .map_err(|err| {
-                SliceFailure::from((err.status_code(), err.to_string()))
-                    .with_spend(&accounting, &FetchStats::default())
-            })?;
 
         let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
@@ -1359,13 +1374,8 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         };
 
+        let segments = self.resolve_pinned(&identities).await?;
         let accounting = QueryAccounting::new();
-        let segments = resolve_identities(self.resolver.as_ref(), &identities, &accounting)
-            .await
-            .map_err(|err| {
-                SliceFailure::from((err.status_code(), err.to_string()))
-                    .with_spend(&accounting, &FetchStats::default())
-            })?;
 
         let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 

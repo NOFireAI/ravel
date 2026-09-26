@@ -4189,8 +4189,8 @@ mod tests {
     }
 
     /// The happy path the rejection tests below perturb: an untouched L0 pin
-    /// resolves through its commit record and returns the segment's one series,
-    /// and the record GET is charged to the slice.
+    /// resolves through its commit record, after exactly one record GET, and
+    /// returns the segment's one series.
     #[tokio::test]
     async fn pinned_l0_resolves_through_its_commit_record() {
         let (store, tenant_hash, seg, service) = pinned_l0("l0-happy").await;

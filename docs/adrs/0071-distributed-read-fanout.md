@@ -1646,7 +1646,20 @@ objects were all still readable.
    draw from, so instantaneous rate stays capped by `max_parallel_slices`
    times the per-worker GET semaphore.
 
-5. **Unchanged.** The `queryfrag` wire and `PROTOCOL_VERSION` are unchanged.
+5. **Record GETs are not charged to the query.** Local execution never issues
+   them, so charging them to `max_bytes_scanned` or `max_s3_requests` would
+   fail a query distributed that succeeds locally, against this ADR's
+   invariant. A worker charges them to a handle apart from the slice's
+   accounting, and neither its own per-segment budget check nor the
+   coordinator's fold over the slice summaries sees them. The summary carries
+   one pooled accounting snapshot with no phase split, so they are also absent
+   from the slice's reported cost, as the catalog re-resolve they replace was:
+   total S3 request count as reported is identical to local execution, and
+   the store serves the record GETs of item 4 on top of it. Reporting them as
+   a separate resolve-phase figure needs a `queryfrag` field, which is a
+   separate decision.
+
+6. **Unchanged.** The `queryfrag` wire and `PROTOCOL_VERSION` are unchanged.
    Cross-cluster federation is unchanged: a resolve-scope request still
    resolves the remote cluster's own snapshot, and its identities are matched
    against that snapshot.
