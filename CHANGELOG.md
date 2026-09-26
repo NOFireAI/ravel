@@ -25,10 +25,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   built from the verified record alone. A worker lists nothing and reads no
   manifest on the intra-cluster fetch path; it issues one record GET per
   pinned L0 segment, one per pinned L1 segment, and two for an L1 segment only
-  a rewrite record describes. A record that is missing, unreadable, fails
-  verification, or disagrees with the identity fails the fragment with
-  `UNSUPPORTED`, and the coordinator runs the query locally; a malformed
-  identity is `BAD_DATA`.
+  a rewrite record describes. Each record GET holds a permit of the worker's
+  process-wide GET limiter, the one its data-object GETs use. Record GETs are
+  not charged to the slice's accounting, so they count toward neither
+  `max_bytes_scanned` nor `max_s3_requests` on the worker or the coordinator,
+  and a query that fits its budget locally also fits it distributed; they are
+  also not in the query's reported cost, which the slice summary carries as
+  one pooled figure. A record that is missing, unreadable, fails verification,
+  or disagrees with the identity fails the fragment with `UNSUPPORTED`, and the
+  coordinator runs the query locally; a throttled, timed-out or transient
+  error on the record GET fails it with `UNAVAILABLE`, and the coordinator
+  re-dispatches that slice; a malformed identity is `BAD_DATA`.
   Records and the objects they name are immutable, so the pinned read is
   unaffected by whatever the catalog says by then. The queryfrag wire and
   `PROTOCOL_VERSION` are unchanged, and cross-cluster federation is unchanged:
