@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A scrub tick's request count follows its budget, not the corpus size**
+  (issue #1686, ADR-1686). Each content-tier tick used to LIST a shard's whole
+  commit prefix and GET every record in it before verifying its slice. It now
+  lists strictly after a start-after marker held in the per-shard cursor and
+  stops once the tick's budget is filled; the rotation rolls over when the
+  listing runs out. A rotation with no predecessor opens with one LIST-only
+  count and runs on `ceil(count * tick / P)` listing entries per tick. The
+  cursor gains serde-default fields, so a cursor from an older build still
+  loads; its position is discarded and the next tick starts a fresh rotation.
+  `ravel_scrub_cursor_position` is now a fraction of listing entries rather
+  than of data objects. The same objects are verified, each once per rotation.
+
 ## [0.17.0] - 2026-09-25
 
 ### Fixed

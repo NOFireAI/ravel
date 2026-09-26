@@ -3379,8 +3379,9 @@ pub struct ScrubSignalSnapshot {
     /// record for this signal:
     /// `ravel_scrub_seal_divergence_total{reason="mismatched"}`.
     pub seal_divergence_mismatched: u64,
-    /// Fraction of the current rotation the content-tier cursor has covered so
-    /// far for this signal, in `[0.0, 1.0]` (operator visibility into cadence).
+    /// Fraction of the current rotation's listing entries the content-tier
+    /// cursor has consumed so far for this signal, in `[0.0, 1.0]` (operator
+    /// visibility into cadence).
     pub cursor_position: f64,
 }
 
@@ -3486,9 +3487,10 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
     write_header(
         out,
         "ravel_scrub_cursor_position",
-        "Fraction of the current scrub rotation the content-tier cursor has covered so far, by \
-         signal, in [0,1] (ADR-0059 decision 3). A rotation completes in about the configured \
-         --scrub-period P; a value stuck near 0 means scrubbing is not keeping pace with P.",
+        "Fraction of the current scrub rotation's commit shard listing entries the content-tier \
+         cursor has consumed so far, by signal, in [0,1] (ADR-0059 decision 3, ADR-1686). A \
+         rotation completes in about the configured --scrub-period P; a value stuck near 0 \
+         means scrubbing is not keeping pace with P.",
         "gauge",
     );
     for signal in &snapshot.signals {

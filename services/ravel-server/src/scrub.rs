@@ -37,23 +37,33 @@
 //! set is still the startup flag restriction rather than the durable per-tenant
 //! lifecycle records.)
 //!
-//! 1. LIST the shard's commit, compaction, rewrite, and tombstone records.
-//!    Decode each commit record and reconstruct the data object key it points
-//!    at; decode each compaction/rewrite record, drop the tombstoned ones,
-//!    the superseded ones, and the overlap losers, and reconstruct the
-//!    survivors' parts' keys the same way. Together these build the rotation corpus ([`ScrubTarget`]s in key
-//!    order) and, beside it, the per-key map holding the record to verify and
-//!    its [`ravel_maintain::ScrubLevel`]. The level lives in that map alone,
+//! The content tier walks the shard with a start-after marker (ADR-1686), so a
+//! tick's LIST and GET count depends on its budget, not on the corpus size:
+//!
+//! 1. Load this shard's persisted [`ScrubCursor`]. When it has no entry count
+//!    for the current rotation (the first rotation, the one after a completed
+//!    rotation, or a cursor an older build wrote), count the entries under the
+//!    commit shard prefix with a LIST-only pass and open a rotation.
+//! 2. Size the per-tick budget from the configured scrub period `P`: the
+//!    previous rotation's bytes ([`ravel_maintain::per_tick_byte_budget`]),
+//!    or, in a rotation with no predecessor, `ceil(count * tick / P)` listing
+//!    entries ([`ravel_maintain::per_tick_entry_budget`]).
+//! 3. List strictly after the cursor's marker and consume entries until the
+//!    budget is filled. A commit record is a unit on its own; the compaction
+//!    records, rewrite records, and tombstone of an hour, which sort after
+//!    every commit record under that hour, form one unit with the rest of the
+//!    hour, so the lineage filter above always sees an hour's whole set.
+//!    Decoding a unit yields the objects it names ([`ScrubTarget`]s), each
+//!    with the record to verify it against and its
+//!    [`ravel_maintain::ScrubLevel`]. The level lives beside the target alone,
 //!    so the label a mismatch is counted under has one owner.
-//! 2. Load this shard's persisted [`ScrubCursor`], size a per-tick byte budget
-//!    from the corpus size and the configured scrub period `P`
-//!    ([`per_tick_byte_budget`]), and [`advance_cursor`] to pick the bounded
-//!    slice of objects to verify this tick.
-//! 3. Verify each object in the slice via
+//! 4. Verify each object in the slice via
 //!    [`scrub_one_object`](ravel_maintain::scrub_one_object) and record any
 //!    anomaly on the metrics counters below.
-//! 4. Persist the advanced cursor so the next tick resumes where this one
-//!    stopped, completing a full rotation over the corpus in about `P`.
+//! 5. Persist the cursor with the marker on the last entry consumed. When the
+//!    listing ended past the marker, the rotation rolls over instead: the
+//!    marker clears and the rotation's bytes size the next one, completing a
+//!    full rotation over the shard in about `P`.
 //!
 //! # Why Maintain-mode only
 //!
@@ -80,10 +90,11 @@
 //! - A FORWARD clobber (a replica writes a position ahead of another's) makes
 //!   the trailing replica resume past a slice that neither verified this
 //!   rotation, so that slice goes unscrubbed until the rotation wraps. It is not
-//!   lost: [`advance_cursor`]'s past-tail wrap re-covers every slice next
-//!   rotation. The effect is purely a promptness cost -- it DELAYS detection of
-//!   a corruption in that one slice by at most one full rotation period (the
-//!   scrub period `P`, [`DEFAULT_SCRUB_PERIOD`] = 7 days at defaults).
+//!   lost: the next rotation starts again from the head of the listing and
+//!   re-covers every slice. The effect is purely a promptness cost -- it
+//!   DELAYS detection of a corruption in that one slice by at most one full
+//!   rotation period (the scrub period `P`, [`DEFAULT_SCRUB_PERIOD`] = 7 days
+//!   at defaults).
 //!
 //! Nothing is lost because scrub is detection-only (it never repairs, see
 //! below): delaying detection by up to one rotation changes only when an alarm
@@ -106,13 +117,14 @@ use std::time::Duration;
 
 use ravel_commit::keys;
 use ravel_ingest::{Clock as _, SystemClock};
-use ravel_maintain::{
-    Clock, ScrubLevel, ScrubResult, ScrubTarget, WorkerSet, advance_cursor, per_tick_byte_budget,
-    scrub_one_object,
+use ravel_maintain::ScrubCursor;
+use ravel_maintain::{Clock, ScrubLevel, ScrubResult, ScrubTarget, WorkerSet, scrub_one_object};
+use ravel_object_store::{
+    DrainStep, GetRange, MAX_LIST_PAGES, ObjectStoreBackend, PageToken, PutOptions, StoreError,
+    drain_pages,
 };
-use ravel_maintain::{ScrubBudget, ScrubCursor};
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, list_all};
 use ravel_types::{Signal, TenantHash};
+use std::collections::VecDeque;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -197,13 +209,14 @@ pub struct ScrubMetrics {
     /// record, per signal. The `reason="mismatched"` value of
     /// `ravel_scrub_seal_divergence_total`.
     seal_divergence_mismatched: [AtomicU64; MAINTAINED_SIGNALS.len()],
-    /// Objects covered so far in the current rotation, per signal (numerator of
-    /// the cursor-position gauge). Last-observed value, overwritten each shard
-    /// tick, matching the "most recent pass" gauge discipline `orphans_withheld`
-    /// keeps in [`crate::maintain`].
+    /// Listing entries consumed so far in the current rotation, per signal
+    /// (numerator of the cursor-position gauge, ADR-1686). Last-observed
+    /// value, overwritten each shard tick, matching the "most recent pass"
+    /// gauge discipline `orphans_withheld` keeps in [`crate::maintain`].
     rotation_covered: [AtomicU64; MAINTAINED_SIGNALS.len()],
-    /// Total objects in the corpus at the current rotation's start, per signal
-    /// (denominator of the cursor-position gauge).
+    /// Listing entries the current rotation's LIST-only count found under the
+    /// commit shard prefix, per signal (denominator of the cursor-position
+    /// gauge).
     rotation_total: [AtomicU64; MAINTAINED_SIGNALS.len()],
 }
 
@@ -225,9 +238,10 @@ impl ScrubMetrics {
     }
 
     /// Fraction of the current rotation covered so far for `signal`, in
-    /// `[0.0, 1.0]` (ADR-0059's `ravel_scrub_cursor_position` gauge). Derived
-    /// from the objects-covered / corpus-total pair the last shard tick
-    /// recorded; `0.0` when the corpus is empty (nothing to rotate over).
+    /// `[0.0, 1.0]` (ADR-0059's `ravel_scrub_cursor_position` gauge, entry-based
+    /// since ADR-1686). Derived from the entries-consumed / entries-counted pair
+    /// the last shard tick recorded; `0.0` when the shard lists no entries
+    /// (nothing to rotate over).
     pub fn cursor_position(&self, signal: Signal) -> f64 {
         let index = signal_index(signal);
         let total = self.rotation_total[index].load(Ordering::Relaxed);
@@ -568,13 +582,14 @@ async fn scan_shards(
     }
 }
 
-/// One content-tier tick over one `(tenant, signal, shard)`: build the rotation
-/// corpus from the shard's L0 commit records plus the parts of every
-/// compaction and rewrite record that survives the lineage filter the module
-/// doc describes, advance this shard's persisted cursor by one budgeted slice,
-/// verify each object in the slice, and persist the advanced cursor. Every
-/// store error is logged and the tick is retried next cycle; nothing here
-/// mutates durable data.
+/// One content-tier tick over one `(tenant, signal, shard)` (ADR-1686): load
+/// the shard's persisted cursor, open a rotation with a LIST-only entry count
+/// when it needs one, walk the commit shard prefix from the cursor's
+/// start-after marker until the per-tick budget is filled, verify each object
+/// the walk sliced, and persist the advanced cursor. The walk never builds the
+/// whole corpus: it lists and GETs only the entries this tick consumes, plus
+/// at most one partial page. Every store error is logged and the tick is
+/// retried next cycle; nothing here mutates durable data.
 #[allow(clippy::too_many_arguments)]
 async fn run_shard_tick(
     store: &dyn ObjectStoreBackend,
@@ -587,13 +602,6 @@ async fn run_shard_tick(
     covering: Option<&ravel_catalog::LoadedCoveringPostings>,
     metrics: &ScrubMetrics,
 ) {
-    // Build the corpus: every L0 data object referenced by a commit record for
-    // this shard, and every part of a compaction or rewrite record that is not
-    // superseded, not an overlap loser, and not in a tombstoned bucket, keyed
-    // by object key so the cursor's key-ordered resume point is well defined.
-    // The commit record (for an L0 object) or the `CompactionPart` (for a
-    // part) carries the object's size (for the byte budget) and the content
-    // hash `scrub_one_object` re-verifies against.
     let prefix = match keys::commit_shard_prefix(tenant, signal, shard) {
         Ok(prefix) => prefix,
         Err(err) => {
@@ -604,47 +612,329 @@ async fn run_shard_tick(
             return;
         }
     };
-    let metas = match list_all(store, &prefix).await {
-        Ok(metas) => metas,
-        Err(err) => {
-            tracing::warn!(
-                tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
-                "scrub: LIST of commit records failed; retried next tick"
-            );
-            return;
-        }
-    };
 
+    let mut cursor = load_cursor(store, tenant, signal, shard, clock.now_ns()).await;
+    if cursor.needs_entry_count() {
+        match count_entries(store, &prefix).await {
+            Ok(total) => cursor.start_rotation(total, clock.now_ns()),
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
+                    "scrub: LIST-only entry count failed; rotation not started, retried next tick"
+                );
+                return;
+            }
+        }
+    }
+
+    // Consume the listing in units until the budget is filled. The marker
+    // advances past each unit whether or not its records decoded, so one bad
+    // record cannot pin the rotation.
+    let budget = cursor.tick_budget(period_secs, tick_secs);
+    let mut listing = MarkerListing::new(store, &prefix, cursor.last_commit_key.clone());
+    let mut slice: Vec<SliceEntry> = Vec::new();
+    let mut slice_entries = 0u64;
+    let mut slice_bytes = 0u64;
+    let mut listing_failed = false;
+    while !budget.is_filled(slice_entries, slice_bytes) {
+        let unit = match next_unit(&mut listing).await {
+            Ok(Some(unit)) => unit,
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
+                    "scrub: LIST of commit records failed; scrubbing the slice so far, resumed \
+                     next tick"
+                );
+                listing_failed = true;
+                break;
+            }
+        };
+        let targets = unit_targets(store, &unit).await;
+        let bytes = targets.iter().fold(0u64, |sum, entry| {
+            sum.saturating_add(entry.target.object_size)
+        });
+        let entries = unit.len() as u64;
+        if let Some(last) = unit.into_iter().next_back() {
+            cursor.consume(last, entries, bytes);
+        }
+        slice_entries = slice_entries.saturating_add(entries);
+        slice_bytes = slice_bytes.saturating_add(bytes);
+        slice.extend(targets);
+    }
+    let rotation_complete = !listing_failed && listing.ended();
+
+    // Build the borrowing `CoveringPostings` once for this signal's tick from
+    // the owned data loaded per (tenant, signal) in `run_cycle`.
+    // `CoveringPostings` is `Copy`, so it is passed by value into each object's
+    // scrub. When no covering postings resolved (no postings ref yet, or a
+    // degrade-to-None load), this stays `None` and `scrub_one_object` runs only
+    // the structural and content tiers, exactly as before this wiring landed.
+    let covering_postings = covering.map(|loaded| ravel_maintain::CoveringPostings {
+        bytes: &loaded.bytes,
+        part_blake3: &loaded.part_blake3,
+        covered_entries: &loaded.covered_entries,
+        max_postings_bytes: ravel_catalog::DEFAULT_MAX_POSTINGS_BYTES,
+    });
+
+    for entry in &slice {
+        let key = &entry.target.object_key;
+        let level = entry.level;
+        // The structural + content tiers always run (footer crc re-verify, then
+        // whole-object blake3 vs the recorded content hash). The postings tier
+        // runs additionally when `covering_postings` is `Some`: the object's
+        // true `__name__` set is re-derived and diffed against what the covering
+        // postings object claims for it (the false-negative check). Postings
+        // only ever cover L0 commit records (an L1/rewrite part's covering
+        // ordinal is not meaningfully defined), so L1 and rewrite targets never
+        // get the postings tier regardless of whether it loaded this tick.
+        let postings_for_object = if level == ScrubLevel::L0 {
+            covering_postings
+        } else {
+            None
+        };
+        match scrub_one_object(store, clock, &entry.record, postings_for_object).await {
+            ScrubResult::Clean => {}
+            ScrubResult::ChecksumMismatch { .. } => {
+                tracing::error!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
+                    level = level.as_str(),
+                    "scrub: content-hash mismatch at rest (bit rot or partial write)"
+                );
+                metrics.record_checksum_mismatch(signal, level);
+            }
+            ScrubResult::StructuralCorruption { detail } => {
+                tracing::error!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
+                    level = level.as_str(), detail = %detail,
+                    "scrub: structural corruption at rest (footer/section crc)"
+                );
+                metrics.record_checksum_mismatch(signal, level);
+            }
+            ScrubResult::PostingsDisagreement { name, ordinal } => {
+                tracing::error!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
+                    name = %name, ordinal,
+                    "scrub: postings disagreement (false negative)"
+                );
+                metrics.record_postings_disagreement(signal);
+            }
+            ScrubResult::ReadError { detail } => {
+                // Transient store/decode failure: retried next tick, never an
+                // anomaly (a throttle or timeout must not read as bit rot).
+                tracing::warn!(
+                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
+                    detail = %detail,
+                    "scrub: transient read error; retried next tick"
+                );
+            }
+        }
+    }
+
+    // Cursor-position gauge (ADR-1686 decision 5): listing entries consumed
+    // this rotation over the rotation's LIST-only count. A completed rotation
+    // reads as full coverage before it rolls over.
+    let total = cursor.rotation_total_entries.unwrap_or(0);
+    if rotation_complete {
+        metrics.record_cursor_position(signal, total, total);
+        cursor.complete_rotation(clock.now_ns());
+    } else {
+        metrics.record_cursor_position(signal, cursor.rotation_entries_visited, total);
+    }
+
+    persist_cursor(store, tenant, signal, shard, &cursor).await;
+}
+
+/// One object a tick's slice verifies: its key and size, the record
+/// [`scrub_one_object`] checks it against, and the level a mismatch counts
+/// under. The level lives here alone, so it has one owner.
+struct SliceEntry {
+    target: ScrubTarget,
+    record: ravel_proto::commit::v1::CommitRecord,
+    level: ScrubLevel,
+}
+
+/// The LIST-only pass that opens a rotation (ADR-1686 decision 3): count every
+/// entry under the commit shard prefix, with no GETs.
+async fn count_entries(store: &dyn ObjectStoreBackend, prefix: &str) -> Result<u64, StoreError> {
+    let mut count = 0u64;
+    drain_pages::<StoreError, _, _, _>(
+        prefix,
+        None,
+        MAX_LIST_PAGES,
+        |_start_after, token| async move { store.list(prefix, token).await },
+        |_meta| {
+            count += 1;
+            Ok(DrainStep::Continue)
+        },
+    )
+    .await?;
+    Ok(count)
+}
+
+/// The commit shard prefix listed strictly after a start-after marker, one
+/// page at a time and only when the walk needs another entry. Applies the same
+/// listing rules as [`drain_pages`]: a repeated key is dropped, a key that
+/// sorts below the last one delivered or a repeated continuation token is a
+/// typed error, and [`MAX_LIST_PAGES`] bounds the walk.
+struct MarkerListing<'a> {
+    store: &'a dyn ObjectStoreBackend,
+    prefix: &'a str,
+    start_after: Option<String>,
+    token: Option<PageToken>,
+    buffered: VecDeque<String>,
+    last_key: Option<String>,
+    exhausted: bool,
+    pages: usize,
+}
+
+impl<'a> MarkerListing<'a> {
+    fn new(
+        store: &'a dyn ObjectStoreBackend,
+        prefix: &'a str,
+        start_after: Option<String>,
+    ) -> Self {
+        MarkerListing {
+            store,
+            prefix,
+            last_key: start_after.clone(),
+            start_after,
+            token: None,
+            buffered: VecDeque::new(),
+            exhausted: false,
+            pages: 0,
+        }
+    }
+
+    /// Every listed entry has been consumed and the store reported no further
+    /// page: the listing, and with it the rotation, has ended.
+    fn ended(&self) -> bool {
+        self.exhausted && self.buffered.is_empty()
+    }
+
+    async fn fill(&mut self) -> Result<(), StoreError> {
+        while self.buffered.is_empty() && !self.exhausted {
+            if self.pages >= MAX_LIST_PAGES {
+                return Err(StoreError::ListPageCeiling {
+                    prefix: self.prefix.to_string(),
+                    ceiling: MAX_LIST_PAGES,
+                });
+            }
+            self.pages += 1;
+            let page = self
+                .store
+                .list_after(self.prefix, self.start_after.as_deref(), self.token.clone())
+                .await?;
+            for meta in page.objects {
+                match self.last_key.as_deref() {
+                    Some(last) if meta.key.as_str() < last => {
+                        return Err(StoreError::ListOrderViolation {
+                            prefix: self.prefix.to_string(),
+                            previous: last.to_string(),
+                            offending: meta.key,
+                        });
+                    }
+                    Some(last) if meta.key.as_str() == last => {}
+                    _ => {
+                        self.last_key = Some(meta.key.clone());
+                        self.buffered.push_back(meta.key);
+                    }
+                }
+            }
+            match page.next {
+                Some(next) if self.token.as_ref() == Some(&next) => {
+                    return Err(StoreError::ListRepeatedToken {
+                        prefix: self.prefix.to_string(),
+                    });
+                }
+                Some(next) => self.token = Some(next),
+                None => self.exhausted = true,
+            }
+        }
+        Ok(())
+    }
+
+    async fn peek(&mut self) -> Result<Option<&str>, StoreError> {
+        self.fill().await?;
+        Ok(self.buffered.front().map(String::as_str))
+    }
+
+    async fn pop(&mut self) -> Result<Option<String>, StoreError> {
+        self.fill().await?;
+        Ok(self.buffered.pop_front())
+    }
+}
+
+/// The next unit of listing entries the walk consumes (ADR-1686 decisions 2
+/// and 6). An L0 commit record, or an entry whose shape is not recognized, is
+/// a unit on its own. The first compaction record, rewrite record, or
+/// tombstone of an hour starts a unit holding every remaining entry under that
+/// hour: those shapes all sort after every commit record under the hour, and
+/// the lineage filter needs the hour's whole set of them at once, since a
+/// tombstone, a superseding rewrite record, or an overlapping compaction record
+/// anywhere in the hour changes which parts are live. So the marker lands only
+/// on a commit record or on an hour's last entry, and a unit never splits a
+/// lineage set across ticks.
+async fn next_unit(listing: &mut MarkerListing<'_>) -> Result<Option<Vec<String>>, StoreError> {
+    let Some(first) = listing.pop().await? else {
+        return Ok(None);
+    };
+    if matches!(
+        keys::partition_bucket_entry(&first),
+        Ok(keys::BucketEntry::CommitRecord(_)) | Err(_)
+    ) {
+        return Ok(Some(vec![first]));
+    }
+    let hour_dir = match first.rfind('/') {
+        Some(slash) => first[..=slash].to_string(),
+        None => return Ok(Some(vec![first])),
+    };
+    let mut unit = vec![first];
+    while let Some(next) = listing.peek().await? {
+        if !next.starts_with(&hour_dir) {
+            break;
+        }
+        if let Some(key) = listing.pop().await? {
+            unit.push(key);
+        }
+    }
+    Ok(Some(unit))
+}
+
+/// The objects one unit of listing entries names: the L0 data object behind
+/// every commit record, and every part of a compaction or rewrite record that
+/// is not superseded, not an overlap loser, and not in a tombstoned bucket.
+/// The commit record (for an L0 object) or the `CompactionPart` (for a part)
+/// carries the object's size (for the byte budget) and the content hash
+/// `scrub_one_object` re-verifies against. A record whose GET or decode fails
+/// is logged and names nothing this tick.
+async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &[String]) -> Vec<SliceEntry> {
     // Retention's physical sweep deletes every object in a tombstoned bucket
     // (L0 commit records, L1 parts, rewrite parts) as one unit, but does not
-    // do so atomically with the LIST above: a compaction/rewrite record can
-    // still be present in `metas` for an hour whose tombstone has already
-    // landed. Collect tombstoned hours first (filename-only classification,
-    // no GETs) so the second pass can skip their compaction/rewrite records
-    // rather than racing a sweep that may delete their parts mid-tick.
+    // do so atomically with the listing: a compaction/rewrite record can
+    // still be listed for an hour whose tombstone has already landed.
+    // Collect tombstoned hours first (filename-only classification, no GETs)
+    // so the second pass can skip their compaction/rewrite records rather
+    // than racing a sweep that may delete their parts mid-tick.
     let mut tombstoned_hours: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for meta in &metas {
-        if let Ok(keys::BucketEntry::Tombstone(parsed)) = keys::partition_bucket_entry(&meta.key) {
+    for key in unit {
+        if let Ok(keys::BucketEntry::Tombstone(parsed)) = keys::partition_bucket_entry(key) {
             tombstoned_hours.insert(parsed.ingest_hour_bucket);
         }
     }
 
-    let mut corpus: Vec<ScrubTarget> = Vec::new();
-    let mut records: std::collections::HashMap<
-        String,
-        (ravel_proto::commit::v1::CommitRecord, ScrubLevel),
-    > = std::collections::HashMap::new();
+    let mut out: Vec<SliceEntry> = Vec::new();
     // Compaction and rewrite records are decoded in the pass below but their
     // parts are not expanded there: a bucket can hold a superseded generation
     // alongside the live one until a horizon-gated sweep retires it, and can
-    // hold two compaction records whose input sets overlap, and only the full
-    // listing says which record of each pair the read path serves. Buffer
-    // them, resolve both exclusions once, then expand. Each record is still
-    // fetched exactly once.
+    // hold two compaction records whose input sets overlap, and only the
+    // hour's full set says which record of each pair the read path serves.
+    // Buffer them, resolve both exclusions once, then expand. Each record is
+    // still fetched exactly once.
     let mut compaction_records: Vec<(String, ravel_proto::commit::v1::CompactionRecord)> =
         Vec::new();
     let mut rewrite_records: Vec<(String, ravel_proto::commit::v1::RewriteRecord)> = Vec::new();
-    for meta in &metas {
+    for key in unit {
         // L0 commit records, and the L1/rewrite parts a compaction or
         // erasure-rewrite record supersedes them with, all name objects
         // `scrub_one_object` can verify (its API is commit-record based; L1
@@ -652,13 +942,13 @@ async fn run_shard_tick(
         // their own part fields). Tombstone records carry no object of their
         // own. Listed explicitly so a new bucket-entry shape fails to
         // compile here rather than being silently swallowed.
-        match keys::partition_bucket_entry(&meta.key) {
+        match keys::partition_bucket_entry(key) {
             Ok(keys::BucketEntry::CommitRecord(_)) => {
-                let got = match store.get(&meta.key, GetRange::Full).await {
+                let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
                         tracing::warn!(
-                            key = %meta.key, error = %err,
+                            key = %key, error = %err,
                             "scrub: commit record GET failed; skipping this object this tick"
                         );
                         continue;
@@ -668,7 +958,7 @@ async fn run_shard_tick(
                     Ok(record) => record,
                     Err(err) => {
                         tracing::warn!(
-                            key = %meta.key, error = %err,
+                            key = %key, error = %err,
                             "scrub: commit record decode failed; skipping this object this tick"
                         );
                         continue;
@@ -678,27 +968,30 @@ async fn run_shard_tick(
                     Ok(key) => key,
                     Err(err) => {
                         tracing::warn!(
-                            key = %meta.key, error = %err,
+                            key = %key, error = %err,
                             "scrub: could not reconstruct data key; skipping this object this tick"
                         );
                         continue;
                     }
                 };
-                corpus.push(ScrubTarget {
-                    object_key: data_key.clone(),
-                    object_size: record.object_size,
+                out.push(SliceEntry {
+                    target: ScrubTarget {
+                        object_key: data_key,
+                        object_size: record.object_size,
+                    },
+                    record,
+                    level: ScrubLevel::L0,
                 });
-                records.insert(data_key, (record, ScrubLevel::L0));
             }
             Ok(keys::BucketEntry::CompactionRecord(parsed)) => {
                 if tombstoned_hours.contains(&parsed.ingest_hour_bucket) {
                     continue;
                 }
-                let got = match store.get(&meta.key, GetRange::Full).await {
+                let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
                         tracing::warn!(
-                            key = %meta.key, error = %err,
+                            key = %key, error = %err,
                             "scrub: compaction record GET failed; skipping this tick"
                         );
                         continue;
@@ -708,23 +1001,23 @@ async fn run_shard_tick(
                     Ok(rec) => rec,
                     Err(err) => {
                         tracing::warn!(
-                            key = %meta.key, error = %err,
+                            key = %key, error = %err,
                             "scrub: compaction record decode failed; skipping this tick"
                         );
                         continue;
                     }
                 };
-                compaction_records.push((meta.key.clone(), rec));
+                compaction_records.push((key.clone(), rec));
             }
             Ok(keys::BucketEntry::RewriteRecord(parsed)) => {
                 if tombstoned_hours.contains(&parsed.ingest_hour_bucket) {
                     continue;
                 }
-                let got = match store.get(&meta.key, GetRange::Full).await {
+                let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
                         tracing::warn!(
-                            key = %meta.key, error = %err,
+                            key = %key, error = %err,
                             "scrub: rewrite record GET failed; skipping this tick"
                         );
                         continue;
@@ -734,18 +1027,18 @@ async fn run_shard_tick(
                     Ok(rec) => rec,
                     Err(err) => {
                         tracing::warn!(
-                            key = %meta.key, error = %err,
+                            key = %key, error = %err,
                             "scrub: rewrite record decode failed; skipping this tick"
                         );
                         continue;
                     }
                 };
-                rewrite_records.push((meta.key.clone(), rec));
+                rewrite_records.push((key.clone(), rec));
             }
             Ok(keys::BucketEntry::Tombstone(_)) => continue,
             Err(err) => {
                 tracing::warn!(
-                    key = %meta.key, error = %err,
+                    key = %key, error = %err,
                     "scrub: unrecognized bucket entry shape; skipping"
                 );
                 continue;
@@ -762,8 +1055,8 @@ async fn run_shard_tick(
     // no query reads them: scrubbing them would page an operator on rot in
     // bytes nothing depends on, and would spend tick budget that belongs to
     // live data. Unlike the rewrite pass, an unresolvable shape here is not
-    // fatal; the scrub keeps whatever survives the filter and the next tick
-    // tries again.
+    // fatal; the scrub keeps whatever survives the filter and the next
+    // rotation tries again.
     let superseded: std::collections::HashSet<&str> = rewrite_records
         .iter()
         .filter(|(_, rec)| !rec.superseded_record_key.is_empty())
@@ -829,11 +1122,14 @@ async fn run_shard_tick(
                 content_hash: part.content_hash.clone(),
                 ..Default::default()
             };
-            corpus.push(ScrubTarget {
-                object_key: part_key.clone(),
-                object_size: part.object_size,
+            out.push(SliceEntry {
+                target: ScrubTarget {
+                    object_key: part_key,
+                    object_size: part.object_size,
+                },
+                record: synthetic,
+                level: ScrubLevel::L1,
             });
-            records.insert(part_key, (synthetic, ScrubLevel::L1));
         }
     }
 
@@ -859,107 +1155,18 @@ async fn run_shard_tick(
                 content_hash: part.content_hash.clone(),
                 ..Default::default()
             };
-            corpus.push(ScrubTarget {
-                object_key: part_key.clone(),
-                object_size: part.object_size,
+            out.push(SliceEntry {
+                target: ScrubTarget {
+                    object_key: part_key,
+                    object_size: part.object_size,
+                },
+                record: synthetic,
+                level: ScrubLevel::Rewrite,
             });
-            records.insert(part_key, (synthetic, ScrubLevel::Rewrite));
         }
     }
 
-    // `advance_cursor` requires the corpus in key order (as a strongly
-    // consistent LIST returns it); the corpus was built from commit records,
-    // not the data-object listing, so sort explicitly.
-    corpus.sort_by(|a, b| a.object_key.cmp(&b.object_key));
-
-    let cursor = load_cursor(store, tenant, signal, shard, clock.now_ns()).await;
-    let total_bytes: u64 = corpus.iter().map(|t| t.object_size).sum();
-    let budget: ScrubBudget = per_tick_byte_budget(total_bytes, period_secs, tick_secs);
-    let slice = advance_cursor(&cursor, &corpus, budget, clock.now_ns());
-
-    // Build the borrowing `CoveringPostings` once for this signal's tick from
-    // the owned data loaded per (tenant, signal) in `run_cycle`.
-    // `CoveringPostings` is `Copy`, so it is passed by value into each object's
-    // scrub. When no covering postings resolved (no postings ref yet, or a
-    // degrade-to-None load), this stays `None` and `scrub_one_object` runs only
-    // the structural and content tiers, exactly as before this wiring landed.
-    let covering_postings = covering.map(|loaded| ravel_maintain::CoveringPostings {
-        bytes: &loaded.bytes,
-        part_blake3: &loaded.part_blake3,
-        covered_entries: &loaded.covered_entries,
-        max_postings_bytes: ravel_catalog::DEFAULT_MAX_POSTINGS_BYTES,
-    });
-
-    for key in &slice.scrub_keys {
-        let Some((record, level)) = records.get(key) else {
-            continue;
-        };
-        let level = *level;
-        // The structural + content tiers always run (footer crc re-verify, then
-        // whole-object blake3 vs the recorded content hash). The postings tier
-        // runs additionally when `covering_postings` is `Some`: the object's
-        // true `__name__` set is re-derived and diffed against what the covering
-        // postings object claims for it (the false-negative check). Postings
-        // only ever cover L0 commit records (an L1/rewrite part's covering
-        // ordinal is not meaningfully defined), so L1 and rewrite targets never
-        // get the postings tier regardless of whether it loaded this tick.
-        let postings_for_object = if level == ScrubLevel::L0 {
-            covering_postings
-        } else {
-            None
-        };
-        match scrub_one_object(store, clock, record, postings_for_object).await {
-            ScrubResult::Clean => {}
-            ScrubResult::ChecksumMismatch { .. } => {
-                tracing::error!(
-                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
-                    level = level.as_str(),
-                    "scrub: content-hash mismatch at rest (bit rot or partial write)"
-                );
-                metrics.record_checksum_mismatch(signal, level);
-            }
-            ScrubResult::StructuralCorruption { detail } => {
-                tracing::error!(
-                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
-                    level = level.as_str(), detail = %detail,
-                    "scrub: structural corruption at rest (footer/section crc)"
-                );
-                metrics.record_checksum_mismatch(signal, level);
-            }
-            ScrubResult::PostingsDisagreement { name, ordinal } => {
-                tracing::error!(
-                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
-                    name = %name, ordinal,
-                    "scrub: postings disagreement (false negative)"
-                );
-                metrics.record_postings_disagreement(signal);
-            }
-            ScrubResult::ReadError { detail } => {
-                // Transient store/decode failure: retried next tick, never an
-                // anomaly (a throttle or timeout must not read as bit rot).
-                tracing::warn!(
-                    tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
-                    detail = %detail,
-                    "scrub: transient read error; retried next tick"
-                );
-            }
-        }
-    }
-
-    // Cursor-position gauge: objects covered so far in this rotation over the
-    // corpus total at rotation start. A completed rotation reads as full
-    // coverage before wrapping.
-    let covered = if slice.rotation_complete {
-        corpus.len()
-    } else {
-        match &slice.next_cursor.last_object_key {
-            Some(last) => corpus.partition_point(|t| &t.object_key <= last),
-            None => 0,
-        }
-    };
-    metrics.record_cursor_position(signal, covered as u64, corpus.len() as u64);
-
-    persist_cursor(store, tenant, signal, shard, &slice.next_cursor).await;
+    out
 }
 
 /// The persisted per-shard cursor's object key. Nested under the existing
@@ -977,12 +1184,24 @@ fn cursor_key(tenant: &TenantHash, signal: Signal, shard: u32) -> String {
     )
 }
 
-/// The on-disk cursor: only the rotation-relative position needs persisting;
-/// tenant/signal/shard are known from the key context on load.
+/// The on-disk cursor: only the rotation-relative state needs persisting;
+/// tenant/signal/shard are known from the key context on load. Every field
+/// ADR-1686 added carries a serde default, so a cursor an older build wrote
+/// (holding `last_object_key`, which is ignored) loads as the start of a fresh
+/// rotation.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedCursor {
-    last_object_key: Option<String>,
+    #[serde(default)]
+    last_commit_key: Option<String>,
     rotation_started_unix_ns: i64,
+    #[serde(default)]
+    rotation_bytes_seen: u64,
+    #[serde(default)]
+    last_rotation_bytes: Option<u64>,
+    #[serde(default)]
+    rotation_total_entries: Option<u64>,
+    #[serde(default)]
+    rotation_entries_visited: u64,
 }
 
 /// Load this shard's persisted cursor, or a fresh one at the start of a
@@ -1003,8 +1222,12 @@ async fn load_cursor(
                 tenant_hash: *tenant,
                 signal,
                 shard,
-                last_object_key: persisted.last_object_key,
+                last_commit_key: persisted.last_commit_key,
                 rotation_started_unix_ns: persisted.rotation_started_unix_ns,
+                rotation_bytes_seen: persisted.rotation_bytes_seen,
+                last_rotation_bytes: persisted.last_rotation_bytes,
+                rotation_total_entries: persisted.rotation_total_entries,
+                rotation_entries_visited: persisted.rotation_entries_visited,
             },
             Err(err) => {
                 tracing::warn!(
@@ -1038,8 +1261,12 @@ async fn persist_cursor(
 ) {
     let key = cursor_key(tenant, signal, shard);
     let persisted = PersistedCursor {
-        last_object_key: cursor.last_object_key.clone(),
+        last_commit_key: cursor.last_commit_key.clone(),
         rotation_started_unix_ns: cursor.rotation_started_unix_ns,
+        rotation_bytes_seen: cursor.rotation_bytes_seen,
+        last_rotation_bytes: cursor.last_rotation_bytes,
+        rotation_total_entries: cursor.rotation_total_entries,
+        rotation_entries_visited: cursor.rotation_entries_visited,
     };
     let bytes = match serde_json::to_vec(&persisted) {
         Ok(bytes) => bytes,
@@ -1065,7 +1292,7 @@ mod tests {
     use bytes::Bytes;
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
     use ravel_proto::commit::v1::CommitRecord;
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
@@ -1090,11 +1317,21 @@ mod tests {
     /// Metrics, shard 0)`, exactly as ingest would, so an unmodified object
     /// scrubs clean. Returns the data-object key.
     async fn publish_segment(store: &MemoryStore, seq: u64, metrics: &[&str]) -> String {
+        publish_segment_at(store, seq, metrics, 500_000).await
+    }
+
+    /// [`publish_segment`] into ingest-hour bucket `hour`.
+    async fn publish_segment_at(
+        store: &MemoryStore,
+        seq: u64,
+        metrics: &[&str],
+        hour: u32,
+    ) -> String {
         let tenant_id = tenant();
         let tenant_hash = tenant_id.hash();
         let writer_id = Uuid::from_u128(u128::from(1_000 + seq));
-        let created_unix_ns = 500_000 * NS_PER_HOUR;
-        let ingest_hour_bucket = 500_000u32;
+        let created_unix_ns = i64::from(hour) * NS_PER_HOUR;
+        let ingest_hour_bucket = hour;
         let series: Vec<SeriesInput> = metrics
             .iter()
             .map(|metric| {
@@ -1164,9 +1401,10 @@ mod tests {
         data_key
     }
 
-    /// A full tick over a clean corpus: discovery -> LIST -> load cursor ->
-    /// advance -> scrub -> persist cursor. No anomaly is recorded, and the
-    /// per-shard cursor is persisted so a later tick resumes from it.
+    /// A full tick over a clean corpus: discovery -> load cursor -> count ->
+    /// walk from the marker -> scrub -> persist cursor. No anomaly is
+    /// recorded, and the per-shard cursor is persisted so a later tick resumes
+    /// from it.
     #[tokio::test]
     async fn clean_shard_tick_scrubs_and_persists_cursor() {
         let store = MemoryStore::new();
@@ -1206,7 +1444,7 @@ mod tests {
             .expect("cursor persisted");
         let cursor: PersistedCursor = serde_json::from_slice(&got.data).expect("cursor decodes");
         // A completed rotation wraps to the start.
-        assert_eq!(cursor.last_object_key, None);
+        assert_eq!(cursor.last_commit_key, None);
     }
 
     /// A single-bit flip in a committed data object surfaces as a checksum
@@ -1253,8 +1491,8 @@ mod tests {
         );
     }
 
-    /// The cursor advances across ticks under a byte budget that admits one
-    /// object per tick: two ticks cover a two-object corpus, and the mid-
+    /// The cursor advances across ticks under a budget that admits one entry
+    /// per tick: two ticks cover a two-record corpus, and the mid-
     /// rotation cursor-position gauge reads a partial fraction.
     #[tokio::test]
     async fn cursor_advances_across_ticks_under_a_tight_budget() {
@@ -1264,7 +1502,7 @@ mod tests {
 
         let metrics = ScrubMetrics::default();
         let worker = solo_worker();
-        // period (100s) >> tick (1s): the per-tick byte budget covers only a
+        // period (100s) >> tick (1s): the per-tick budget covers only a
         // fraction of the corpus, so a rotation takes multiple ticks.
         run_cycle(
             &store,
@@ -1300,7 +1538,7 @@ mod tests {
             let key = cursor_key(&tenant_hash, Signal::Metrics, 0);
             let got = store.get(&key, GetRange::Full).await.expect("cursor");
             let cursor: PersistedCursor = serde_json::from_slice(&got.data).expect("decode");
-            if cursor.last_object_key.is_none() {
+            if cursor.last_commit_key.is_none() {
                 // Rotation wrapped: coverage was complete at some tick.
                 return;
             }
@@ -2499,5 +2737,316 @@ mod tests {
             .put(key, Bytes::from(corrupted), PutOptions::default())
             .await
             .expect("overwrite corrupted part");
+    }
+
+    /// Run `ticks` content-tier ticks over shard 0 of a corpus of `records`
+    /// one-series L0 segments, listed four entries per page, and return each
+    /// tick's `(LIST calls, GET calls)`.
+    async fn per_tick_request_counts(
+        records: u64,
+        period_secs: u64,
+        ticks: usize,
+    ) -> Vec<(u64, u64)> {
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        for seq in 1..=records {
+            publish_segment(&memory, seq, &["cpu"]).await;
+        }
+        let store = ravel_object_store::InstrumentedStore::new(memory.clone());
+        let counters = store.metrics();
+        let tenant_hash = tenant().hash();
+        let metrics = ScrubMetrics::default();
+        let clock = ravel_maintain::FixedClock::new(500_001 * NS_PER_HOUR);
+        let mut out = Vec::with_capacity(ticks);
+        for _ in 0..ticks {
+            let before = counters.snapshot();
+            run_shard_tick(
+                &store,
+                &clock,
+                &tenant_hash,
+                Signal::Metrics,
+                0,
+                period_secs,
+                1,
+                None,
+                &metrics,
+            )
+            .await;
+            let after = counters.snapshot();
+            out.push((
+                after.list.calls - before.list.calls,
+                after.get.calls - before.get.calls,
+            ));
+        }
+        out
+    }
+
+    /// ADR-1686 decisions 1 to 3: a tick resumes the listing from its marker
+    /// and stops once its budget is spent, so over an unchanged corpus every
+    /// tick after the first issues the same LIST and GET count whatever the
+    /// corpus size. Both corpora run on a two-entry budget (`ceil(8 / 4)` and
+    /// `ceil(16 / 8)`), so a steady tick is one listing page, one cursor GET,
+    /// and per consumed record one record GET plus the scrub's footer and
+    /// whole-object GETs: `1 + 2 * 3 = 7`. Only tick 1 differs, by the
+    /// rotation's one LIST-only count: `ceil(N / 4)` full pages plus the empty
+    /// page a full page's continuation leads to.
+    #[tokio::test]
+    async fn scrub_ticks_over_an_unchanged_corpus_issue_a_constant_request_count() {
+        let small = per_tick_request_counts(8, 4, 4).await;
+        let large = per_tick_request_counts(16, 8, 4).await;
+
+        assert_eq!(small[0], (3 + 1, 7), "8 records: tick 1 counts in 3 pages");
+        assert_eq!(large[0], (5 + 1, 7), "16 records: tick 1 counts in 5 pages");
+        for tick in 1..4 {
+            assert_eq!(small[tick], (1, 7), "8 records, tick {}", tick + 1);
+            assert_eq!(large[tick], (1, 7), "16 records, tick {}", tick + 1);
+        }
+    }
+
+    /// A delegating store that records the key of every whole-object GET, so a
+    /// test can name exactly which objects the content tier read.
+    struct FullGetLog {
+        inner: Arc<MemoryStore>,
+        full_gets: parking_lot::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for FullGetLog {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            if matches!(range, GetRange::Full) {
+                self.full_gets.lock().push(key.to_string());
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// ADR-1686 decision 6: one rotation of one-entry ticks over a corpus that
+    /// mixes plain L0 hours with a compacted hour visits every object exactly
+    /// once: the seven L0 data objects (the two the compaction folded included,
+    /// as before) and the compacted hour's single L1 part. The corpus is eight
+    /// listing entries (seven commit records and one compaction record) listed
+    /// two per page, so the one-entry budget `ceil(8 / 100)` finishes the
+    /// rotation on tick 8 and the marker stays set until then.
+    #[tokio::test]
+    async fn a_full_rotation_visits_every_record_once() {
+        let memory = Arc::new(MemoryStore::with_page_size(2));
+        let tenant_hash = tenant().hash();
+        let mut data_keys = Vec::new();
+        for (seq, hour) in [(1, 500_000), (2, 500_000)] {
+            data_keys.push(publish_segment_at(&memory, seq, &["cpu"], hour).await);
+        }
+        let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, 0, 500_000);
+        let compact_clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let outcome = ravel_maintain::compact_bucket(
+            memory.as_ref(),
+            &compact_clock,
+            &ravel_maintain::CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+            "two sealed L0 inputs must compact, got {outcome:?}"
+        );
+        for (seq, hour) in [
+            (3, 500_001),
+            (4, 500_001),
+            (5, 500_001),
+            (6, 500_002),
+            (7, 500_002),
+        ] {
+            data_keys.push(publish_segment_at(&memory, seq, &["cpu"], hour).await);
+        }
+
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(
+            listed.len(),
+            8,
+            "seven commit records and one compaction record"
+        );
+        let record_key = listed
+            .iter()
+            .map(|m| m.key.clone())
+            .find(|k| {
+                matches!(
+                    keys::partition_bucket_entry(k),
+                    Ok(keys::BucketEntry::CompactionRecord(_))
+                )
+            })
+            .expect("a compaction record was published");
+        let record_bytes = memory
+            .get(&record_key, GetRange::Full)
+            .await
+            .expect("get compaction record")
+            .data;
+        let record = ravel_commit::record::decode_compaction(&record_bytes)
+            .expect("decode compaction record");
+        assert_eq!(record.parts.len(), 1, "two small inputs fit in one L1 part");
+        let part_key =
+            keys::reconstruct_l1_part_key(&record, &record.parts[0]).expect("l1 part key");
+
+        let mut expected: Vec<String> = data_keys.clone();
+        expected.push(part_key.clone());
+        expected.sort();
+        let mut expected_bytes = 0u64;
+        for key in &expected {
+            expected_bytes += memory.head(key).await.expect("head object").size;
+        }
+
+        let store = FullGetLog {
+            inner: memory.clone(),
+            full_gets: parking_lot::Mutex::new(Vec::new()),
+        };
+        let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let metrics = ScrubMetrics::default();
+        for tick in 1..=8u64 {
+            run_shard_tick(
+                &store,
+                &clock,
+                &tenant_hash,
+                Signal::Metrics,
+                0,
+                100,
+                1,
+                None,
+                &metrics,
+            )
+            .await;
+            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0).await;
+            if tick < 8 {
+                assert!(cursor.last_commit_key.is_some(), "tick {tick}: marker set");
+                assert_eq!(cursor.rotation_entries_visited, tick, "tick {tick}");
+                assert_eq!(cursor.rotation_total_entries, Some(8), "tick {tick}");
+            } else {
+                assert_eq!(cursor.last_commit_key, None, "tick 8 ends the rotation");
+                assert_eq!(cursor.rotation_total_entries, None);
+                assert_eq!(cursor.last_rotation_bytes, Some(expected_bytes));
+            }
+        }
+
+        let mut visited: Vec<String> = store
+            .full_gets
+            .lock()
+            .iter()
+            .filter(|key| !key.contains("/c/") && !key.contains("/maint/"))
+            .cloned()
+            .collect();
+        visited.sort();
+        assert_eq!(visited, expected, "every object once, and nothing else");
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0)
+                + metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0
+        );
+    }
+
+    /// ADR-1686 decision 1: a cursor an older build wrote, holding only
+    /// `last_object_key` and `rotation_started_unix_ns`, still loads. The new
+    /// fields take their defaults and the old marker is ignored, so the next
+    /// tick opens a fresh rotation with a LIST-only count and consumes the
+    /// first commit record.
+    #[tokio::test]
+    async fn an_old_format_cursor_loads_with_defaults() {
+        let store = MemoryStore::new();
+        let tenant_hash = tenant().hash();
+        publish_segment(&store, 1, &["cpu"]).await;
+        publish_segment(&store, 2, &["mem"]).await;
+        let old = br#"{"last_object_key":"t/old/data/key.rseg","rotation_started_unix_ns":7}"#;
+        store
+            .put(
+                &cursor_key(&tenant_hash, Signal::Metrics, 0),
+                Bytes::from_static(old),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put old cursor");
+
+        let loaded = load_cursor(&store, &tenant_hash, Signal::Metrics, 0, 99).await;
+        assert_eq!(loaded.last_commit_key, None);
+        assert_eq!(loaded.rotation_started_unix_ns, 7);
+        assert_eq!(loaded.rotation_bytes_seen, 0);
+        assert_eq!(loaded.last_rotation_bytes, None);
+        assert_eq!(loaded.rotation_total_entries, None);
+        assert_eq!(loaded.rotation_entries_visited, 0);
+
+        let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let metrics = ScrubMetrics::default();
+        run_shard_tick(
+            &store,
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            100,
+            1,
+            None,
+            &metrics,
+        )
+        .await;
+
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(&store, &shard_prefix).await.expect("list shard");
+        let cursor = load_cursor(&store, &tenant_hash, Signal::Metrics, 0, 0).await;
+        assert_eq!(cursor.rotation_total_entries, Some(2));
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[0].key.as_str())
+        );
+        assert_eq!(cursor.rotation_entries_visited, 1);
+        assert_eq!(cursor.rotation_started_unix_ns, 500_003 * NS_PER_HOUR);
     }
 }

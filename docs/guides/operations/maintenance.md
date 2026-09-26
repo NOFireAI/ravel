@@ -274,8 +274,18 @@ generation's, not an overlap loser's, and none in a tombstoned bucket): a
 section checksum re-check plus a whole-object rehash against the recorded
 content hash. The [observability guide](../observability.md) records the
 lineage filter and the `level` label a mismatch is counted under. A
-persisted per-shard cursor advances the slice each tick, so a full rotation over
-the corpus completes in about the configured period.
+persisted per-shard cursor in object storage holds a start-after marker: each
+tick lists the shard's commit records strictly after it and stops once the tick's
+budget is filled, so a tick's LIST and GET count follows its budget, not the
+corpus size. When the listing runs out past the marker, the rotation rolls over
+and the next tick starts again from the head, so a full rotation over the corpus
+completes in about the configured period and visits every object once.
+
+A rotation's budget is sized from the one before it: that rotation's bytes
+divided across the ticks in `P`. A rotation with no predecessor (the first on a
+shard, or the first after upgrading from a build with an object-based cursor)
+opens with one LIST-only pass that counts the shard's listing entries, then
+consumes `ceil(count * tick / P)` entries per tick.
 
 It detects and never repairs. An anomaly is reported; there is no redundant copy
 to repair a corrupt segment from.
