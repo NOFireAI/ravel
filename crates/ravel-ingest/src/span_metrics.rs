@@ -142,11 +142,10 @@ pub struct SpanIngestMetrics {
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
     /// Per-shard ingest-skew accounting (issue #865), the span-pipeline
     /// counterpart of [`crate::IngestMetrics`]'s own and
-    /// [`crate::LogIngestMetrics`]'s own. The flush-permit-wait span is
-    /// recorded on this pipeline at the `max_inflight_flushes` acquire in
-    /// `span_shard.rs`, and the queued-flush gauge and deferred-trigger
-    /// counter at the queued-flush cap (issue #1740); the on-actor and
-    /// off-actor spans issue #865 never wired up here.
+    /// [`crate::LogIngestMetrics`]'s own. All three spans (on-actor,
+    /// flush-permit-wait, off-actor) are recorded on this pipeline (ADR-1692
+    /// decision 5), and the queued-flush gauge and deferred-trigger counter
+    /// at the queued-flush cap (issue #1740).
     ///
     /// Preallocated by [`SpanIngestMetrics::new`]; `default()` allocates none
     /// and therefore records nothing, exactly as [`crate::IngestMetrics`] does.
@@ -250,6 +249,15 @@ impl SpanIngestMetrics {
         }
     }
 
+    /// One write message pulled and handled by shard `shard`'s actor, plus the
+    /// injected-`Clock` nanoseconds the actor spent handling it, excluding both
+    /// the flush that runs off the actor and any flush-permit wait nested
+    /// inside the call (ADR-1692 decision 5, the span-pipeline counterpart of
+    /// [`crate::LogIngestMetrics::record_shard_processed`]).
+    pub(crate) fn record_shard_processed(&self, shard: u32, on_actor_ns: u64) {
+        self.shard_skew.record_processed(shard, on_actor_ns);
+    }
+
     /// One flush task's injected-`Clock` wait on shard `shard`'s
     /// `max_inflight_flushes` semaphore (issue #865), the span-pipeline
     /// counterpart of [`crate::LogIngestMetrics`]'s own. Recorded inside the
@@ -257,6 +265,16 @@ impl SpanIngestMetrics {
     /// tasks are queuing for a permit while the actor keeps draining.
     pub(crate) fn record_shard_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
         self.shard_skew.record_flush_permit_wait_ns(shard, wait_ns);
+    }
+
+    /// One completed flush task's injected-`Clock` nanoseconds, attributed to
+    /// the shard it flushed (ADR-1692 decision 5, the span-pipeline
+    /// counterpart of [`crate::LogIngestMetrics::record_shard_off_actor_ns`]).
+    /// Bracketed inside the spawned task with the permit already held, so it
+    /// re-counts neither `on_actor_ns` nor the permit wait that preceded the
+    /// spawn.
+    pub(crate) fn record_shard_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
+        self.shard_skew.record_off_actor_ns(shard, off_actor_ns);
     }
 
     /// Shard `shard`'s current spawned-but-unreaped flush-task count, the
@@ -277,9 +295,7 @@ impl SpanIngestMetrics {
     /// Point-in-time per-shard skew figures, sorted by shard index (issue
     /// #865), the span counterpart of
     /// [`crate::IngestMetrics::shard_skew_by_shard`]. A shard with no recorded
-    /// activity is simply absent. Only `flush_permit_wait_ns`,
-    /// `flushes_queued` and `flush_trigger_deferred` are ever nonzero on this
-    /// pipeline today; see the field doc on `shard_skew`.
+    /// activity is simply absent; see the field doc on `shard_skew`.
     pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
         self.shard_skew.by_shard()
     }
@@ -620,6 +636,37 @@ mod tests {
                 flush_permit_wait_ns_total: 700,
                 ..Default::default()
             },
+        );
+    }
+
+    /// ADR-1692 decision 5: the span pipeline now records all three spans, the
+    /// same exact-nanosecond assertion `shard_skew_tracks_per_shard_throughput_
+    /// and_time_split` in `metrics.rs` pins for the metrics pipeline. The three
+    /// spans accumulate independently and neither counter leaks into another.
+    #[test]
+    fn shard_skew_records_on_actor_and_off_actor_time() {
+        let metrics = SpanIngestMetrics::new(1);
+        metrics.record_shard_processed(0, 300);
+        metrics.record_shard_processed(0, 200);
+        metrics.record_shard_off_actor_ns(0, 9_000);
+        metrics.record_shard_flush_permit_wait_ns(0, 700);
+
+        let skew = metrics.shard_skew_by_shard();
+        assert_eq!(
+            skew,
+            vec![(
+                0,
+                ShardSkewStats {
+                    messages_enqueued: 0,
+                    messages_processed: 2,
+                    queue_depth: 0,
+                    on_actor_ns: 500,
+                    flush_permit_wait_ns: 700,
+                    off_actor_ns: 9_000,
+                    flushes_queued: 0,
+                    flush_trigger_deferred: 0,
+                }
+            )]
         );
     }
 

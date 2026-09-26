@@ -1352,13 +1352,11 @@ either pipeline. This matters because `ravel-cli load` drives the logs pipeline
 and not the metrics one: while the accounting existed only on the metrics side,
 every skew figure for the bulk-load path read as absent, and ADR-0807's audit of
 that path had to reason from the code instead of from a measurement. The span
-path (`span_router.rs`, `span_shard.rs`) now records one of the three spans:
-`flush_permit_wait_ns`, at the same off-actor acquire site as the metrics and
-log pipelines (`span_shard.rs` around line 1143). It also records
-`flushes_queued` and `flush_trigger_deferred`, which the queued-flush cap wires
-up identically on all three pipelines. `messages_enqueued`,
-`messages_processed`, `queue_depth`, `on_actor_ns`, and `off_actor_ns` are
-still uncovered there.
+path (`span_router.rs`, `span_shard.rs`) now records all three spans:
+`on_actor_ns` and `off_actor_ns` alongside the `flush_permit_wait_ns` it already
+had, at the same actor and off-actor acquire sites as the metrics and log
+pipelines. It also records `flushes_queued` and `flush_trigger_deferred`, which
+the queued-flush cap wires up identically on all three pipelines.
 
 The per-shard dimension is not part of the flat `IngestMetricsSnapshot` or its
 log and span counterparts, whose `Copy` shape holds no per-shard field. The
@@ -1369,8 +1367,10 @@ snapshot, and the process `/metrics` surface renders
 `ravel_ingest_flush_permit_wait_seconds_total`,
 `ravel_ingest_queued_flushes`, and
 `ravel_ingest_flush_trigger_deferred_total` for every signal
-(`services/ravel-server/src/metrics.rs`); the per-shard breakdown stays
-internal, read only through `shard_skew_by_shard()`. Per shard
+(`services/ravel-server/src/metrics.rs`). Since ADR-1692 the per-shard
+breakdown is also rendered directly, as the `ravel_ingest_shard_*` family
+labelled `shard` (see the observability guide); `shard_skew_by_shard()` remains
+the read path that family and any in-process caller both use. Per shard
 (`ShardSkewStats`):
 
 - `messages_enqueued`: `Write` messages the router sent into the shard's

@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/metrics` now renders a per-shard ingest skew family** (issue #1692).
+  `ravel_ingest_shard_messages_enqueued_total`,
+  `ravel_ingest_shard_messages_processed_total`,
+  `ravel_ingest_shard_queue_depth`,
+  `ravel_ingest_shard_on_actor_seconds_total`,
+  `ravel_ingest_shard_flush_permit_wait_seconds_total`, and
+  `ravel_ingest_shard_off_actor_seconds_total` render one series per
+  configured shard, labelled `mode`, `signal`, and `shard`, with idle shards
+  reading zero rather than being omitted. The span pipeline now records
+  on-actor and off-actor time in `span_shard.rs` to match the metrics and
+  log pipelines, so all three signals carry the full family.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed
