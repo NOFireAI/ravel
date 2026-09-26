@@ -34,7 +34,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, collect};
-use datafusion::prelude::{col, lit};
+use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -439,6 +439,90 @@ async fn pending_erasure_excludes_matching_spans() {
         keep.name.clone(),
     ));
     assert_eq!(got, want, "the u1 span is erased; the u2 span survives");
+}
+
+/// Five spans, two of them (`user_id = u1`) matched by the erasure request
+/// `count_star_request` builds, spread over three blocks (`small_blocks` cuts
+/// every two records).
+fn count_star_fixture() -> Vec<SpanRecord> {
+    let t1 = [0x11u8; 16];
+    (0u8..5)
+        .map(|i| {
+            let mut s = span(t1, i, 100 + i64::from(i) * 10, 105 + i64::from(i) * 10, "s");
+            let user = if i % 2 == 1 { "u1" } else { "u2" };
+            s.attrs = vec![("user_id".to_string(), user.to_string())];
+            s
+        })
+        .collect()
+}
+
+/// Run `SELECT count(*) FROM spans` through a DataFusion SQL session over a
+/// `SpansTableProvider` for `records`, with a pending `user_id = u1` erasure
+/// request on the snapshot when `erase` is set. A bare `count(*)` pushes an
+/// empty projection into the scan, which no `provider.plan()` call exercises.
+async fn count_star(records: &[SpanRecord], erase: bool) -> i64 {
+    let store = MemoryStore::new();
+    let seg = write_object(&store, "spans/count.rspan", records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let pending_erasure = if erase {
+        vec![ravel_proto::commit::v1::ErasureRequest {
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: "user_id".to_string(),
+                value: "u1".to_string(),
+            }],
+            ..Default::default()
+        }]
+    } else {
+        Vec::new()
+    };
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure,
+    };
+    let provider = SpansTableProvider::new(
+        snapshot,
+        TenantHash([1u8; 16]),
+        SpanSegmentFetcher::new(store),
+        QueryAccounting::new(),
+    );
+    let ctx = SessionContext::new();
+    ctx.register_table("spans", Arc::new(provider))
+        .expect("register spans");
+    let batches = ctx
+        .sql("SELECT count(*) FROM spans")
+        .await
+        .expect("count(*) plans")
+        .collect()
+        .await
+        .expect("count(*) executes");
+    scalar_count(&batches)
+}
+
+/// Issue #1710: `SELECT count(*) FROM spans` on a tenant with a pending
+/// selective erasure. The erasure makes the query ineligible for the columnar
+/// path, so the empty projection reaches the row-path batch builder, which
+/// must carry the row count explicitly: with zero columns there is nothing to
+/// infer it from. Exactly the three surviving spans are counted.
+#[tokio::test]
+async fn count_star_with_pending_erasure_counts_surviving_spans() {
+    assert_eq!(count_star(&count_star_fixture(), true).await, 3);
+}
+
+/// Issue #1710: the same bare `count(*)` with no erasure takes the columnar
+/// fast path, whose batch builder gets the same empty projection. All five
+/// spans are counted, through a DataFusion session and through `SqlExecutor`.
+#[tokio::test]
+async fn count_star_without_erasure_counts_every_span() {
+    let records = count_star_fixture();
+    assert_eq!(count_star(&records, false).await, 5);
+
+    let executor = executor_with_spans(&records).await;
+    let outcome = executor
+        .execute(tenant().hash(), &sql_request("SELECT count(*) FROM spans"))
+        .await
+        .expect("count(*) executes through SqlExecutor");
+    assert_eq!(scalar_count(outcome.output.batches()), 5);
 }
 
 /// (ADR-0044) The spans scan path is request/byte accounted, the same way the

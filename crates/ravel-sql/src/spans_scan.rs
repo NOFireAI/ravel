@@ -52,7 +52,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -931,7 +931,10 @@ fn build_row_batch(
         columns.push(row_column(idx, rows)?);
     }
     debug_assert_eq!(schema.fields().len(), columns.len());
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+    // An empty projection (a bare `count(*)`) has no column to infer the row
+    // count from, so it is carried explicitly.
+    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(DataFusionError::from)
 }
 
 /// Build one `spans` column array for schema index `idx` from the row path's
@@ -1224,7 +1227,10 @@ fn build_columnar_batch(
         columns.push(columnar_column(idx, &views, order)?);
     }
     debug_assert_eq!(schema.fields().len(), columns.len());
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+    // An empty projection (a bare `count(*)`) has no column to infer the row
+    // count from, so it is carried explicitly.
+    let options = RecordBatchOptions::new().with_row_count(Some(order.len()));
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(DataFusionError::from)
 }
 
 /// Build one `spans` column array for schema index `idx` by gathering the
