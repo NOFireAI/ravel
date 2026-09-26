@@ -14,25 +14,81 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// The built `ravel-server` binary, the same artifact `cargo run -p
 /// ravel-server` and the release image start.
 const BINARY: &str = env!("CARGO_BIN_EXE_ravel-server");
 
-/// Runs the binary with `args` and returns `(status code, stdout, stderr)`.
+/// How long a refusal may take to exit. A refusal is argument parsing and
+/// nothing else, so reaching this means the process started up instead.
+const EXIT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Flags appended to every run. Ephemeral loopback ports, so a process that
+/// wrongly starts up binds nothing another test or a local server holds; and
+/// an unkeyed tenant hash over the default memory store, so such a process
+/// really starts and is caught at [`EXIT_DEADLINE`] rather than exiting 1 on
+/// a fresh bucket's missing hash key, which would read as some other failure.
+const STARTUP_ARGS: [&str; 5] = [
+    "--listen-http",
+    "127.0.0.1:0",
+    "--listen-grpc",
+    "127.0.0.1:0",
+    "--tenant-hash-unkeyed",
+];
+
+/// Drains one child pipe on its own thread, so a chatty process cannot block
+/// on a full pipe while the caller polls for its exit.
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// Runs the binary with `args` plus [`STARTUP_ARGS`] and returns
+/// `(status code, stdout, stderr)`.
 ///
 /// A signal death has no code; it is reported as `None` so the assertion says
-/// "killed by a signal" rather than silently reading as a refusal.
+/// "killed by a signal" rather than silently reading as a refusal. A process
+/// still running at [`EXIT_DEADLINE`] is killed and fails the test here: it
+/// started up instead of refusing, which is itself the regression.
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
-    let output = Command::new(BINARY)
+    let mut child = Command::new(BINARY)
         .args(args)
-        .output()
+        .args(STARTUP_ARGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap_or_else(|e| panic!("the built binary at {BINARY} must be runnable: {e}"));
+    let stdout = drain(child.stdout.take().expect("stdout is piped"));
+    let stderr = drain(child.stderr.take().expect("stderr is piped"));
+
+    let deadline = Instant::now() + EXIT_DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = stderr.join().unwrap_or_default();
+            panic!(
+                "`ravel-server {}` did not exit within {EXIT_DEADLINE:?}: it started up \
+                 instead of refusing, and was killed; stderr: {stderr}",
+                args.join(" ")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     (
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
+        status.code(),
+        stdout.join().expect("stdout reader"),
+        stderr.join().expect("stderr reader"),
     )
 }
 
@@ -45,8 +101,9 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
 ///
 /// Flip to watch it fail: change `main.rs`'s
 /// `Cli::parse_validated_from(std::env::args_os())` back to `Cli::parse()`.
-/// Every process below then starts up instead of refusing, and each case here
-/// fails on the exit status.
+/// The first process below then starts up and serves instead of refusing, and
+/// the case fails after [`EXIT_DEADLINE`] with "did not exit", rather than
+/// hanging the test run.
 #[test]
 fn the_binary_refuses_a_fold_flag_in_a_mode_that_never_schedules_a_fold() {
     for mode in ["gateway", "query"] {
