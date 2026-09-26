@@ -303,10 +303,12 @@ impl ObjectStoreBackend for SharedKmsStore {
 /// one from issue #1911), owned by `ravel-object-store` beside the
 /// `S3Config::allow_http` field they decide, because `ravel-cli` obeys the same
 /// rules against the same bucket and two copies of them would drift.
-/// Re-exported here for `Cli::validate` and [`build_store`], the two callers in
-/// this crate.
+/// Re-exported here for `Cli::validate` and [`build_store`], which apply the
+/// endpoint rules, and for `Cli::resolve_logs_fetch_policy`, which reads
+/// `is_loopback_endpoint` to derive the default fetch policy (ADR-2014).
 pub use ravel_object_store::s3::{
-    PlaintextS3Endpoint, S3EndpointRefusal, SchemelessS3Endpoint, resolve_s3_allow_http,
+    PlaintextS3Endpoint, S3EndpointRefusal, SchemelessS3Endpoint, is_loopback_endpoint,
+    resolve_s3_allow_http,
 };
 
 /// The argument error for `--s3-auth instance-role` combined with an inline

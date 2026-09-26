@@ -874,17 +874,46 @@ billed request to save bytes that cost nothing. Elsewhere the reverse holds.
 Three flags size this, all read at startup only.
 
 `--logs-fetch-policy` takes one of four values, spelled exactly as here. Its
-default is `cost-based`.
+default is `cost-based`, except that unset with `--store s3` against a
+loopback `--s3-endpoint` (`localhost` or a loopback IPv4/IPv6 literal), it
+instead derives `byte-minimal`.
 
 | Value | Optimizes for | Pick it when |
 |---|---|---|
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
-| `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
+| `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. Also the unset default on a loopback store (see below): the cold path there is disk-bound, not network-bound, so a whole-object GET wastes local I/O rather than saving billed bytes. |
 | `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved from the profile's prices at startup. | You want the shape the deployment's own prices imply. At the reference intra-region profile this resolves to request-minimal. |
 | `latency-first` | Fewest transferred bytes, exactly like `byte-minimal`. An intent, not a tuning constant: it says spend requests to save wall time, and leaves how up to the concurrency you configure. | Cold wall-clock matters more than the request bill, and you are willing to raise the object-store GET concurrency and the SQL scan width explicitly to cash in the trade: measured over 3 reps on a 42-statement reference corpus, true cold in the warm-up-empty state, at GET concurrency 256: 5.30x the GET requests (570,752 against 107,781) for 52% less cold time, with a per-rep range of 50.3% to 54.2%. That ratio is a measurement of two code paths at one point in the project's history, not a property of the policy, and it has already moved once as the cost-based side changed; the decision record for the fetch objective names the exact build it was taken on. Re-measure against the build you run rather than treating it as a constant. |
 
 For any policy value a query returns exactly the same rows. Only request counts
 and timing differ.
+
+### The loopback default
+
+Unset, `--logs-fetch-policy` derives `byte-minimal` instead of `cost-based`
+when `--store` is `s3` and `--s3-endpoint` names this host: `localhost`, a
+loopback IPv4 literal (the whole `127.0.0.0/8` block), or the loopback IPv6
+literal `::1`. The basis is locality, not a guess at billing shape:
+a store reachable over loopback is disk-bound on the cold path, not
+network-bound, so the whole-object reads `cost-based` picks at the reference
+profile spend local disk I/O a ranged read would have skipped. Object-store
+request count rises under this default, but on a loopback store those
+requests are not billed the way a remote GET is.
+
+An explicit `--logs-fetch-policy` always wins over this derivation, including
+an explicit `cost-based` on a loopback endpoint, and a non-loopback
+`--s3-endpoint` (or `--store memory`) is entirely unaffected: it keeps
+`cost-based`, exactly as before this default existed. GET concurrency and the
+store cost profile are untouched either way; this only changes which fetch
+shape is selected. Measured on the ClickBench reference machine (RustFS on
+loopback, 42 statements): cold wall-clock 1,720.4s to 1,186.6s, hot wall-clock
+272.3s to 88.5s.
+
+The resolved policy's source -- `flag` (explicit), `default` (unset,
+non-loopback), or `derived-loopback-endpoint` (unset, loopback) -- is logged
+at startup alongside the policy itself on the `logs fetch policy resolved`
+line, so an operator can tell which of the two unset cases produced a given
+run's behaviour without re-deriving it from the flags by hand.
 
 `latency-first` resolves `--store-get-concurrency`, `--sql-partition-count`,
 and `--promql-fetch-fanout` the same way every other policy does -- it sets no
