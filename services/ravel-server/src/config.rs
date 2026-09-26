@@ -8565,10 +8565,13 @@ mod tests {
         );
         assert_eq!(with_cache.cache_max_bytes, 4096);
         assert_eq!(with_cache.sources.cache_max_bytes, PERF_SOURCE_FLAG);
-        // An explicit --cache-max-bytes bounds BOTH caches at that value,
-        // preserving the pre-#1141 single-number coupling.
-        assert_eq!(with_cache.catalog_cache_max_bytes, 4096);
-        assert_eq!(with_cache.sources.catalog_cache_max_bytes, PERF_SOURCE_FLAG);
+        // ADR-2023: --cache-max-bytes bounds the fetcher cache only. The
+        // catalog byte cache is unaffected and keeps its own derivation.
+        assert_eq!(with_cache.catalog_cache_max_bytes, derived.catalog_cache_max_bytes);
+        assert_eq!(
+            with_cache.sources.catalog_cache_max_bytes,
+            derived.sources.catalog_cache_max_bytes
+        );
         assert_eq!(
             with_cache.sql_max_query_bytes, derived.sql_max_query_bytes,
             "the cache flag must not disturb the SQL pools"
@@ -8676,16 +8679,20 @@ mod tests {
     /// The catalog byte cache is a SEPARATE derived ceiling from the fetcher
     /// cache (issue #1141): unset, it takes 5% of `memory_budget_bytes` while
     /// the fetcher cache takes 25% of the same budget (ADR-1170 decision 3),
-    /// so the two independent LRU caches do not each claim the full share; an
-    /// explicit `--cache-max-bytes` sets both equal, the pre-#1141 coupling.
-    /// Exact integers, one host shape each.
+    /// so the two independent LRU caches do not each claim the full share.
+    /// Since ADR-2023, `--cache-max-bytes` reaches the fetcher cache only:
+    /// the catalog byte cache resolves solely from its own
+    /// `--catalog-cache-max-bytes` flag, independently of what
+    /// `--cache-max-bytes` is set to. Exact integers, one host shape each.
     ///
     /// Prove-the-test: change [`CATALOG_CACHE_MEMORY_PERCENT`] from 5 to 80 and
     /// the reference assertion reads 24,051,816,857 against the expected
-    /// 1,503,238,553; drop the `(Some(n), _)` arm of the catalog match and the
-    /// explicit-flag case reads the derived 1,503,238,553 against 12,345,678.
+    /// 1,503,238,553; make the catalog match read `flags.cache_max_bytes`
+    /// instead of `flags.catalog_cache_max_bytes` and the
+    /// `cache_max_bytes_does_not_affect_it` case reads 12,345,678 against the
+    /// expected derived 1,503,238,553.
     #[test]
-    fn the_catalog_cache_derives_at_its_own_share_and_the_flag_couples_both() {
+    fn the_catalog_cache_derives_at_its_own_share_independent_of_the_fetch_flag() {
         // Reference profile: fetcher 25%, catalog 5% of the same budget.
         let reference = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
         assert_eq!(reference.cache_max_bytes, 7_516_192_768);
@@ -8707,17 +8714,205 @@ mod tests {
             PERF_SOURCE_FALLBACK
         );
 
-        // Explicit flag: both caches take the flag value verbatim.
-        let flagged = resolve_performance_defaults(
+        // ADR-2023: an explicit --cache-max-bytes no longer reaches the
+        // catalog cache. It still derives its own 5% share.
+        let cache_max_bytes_does_not_affect_it = resolve_performance_defaults(
             reference_host(),
             PerformanceFlags {
                 cache_max_bytes: Some(12_345_678),
                 ..PerformanceFlags::default()
             },
         );
-        assert_eq!(flagged.cache_max_bytes, 12_345_678);
-        assert_eq!(flagged.catalog_cache_max_bytes, 12_345_678);
-        assert_eq!(flagged.sources.catalog_cache_max_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(cache_max_bytes_does_not_affect_it.cache_max_bytes, 12_345_678);
+        assert_eq!(
+            cache_max_bytes_does_not_affect_it.catalog_cache_max_bytes,
+            1_503_238_553
+        );
+        assert_eq!(
+            cache_max_bytes_does_not_affect_it.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+
+        // --catalog-cache-max-bytes sets the catalog cache alone.
+        let catalog_flagged = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                catalog_cache_max_bytes: Some(12_345_678),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(catalog_flagged.catalog_cache_max_bytes, 12_345_678);
+        assert_eq!(
+            catalog_flagged.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_FLAG
+        );
+        assert_eq!(
+            catalog_flagged.cache_max_bytes, reference.cache_max_bytes,
+            "the catalog flag must not disturb the fetcher cache"
+        );
+    }
+
+    /// ADR-2023 decision 3: on a `--store s3` deployment against a loopback
+    /// `--s3-endpoint`, with no cache flags and known memory, the fetcher
+    /// cache takes [`LOOPBACK_CACHE_MEMORY_PERCENT`] (40%) of
+    /// `memory_budget_bytes` rather than the ordinary
+    /// [`CACHE_MEMORY_PERCENT`] (25%), sourced `budget-carve-loopback`. The
+    /// catalog byte cache is unaffected by loopback status: it still takes
+    /// its own 5% share, sourced the ordinary `budget-carve`. The same
+    /// `"performance default resolved"` line `emit()` writes for every other
+    /// setting must carry the new source string.
+    ///
+    /// Prove-the-test: change the `(None, Some(_)) if flags.store_is_loopback`
+    /// arm in `resolve_performance_defaults` to use `CACHE_MEMORY_PERCENT`
+    /// instead of `LOOPBACK_CACHE_MEMORY_PERCENT` and the fetch-cache
+    /// assertion reads 7,516,192,768 against the expected 12,025,908,428.
+    #[test]
+    fn loopback_store_carves_a_larger_fetch_cache_share() {
+        let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
+        let resolved = resolved_from(&loopback);
+
+        assert_eq!(resolved.cache_max_bytes, 12_025_908_428);
+        assert_eq!(
+            resolved.sources.cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE_LOOPBACK
+        );
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_503_238_553);
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+        resolved.emit(reference_host());
+        let lines = captured.lock();
+        assert!(
+            lines.iter().any(|l| l.contains("setting=\"cache_max_bytes\"")
+                && l.contains("value=12025908428")
+                && l.contains(&format!("source=\"{PERF_SOURCE_BUDGET_CARVE_LOOPBACK}\""))),
+            "the resolved fetch-cache line must carry the budget-carve-loopback source, \
+             lines: {lines:?}"
+        );
+    }
+
+    /// The loopback share applies only when BOTH conditions hold: `--store
+    /// s3` AND a loopback-shaped `--s3-endpoint`. Every other combination
+    /// keeps the ordinary 25% `budget-carve` share: a non-loopback S3
+    /// endpoint, no endpoint at all, and -- the distinguishing case -- a
+    /// loopback-SHAPED endpoint under `--store memory`, which never resolves
+    /// it.
+    ///
+    /// Prove-the-test (b/d): drop the `matches!(self.store, StoreKind::S3)
+    /// &&` conjunct from `Cli::store_is_loopback`. The `--store memory` case
+    /// below then derives `budget-carve-loopback`/12,025,908,428 from the
+    /// loopback-shaped `--s3-endpoint` alone, against the expected
+    /// `budget-carve`/7,516,192,768: a store that never resolves that
+    /// endpoint would still have its fetch cache sized by it.
+    #[test]
+    fn only_a_store_s3_loopback_endpoint_gets_the_larger_share() {
+        let remote = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "https://s3.us-east-1.amazonaws.com",
+        ]);
+        let resolved = resolved_from(&remote);
+        assert_eq!(resolved.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
+
+        // `--s3-endpoint` is env-backed: clear any ambient RAVEL_S3_ENDPOINT
+        // so this case asserts the absence it names.
+        let mut no_endpoint = cli(&["--store", "s3"]);
+        no_endpoint.s3_endpoint = None;
+        let resolved = resolved_from(&no_endpoint);
+        assert_eq!(resolved.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
+
+        let memory_with_loopback_shaped_endpoint = cli(&[
+            "--store",
+            "memory",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+        ]);
+        let resolved = resolved_from(&memory_with_loopback_shaped_endpoint);
+        assert_eq!(
+            resolved.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES,
+            "a store that never resolves the s3 endpoint must not have its fetch cache \
+             sized by it"
+        );
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
+    }
+
+    /// An explicit `--cache-max-bytes` wins verbatim even on a loopback
+    /// store: the loopback share only applies in the derived,
+    /// no-flag-and-known-memory arm. The catalog cache keeps deriving its
+    /// own 5% share regardless, never the flag value.
+    ///
+    /// Prove-the-test (c): move the `(Some(n), _) => (n, PERF_SOURCE_FLAG)`
+    /// arm below the loopback arm in the fetch-cache match (so the loopback
+    /// check runs unconditionally first). The assertion reads
+    /// 12,025,908,428/budget-carve-loopback against the expected
+    /// 4,096/flag.
+    #[test]
+    fn explicit_cache_max_bytes_wins_over_the_loopback_share() {
+        let loopback = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--cache-max-bytes",
+            "4096",
+        ]);
+        let resolved = resolved_from(&loopback);
+        assert_eq!(resolved.cache_max_bytes, 4096);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(
+            resolved.catalog_cache_max_bytes, 1_503_238_553,
+            "the catalog cache derives its own share, never the fetch flag's value"
+        );
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+    }
+
+    /// `--catalog-cache-max-bytes` alone, through the CLI parse path: the
+    /// catalog cache takes the flag value and the fetch cache still derives
+    /// normally (25% on a non-loopback host).
+    ///
+    /// Prove-the-test: drop the `(Some(n), _) => (n, PERF_SOURCE_FLAG)` arm
+    /// from the catalog-cache match and the assertion reads 1,503,238,553
+    /// against the expected 99,999.
+    #[test]
+    fn catalog_cache_max_bytes_flag_resolves_independently_through_the_cli() {
+        let cli = cli(&["--catalog-cache-max-bytes", "99999"]);
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.catalog_cache_max_bytes, 99_999);
+        assert_eq!(resolved.sources.catalog_cache_max_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(resolved.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
+    }
+
+    /// Unknown memory (the fallback path) on a loopback store: neither cache
+    /// can derive a share of a budget that does not exist, so both fall back
+    /// to [`DEFAULT_CACHE_MAX_BYTES`] exactly as on a non-loopback host.
+    /// `store_is_loopback` is irrelevant once `host.mem_total_bytes` is
+    /// `None`.
+    ///
+    /// Prove-the-test: make the `(None, None)` arm of the fetch-cache match
+    /// read `LOOPBACK_CACHE_MEMORY_PERCENT` of some assumed total instead of
+    /// `DEFAULT_CACHE_MAX_BYTES` and the assertion reads a nonzero derived
+    /// figure against the expected 268,435,456.
+    #[test]
+    fn unknown_memory_on_loopback_falls_back_like_today() {
+        let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
+        let resolved = loopback
+            .resolve_performance(HostProfile::new(16, None))
+            .expect("fallback path resolves");
+
+        assert_eq!(resolved.cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FALLBACK);
+        assert_eq!(resolved.catalog_cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        assert_eq!(resolved.sources.catalog_cache_max_bytes, PERF_SOURCE_FALLBACK);
     }
 
     /// Issue #1141 clamp rule: an EXPLICIT per-query pool RAISES a non-explicit
@@ -8931,10 +9126,10 @@ mod tests {
     }
 
     /// Startup refuses, never clamps, a flag combination whose two hard cache
-    /// caps together exceed `memory_budget_bytes` (ADR-1170 decision 3). An
-    /// explicit `--cache-max-bytes` bounds BOTH the fetcher and catalog caches
-    /// at that one value (the pre-#1141 coupling), so a value above half the
-    /// reference host's 30,064,771,072-byte budget makes their sum exceed it.
+    /// caps together exceed `memory_budget_bytes` (ADR-1170 decision 3). Since
+    /// ADR-2023 the two flags bound their own cache independently, so both
+    /// must be set explicitly to make their sum exceed half the reference
+    /// host's 30,064,771,072-byte budget.
     ///
     /// Prove-the-test: replace `self.memory_hard_caps_bytes >=
     /// self.memory_budget_bytes` in `check_memory_budget` with `false` and
@@ -8942,8 +9137,14 @@ mod tests {
     /// of the expected `MemoryBudgetExceeded`.
     #[test]
     fn startup_refuses_hard_caps_over_the_memory_budget() {
-        let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "20000000000"])
-            .expect("flag parses");
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--cache-max-bytes",
+            "20000000000",
+            "--catalog-cache-max-bytes",
+            "20000000000",
+        ])
+        .expect("flags parse");
 
         let err = cli
             .resolve_performance(reference_host())
@@ -8993,8 +9194,14 @@ mod tests {
              at the budget"
         );
 
-        let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", &half.to_string()])
-            .expect("flag parses");
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--cache-max-bytes",
+            &half.to_string(),
+            "--catalog-cache-max-bytes",
+            &half.to_string(),
+        ])
+        .expect("flags parse");
         let err = cli
             .resolve_performance(reference_host())
             .expect_err("hard caps landing exactly at the budget must leave zero remainder");
@@ -9203,12 +9410,15 @@ mod tests {
     #[test]
     fn disabling_the_cache_starts_where_the_hard_caps_would_refuse() {
         // Configuration 1: caps an operator set well above the budget, with
-        // the caches turned off. 20 GB bounds both caches, so the sum is
-        // 40 GB against the reference host's 30,064,771,072-byte budget.
+        // the caches turned off. Each flag bounds its own cache at 20 GB, so
+        // the sum is 40 GB against the reference host's 30,064,771,072-byte
+        // budget.
         let cli = Cli::try_parse_from([
             "ravel-server",
             "--disable-cache",
             "--cache-max-bytes",
+            "20000000000",
+            "--catalog-cache-max-bytes",
             "20000000000",
         ])
         .expect("flags parse");
