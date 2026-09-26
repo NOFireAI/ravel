@@ -58,7 +58,8 @@ cache.
    deployment keeps 25%. The resolved `cache_max_bytes` line names the source
    `budget-carve-loopback`, so the choice is visible.
 3. **The share is measured, not assumed.** It starts at 40%: 12.3 GB on the
-   reference host, above the 11.24 GB corpus. It ships only if a fresh
+   ClickBench c6a.4xlarge (budget 30,756,311,040 bytes), above the 11.24 GB
+   corpus, and 12.03 GB on the repository's 30 GiB reference host. It ships only if a fresh
    bot-style end-to-end run of the stock entry meets all of these:
    - concurrent throughput at or above 0.40 QPS, against v0.17.0's
      end-to-end 0.46 to 0.50;
@@ -90,7 +91,8 @@ the stock entry passes no flags.
   and hot gains and, if the measurement holds, recovers its concurrent
   throughput.
 - The shared SQL/fetch remainder on a loopback store shrinks by the extra
-  share: 15 points of the budget, about 4.6 GB on the reference host. The
+  share: 15 points of the budget, about 4.6 GB on the ClickBench c6a.4xlarge.
+  The
   error-ratio bound in decision 3 is what guards it.
 - With `--cache-dir` set, the fetcher cache's disk tier is bounded by the same
   resolved ceiling as its RAM tier, so on a loopback store the disk tier also
