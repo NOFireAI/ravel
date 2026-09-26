@@ -1460,31 +1460,48 @@ pub struct Cli {
     #[arg(long)]
     pub otap: bool,
 
-    /// Maximum resident bytes for the ADR-0046 read caches' RAM tier. When SET,
-    /// bounds BOTH caches from this one number: the query fetcher cache
-    /// (`store::build_cache`) and the catalog's byte cache
-    /// (`query::build_catalog`). When UNSET the two derive independently, the
-    /// catalog cache at a smaller share (they are separate LRU caches, so one
-    /// number would double-commit RAM). Read at startup only; there is no live
-    /// resize. Ignored when `--disable-cache` is set. Default when unset:
-    /// derived, 25% of `memory_budget_bytes` for the fetcher cache and 5% for
-    /// the catalog byte cache (ADR-1170 decision 3: the budget is
-    /// cgroup-capped effective memory minus a reserve, not raw `MemTotal`);
-    /// reference host (16 cores, 30 GiB, at today's provisional reserve):
-    /// 7,516,192,768 and 1,503,238,553. Fallback when MemTotal is unknown:
-    /// 256 MiB each. Startup refuses (does not clamp) a value whose two
-    /// resolved caps together exceed `memory_budget_bytes`.
+    /// Maximum resident bytes for the query fetcher cache's RAM tier
+    /// (`store::build_cache`), the ADR-0046 read cache that holds byte ranges
+    /// of the data objects a query scans. This flag bounds the fetcher cache
+    /// ONLY (ADR-2023): the catalog's separate byte cache
+    /// (`query::build_catalog`) derives on its own, or is set independently
+    /// with [`--catalog-cache-max-bytes`](Self::catalog_cache_max_bytes).
+    /// Read at startup only; there is no live resize. Ignored when
+    /// `--disable-cache` is set.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141,
-    /// rebased onto `memory_budget_bytes` by ADR-1170 decision 3): the
-    /// fetcher cache takes [`CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`
-    /// (cgroup-capped effective memory minus
-    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]) and the catalog byte cache
-    /// [`CATALOG_CACHE_MEMORY_PERCENT`], or [`DEFAULT_CACHE_MAX_BYTES`]
-    /// (256 MiB) each when memory cannot be read.
+    /// rebased onto `memory_budget_bytes` by ADR-1170 decision 3): normally
+    /// [`CACHE_MEMORY_PERCENT`] of `memory_budget_bytes` (cgroup-capped
+    /// effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`], not raw
+    /// `MemTotal`); reference host (16 cores, 30 GiB, at today's provisional
+    /// reserve): 7,516,192,768. On a `--store s3` deployment whose
+    /// `--s3-endpoint` is a loopback address, the fetcher cache instead takes
+    /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`: cache
+    /// misses there cost a local disk round trip rather than a network one,
+    /// so a loopback store can afford a larger share of the budget (ADR-2023).
+    /// Fallback when MemTotal is unknown: [`DEFAULT_CACHE_MAX_BYTES`]
+    /// (256 MiB). Startup refuses (does not clamp) a value that, together
+    /// with the resolved `--catalog-cache-max-bytes`, exceeds
+    /// `memory_budget_bytes`.
     #[arg(long, value_name = "BYTES")]
     pub cache_max_bytes: Option<u64>,
+
+    /// Maximum resident bytes for the catalog byte cache's RAM tier
+    /// (`query::build_catalog`), a SEPARATE LRU ceiling from
+    /// [`--cache-max-bytes`](Self::cache_max_bytes) (ADR-2023):
+    /// `--cache-max-bytes` no longer affects this cache. Read at startup
+    /// only; there is no live resize. Ignored when `--disable-cache` is set.
+    ///
+    /// Omitted, the value derives at [`CATALOG_CACHE_MEMORY_PERCENT`] of
+    /// `memory_budget_bytes` (cgroup-capped effective memory minus
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]), unaffected by whether the store is
+    /// loopback; reference host: 1,503,238,553. Fallback when MemTotal is
+    /// unknown: [`DEFAULT_CACHE_MAX_BYTES`] (256 MiB). Startup refuses (does
+    /// not clamp) a value that, together with the resolved
+    /// `--cache-max-bytes`, exceeds `memory_budget_bytes`.
+    #[arg(long, value_name = "BYTES")]
+    pub catalog_cache_max_bytes: Option<u64>,
 
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
@@ -1492,8 +1509,8 @@ pub struct Cli {
     /// cache (`query::build_catalog`) gain a `DiskCache` at this path, each
     /// bounded by its own resolved RAM ceiling: the fetcher cache by
     /// `--cache-max-bytes` or its derived value, the catalog byte cache by its
-    /// own resolved value, which equals `--cache-max-bytes` only when that flag
-    /// is set explicitly (there is no separate disk-tier capacity flag). The
+    /// own resolved value, from `--catalog-cache-max-bytes` or its own derived
+    /// share (there is no separate disk-tier capacity flag). The
     /// directory is created lazily on first admission and is never
     /// required to exist; a missing, full, or corrupt cache directory degrades
     /// to a store read, never a query error.
@@ -2603,7 +2620,33 @@ pub const MEMORY_OVERHEAD_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 ///
 /// This buys headroom; it does not by itself make the process fit. Bounding the
 /// query and fetch working set is #1170's remaining subject.
+///
+/// This share applies except on a `--store s3` deployment whose
+/// `--s3-endpoint` is a loopback address, where the fetcher cache instead
+/// takes [`LOOPBACK_CACHE_MEMORY_PERCENT`] (ADR-2023).
 pub const CACHE_MEMORY_PERCENT: u64 = 25;
+
+/// Starting share of `memory_budget_bytes` the derived fetcher cache takes on
+/// a `--store s3` deployment whose `--s3-endpoint` is a loopback address,
+/// in place of [`CACHE_MEMORY_PERCENT`] (ADR-2023 decision 3). Applies to the
+/// fetcher cache only; the catalog byte cache always derives at
+/// [`CATALOG_CACHE_MEMORY_PERCENT`], loopback or not.
+///
+/// A cache miss on a loopback store still pays a local disk round trip
+/// rather than a network one, so the fetch cache can afford a larger share
+/// of the budget there without starving the rest of the process the way a
+/// larger share would on a remote store. Attribution on issue #2014 found
+/// ADR-2014's byte-minimal default on a loopback store cut concurrent
+/// throughput on the ClickBench reference machine from about 0.40 to 0.12
+/// queries per second, mostly from cache capacity: the ranged plan caches
+/// column blocks, and ten statements sharing a fetch cache smaller than the
+/// corpus keep missing to the store's disk. A 12 GB fetch cache reached
+/// 0.32, with more memory refusals because `--cache-max-bytes` also
+/// committed 12 GB to a catalog cache that served no hits -- the coupling
+/// this ADR removes. 40 is a starting value: ADR-2023 decision 3 is the
+/// measurement this constant is meant to be checked against, and it is the
+/// number to revisit once a fresh end-to-end run reports a figure.
+pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 40;
 
 /// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
 /// SEPARATE ceiling from [`CACHE_MEMORY_PERCENT`]. The fetcher cache
@@ -2614,8 +2657,10 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// doubling the fetcher's claim. Both percentages carve the same
 /// `memory_budget_bytes`, so their 5-to-1 ratio to each other (and thus the
 /// relative split between the two caches) is unchanged by rebasing off the
-/// budget instead of the raw host total. An explicit `--cache-max-bytes`
-/// still bounds both caches at that one value.
+/// budget instead of the raw host total. This share does not change on a
+/// loopback store: only the fetcher cache does (ADR-2023). Set the catalog
+/// byte cache explicitly with `--catalog-cache-max-bytes`; `--cache-max-bytes`
+/// no longer bounds it.
 pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
 
 /// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~8 GiB on the
@@ -2656,6 +2701,12 @@ pub const PERF_SOURCE_LEGACY_FLAG: &str = "legacy-flag";
 /// carved as a fixed share of `memory_budget_bytes` rather than of raw
 /// `MemTotal` (ADR-1170 decision 3): the fetcher and catalog byte caches.
 pub const PERF_SOURCE_BUDGET_CARVE: &str = "budget-carve";
+/// [`ResolvedPerformanceDefaults`] source: `--cache-max-bytes` was unset, the
+/// host's memory is known, and the store is a `--store s3` deployment against
+/// a loopback `--s3-endpoint`, so the fetcher cache was carved at
+/// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes` rather than at
+/// [`CACHE_MEMORY_PERCENT`] (ADR-2023).
+pub const PERF_SOURCE_BUDGET_CARVE_LOOPBACK: &str = "budget-carve-loopback";
 
 /// The operator's explicit performance flags: `None` per field means "derive".
 ///
@@ -2687,6 +2738,15 @@ pub struct PerformanceFlags {
     pub max_segments: Option<usize>,
     /// `--cache-max-bytes`.
     pub cache_max_bytes: Option<u64>,
+    /// `--catalog-cache-max-bytes` (ADR-2023): independent of
+    /// `cache_max_bytes` above.
+    pub catalog_cache_max_bytes: Option<u64>,
+    /// Whether this deployment's store is a `--store s3` deployment against a
+    /// loopback `--s3-endpoint`, computed by [`Cli::store_is_loopback`]: the
+    /// same predicate [`Cli::resolve_logs_fetch_policy`] uses. Only the
+    /// fetcher cache's derivation (ADR-2023) reads this; the catalog byte
+    /// cache does not.
+    pub store_is_loopback: bool,
     /// `--sql-max-query-bytes`.
     pub sql_max_query_bytes: Option<usize>,
     /// `--sql-tenant-max-bytes`.
@@ -2749,14 +2809,16 @@ pub struct ResolvedPerformanceDefaults {
     pub max_segments: usize,
     /// Reaches the query fetcher cache's byte ceiling
     /// (`store::build_cache`). NOT the catalog byte cache: that has its own
-    /// [`Self::catalog_cache_max_bytes`], so the two independent LRU caches do
-    /// not each claim the full derived share of RAM.
+    /// [`Self::catalog_cache_max_bytes`], resolved from its own flag
+    /// (ADR-2023), so the two independent LRU caches do not each claim the
+    /// full derived share of RAM.
     pub cache_max_bytes: u64,
     /// Reaches the catalog byte cache's byte ceiling
-    /// (`query::build_catalog`), a SEPARATE LRU from the fetcher cache. Derived
-    /// at [`CATALOG_CACHE_MEMORY_PERCENT`] rather than sharing
-    /// [`Self::cache_max_bytes`]'s 25%; an explicit `--cache-max-bytes` sets
-    /// both equal.
+    /// (`query::build_catalog`), a SEPARATE LRU from the fetcher cache,
+    /// resolved from its own `--catalog-cache-max-bytes` flag rather than
+    /// from [`Self::cache_max_bytes`] (ADR-2023). Derived at
+    /// [`CATALOG_CACHE_MEMORY_PERCENT`] rather than sharing
+    /// [`Self::cache_max_bytes`]'s share, whatever that share is.
     pub catalog_cache_max_bytes: u64,
     /// Reaches `SqlConfig::max_query_bytes`. Never above
     /// [`Self::sql_tenant_max_bytes`].
@@ -2904,11 +2966,16 @@ fn resolve_knob(
 ///   or `u64::MAX` when memory is unknown (no trustworthy ceiling can be
 ///   derived, which is unlimited, not `0`).
 /// - `cache_max_bytes` (fetcher cache): [`CACHE_MEMORY_PERCENT`] of
-///   `memory_budget_bytes`, else [`DEFAULT_CACHE_MAX_BYTES`].
+///   `memory_budget_bytes`, or [`LOOPBACK_CACHE_MEMORY_PERCENT`] instead when
+///   `flags.store_is_loopback` (a `--store s3` deployment against a loopback
+///   `--s3-endpoint`, ADR-2023), else [`DEFAULT_CACHE_MAX_BYTES`] when memory
+///   is unknown.
 /// - `catalog_cache_max_bytes` (catalog byte cache): a SEPARATE ceiling,
-///   [`CATALOG_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`, else
-///   [`DEFAULT_CACHE_MAX_BYTES`]. An explicit `--cache-max-bytes` sets it equal
-///   to `cache_max_bytes`, preserving the pre-#1141 single-number coupling.
+///   resolved from its own `--catalog-cache-max-bytes` flag
+///   (`flags.catalog_cache_max_bytes`), independent of `cache_max_bytes`
+///   (ADR-2023): unset, it derives at [`CATALOG_CACHE_MEMORY_PERCENT`] of
+///   `memory_budget_bytes`, unaffected by whether the store is loopback,
+///   else [`DEFAULT_CACHE_MAX_BYTES`] when memory is unknown.
 ///   `memory_hard_caps_bytes` is the sum of these two, and
 ///   `memory_remainder_bytes` is what's left of the budget after them: what
 ///   sizes the shared `MemoryBudget` the SQL/fetch accountant draws from,
@@ -3023,8 +3090,17 @@ pub fn resolve_performance_defaults(
         None => (u64::MAX, PERF_SOURCE_FALLBACK),
     };
 
+    // ADR-2023: a loopback store's cache miss still costs a local disk round
+    // trip, not a network one, so the fetcher cache affords a larger share of
+    // the budget there. `--cache-max-bytes` always wins verbatim when set;
+    // the loopback share applies only in the derived (unset-flag,
+    // known-memory) arm, and only when `flags.store_is_loopback` is true.
     let (cache_max_bytes, cache_source) = match (flags.cache_max_bytes, host.mem_total_bytes) {
         (Some(n), _) => (n, PERF_SOURCE_FLAG),
+        (None, Some(_)) if flags.store_is_loopback => (
+            percent_of(memory_budget_bytes, LOOPBACK_CACHE_MEMORY_PERCENT),
+            PERF_SOURCE_BUDGET_CARVE_LOOPBACK,
+        ),
         (None, Some(_)) => (
             percent_of(memory_budget_bytes, CACHE_MEMORY_PERCENT),
             PERF_SOURCE_BUDGET_CARVE,
@@ -3032,12 +3108,12 @@ pub fn resolve_performance_defaults(
         (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
     };
 
-    // The catalog byte cache is a SEPARATE LRU from the fetcher cache, so an
-    // unset flag derives it at its own smaller share rather than committing a
-    // second 25% of the budget. An explicit `--cache-max-bytes` bounds both at
-    // that one value (the pre-#1141 coupling).
+    // The catalog byte cache is a SEPARATE LRU from the fetcher cache, resolved
+    // from its own `--catalog-cache-max-bytes` flag: `--cache-max-bytes` no
+    // longer reaches it (ADR-2023), and its derived share never varies with
+    // `flags.store_is_loopback` -- only the fetcher cache's does.
     let (catalog_cache_max_bytes, catalog_cache_source) =
-        match (flags.cache_max_bytes, host.mem_total_bytes) {
+        match (flags.catalog_cache_max_bytes, host.mem_total_bytes) {
             (Some(n), _) => (n, PERF_SOURCE_FLAG),
             (None, Some(_)) => (
                 percent_of(memory_budget_bytes, CATALOG_CACHE_MEMORY_PERCENT),
@@ -3184,25 +3260,28 @@ impl std::fmt::Display for MemoryBudgetExceeded {
             self.hard_caps_total,
             self.memory_budget_bytes
         )?;
-        // A `0` budget is not fixable by any --cache-max-bytes value: an
-        // explicit `n` bounds both caches, so any `n >= 1` sums to `2n > 0`
-        // and `n == 0` still fails the `hard_caps >= budget` comparison.
-        // Naming the flag there sends the operator after a knob that cannot
-        // satisfy the check; the memory the process is given is the only
-        // thing that can.
+        // A `0` budget is not fixable by any --cache-max-bytes value: both
+        // hard caps are unsigned byte counts, so their sum can never be
+        // negative, and `n == 0` for each still fails the `hard_caps >=
+        // budget` comparison against a 0-byte budget. Naming a flag there
+        // sends the operator after a knob that cannot satisfy the check; the
+        // memory the process is given is the only thing that can.
         if self.memory_budget_bytes == 0 {
             write!(
                 f,
                 "no --cache-max-bytes value can satisfy this check against a 0-byte budget, \
-                 because an explicit value bounds both caches and any positive one sums \
-                 above 0. The host's effective memory (its cgroup memory limit when it runs \
+                 because both hard caps are non-negative byte counts and their sum can never \
+                 go below 0. The host's effective memory (its cgroup memory limit when it runs \
                  under a finite one, else MemTotal) is at or below the overhead reserve \
                  ({MEMORY_OVERHEAD_RESERVE_BYTES} bytes) subtracted to derive the budget: \
                  give the process more memory, or raise its cgroup memory limit, above that \
                  reserve"
             )
         } else {
-            f.write_str("lower --cache-max-bytes or raise the host's available memory")
+            f.write_str(
+                "lower --cache-max-bytes or --catalog-cache-max-bytes, or raise the host's \
+                 available memory",
+            )
         }
     }
 }
@@ -4459,6 +4538,21 @@ impl Cli {
         })
     }
 
+    /// Whether this deployment's store is a `--store s3` deployment against a
+    /// loopback `--s3-endpoint`: the single place this predicate is computed
+    /// (ADR-2014, ADR-2023), shared by [`Self::resolve_logs_fetch_policy`]
+    /// and [`Self::performance_flags`] so the two can never disagree on what
+    /// counts as loopback. Gated on `--store s3` so a stray exported
+    /// `RAVEL_S3_ENDPOINT` cannot change behaviour for a `--store memory`
+    /// start.
+    pub(crate) fn store_is_loopback(&self) -> bool {
+        matches!(self.store, StoreKind::S3)
+            && self
+                .s3_endpoint
+                .as_deref()
+                .is_some_and(crate::store::is_loopback_endpoint)
+    }
+
     /// Resolve `--logs-fetch-policy` and its provenance (ADR-2014). The one
     /// place this decision is made: [`Self::query_budgets`] is its only
     /// caller, and both the engine-bound policy and the startup stamp
@@ -4481,12 +4575,7 @@ impl Cli {
         if let Some(policy) = self.logs_fetch_policy {
             return (policy, LOGS_FETCH_POLICY_SOURCE_FLAG);
         }
-        let loopback = matches!(self.store, StoreKind::S3)
-            && self
-                .s3_endpoint
-                .as_deref()
-                .is_some_and(crate::store::is_loopback_endpoint);
-        if loopback {
+        if self.store_is_loopback() {
             (
                 LogsFetchPolicyArg::ByteMinimal,
                 LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT,
@@ -5646,6 +5735,8 @@ impl Cli {
             max_concurrent_queries: self.max_concurrent_queries,
             max_segments: self.max_segments,
             cache_max_bytes: self.cache_max_bytes,
+            catalog_cache_max_bytes: self.catalog_cache_max_bytes,
+            store_is_loopback: self.store_is_loopback(),
             sql_max_query_bytes: self.sql_max_query_bytes,
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
             query_deadline,
