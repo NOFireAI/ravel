@@ -302,8 +302,9 @@ documents every storage flag, including temporary session tokens and a rotating
 credentials file.
 
 Every query byte comes from object storage, so a read cache sits in front of it.
-The RAM tier is on by default, bounded by `--cache-max-bytes` and switched off
-with `--disable-cache`; `--cache-dir <path>` adds a second, disposable disk
+The RAM tier is on by default, bounded by `--cache-max-bytes` (the catalog's
+own byte cache by `--catalog-cache-max-bytes`) and switched off with
+`--disable-cache`; `--cache-dir <path>` adds a second, disposable disk
 tier. Neither tier holds durable state. See the
 [caching guide](docs/guides/caching.md).
 
