@@ -27,9 +27,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the bulk-import follow-up each one waits on, because an exported file
   no command can load back is not an export. `--parquet` is replaced only
   once the export finishes, by renaming a temporary file written beside it,
-  so a failed export leaves an existing file untouched. `--max-ingest-lag`
-  and `--max-flush-lifetime` pass the deployment's own catalog window through
-  when it differs from the defaults. The whole window is decoded into memory
+  so a failed export leaves an existing file untouched; a path under `/dev`
+  or an existing directory is refused before anything is read.
+  `--max-ingest-lag` passes the deployment's own `ravel-server
+  --max-ingest-lag` through when it differs from the 2h default, and refuses
+  zero as the server does. The whole window is decoded into memory
   before the first row is written, so a wide range wants several narrower
   exports. The ingest guide's bulk-export section covers that and the
   round-trip caveats, including `ts_unit` truncation and the fact that `load`

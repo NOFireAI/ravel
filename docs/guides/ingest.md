@@ -917,18 +917,17 @@ windows; the half-open bound is what makes that safe to do.
 The catalog lists ingest-hour buckets from `--start` minus `max_ingest_lag`
 forward, and `export` defaults that to the same 2 hours the server defaults
 to. The reach-back is what finds the bucket of a record whose event time falls
-in a later ingest hour than the bucket it was written into: narrow it to zero
-and the listing starts in the export window's own hour, so that bucket is
-never listed and the export reports a clean, short result.
+in a later ingest hour than the bucket it was written into: narrow it so that
+`--start` minus the lag no longer reaches that earlier hour, and the listing
+starts in the export window's own hour, so that bucket is never listed and the
+export reports a clean, short result.
 
 An export therefore has to resolve with the same value the server's own
 resolves use, or it answers a different window than a query over the same
 range does. Nothing on the bucket records what the server was configured with,
 so pass it: `--max-ingest-lag` takes the same humantime duration
-`ravel-server --max-ingest-lag` does. `--max-flush-lifetime` is the matching
-override for the seal margin the resolve uses to skip folded history, the same
-flag `catalog fold` and `maintain compact-tenant` offer. On a default
-deployment neither is needed.
+`ravel-server --max-ingest-lag` does, and refuses zero as the server does. On
+a default deployment it is not needed.
 
 ### Exported rows are sorted by event time
 
@@ -981,7 +980,22 @@ that tenant uses, and the tenant's durable provisioning record supplies the
 real per-hour shard generations on top of it.
 
 `--parquet` names the output path and replaces it if it exists, but only once
-the export has finished. The rows go to a temporary file beside the target and
-are renamed over it after the Parquet writer closes, so an export that fails
+the export has finished. The rows go to a temporary file beside the target,
+named `.<file name>.<pid>.<n>.tmp`, which is synced to disk and renamed over
+the target after the Parquet writer closes, and the directory is synced after
+the rename, so the replace survives a power loss. An export that fails
 part-way leaves the previous file exactly as it was rather than a truncated
-one with no footer. The temporary file is removed on every failure path.
+one with no footer. The temporary file is removed on every failure path the
+export returns from; a SIGINT or a panic mid-write leaves it behind.
+
+Because the replace is a rename rather than a write into the existing file:
+
+- A symlink at `--parquet` is itself replaced by the new file; the file it
+  pointed to is left unchanged.
+- The new file's mode comes from the default creation mode and your umask,
+  not from the file it replaces, and the old file's owner and ACLs are not
+  carried over.
+- The path must name a regular file in a writable directory. A path under
+  `/dev` (such as `/dev/stdout`), an existing directory, and any other
+  existing non-regular file are refused before the export reads anything
+  from object storage.
