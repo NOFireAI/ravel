@@ -20,7 +20,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   SQL rule keep their existing single alert and identity. Two rules in one
   tenant may no longer share a `rule_id`, even with different labels: such a
   rules file now fails startup. Per-series rules over churning label sets
-  should wait for alert state pruning (#1438).
+  should wait for alert state pruning (#1438). A rule whose write fails
+  partway through its alerts now counts the records already written in
+  `ravel_alert_records_written_total`.
+
+  Upgrade notes:
+  - Expect a notification burst on the first tick. A PromQL rule whose
+    matching series carry labels besides `__name__` that the rule labels do
+    not override gets a new identity for each series. If its single
+    rule-level alert is pending or firing at upgrade, that tick writes one
+    Resolved transition for it and one new transition per matching series.
+    The webhook sink is notified of every one of them, and the Alertmanager
+    sink of every one except a pending transition.
+  - A rule that fires today can start failing every tick. It fails with
+    `DuplicateAlertIdentity` when two matching series merge to one label
+    set, for example a selector over several metric names
+    (`{__name__=~"a|b"}`) whose series differ only in `__name__`, or a rule
+    label that overrides the series label that told them apart. It fails
+    with `TooManyAlerts` when more than 1000 series match. On every tick it
+    fails, the rule writes no record, and its existing alerts keep their
+    state.
+  - A rules file in which two rules of one tenant share a `rule_id` now
+    fails startup with `rule id "<id>" is used by more than one rule in
+    tenant "<tenant>"`. Give each rule its own `rule_id` before upgrading.
 
 ## [0.17.0] - 2026-09-25
 

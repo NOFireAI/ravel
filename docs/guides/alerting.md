@@ -135,6 +135,32 @@ The labels a rule's query returns are retained with every alert record it
 writes, alongside the rule's own labels, and no erasure path reaches alert
 history today.
 
+### Upgrading from one alert per rule
+
+Releases before per-series evaluation raised one alert per rule, carrying the
+rule labels only. Three things change for an existing rules file on upgrade:
+
+- **A notification burst on the first tick.** A PromQL rule whose matching
+  series carry labels besides `__name__` that the rule labels do not override
+  gets a new identity for each series. If its single rule-level alert is
+  pending or firing at upgrade, that tick writes one Resolved transition for
+  it and one new transition per matching series. The webhook sink receives a
+  notification for every one of them, and the Alertmanager sink for every one
+  except a pending transition (a rule with a nonzero `for` starts its new
+  alerts pending).
+- **Rules that fire today can start failing every tick.** A rule fails with
+  `DuplicateAlertIdentity` when two matching series merge to one label set,
+  for example a selector over several metric names (`{__name__=~"a|b"}`)
+  whose series differ only in `__name__`, or a rule label that overrides the
+  series label that told them apart. It fails with `TooManyAlerts` when more
+  than 1000 series match. On every tick it fails, the rule writes no record,
+  its existing alerts keep their state, and `ravel_alert_rules_failed_total`
+  rises. Check that counter and the evaluator's warnings after upgrading.
+- **Duplicate rule ids fail startup.** Two rules of one tenant sharing a
+  `rule_id` stop the process at load with `rule id "<id>" is used by more than
+  one rule in tenant "<tenant>"`. Give each rule its own `rule_id` before
+  upgrading.
+
 A SQL detection rule reads the same tables the `POST /api/v1/sql` endpoint
 serves (`samples`, `logs`, `spans`, `audit`), under the same
 one-signal-per-query rule. See the [query guide](query.md) for the query

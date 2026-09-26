@@ -1,7 +1,7 @@
 # ADR-0117: per-series alert evaluation
 
 Status: Accepted (2026-09-16). Issue #117. Amends ADR-1294 (the one-alert-per-rule
-premise in its Context).
+premise in its Context). Amended 2026-09-26 (unique rule id amendment).
 
 ## Context
 
@@ -85,7 +85,9 @@ holds no evaluation-cap variant.
    `evaluate_transition` `condition_met = false` for each identity absent
    from the matched set. `evaluate_transition` is pure and per identity
    (`state.rs:129-175`), so it needs no change. `queue_repeat_if_due` iterates
-   the same set instead of computing one id from the rule's labels.
+   the same set instead of computing one id from the rule's labels. Two
+   rules sharing a `rule_id` would resolve each other's alerts in this walk;
+   see the unique rule id amendment below.
 
 5. **SQL rules are unchanged.** `RowCount` (`condition.rs:68`) has no series
    identity, so a SQL rule keeps one alert with the rule's labels.
@@ -159,7 +161,8 @@ flowchart LR
   transition per stale identity after the upgrade.
 - The startup duplicate-identity check (`alerting.rs:1857-1865`) keeps its
   rule-level meaning; `rule_id` is in the preimage, so series-level
-  collisions across rules cannot occur.
+  collisions across rules cannot occur. See the unique rule id amendment
+  below: neither holds, and rule ids are now unique per tenant.
 - What changes for an operator: rules like the guide's
   `max by (instance) (cpu_usage)` example (`docs/guides/alerting.md:37`) now
   raise one alert per instance; Alertmanager grouping and silences work on
@@ -179,3 +182,38 @@ flowchart LR
      for churning label sets.
   4. A batching follow-up for the per-tick publish path if measurement shows
      the sequential 1000-object worst case breaches the lease TTL.
+
+## Amendment (2026-09-26): rule ids are unique per tenant
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="unique rule id amendment" -->
+<!-- amendment-supersedes: phrase="keeps its rule-level meaning" pointer="unique rule id amendment" -->
+<!-- amendment-supersedes: phrase="collisions across rules cannot occur" pointer="unique rule id amendment" -->
+
+The Consequences bullet on the startup duplicate check is wrong: the check
+cannot keep its rule-level meaning under per-series evaluation, and
+series-level collisions across rules can occur. Both follow once two rules in
+one tenant share a `rule_id`:
+
+- Decision 4 walks every Pending or Firing entry in `latest` whose `rule_id`
+  is the rule's. Rule A's walk reaches rule B's alerts, finds them absent from
+  A's matched set, and resolves them; B's evaluation raises them again. The
+  two rules resolve each other's alerts every tick, whatever their labels.
+- Decision 2 builds identity from the series labels overlaid by the rule
+  labels, so rule labels no longer keep two rules' identities apart. Two
+  rules sharing a `rule_id` with rule labels `{}` and `{shard: "2"}` produce
+  the same merged set, and so the same `alert_id`, for every series that
+  carries `shard="2"`. The `rule_id` in the preimage separates rules only when
+  their rule ids differ.
+
+Decision: a `rule_id` is unique per tenant. Startup refuses a rules file in
+which two rules of one tenant share a `rule_id`, whatever their labels, with
+`rule id "<id>" is used by more than one rule in tenant "<tenant>"; rule ids
+must be unique per tenant`. This replaces the rule-level duplicate-identity
+check, which compared rule id plus rule labels and let both cases above
+through. The same `rule_id` in two tenants is still two independent rules.
+
+Consequence: a rule set with duplicate rule ids in one tenant, which loaded
+before, now fails at startup. The changelog entry and the alerting guide
+carry this as an upgrade note. Nothing else in the decision changes: the
+identity preimage, the cap, and the storage format are as written above, and
+records already written stay readable.
