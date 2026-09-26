@@ -8,27 +8,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **A distributed-query worker rebuilds each pinned segment's object key from
-  the identity the coordinator shipped and resolves no catalog** (issue #1721).
-  Every fragment request used to re-resolve the worker's catalog to map the
+- **A distributed-query worker resolves each pinned segment from that segment's
+  own commit record instead of re-resolving its catalog** (issue #1721). Every
+  fragment request used to re-resolve the worker's catalog to map the
   coordinator's pins back to segments, so a compaction committed between the
   coordinator's resolve and the worker's fetch could invalidate the slice and
-  cost a full re-resolve and re-dispatch. The worker now reconstructs the
-  data-object key from the identity with the ADR-0010 key builders, `data_key`
-  for an L0 segment and `l1_part_key` for a compacted L1 segment, and parses
-  the rebuilt key back to check every component against the identity before it
-  reads anything. Object keys and the objects under them are immutable, so the
-  pinned read is unaffected by whatever the catalog says by then, and a worker
-  issues zero catalog requests on the intra-cluster fetch path. An identity that
-  cannot be reconstructed, or whose rebuilt key does not parse back to it,
-  fails the fragment with the terminal `BAD_DATA` status; it never reads some
-  other object. Cross-cluster federation is unchanged: a resolve-scope request
-  still resolves the remote cluster's own snapshot. `SegmentIdentity` now also
-  carries the segment's `created_unix_ns`, declared event range, and counts,
-  which the worker can no longer ask a catalog for and cannot recover from the
-  object footer, and `PROTOCOL_VERSION` moves from 4 to 5 so a coordinator on
-  the older wire is routed away from a worker on the newer one rather than
-  reconstructing keys from identities missing those fields.
+  cost a full re-resolve and re-dispatch. The worker now rebuilds the key of
+  the pinned segment's own record from the identity the coordinator shipped
+  with the ADR-0010 key builders: the commit record for an L0 segment, and the
+  compaction record (or, when none exists, the erasure rewrite record) for a
+  compacted L1 part. It GETs that one record, checks that the record's own
+  fields address the key it was read from, verifies the data-object key with
+  `verify_object_key` (or the L1 part-key reconstruction), and compares the
+  full 32-byte content hash, the object size, and for L1 the full input-set
+  hash and part index against the identity. The segment ref it reads is built
+  from the verified record alone. A worker lists nothing and reads no manifest
+  on the intra-cluster fetch path; it issues one record GET per pinned L0
+  segment, one per pinned L1 part, and two for a part only a rewrite record
+  describes. A record that is missing, unreadable, fails verification, or
+  disagrees with the identity fails the fragment with `UNSUPPORTED`, and the
+  coordinator runs the query locally; a malformed identity is `BAD_DATA`.
+  Records and the objects they name are immutable, so the pinned read is
+  unaffected by whatever the catalog says by then. The queryfrag wire and
+  `PROTOCOL_VERSION` are unchanged, and cross-cluster federation is unchanged:
+  a resolve-scope request still resolves the remote cluster's own snapshot.
 
 ## [0.17.0] - 2026-09-25
 
