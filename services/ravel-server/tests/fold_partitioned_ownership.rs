@@ -724,6 +724,61 @@ async fn wait_for_folded_metrics_heads(store: &MemoryStore, tenants: &[TenantHas
     }
 }
 
+/// This server's `ravel_catalog_fold_cycles_total{signal="metrics"}`: every
+/// successful metrics fold it has run, no-op folds included.
+async fn metrics_fold_cycles(running: &ravel_server::Running) -> u64 {
+    let body = scrape(running).await;
+    let samples: Vec<u64> = body
+        .lines()
+        .filter(|line| {
+            line.starts_with("ravel_catalog_fold_cycles_total{")
+                && line.contains("signal=\"metrics\"")
+        })
+        .map(|line| {
+            line.rsplit(' ')
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("a counter sample ends in its value: {line}"))
+        })
+        .collect();
+    assert_eq!(
+        samples.len(),
+        1,
+        "exactly one metrics fold-cycles sample per scrape"
+    );
+    samples[0]
+}
+
+/// Waits until this server's metrics fold loop has run at least one complete
+/// tick that STARTED after `baseline` was read.
+///
+/// Ticks run one after another, and one tick folds at most `max_per_tick`
+/// pairs, so the folds counted after the read come first from the at most one
+/// tick already in flight at the read, then from the ticks after it. A count
+/// more than `2 * max_per_tick` past `baseline` therefore includes a fold of
+/// the second tick after the read, which means the first tick after it has
+/// completed. Bounded, like every other wait here.
+async fn wait_for_a_complete_tick_after(
+    running: &ravel_server::Running,
+    baseline: u64,
+    max_per_tick: u64,
+) {
+    let want = baseline + 2 * max_per_tick + 1;
+    let deadline = std::time::Instant::now() + WAIT_BUDGET;
+    loop {
+        let cycles = metrics_fold_cycles(running).await;
+        if cycles >= want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {WAIT_BUDGET:?} waiting for a complete fold tick after seeding: \
+             {cycles} metrics fold cycles, want at least {want}"
+        );
+        tokio::time::sleep(WAIT_POLL).await;
+    }
+}
+
 /// Assert a HEAD a running server's scheduled fold published covers exactly
 /// the one segment [`seed_sealed_metric_segment`] seeded, and return its
 /// folder id.
@@ -843,11 +898,24 @@ async fn a_maintain_server_folds_the_partition_its_published_live_set_defines() 
     for tenant in mine.iter().chain(theirs.iter()) {
         seed_sealed_metric_segment(inner.as_ref(), tenant).await;
     }
-    // Every pair this process owns has been folded. The pairs the foreign
-    // worker owns are asserted unfolded below, and they stay so for as long as
-    // this process runs: ownership is decided before any per-tenant read, so
-    // there is no later moment at which this process would fold one.
+    let after_seeding = metrics_fold_cycles(&running).await;
+    // Every tenant discovery can now find: the most pairs one tick can fold,
+    // even for a process that ignored ownership.
+    let discoverable = inner
+        .list_delimited("t/")
+        .await
+        .expect("list tenant prefixes")
+        .common_prefixes
+        .len();
+    assert_eq!(discoverable, 6, "the six seeded tenants and nothing else");
+
+    // Every pair this process owns has been folded.
     wait_for_folded_metrics_heads(inner.as_ref(), &mine).await;
+    // The HEADs above can all come from one tick that listed the tenants
+    // before "theirs" were seeded, so they prove nothing about "theirs". A
+    // complete tick that started after seeding saw every seeded tenant, and a
+    // process folding pairs it does not own would have folded "theirs" in it.
+    wait_for_a_complete_tick_after(&running, after_seeding, 6).await;
     running.shutdown().await.expect("graceful shutdown");
 
     let mut folders: Vec<Uuid> = Vec::new();
