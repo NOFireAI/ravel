@@ -4139,6 +4139,29 @@ mod tests {
         (store, tenant.hash(), seg, service)
     }
 
+    /// The worker's resolver, fed the identity the coordinator would ship for
+    /// `seg`, returns the catalog's own ref field for field, after exactly one
+    /// record GET.
+    async fn assert_worker_ref_is_the_catalogs(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        seg: &ravel_catalog::SegmentRef,
+    ) {
+        let accounting = ravel_types::accounting::QueryAccounting::new();
+        let resolved =
+            ReconstructingSegmentResolver::new(store.clone(), tenant_hash, Signal::Metrics)
+                .resolve(&codec::encode_segment_identity(seg), &accounting)
+                .await
+                .expect("the pin resolves");
+        assert_eq!(&resolved, seg);
+        assert_eq!(
+            accounting
+                .snapshot()
+                .s3_requests(ravel_types::accounting::AccountedOp::Get),
+            1
+        );
+    }
+
     fn envelope(seg: &ravel_catalog::SegmentRef) -> TimeRange {
         TimeRange {
             start_ns: seg.min_event_ts_ns,
@@ -4165,7 +4188,8 @@ mod tests {
     /// and the record GET is charged to the slice.
     #[tokio::test]
     async fn pinned_l0_resolves_through_its_commit_record() {
-        let (_store, tenant_hash, seg, service) = pinned_l0("l0-happy").await;
+        let (store, tenant_hash, seg, service) = pinned_l0("l0-happy").await;
+        assert_worker_ref_is_the_catalogs(&store, tenant_hash, &seg).await;
         let response = service
             .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
             .await
@@ -4362,7 +4386,8 @@ mod tests {
     /// and returns the compacted series.
     #[tokio::test]
     async fn pinned_l1_resolves_through_its_compaction_record() {
-        let (_store, tenant_hash, seg, _key, service) = pinned_l1("l1-happy").await;
+        let (store, tenant_hash, seg, _key, service) = pinned_l1("l1-happy").await;
+        assert_worker_ref_is_the_catalogs(&store, tenant_hash, &seg).await;
         let response = service
             .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
             .await
