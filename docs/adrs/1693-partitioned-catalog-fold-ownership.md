@@ -262,6 +262,18 @@ skipped tick and restarts promptly, which is what the backoff reset is for.
 The target is the loop that cannot make progress, which the restart counter
 reports and which no other figure in the family can.
 
+That target is a loop that keeps panicking; supervision covers panics only. A
+tick that hangs, on a store call that never returns for example, neither
+panics nor completes, so the restart counter does not move and the
+crash-loop alert stays silent. What stops is that replica's own
+`ravel_catalog_fold_last_success_timestamp_seconds` and
+`ravel_catalog_fold_cycles_total` for the signal. No shipped alert catches a
+hung loop on one replica of several: `RavelCatalogFoldStalled` aggregates
+`max by (signal)`, so the peers hold it under its threshold, and it fires only
+once every folding replica's loop for that signal is stalled. A per-replica
+staleness rule is not shipped, because a gauge standing still is also the
+healthy reading of a replica the hash gives no pairs.
+
 Scope: the supervisor is in `ravel-server`'s fold task and the alert is in
 `deploy/prometheus/ravel.rules.yaml`. No ownership rule, no key layout, no
 mode gate and no metric already in the family changes.

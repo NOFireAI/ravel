@@ -56,9 +56,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`max by (signal)`) under its threshold. The new
   `RavelCatalogFoldLoopCrashLooping` rule in
   `deploy/prometheus/ravel.rules.yaml` fires on more than 5 restarts in 15m,
-  unaggregated, because the condition is about one replica; such a loop
-  crosses it 31 s after its first panic, and a single transient panic counts
-  1. **On upgrade**, a
+  unaggregated, because the condition is about one replica; a loop panicking
+  on every tick crosses it 31 s after its first panic, while a single
+  transient panic counts one restart. Supervision covers panics only: a tick
+  that hangs on a store call that never returns moves no restart counter, and
+  no shipped alert catches it on one replica of several, since only that
+  replica's own `ravel_catalog_fold_last_success_timestamp_seconds` stops
+  moving and `RavelCatalogFoldStalled` reads the fleet-wide maximum.
+  **On upgrade**, a
   `RavelCluster` with `spec.gateway.fold` set now fails the render before any
   tier renders, so the whole cluster stops reconciling until the field moves
   to `spec.maintain.fold`; a hand-written manifest passing `--disable-fold` or

@@ -526,6 +526,22 @@ gives it go unsealed, and `max by (signal)` reports a peer's fresh sample
 throughout. `RavelCatalogFoldLoopCrashLooping` is deliberately unaggregated
 for that reason.
 
+That supervision covers panics only. A tick that hangs, on a store call that
+never returns for example, neither panics nor completes, so the restart
+counter does not move and `RavelCatalogFoldLoopCrashLooping` stays silent.
+What does stop is that replica's own `ravel_catalog_fold_last_success_timestamp_seconds`
+and `ravel_catalog_fold_cycles_total` for the signal, while its peers' keep
+moving. No shipped alert catches a hung loop on one replica of several:
+`RavelCatalogFoldStalled` reads `max by (signal)`, so a peer's fresh sample
+holds it under its threshold exactly as in the crash-looping row, and it fires
+only once every folding replica's loop for that signal is stalled, which
+includes a deployment with one folding process. A per-replica staleness rule
+is not shipped because that gauge standing still is also the healthy reading
+of a replica the hash gives no pairs, and of one that owned pairs and lost them
+to a scale-up; this family exports nothing that tells those apart from a hung
+loop. Detecting it takes a per-instance look at that gauge, read against which
+replicas are expected to own pairs.
+
 The last row is the one that would be a false page if the gauge tracked
 published snapshots rather than fold cycles. Every loop folds every discovered
 tenant it owns for its own signal every tick; a fold over a signal a tenant
