@@ -399,7 +399,7 @@ paths             ravel-ingest, ravel-maintain, ravel-query, ravel-sql
 binaries          ravel-server, ravel-cli, ravel-ingest-router,
                   ravel-operator
 test and bench    ravel-bench, ravel-failure-tests, ravel-promql-difftest,
-                  ravel-sim
+                  ravel-sim, ravel-test-support
 ```
 
 The last group is development-only and no shipping crate depends on it.

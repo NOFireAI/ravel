@@ -96,8 +96,6 @@ mod limits;
 mod metrics;
 mod s3fifo;
 mod single_flight;
-#[cfg(test)]
-mod test_support;
 pub mod tiered;
 
 pub use cache::Cache;

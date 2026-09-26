@@ -1,8 +1,9 @@
-//! Shared test scaffolding for the off-worker / blocking-pool tests in
-//! [`tiered`](crate::tiered) and [`disk`](crate::disk): a parking [`Clock`]
-//! that announces its first post-arm call and then blocks until released,
-//! and a watchdog that turns a wedged runtime into a deterministic panic
-//! instead of an indefinitely hung test binary.
+//! Shared test scaffolding for off-worker / blocking-pool tests: a parking
+//! clock that announces its first post-arm call and then blocks until
+//! released, and a watchdog that turns a wedged runtime into a deterministic
+//! panic instead of an indefinitely hung test binary.
+//!
+//! Development-only: no shipping crate may depend on this one.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -12,11 +13,10 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::clock::Clock;
-
-/// A [`Clock`] that parks the calling thread inside the first `now_ns` call
-/// made after [`arm`](Self::arm), announcing beforehand that the call has
-/// begun, then blocking on `release_rx` until the test releases it.
+/// A clock that parks the calling thread inside the first
+/// [`now_ns`](Self::now_ns) call made after [`arm`](Self::arm), announcing
+/// beforehand that the call has begun, then blocking on `release_rx` until the
+/// test releases it.
 ///
 /// The announcement is generic over its channel type via a boxed closure, and
 /// which sender a call site passes turns on WHICH THREAD the park lands on,
@@ -42,11 +42,11 @@ use crate::clock::Clock;
 /// Either way, `release_rx` is always a rendezvous channel: nothing here ever
 /// waits on, measures, or compares a duration, only on an explicit release.
 ///
-/// Arming is separate from construction because a fresh [`DiskCache`]
-/// (`crate::disk::DiskCache::new_with_clock`) and a test's own setup
+/// Arming is separate from construction because a fresh `DiskCache`
+/// (`ravel_cache::DiskCache::new_with_clock`) and a test's own setup
 /// `insert` both call the clock before the operation under test does; the
 /// park must land on the first call *after* arming, not the first call ever.
-pub(crate) struct ParkOnFirstArmedCall {
+pub struct ParkOnFirstArmedCall {
     armed: AtomicBool,
     parked: AtomicBool,
     announce: Box<dyn Fn() + Send + Sync>,
@@ -54,10 +54,7 @@ pub(crate) struct ParkOnFirstArmedCall {
 }
 
 impl ParkOnFirstArmedCall {
-    pub(crate) fn new(
-        announce: impl Fn() + Send + Sync + 'static,
-        release_rx: Receiver<()>,
-    ) -> Self {
+    pub fn new(announce: impl Fn() + Send + Sync + 'static, release_rx: Receiver<()>) -> Self {
         Self {
             armed: AtomicBool::new(false),
             parked: AtomicBool::new(false),
@@ -68,13 +65,13 @@ impl ParkOnFirstArmedCall {
 
     /// Start parking on the next `now_ns` call. Calls made before this are
     /// no-ops (setup writes, the disk tier's own startup scan).
-    pub(crate) fn arm(&self) {
+    pub fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
     }
-}
 
-impl Clock for ParkOnFirstArmedCall {
-    fn now_ns(&self) -> u64 {
+    /// The clock reading: always `0`, after parking once if armed. A crate
+    /// with its own clock trait forwards that trait's `now_ns` here.
+    pub fn now_ns(&self) -> u64 {
         if self.armed.load(Ordering::SeqCst) && !self.parked.swap(true, Ordering::SeqCst) {
             (self.announce)();
             self.release_rx.lock().recv().unwrap();
@@ -98,11 +95,8 @@ impl Clock for ParkOnFirstArmedCall {
 /// than this shared helper: consolidating four copies into one otherwise
 /// points every hang in a CI log at the same line here.
 #[track_caller]
-pub(crate) fn run_with_watchdog<F>(
-    bound: Duration,
-    timeout_message: impl FnOnce() -> String,
-    body: F,
-) where
+pub fn run_with_watchdog<F>(bound: Duration, timeout_message: impl FnOnce() -> String, body: F)
+where
     F: FnOnce() + Send + 'static,
 {
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();

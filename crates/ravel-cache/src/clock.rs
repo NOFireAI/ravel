@@ -36,3 +36,10 @@ impl Clock for SystemClock {
         }
     }
 }
+
+#[cfg(test)]
+impl Clock for ravel_test_support::ParkOnFirstArmedCall {
+    fn now_ns(&self) -> u64 {
+        ravel_test_support::ParkOnFirstArmedCall::now_ns(self)
+    }
+}

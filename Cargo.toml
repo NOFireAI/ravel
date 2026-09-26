@@ -51,6 +51,7 @@ ravel-tracing-export = { path = "crates/ravel-tracing-export", version = "0.18.0
 ravel-affinity = { path = "crates/ravel-affinity", version = "0.18.0" }
 ravel-memory = { path = "crates/ravel-memory", version = "0.18.0" }
 ravel-mcp = { path = "crates/ravel-mcp", version = "0.18.0" }
+ravel-test-support = { path = "crates/ravel-test-support", version = "0.18.0" }
 
 # async runtime / rpc / http
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
