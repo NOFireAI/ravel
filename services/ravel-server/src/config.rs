@@ -1467,7 +1467,9 @@ pub struct Cli {
     /// (`query::build_catalog`) derives on its own, or is set independently
     /// with `--catalog-cache-max-bytes`.
     /// Read at startup only; there is no live resize. Ignored when
-    /// `--disable-cache` is set.
+    /// `--disable-cache` is set. Unset, it derives at 25% of the memory budget,
+    /// or 40% on a `--store s3` deployment against a loopback `--s3-endpoint`,
+    /// and 256 MiB when memory is unknown.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141,
@@ -1477,9 +1479,10 @@ pub struct Cli {
     /// `MemTotal`); reference host (16 cores, 30 GiB, at today's provisional
     /// reserve): 7,516,192,768. On a `--store s3` deployment whose
     /// `--s3-endpoint` is a loopback address, the fetcher cache instead takes
-    /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`: cache
-    /// misses there cost a local disk round trip rather than a network one,
-    /// so a loopback store can afford a larger share of the budget (ADR-2023).
+    /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`: a miss
+    /// there is served from the same local disk the store reads from, and
+    /// under concurrent queries the ranged read plan's block cache needs its
+    /// working set resident to keep those misses off that disk (ADR-2023).
     /// Fallback when MemTotal is unknown: [`DEFAULT_CACHE_MAX_BYTES`]
     /// (256 MiB). Startup refuses (does not clamp) a value that, together
     /// with the resolved `--catalog-cache-max-bytes`, exceeds
@@ -1492,6 +1495,8 @@ pub struct Cli {
     /// `--cache-max-bytes` (ADR-2023):
     /// `--cache-max-bytes` no longer affects this cache. Read at startup
     /// only; there is no live resize. Ignored when `--disable-cache` is set.
+    /// Unset, it derives at 5% of the memory budget, and 256 MiB when memory
+    /// is unknown.
     ///
     /// Omitted, the value derives at [`CATALOG_CACHE_MEMORY_PERCENT`] of
     /// `memory_budget_bytes` (cgroup-capped effective memory minus
@@ -8450,11 +8455,10 @@ mod tests {
     /// real query permanently. Startup must refuse instead.
     ///
     /// The refusal message is asserted, not just the refusal: with a `0`
-    /// budget no cache flag value satisfies the check (both caps are unsigned,
-    /// so their sum is never below `0`, and `0` still fails the `>=`
-    /// comparison), so a
-    /// message naming that flag as the fix sends the operator after a knob
-    /// that cannot help. The zero-budget arm must point at the host's memory
+    /// budget no value of either cache flag satisfies the check (both caps are
+    /// unsigned, so their sum is never below `0`, and `0` still fails the `>=`
+    /// comparison), so a message naming a cache flag as the fix sends the
+    /// operator after a knob that cannot help. The zero-budget arm must point at the host's memory
     /// (or its cgroup limit) and at the overhead reserve instead.
     ///
     /// Prove-the-test: this test fails against the pre-fix `>` comparison
