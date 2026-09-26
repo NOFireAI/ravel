@@ -375,7 +375,16 @@ fn build_batch(mapping: &Mapping, rows: &[ExportRow<'_>]) -> anyhow::Result<Reco
         }
     }
 
-    RecordBatch::try_from_iter(columns).context("failed to build the export record batch")
+    // Every field is declared nullable explicitly. `RecordBatch::try_from_iter`
+    // would infer nullability from each array's own null count, which differs
+    // between batches of the same export (and is always "not nullable" for the
+    // empty batch the writer takes its schema from), so a later batch's nulls
+    // would be written into a column the file declares required and read back
+    // as values.
+    RecordBatch::try_from_iter_with_nullable(
+        columns.into_iter().map(|(name, array)| (name, array, true)),
+    )
+    .context("failed to build the export record batch")
 }
 
 /// The `attrs_map_column` overflow column: every record attribute the mapping
