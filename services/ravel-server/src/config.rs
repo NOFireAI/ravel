@@ -1110,9 +1110,8 @@ pub struct Cli {
     /// shed immediately, never queued: HTTP gets 429 with `Retry-After`,
     /// gRPC gets `RESOURCE_EXHAUSTED`. The permit is taken from the request
     /// head, before the body is read or decoded and before the tenant
-    /// credential is checked, so a shed request never buffers a body. This
-    /// value also caps HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` on both
-    /// tonic listeners. Unlike `--max-concurrent-queries`,
+    /// credential is checked, so a shed request never buffers a body.
+    /// Unlike `--max-concurrent-queries`,
     /// this is never fleet-reconciled: each process enforces its own local
     /// bound independently. It bounds request COUNT, so the transient
     /// decode memory it caps is this ceiling times the largest per-request

@@ -20,9 +20,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process read and decode a full request body no matter how far over the
   ceiling it was. Both decisions now happen on the request head, through
   middleware on the HTTP ingest routes and a tower layer on the gRPC
-  listener, so a refused request costs the bytes of one request head. Both
-  tonic listeners also cap HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` at the
-  same configured value. The ceiling, its flag, and the
+  listener, so a refused request costs the bytes of one request head. No
+  HTTP/2 stream cap is derived from the ceiling, so the Flight SQL and
+  fragment listeners keep their previous stream limits. The ceiling, its
+  flag, and the
   `ravel_ingest_concurrency_shed_total` counter are unchanged, and a refusal
   keeps the status and body it had: 429 with `Retry-After` on HTTP, 401 for
   bad credentials, `RESOURCE_EXHAUSTED` on gRPC.

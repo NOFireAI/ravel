@@ -31,26 +31,6 @@ pub enum IngestConcurrencyLimit {
     Unlimited,
 }
 
-impl IngestConcurrencyLimit {
-    /// The same ceiling as an HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` value
-    /// for a tonic listener (issue #1705). `None` leaves tonic's own default
-    /// in place, which is what `Unlimited` asks for.
-    ///
-    /// This bounds concurrent streams on a connection, one layer below the
-    /// permit: the permit bounds requests this process is working on, and
-    /// without a stream cap a single client can still open an unbounded
-    /// number of streams whose headers this process has to track before any
-    /// of them reaches admission. `Bounded(0)` cannot come from the flag (the
-    /// config maps `0` to `Unlimited`), and a literal zero here would wedge
-    /// the listener, so the floor is 1.
-    pub fn max_concurrent_streams(self) -> Option<u32> {
-        match self {
-            IngestConcurrencyLimit::Bounded(n) => Some(u32::try_from(n).unwrap_or(u32::MAX).max(1)),
-            IngestConcurrencyLimit::Unlimited => None,
-        }
-    }
-}
-
 /// Process-wide admission gate over in-flight ingest requests. Backed by a
 /// [`tokio::sync::Semaphore`] rather than the hand-rolled `Mutex<state>` shape
 /// `ravel_query::QueryAdmissionController` uses, since a permit here needs no
@@ -158,29 +138,6 @@ mod tests {
         let second = controller.try_admit();
         assert!(second.is_ok());
         assert_eq!(controller.shed_total(), 1);
-    }
-
-    /// The stream cap is the configured ceiling verbatim, with `Unlimited`
-    /// leaving tonic's default alone and the degenerate `Bounded(0)` floored
-    /// at 1 rather than wedging the listener.
-    #[test]
-    fn max_concurrent_streams_tracks_the_configured_ceiling() {
-        assert_eq!(
-            IngestConcurrencyLimit::Bounded(1024).max_concurrent_streams(),
-            Some(1024)
-        );
-        assert_eq!(
-            IngestConcurrencyLimit::Bounded(0).max_concurrent_streams(),
-            Some(1)
-        );
-        assert_eq!(
-            IngestConcurrencyLimit::Bounded(u64::from(u32::MAX) + 7).max_concurrent_streams(),
-            Some(u32::MAX)
-        );
-        assert_eq!(
-            IngestConcurrencyLimit::Unlimited.max_concurrent_streams(),
-            None
-        );
     }
 
     #[test]
