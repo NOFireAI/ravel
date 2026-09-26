@@ -249,6 +249,15 @@ impl SpanIngestMetrics {
         }
     }
 
+    /// One `Write` message sent by the router into shard `shard`'s channel
+    /// (issue #1692), the span-pipeline counterpart of
+    /// [`crate::LogIngestMetrics::record_shard_enqueued`]. Enqueue-time, so
+    /// `messages_enqueued - messages_processed` is the depth still in the
+    /// channel.
+    pub(crate) fn record_shard_enqueued(&self, shard: u32) {
+        self.shard_skew.record_enqueued(shard);
+    }
+
     /// One write message pulled and handled by shard `shard`'s actor, plus the
     /// injected-`Clock` nanoseconds the actor spent handling it, excluding both
     /// the flush that runs off the actor and any flush-permit wait nested
