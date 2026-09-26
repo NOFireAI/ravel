@@ -276,7 +276,14 @@ counted too, although the walk will not reach it until the next rotation, so
 the estimate errs high. What the window does not see is an entry landing
 ahead of the marker in an hour older than the window, such as a compaction
 record for an hour sealed well before; the walk still verifies it, it is
-only missing from the estimate.
+only missing from the estimate. Growth is the window's tally minus its
+previous tally, so a deletion inside the two-hour window cancels an append in
+the same tick: under a retention short enough to reach the window, or a sweep
+deleting there, the appends a tick adds to the estimate are net of those
+deletions and the estimate errs low. A retention tombstone (`retire.tmb`)
+written after the rotation opened lands in an old hour outside the window,
+so when it sorts ahead of the marker the walk consumes it as an entry the
+estimate never counted.
 
 **A rotation is sized by a deadline, and the deadline is the shorter of the
 period and half the tenant's retention window.** An object retention deletes
