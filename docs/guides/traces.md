@@ -183,12 +183,16 @@ blocks but still filters rows exactly. Notes on the shapes above:
   is evaluated exactly over the merged map.
 - A predicate over `events` does not prune either, and selecting the column
   turns off the columnar fast path for that query: the events are rebuilt from
-  the span's attribute pages, the same as `attrs`. A query that does not select
-  `events` pays nothing for it.
+  the span's attribute pages, the same as `attrs`. On a single-node query, one
+  that does not select `events` never builds the column.
 - A predicate over `links` does not prune, and selecting the column also turns
   off the columnar fast path: the fast path never builds the merged `attrs`
-  map that `links` decodes `_links_raw` out of. A query that does not select
-  `links` pays nothing for it.
+  map that `links` decodes `_links_raw` out of. On a single-node query, one
+  that does not select `links` never decodes it.
+- Under distributed execution the column selection is not pushed to the
+  workers: each worker scans the full `spans` schema, `events` and `links`
+  included, for every row it returns, and the coordinator drops the columns
+  the query did not select.
 
 ### Worked queries
 
@@ -271,9 +275,10 @@ exactly the spans in view and never waits for a missing root or sibling.
 ## What Ravel does not decode
 
 Span events and span links are both decoded into columns now (`events` and
-`links` above). Neither is promoted into RSPAN storage for links: RSPAN is a
-frozen persistent format, and a links-specific block layout would need an ADR
-and a version bump the same way the `events` promotion (RSPAN v4) did. The
+`links` above). Events are stored in nested RSPAN v4 columns; links are not
+stored in any column of their own, because RSPAN is a frozen persistent
+format and a links-specific block layout would need an ADR and a version bump
+the same way the `events` promotion (RSPAN v4) did. The
 `links` column instead decodes `attrs['_links_raw']` fresh at scan time on
 every RSPAN version, so it costs a protobuf decode per row rather than bytes
 on disk.
