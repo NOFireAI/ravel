@@ -1706,6 +1706,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
 
@@ -1762,6 +1763,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
 
@@ -1794,6 +1796,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         let after_first = metrics.cursor_position(Signal::Metrics);
@@ -1813,6 +1816,7 @@ mod tests {
                 &metrics,
                 &worker,
                 &worker.solo_live_set(),
+                None,
             )
             .await;
             let tenant_hash = tenant().hash();
@@ -1843,6 +1847,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -1913,6 +1918,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
 
@@ -2004,6 +2010,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
 
@@ -2091,6 +2098,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2117,6 +2125,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2254,6 +2263,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2282,6 +2292,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2465,6 +2476,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2493,6 +2505,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2679,6 +2692,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2706,6 +2720,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2726,6 +2741,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2941,6 +2957,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2968,6 +2985,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -2988,6 +3006,7 @@ mod tests {
             &metrics,
             &worker,
             &worker.solo_live_set(),
+            None,
         )
         .await;
         assert_eq!(
@@ -3049,6 +3068,7 @@ mod tests {
                 period_secs,
                 1,
                 None,
+                None,
                 &metrics,
             )
             .await;
@@ -3065,11 +3085,13 @@ mod tests {
     /// and stops once its budget is spent, so over an unchanged corpus every
     /// tick after the first issues the same LIST and GET count whatever the
     /// corpus size. Both corpora run on a two-entry budget (`ceil(8 / 4)` and
-    /// `ceil(16 / 8)`), so a steady tick is one listing page, one cursor GET,
-    /// and per consumed record one record GET plus the scrub's footer and
-    /// whole-object GETs: `1 + 2 * 3 = 7`. Only tick 1 differs, by the
-    /// rotation's one LIST-only count: `ceil(N / 4)` full pages plus the empty
-    /// page a full page's continuation leads to.
+    /// `ceil(16 / 8)`), so a steady tick is two LISTs (the appended-entry tail
+    /// count, which finds nothing and ends in one page, and the walk's one
+    /// listing page) and, on GETs, one cursor GET plus per consumed record one
+    /// record GET and the scrub's footer and whole-object GETs: `1 + 2 * 3 =
+    /// 7`. Only tick 1 differs, by the rotation's one LIST-only count:
+    /// `ceil(N / 4)` full pages plus the empty page a full page's continuation
+    /// leads to, and it pays no tail count because it opens the rotation.
     #[tokio::test]
     async fn scrub_ticks_over_an_unchanged_corpus_issue_a_constant_request_count() {
         let small = per_tick_request_counts(8, 4, 4).await;
@@ -3078,8 +3100,8 @@ mod tests {
         assert_eq!(small[0], (3 + 1, 7), "8 records: tick 1 counts in 3 pages");
         assert_eq!(large[0], (5 + 1, 7), "16 records: tick 1 counts in 5 pages");
         for tick in 1..4 {
-            assert_eq!(small[tick], (1, 7), "8 records, tick {}", tick + 1);
-            assert_eq!(large[tick], (1, 7), "16 records, tick {}", tick + 1);
+            assert_eq!(small[tick], (2, 7), "8 records, tick {}", tick + 1);
+            assert_eq!(large[tick], (2, 7), "16 records, tick {}", tick + 1);
         }
     }
 
@@ -3243,10 +3265,13 @@ mod tests {
                 100,
                 1,
                 None,
+                None,
                 &metrics,
             )
             .await;
-            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0).await;
+            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+                .await
+                .expect("cursor loads");
             if tick < 8 {
                 assert!(cursor.last_commit_key.is_some(), "tick {tick}: marker set");
                 assert_eq!(cursor.rotation_entries_visited, tick, "tick {tick}");
@@ -3295,13 +3320,17 @@ mod tests {
             .await
             .expect("put old cursor");
 
-        let loaded = load_cursor(&store, &tenant_hash, Signal::Metrics, 0, 99).await;
+        let loaded = load_cursor(&store, &tenant_hash, Signal::Metrics, 0, 99)
+            .await
+            .expect("an old-format cursor still loads");
         assert_eq!(loaded.last_commit_key, None);
         assert_eq!(loaded.rotation_started_unix_ns, 7);
         assert_eq!(loaded.rotation_bytes_seen, 0);
         assert_eq!(loaded.last_rotation_bytes, None);
         assert_eq!(loaded.rotation_total_entries, None);
         assert_eq!(loaded.rotation_entries_visited, 0);
+        assert_eq!(loaded.rotation_appended_entries, 0);
+        assert_eq!(loaded.rotation_tail_key, None);
 
         let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
         let metrics = ScrubMetrics::default();
@@ -3314,6 +3343,7 @@ mod tests {
             100,
             1,
             None,
+            None,
             &metrics,
         )
         .await;
@@ -3321,7 +3351,9 @@ mod tests {
         let shard_prefix =
             keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
         let listed = list_all(&store, &shard_prefix).await.expect("list shard");
-        let cursor = load_cursor(&store, &tenant_hash, Signal::Metrics, 0, 0).await;
+        let cursor = load_cursor(&store, &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
         assert_eq!(cursor.rotation_total_entries, Some(2));
         assert_eq!(
             cursor.last_commit_key.as_deref(),
