@@ -13,12 +13,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   commit prefix and GET every record in it before verifying its slice. It now
   lists strictly after a start-after marker held in the per-shard cursor and
   stops once the tick's budget is filled; the rotation rolls over when the
-  listing runs out. A rotation with no predecessor opens with one LIST-only
-  count and runs on `ceil(count * tick / P)` listing entries per tick. The
-  cursor gains serde-default fields, so a cursor from an older build still
-  loads; its position is discarded and the next tick starts a fresh rotation.
-  `ravel_scrub_cursor_position` is now a fraction of listing entries rather
-  than of data objects. The same objects are verified, each once per rotation.
+  listing runs out. The budget is a pair of caps, one on listing entries and
+  one on requests, recomputed every tick from what the walk has actually
+  observed: a rotation with no predecessor opens with one LIST-only count, and
+  entries appended after it began are added to that count as the walk meets
+  them. The per-tick entry cap is the share needed to reach the rotation's
+  deadline, floored at the shard's sustained commit rate and capped at four
+  times that rate. The deadline is the smaller of `--scrub-period` and the
+  tenant's retention window, so a rotation cannot outlive the data it verifies;
+  a shard committing faster than four times its sustained rate increments
+  `ravel_scrub_behind_total{signal}` and logs the entries per tick the deadline
+  needs beside the number the tick is allowed, with the deadline itself. Every
+  listed entry and every GET attempt is charged against the budget, and a unit
+  whose record GET failed does not move the marker past it, so the next tick
+  retries that unit. A compaction record that lands in an hour the marker has
+  already passed is still judged against that whole hour, and a tick whose
+  cursor GET fails for any reason other than `NotFound` is skipped with the
+  stored cursor left alone. The cursor gains serde-default fields, so a cursor
+  from an older build still loads; its position is discarded and the next tick
+  starts a fresh rotation. `ravel_scrub_cursor_position` is now a fraction of
+  listing entries rather than of data objects. Every object the walk reaches is
+  still verified once per rotation; a unit retried after a failed GET is the
+  only one a rotation fetches twice, and a record committed behind the marker
+  waits for the next rotation.
 
 ## [0.17.0] - 2026-09-25
 
