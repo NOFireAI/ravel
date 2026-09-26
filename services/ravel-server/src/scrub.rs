@@ -747,9 +747,10 @@ async fn run_shard_tick(
     // after the walk. The marker stays behind a unit only when one of its GETs
     // failed with a retryable error: skipping it would leave its objects
     // unverified for a whole rotation, and retrying can clear the error. A
-    // record that failed to decode, was not found, or failed with an error
-    // retrying cannot clear moves the marker on, so one bad record cannot pin
-    // the rotation; the last of those is counted as a finding.
+    // record or object that was not found or failed with an error retrying
+    // cannot clear, and a record that failed to decode, move the marker on, so
+    // one bad record cannot pin the rotation; a GET error retrying cannot
+    // clear is counted as a finding.
     let mut listing = MarkerListing::new(store, &prefix, cursor.last_commit_key.clone());
     let mut slice_entries = 0u64;
     let mut requests = 0u64;
@@ -794,7 +795,7 @@ async fn run_shard_tick(
         )
         .await
         else {
-            // An object GET failed retryably: the whole unit, findings
+            // An object read failed retryably: the whole unit, findings
             // included, is retried next tick, so nothing is counted twice.
             unit_held = true;
             break;

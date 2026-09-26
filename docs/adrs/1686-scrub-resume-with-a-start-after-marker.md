@@ -287,9 +287,10 @@ reaches each object at about the age retention deletes it, and most of a
 retention-capped tenant would expire unverified. The rotation window is
 `min(--scrub-period, RetentionConfig::window_for(tenant) / 2)`, so a
 rotation that keeps pace reaches every object by about half its retained
-life, and `None` (unlimited retention) caps nothing. Within that window a tick takes `ceil(remaining entries / ticks
-remaining)`, floored at the sustained rate `ceil(estimated * tick /
-rotation)` so an early tick never coasts, and capped at `SCRUB_MAX_CATCHUP`
+life, and `None` (unlimited retention) caps nothing. Within that window a
+tick takes `ceil(remaining entries / ticks remaining)`, floored at the
+sustained rate `ceil(estimated * tick / rotation)` so an early tick never
+coasts, and capped at `SCRUB_MAX_CATCHUP`
 (4) times that sustained rate so one late tick cannot ask for the whole
 corpus at once. Termination: the walk consumes at least the sustained rate
 every tick, and the sustained rate is computed from the current estimate, so
