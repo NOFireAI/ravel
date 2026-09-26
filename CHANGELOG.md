@@ -16,9 +16,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ravel_ingest_shard_flush_permit_wait_seconds_total`, and
   `ravel_ingest_shard_off_actor_seconds_total` render one series per
   configured shard, labelled `mode`, `signal`, and `shard`, with idle shards
-  reading zero rather than being omitted. The span pipeline now records
-  on-actor and off-actor time in `span_shard.rs` to match the metrics and
-  log pipelines, so all three signals carry the full family.
+  reading zero rather than being omitted. Zero-fill covers shards 0 to
+  `--shards - 1`; a tenant resharded above `--shards` renders its extra
+  shards once they record activity. The span pipeline now counts enqueued
+  messages in `span_router.rs` and records on-actor and off-actor time in
+  `span_shard.rs`, matching the metrics and log pipelines, so all six series
+  carry live figures on all three signals.
 
 ## [0.18.0] - 2026-09-26
 

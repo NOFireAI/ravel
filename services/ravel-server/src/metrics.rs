@@ -913,11 +913,12 @@ pub struct IngestPipelineSnapshot {
     /// not configured on this process, the same structural-absence
     /// convention `postings` uses.
     pub shard_skew: Vec<(u32, ravel_ingest::ShardSkewStats)>,
-    /// This pipeline's router's current active shard count (ADR-1692
-    /// decision 4), the upper bound the renderer zero-fills up to. A shard
-    /// index in `shard_skew` at or above this count is a retiring
-    /// generation (ADR-0052) still carrying recorded activity, and renders
-    /// too.
+    /// This pipeline's router's configured default shard count
+    /// (`shard_count()`, which is `IngestConfig::shard_count`, not any
+    /// tenant's live generation), the upper bound the renderer zero-fills up
+    /// to (ADR-1692 decision 4). A shard index in `shard_skew` at or above
+    /// this count renders only once it has recorded activity: a tenant
+    /// resharded above the default, or a retiring generation (ADR-0052).
     pub active_shard_count: u32,
 }
 
@@ -1651,9 +1652,10 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
 }
 
 /// Per-shard skew figures for one pipeline (ADR-1692 decision 4): every index
-/// below the router's active shard count, in order, plus any index at or
-/// above it that still carries recorded activity (a retiring generation,
-/// ADR-0052). A shard absent from `shard_skew` renders the zero
+/// below the router's configured default shard count, in order, plus any index
+/// at or above it that has recorded activity (a tenant resharded above the
+/// default, or a retiring generation, ADR-0052). The accumulator is keyed by
+/// shard index alone, so one index sums every generation's actor at it. A shard absent from `shard_skew` renders the zero
 /// `ShardSkewStats::default()` rather than being omitted: an idle shard is
 /// the finding this family exists to show.
 fn shard_stats(pipeline: &IngestPipelineSnapshot) -> Vec<(u32, ravel_ingest::ShardSkewStats)> {
@@ -1672,9 +1674,9 @@ fn shard_stats(pipeline: &IngestPipelineSnapshot) -> Vec<(u32, ravel_ingest::Sha
         .collect()
 }
 
-/// The per-shard ingest-skew family (ADR-1692): six samples per configured
-/// shard, labelled `mode`, `signal`, `shard`, fed from each router's
-/// `shard_skew_by_shard` and active shard count. No tenant and no operation
+/// The per-shard ingest-skew family (ADR-1692): six samples per rendered
+/// shard index, labelled `mode`, `signal`, `shard`, fed from each router's
+/// `shard_skew_by_shard` and configured default shard count. No tenant and no operation
 /// label ever joins `shard` on these samples (decision 1). An index at or
 /// above `MAX_SHARD_COUNT` is refused by `Label::shard` rather than rendered;
 /// `shard_stats` never produces one in practice, since the accumulator itself
@@ -1692,8 +1694,10 @@ fn render_ingest_shard_family(out: &mut String, mode: Mode, pipelines: &[IngestP
     write_header(
         out,
         "ravel_ingest_shard_messages_enqueued_total",
-        "Write messages the router sent into this shard's channel, by signal and shard \
-         (issue #865, ADR-1692). Every configured shard renders, idle ones at zero.",
+        "Write messages the router sent into this shard index's channel, by signal and \
+         shard (issue #865, ADR-1692). Shards 0 to the configured --shards count minus one \
+         always render, idle ones at zero; a higher index renders once it has recorded \
+         activity. One index sums every shard generation's actor at that index.",
         "counter",
     );
     for (signal, stats) in &per_pipeline {
@@ -1714,7 +1718,8 @@ fn render_ingest_shard_family(out: &mut String, mode: Mode, pipelines: &[IngestP
         out,
         "ravel_ingest_shard_messages_processed_total",
         "Write messages this shard's actor pulled off its channel and handled, by signal \
-         and shard (issue #865, ADR-1692). messages_enqueued minus this is the channel depth.",
+         and shard (issue #865, ADR-1692). messages_enqueued minus this, saturating at zero, \
+         is the write messages still queued; flush and shutdown requests are not counted.",
         "counter",
     );
     for (signal, stats) in &per_pipeline {
@@ -1734,8 +1739,10 @@ fn render_ingest_shard_family(out: &mut String, mode: Mode, pipelines: &[IngestP
     write_header(
         out,
         "ravel_ingest_shard_queue_depth",
-        "This shard's channel depth: messages_enqueued minus messages_processed at scrape \
-         time, by signal and shard (issue #865, ADR-1692). A gauge.",
+        "Write messages still queued for this shard index: messages_enqueued minus \
+         messages_processed at scrape time, saturating at zero, by signal and shard (issue \
+         #865, ADR-1692). Flush and shutdown requests in the channel are not counted. A \
+         gauge.",
         "gauge",
     );
     for (signal, stats) in &per_pipeline {

@@ -1355,7 +1355,9 @@ that path had to reason from the code instead of from a measurement. The span
 path (`span_router.rs`, `span_shard.rs`) now records all three spans:
 `on_actor_ns` and `off_actor_ns` alongside the `flush_permit_wait_ns` it already
 had, at the same actor and off-actor acquire sites as the metrics and log
-pipelines. It also records `flushes_queued` and `flush_trigger_deferred`, which
+pipelines. The span router also counts `messages_enqueued` after each
+successful send into a shard channel, as the other two routers do, so
+`queue_depth` is live on all three signals. It also records `flushes_queued` and `flush_trigger_deferred`, which
 the queued-flush cap wires up identically on all three pipelines.
 
 The per-shard dimension is not part of the flat `IngestMetricsSnapshot` or its
@@ -1370,12 +1372,22 @@ snapshot, and the process `/metrics` surface renders
 (`services/ravel-server/src/metrics.rs`). Since ADR-1692 the per-shard
 breakdown is also rendered directly, as the `ravel_ingest_shard_*` family
 labelled `shard` (see the observability guide); `shard_skew_by_shard()` remains
-the read path that family and any in-process caller both use. Per shard
+the read path that family and any in-process caller both use. The renderer
+zero-fills shards 0 to `shard_count - 1` of the configured default
+(`IngestConfig::shard_count`, each router's `shard_count()`), not any tenant's
+live shard count: a tenant resharded above the default renders its extra
+shards only once they have recorded something, and the family is exactly
+`6 * signals * shards` series only when no tenant's shard count differs from
+the configured one. The accumulator is keyed by shard index alone, so during a
+reshard, or when tenants run different shard counts, one index sums every
+generation's actor at that index. Per shard
 (`ShardSkewStats`):
 
-- `messages_enqueued`: `Write` messages the router sent into the shard's
-  channel, counted at the router's `send`.
-- `messages_processed`: `Write` messages the shard actor pulled and handled.
+- `messages_enqueued`: write messages (`Write` on every signal, plus
+  `WriteColumnar` on logs) the router sent into the shard's channel, counted
+  after the router's `send` succeeds.
+- `messages_processed`: those write messages the shard actor pulled and
+  handled.
   `FlushNow`/`Shutdown` are excluded from both counts: they are control
   messages, not ingest load.
 - `queue_depth`: `messages_enqueued - messages_processed` at read time
@@ -1452,7 +1464,7 @@ of any sampled interval is charged to more than one counter.
 |---|---|---|---|
 | `on_actor_ns` | the actor pulls a `Write` off its channel | `handle_write` returns | merge-and-pin work the single-threaded actor genuinely serialises |
 | `flush_permit_wait_ns` | the spawned flush task reaches the `max_inflight_flushes` acquire | that acquire grants a permit | this shard's flush backpressure: flushes are queued behind earlier flushes of the same shard |
-| `off_actor_ns` | the spawned flush task enters `run_flush`, permit already held | `run_flush` returns (success or abandonment) | exemplar admission, encode, and both PUTs |
+| `off_actor_ns` | the spawned flush task enters `run_flush`, permit already held | `run_flush` returns (success or abandonment) | encode and both PUTs on every signal, plus exemplar admission on the metrics pipeline only |
 
 Read them as: a rising `on_actor_ns` means the actor is the bottleneck; a rising
 `flush_permit_wait_ns` means flushing is, and flushes are queueing behind the

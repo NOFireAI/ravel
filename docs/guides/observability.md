@@ -218,20 +218,27 @@ dimension without a tenant or operation dimension.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_ingest_shard_messages_enqueued_total` | `Write` messages the router sent into this shard's channel. |
-| `ravel_ingest_shard_messages_processed_total` | `Write` messages this shard's actor pulled and handled. |
-| `ravel_ingest_shard_queue_depth` | Gauge. `messages_enqueued - messages_processed` at read time (saturating): messages still in the channel. |
+| `ravel_ingest_shard_messages_enqueued_total` | Write messages the router sent into this shard's channel (`Write` on every signal, plus `WriteColumnar` on logs). |
+| `ravel_ingest_shard_messages_processed_total` | Write messages this shard's actor pulled and handled. |
+| `ravel_ingest_shard_queue_depth` | Gauge. `messages_enqueued - messages_processed` at read time, saturating at zero: write messages still in the channel. Flush and shutdown requests are not counted. |
 | `ravel_ingest_shard_on_actor_seconds_total` | Merge-and-pin work the single-threaded shard actor genuinely serialises, nanoseconds rendered as seconds. |
 | `ravel_ingest_shard_flush_permit_wait_seconds_total` | This shard's flush backpressure: a sum over concurrently waiting tasks, so it can exceed wall time. |
-| `ravel_ingest_shard_off_actor_seconds_total` | Exemplar admission, encode, and both PUTs for this shard's flushes. |
+| `ravel_ingest_shard_off_actor_seconds_total` | The whole of this shard's flushes once their permit is granted: encode, the data-object PUT, and the commit-record publish on every signal, plus exemplar admission on the metrics pipeline only. |
 
-Every configured shard renders, including idle ones: the renderer emits a
-sample for each index below the router's current active shard count, plus
-any index above it that still carries recorded activity (a retiring
-generation during a reshard). An idle shard reading zero is the finding this
-family exists to show, not an absent series. Each gateway or `all` process
-therefore adds `6 * signals * shards` series to its scrape (three signals
-and the `--shards` default of 4 make 72). See [docs/ingest.md's per-shard
+Idle shards render at zero rather than being omitted, up to the configured
+`--shards` count: the renderer emits a sample for every index from 0 to
+`--shards - 1`, plus any index at or above it that has recorded activity. The
+bound is the configured default (each router's `shard_count()`), not any
+tenant's live shard count, so a tenant resharded above the default renders its
+extra shards only once they have recorded something, and an idle shard above
+the default does not render. The accumulator is keyed by shard index alone:
+during a reshard, or when tenants run different shard counts, one
+`shard` value sums every generation's actor at that index. An idle shard
+reading zero is the finding this family exists to show, not an absent series.
+Each gateway or `all` process adds `6 * signals * shards` series to its scrape
+(three signals and the `--shards` default of 4 make 72) when no tenant's shard
+count differs from the configured one, and more once a tenant resharded above
+it records activity on a higher index. See [docs/ingest.md's per-shard
 skew section](../ingest.md#per-shard-skew) for what each of the six
 underlying `ShardSkewStats` fields means and the ordering guarantees a
 single read does and does not carry.
