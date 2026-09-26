@@ -187,11 +187,7 @@ pub fn span_events_type() -> DataType {
 /// attributes in the same map type the span-level `attrs` column uses.
 pub fn span_link_fields() -> Fields {
     Fields::from(vec![
-        Field::new(
-            "trace_id",
-            DataType::FixedSizeBinary(TRACE_ID_WIDTH),
-            false,
-        ),
+        Field::new("trace_id", DataType::FixedSizeBinary(TRACE_ID_WIDTH), false),
         Field::new("span_id", DataType::FixedSizeBinary(SPAN_ID_WIDTH), false),
         Field::new("trace_state", DataType::Utf8, false),
         Field::new("attrs", label_map_type(), false),

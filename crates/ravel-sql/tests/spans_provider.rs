@@ -1259,7 +1259,12 @@ async fn events_column_returns_structured_exception_event_and_filters_on_its_att
 
 /// One `opentelemetry.proto.trace.v1.Span.Link` with string-valued attributes,
 /// the shape an OTel SDK sends for a batching or fan-in span link.
-fn otlp_link(trace_id: [u8; 16], span_id: [u8; 8], trace_state: &str, attrs: &[(&str, &str)]) -> SpanLinkProto {
+fn otlp_link(
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    trace_state: &str,
+    attrs: &[(&str, &str)],
+) -> SpanLinkProto {
     SpanLinkProto {
         trace_id: trace_id.to_vec(),
         span_id: span_id.to_vec(),
@@ -1338,12 +1343,7 @@ async fn links_column_returns_structured_links_and_filters_on_their_attrs() {
             100,
             "root",
             &[
-                otlp_link(
-                    linked_a,
-                    [0xaau8; 8],
-                    "congo=1",
-                    &[("link.attr", "first")],
-                ),
+                otlp_link(linked_a, [0xaau8; 8], "congo=1", &[("link.attr", "first")]),
                 otlp_link(linked_b, [0xbbu8; 8], "", &[("link.attr", "second")]),
             ],
         ),
@@ -1461,7 +1461,10 @@ async fn links_column_treats_unparseable_links_raw_as_null() {
     let t1 = [0x11u8; 16];
     let mut record = span(t1, 0, 100, 110, "garbage-links");
     record.attrs = vec![
-        (LINKS_RAW_KEY.to_string(), "not-hex-and-not-a-link".to_string()),
+        (
+            LINKS_RAW_KEY.to_string(),
+            "not-hex-and-not-a-link".to_string(),
+        ),
         ("svc".to_string(), "api".to_string()),
     ];
     let executor = executor_with_spans(&[record]).await;

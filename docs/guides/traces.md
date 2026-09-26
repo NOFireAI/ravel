@@ -66,6 +66,7 @@ The `spans` table has these columns:
 | `service_name`   | `Utf8`                        | from `attrs["service.name"]`, null when absent |
 | `duration_ns`    | `Int64`                       | computed `end_ts - start_ts`, never stored   |
 | `events`         | `List(Struct{ts_unix_nano Int64, name Utf8, attrs Map(Utf8, Utf8)})` | span events, null when the span carried none |
+| `links`          | `List(Struct{trace_id FixedSizeBinary(16), span_id FixedSizeBinary(8), trace_state Utf8, attrs Map(Utf8, Utf8)})` | span links, null when the span carried none |
 
 `status_code` is the stored OTLP byte. To read it as text, map the three values
 in SQL, for example `CASE status_code WHEN 0 THEN 'Unset' WHEN 1 THEN 'Ok' WHEN
@@ -107,6 +108,37 @@ WHERE e['name'] = 'exception';
 event, not per span. Both subscripts above are `get_field` lookups: `e['name']`
 reads a struct field, and `e['attrs']['exception.type']` reads a map key that
 evaluates to null when the event did not set it.
+
+### Span links
+
+`links` is a list of structs, one element per OTLP span link, in the order the
+span recorded them. Each element carries the linked span's `trace_id` and
+`span_id` (`FixedSizeBinary`, the same widths as the span-level `trace_id`/
+`span_id` columns), its `trace_state` (empty, never null, when the link set
+none), and its `attrs` as a `Map(Utf8, Utf8)` in the same shape as the span's
+own `attrs`. The column is null, not an empty list, on a span that carried no
+links.
+
+Link attribute values are stringified the same way event and span attribute
+values are, and for the same reason the raw bytes stay available beside the
+column: `attrs['_links_raw']` is the lossless hex form for the value kinds
+`Map(Utf8, Utf8)` cannot spell.
+
+Expand the list with `unnest` to filter on an individual link's attributes:
+
+```sql
+SELECT trace_id, span_id, l['trace_id'] AS linked_trace_id,
+       l['attrs']['relationship'] AS relationship
+FROM (SELECT trace_id, span_id, unnest(links) AS l FROM spans
+      WHERE start_ts >= TIMESTAMP '2026-08-19T00:00:00')
+WHERE l['attrs']['relationship'] = 'follows_from';
+```
+
+Unlike `events` (RSPAN v4's nested event columns), `links` is decoded straight
+from the plain `_links_raw` attribute on every RSPAN version: RSPAN is a
+frozen persistent format, so a links-specific on-disk column would need an ADR
+and a version bump. This column instead costs one protobuf decode per row
+whenever a query selects it.
 
 ### Which predicates prune
 
@@ -153,6 +185,10 @@ blocks but still filters rows exactly. Notes on the shapes above:
   turns off the columnar fast path for that query: the events are rebuilt from
   the span's attribute pages, the same as `attrs`. A query that does not select
   `events` pays nothing for it.
+- A predicate over `links` does not prune, and selecting the column also turns
+  off the columnar fast path: the fast path never builds the merged `attrs`
+  map that `links` decodes `_links_raw` out of. A query that does not select
+  `links` pays nothing for it.
 
 ### Worked queries
 
@@ -234,13 +270,16 @@ exactly the spans in view and never waits for a missing root or sibling.
 
 ## What Ravel does not decode
 
-Span links are not decoded into columns. A link points from one span to
-another span in a different trace; RSPAN has no field for it, so the raw link
-bytes ride along as one opaque hex attribute, `attrs['_links_raw']`. A query
-over the `spans` table can return that blob and cannot filter on a link's
-fields. A `links` column is planned; until it lands, links arrive only as that
-hex attribute.
+Span events and span links are both decoded into columns now (`events` and
+`links` above). Neither is promoted into RSPAN storage for links: RSPAN is a
+frozen persistent format, and a links-specific block layout would need an ADR
+and a version bump the same way the `events` promotion (RSPAN v4) did. The
+`links` column instead decodes `attrs['_links_raw']` fresh at scan time on
+every RSPAN version, so it costs a protobuf decode per row rather than bytes
+on disk.
 
-Span events used to take the same route. They are now decoded into the `events`
-column described above, with `attrs['_events_raw']` kept beside it as the
-lossless form for the attribute value kinds the column cannot spell.
+Both columns are lossy projections of their raw attribute: an event or link
+attribute value whose OTLP kind has no `Map(Utf8, Utf8)` spelling (an array or
+a key-value list) is dropped from the column's `attrs`, so `attrs['_events_raw']`
+and `attrs['_links_raw']` stay available beside the columns as the lossless
+form.

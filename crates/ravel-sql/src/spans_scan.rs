@@ -72,7 +72,8 @@ use ravel_query::erasure::{ErasurePredicate, is_erased_span};
 use ravel_rspan::block::DecodedBlock;
 use ravel_rspan::record::{
     COL_END_TS, COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_START_TS, COL_STATUS_CODE, COL_STATUS_MESSAGE,
-    COL_TRACE_ID, EVENTS_RAW_KEY, LINKS_RAW_KEY, event_attrs, link_attrs, parse_events, parse_links,
+    COL_TRACE_ID, EVENTS_RAW_KEY, LINKS_RAW_KEY, event_attrs, link_attrs, parse_events,
+    parse_links,
 };
 use ravel_rspan::{BloomPredicate, COL_NAME, COL_SERVICE_NAME, SpanQuery};
 use ravel_types::TenantHash;
