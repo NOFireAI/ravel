@@ -18,7 +18,7 @@ ravel-query = { workspace = true }
 # the `ravel-mcp` member and the `rmcp` workspace dependency to the root
 # manifest, so this follows the same path-dependency convention
 # services/ravel-server and services/ravel-cli already use.
-ravel-sql = { path = "../ravel-sql", version = "0.17.0" }
+ravel-sql = { path = "../ravel-sql", version = "0.18.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
