@@ -441,6 +441,58 @@ fn promql_harness(
     (state, promql, metrics)
 }
 
+/// The running fetch-reservation totals an instant query of `metric` at
+/// `query_time_s` passes through, in order: entry `i` is the bytes held right
+/// after the fetcher's `i`-th reservation. Read from typed refusals rather
+/// than from the `fetch_reserved()` counter the gauges render: starting from a
+/// 1-byte budget, each `FetchMemoryExhausted` names what was already held and
+/// what the next reservation asked for, and the next attempt runs a budget of
+/// exactly their sum, until the query answers. The last entry is therefore the
+/// smallest budget that admits the query.
+async fn fetch_reservation_steps(
+    store: &Arc<dyn ObjectStoreBackend>,
+    tenant: &TenantId,
+    metric: &str,
+    query_time_s: i64,
+    now: i64,
+) -> Vec<u64> {
+    let mut steps = Vec::new();
+    let mut limit = 1;
+    for _ in 0..16 {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let (state, _promql, _metrics) =
+            promql_harness(Arc::clone(store), Arc::clone(&budget), None);
+        let result = state
+            .engine
+            .instant(
+                tenant.hash(),
+                metric,
+                query_time_s * 1000,
+                &[],
+                now,
+                Duration::from_secs(30),
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                assert!(!steps.is_empty(), "the oracle's 1-byte budget never refused");
+                return steps;
+            }
+            Err(QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit: refused_at,
+            })) => {
+                assert_eq!(refused_at, limit);
+                limit = reserved + requested;
+                steps.push(limit);
+            }
+            Err(other) => panic!("expected FetchMemoryExhausted from the oracle, got {other:?}"),
+        }
+    }
+    panic!("the oracle did not converge in 16 budget steps: {steps:?}");
+}
+
 fn sql_body(query: &str) -> String {
     serde_json::json!({
         "query": query,
@@ -716,17 +768,62 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
             Duration::from_secs(30),
         )
         .await;
-    match result {
-        Err(QueryError::Fetch(FetchError::FetchMemoryExhausted { limit, .. })) => {
+    let (requested, reserved) = match result {
+        Err(QueryError::Fetch(FetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+        })) => {
             assert_eq!(limit, 4 * 1024, "the refusal must name the configured limit");
+            (requested, reserved)
         }
         other => panic!("expected FetchMemoryExhausted, got {other:?}"),
-    }
-    assert_eq!(
-        budget.fetch_reserved(),
-        0,
-        "an all-or-nothing refusal leaves no charge on the shared counter"
+    };
+    assert!(
+        requested > 4 * 1024 - reserved,
+        "the refused reservation must need more than the budget remainder: \
+         requested {requested}, reserved {reserved}"
     );
+    assert_eq!(
+        budget.reserved(),
+        0,
+        "the refused query releases every reservation it held"
+    );
+    assert_eq!(budget.fetch_reserved(), 0);
+
+    // The refusal sits exactly at the remainder. The oracle's step totals
+    // include the one this refusal names, and the smallest admitting budget
+    // (its last step) admits the same query while one byte less refuses it.
+    let steps =
+        fetch_reservation_steps(&store, &tenant, "big_gauge_budget", query_time_s, now).await;
+    assert!(
+        steps.contains(&(reserved + requested)),
+        "the refusal ({reserved} held + {requested} requested) must be one of the \
+         fetcher's reservation steps {steps:?}"
+    );
+    let peak = *steps.last().expect("oracle returns at least one step");
+    for (limit, admitted) in [(peak, true), (peak - 1, false)] {
+        let exact = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let (exact_state, _exact_promql, _exact_metrics) =
+            promql_harness(Arc::clone(&store), Arc::clone(&exact), None);
+        let result = exact_state
+            .engine
+            .instant(
+                tenant.hash(),
+                "big_gauge_budget",
+                query_time_s * 1000,
+                &[],
+                now,
+                Duration::from_secs(30),
+            )
+            .await;
+        match (admitted, result) {
+            (true, Ok(_)) => {}
+            (false, Err(QueryError::Fetch(FetchError::FetchMemoryExhausted { .. }))) => {}
+            (_, other) => panic!("budget {limit} (peak {peak}): unexpected {other:?}"),
+        }
+        assert_eq!(exact.reserved(), 0);
+    }
 
     // The same refusal, through the real HTTP router: distinct status from
     // the SQL path's 422 for the same underlying condition (see doc comment
@@ -764,7 +861,10 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
 /// ACCEPTANCE TEST: while a PromQL fetch's budgeted range GET is in flight,
 /// `ravel_memory_reserved_bytes{component="fetch"}` reads exactly the live
 /// `Reservation`'s size, both through the direct counter and through a real
-/// `/metrics` scrape, and both return to exactly 0 once the query completes.
+/// `/metrics` scrape, `component="sql"` reads 0, and both return to exactly 0
+/// once the query completes. The expected size comes from
+/// [`fetch_reservation_size`], the fetcher's own request for the same query,
+/// not from the counter under test.
 ///
 /// A `FaultStore` holds every `Get` against the published segment's data key
 /// so the reservation is observable while `budget.fetch_reserved()` is
@@ -788,6 +888,8 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
     let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
     let (state, _promql, metrics) = promql_harness(Arc::clone(&store), Arc::clone(&budget), None);
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
+    let steps =
+        fetch_reservation_steps(&store, &tenant, "big_gauge_gauge", query_time_s, now).await;
 
     let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
     let mut query = Box::pin(state.engine.instant(
@@ -799,13 +901,14 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
         Duration::from_secs(30),
     ));
 
-    let mut observed = false;
+    let mut seen: Vec<u64> = Vec::new();
     loop {
         tokio::select! {
             result = &mut query => {
-                assert!(
-                    observed,
-                    "the query completed before a budgeted GET was ever observed held"
+                assert_eq!(
+                    seen, steps,
+                    "every reservation step must be observed held, in order, at its \
+                     exact total"
                 );
                 let (_value, _coverage) = result.expect("query must succeed");
                 break;
@@ -815,13 +918,28 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
                 let (id, _, _) = held[0];
                 let reserved = budget.fetch_reserved();
                 if reserved > 0 {
-                    observed = true;
+                    assert!(
+                        steps.contains(&reserved),
+                        "the fetch counter ({reserved}) must hold exactly one of the \
+                         fetcher's reservation totals {steps:?}"
+                    );
+                    if seen.last() != Some(&reserved) {
+                        seen.push(reserved);
+                    }
+                    let expected = reserved;
+                    assert_eq!(budget.reserved(), expected);
                     let scrape = scrape_metrics(&metrics).await;
                     assert!(
                         scrape.contains(&format!(
-                            "ravel_memory_reserved_bytes{{mode=\"all\",component=\"fetch\"}} {reserved}"
+                            "ravel_memory_reserved_bytes{{mode=\"all\",component=\"fetch\"}} {expected}\n"
                         )),
-                        "the fetch gauge must equal the live reservation ({reserved}):\n{scrape}"
+                        "the fetch gauge must equal the fetcher's reservation ({expected}):\n{scrape}"
+                    );
+                    assert!(
+                        scrape.contains(
+                            "ravel_memory_reserved_bytes{mode=\"all\",component=\"sql\"} 0\n"
+                        ),
+                        "a fetch reservation must not be counted under component=\"sql\":\n{scrape}"
                     );
                 }
                 gate.release(id);
@@ -834,10 +952,15 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
         0,
         "the reservation must release once the query completes"
     );
+    assert_eq!(budget.reserved(), 0);
     let scrape = scrape_metrics(&metrics).await;
     assert!(
-        scrape.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"fetch\"} 0"),
+        scrape.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"fetch\"} 0\n"),
         "the fetch gauge must read back to 0 after completion:\n{scrape}"
+    );
+    assert!(
+        scrape.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"sql\"} 0\n"),
+        "the sql gauge must read 0 when only the fetch path ran:\n{scrape}"
     );
 }
 
@@ -870,6 +993,8 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
     let (state, _promql, metrics) =
         promql_harness(Arc::clone(&store), Arc::clone(&budget), Some(cache));
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
+    let steps =
+        fetch_reservation_steps(&store, &tenant, "big_gauge_overlap", query_time_s, now).await;
 
     let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
     let mut query = Box::pin(state.engine.instant(
@@ -881,13 +1006,14 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
         Duration::from_secs(30),
     ));
 
-    let mut observed = false;
+    let mut seen: Vec<u64> = Vec::new();
     loop {
         tokio::select! {
             result = &mut query => {
-                assert!(
-                    observed,
-                    "the query completed before a budgeted GET was ever observed held"
+                assert_eq!(
+                    seen, steps,
+                    "every reservation step must be observed held, in order, at its \
+                     exact total"
                 );
                 let (_value, _coverage) = result.expect("query must succeed");
                 break;
@@ -897,19 +1023,38 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
                 let (id, _, _) = held[0];
                 let reserved = budget.fetch_reserved();
                 if reserved > 0 {
-                    observed = true;
-                    let overlap = budget.handoff_overlap();
+                    assert!(
+                        steps.contains(&reserved),
+                        "the fetch counter ({reserved}) must hold exactly one of the \
+                         fetcher's reservation totals {steps:?}"
+                    );
+                    if seen.last() != Some(&reserved) {
+                        seen.push(reserved);
+                    }
+                    let expected = reserved;
                     assert_eq!(
-                        overlap, reserved,
+                        budget.handoff_overlap(),
+                        expected,
                         "a cache-configured fetch hands off its WHOLE reservation, so the \
-                         overlap must equal the live fetch reservation exactly"
+                         overlap must equal the fetcher's reservation exactly"
+                    );
+                    assert_eq!(
+                        budget.reserved(),
+                        expected,
+                        "handed-off bytes stay counted once in the budget total"
                     );
                     let scrape = scrape_metrics(&metrics).await;
                     assert!(
                         scrape.contains(&format!(
-                            "ravel_memory_handoff_overlap_bytes{{mode=\"all\"}} {overlap}"
+                            "ravel_memory_handoff_overlap_bytes{{mode=\"all\"}} {expected}\n"
                         )),
-                        "the overlap gauge must equal the live counter ({overlap}):\n{scrape}"
+                        "the overlap gauge must equal the fetcher's reservation ({expected}):\n{scrape}"
+                    );
+                    assert!(
+                        scrape.contains(&format!(
+                            "ravel_memory_reserved_bytes{{mode=\"all\",component=\"fetch\"}} {expected}\n"
+                        )),
+                        "the fetch gauge must equal the fetcher's reservation ({expected}):\n{scrape}"
                     );
                 }
                 gate.release(id);
@@ -925,7 +1070,7 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
     );
     let scrape = scrape_metrics(&metrics).await;
     assert!(
-        scrape.contains("ravel_memory_handoff_overlap_bytes{mode=\"all\"} 0"),
+        scrape.contains("ravel_memory_handoff_overlap_bytes{mode=\"all\"} 0\n"),
         "the overlap gauge must read back to 0 after completion:\n{scrape}"
     );
 }
