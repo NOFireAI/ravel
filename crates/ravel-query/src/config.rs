@@ -37,6 +37,8 @@ pub const REQUEST_BUDGET_FIXED_OVERHEAD: u64 = 5_000;
 /// (ADR-1306 decision 4), for a segment at or under the fetcher's 512 KiB
 /// whole-object threshold; a larger segment pays a footer read and range reads
 /// on top. `cold_recent_query_requests_per_unsealed_flush_by_phase` pins it.
+/// It is not an upper bound above that threshold, where one flush costs at
+/// least 3 requests (ADR-1306, "Amendment (2026-09-26)").
 pub const REQUESTS_PER_UNSEALED_FLUSH: u64 = 2;
 
 /// Reference inputs for [`EngineConfig::default`]'s S3 request budget. The
