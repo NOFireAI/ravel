@@ -56,6 +56,18 @@ impl Mode {
     pub fn mounts_on_demand_fold(self) -> bool {
         self.installs_query_audit_pipeline()
     }
+
+    /// Whether [`crate::start`] spawns the scheduled background catalog fold
+    /// for this mode (ADR-1693 decisions 1 to 3): true for [`Mode::Maintain`],
+    /// which partitions the tenant/signal pairs across the maintenance
+    /// [`ravel_maintain::WorkerSet`]'s live set, and for [`Mode::All`], which
+    /// folds everything as a solo process. [`Mode::Gateway`] and
+    /// [`Mode::Query`] scale on request load rather than on fold work, so they
+    /// no longer fold on a timer; they keep the on-demand route
+    /// ([`Mode::mounts_on_demand_fold`]).
+    pub fn runs_scheduled_fold(self) -> bool {
+        matches!(self, Mode::All | Mode::Maintain)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

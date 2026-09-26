@@ -99,7 +99,7 @@ use ravel_maintain::{
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
 use ravel_proto::commit::v1::{ErasureCompletion, ErasureDeferralCause, ErasureRequest};
 use ravel_types::{Signal, TenantHash};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -113,7 +113,7 @@ pub const DEFAULT_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Delegates to `ravel-ingest`'s [`SystemClock`], the one blessed wall clock in
 /// this process, so no maintenance code path ever reads `SystemTime::now()`
 /// directly.
-struct WallClock;
+pub(crate) struct WallClock;
 
 impl Clock for WallClock {
     fn now_ns(&self) -> i64 {
@@ -799,6 +799,8 @@ pub fn spawn(
     safety: Arc<MaintenanceSafetyMetrics>,
     ownership: Arc<MaintenanceOwnershipMetrics>,
     worker: Arc<WorkerSet>,
+    live_tx: Arc<watch::Sender<Vec<Uuid>>>,
+    clock: Arc<dyn Clock>,
 ) -> Result<MaintenanceTasks, ravel_maintain::GcConfigError> {
     if !config.enabled {
         return Ok(MaintenanceTasks::none());
@@ -840,9 +842,11 @@ pub fn spawn(
         ownership,
         worker,
         rng,
-        // The one blessed wall clock in this process; tests inject a
-        // `FixedClock` here instead.
-        clock: Arc::new(WallClock),
+        // The one blessed wall clock in this process, injected by the caller so
+        // the scheduled fold reads the same instance (ADR-1693 decision 6);
+        // tests inject a `FixedClock` here instead.
+        clock,
+        live_tx,
         // Production has no test seam, so the per-cycle hook is a no-op. Tests
         // pass a closure that panics to exercise the supervisor's restart path.
         cycle_hook: Arc::new(|| {}),
@@ -879,6 +883,11 @@ struct LoopContext {
     worker: Arc<WorkerSet>,
     rng: Arc<dyn RngSource>,
     clock: Arc<dyn Clock>,
+    /// Publishes each freshly computed live set. The loop's own discovery reads
+    /// it back through a subscription, and the scheduled catalog fold
+    /// subscribes to the same channel so both loops partition against one
+    /// membership view (ADR-1693 decision 1).
+    live_tx: Arc<watch::Sender<Vec<Uuid>>>,
     /// Called once at the top of every cycle body, inside the `catch_unwind`
     /// boundary. A no-op in production; a test seam for driving a panic through
     /// the supervisor.
@@ -1013,6 +1022,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
         worker,
         rng,
         clock,
+        live_tx,
         cycle_hook,
     } = ctx;
     // One memo for the whole process, held across every tick and every
@@ -1074,7 +1084,12 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
     // cycle runs. A live-set read failure publishes nothing, so the receiver
     // keeps the last-known set (fail-open, ADR-0065 decision 1): ownership stays
     // stable rather than collapsing.
-    let (live_tx, live_rx) = tokio::sync::watch::channel(worker.solo_live_set());
+    // The channel itself is owned by the caller (`spawn`'s `live_tx`
+    // parameter), because the scheduled catalog fold subscribes to the same
+    // live set to gate its own unit ownership (ADR-1693 decision 1). It starts
+    // holding this process's solo set, so a fold that runs before the first
+    // heartbeat owns everything rather than nothing.
+    let live_rx = live_tx.subscribe();
     ownership.set_workers_live(live_rx.borrow().len() as u64);
     let (heartbeat_shutdown_tx, mut heartbeat_shutdown_rx) = oneshot::channel::<()>();
     let heartbeat_handle = {
@@ -1087,6 +1102,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
         // the loop reads (issue #1756). The cadence stays on
         // `tokio::time::interval`, which a paused runtime already controls.
         let clock = Arc::clone(&clock);
+        let live_tx = Arc::clone(&live_tx);
         tokio::spawn(async move {
             let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5165,6 +5181,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let discovery_interval = Duration::from_secs(300);
+        let live_tx = Arc::new(watch::channel(worker.solo_live_set()).0);
         let handle = tokio::spawn(run_loop(
             LoopContext {
                 store,
@@ -5179,6 +5196,7 @@ mod tests {
                 worker,
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
+                live_tx,
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
@@ -6803,6 +6821,7 @@ mod tests {
         ));
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
 
+        let live_tx = Arc::new(watch::channel(worker.solo_live_set()).0);
         let handle = tokio::spawn(run_loop(
             LoopContext {
                 store,
@@ -6817,6 +6836,7 @@ mod tests {
                 worker,
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
+                live_tx,
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
@@ -6889,6 +6909,7 @@ mod tests {
         ));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
+        let live_tx = Arc::new(watch::channel(worker.solo_live_set()).0);
         let handle = tokio::spawn(run_loop(
             LoopContext {
                 store,
@@ -6905,6 +6926,7 @@ mod tests {
                 worker,
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
+                live_tx,
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
