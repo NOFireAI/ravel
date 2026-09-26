@@ -53,38 +53,173 @@ pub const REQUESTS_PER_UNSEALED_FLUSH: u64 = 2;
 pub const DEFAULT_BUDGET_REFERENCE_SHARDS: u32 = 4;
 pub const DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY: Duration = Duration::from_millis(500);
 
+/// The shipped `RavelCatalogFoldStalled` alert's `for:` (ADR-1306 decision 1).
+/// Its threshold is the seal margin, so the seal margin plus this is the time
+/// from the last successful fold to the alert firing.
+pub const FOLD_STALL_ALERT_FOR: Duration = Duration::from_secs(600);
+
+/// Time between the fold-stall alert firing and a page reaching an operator:
+/// scrape interval, rule evaluation interval and Alertmanager's `group_wait`
+/// (ADR-1306 decision 1).
+pub const ALERT_DELIVERY_SLACK: Duration = Duration::from_secs(300);
+
+/// The open ingest hour a healthy fold's watermark leaves unsealed on top of
+/// the seal margin (ADR-1306 decision 1, `healthy_tail_max`).
+const OPEN_INGEST_HOUR: Duration = Duration::from_secs(3_600);
+
+/// `CatalogConfig::default`'s `max_flush_lifetime`, 1 h: the reference input
+/// for [`SealMargin::REFERENCE`] (ADR-1306 decision 3).
+pub const REFERENCE_MAX_FLUSH_LIFETIME: Duration =
+    Duration::from_nanos(ravel_catalog::DEFAULT_MAX_FLUSH_LIFETIME_NS.unsigned_abs());
+/// `CatalogConfig::default`'s `clock_skew_allowance`, 5 m: the reference input
+/// for [`SealMargin::REFERENCE`] (ADR-1306 decision 3).
+pub const REFERENCE_CLOCK_SKEW_ALLOWANCE: Duration =
+    Duration::from_nanos(ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS.unsigned_abs());
+/// `CatalogConfig::default`'s `fold_safety_margin`, 15 m: the reference input
+/// for [`SealMargin::REFERENCE`] (ADR-1306 decision 3).
+pub const REFERENCE_FOLD_SAFETY_MARGIN: Duration =
+    Duration::from_nanos(ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS.unsigned_abs());
+
+/// The three durations whose sum is the fold's seal margin, taken from the
+/// `CatalogConfig` the fold and resolve run with (ADR-1306 decision 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealMargin {
+    pub max_flush_lifetime: Duration,
+    pub clock_skew_allowance: Duration,
+    pub fold_safety_margin: Duration,
+}
+
+impl SealMargin {
+    /// The catalog's compiled-in defaults, 1 h + 5 m + 15 m (ADR-1306
+    /// decision 3). What [`derive_max_s3_requests`] and
+    /// [`EngineConfig::default`] size from when no catalog config is at hand.
+    pub const REFERENCE: SealMargin = SealMargin {
+        max_flush_lifetime: REFERENCE_MAX_FLUSH_LIFETIME,
+        clock_skew_allowance: REFERENCE_CLOCK_SKEW_ALLOWANCE,
+        fold_safety_margin: REFERENCE_FOLD_SAFETY_MARGIN,
+    };
+
+    /// The seal margin the given catalog config folds with (ADR-1306
+    /// decision 3). A negative duration is not a real configuration and
+    /// counts as zero.
+    pub fn from_catalog_config(config: &ravel_catalog::CatalogConfig) -> SealMargin {
+        let nanos = |ns: i64| Duration::from_nanos(u64::try_from(ns).unwrap_or(0));
+        SealMargin {
+            max_flush_lifetime: nanos(config.max_flush_lifetime_ns),
+            clock_skew_allowance: nanos(config.clock_skew_allowance_ns),
+            fold_safety_margin: nanos(config.fold_safety_margin_ns),
+        }
+    }
+
+    /// `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`
+    /// (ADR-1306 decision 1).
+    pub fn total(&self) -> Duration {
+        self.max_flush_lifetime
+            .saturating_add(self.clock_skew_allowance)
+            .saturating_add(self.fold_safety_margin)
+    }
+}
+
+impl Default for SealMargin {
+    fn default() -> Self {
+        SealMargin::REFERENCE
+    }
+}
+
+/// The longest unsealed tail a healthy catalog carries, the seal margin plus
+/// the open hour (ADR-1306 decision 1, `healthy_tail_max`).
+pub fn healthy_tail_max(seal_margin: SealMargin) -> Duration {
+    seal_margin.total().saturating_add(OPEN_INGEST_HOUR)
+}
+
+/// The span the per-shard request allowance is sized from (ADR-1306
+/// decisions 1 and 2): the healthy tail plus the time a stalled fold takes to
+/// page, `healthy_tail_max + seal_margin + FOLD_STALL_ALERT_FOR +
+/// ALERT_DELIVERY_SLACK`. 14,100 s at the reference seal margin.
+pub fn covered_span(seal_margin: SealMargin) -> Duration {
+    healthy_tail_max(seal_margin)
+        .saturating_add(seal_margin.total())
+        .saturating_add(FOLD_STALL_ALERT_FOR)
+        .saturating_add(ALERT_DELIVERY_SLACK)
+}
+
+/// The shard-independent parts of the derived request budget (ADR-1306
+/// decision 1), kept apart so a caller can rebuild the budget with a
+/// different headroom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudgetParts {
+    /// Requests one shard's unsealed flushes over [`covered_span`] cost
+    /// before headroom: `ceil(covered_span / max_flush_delay) x
+    /// REQUESTS_PER_UNSEALED_FLUSH`.
+    pub per_shard_allowance: u64,
+    /// Headroom multiplier numerator applied to the per-shard allowance.
+    pub headroom_num: u64,
+    /// Headroom multiplier denominator; zero is treated as one.
+    pub headroom_den: u64,
+    /// Requests that do not scale with flushes, added once.
+    pub fixed_overhead: u64,
+}
+
+impl RequestBudgetParts {
+    /// `per_shard_allowance x headroom x shard_count + fixed_overhead`
+    /// (ADR-1306 decision 1), with a zero shard count read as one.
+    pub fn budget(&self, shard_count: u32) -> u64 {
+        let per_shard =
+            self.per_shard_allowance.saturating_mul(self.headroom_num) / self.headroom_den.max(1);
+        per_shard
+            .saturating_mul(u64::from(shard_count.max(1)))
+            .saturating_add(self.fixed_overhead)
+    }
+}
+
+/// The budget parts for a flush cadence and seal margin, with the ADR-0075
+/// 3/2 headroom and the 5,000 fixed overhead (ADR-1306 decisions 1 and 4).
+pub fn request_budget_parts(
+    max_flush_delay: Duration,
+    seal_margin: SealMargin,
+) -> RequestBudgetParts {
+    // A zero cadence is not a real configuration; clamp it rather than divide
+    // by zero.
+    let flush_ns = max_flush_delay.as_nanos().max(1);
+    let flushes = covered_span(seal_margin).as_nanos().div_ceil(flush_ns);
+    let flushes = u64::try_from(flushes).unwrap_or(u64::MAX);
+    RequestBudgetParts {
+        per_shard_allowance: flushes.saturating_mul(REQUESTS_PER_UNSEALED_FLUSH),
+        headroom_num: REQUEST_BUDGET_HEADROOM_NUM,
+        headroom_den: REQUEST_BUDGET_HEADROOM_DEN,
+        fixed_overhead: REQUEST_BUDGET_FIXED_OVERHEAD,
+    }
+}
+
+/// The derived per-query S3 request budget for a deployment's shard count,
+/// flush cadence and seal margin (ADR-1306 decisions 1 to 3).
+pub fn derive_max_s3_requests_for(
+    shard_count: u32,
+    max_flush_delay: Duration,
+    seal_margin: SealMargin,
+) -> u64 {
+    request_budget_parts(max_flush_delay, seal_margin).budget(shard_count)
+}
+
 /// Derives the per-query S3 request budget from a deployment's shard count and
-/// ingest flush cadence (ADR-0075 decisions 1 and 2):
+/// ingest flush cadence at the catalog's reference seal margin (ADR-1306
+/// decisions 1 to 3, on top of ADR-0075 decisions 1 and 2):
 ///
 /// ```text
-/// budget = per_shard_allowance * shard_count + REQUEST_BUDGET_FIXED_OVERHEAD
-/// per_shard_allowance = ceil(3600s / max_flush_delay) * NUM / DEN
+/// budget = per_shard_allowance * NUM / DEN * shard_count + REQUEST_BUDGET_FIXED_OVERHEAD
+/// per_shard_allowance = ceil(covered_span / max_flush_delay) * REQUESTS_PER_UNSEALED_FLUSH
 /// ```
 ///
-/// The request budget's cost is per shard-hour, not per query. A busy tenant
-/// seals `ceil(3600s / max_flush_delay)` segments per shard per open hour
-/// (1,800 at the 2s deployment cadence ADR-0076 decision 4 sets; 7,200 at the
-/// 500ms reference cadence in [`DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY`]), and a
-/// cold query over that hour GETs
-/// each one, on every shard. The old flat 25,000 cap was correct only at 3
-/// shards or fewer; at the default 4 it rejected the worst legitimate open
-/// hour (4 x 7,200 = 28,800) before it could answer. Deriving from
-/// `max_flush_delay` rather than hardcoding 7,200 means a deployment that
-/// raises the flush delay (a supported cost lever) gets a correct cap with no
-/// hand recomputation.
+/// The cost is per shard and per unsealed flush a query resolves. The span is
+/// [`covered_span`], the longest tail a healthy catalog carries plus the time a
+/// stalled fold takes to page, so a query is not refused for fold lag before
+/// the fold-stall alert reaches an operator: 89,600 at 4 shards and a 2 s
+/// cadence. Deriving from `max_flush_delay` means a deployment that raises the
+/// flush delay (a supported cost lever) gets a correct cap with no hand
+/// recomputation. A caller with a non-default seal margin uses
+/// [`derive_max_s3_requests_for`].
 pub fn derive_max_s3_requests(shard_count: u32, max_flush_delay: Duration) -> u64 {
-    // Guard a zero/absurd cadence: a zero delay is not a real configuration,
-    // but dividing by it would panic. Clamp to one shard for the same reason a
-    // zero-shard deployment is nonsensical.
-    let flush_ms = max_flush_delay.as_millis().max(1);
-    // ceil(3_600_000ms / flush_ms): the most segments one shard can seal in an
-    // open hour, which is the most GETs a cold query pays for that shard.
-    let segments_per_shard_hour = 3_600_000u128.div_ceil(flush_ms) as u64;
-    let per_shard_allowance = segments_per_shard_hour.saturating_mul(REQUEST_BUDGET_HEADROOM_NUM)
-        / REQUEST_BUDGET_HEADROOM_DEN;
-    per_shard_allowance
-        .saturating_mul(u64::from(shard_count.max(1)))
-        .saturating_add(REQUEST_BUDGET_FIXED_OVERHEAD)
+    derive_max_s3_requests_for(shard_count, max_flush_delay, SealMargin::REFERENCE)
 }
 
 /// A per-tenant cap on the total S3 bytes a single query may scan, or an

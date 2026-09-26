@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The default query request budget is now derived from the unsealed tail a
+  healthy catalog carries plus the fold-stall alert window** (ADR-1306). At 4
+  shards and a 2 s flush cadence it gives 89,600 requests instead of 15,800,
+  so a wide query is not refused for fold lag before the fold-stall alert
+  pages. An explicit `--max-s3-requests` is still used as given.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed

@@ -176,6 +176,116 @@ mod tests {
         assert!(RequestLimit::Bounded(OLD_FLAT_CAP).is_exceeded_by(open_hour_4));
     }
 
+    /// ADR-1306 follow-up task 2, at the figures of its 2026-09-26 amendment.
+    #[test]
+    fn derived_budget_covers_healthy_tail_plus_stall_alert_window() {
+        use crate::config::{
+            ALERT_DELIVERY_SLACK, FOLD_STALL_ALERT_FOR, REQUEST_BUDGET_FIXED_OVERHEAD,
+            REQUEST_BUDGET_HEADROOM_DEN, REQUEST_BUDGET_HEADROOM_NUM, REQUESTS_PER_UNSEALED_FLUSH,
+            SealMargin, covered_span, derive_max_s3_requests_for, healthy_tail_max,
+            request_budget_parts,
+        };
+
+        const HOUR_S: u64 = 3_600;
+        let cadence_2s = Duration::from_secs(2);
+        let cadence_500ms = Duration::from_millis(500);
+        let margin = SealMargin::REFERENCE;
+
+        // The reference seal margin is the catalog's compiled-in 1 h + 5 m + 15 m.
+        assert_eq!(margin.max_flush_lifetime, Duration::from_secs(HOUR_S));
+        assert_eq!(margin.clock_skew_allowance, Duration::from_secs(5 * 60));
+        assert_eq!(margin.fold_safety_margin, Duration::from_secs(15 * 60));
+        assert_eq!(
+            margin,
+            SealMargin::from_catalog_config(&ravel_catalog::CatalogConfig::default())
+        );
+        let seal_margin_s = HOUR_S + 5 * 60 + 15 * 60;
+        assert_eq!(margin.total().as_secs(), seal_margin_s);
+        assert_eq!(seal_margin_s, 4_800);
+
+        // covered_span = healthy_tail_max + lag_allowance = 8,400 s + 5,700 s.
+        let healthy_tail_s = seal_margin_s + HOUR_S;
+        assert_eq!(healthy_tail_s, 8_400);
+        assert_eq!(
+            healthy_tail_max(margin),
+            Duration::from_secs(healthy_tail_s)
+        );
+        let lag_allowance_s =
+            seal_margin_s + FOLD_STALL_ALERT_FOR.as_secs() + ALERT_DELIVERY_SLACK.as_secs();
+        assert_eq!(lag_allowance_s, 5_700);
+        let covered_s = healthy_tail_s + lag_allowance_s;
+        assert_eq!(covered_s, 14_100);
+        assert_eq!(covered_span(margin), Duration::from_secs(covered_s));
+        assert_eq!(covered_span(margin), Duration::from_secs(14_100));
+
+        // The four budgets: ceil(covered_span / cadence) x 2 x 3/2 x shards + 5,000.
+        assert_eq!(REQUESTS_PER_UNSEALED_FLUSH, 2);
+        let formula = |shards: u64, flushes: u64| {
+            flushes * REQUESTS_PER_UNSEALED_FLUSH * REQUEST_BUDGET_HEADROOM_NUM
+                / REQUEST_BUDGET_HEADROOM_DEN
+                * shards
+                + REQUEST_BUDGET_FIXED_OVERHEAD
+        };
+        let flushes_2s = covered_s.div_ceil(2);
+        assert_eq!(flushes_2s, 7_050);
+        let flushes_500ms = (covered_s * 1_000).div_ceil(500);
+        assert_eq!(flushes_500ms, 28_200);
+        for (shards, cadence, flushes, stated) in [
+            (1u32, cadence_2s, flushes_2s, 26_150u64),
+            (4, cadence_2s, flushes_2s, 89_600),
+            (8, cadence_2s, flushes_2s, 174_200),
+            (4, cadence_500ms, flushes_500ms, 343_400),
+        ] {
+            let expected = formula(u64::from(shards), flushes);
+            assert_eq!(
+                expected, stated,
+                "ADR figure at {shards} shards, {cadence:?}"
+            );
+            assert_eq!(
+                derive_max_s3_requests(shards, cadence),
+                stated,
+                "derive_max_s3_requests at {shards} shards, {cadence:?}"
+            );
+            assert_eq!(derive_max_s3_requests_for(shards, cadence, margin), stated);
+        }
+
+        // The parts carry the pre-headroom allowance, so headroom 1 rebuilds
+        // the bare covered-span cost plus the fixed overhead.
+        let parts = request_budget_parts(cadence_2s, margin);
+        assert_eq!(parts.per_shard_allowance, 7_050 * 2);
+        assert_eq!((parts.headroom_num, parts.headroom_den), (3, 2));
+        assert_eq!(parts.fixed_overhead, 5_000);
+        let bare = crate::config::RequestBudgetParts {
+            headroom_num: 1,
+            headroom_den: 1,
+            ..parts
+        };
+        assert_eq!(bare.budget(4), 7_050 * 2 * 4 + 5_000);
+
+        // Today's derivation (one hour, 1 request per flush, 3/2) at 4 shards
+        // and 2 s, against the 2 h 20 m tail a healthy catalog reaches.
+        let today = (HOUR_S / 2) * REQUEST_BUDGET_HEADROOM_NUM / REQUEST_BUDGET_HEADROOM_DEN * 4
+            + REQUEST_BUDGET_FIXED_OVERHEAD;
+        assert_eq!(today, 15_800);
+        let tail_s = 2 * HOUR_S + 20 * 60;
+        let tail_flushes = tail_s / 2;
+        assert_eq!(tail_flushes, 4_200);
+        let tail_cost = tail_flushes * REQUESTS_PER_UNSEALED_FLUSH * 4;
+        assert_eq!(tail_cost, 33_600);
+        // The fixed overhead stays reserved for requests outside the tail.
+        let tail_query = tail_cost + REQUEST_BUDGET_FIXED_OVERHEAD;
+        assert!(request_budget_exceeded(tail_query, RequestLimit::Bounded(today)).is_some());
+        assert!(request_budget_exceeded(tail_cost, RequestLimit::Bounded(today)).is_some());
+        let new_budget = derive_max_s3_requests(4, cadence_2s);
+        assert_eq!(new_budget, 89_600);
+        assert!(request_budget_exceeded(tail_query, RequestLimit::Bounded(new_budget)).is_none());
+
+        // A runaway at three times the covered-span cost is still refused.
+        let runaway = 3 * flushes_2s * REQUESTS_PER_UNSEALED_FLUSH * 4;
+        assert_eq!(runaway, 169_200);
+        assert!(request_budget_exceeded(runaway, RequestLimit::Bounded(new_budget)).is_some());
+    }
+
     /// A snapshot of `sealed` sealed, below-watermark segments and one recent
     /// (exempt) one, with `origins` parallel to `segments` as `admit`'s
     /// debug assertion requires.
