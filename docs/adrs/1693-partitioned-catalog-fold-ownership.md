@@ -85,7 +85,8 @@ the sweep and the fold for a unit run in the same process.
    `ravel_catalog_fold_last_success_timestamp_seconds` is rendered in
    `maintain` and `all`. A gateway or query process no longer renders a
    permanently-zero series. The alert rule's `max by (signal)` aggregation
-   already tolerates replicas that do not fold, so it needs no change; its
+   already tolerates replicas that do not fold, so it needs no change (this
+   sentence is corrected by the 2026-09-26 supervision amendment below); its
    comment about "an intentionally maintain-only fleet" that never folds
    becomes stale and is corrected.
 
@@ -177,6 +178,9 @@ flowchart TB
 - ADR-0065 decision 2's list of ownership-gated work gains the fold, keyed
   on shard 0 of the pair. docs/catalog-and-mvcc.md records the ownership
   rule in its fold section.
+- Partitioning makes a dead fold loop invisible to the fold-liveness alert,
+  which it was not before. The 2026-09-26 supervision amendment below adds
+  the loop supervision and the restart alert that close that gap.
 - Follow-up work, as tasks:
   1. ravel-server: pass the maintain `WorkerSet`, the live-set `watch`
      receiver, and the injected clock into `fold::spawn`; gate
@@ -194,3 +198,62 @@ flowchart TB
      docs/catalog-and-mvcc.md fold section, docs/architecture.md:29-33,
      docs/guides/observability.md:297-301 and the ADR-0065 decision 2
      amendment paragraph.
+
+## Amendment (2026-09-26): a partitioned fold needs loop supervision and a restart alert
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="2026-09-26 supervision amendment" -->
+<!-- amendment-supersedes: phrase="The alert rule's `max by (signal)` aggregation already tolerates replicas that do not fold, so it needs no change" pointer="2026-09-26 supervision amendment" -->
+
+Decision 5 states that the fold-stalled alert needs no change. That is false
+under decision 1, and the reason is the partition itself.
+
+Before the fold was partitioned, every folding process folded every tenant. A
+panic in one signal's loop was a fleet-wide fault of that signal: the loop was
+a plain spawned task with no supervisor, every copy of it died the same way,
+every process's gauge for that signal went stale, and
+`RavelCatalogFoldStalled` fired. The alert really did need no change, because
+the failure it covered was fleet-wide by construction.
+
+Under decision 1 it is not. A maintain replica whose loop for one signal
+panics keeps heartbeating, because the heartbeat is the maintenance loop's,
+not the fold's. It therefore stays in the live set, no peer wins the
+rendezvous hash for its pairs, and those pairs are folded by nobody.
+`ravel_catalog_fold_last_success_timestamp_seconds` moves only on a successful
+`Catalog::fold`, so that replica's own gauge goes stale, but the alert
+aggregates `max by (signal)` across the fleet precisely so that a replica
+which folds nothing does not page. The peers' fresh gauges hold the maximum
+under the threshold and nothing fires, for as long as the replica stays up.
+Decision 4 stays correct: a fleet with no folding process at all still fires
+through the `absent()` arm. What is uncovered is the mixed state, one replica
+down for one signal inside an otherwise healthy fleet, which the partition
+created.
+
+Two changes, neither of which touches the ownership rule:
+
+1. **Each signal's fold loop runs under a supervisor.** The tick body is
+   guarded, a caught panic ends that attempt rather than the task, and a fresh
+   attempt is spawned after a bounded backoff that doubles from 1 s to 60 s
+   and resets once an attempt completes a tick. Each restart is logged at
+   error level with the signal and counted on a new counter,
+   `ravel_catalog_fold_loop_restarts_total{signal}`, rendered beside the
+   existing fold families and under the same gate as the liveness gauge:
+   `Mode::runs_scheduled_fold`, since a loop that was never scheduled cannot be
+   restarted. Shutdown still stops the loop and never restarts it, and a drain
+   arriving inside a backoff is observed at once rather than held behind it.
+   This mirrors what ADR-0065's maintenance loop already does
+   (`ravel_maintain_loop_panics_total`); the fold simply never got it.
+
+2. **A crash loop is alerted on.** `RavelCatalogFoldLoopCrashLooping` fires on
+   `increase(ravel_catalog_fold_loop_restarts_total[15m]) > 3` held for 15m,
+   at `warning`. It is deliberately unaggregated: the condition is about one
+   replica, and the whole defect above is a peer's health averaging that
+   replica away.
+
+A single transient panic is not the target of either change. It costs one
+skipped tick and restarts promptly, which is what the backoff reset is for.
+The target is the loop that cannot make progress, which the restart counter
+reports and which no other figure in the family can.
+
+Scope: the supervisor is in `ravel-server`'s fold task and the alert is in
+`deploy/prometheus/ravel.rules.yaml`. No ownership rule, no key layout, no
+mode gate and no metric already in the family changes.

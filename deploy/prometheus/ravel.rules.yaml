@@ -68,6 +68,29 @@ groups:
             that is running and failing, and the fold task's logs for the
             underlying store error.
           runbook: docs/guides/observability.md#the-fold-stalled-alert
+      - alert: RavelCatalogFoldLoopCrashLooping
+        # The shape RavelCatalogFoldStalled cannot catch since the fold became
+        # partitioned. A replica whose loop for one signal keeps panicking goes
+        # on heartbeating, so it stays in the live set and keeps its pairs,
+        # while its peers' fresh gauges hold max by (signal) under the stalled
+        # threshold. This counter is the only figure that moves.
+        expr: |
+          increase(ravel_catalog_fold_loop_restarts_total[15m]) > 3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel catalog fold loop for {{ $labels.signal }} is panicking and
+            restarting repeatedly
+          description: >-
+            The supervisor is catching a panic and restarting this signal's
+            fold loop faster than the loop is making progress, so the pairs
+            this replica owns are going unfolded while the rest of the fleet
+            looks healthy. Read this process's logs for the panic itself. No
+            aggregation, unlike RavelCatalogFoldStalled: the point is the one
+            replica, and a peer's health must not average it away.
+          runbook: docs/guides/observability.md#the-fold-stalled-alert
       - alert: RavelCatalogFoldFailing
         expr: |
           sum by (signal) (rate(ravel_catalog_fold_failures_total[15m])) > 0
