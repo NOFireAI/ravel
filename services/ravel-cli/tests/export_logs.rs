@@ -15,6 +15,7 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array,
     StringArray,
 };
+use arrow::datatypes::{DataType, Field, Fields};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -26,6 +27,7 @@ use ravel_cli::maintain::{SignalArg, compact_tenant};
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_ingest::Clock;
+use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::RetentionTombstone;
@@ -252,7 +254,7 @@ async fn load_then_export_round_trips_logs_field_by_field() {
         &m,
         &export_pq,
         1,
-        export::CatalogWindow::default(),
+        None,
         load_now_ns,
     )
     .await
@@ -410,6 +412,31 @@ const SHARED_MAPPING_COLUMNS: [&str; 12] = [
     "blob_col",
 ];
 
+/// The exact Arrow schema an export under [`SHARED_MAPPING`] writes: the
+/// columns of [`SHARED_MAPPING_COLUMNS`] in that order, each in the type the
+/// mapping's reader accepts, and every one nullable.
+fn shared_mapping_fields() -> Fields {
+    let types = [
+        DataType::Int64,
+        DataType::Utf8,
+        DataType::Int64,
+        DataType::Utf8,
+        DataType::FixedSizeBinary(16),
+        DataType::FixedSizeBinary(8),
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Int64,
+        DataType::Float64,
+        DataType::Boolean,
+        DataType::Binary,
+    ];
+    SHARED_MAPPING_COLUMNS
+        .iter()
+        .zip(types)
+        .map(|(name, data_type)| Field::new(*name, data_type, true))
+        .collect()
+}
+
 /// ADR-1751 follow-up 3's `load(export(x))` round trip, end to end: the file
 /// the export writes is fed back through `ravel-cli load` into a second,
 /// fresh tenant, and that tenant is exported again.
@@ -462,7 +489,7 @@ async fn export_reloads_into_a_second_tenant_field_for_field() {
         &m,
         &first_pq,
         1,
-        export::CatalogWindow::default(),
+        None,
         T2,
     )
     .await
@@ -499,7 +526,7 @@ async fn export_reloads_into_a_second_tenant_field_for_field() {
         &m,
         &second_pq,
         1,
-        export::CatalogWindow::default(),
+        None,
         T2,
     )
     .await
@@ -510,6 +537,23 @@ async fn export_reloads_into_a_second_tenant_field_for_field() {
     let second = read_parquet(&second_pq);
     assert_eq!(first.num_rows(), 3);
     assert_eq!(second.num_rows(), 3);
+
+    // The exact schema, not only the named columns: an extra, retyped,
+    // reordered or required column in either export fails here.
+    let expected_fields = shared_mapping_fields();
+    for (label, batch) in [("first", &first), ("second", &second)] {
+        assert_eq!(
+            batch.num_columns(),
+            SHARED_MAPPING_COLUMNS.len(),
+            "the {label} export must write exactly the mapping's columns"
+        );
+        assert_eq!(
+            batch.schema().fields(),
+            &expected_fields,
+            "the {label} export's schema must be exactly the mapping's columns, types and \
+             nullability"
+        );
+    }
 
     for name in SHARED_MAPPING_COLUMNS {
         let a = first
@@ -732,9 +776,12 @@ fn exported_timestamps(path: &Path) -> Vec<i64> {
 /// exactly `--end` is excluded and the one a nanosecond earlier is kept.
 ///
 /// All three rows are loaded in one batch, so they share one object and one
-/// block. Block pruning therefore cannot separate them -- the fetch returns
-/// all three -- and only the post-decode `ts_ns < end_ns` filter can, which
-/// is what this pins. The sibling test below pins the fetch bound instead.
+/// block, and block pruning cannot separate them. Two bounds can: the fetch's
+/// inclusive `end - 1`, which the RLOG reader evaluates on every decoded row
+/// as well as per block, and the post-decode `ts_ns < end_ns` filter over the
+/// fetched records. This test pins the two together, so it fails only when
+/// both let the row at `--end` through. The fetch bound on its own is pinned
+/// by the `segments_read` assertion in the next test.
 #[tokio::test]
 async fn a_record_at_exactly_the_window_end_is_not_exported() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -768,7 +815,7 @@ async fn a_record_at_exactly_the_window_end_is_not_exported() {
         &mapping(TS_BODY_MAPPING),
         &export_pq,
         1,
-        export::CatalogWindow::default(),
+        None,
         load_now_ns,
     )
     .await
@@ -776,8 +823,8 @@ async fn a_record_at_exactly_the_window_end_is_not_exported() {
 
     assert_eq!(
         report.segments_read, 1,
-        "the fixture must put all three rows in one object, or the post-decode filter is not \
-         what separates them"
+        "the fixture must put all three rows in one object, or block pruning rather than the \
+         row-level bounds is what separates them"
     );
     assert_eq!(
         report.rows_written, 2,
@@ -839,7 +886,7 @@ async fn an_object_holding_only_the_record_at_the_window_end_is_not_fetched() {
         &mapping(TS_BODY_MAPPING),
         &export_pq,
         1,
-        export::CatalogWindow::default(),
+        None,
         load_now_ns,
     )
     .await
@@ -917,7 +964,7 @@ async fn a_failing_export_leaves_an_existing_output_file_byte_identical() {
         &export_mapping,
         &export_pq,
         1,
-        export::CatalogWindow::default(),
+        None,
         BASE_NS + ONE_SEC_NS,
     )
     .await
@@ -1072,7 +1119,7 @@ async fn a_pending_erasure_request_excludes_exactly_its_subject() {
         &mapping(TS_BODY_SUBJECT_MAPPING),
         &export_pq,
         1,
-        export::CatalogWindow::default(),
+        None,
         T2 + 1,
     )
     .await
@@ -1142,7 +1189,6 @@ async fn a_retention_tombstone_removes_exactly_its_buckets_records() {
     )
     .await;
 
-    let window = export::CatalogWindow::default();
     let export_now_ns = second_load_ns + NS_PER_HOUR;
 
     // Baseline: without the tombstone all four records export.
@@ -1155,7 +1201,7 @@ async fn a_retention_tombstone_removes_exactly_its_buckets_records() {
         &mapping(TS_BODY_MAPPING),
         &export_pq,
         1,
-        window,
+        None,
         export_now_ns,
     )
     .await
@@ -1176,7 +1222,7 @@ async fn a_retention_tombstone_removes_exactly_its_buckets_records() {
         &mapping(TS_BODY_MAPPING),
         &export_pq,
         1,
-        window,
+        None,
         export_now_ns,
     )
     .await
@@ -1330,7 +1376,7 @@ async fn a_compacted_bucket_exports_each_record_exactly_once() {
         &mapping(TS_BODY_MAPPING),
         &export_pq,
         1,
-        export::CatalogWindow::default(),
+        None,
         compact_now_ns,
     )
     .await
@@ -1351,20 +1397,18 @@ async fn a_compacted_bucket_exports_each_record_exactly_once() {
     assert_eq!(exported_timestamps(&export_pq), vec![T0, T1, T2]);
 }
 
-/// `--signal metrics` (and, by the same code path, `spans`) is refused by
-/// name rather than attempted: ADR-1751's follow-up order lands metrics load
-/// and spans load first, and export has nothing to round-trip either against
-/// until then.
 /// `--max-ingest-lag` reaches `CatalogConfig` and decides which ingest-hour
 /// buckets the resolve lists at all.
 ///
 /// The fixture is the case the bound exists for: a record whose event time
 /// falls in a later ingest hour than the bucket it was written into. It is
 /// loaded a few minutes before an hour boundary with an event time a minute
-/// after it, so its bucket is the earlier hour while the export window starts
-/// in the later one. At the 2h default the listing window reaches back past
-/// the boundary and finds it; at `--max-ingest-lag 0` it starts at the
-/// window's own hour and the bucket is never listed.
+/// after it, and the export window starts at that event time, so the record's
+/// bucket is the hour before the window's. At the 2h default the listing
+/// reaches back past the boundary and finds it; at a 1s lag the listing
+/// starts 59s after the boundary, in the window's own hour, and the bucket is
+/// never listed. 1s rather than 0 because the CLI refuses a zero lag, as the
+/// server does.
 ///
 /// A defaulted export against a deployment whose `ravel-server
 /// --max-ingest-lag` differs resolves a different window than that server's
@@ -1396,39 +1440,32 @@ async fn max_ingest_lag_decides_which_buckets_the_resolve_lists() {
 
     let export_now_ns = load_now_ns + 10 * 60 * 1_000_000_000;
     let m = mapping(TS_BODY_MAPPING);
-    let export = |window| {
+    let export = |max_ingest_lag_ns| {
         export::export_logs(
             Arc::clone(&store),
             StoreSelection::explicit(StoreKind::Memory),
             "acme",
-            hour_boundary_ns,
+            event_ns,
             event_ns + 1,
             &m,
             &export_pq,
             1,
-            window,
+            max_ingest_lag_ns,
             export_now_ns,
         )
     };
 
-    let defaulted = export(export::CatalogWindow::default())
-        .await
-        .expect("export succeeds");
+    let defaulted = export(None).await.expect("export succeeds");
     assert_eq!(
         defaulted.rows_written, 1,
         "the 2h default reaches back past the hour boundary to the record's bucket"
     );
     assert_eq!(exported_timestamps(&export_pq), vec![event_ns]);
 
-    let narrowed = export(export::CatalogWindow {
-        max_ingest_lag_ns: Some(0),
-        max_flush_lifetime_ns: None,
-    })
-    .await
-    .expect("export succeeds");
+    let narrowed = export(Some(ONE_SEC_NS)).await.expect("export succeeds");
     assert_eq!(
         narrowed.rows_written, 0,
-        "at a zero lag the listing window starts in the window's own hour, so the record's \
+        "at a 1s lag the listing window starts in the window's own hour, so the record's \
          bucket is never listed"
     );
     assert_eq!(
@@ -1437,6 +1474,54 @@ async fn max_ingest_lag_decides_which_buckets_the_resolve_lists() {
     );
 }
 
+/// A `--parquet` that names an existing directory is refused before the
+/// export makes a single object-store request, rather than after the whole
+/// window has been listed, fetched and encoded only to fail at the final
+/// rename.
+#[tokio::test]
+async fn export_refuses_a_directory_output_before_any_store_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let metrics = instrumented.metrics();
+    let store: Arc<dyn ObjectStoreBackend> = instrumented;
+
+    let err = export::export_logs(
+        store,
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        BASE_NS,
+        BASE_NS + ONE_SEC_NS,
+        &mapping(TS_BODY_MAPPING),
+        dir.path(),
+        1,
+        None,
+        BASE_NS,
+    )
+    .await
+    .expect_err("a directory --parquet is refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "--parquet {} is a directory: pass the path of the Parquet file to write",
+            dir.path().display()
+        )
+    );
+    assert_eq!(
+        metrics.snapshot(),
+        StoreMetricsSnapshot::default(),
+        "the refusal must come before any object-store request"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("read dir").count(),
+        0,
+        "no temporary file is left in the directory"
+    );
+}
+
+/// `--signal metrics` (and, by the same code path, `spans`) is refused by
+/// name rather than attempted: ADR-1751's follow-up order lands metrics load
+/// and spans load first, and export has nothing to round-trip either against
+/// until then.
 #[tokio::test]
 async fn export_refuses_unsupported_signal_metrics() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -1450,7 +1535,7 @@ async fn export_refuses_unsupported_signal_metrics() {
         Path::new("/nonexistent/mapping.toml"),
         Path::new("/nonexistent/out.parquet"),
         1,
-        export::CatalogWindow::default(),
+        None,
         BASE_NS,
     )
     .await

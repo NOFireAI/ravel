@@ -103,33 +103,6 @@ pub struct ExportReport {
     pub erasure_predicates: usize,
 }
 
-/// The two `CatalogConfig` knobs that decide which ingest-hour buckets a
-/// resolve even lists, exposed so an export can be told what the server it
-/// reads behind was configured with.
-///
-/// `Catalog::resolve` lists buckets from `--start` minus `max_ingest_lag`
-/// forward, and skips history below the fold watermark, whose seal margin is
-/// `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`. Both
-/// default to what the server defaults to (2 h and 1 h), so an export against
-/// a default deployment needs neither flag.
-///
-/// What the reach-back buys is the bucket of a record whose event time falls
-/// in a later ingest hour than the bucket it was written into: at
-/// `max_ingest_lag` 0 the listing starts in the window's own hour and that
-/// bucket is never listed at all. The export therefore has to resolve with
-/// the same value the server's own resolves use, or it answers a different
-/// window than a query over the same range does, and nothing on the bucket
-/// records what the server was configured with.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CatalogWindow {
-    /// `--max-ingest-lag`, in nanoseconds. `None` keeps
-    /// `CatalogConfig::default()`'s 2 hours.
-    pub max_ingest_lag_ns: Option<i64>,
-    /// `--max-flush-lifetime`, in nanoseconds. `None` keeps
-    /// `CatalogConfig::default()`'s 1 hour.
-    pub max_flush_lifetime_ns: Option<i64>,
-}
-
 /// Why `signal` cannot be exported yet, or `None` when it can.
 ///
 /// `logs` is the only supported signal. ADR-1751 sequences bulk import for
@@ -164,7 +137,7 @@ pub async fn run(
     mapping_path: &Path,
     out: &Path,
     shards: u32,
-    window: CatalogWindow,
+    max_ingest_lag_ns: Option<i64>,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     if let Some(message) = unsupported_signal_message(signal) {
@@ -175,7 +148,16 @@ pub async fn run(
     let mapping = crate::load::parse_mapping(&text)?;
     selection.print_header();
     let report = export_logs(
-        store, selection, tenant, start_ns, end_ns, &mapping, out, shards, window, now_ns,
+        store,
+        selection,
+        tenant,
+        start_ns,
+        end_ns,
+        &mapping,
+        out,
+        shards,
+        max_ingest_lag_ns,
+        now_ns,
     )
     .await?;
     println!("output: {}", out.display());
@@ -192,6 +174,19 @@ pub async fn run(
 /// `shards` is the configured shard count, resolved the same way the other
 /// read commands resolve it; the catalog reads the tenant's real shard
 /// generations from its provisioning record on top of it.
+///
+/// `max_ingest_lag_ns` replaces `CatalogConfig::max_ingest_lag_ns` (2 hours
+/// when `None`). `Catalog::resolve` lists ingest-hour buckets from `start_ns`
+/// minus this value forward, which is what reaches the bucket of a record
+/// whose event time falls in a later ingest hour than the bucket it was written
+/// into, so an export resolving with a different value than the server's own
+/// `--max-ingest-lag` answers a different window than a query over the same
+/// range. Nothing on the bucket records what the server was configured with.
+///
+/// `out` is checked before any object-store request: an existing directory,
+/// any other existing non-regular file, and any path under `/dev` are refused
+/// up front, because the final step is a rename that cannot write through to
+/// them (see [`write_parquet`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn export_logs(
     store: Arc<dyn ObjectStoreBackend>,
@@ -202,7 +197,7 @@ pub async fn export_logs(
     mapping: &Mapping,
     out: &Path,
     shards: u32,
-    window: CatalogWindow,
+    max_ingest_lag_ns: Option<i64>,
     now_ns: i64,
 ) -> anyhow::Result<ExportReport> {
     if end_ns <= start_ns {
@@ -211,6 +206,7 @@ pub async fn export_logs(
              [{start_ns}, {end_ns}) is empty"
         );
     }
+    check_output_path(out)?;
     let tenant_hash = TenantId::new(tenant).hash();
     require_tenant_data_present(selection, store.as_ref(), "export", tenant, &tenant_hash).await?;
 
@@ -222,11 +218,8 @@ pub async fn export_logs(
         shard_count: shards,
         ..ravel_catalog::CatalogConfig::default()
     };
-    if let Some(ns) = window.max_ingest_lag_ns {
+    if let Some(ns) = max_ingest_lag_ns {
         catalog_config.max_ingest_lag_ns = ns;
-    }
-    if let Some(ns) = window.max_flush_lifetime_ns {
-        catalog_config.max_flush_lifetime_ns = ns;
     }
     let catalog = ravel_catalog::Catalog::new(Arc::clone(&store), catalog_config)
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
@@ -322,17 +315,54 @@ fn decode_resources(
     Ok(by_stream)
 }
 
+/// Refuses an `--parquet` path the final rename cannot replace, before the
+/// export reads anything: a path under `/dev` (`/dev/stdout` included, since
+/// a rename would replace the device node, or fail, rather than write to it),
+/// and an existing path that is not a regular file once symlinks are
+/// followed, such as a directory, which would otherwise fail only at the
+/// rename after the whole window had been read and encoded.
+fn check_output_path(out: &Path) -> anyhow::Result<()> {
+    if out.starts_with("/dev") {
+        anyhow::bail!(
+            "--parquet {} is under /dev: the export replaces its output by renaming a \
+             finished file over it, so it cannot write to a device; pass a regular file path",
+            out.display()
+        );
+    }
+    match std::fs::metadata(out) {
+        Ok(meta) if meta.is_dir() => anyhow::bail!(
+            "--parquet {} is a directory: pass the path of the Parquet file to write",
+            out.display()
+        ),
+        Ok(meta) if !meta.is_file() => anyhow::bail!(
+            "--parquet {} exists and is not a regular file: the export replaces its output \
+             by renaming a finished file over it, so it can only replace a regular file",
+            out.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Writes `records` to `out` in `EXPORT_BATCH_ROWS`-row batches and returns
 /// the row count written. An empty export still writes a schema-only file, so
 /// a loader pointed at it reads zero rows rather than failing to open it.
 ///
 /// `out` is only ever replaced by a `rename` of a finished file. The rows are
-/// written to a sibling temporary file in the same directory and renamed over
-/// `out` after the Parquet writer closes, so a failure part-way through (a
-/// stored attribute whose type the mapping does not declare, a full disk)
-/// leaves any pre-existing `out` exactly as it was instead of having truncated
-/// it into a footer-less fragment. The temporary file is removed on every
-/// failure path, including a failed rename.
+/// written to a sibling temporary file named `.<file name>.<pid>.<n>.tmp` in
+/// the same directory, synced to disk, and renamed over `out` after the
+/// Parquet writer closes; the directory is synced after the rename, so the
+/// replace survives a power loss. A failure part-way through (a stored
+/// attribute whose type the mapping does not declare, a full disk) leaves any
+/// pre-existing `out` exactly as it was instead of having truncated it into a
+/// footer-less fragment. The temporary file is removed on every failure path
+/// that returns, including a failed rename; a SIGINT or a panic mid-write
+/// leaves it behind.
+///
+/// Because the replace is a rename rather than a write into the existing file:
+/// a symlink at `out` is itself replaced by the new file, and the file it
+/// pointed to is left unchanged; the new file's mode comes from the default
+/// creation mode and the umask, not from the file it replaces, and the old
+/// file's owner and ACLs are not carried over.
 fn write_parquet(
     mapping: &Mapping,
     records: &[LogRecord],
@@ -341,8 +371,29 @@ fn write_parquet(
 ) -> anyhow::Result<u64> {
     let empty = build_batch(mapping, &[])?;
     let (tmp_path, file) = create_temp_output(out)?;
-    let rows_written = match write_batches(file, &empty, mapping, records, resource_by_stream, out)
-    {
+    let written = file
+        .try_clone()
+        .context("failed to duplicate the temporary export file handle")
+        .and_then(|writer_file| {
+            write_batches(
+                writer_file,
+                &empty,
+                mapping,
+                records,
+                resource_by_stream,
+                out,
+            )
+        })
+        .and_then(|rows| {
+            file.sync_all().with_context(|| {
+                format!(
+                    "failed to sync the temporary export file {}",
+                    tmp_path.display()
+                )
+            })?;
+            Ok(rows)
+        });
+    let rows_written = match written {
         Ok(rows) => rows,
         Err(err) => {
             let _ = std::fs::remove_file(&tmp_path);
@@ -357,7 +408,23 @@ fn write_parquet(
             out.display()
         )));
     }
+    std::fs::File::open(output_dir(out))
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| {
+            format!(
+                "moved the finished export into place at {} but failed to sync its directory",
+                out.display()
+            )
+        })?;
     Ok(rows_written)
+}
+
+/// The directory `out` is created in: its parent, or `.` for a bare file name.
+fn output_dir(out: &Path) -> &Path {
+    match out.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 /// Creates the sibling temporary file [`write_parquet`] writes into, and
@@ -373,10 +440,7 @@ fn create_temp_output(out: &Path) -> anyhow::Result<(std::path::PathBuf, std::fs
     let name = out
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} names no output file", out.display()))?;
-    let dir = match out.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
+    let dir = output_dir(out);
     let pid = std::process::id();
     for attempt in 0..1024u32 {
         let mut candidate_name = std::ffi::OsString::from(".");

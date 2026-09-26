@@ -599,7 +599,10 @@ enum Command {
         /// Path of the Parquet file to write. Replaced only once the export
         /// finishes: the rows go to a temporary file beside it which is
         /// renamed over it at the end, so a failed export leaves an existing
-        /// file untouched.
+        /// file untouched. The rename replaces a symlink itself rather than
+        /// the file it points to, and does not keep the old file's mode,
+        /// owner or ACLs. A directory, any other non-regular file, and any
+        /// path under `/dev` are refused before the export reads anything.
         #[arg(long, value_name = "FILE")]
         parquet: std::path::PathBuf,
         /// Path to the `--mapping` TOML naming the output columns. The same
@@ -619,17 +622,9 @@ enum Command {
         /// than the bucket it was written into. Defaults to the server's own
         /// 2h default; pass the server's value when the deployment differs,
         /// or the export resolves a different window than a query over the
-        /// same range.
+        /// same range. Zero is refused, as the server refuses it.
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_ingest_lag_ns)]
         max_ingest_lag: Option<i64>,
-        /// Override the resolve's `max_flush_lifetime` (humantime duration,
-        /// e.g. `2h`; same grammar as ravel-server's
-        /// `--gc-max-flush-lifetime`). It sets the seal margin below which
-        /// the resolve skips folded history; raise it to match a deployment
-        /// whose writers hold flushes open longer than the 1h default.
-        #[arg(long, value_name = "DURATION",
-              value_parser = ravel_cli::parse_max_flush_lifetime_ns)]
-        max_flush_lifetime: Option<i64>,
     },
 }
 
@@ -1949,7 +1944,6 @@ async fn main() -> anyhow::Result<()> {
             mapping,
             shards,
             max_ingest_lag,
-            max_flush_lifetime,
         } => {
             ravel_cli::export::run(
                 store::build_store(&cli.store)?,
@@ -1961,10 +1955,7 @@ async fn main() -> anyhow::Result<()> {
                 &mapping,
                 &parquet,
                 shards,
-                ravel_cli::export::CatalogWindow {
-                    max_ingest_lag_ns: max_ingest_lag,
-                    max_flush_lifetime_ns: max_flush_lifetime,
-                },
+                max_ingest_lag,
                 now_ns()?,
             )
             .await

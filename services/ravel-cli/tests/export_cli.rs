@@ -123,50 +123,121 @@ fn export_window_flags_reach_the_command_as_rfc3339_nanoseconds() {
     );
 }
 
-/// The two catalog-window flags exist under the names the server uses and
-/// parse as humantime durations. A refused value is the observable effect:
-/// clap runs the value parser before the command, so a message naming the
-/// flag proves the flag reached the parser this crate wired to it, and a flag
-/// that did not exist would be an unknown-argument error instead.
-#[test]
-fn export_catalog_window_flags_parse_as_humantime_durations() {
-    for (flag, value) in [
-        ("--max-ingest-lag", "later"),
-        ("--max-flush-lifetime", "later"),
-    ] {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mapping = write_mapping(&dir);
-        let out = dir.path().join("out.parquet");
-        let output = run(&[
-            "--store",
-            "memory",
-            "export",
-            "--signal",
-            "logs",
-            "--tenant",
-            "acme",
-            "--start",
-            BASE_RFC3339,
-            "--end",
-            "2023-11-14T22:13:21Z",
-            "--parquet",
-            &out.display().to_string(),
-            "--mapping",
-            &mapping.display().to_string(),
-            flag,
-            value,
-        ]);
+/// Runs `export --signal logs` over a one-second window with `extra`
+/// appended to the arguments.
+fn run_export_with(dir: &tempfile::TempDir, parquet: &str, extra: &[&str]) -> std::process::Output {
+    let mapping = write_mapping(dir);
+    let mapping = mapping.display().to_string();
+    let mut args = vec![
+        "--store",
+        "memory",
+        "export",
+        "--signal",
+        "logs",
+        "--tenant",
+        "acme",
+        "--start",
+        BASE_RFC3339,
+        "--end",
+        "2023-11-14T22:13:21Z",
+        "--parquet",
+        parquet,
+        "--mapping",
+        &mapping,
+    ];
+    args.extend_from_slice(extra);
+    run(&args)
+}
 
-        assert!(
-            !output.status.success(),
-            "{flag} with an unparseable duration must exit non-zero"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!("invalid {flag} '{value}'")),
-            "{flag} must be refused by its own parser, got: {stderr}"
-        );
-    }
+/// `--max-ingest-lag` exists under the name the server uses and parses as a
+/// humantime duration. A refused value is the observable effect: clap runs the
+/// value parser before the command, so a message naming the flag proves the
+/// flag reached the parser this crate wired to it, and a flag that did not
+/// exist would be an unknown-argument error instead.
+#[test]
+fn export_max_ingest_lag_parses_as_a_humantime_duration() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out.parquet").display().to_string();
+    let output = run_export_with(&dir, &out, &["--max-ingest-lag", "later"]);
+
+    assert!(
+        !output.status.success(),
+        "--max-ingest-lag with an unparseable duration must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid --max-ingest-lag 'later'"),
+        "--max-ingest-lag must be refused by its own parser, got: {stderr}"
+    );
+}
+
+/// A zero `--max-ingest-lag` is refused, as `ravel-server --max-ingest-lag`
+/// refuses it, so an export cannot resolve a window no server's queries do.
+#[test]
+fn export_refuses_a_zero_max_ingest_lag_like_the_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out.parquet");
+    let output = run_export_with(
+        &dir,
+        &out.display().to_string(),
+        &["--max-ingest-lag", "0s"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "--max-ingest-lag 0s must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "--max-ingest-lag '0s' must be a positive duration: ravel-server refuses a zero \
+             lag, so no deployment's queries resolve the window a zero lag would"
+        ),
+        "a zero lag must be refused with the server's reason, got: {stderr}"
+    );
+    assert!(
+        !out.exists(),
+        "a refused export must not create the --parquet file"
+    );
+}
+
+/// `export` takes no `--max-flush-lifetime`: the resolve never reads the
+/// flush lifetime (only a fold does), so a flag for it would change nothing.
+#[test]
+fn export_has_no_max_flush_lifetime_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out.parquet").display().to_string();
+    let output = run_export_with(&dir, &out, &["--max-flush-lifetime", "2h"]);
+
+    assert!(
+        !output.status.success(),
+        "an export given --max-flush-lifetime must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error: unexpected argument '--max-flush-lifetime' found"),
+        "--max-flush-lifetime must be an unknown argument to export, got: {stderr}"
+    );
+}
+
+/// A `--parquet` under `/dev` is refused before the export reads anything:
+/// the output is replaced by a rename, which cannot write to a device.
+#[test]
+fn export_refuses_a_device_output_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run_export_with(&dir, "/dev/stdout", &[]);
+
+    assert!(
+        !output.status.success(),
+        "export --parquet /dev/stdout must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.trim_end(),
+        "Error: --parquet /dev/stdout is under /dev: the export replaces its output by \
+         renaming a finished file over it, so it cannot write to a device; pass a regular file \
+         path",
+    );
 }
 
 /// `--tenant` reaches the store layer: with `--store` omitted the defaulted
