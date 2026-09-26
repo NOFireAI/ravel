@@ -370,12 +370,13 @@ async fn publish_metrics_bucket(
 }
 
 /// Build a PromQL query app whose read cache is `cache`, so two queries against
-/// it share one warm cache.
+/// it share one warm cache, over the given process memory budget.
 fn build_metrics_app(
     store: Arc<dyn ObjectStoreBackend>,
     cache: ReadCache,
     tenant: &TenantId,
     shard_count: u32,
+    budget: Arc<ravel_memory::MemoryBudget>,
 ) -> Router {
     let cli = Cli::try_parse_from(["ravel-server"]).expect("default flags parse");
     let flush_cadence = cli.resolve_flush_cadence().expect("flush cadence resolves");
@@ -408,6 +409,7 @@ fn build_metrics_app(
         None,
         None,
         None,
+        budget,
     );
     ravel_query::http::router(state)
 }
@@ -490,7 +492,13 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     let ReadCache::Ram(ram) = cache.clone() else {
         unreachable!("default CLI has no --cache-dir, so build_cache returns ReadCache::Ram");
     };
-    let app = build_metrics_app(Arc::clone(&store), cache, &tenant_id, SHARD_COUNT);
+    let app = build_metrics_app(
+        Arc::clone(&store),
+        cache,
+        &tenant_id,
+        SHARD_COUNT,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+    );
 
     // Pre-erase: both subjects reachable in both shards, and the query warms the
     // read cache with the segment bytes (which include the subject's).
@@ -649,7 +657,13 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
         crate::config::DEFAULT_CACHE_MAX_BYTES,
     )
     .expect("cache");
-    let fresh_app = build_metrics_app(Arc::clone(&store), cold_cache, &tenant_id, SHARD_COUNT);
+    let fresh_app = build_metrics_app(
+        Arc::clone(&store),
+        cold_cache,
+        &tenant_id,
+        SHARD_COUNT,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+    );
     let post_sweep = query_metric_subjects(&fresh_app).await;
     assert_eq!(
         user_ids(&post_sweep),

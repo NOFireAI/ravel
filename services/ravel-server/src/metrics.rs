@@ -279,22 +279,16 @@ pub enum Label {
     Allocator(&'static str),
     AllocatorStat(AllocatorStat),
     /// Which side of the ADR-1170 process memory budget a
-    /// `ravel_memory_reserved_bytes` sample is. `Fetch` always renders `0`:
-    /// decision 2 (fetch-layer reservation against this same budget) has not
-    /// landed upstream, so nothing yet charges the budget on the fetcher's
-    /// behalf. This is an honest gap, not a bug -- the gauge exists now so a
-    /// dashboard need not change shape once decision 2 lands.
-    ///
-    /// The split is not yet a real split, and landing decision 2 is more than
-    /// flipping the hardcoded `Fetch` constant to a reader. `Sql` renders
-    /// `MemoryBudget::reserved()`, the WHOLE process budget's reserved total,
-    /// which is only equal to SQL's share because SQL is the sole reserver
-    /// today. Wire a fetcher to the same instance and `component="sql"`
-    /// silently becomes the process total while `component="fetch"` reports
-    /// its own share, so the two double-count and a dashboard summing them
-    /// reads high. Decision 2 has to give the budget per-component
-    /// accounting (or give each component its own counter) before either
-    /// sample can be read as a share.
+    /// `ravel_memory_reserved_bytes` sample is: `Sql` is
+    /// `MemoryBudget::sql_reserved()` (the raw-counter API
+    /// `TenantMemoryAccountant` uses), `Fetch` is
+    /// `MemoryBudget::fetch_reserved()` (the RAII `Reservation` API
+    /// `ravel-query`'s fetchers use). The two counters are disjoint by
+    /// construction (`ravel_memory::MemoryBudget` tracks fetch reservations
+    /// separately from the total, so `sql_reserved` is the total minus
+    /// `fetch_reserved`, never the total itself), so summing both samples
+    /// equals `ravel_memory_budget_bytes`'s `reserved` total with no
+    /// double-count. See [`MemoryComponent`]'s doc comment.
     MemoryComponent(MemoryComponent),
     /// Which fragment admission class a `ravel_distrib_fragment_*`
     /// sample belongs to (issue #1722): `Pinned`
@@ -429,8 +423,12 @@ impl AllocatorStat {
 /// Which side of the ADR-1170 process memory budget reserved a share of it:
 /// `Sql` is the `SqlExecutor`'s per-tenant accountants
 /// (`ravel_memory::TenantMemoryAccountant`), all sharing the one process
-/// `MemoryBudget`; `Fetch` is the fetch layer's own reservation against that
-/// same budget, decision 2, not yet landed (see [`Label::MemoryComponent`]).
+/// `MemoryBudget` through its raw `try_reserve`/`reserve_unchecked`/`release`
+/// counter API; `Fetch` is the fetch layer's own reservation against that
+/// same budget (`ravel_query`'s `SegmentFetcher`, `LogSegmentFetcher`, and
+/// `SpanSegmentFetcher`, through the RAII `reserve`/`Reservation` API).
+/// `ravel_memory::MemoryBudget` tracks the fetch share in its own counter, so
+/// the two never double-count (see [`Label::MemoryComponent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryComponent {
     Sql,
@@ -2107,13 +2105,26 @@ fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
 /// [`exposed_memory_budget_limit`] clamps that path before it reaches this
 /// family.
 ///
-/// `ravel_memory_reserved_bytes{component="fetch"}` and
-/// `ravel_memory_handoff_overlap_bytes` are both always `0` here.
-/// `ravel-query`'s fetchers do reserve and mark handoffs, but against the
-/// private `MemoryBudget::unlimited` each one carries by default:
-/// `crate::query::build_sql_state` wires no fetcher to the process-wide
-/// instance, so nothing this family reads ever sees a fetch reservation. See
+/// `ravel_memory_reserved_bytes{component="fetch"}` is
+/// `MemoryBudget::fetch_reserved()`: bytes currently held by a live
+/// `ravel_memory::Reservation` (`ravel-query`'s fetchers). `component="sql"`
+/// is `MemoryBudget::sql_reserved()`, the total minus the fetch share, i.e.
+/// `TenantMemoryAccountant`'s raw-counter reservations -- never the whole
+/// budget total, so the two samples never double-count each other. Both
+/// paths share the one process-wide instance: `crate::query::build_app_state`
+/// and `crate::query::build_sql_state` are wired to the SAME
+/// `Arc<ravel_memory::MemoryBudget>` (ADR-1170 decisions 1/3/4). See
 /// [`Label::MemoryComponent`]'s doc comment.
+///
+/// `ravel_memory_handoff_overlap_bytes` is `MemoryBudget::handoff_overlap()`:
+/// bytes that are simultaneously held by a live fetch `Reservation` AND
+/// resident in the ADR-0046 read cache, because the fetcher marked that
+/// reservation handed off (`Reservation::mark_handed_off`) once the cache
+/// took its own independent copy of the same bytes. It counts double-booked
+/// bytes, not evicted or freed ones: a cache hit that never issues a fetch
+/// reserves nothing and contributes nothing here, and the figure returns to
+/// `0` as soon as the fetcher's `Reservation` (and thus its handoff) drops,
+/// whether or not the cache still holds the bytes.
 fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudgetSnapshot) {
     write_header(
         out,
@@ -2131,7 +2142,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_reserved_bytes",
-        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is the budget's whole reserved total, equal to SQL's share only because SQL is its sole reserver today; component=\"fetch\" reads 0 until decision 2 (fetch-layer reservation) lands upstream.",
+        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is TenantMemoryAccountant's raw-counter share, component=\"fetch\" is bytes held by a live ravel-query fetcher Reservation; the two are disjoint and sum to the budget's whole reserved total.",
         "gauge",
     );
     write_sample(
@@ -2141,7 +2152,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
             Label::Mode(mode),
             Label::MemoryComponent(MemoryComponent::Sql),
         ],
-        budget.reserved,
+        budget.sql_reserved,
     );
     write_sample(
         out,
@@ -2150,13 +2161,13 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
             Label::Mode(mode),
             Label::MemoryComponent(MemoryComponent::Fetch),
         ],
-        0,
+        budget.fetch_reserved,
     );
 
     write_header(
         out,
         "ravel_memory_handoff_overlap_bytes",
-        "Bytes double-counted because a tenant's memory handed off between components overlaps in the ADR-1170 process budget's accounting window; inactive (always 0) until fetch handoff accounting lands.",
+        "Bytes simultaneously held by a live fetch Reservation and resident in the ADR-0046 read cache (Reservation::mark_handed_off), i.e. double-booked across the two ledgers; 0 when no fetch reservation has been handed off to a cache.",
         "gauge",
     );
     write_sample(
@@ -5228,11 +5239,15 @@ pub struct IngestBufferBudgetSnapshot {
 /// loads). `Default` (all zero) is the reading of an unpopulated test
 /// snapshot, not a real process's; a real process's `limit` is never `0`
 /// (see [`render_memory_budget_family`]'s doc comment on the `u64::MAX`
-/// unlimited convention).
+/// unlimited convention). `sql_reserved` and `fetch_reserved` are disjoint
+/// (`MemoryBudget::sql_reserved()`/`fetch_reserved()`) and sum to the whole
+/// budget's reserved total; there is no separate `reserved` field to keep in
+/// sync with them.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryBudgetSnapshot {
     pub limit: u64,
-    pub reserved: u64,
+    pub sql_reserved: u64,
+    pub fetch_reserved: u64,
     pub handoff_overlap: u64,
 }
 
@@ -5616,7 +5631,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             state.process_memory_budget.limit(),
             state.process_memory_budget_is_fallback,
         ),
-        reserved: state.process_memory_budget.reserved(),
+        sql_reserved: state.process_memory_budget.sql_reserved(),
+        fetch_reserved: state.process_memory_budget.fetch_reserved(),
         handoff_overlap: state.process_memory_budget.handoff_overlap(),
     };
 

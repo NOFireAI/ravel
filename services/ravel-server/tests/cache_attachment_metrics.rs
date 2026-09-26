@@ -208,6 +208,7 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
         None,
         None,
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     );
     let app: Router = router(state);
 

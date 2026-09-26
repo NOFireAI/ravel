@@ -2505,6 +2505,7 @@ pub async fn start(
             distributed.clone(),
             federation,
             metadata_cache.clone(),
+            process_memory_budget.clone(),
         );
         // `build_app_state` installs `NoopQueryAuditSink` internally; override
         // with the process-wide pipeline (ADR-0062 decision 2b) so PromQL
