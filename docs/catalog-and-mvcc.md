@@ -765,8 +765,11 @@ or `query` process runs no fold timer. A `query` process keeps the on-demand
 names regardless of ownership; a `gateway` process mounts no fold route at all
 and so cannot fold by any route, which was already true before ADR-1693.
 
-In `maintain`, a `(tenant, signal)` pair is folded by exactly one process at a
-time. The owner is the rendezvous-hash owner of the unit `(tenant_hash,
+In `maintain`, a `(tenant, signal)` pair is normally folded by one process.
+"Normally" rather than "by exactly one at a time": a membership transition is
+the exception, during which two processes can fold the same pair, and the
+membership-transition paragraph below states the window and why the overlap is
+safe. The owner is the rendezvous-hash owner of the unit `(tenant_hash,
 signal, 0)` over the maintenance live set (ADR-0065 decision 1): the worker
 `w` in the live set maximizing `blake3(unit_key || w)`, ties broken toward the
 larger `process_id`. Shard `0` is a constant here, not a shard of the data: a

@@ -87,10 +87,32 @@ ownership test is pure computation over the tenant listing and it runs before
 every per-tenant read, that pair's `t/<hash>/config` lifecycle record and its
 `HEAD` peek included. The one request a tick makes that no owned pair accounts
 for is the single delimited listing of `t/` that finds the tenants in the first
-place. Ownership is evaluated per tick, so
-a replica that leaves the fleet hands its pairs to the survivors within the
-liveness window (three heartbeat intervals, 180 s at defaults) with no
-operator action.
+place. Ownership is evaluated per tick, so a replica that leaves the fleet
+hands its pairs to the survivors with no operator action.
+
+The handover bound is 570 s (9 min 30 s) at the defaults, not the liveness
+window alone. Three terms add up, and each is the worst case of the one before
+it:
+
+| Term | Default | Seconds |
+|---|---|---|
+| Liveness window, `liveness_factor * heartbeat_interval` | 3 x 60 s | 180 |
+| The survivor's next heartbeat tick, which is when it re-lists and recomputes the live set | 60 s | 60 |
+| The survivor's next fold tick, `--fold-interval-secs` plus up to 10% jitter | 300 s + 30 s | 330 |
+| **Sum** | | **570** |
+
+The departed replica's heartbeat record stops being refreshed, but nothing
+reacts to that on its own: a survivor only drops it once it reads the record
+at more than `3 * H` old, and it reads on its own heartbeat cadence, which is
+the second term. The recomputed set then reaches the fold through a `watch`
+channel the fold reads at the top of each of its own ticks, which is the
+third. The liveness window alone is the bound on when the departure becomes
+VISIBLE, not on when the pairs are folded again.
+
+Nothing here is a durability bound: an unfolded pair costs query listing and
+nothing else. A shorter `--fold-interval-secs` shortens the third term
+proportionally; the heartbeat interval and the liveness factor carry no flag
+and are always the defaults above.
 
 A `maintain` process still serves no query surface. It folds because the fold
 is scheduled work over the same tenant list it already walks, and because the

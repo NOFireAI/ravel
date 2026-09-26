@@ -19,8 +19,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pair accounts for is the single delimited listing of `t/` that discovers the
   tenants. Scaling `maintain` to N replicas therefore divides the fold's
   request cost N ways instead of running N full copies of it, and a replica
-  leaving the fleet hands its pairs to the survivors within the liveness
-  window. `--mode all` computes its live set as itself alone and keeps folding
+  leaving the fleet hands its pairs to the survivors within 570 s at the
+  defaults: the 180 s liveness window, plus the survivor's next 60 s heartbeat
+  tick, which is when it re-lists and recomputes the live set, plus its next
+  fold tick, 300 s with up to 10% jitter. The liveness window alone bounds
+  when the departure becomes visible, not when the pairs are folded again.
+  `--mode all` computes its live set as itself alone and keeps folding
   everything. `gateway` and `query` processes no longer fold on a timer. A
   `query` process keeps the on-demand `POST /api/v1/admin/fold` route, which
   is unchanged; a `gateway` process mounts no fold route at all, as before. A
@@ -38,7 +42,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ravel_catalog_fold_failures_total` render wherever a fold can run, the
   `query` mode's on-demand route included, so an on-demand fold's failures
   stay visible. The fold also reads the injected maintain clock rather than
-  the system clock.
+  the system clock. Each signal's fold loop now runs under a supervisor: a
+  panic in a tick body is caught, counted on the new
+  `ravel_catalog_fold_loop_restarts_total{signal}` counter, logged at error
+  level, and the loop is respawned after a bounded backoff doubling from 1 s
+  to 60 s and resetting after a completed tick. The supervision is not
+  optional under a partitioned fold: a replica whose loop dies keeps
+  heartbeating, so it stays in the live set, keeps its pairs, and leaves them
+  unfolded while its peers' fresh gauges hold `RavelCatalogFoldStalled`
+  (`max by (signal)`) under its threshold. The new
+  `RavelCatalogFoldLoopCrashLooping` rule in
+  `deploy/prometheus/ravel.rules.yaml` fires on more than 3 restarts in 15m,
+  unaggregated, because the condition is about one replica. **On upgrade**, a
+  `RavelCluster` with `spec.gateway.fold` set now fails the render before any
+  tier renders, so the whole cluster stops reconciling until the field moves
+  to `spec.maintain.fold`; a hand-written manifest passing `--disable-fold` or
+  `--fold-interval-secs` to a gateway or query container now fails at startup
+  instead of ignoring the flag; and during a rolling upgrade an old-version
+  maintain pod sits in the live set without folding, so the pairs the hash
+  gives it stay unfolded until the rollout completes.
 
 ## [0.18.0] - 2026-09-26
 
