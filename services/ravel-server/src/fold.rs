@@ -733,3 +733,249 @@ pub(crate) fn head_is_fresh(created_unix_ns: i64, now_ns: i64, interval: Duratio
 pub(crate) fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use bytes::Bytes;
+    use ravel_catalog::CatalogConfig;
+    use ravel_maintain::FixedClock;
+    use ravel_maintain::worker_set::{DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::PutOptions;
+    use ravel_types::TenantId;
+
+    use super::*;
+
+    /// The injected clock's one value. Every fold in these tests stamps this
+    /// exact number, so a stamp taken from a second clock fails rather than
+    /// landing in a band.
+    const NOW_NS: i64 = 1_700_000_000_000_000_000;
+
+    /// The heartbeat cadence the `WorkerSet` is built with. Irrelevant to the
+    /// partition here (the solo live set owns every unit) and named only
+    /// because the constructor takes one.
+    const HEARTBEAT: Duration = Duration::from_secs(60);
+
+    /// One tick's interval. Larger than the [`advance_until`] step below, so a
+    /// single step can never carry the paused clock across two ticks and the
+    /// exact cycle counts these tests assert stay exact.
+    const TEST_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Advances the paused clock in small steps until `pred` holds or the step
+    /// budget runs out, returning whether it held. Small steps so the paused
+    /// runtime actually wakes the spawned loop between each. Mirrors the
+    /// maintenance supervisor's test helper: every wait in these tests is
+    /// bounded and driven by state, never by a fixed sleep.
+    async fn advance_until(steps: usize, step: Duration, pred: impl Fn() -> bool) -> bool {
+        for _ in 0..steps {
+            if pred() {
+                return true;
+            }
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+        }
+        pred()
+    }
+
+    /// A store holding one tenant prefix, and a `Catalog` over it. The tenant
+    /// carries no commit records: the fold over it is a no-op cycle, which is
+    /// the healthy steady state and still records a successful fold, so it is
+    /// enough to prove a restarted loop is folding again.
+    async fn seeded_store() -> (Arc<dyn ObjectStoreBackend>, Arc<Catalog>, TenantHash) {
+        let inner = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("fold-loop-supervision").hash();
+        inner
+            .put(
+                &format!("t/{}/marker", tenant.to_hex()),
+                Bytes::from_static(b"x"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the tenant prefix discovery lists");
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    shard_count: 1,
+                    ..CatalogConfig::default()
+                },
+            )
+            .expect("catalog builds"),
+        );
+        (store, catalog, tenant)
+    }
+
+    /// One signal's loop context over [`seeded_store`], with the test's panic
+    /// seam installed. The live set is this process's solo set, so the one
+    /// seeded tenant is always owned and the partition is not what these tests
+    /// are about.
+    fn loop_context(
+        catalog: Arc<Catalog>,
+        store: Arc<dyn ObjectStoreBackend>,
+        tenant: TenantHash,
+        tick_hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> LoopContext {
+        let worker = Arc::new(WorkerSet::new(
+            NOW_NS,
+            HEARTBEAT,
+            DEFAULT_LIVENESS_FACTOR,
+            DEFAULT_UNIT_CONCURRENCY,
+        ));
+        let live_set = watch::channel(worker.solo_live_set()).0.subscribe();
+        LoopContext {
+            catalog,
+            store,
+            signal: Signal::Metrics,
+            fallback_allow: Some(vec![tenant]),
+            folder_id: Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0011),
+            interval: TEST_INTERVAL,
+            rng: Arc::new(SystemRng),
+            retention: Arc::new(RetentionConfig::default()),
+            worker,
+            live_set,
+            clock: Arc::new(FixedClock::new(NOW_NS)),
+            tick_hook,
+        }
+    }
+
+    /// A panic in one signal's tick body is caught, counted exactly once on
+    /// `ravel_catalog_fold_loop_restarts_total{signal="metrics"}`, and the
+    /// supervisor restarts the loop so a later tick folds again.
+    ///
+    /// This is the blocker ADR-1693 opened. Before the fold was partitioned, a
+    /// panic killed every replica's loop for that signal and the fold-stalled
+    /// alert fired. Now the panicking replica keeps heartbeating, so it keeps
+    /// its pairs while its peers hold `max by (signal)` fresh, and nothing
+    /// reports it.
+    ///
+    /// Flip to watch it fail against pre-fix code: spawn `run_loop(ctx, rx)`
+    /// here instead of `run_supervisor(...)` and drop the `catch_unwind` in
+    /// `run_loop`'s tick arm. The injected panic then ends the task, the
+    /// restart counter never leaves zero, and no tick ever folds.
+    #[tokio::test(start_paused = true)]
+    async fn a_caught_panic_restarts_the_loop_and_a_later_tick_folds() {
+        let (store, catalog, tenant) = seeded_store().await;
+        let metrics = Arc::new(FoldLoopMetrics::default());
+
+        // Panic on the first tick only; every later tick runs normally. The
+        // supervisor clones the context (and this shared flag) into each
+        // attempt, so the second attempt sees the flag already consumed.
+        let panic_armed = Arc::new(AtomicBool::new(true));
+        let hook_flag = Arc::clone(&panic_armed);
+        let tick_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if hook_flag.swap(false, Ordering::SeqCst) {
+                panic!("injected catalog fold loop panic (test)");
+            }
+        });
+
+        let ctx = loop_context(catalog.clone(), store, tenant, tick_hook);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Small, fixed backoff so the paused-time advance drives the restart.
+        let handle = tokio::spawn(run_supervisor(
+            ctx,
+            shutdown_rx,
+            Arc::clone(&metrics),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+
+        let folded = advance_until(600, Duration::from_millis(100), || {
+            catalog.fold_cycles(Signal::Metrics) >= 1
+        })
+        .await;
+        assert!(
+            folded,
+            "the supervisor must restart the loop and a later tick must fold"
+        );
+        assert!(
+            !panic_armed.load(Ordering::SeqCst),
+            "the one-shot panic must have fired"
+        );
+        assert_eq!(
+            metrics.restarts_for(Signal::Metrics),
+            1,
+            "exactly one restart was counted, not zero (an uncounted death) and not a \
+             restart loop"
+        );
+        assert_eq!(
+            metrics.restarts_for(Signal::Logs),
+            0,
+            "the counter is per signal: only the loop that panicked restarted"
+        );
+        assert_eq!(
+            catalog.fold_cycles(Signal::Metrics),
+            1,
+            "the restarted loop folded on its next tick"
+        );
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            NOW_NS,
+            "the fold after the restart stamps the liveness gauge from the injected clock"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
+    }
+
+    /// Shutdown after a panic stops the loop and does not respawn it, and it is
+    /// observed DURING the restart backoff rather than after it. Every tick
+    /// panics here, so the supervisor is always inside its backoff when the
+    /// drain arrives; the backoff is 60 s and the drain deadline is 5 s, both on
+    /// the paused runtime's virtual clock, so a supervisor that waited the
+    /// backoff out would miss the deadline rather than merely be slow.
+    ///
+    /// Flip to watch it fail against pre-fix code: spawn `run_loop(ctx, rx)`
+    /// here instead of `run_supervisor(...)` and drop the `catch_unwind` in
+    /// `run_loop`'s tick arm. The restart counter never reaches one, so the
+    /// bounded wait below times out.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_after_a_panic_does_not_respawn_the_loop() {
+        const BACKOFF: Duration = Duration::from_secs(60);
+
+        let (store, catalog, tenant) = seeded_store().await;
+        let metrics = Arc::new(FoldLoopMetrics::default());
+        let tick_hook: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(|| panic!("injected catalog fold loop panic (test)"));
+
+        let ctx = loop_context(catalog.clone(), store, tenant, tick_hook);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_supervisor(
+            ctx,
+            shutdown_rx,
+            Arc::clone(&metrics),
+            BACKOFF,
+            BACKOFF,
+        ));
+
+        let panicked = advance_until(600, Duration::from_millis(100), || {
+            metrics.restarts_for(Signal::Metrics) >= 1
+        })
+        .await;
+        assert!(panicked, "the first attempt must panic and be counted");
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let drained = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            drained.is_ok(),
+            "a drain arriving during the {BACKOFF:?} backoff must be observed at once, not \
+             held behind it"
+        );
+        drained.expect("deadline").expect("supervisor joins");
+
+        assert_eq!(
+            metrics.restarts_for(Signal::Metrics),
+            1,
+            "no further attempt is spawned once shutdown arrives, so the restart total stays \
+             at the one attempt that ran"
+        );
+        assert_eq!(
+            catalog.fold_cycles(Signal::Metrics),
+            0,
+            "every tick panicked, so nothing was ever folded"
+        );
+    }
+}
