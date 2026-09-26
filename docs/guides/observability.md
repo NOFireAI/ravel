@@ -1459,10 +1459,11 @@ Labels: `mode` and `signal`, plus `level` on the checksum-mismatch counter and
 
 | Metric | Meaning |
 |---|---|
-| `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), by signal and level. |
+| `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), or an object or record GET the store refused with an error retrying cannot clear (anything but not-found, throttled, timeout, or transient), by signal and level. |
 | `ravel_scrub_postings_disagreement_total` | Objects whose covering name-postings object omitted a `__name__` the object really carries (a false negative), by signal. |
 | `ravel_scrub_seal_divergence_total` | Divergences between the folded snapshot and the re-listed sealed commit history, by signal and reason. |
 | `ravel_scrub_cursor_position` | Gauge. Fraction of the current scrub rotation's commit shard listing entries the content-tier cursor has consumed so far, by signal, in [0,1]. The unit is listing entries (commit, compaction, and rewrite records and tombstones), not data objects: one compaction record can name several parts. |
+| `ravel_scrub_behind_total` | Shard ticks whose content-tier rotation cannot finish inside its window (`--scrub-period`, capped at half the tenant's retention window), by signal: the entries the tick needed to reach the end of the listing by the deadline exceeded four times the rotation's sustained rate. Causes are a sustained commit rate above four times the measured sustained rate, scrub cycles slower than a tick, or a marker held on a unit whose GETs keep failing with a retryable error. A nonzero increase means some objects may expire before they are verified; the log line beside it names the entries per tick needed and allowed, the window, and the period. |
 
 `ravel_scrub_checksum_mismatch_total` is the one to alert on for any increase:
 Ravel keeps no redundant copy to repair a corrupt object from, so a nonzero
