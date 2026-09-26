@@ -120,10 +120,32 @@ pub async fn discover_and_restrict_by_lifecycle(
     fallback_allow: Option<&[TenantHash]>,
 ) -> Result<DiscoveryOutcome, MaintainError> {
     let discovered = ravel_maintain::discover_tenants(store).await?;
+    let (maintained, excluded) = restrict_by_lifecycle(store, &discovered, fallback_allow).await;
+    Ok(DiscoveryOutcome {
+        discovered,
+        maintained,
+        excluded,
+    })
+}
+
+/// The lifecycle restriction of [`discover_and_restrict_by_lifecycle`] over an
+/// arbitrary candidate set, returning the kept tenants and how many were
+/// excluded. The rules are exactly the ones documented there.
+///
+/// This is separate because it costs one `GET t/<hash>/config` per candidate.
+/// A caller that will only act on a subset of the discovered tenants (the
+/// scheduled fold, which owns one partition of them under ADR-1693) must
+/// narrow the set to that subset first, so it pays nothing for a tenant it was
+/// never going to touch.
+pub async fn restrict_by_lifecycle(
+    store: &dyn ObjectStoreBackend,
+    candidates: &[TenantHash],
+    fallback_allow: Option<&[TenantHash]>,
+) -> (Vec<TenantHash>, usize) {
     let fallback: Option<HashSet<TenantHash>> = fallback_allow.map(|a| a.iter().copied().collect());
-    let mut maintained = Vec::with_capacity(discovered.len());
+    let mut maintained = Vec::with_capacity(candidates.len());
     let mut excluded = 0usize;
-    for tenant in &discovered {
+    for tenant in candidates {
         let keep = match read_config_values(store, tenant).await {
             // A durable config record (any lifecycle state) is the sole
             // authority: the tenant is maintained unconditionally, no flag can
@@ -150,11 +172,7 @@ pub async fn discover_and_restrict_by_lifecycle(
             excluded += 1;
         }
     }
-    Ok(DiscoveryOutcome {
-        discovered,
-        maintained,
-        excluded,
-    })
+    (maintained, excluded)
 }
 
 /// Process-global gauges and failure counter for tenant discovery (ADR-0048

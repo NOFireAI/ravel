@@ -4,13 +4,16 @@
 //! The acceptance test drives two maintain processes over one `MemoryStore`
 //! with a live set of two and one tick each, and asserts the exact partition:
 //! every `(tenant, metrics)` pair is folded exactly once, and for a pair it
-//! does not own a process issues exactly one store request, the per-tenant
-//! discovery `GET t/<hash>/config` that precedes any ownership decision. No
-//! LIST of the pair's commit prefix, no `catalog/m/HEAD` peek, no PUT.
+//! does not own a process issues no store request at all. The only request a
+//! tick makes that does not name a pair the process owns is the one
+//! `LISTD t/` that discovers which tenants exist, which is per signal and per
+//! tick rather than per tenant; the test asserts that exact remaining list.
 //!
 //! The remaining tests cover the hand-over bound the ADR states (a pair moves
-//! to a new owner when the previous owner leaves the live set) and the two
-//! modes that stop folding on a schedule.
+//! to a new owner when the previous owner leaves the live set), the wiring of
+//! the scheduled fold in a running server (a maintain process folds the live
+//! set its heartbeat publishes, an `all` process folds every unit), and the
+//! two modes that stop folding on a schedule.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -281,8 +284,7 @@ fn sorted_hex(tenants: &[TenantHash]) -> Vec<String> {
 
 /// THE ADR-1693 acceptance test. Two maintain processes, one live set of two,
 /// one tick each: every `(tenant, metrics)` pair folds exactly once, and the
-/// non-owner of a pair issues exactly one request naming that tenant, the
-/// discovery config read that precedes any ownership decision.
+/// non-owner of a pair issues no request naming that tenant at all.
 #[tokio::test]
 async fn two_maintain_workers_fold_each_unit_exactly_once_and_the_non_owner_issues_no_requests() {
     let inner = Arc::new(MemoryStore::new());
@@ -323,12 +325,16 @@ async fn two_maintain_workers_fold_each_unit_exactly_once_and_the_non_owner_issu
     let report_a = a.tick(&live_set, SEAL_NOW_NS).await;
     let report_b = b.tick(&live_set, SEAL_NOW_NS).await;
 
-    // Both processes discover and maintain every tenant: discovery is
-    // per-process and never gated on ownership (ADR-0065 decision 2).
+    // Both processes discover every tenant: discovery is per-process and never
+    // gated on ownership (ADR-0065 decision 2). The lifecycle restriction runs
+    // only over the pairs a process owns, so `maintained` counts those and
+    // nothing else.
     assert_eq!(report_a.discovered, TENANTS.len());
-    assert_eq!(report_a.maintained, TENANTS.len());
     assert_eq!(report_b.discovered, TENANTS.len());
-    assert_eq!(report_b.maintained, TENANTS.len());
+    assert_eq!(report_a.maintained, expected_a.len());
+    assert_eq!(report_b.maintained, expected_b.len());
+    assert_eq!(report_a.excluded, 0);
+    assert_eq!(report_b.excluded, 0);
 
     // Each process folded exactly the pairs it owns, and nothing else.
     assert_eq!(sorted_hex(&report_a.owned), sorted_hex(&expected_a));
@@ -384,10 +390,8 @@ async fn two_maintain_workers_fold_each_unit_exactly_once_and_the_non_owner_issu
     }
 
     // The cost claim, counted on the instrumented store. For a pair it does not
-    // own, a process's requests naming that tenant are exactly the one
-    // discovery config read, which precedes any ownership decision
-    // (`tenant_discovery::discover_and_restrict_by_lifecycle`). Zero LISTs of
-    // the commit prefix, zero HEAD peeks, zero PUTs.
+    // own, a process issues no request naming that tenant: no lifecycle config
+    // read, no `catalog/m/HEAD` peek, no LIST of the commit prefix, no PUT.
     for (process, store, owned) in [("A", &a.store, &expected_a), ("B", &b.store, &expected_b)] {
         for tenant in &tenants {
             if owned.contains(tenant) {
@@ -395,11 +399,26 @@ async fn two_maintain_workers_fold_each_unit_exactly_once_and_the_non_owner_issu
             }
             assert_eq!(
                 store.requests_naming(tenant),
-                vec![format!("GET t/{}/config", tenant.to_hex())],
-                "process {process} must issue only the discovery config read for a pair it does \
-                 not own"
+                Vec::<String>::new(),
+                "process {process} must issue no request at all for a pair it does not own"
             );
         }
+
+        // And the exact remaining list: every other request the tick made is
+        // the single delimited listing that discovers which tenants exist,
+        // which is per signal and per tick, not per tenant.
+        let owned_hex: Vec<String> = owned.iter().map(|t| format!("t/{}/", t.to_hex())).collect();
+        let unowned_requests: Vec<String> = store
+            .requests()
+            .into_iter()
+            .filter(|entry| !owned_hex.iter().any(|prefix| entry.contains(prefix)))
+            .collect();
+        assert_eq!(
+            unowned_requests,
+            vec!["LISTD t/".to_string()],
+            "process {process}'s only request that does not name a pair it owns is the \
+             per-tick tenant discovery listing"
+        );
     }
 
     // The owner, by contrast, really did pay for the fold: the HEAD peek, the
