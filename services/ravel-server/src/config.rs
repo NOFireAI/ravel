@@ -2709,6 +2709,8 @@ pub const PERF_SOURCE_BUDGET_CARVE: &str = "budget-carve";
 pub const PERF_SOURCE_BUDGET_CARVE_LOOPBACK: &str = "budget-carve-loopback";
 
 /// The operator's explicit performance flags: `None` per field means "derive".
+/// One field is not a flag: `store_is_loopback`, a fact about the store the
+/// derivation reads, computed from `--store` and `--s3-endpoint`.
 ///
 /// A parsed, typed mirror of the CLI flags rather than the CLI itself, so
 /// [`resolve_performance_defaults`] takes no `Cli`, does no string parsing, and
@@ -8448,8 +8450,9 @@ mod tests {
     /// real query permanently. Startup must refuse instead.
     ///
     /// The refusal message is asserted, not just the refusal: with a `0`
-    /// budget no `--cache-max-bytes` value satisfies the check (any `n >= 1`
-    /// makes the sum `2n > 0`, and `0` still fails the `>=` comparison), so a
+    /// budget no cache flag value satisfies the check (both caps are unsigned,
+    /// so their sum is never below `0`, and `0` still fails the `>=`
+    /// comparison), so a
     /// message naming that flag as the fix sends the operator after a knob
     /// that cannot help. The zero-budget arm must point at the host's memory
     /// (or its cgroup limit) and at the overhead reserve instead.

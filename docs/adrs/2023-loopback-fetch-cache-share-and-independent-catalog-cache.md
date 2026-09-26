@@ -92,5 +92,8 @@ the stock entry passes no flags.
 - The shared SQL/fetch remainder on a loopback store shrinks by the extra
   share: 15 points of the budget, about 4.6 GB on the reference host. The
   error-ratio bound in decision 3 is what guards it.
+- With `--cache-dir` set, the fetcher cache's disk tier is bounded by the same
+  resolved ceiling as its RAM tier, so on a loopback store the disk tier also
+  grows from 25% to 40% of the budget, on the same disk the store reads from.
 - `--cache-max-bytes` no longer resizes the catalog cache. A deployment that
   relied on the flag to grow both sets `--catalog-cache-max-bytes` as well.

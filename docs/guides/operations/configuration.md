@@ -1170,8 +1170,8 @@ shard-hour prefix, a snapshot's parts by the one directory they share, its
 postings and column stats by theirs, and a LIST by the prefix it lists. So
 raising this ceiling adds breadth across prefixes and never depth within one.
 
-Two more settings are derived the same way: `--cache-max-bytes` (fetcher
-cache, 25% normally or 40% against a loopback `--s3-endpoint`) and
+Three more settings are derived the same way: `--cache-max-bytes` (fetcher
+cache, 25% normally or 40% against a loopback `--s3-endpoint`),
 `--catalog-cache-max-bytes` (catalog byte cache, always a separate 5%
 ceiling; 256 MiB each if memory is unknown) and `--gc-max-query-duration` (11
 minutes). Each cache flag bounds only its own cache; setting one never
