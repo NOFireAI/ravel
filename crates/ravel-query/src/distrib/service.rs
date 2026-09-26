@@ -83,6 +83,7 @@ use ravel_types::{SeriesId, Signal, TenantHash};
 
 use ravel_rspan::SpanQuery;
 
+use crate::GetLimiter;
 use crate::config::{ByteLimit, EngineConfig};
 use crate::distrib::codec;
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
@@ -166,8 +167,9 @@ pub trait SegmentResolver: Send + Sync {
 }
 
 /// How many pinned identities one slice resolves concurrently. Each costs one
-/// record GET (two for an erasure-rewrite part), so this bounds the burst a
-/// slice adds ahead of its data-object reads.
+/// record GET (two for an erasure-rewrite part). Every one of those GETs also
+/// holds a permit of the resolver's GET limiter, so this only bounds how many
+/// wait for one.
 const RESOLVE_CONCURRENCY: usize = 16;
 
 /// Resolve every identity in order, stopping at the first refusal.
@@ -205,6 +207,9 @@ pub struct ReconstructingSegmentResolver {
     store: Arc<dyn ObjectStoreBackend>,
     tenant_hash: TenantHash,
     signal: Signal,
+    /// The process-wide GET limiter (ADR-1195) the worker's data-object GETs
+    /// also draw from, so record GETs never add to the per-worker bound.
+    get_limiter: Arc<GetLimiter>,
 }
 
 impl ReconstructingSegmentResolver {
@@ -212,22 +217,32 @@ impl ReconstructingSegmentResolver {
         store: Arc<dyn ObjectStoreBackend>,
         tenant_hash: TenantHash,
         signal: Signal,
+        get_limiter: Arc<GetLimiter>,
     ) -> Self {
         ReconstructingSegmentResolver {
             store,
             tenant_hash,
             signal,
+            get_limiter,
         }
     }
 
     /// GET one record in full, charging the request and its bytes to the slice.
+    /// The GET holds a permit of the same limiter the data-object GETs draw
+    /// from, and only around the store call.
     async fn get_record(
         &self,
         key: &str,
         accounting: &QueryAccounting,
     ) -> Result<bytes::Bytes, ResolveIdentityError> {
-        accounting.record_s3_request(AccountedOp::Get);
-        match self.store.get(key, GetRange::Full).await {
+        let got = match self.get_limiter.acquire().await {
+            Ok(_permit) => {
+                accounting.record_s3_request(AccountedOp::Get);
+                self.store.get(key, GetRange::Full).await
+            }
+            Err(closed) => Err(StoreError::Transient(closed.to_string())),
+        };
+        match got {
             Ok(outcome) => {
                 accounting.add_s3_bytes(AccountedOp::Get, outcome.data.len() as u64);
                 Ok(outcome.data)
@@ -1769,7 +1784,11 @@ mod reconstruct_tests {
     }
 
     fn resolver(store: Arc<dyn ObjectStoreBackend>) -> ReconstructingSegmentResolver {
-        ReconstructingSegmentResolver::new(store, tenant(), Signal::Metrics)
+        ReconstructingSegmentResolver::new(store, tenant(), Signal::Metrics, limiter(8))
+    }
+
+    fn limiter(permits: usize) -> Arc<GetLimiter> {
+        Arc::new(GetLimiter::new(permits).expect("nonzero permits"))
     }
 
     /// A commit record whose every field differs from the identity's non-key
@@ -2024,7 +2043,7 @@ mod reconstruct_tests {
         let store = store_with_l0().await;
         let other = ravel_types::TenantId::new("other-tenant".to_string()).hash();
         let accounting = QueryAccounting::new();
-        let err = ReconstructingSegmentResolver::new(store, other, Signal::Metrics)
+        let err = ReconstructingSegmentResolver::new(store, other, Signal::Metrics, limiter(8))
             .resolve(&l0_identity(), &accounting)
             .await
             .expect_err("another tenant's record is absent");
@@ -2390,6 +2409,125 @@ mod reconstruct_tests {
             .await
             .expect_err("the second identity is refused");
         assert_mismatch(&err, &l0_key(), "object_size");
+    }
+
+    /// Counts the GETs in flight at its own `get` and keeps the peak. Each GET
+    /// yields before completing, so on a current-thread runtime every GET a
+    /// caller lets start overlaps every other one it lets start.
+    struct PeakGetStore {
+        inner: MemoryStore,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for PeakGetStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.gets.fetch_add(1, SeqCst);
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            let got = self.inner.get(key, range).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            got
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Record GETs draw from the GET limiter the resolver was built with, the
+    /// same process-wide one the data-object GETs use (ADR-1195), so
+    /// `RESOLVE_CONCURRENCY` never lets a slice put more record GETs in flight
+    /// than that limiter's permits. Eight pinned identities resolve under
+    /// limiters of 1 and 3 permits; the store's own peak in-flight count must
+    /// equal the permit count exactly, and every identity costs one GET.
+    #[tokio::test]
+    async fn record_gets_are_bounded_by_the_shared_get_limiter() {
+        for permits in [1usize, 3] {
+            let inner = MemoryStore::new();
+            inner
+                .put(
+                    &l0_key(),
+                    bytes::Bytes::from(l0_record().encode_to_vec()),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+            let store = Arc::new(PeakGetStore {
+                inner,
+                in_flight: Default::default(),
+                peak: Default::default(),
+                gets: Default::default(),
+            });
+            let resolver = ReconstructingSegmentResolver::new(
+                Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+                tenant(),
+                Signal::Metrics,
+                limiter(permits),
+            );
+            let identities = vec![l0_identity(); 8];
+            let accounting = QueryAccounting::new();
+            let refs = resolve_identities(&resolver, &identities, &accounting)
+                .await
+                .expect("every identity resolves");
+            assert_eq!(refs.len(), 8);
+            use std::sync::atomic::Ordering::SeqCst;
+            assert_eq!(store.gets.load(SeqCst), 8, "one record GET per identity");
+            assert_eq!(
+                store.peak.load(SeqCst),
+                permits,
+                "record GETs in flight must be capped at the limiter's {permits} permits"
+            );
+        }
     }
 
     /// A snapshot resolver miss is retryable, not terminal: the coordinator

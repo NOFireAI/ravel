@@ -868,6 +868,7 @@ impl FragmentService {
             self.inner.store.clone(),
             tenant_hash,
             signal,
+            self.inner.get_limiter.clone(),
         )))
     }
 
@@ -4148,11 +4149,15 @@ mod tests {
         seg: &ravel_catalog::SegmentRef,
     ) {
         let accounting = ravel_types::accounting::QueryAccounting::new();
-        let resolved =
-            ReconstructingSegmentResolver::new(store.clone(), tenant_hash, Signal::Metrics)
-                .resolve(&codec::encode_segment_identity(seg), &accounting)
-                .await
-                .expect("the pin resolves");
+        let resolved = ReconstructingSegmentResolver::new(
+            store.clone(),
+            tenant_hash,
+            Signal::Metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        )
+        .resolve(&codec::encode_segment_identity(seg), &accounting)
+        .await
+        .expect("the pin resolves");
         assert_eq!(&resolved, seg);
         assert_eq!(
             accounting

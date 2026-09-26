@@ -1641,7 +1641,10 @@ objects were all still readable.
 4. **Request count.** A worker issues one record GET per pinned L0 segment,
    one per pinned L1 part, and two for an L1 part only a rewrite record
    describes (the compaction key misses first), on top of the data-object
-   reads local execution also issues.
+   reads local execution also issues. Every record GET holds a permit of the
+   worker's process-wide GET limiter (ADR-1195), the one its data-object GETs
+   draw from, so instantaneous rate stays capped by `max_parallel_slices`
+   times the per-worker GET semaphore.
 
 5. **Unchanged.** The `queryfrag` wire and `PROTOCOL_VERSION` are unchanged.
    Cross-cluster federation is unchanged: a resolve-scope request still
