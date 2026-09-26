@@ -105,6 +105,7 @@ pub fn alert_instances(
     if let Some(pair) = instances.windows(2).find(|w| w[0].labels == w[1].labels) {
         return Err(AlertError::DuplicateAlertIdentity {
             rule_id: rule.rule_id.clone(),
+            alert_id: pair[0].alert_id,
             labels: pair[0].labels.clone(),
         });
     }
@@ -298,9 +299,25 @@ mod tests {
             (series(&[("__name__", "probe_up"), ("instance", "a")]), 0.0),
         ]);
         let err = alert_instances(&rule, &result).expect_err("duplicate");
+        // The message reaches the evaluator's warn log every failing tick, so
+        // it names the labels and the colliding identity but no label value.
+        let alert_id = compute_alert_id("instance-down", &pairs(&[("instance", "a")]));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "rule \"instance-down\" produced alert {} with label names [instance] \
+                 from more than one series",
+                alert_id.to_hex()
+            )
+        );
         match err {
-            AlertError::DuplicateAlertIdentity { rule_id, labels } => {
+            AlertError::DuplicateAlertIdentity {
+                rule_id,
+                alert_id: id,
+                labels,
+            } => {
                 assert_eq!(rule_id, "instance-down");
+                assert_eq!(id, alert_id);
                 assert_eq!(labels, pairs(&[("instance", "a")]));
             }
             other => panic!("expected DuplicateAlertIdentity, got {other:?}"),

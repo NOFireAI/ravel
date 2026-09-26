@@ -2,6 +2,8 @@
 //! [`AlertError`]; nothing in this crate panics, unwraps, or expects on a
 //! production path (CLAUDE.md invariants).
 
+use crate::record::AlertId;
+
 /// An alerting-engine error.
 #[derive(Debug, thiserror::Error)]
 pub enum AlertError {
@@ -49,10 +51,16 @@ pub enum AlertError {
     /// a query selecting several metric names, which differ only in the
     /// dropped `__name__`, or a series label overridden by a rule label. The
     /// rule fails the tick rather than let one series silently overwrite the
-    /// other.
-    #[error("rule {rule_id:?} produced the alert label set {labels:?} from more than one series")]
+    /// other. The message names the label names and the colliding `alert_id`
+    /// but no label value, because it is logged on every failing tick.
+    #[error(
+        "rule {rule_id:?} produced alert {} with label names [{}] from more than one series",
+        alert_id.to_hex(),
+        label_names(labels)
+    )]
     DuplicateAlertIdentity {
         rule_id: String,
+        alert_id: AlertId,
         labels: Vec<(String, String)>,
     },
 
@@ -66,4 +74,14 @@ pub enum AlertError {
     /// `ravel-logseg`'s own typed error unchanged.
     #[error(transparent)]
     Segment(#[from] ravel_logseg::LogSegError),
+}
+
+/// The names of `labels`, comma-separated, for a message that must not carry
+/// label values.
+fn label_names(labels: &[(String, String)]) -> String {
+    labels
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
