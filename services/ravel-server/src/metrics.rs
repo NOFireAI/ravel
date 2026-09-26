@@ -10566,7 +10566,9 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
         use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
         use opentelemetry_proto::tonic::resource::v1::Resource;
-        use ravel_ingest::{AdmissionController, AdmissionLimits, IngestConfig, SystemClock, WriteMode};
+        use ravel_ingest::{
+            AdmissionController, AdmissionLimits, IngestConfig, SystemClock, WriteMode,
+        };
         use ravel_object_store::ObjectStoreBackend;
         use ravel_object_store::memory::MemoryStore;
         use ravel_types::logstream::{AttrValue, log_stream_id};
@@ -10594,7 +10596,10 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             for i in 0..100_000u32 {
                 let host = i.to_string();
                 let attrs = vec![
-                    ("service.name".to_string(), AttrValue::Str("api".to_string())),
+                    (
+                        "service.name".to_string(),
+                        AttrValue::Str("api".to_string()),
+                    ),
                     ("host".to_string(), AttrValue::Str(host.clone())),
                 ];
                 let stream_id = log_stream_id(&attrs, "", "", &[]);
@@ -10795,10 +10800,13 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             ..Default::default()
         });
         pipeline.shard_skew = vec![
-            (0, ravel_ingest::ShardSkewStats {
-                messages_enqueued: 5,
-                ..Default::default()
-            }),
+            (
+                0,
+                ravel_ingest::ShardSkewStats {
+                    messages_enqueued: 5,
+                    ..Default::default()
+                },
+            ),
             (
                 ravel_catalog::MAX_SHARD_COUNT,
                 ravel_ingest::ShardSkewStats {
