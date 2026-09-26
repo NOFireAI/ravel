@@ -236,8 +236,7 @@ A minimal example is in
 | `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set. See "Query-audit token key" below. |
 | `spec.gateway.replicas` | integer | `1` | |
 | `spec.gateway.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | `requests` / `limits` maps, as in a Pod spec. An explicit block replaces the default entirely rather than merging with it. |
-| `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
-| `spec.gateway.fold.intervalSecs` | integer | none | `--fold-interval-secs`. |
+| `spec.gateway.fold` | object | none | Retired by ADR-1693, and refused rather than ignored: the scheduled fold runs on the maintain tier, and a `ravel-server` in `--mode gateway` refuses both fold flags at startup. Setting this block degrades the cluster with reason `GatewayFoldUnsupported` and renders nothing; move it to `spec.maintain.fold`. |
 | `spec.gateway.maxInflightFlushes` | integer | `1` | `--max-inflight-flushes`. Per-shard cap on concurrent flushes. This is the cross-tenant flush isolation control, not only a throughput knob: at `1` one tenant's stalled flush blocks co-resident tenants' flushes on that shard, so raise it to bound that. Gateway-only (ingest runs in no other tier). Omit to keep the server default of `1`; `0` is rejected at admission. |
 | `spec.gateway.ingestAffinity` | object | none | Layer-7 ingest affinity. Omit and nothing is rendered. Present, it pins tenant identity to a stable subset of gateway replicas, cutting flush PUTs by `replicas / subsetSize`, via one of two backends. Full reference, backend comparison, and sizing guidance in [ingest-affinity.md](ingest-affinity.md). |
 | `spec.gateway.ingestAffinity.enabled` | boolean | `true` | `false` deletes the rendered objects and returns to the affinity-absent render. |
@@ -256,6 +255,8 @@ A minimal example is in
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
 | `spec.maintain.replicas` | integer | `1` | |
 | `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. |
+| `spec.maintain.fold.disabled` | boolean | `false` | `--disable-fold` on the maintain pods, the only tier the operator renders that runs the scheduled fold (ADR-1693). Fold is a query-cost optimization only; disabling it never changes results. |
+| `spec.maintain.fold.intervalSecs` | integer | none | `--fold-interval-secs` on the maintain pods. |
 | `spec.maintain.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
 | `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |

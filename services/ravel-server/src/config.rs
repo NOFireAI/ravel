@@ -63,10 +63,26 @@ impl Mode {
     /// [`ravel_maintain::WorkerSet`]'s live set, and for [`Mode::All`], which
     /// folds everything as a solo process. [`Mode::Gateway`] and
     /// [`Mode::Query`] scale on request load rather than on fold work, so they
-    /// no longer fold on a timer; they keep the on-demand route
-    /// ([`Mode::mounts_on_demand_fold`]).
+    /// no longer fold on a timer. [`Mode::Query`] still serves the on-demand
+    /// route ([`Mode::mounts_on_demand_fold`]); [`Mode::Gateway`] mounts no
+    /// fold route at all and cannot fold by any route.
     pub fn runs_scheduled_fold(self) -> bool {
         matches!(self, Mode::All | Mode::Maintain)
+    }
+
+    /// Whether [`crate::metrics`] renders `ravel_catalog_fold_cycles_total`
+    /// and `ravel_catalog_fold_failures_total` for this mode: every mode a
+    /// fold can run in by either route, so an on-demand fold's failures are
+    /// visible on `/metrics` where it runs. That is [`Mode::Query`] on top of
+    /// the two scheduled-fold modes; [`Mode::Gateway`] renders no fold family
+    /// at all.
+    ///
+    /// Deliberately mode-only, ignoring `--disable-fold`: those two counters
+    /// render wherever the liveness gauge does, and that gauge is rendered by
+    /// mode alone (ADR-1693 decision 5) so a maintain process started with
+    /// `--disable-fold` still shows a `0` gauge and pages.
+    pub fn renders_fold_counters(self) -> bool {
+        self.runs_scheduled_fold() || self.mounts_on_demand_fold()
     }
 }
 
@@ -571,7 +587,8 @@ pub struct Cli {
     pub tenant_kms_config: Option<PathBuf>,
 
     /// Disables the per-(tenant, signal) background catalog fold task, which
-    /// runs in `--mode maintain` and `--mode all` and nowhere else.
+    /// runs in `--mode maintain` and `--mode all` and nowhere else. The other
+    /// two modes refuse this flag at startup rather than ignore it.
     /// Folding is a pure optimization
     /// for query resolve cost; disabling it never changes query results, only
     /// their cost (ADR-0020).
@@ -579,7 +596,8 @@ pub struct Cli {
     pub disable_fold: bool,
 
     /// How often each tenant's fold task wakes up to check for newly sealed
-    /// hours, in seconds. Read only in the modes that run that task.
+    /// hours, in seconds. Read only in the modes that run that task, and
+    /// refused at startup in the two that do not.
     #[arg(long, default_value_t = 300)]
     pub fold_interval_secs: u64,
 
@@ -3780,6 +3798,56 @@ fn parse_bool_field(spec: &str, key: &str, value: &str) -> anyhow::Result<bool> 
 }
 
 impl Cli {
+    /// Parses `args` as [`Parser::parse_from`] does, and then refuses the
+    /// flags the parsed `--mode` never reads (ADR-1693): `--disable-fold` and
+    /// `--fold-interval-secs` configure the scheduled fold, which runs in
+    /// [`Mode::Maintain`] and [`Mode::All`] and nowhere else. The check is on
+    /// whether the flag was PASSED, read from [`ArgMatches::value_source`],
+    /// not on its value: `--fold-interval-secs` carries a generated default of
+    /// 300 that every mode has always had, and comparing against that default
+    /// would both refuse a gateway that named no flag and accept one that
+    /// passed `--fold-interval-secs 300` explicitly.
+    ///
+    /// The error is a [`clap::Error`] rather than an [`anyhow::Error`] so the
+    /// binary reports it exactly as it reports an unknown flag, and so `--help`
+    /// keeps going to stdout at exit 0 through the same path.
+    pub fn parse_validated_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let matches = Self::command().try_get_matches_from(args)?;
+        let cli = Self::from_arg_matches(&matches)?;
+        if !cli.mode.runs_scheduled_fold() {
+            for (id, flag) in [
+                ("disable_fold", "--disable-fold"),
+                ("fold_interval_secs", "--fold-interval-secs"),
+            ] {
+                let passed = !matches!(
+                    matches.value_source(id),
+                    None | Some(clap::parser::ValueSource::DefaultValue)
+                );
+                if passed {
+                    let mode = cli
+                        .mode
+                        .to_possible_value()
+                        .map_or_else(|| "gateway".to_string(), |v| v.get_name().to_string());
+                    return Err(Self::command().error(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        format!(
+                            "{flag} configures the scheduled catalog fold, which --mode {mode} \
+                             never runs (ADR-1693). Drop the flag, or set it on the maintain \
+                             tier, which is where the scheduled fold runs."
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(cli)
+    }
+
     /// The `backend_identity` this process compares against a
     /// `sys/qualification` record at startup (ADR-0050 section 6, D2), or
     /// `None` for the exempt memory store. Built from
@@ -7310,6 +7378,60 @@ mod tests {
             msg.contains("credential-file, tenant, tls"),
             "the expected-key list must name tenant, got: {msg}"
         );
+    }
+
+    /// ADR-1693: `--disable-fold` and `--fold-interval-secs` configure the
+    /// scheduled fold, which runs in `maintain` and `all` and nowhere else. A
+    /// mode that never schedules one refuses them at startup: accepting a flag
+    /// nothing reads is how a fleet ends up believing it turned the fold off
+    /// on a process that was never going to run it.
+    #[test]
+    fn fold_flags_are_refused_in_the_modes_that_never_schedule_a_fold() {
+        for mode in ["gateway", "query"] {
+            for flag in [
+                vec!["--disable-fold"],
+                vec!["--fold-interval-secs", "900"],
+                vec!["--disable-fold", "--fold-interval-secs", "900"],
+            ] {
+                let mut argv = vec!["ravel-server", "--mode", mode];
+                argv.extend_from_slice(&flag);
+                let err = Cli::parse_validated_from(argv.clone())
+                    .expect_err(&format!("{argv:?} must be refused at startup"));
+                let message = err.to_string();
+                assert!(
+                    message.contains(flag[0]),
+                    "the refusal must name {}, got: {message}",
+                    flag[0]
+                );
+                assert!(
+                    message.contains(mode),
+                    "the refusal must name the mode {mode}, got: {message}"
+                );
+            }
+        }
+
+        // Where the scheduled fold runs, both flags parse and reach the Cli.
+        for mode in ["maintain", "all"] {
+            let cli = Cli::parse_validated_from([
+                "ravel-server",
+                "--mode",
+                mode,
+                "--disable-fold",
+                "--fold-interval-secs",
+                "900",
+            ])
+            .unwrap_or_else(|err| panic!("--mode {mode} must accept the fold flags: {err}"));
+            assert!(cli.disable_fold);
+            assert_eq!(cli.fold_interval_secs, 900);
+        }
+
+        // The refusal is on the flag being PASSED, not on the value: a gateway
+        // that names neither flag still starts and still carries the generated
+        // default that `docs/reference/ravel-server-flags.md` documents.
+        let cli = Cli::parse_validated_from(["ravel-server", "--mode", "gateway"])
+            .expect("a gateway that passes no fold flag starts");
+        assert!(!cli.disable_fold);
+        assert_eq!(cli.fold_interval_secs, 300);
     }
 
     /// A zero (or negative) `--gc-*` duration must be rejected at parse time,

@@ -266,13 +266,22 @@ an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.
 
 ### Catalog fold liveness (`ravel_catalog_fold_*`)
 
-Labels: `mode`, `signal`. All three families render in the two modes that run
-the scheduled fold, `maintain` and `all`, with one series per
-folded signal (`metrics`, `logs`, `spans`). A `gateway` or `query` process
-renders none of them at all: it folds only when someone calls the on-demand
-route, so a liveness gauge there would be stale by construction. What still
-stops the loop inside a folding mode is `--disable-fold`, which returns no
-fold tasks; such a process reports zeros permanently.
+Labels: `mode`, `signal`. Which of the three a process renders follows from
+the routes by which that mode can fold, with one series per folded signal
+(`metrics`, `logs`, `spans`):
+
+- `maintain` and `all` run the scheduled fold and render all three.
+- `query` renders the two counters and no gauge. It folds only when someone
+  calls the on-demand `POST /api/v1/admin/fold` route it keeps, so an
+  on-demand fold's failures there are visible on `/metrics`, but nothing
+  makes such a fold recur and a liveness gauge would be stale by
+  construction on a healthy process.
+- `gateway` renders none of the three. It mounts no fold route at all and so
+  folds by neither route.
+
+The rule is the mode alone. `--disable-fold` still stops the loop inside a
+folding mode, which returns no fold tasks; such a process renders all three
+families and reports zeros permanently.
 
 The `ravel_catalog_fold_stamped_*` pair shares this prefix and is not part of
 this family. It is stamp coverage, documented under declared-column
@@ -344,8 +353,12 @@ groups:
     # on a timer, ADR-1693), or one running --disable-fold everywhere. Such a
     # fleet must drop this rule or inhibit it; the state walkthrough below
     # explains why that opt-out is deliberate. A gateway-only or query-only
-    # fleet is in that class: those modes keep the on-demand fold route but
-    # emit no fold series at all, so the `absent()` arm is what fires there.
+    # fleet is in that class. Neither mode renders
+    # ravel_catalog_fold_last_success_timestamp_seconds, so the `absent()` arm
+    # is what fires there. A query process does render
+    # ravel_catalog_fold_cycles_total and _failures_total, for the on-demand
+    # `POST /api/v1/admin/fold` route it keeps; a gateway process folds by no
+    # route and emits no fold series at all.
     rules:
       - alert: RavelCatalogFoldStalled
         expr: |

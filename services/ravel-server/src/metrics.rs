@@ -1839,11 +1839,13 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     // loop that has died leaves its own series standing and going stale
     // instead of vanishing into an aggregate its siblings keep fresh.
     //
-    // They render only in the modes that run the scheduled fold (ADR-1693
-    // decision 5). A gateway or query process no longer folds on a timer, so
-    // rendering its liveness gauge there would publish a series that is stale
-    // by construction and fire the fold-liveness alert on a healthy fleet.
-    if !mode.runs_scheduled_fold() {
+    // The two counters render wherever a fold can run by either route
+    // (`Mode::renders_fold_counters`), so an on-demand fold's cycles and
+    // failures are visible on `/metrics` in the process that served it: a
+    // query process folds only through `POST /api/v1/admin/fold`, and
+    // `Catalog::fold` moves these counters whichever route called it. A
+    // gateway process folds by no route and renders no fold family at all.
+    if !mode.renders_fold_counters() {
         return;
     }
 
@@ -1886,6 +1888,15 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     // succeeded since this process started, which is why the alert rule in
     // docs/guides/observability.md carries a `for:` long enough to cover a
     // freshly started process's first fold interval.
+    //
+    // Unlike the counters above it renders only where a fold runs on a
+    // SCHEDULE (ADR-1693 decision 5). Nothing makes an on-demand fold recur,
+    // so a gauge in a query process would age past the alert threshold on a
+    // healthy fleet and page for a fold nobody asked for.
+    if !mode.runs_scheduled_fold() {
+        return;
+    }
+
     write_header(
         out,
         "ravel_catalog_fold_last_success_timestamp_seconds",
@@ -7174,13 +7185,16 @@ mod tests {
         }
     }
 
-    /// The fold families render exactly in the modes that run the scheduled
-    /// fold (ADR-1693 decision 5). A gateway or query process folds only when
-    /// someone calls the on-demand route, so a liveness gauge there is stale by
+    /// The liveness gauge renders exactly in the modes that run the scheduled
+    /// fold (ADR-1693 decision 5): a gateway or query process folds only when
+    /// someone calls the on-demand route, so a gauge there is stale by
     /// construction and its age fires the fold-liveness alert on a healthy
-    /// fleet. The same snapshot is rendered in all four modes and the series
-    /// count is pinned per mode, so gating that dropped a mode that does fold
-    /// fails here too.
+    /// fleet. The two counters render one mode wider, wherever a fold can run
+    /// by either route, so an on-demand fold's failures are visible on
+    /// `/metrics` in the process that served it. A gateway folds by no route
+    /// and renders nothing. The same snapshot is rendered in all four modes
+    /// and the series count is pinned per family per mode, so gating that
+    /// dropped a mode that does fold fails here too.
     #[test]
     fn fold_families_render_only_in_the_modes_that_fold() {
         let snapshot = CatalogCountersSnapshot {
@@ -7207,18 +7221,21 @@ mod tests {
             ..Default::default()
         };
 
-        for (mode, expected_series) in [
-            (Mode::All, 3),
-            (Mode::Maintain, 3),
-            (Mode::Gateway, 0),
-            (Mode::Query, 0),
+        for (mode, expected_counters, expected_gauge) in [
+            (Mode::All, 3, 3),
+            (Mode::Maintain, 3, 3),
+            (Mode::Query, 3, 0),
+            (Mode::Gateway, 0, 0),
         ] {
             let mut out = String::new();
             render_catalog_family(&mut out, mode, &snapshot);
-            for family in [
-                "ravel_catalog_fold_cycles_total",
-                "ravel_catalog_fold_failures_total",
-                "ravel_catalog_fold_last_success_timestamp_seconds",
+            for (family, expected_series) in [
+                ("ravel_catalog_fold_cycles_total", expected_counters),
+                ("ravel_catalog_fold_failures_total", expected_counters),
+                (
+                    "ravel_catalog_fold_last_success_timestamp_seconds",
+                    expected_gauge,
+                ),
             ] {
                 let samples = out
                     .lines()

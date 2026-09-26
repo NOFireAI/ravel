@@ -13,20 +13,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (ADR-1693, issue #1693). A `maintain` process folds only the
   `(tenant, signal)` pairs it owns under the rendezvous hash and heartbeat
   live set that already distribute maintenance units, and it tests ownership
-  before reading that pair's `HEAD`, so a non-owner issues no object-store
-  request at all for a pair it does not own. Scaling `maintain` to N replicas
-  therefore divides the fold's request cost N ways instead of running N full
-  copies of it, and a replica leaving the fleet hands its pairs to the
-  survivors within the liveness window. `--mode all` computes its live set as
-  itself alone and keeps folding everything. `gateway` and `query` processes
-  no longer fold on a timer; they keep the on-demand
-  `POST /api/v1/admin/fold` route, which is unchanged. A deployment running
-  neither `maintain` nor `all` no longer folds on a timer at all, and must add
-  a `maintain` process. The three `ravel_catalog_fold_*` liveness families now
-  render only in the modes that fold, so a `gateway` or `query` process
-  publishes no permanently stale gauge; `RavelCatalogFoldStalled` fires
-  through its `absent()` arm on a fleet with no folding process. The fold also
-  reads the injected maintain clock rather than the system clock.
+  before every per-tenant read, the pair's lifecycle `t/<hash>/config` record
+  and its `HEAD` peek alike, so a non-owner issues no object-store request at
+  all for a pair it does not own. The only request a tick makes that no owned
+  pair accounts for is the single delimited listing of `t/` that discovers the
+  tenants. Scaling `maintain` to N replicas therefore divides the fold's
+  request cost N ways instead of running N full copies of it, and a replica
+  leaving the fleet hands its pairs to the survivors within the liveness
+  window. `--mode all` computes its live set as itself alone and keeps folding
+  everything. `gateway` and `query` processes no longer fold on a timer. A
+  `query` process keeps the on-demand `POST /api/v1/admin/fold` route, which
+  is unchanged; a `gateway` process mounts no fold route at all, as before. A
+  deployment running neither `maintain` nor `all` no longer folds on a timer
+  at all, and must add a `maintain` process. `--disable-fold` and
+  `--fold-interval-secs` are now refused at startup in `--mode gateway` and
+  `--mode query` instead of being accepted and ignored, and the operator
+  renders them on the maintain tier: `spec.maintain.fold` replaces
+  `spec.gateway.fold`, which is now refused with a `Degraded` condition
+  (reason `GatewayFoldUnsupported`) naming the field that replaces it.
+  `ravel_catalog_fold_last_success_timestamp_seconds` now renders only in the
+  two modes that fold on a schedule, so no process publishes a permanently
+  stale gauge and `RavelCatalogFoldStalled` fires through its `absent()` arm
+  on a fleet with no scheduled fold; `ravel_catalog_fold_cycles_total` and
+  `ravel_catalog_fold_failures_total` render wherever a fold can run, the
+  `query` mode's on-demand route included, so an on-demand fold's failures
+  stay visible. The fold also reads the injected maintain clock rather than
+  the system clock.
 
 ## [0.17.0] - 2026-09-25
 

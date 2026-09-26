@@ -122,7 +122,7 @@
                         "type": "object"
                       },
                       "fold": {
-                        "description": "Catalog fold tuning. Fold is a pure query-cost optimization and only\nruns in the gateway tier, so it is a gateway-only field.",
+                        "description": "Retired by ADR-1693: the scheduled fold moved to the maintain tier, and\n`ravel-server` now refuses either fold flag in `--mode gateway`. The\nfield is still parsed so a cluster that sets it gets a `Degraded`\ncondition naming `maintain.fold` instead of having its setting dropped\non the floor. Set `maintain.fold` instead.",
                         "nullable": true,
                         "properties": {
                           "disabled": {
@@ -235,7 +235,7 @@
                         ]
                       },
                       "maxInflightFlushes": {
-                        "description": "Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).\nIt caps how many flushes a shard actor runs at once, so one tenant's\nstalled flush cannot block co-resident tenants beyond this many permits.\nIngest runs only in the gateway tier (the query and maintain modes never\nenter the ingest path), so this is a gateway-only field, like `fold`.\nOmit to keep `ravel-server`'s own default of 1 (today's non-pipelined\nbehavior). The CRD schema enforces a minimum of 1 at admission:\n`ravel-server` rejects 0 as a flush deadlock.",
+                        "description": "Per-shard cross-tenant flush isolation bound (`--max-inflight-flushes`).\nIt caps how many flushes a shard actor runs at once, so one tenant's\nstalled flush cannot block co-resident tenants beyond this many permits.\nIngest runs only in the gateway tier (the query and maintain modes never\nenter the ingest path), so this is a gateway-only field.\nOmit to keep `ravel-server`'s own default of 1 (today's non-pipelined\nbehavior). The CRD schema enforces a minimum of 1 at admission:\n`ravel-server` rejects 0 as a flush deadlock.",
                         "format": "uint32",
                         "minimum": 1.0,
                         "nullable": true,
@@ -335,6 +335,25 @@
                         "default": true,
                         "description": "Whether the maintain Deployment exists at all. Defaults to true.",
                         "type": "boolean"
+                      },
+                      "fold": {
+                        "description": "Catalog fold tuning, rendered onto this tier alone (ADR-1693). The\nscheduled fold runs in `--mode maintain` and `--mode all`, so these are\nthe only replicas the flags reach; a `maintain` tier turned off by\n`enabled: false` renders no fold flags because it renders no\nDeployment.",
+                        "nullable": true,
+                        "properties": {
+                          "disabled": {
+                            "default": false,
+                            "description": "Disable the background fold task entirely (`--disable-fold`). Never\nchanges query results, only their cost.",
+                            "type": "boolean"
+                          },
+                          "intervalSecs": {
+                            "description": "How often each tenant's fold task wakes, in seconds\n(`--fold-interval-secs`).",
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "nullable": true,
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
                       },
                       "intervalSecs": {
                         "description": "How often the maintenance task wakes, in seconds\n(`--maintain-interval-secs`).",
