@@ -1465,7 +1465,7 @@ pub struct Cli {
     /// of the data objects a query scans. This flag bounds the fetcher cache
     /// ONLY (ADR-2023): the catalog's separate byte cache
     /// (`query::build_catalog`) derives on its own, or is set independently
-    /// with [`--catalog-cache-max-bytes`](Self::catalog_cache_max_bytes).
+    /// with `--catalog-cache-max-bytes`.
     /// Read at startup only; there is no live resize. Ignored when
     /// `--disable-cache` is set.
     ///
@@ -1489,7 +1489,7 @@ pub struct Cli {
 
     /// Maximum resident bytes for the catalog byte cache's RAM tier
     /// (`query::build_catalog`), a SEPARATE LRU ceiling from
-    /// [`--cache-max-bytes`](Self::cache_max_bytes) (ADR-2023):
+    /// `--cache-max-bytes` (ADR-2023):
     /// `--cache-max-bytes` no longer affects this cache. Read at startup
     /// only; there is no live resize. Ignored when `--disable-cache` is set.
     ///
@@ -8567,7 +8567,10 @@ mod tests {
         assert_eq!(with_cache.sources.cache_max_bytes, PERF_SOURCE_FLAG);
         // ADR-2023: --cache-max-bytes bounds the fetcher cache only. The
         // catalog byte cache is unaffected and keeps its own derivation.
-        assert_eq!(with_cache.catalog_cache_max_bytes, derived.catalog_cache_max_bytes);
+        assert_eq!(
+            with_cache.catalog_cache_max_bytes,
+            derived.catalog_cache_max_bytes
+        );
         assert_eq!(
             with_cache.sources.catalog_cache_max_bytes,
             derived.sources.catalog_cache_max_bytes
@@ -8723,13 +8726,18 @@ mod tests {
                 ..PerformanceFlags::default()
             },
         );
-        assert_eq!(cache_max_bytes_does_not_affect_it.cache_max_bytes, 12_345_678);
+        assert_eq!(
+            cache_max_bytes_does_not_affect_it.cache_max_bytes,
+            12_345_678
+        );
         assert_eq!(
             cache_max_bytes_does_not_affect_it.catalog_cache_max_bytes,
             1_503_238_553
         );
         assert_eq!(
-            cache_max_bytes_does_not_affect_it.sources.catalog_cache_max_bytes,
+            cache_max_bytes_does_not_affect_it
+                .sources
+                .catalog_cache_max_bytes,
             PERF_SOURCE_BUDGET_CARVE
         );
 
@@ -8786,9 +8794,11 @@ mod tests {
         resolved.emit(reference_host());
         let lines = captured.lock();
         assert!(
-            lines.iter().any(|l| l.contains("setting=\"cache_max_bytes\"")
-                && l.contains("value=12025908428")
-                && l.contains(&format!("source=\"{PERF_SOURCE_BUDGET_CARVE_LOOPBACK}\""))),
+            lines
+                .iter()
+                .any(|l| l.contains("setting=\"cache_max_bytes\"")
+                    && l.contains("value=12025908428")
+                    && l.contains(&format!("source=\"{PERF_SOURCE_BUDGET_CARVE_LOOPBACK}\""))),
             "the resolved fetch-cache line must carry the budget-carve-loopback source, \
              lines: {lines:?}"
         );
@@ -8912,7 +8922,10 @@ mod tests {
         assert_eq!(resolved.cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FALLBACK);
         assert_eq!(resolved.catalog_cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
-        assert_eq!(resolved.sources.catalog_cache_max_bytes, PERF_SOURCE_FALLBACK);
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_FALLBACK
+        );
     }
 
     /// Issue #1141 clamp rule: an EXPLICIT per-query pool RAISES a non-explicit

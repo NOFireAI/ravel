@@ -1900,7 +1900,7 @@ Each example is a short procedure. Run the PromQL against Ravel's own
 2. Read the result. A value near 1 means the cache serves most reads.
 3. If the hit rate is low, the cache is not helping.
 4. Compute the eviction rate. Run `rate(ravel_cache_evictions_total[5m])`.
-5. If evictions are high alongside the misses, an undersized cache rules in. Raise `--cache-max-bytes`.
+5. If evictions are high alongside the misses, an undersized cache rules in. Raise the ceiling for the `cache` label that is evicting: `--cache-max-bytes` for `cache="fetch"`, `--catalog-cache-max-bytes` for `cache="catalog"`.
 6. If evictions are near zero alongside the misses, cold or unique reads rule in and undersizing rules out.
 
 ## Known gaps

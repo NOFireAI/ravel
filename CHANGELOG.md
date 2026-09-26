@@ -6,6 +6,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`ravel-server`'s catalog byte cache is sized independently of
+  `--cache-max-bytes`** (ADR-2023, issue #2023). `--cache-max-bytes` now
+  bounds the query fetcher cache only; the catalog byte cache derives its
+  own share of the process memory budget (`CATALOG_CACHE_MEMORY_PERCENT`,
+  5%) regardless of `--cache-max-bytes`, or takes a new
+  `--catalog-cache-max-bytes <BYTES>` flag explicitly. A deployment that
+  relied on `--cache-max-bytes` to grow the catalog byte cache above its
+  default now also needs `--catalog-cache-max-bytes` set explicitly to get
+  the same catalog cache size. Startup still refuses to start when the two
+  caches' resolved ceilings together exceed the process memory budget,
+  exempting `--disable-cache` as before.
+- **`ravel-server` derives a larger fetcher-cache share on a loopback S3
+  store** (ADR-2023, issue #2023). Unset, `--cache-max-bytes` used to
+  always derive 25% of the process memory budget; now, a `--store s3`
+  deployment whose `--s3-endpoint` is loopback (the same predicate
+  ADR-2014 uses for `--logs-fetch-policy`) derives 40% instead, since a
+  loopback store has no network cost to amortize with a larger cache. An
+  explicit `--cache-max-bytes` always wins, and every other deployment
+  keeps the 25% share. The resolved value's source (`budget-carve-loopback`)
+  is logged on the `performance default resolved` startup line alongside
+  `cache_max_bytes`.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed
