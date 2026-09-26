@@ -614,9 +614,12 @@ enum Command {
         shards: u32,
         /// The deployment's `ravel-server --max-ingest-lag` (humantime
         /// duration, e.g. `6h`). The catalog lists ingest-hour buckets from
-        /// `--start` minus this value forward, so a server configured above
-        /// the 2h default accepts records whose bucket a defaulted export
-        /// would not list. Pass the server's own value when it differs.
+        /// `--start` minus this value forward, which is what reaches the
+        /// bucket of a record whose event time falls in a later ingest hour
+        /// than the bucket it was written into. Defaults to the server's own
+        /// 2h default; pass the server's value when the deployment differs,
+        /// or the export resolves a different window than a query over the
+        /// same range.
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_ingest_lag_ns)]
         max_ingest_lag: Option<i64>,
         /// Override the resolve's `max_flush_lifetime` (humantime duration,

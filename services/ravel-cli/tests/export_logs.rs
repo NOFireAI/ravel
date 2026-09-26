@@ -19,11 +19,11 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+use ravel_cli::erase;
 use ravel_cli::export;
 use ravel_cli::load::{self, Mapping};
 use ravel_cli::maintain::{SignalArg, compact_tenant};
 use ravel_cli::store::{StoreKind, StoreSelection};
-use ravel_cli::{erase, maintain};
 use ravel_commit::keys;
 use ravel_ingest::Clock;
 use ravel_object_store::memory::MemoryStore;
@@ -1355,6 +1355,88 @@ async fn a_compacted_bucket_exports_each_record_exactly_once() {
 /// name rather than attempted: ADR-1751's follow-up order lands metrics load
 /// and spans load first, and export has nothing to round-trip either against
 /// until then.
+/// `--max-ingest-lag` reaches `CatalogConfig` and decides which ingest-hour
+/// buckets the resolve lists at all.
+///
+/// The fixture is the case the bound exists for: a record whose event time
+/// falls in a later ingest hour than the bucket it was written into. It is
+/// loaded a few minutes before an hour boundary with an event time a minute
+/// after it, so its bucket is the earlier hour while the export window starts
+/// in the later one. At the 2h default the listing window reaches back past
+/// the boundary and finds it; at `--max-ingest-lag 0` it starts at the
+/// window's own hour and the bucket is never listed.
+///
+/// A defaulted export against a deployment whose `ravel-server
+/// --max-ingest-lag` differs resolves a different window than that server's
+/// own queries do, which is what the flag is for.
+#[tokio::test]
+async fn max_ingest_lag_decides_which_buckets_the_resolve_lists() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let export_pq = dir.path().join("export.parquet");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    let hour_boundary_ns = (T0 / NS_PER_HOUR + 1) * NS_PER_HOUR;
+    let load_now_ns = hour_boundary_ns - 5 * 60 * 1_000_000_000;
+    let event_ns = hour_boundary_ns + 60 * 1_000_000_000;
+    assert_eq!(
+        load_now_ns / NS_PER_HOUR + 1,
+        event_ns / NS_PER_HOUR,
+        "the fixture needs the event time one ingest hour past its bucket"
+    );
+
+    load_ts_body_rows(
+        &store,
+        dir.path(),
+        "acme",
+        &[(event_ns, "just-after-the-boundary")],
+        10_000,
+        load_now_ns,
+    )
+    .await;
+
+    let export_now_ns = load_now_ns + 10 * 60 * 1_000_000_000;
+    let m = mapping(TS_BODY_MAPPING);
+    let export = |window| {
+        export::export_logs(
+            Arc::clone(&store),
+            StoreSelection::explicit(StoreKind::Memory),
+            "acme",
+            hour_boundary_ns,
+            event_ns + 1,
+            &m,
+            &export_pq,
+            1,
+            window,
+            export_now_ns,
+        )
+    };
+
+    let defaulted = export(export::CatalogWindow::default())
+        .await
+        .expect("export succeeds");
+    assert_eq!(
+        defaulted.rows_written, 1,
+        "the 2h default reaches back past the hour boundary to the record's bucket"
+    );
+    assert_eq!(exported_timestamps(&export_pq), vec![event_ns]);
+
+    let narrowed = export(export::CatalogWindow {
+        max_ingest_lag_ns: Some(0),
+        max_flush_lifetime_ns: None,
+    })
+    .await
+    .expect("export succeeds");
+    assert_eq!(
+        narrowed.rows_written, 0,
+        "at a zero lag the listing window starts in the window's own hour, so the record's \
+         bucket is never listed"
+    );
+    assert_eq!(
+        narrowed.segments_read, 0,
+        "the bucket is not listed at all, rather than listed and pruned"
+    );
+}
+
 #[tokio::test]
 async fn export_refuses_unsupported_signal_metrics() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

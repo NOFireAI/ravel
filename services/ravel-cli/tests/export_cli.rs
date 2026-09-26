@@ -123,6 +123,52 @@ fn export_window_flags_reach_the_command_as_rfc3339_nanoseconds() {
     );
 }
 
+/// The two catalog-window flags exist under the names the server uses and
+/// parse as humantime durations. A refused value is the observable effect:
+/// clap runs the value parser before the command, so a message naming the
+/// flag proves the flag reached the parser this crate wired to it, and a flag
+/// that did not exist would be an unknown-argument error instead.
+#[test]
+fn export_catalog_window_flags_parse_as_humantime_durations() {
+    for (flag, value) in [
+        ("--max-ingest-lag", "later"),
+        ("--max-flush-lifetime", "later"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mapping = write_mapping(&dir);
+        let out = dir.path().join("out.parquet");
+        let output = run(&[
+            "--store",
+            "memory",
+            "export",
+            "--signal",
+            "logs",
+            "--tenant",
+            "acme",
+            "--start",
+            BASE_RFC3339,
+            "--end",
+            "2023-11-14T22:13:21Z",
+            "--parquet",
+            &out.display().to_string(),
+            "--mapping",
+            &mapping.display().to_string(),
+            flag,
+            value,
+        ]);
+
+        assert!(
+            !output.status.success(),
+            "{flag} with an unparseable duration must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("invalid {flag} '{value}'")),
+            "{flag} must be refused by its own parser, got: {stderr}"
+        );
+    }
+}
+
 /// `--tenant` reaches the store layer: with `--store` omitted the defaulted
 /// memory store holds nothing, and the walk precondition refuses by naming this
 /// command and the tenant it was pointed at.

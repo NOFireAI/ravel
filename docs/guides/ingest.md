@@ -916,16 +916,19 @@ windows; the half-open bound is what makes that safe to do.
 
 The catalog lists ingest-hour buckets from `--start` minus `max_ingest_lag`
 forward, and `export` defaults that to the same 2 hours the server defaults
-to. A deployment running `ravel-server --max-ingest-lag` above the default
-accepts records whose event time sits further behind their ingest hour than
-the default reaches back, so an export left on the default would not list the
-bucket those records landed in, and would report a clean, short result.
+to. The reach-back is what finds the bucket of a record whose event time falls
+in a later ingest hour than the bucket it was written into: narrow it to zero
+and the listing starts in the export window's own hour, so that bucket is
+never listed and the export reports a clean, short result.
 
-Nothing on the bucket records what the server was configured with, so pass it:
-`--max-ingest-lag` takes the same humantime duration the server's flag does.
-`--max-flush-lifetime` is the matching override for the seal margin the
-resolve uses to skip folded history, the same flag `catalog fold` and
-`maintain compact-tenant` offer. On a default deployment neither is needed.
+An export therefore has to resolve with the same value the server's own
+resolves use, or it answers a different window than a query over the same
+range does. Nothing on the bucket records what the server was configured with,
+so pass it: `--max-ingest-lag` takes the same humantime duration
+`ravel-server --max-ingest-lag` does. `--max-flush-lifetime` is the matching
+override for the seal margin the resolve uses to skip folded history, the same
+flag `catalog fold` and `maintain compact-tenant` offer. On a default
+deployment neither is needed.
 
 ### Exported rows are sorted by event time
 

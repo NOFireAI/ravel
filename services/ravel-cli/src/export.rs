@@ -110,13 +110,16 @@ pub struct ExportReport {
 /// `Catalog::resolve` lists buckets from `--start` minus `max_ingest_lag`
 /// forward, and skips history below the fold watermark, whose seal margin is
 /// `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`. Both
-/// default to the same values the server defaults to (2 h and 1 h), so an
-/// export against a default deployment needs neither flag. A deployment
-/// running `ravel-server --max-ingest-lag` above 2 h accepts records whose
-/// event time is further behind their ingest hour than this default reaches
-/// back, and an export left on the default would silently not list the bucket
-/// those records landed in. Passing the server's own value is what makes the
-/// window complete; nothing here can read that value off the bucket.
+/// default to what the server defaults to (2 h and 1 h), so an export against
+/// a default deployment needs neither flag.
+///
+/// What the reach-back buys is the bucket of a record whose event time falls
+/// in a later ingest hour than the bucket it was written into: at
+/// `max_ingest_lag` 0 the listing starts in the window's own hour and that
+/// bucket is never listed at all. The export therefore has to resolve with
+/// the same value the server's own resolves use, or it answers a different
+/// window than a query over the same range does, and nothing on the bucket
+/// records what the server was configured with.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CatalogWindow {
     /// `--max-ingest-lag`, in nanoseconds. `None` keeps
