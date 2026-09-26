@@ -888,33 +888,6 @@ instead derives `byte-minimal`.
 For any policy value a query returns exactly the same rows. Only request counts
 and timing differ.
 
-### The loopback default
-
-Unset, `--logs-fetch-policy` derives `byte-minimal` instead of `cost-based`
-when `--store` is `s3` and `--s3-endpoint` names this host: `localhost`, a
-loopback IPv4 literal (the whole `127.0.0.0/8` block), or the loopback IPv6
-literal `::1`. The basis is locality, not a guess at billing shape:
-a store reachable over loopback is disk-bound on the cold path, not
-network-bound, so the whole-object reads `cost-based` picks at the reference
-profile spend local disk I/O a ranged read would have skipped. Object-store
-request count rises under this default, but on a loopback store those
-requests are not billed the way a remote GET is.
-
-An explicit `--logs-fetch-policy` always wins over this derivation, including
-an explicit `cost-based` on a loopback endpoint, and a non-loopback
-`--s3-endpoint` (or `--store memory`) is entirely unaffected: it keeps
-`cost-based`, exactly as before this default existed. GET concurrency and the
-store cost profile are untouched either way; this only changes which fetch
-shape is selected. Measured on the ClickBench reference machine (RustFS on
-loopback, 42 statements): cold wall-clock 1,720.4s to 1,186.6s, hot wall-clock
-272.3s to 88.5s.
-
-The resolved policy's source -- `flag` (explicit), `default` (unset,
-non-loopback), or `derived-loopback-endpoint` (unset, loopback) -- is logged
-at startup alongside the policy itself on the `logs fetch policy resolved`
-line, so an operator can tell which of the two unset cases produced a given
-run's behaviour without re-deriving it from the flags by hand.
-
 `latency-first` resolves `--store-get-concurrency`, `--sql-partition-count`,
 and `--promql-fetch-fanout` the same way every other policy does -- it sets no
 default of its own. The measured trade above only pays off once you raise
@@ -923,8 +896,8 @@ measurement used; `--fetch-concurrency` raises all three at once. Selecting
 the policy on its own is not inert: the byte quantities change immediately, so
 a logs read is routed the way `byte-minimal` routes it, taking ranged reads
 wherever they save more bytes than a request costs and whole-object reads
-where they do not. On the reference corpus that shape at the default
-concurrency measured slower than the default policy, not faster. Treat the
+where they do not. On the reference corpus against real S3 that shape at the
+default concurrency measured slower than the default policy, not faster. Treat the
 concurrency as a precondition, not a suggestion. The startup line says which
 side of it this process is on, and it reports the precondition met only when
 both the GET permits and the scan width have been raised.
@@ -939,6 +912,37 @@ header or a ticket: under request billing, a tenant that could force
 measured amplification factor. The running engine also never changes its own
 policy. If a measurement shows the default is wrong for a deployment, set
 `--logs-fetch-policy` explicitly.
+
+### The loopback default
+
+Unset, `--logs-fetch-policy` derives `byte-minimal` instead of `cost-based`
+when `--store` is `s3` and `--s3-endpoint` names this host: `localhost`, a
+loopback IPv4 literal (the whole `127.0.0.0/8` block), or the loopback IPv6
+literal `::1`. The basis is locality, not a guess at billing shape:
+a store reachable over loopback is disk-bound on the cold path, not
+network-bound, so the whole-object reads `cost-based` picks at the reference
+profile spend local disk I/O a ranged read would have skipped. Object-store
+request count rises under this default, but a store running on this host
+bills no requests. A loopback endpoint that fronts a tunnel or proxy to a
+remote, request-billed store derives the same default; set
+`--logs-fetch-policy cost-based` there.
+
+An explicit `--logs-fetch-policy` always wins over this derivation, including
+an explicit `cost-based` on a loopback endpoint, and a non-loopback
+`--s3-endpoint` (or `--store memory`) is entirely unaffected: it keeps
+`cost-based`, exactly as before this default existed. GET concurrency is
+unchanged. The store cost profile is not overridden but goes unread:
+`byte-minimal` does not consult it, so an explicit `--store-cost-profile` on a
+loopback endpoint has no effect on the read shape unless
+`--logs-fetch-policy cost-based` is also set. Measured on the ClickBench
+reference machine (RustFS on loopback, 42 statements): cold wall-clock
+1,720.4s to 1,186.6s, hot wall-clock 272.3s to 88.5s.
+
+The resolved policy's source -- `flag` (explicit), `default` (unset,
+non-loopback), or `derived-loopback-endpoint` (unset, loopback) -- is logged
+at startup alongside the policy itself on the `logs fetch policy resolved`
+line, so an operator can tell which of the two unset cases produced a given
+run's behaviour without re-deriving it from the flags by hand.
 
 ### The store cost profile
 
