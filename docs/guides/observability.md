@@ -307,9 +307,9 @@ from 1 s to 60 s and resets once an attempt completes a tick. A single
 transient panic therefore costs one skipped tick, not the loop. A loop that
 panics every tick keeps restarting and folds nothing, and that state is what
 the restart counter and `RavelCatalogFoldLoopCrashLooping` below exist to
-report:
-the liveness gauge cannot, because the replica keeps heartbeating and so keeps
-its pairs while its peers hold the fleet-wide maximum fresh.
+report. The liveness gauge cannot report it, because the replica keeps
+heartbeating and so keeps its pairs while its peers hold the fleet-wide
+maximum fresh.
 
 | Metric | Meaning |
 |---|---|

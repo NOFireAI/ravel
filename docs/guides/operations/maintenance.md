@@ -106,8 +106,8 @@ reacts to that on its own: a survivor only drops it once it reads the record
 at more than `3 * H` old, and it reads on its own heartbeat cadence, which is
 the second term. The recomputed set then reaches the fold through a `watch`
 channel the fold reads at the top of each of its own ticks, which is the
-third. The liveness window alone is the bound on when the departure becomes
-VISIBLE, not on when the pairs are folded again.
+third. The liveness window alone bounds when the departure becomes visible,
+not when the pairs are folded again.
 
 Nothing here is a durability bound: an unfolded pair costs query listing and
 nothing else. A shorter `--fold-interval-secs` shortens the third term
