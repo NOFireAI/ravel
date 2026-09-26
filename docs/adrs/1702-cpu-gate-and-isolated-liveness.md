@@ -118,8 +118,14 @@ rule on thread placement.
    tokio blocking pool, as the cache does today. Codec work (decompress,
    decode, encode, hash) on a unit at or above the gate's inline floor
    goes through a CPU gate. Neither runs on a runtime worker. The floor
-   defaults to 256 KiB of uncompressed bytes (decision 4). The rule covers
-   codec work only; decision 12 lists the CPU work it leaves on the
+   defaults to 256 KiB of uncompressed bytes (decision 4). The rule also
+   covers PromQL evaluation, which is synchronous and never yields: an
+   evaluation whose sample count, which the engine knows before it
+   evaluates (`crates/ravel-query/src/engine.rs:781-788`), is at or above an
+   evaluation floor goes through the read gate, and a smaller one runs
+   inline. The evaluation floor defaults to 100,000 samples, is a gate
+   setting like the byte floor, and is measured in task 11 rather than
+   trusted. Decision 12 lists the CPU work the rule leaves on the
    workers. The rule goes into `docs/architecture.md`.
 
 2. **The CPU gate is a capped `spawn_blocking`.** A new workspace crate,
@@ -194,17 +200,21 @@ rule on thread placement.
    runtime stores the injected clock's time into an atomic once per second.
    The dedicated listener reads its age. `/healthz` there returns 503 when
    the age exceeds 60 s, so a deadlocked main runtime is still restarted.
-   `/readyz` there does not read the heartbeat: it returns 503 only when
-   one of today's four flags says not ready. Work that stays on the
-   workers (decision 12) can still delay the heartbeat on a busy node, so
-   readiness must not depend on it: a busy node stays in the Service, and
-   overload is handled by admission control, not by the probe. Liveness
-   uses the heartbeat because only a stall far past any single unit of
-   on-worker work means the runtime is stuck. PromQL evaluation, which is
+   `/readyz` there returns 503 when one of today's four flags says not
+   ready, or when the heartbeat age exceeds 30 s. That threshold sits far
+   above the longest unit of work left on the workers (decision 12), so a
+   busy node stays in the Service and overload is handled by admission
+   control, not by the probe, while a deadlocked runtime still leaves the
+   Service. The cost is stated in Consequences: a deadlocked pod keeps
+   receiving traffic for about 60 s instead of today's 30 s. Liveness uses
+   the same heartbeat at 60 s, because only a stall far past any single unit
+   of on-worker work means the runtime is stuck. PromQL evaluation, which is
    synchronous and never yields, runs on the read gate (task 7) so it
-   cannot hold a worker for that long. Whether 60 s is safe against what
-   remains on the workers is measured, not assumed: the saturation bench
-   (task 11) asserts it before the operator default flips (task 12). The
+   cannot hold a worker for that long. Whether 30 s and 60 s are safe
+   against what remains on the workers is measured, not assumed: the
+   saturation bench (task 11) must show the heartbeat age under load staying
+   below 10 s, a third of the readiness threshold, before the operator
+   default flips (task 12). The
    main-router copies of `/healthz` and `/readyz` keep today's behavior.
 
 10. **The operator probes the health port behind a CRD field.** A new
@@ -233,10 +243,12 @@ rule on thread placement.
 
 12. **What the gate does not cover.** DataFusion operator CPU (sort,
     aggregate, join) and tonic's own gzip codec still run on workers.
-    PromQL evaluation does not: its evaluator functions are synchronous with
-    no yield points (`crates/ravel-promql/src/aggregate.rs`, `binop.rs`), so
-    one evaluation over up to 10,000,000 samples could hold a worker, and it
-    runs on the read gate instead. The isolated health listener is the
+    PromQL evaluation over the evaluation floor does not: its evaluator
+    functions are synchronous with no yield points
+    (`crates/ravel-promql/src/aggregate.rs`, `binop.rs`), so one evaluation
+    over up to 10,000,000 samples could hold a worker, and it runs on the
+    read gate instead (decision 1). A small evaluation stays inline, so the
+    cheapest queries never queue behind a large part decode. The isolated health listener is the
     backstop for what remains.
     A later ADR can move them if the busy metrics show they matter.
 
@@ -244,9 +256,10 @@ rule on thread placement.
 flowchart LR
     subgraph health [health thread: current_thread runtime]
         H["/healthz on :4316"]
-        RZ["/readyz on :4316: four flags only"]
+        RZ["/readyz on :4316: flags, heartbeat age over 30 s"]
         HB{heartbeat age}
-        H --> HB
+        H -- "over 60 s" --> HB
+        RZ --> HB
     end
     subgraph workers [main runtime workers]
         R[HTTP and gRPC handlers]
@@ -318,8 +331,9 @@ flowchart LR
   of the Service. When every replica saturates at once, the Service has no
   endpoints and clients get refused connections instead of slow answers.
   The dedicated listener keeps readiness answering while the workers are
-  busy, and the heartbeat drives liveness only, so a busy fleet stays in
-  the Service and a stuck runtime is still restarted.
+  busy, and its heartbeat thresholds (30 s for readiness, 60 s for
+  liveness) sit far above the longest on-worker unit, so a busy fleet stays
+  in the Service while a stuck runtime still leaves it and is restarted.
 
 - **A TCP socket probe.** The kernel completes the handshake from the
   listen backlog, so the probe passes even with a deadlocked runtime. It
@@ -332,8 +346,12 @@ flowchart LR
 ## Consequences
 
 - A node under decode load keeps answering liveness and readiness. It is
-  no longer restarted for being busy. A deadlocked main runtime still gets
-  restarted, about 60 s plus three probe periods after its last heartbeat.
+  no longer restarted for being busy. A deadlocked main runtime leaves the
+  Service about 30 s plus three probe periods after its last heartbeat,
+  roughly 60 s, where today's main-router `/readyz` stops answering after
+  about 30 s. It is restarted about 60 s plus three probe periods after its
+  last heartbeat, roughly 90 s. That extra 30 s of traffic to a stuck pod
+  is the price of keeping a merely busy node in the Service.
 - A single query can now decode on more than one core, because its decodes
   no longer share one worker. The read gate caps the total across queries.
   Per-query latency on an idle node should drop, and CPU per node under
@@ -360,8 +378,10 @@ flowchart LR
   - Two new flags size the gates. The defaults suit a node that only runs
     Ravel. Lower the read gate on a node shared with other CPU-heavy work.
   - New metrics: `ravel_cpu_gate_*`, `ravel_runtime_*` and
-    `ravel_health_heartbeat_age_seconds`. A rising
-    `ravel_cpu_gate_wait_seconds_total` with a full `ravel_cpu_gate_running`
+    `ravel_health_heartbeat_age_seconds`. A rising mean wait,
+    `rate(ravel_cpu_gate_wait_seconds_sum[5m]) /
+    rate(ravel_cpu_gate_wait_seconds_count[5m])`, with a full
+    `ravel_cpu_gate_running`
     means the node is CPU-bound on decode and needs more replicas or
     permits.
 - The placement tests in ravel-cache need their parking clock and watchdog
@@ -388,10 +408,9 @@ change, shown by reverting the change under test.
    completes and the watchdog panics. Second test
    `liveness_fails_after_heartbeat_stall`: with an injected clock and a
    parked main runtime, `/healthz` is 200 at 59 s of heartbeat age and 503
-   at 61 s, while `/readyz` stays 200 at 61 s because its four flags say
-   ready. The mutation that drops the heartbeat check keeps `/healthz` at
-   200 and fails the test; the mutation that makes `/readyz` read the
-   heartbeat turns it 503 and fails the test.
+   at 61 s, and `/readyz` is 200 at 29 s and 503 at 31 s with all four flags
+   saying ready. The mutation that drops the heartbeat check keeps both at
+   200 and fails the test.
 3. **Operator probe field** (`ravel-operator`). Adds
    `spec.probes.dedicatedHealthPort`. Acceptance test
    `probes_render_on_health_port_when_enabled`: with the field `true`, the
@@ -428,10 +447,12 @@ change, shown by reverting the change under test.
 7. **Query fetchers and PromQL evaluation on the read gate**
    (`ravel-query`, `ravel-promql`): `decode_selected` and
    `decode_sparse_catalog` in `fetcher.rs`, the LogQL and span fetcher
-   paths, and each PromQL evaluation. Acceptance tests: the same floor-0
-   per-site counter test over a fixture RSEG, RLOG and RSPAN object, and
-   `promql_evaluation_runs_through_the_read_gate`, which counts one gate job
-   per evaluated query.
+   paths, and PromQL evaluation at or above the evaluation floor.
+   Acceptance tests: the same floor-0 per-site counter test over a fixture
+   RSEG, RLOG and RSPAN object, and
+   `promql_evaluation_over_the_floor_runs_through_the_read_gate`, which
+   evaluates one query just over the evaluation floor and one just under
+   it and asserts exactly one gate job and one inline count.
 8. **Logs and spans scan decode state** (`ravel-sql`). Adds the decode
    state to `LogScan` and the spans scan. Acceptance test
    `log_scan_yields_while_a_block_decodes`: with the gate job parked, a
