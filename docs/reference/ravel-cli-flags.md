@@ -520,4 +520,18 @@ Bulk-import a Parquet file into the logs signal (ADR-0089)
 | `--target-bytes` |  | `1` | Estimated in-memory bytes a shard's buffer accumulates before it flushes as one RLOG object (issue #801). At the default `1` every batch flushes as its own object the moment it is written: one object per involved shard per batch, `--batch-rows` sets its size, and no buffer lingers. A larger value lets a shard hold several batches' records in one buffer until the target is reached, so objects grow without any more Arrow batches being held in memory -- unlike raising `--batch-rows`, whose memory cost is linear because each batch is buffered whole |
 | `--tenant` |  |  | Target tenant id (hashed under the bucket's pinned scheme) |
 
+## export
+
+Bulk-export a tenant's stored logs to a Parquet file (ADR-1751)
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--end` |  |  | Exclusive end of the event-time window, RFC 3339. Must be after `--start` |
+| `--mapping` |  |  | Path to the `--mapping` TOML naming the output columns. The same file a `load` of this data used produces a file that load reads back |
+| `--parquet` |  |  | Path of the Parquet file to write. Overwritten if it exists |
+| `--shards` |  | `4` | Configured shard count, used to resolve the catalog. The tenant's durable provisioning record supplies the real per-hour shard generations on top of it. Defaults to the server's default of 4 |
+| `--signal` |  |  | Signal to export. Only `logs` is supported; `metrics` and `spans` are refused with the follow-up each one waits on. No default: a command that chooses for you which data it touches is a silent wrong answer on a tenant that holds more than one signal |
+| `--start` |  |  | Inclusive start of the event-time window, RFC 3339 (`2024-01-01T00:00:00Z`) |
+| `--tenant` |  |  | Source tenant id (hashed under the bucket's pinned scheme) |
+
 <!-- END GENERATED FLAGS -->

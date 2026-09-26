@@ -6,6 +6,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`ravel-cli export --signal logs` writes a tenant's stored logs back out to
+  a Parquet file `ravel-cli load` reads in** (ADR-1751, issue #1712). The
+  command takes the store and tenancy flags the other read commands take, plus
+  `--tenant`, an RFC 3339 `--start`/`--end` window, `--parquet` for the output
+  path, and the same `--mapping` TOML a load uses to decide which column each
+  field lands in. It resolves the catalog once, reads and decodes the RLOG
+  objects that snapshot names, and writes the rows sorted by event time. The
+  window is half-open, so exporting adjoining ranges writes no row twice and
+  drops none between them. Exclusion follows the query path rather than a
+  second copy of the rules: retention tombstones and compaction supersession
+  are already applied by the catalog resolve, and erasure predicates from that
+  same snapshot are handed to the segment fetcher, so a record a query cannot
+  see is a record the export does not write. The mapping's typed attribute
+  columns round-trip, and the optional `attrs_map_column` adds one map column
+  carrying every record attribute no typed column covers. `--signal` has no
+  default and today accepts only `logs`; `metrics` and `spans` are refused
+  with the bulk-import follow-up each one waits on, because an exported file
+  no command can load back is not an export. The ingest guide's bulk-export
+  section covers the round-trip caveats, including `ts_unit` truncation and
+  the fact that `load` does not read `attrs_map_column` back.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed
