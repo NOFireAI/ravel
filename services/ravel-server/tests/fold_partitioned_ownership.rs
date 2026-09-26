@@ -35,7 +35,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_server::fold::{self, FoldTaskConfig};
+use ravel_server::fold::{self, FOLD_UNIT_SHARD, FoldTaskConfig};
 use ravel_server::{Mode, ServerConfig};
 use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
@@ -584,6 +584,280 @@ fn test_config(mode: Mode, tenant: &TenantId, fold_interval: Duration) -> Server
             1024,
         ),
     }
+}
+
+/// A foreign maintain worker that only ever exists as a heartbeat record: the
+/// live set a running server computes has to contain it, and the partition has
+/// to move accordingly.
+const FOREIGN_WORKER: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0f01);
+
+/// Real wall-clock nanoseconds. The heartbeat a running server writes and
+/// judges liveness against is on the wall clock (`maintain::WallClock`), so a
+/// heartbeat seeded for it must be too.
+fn wall_now_ns() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos(),
+    )
+    .expect("wall clock fits in i64 nanoseconds")
+}
+
+/// Publish one heartbeat for `process_id`, dated now, through the same
+/// `WorkerSet` path a real maintain process uses. With the default 60s
+/// heartbeat interval the liveness window is 180s, so this record stays live
+/// for the whole of a test.
+async fn seed_worker_heartbeat(store: &MemoryStore, process_id: Uuid) {
+    let now_ns = wall_now_ns();
+    WorkerSet::new(
+        now_ns,
+        HEARTBEAT,
+        DEFAULT_LIVENESS_FACTOR,
+        DEFAULT_UNIT_CONCURRENCY,
+    )
+    .with_process_id(process_id)
+    .write_heartbeat(store, now_ns)
+    .await
+    .expect("seed a foreign worker heartbeat");
+}
+
+/// Every process id with a heartbeat record, once there are `expected` of them.
+/// A running maintain process mints its own id, so this is how a test learns
+/// which id the partition it is about to assert is keyed on.
+async fn worker_ids(store: &MemoryStore, expected: usize) -> Vec<Uuid> {
+    for _ in 0..200 {
+        let page = store
+            .list("sys/maintain/workers/", None)
+            .await
+            .expect("list the workers prefix");
+        if page.objects.len() == expected {
+            return page
+                .objects
+                .iter()
+                .map(|meta| {
+                    let raw = meta
+                        .key
+                        .strip_prefix("sys/maintain/workers/")
+                        .expect("a workers-prefix key");
+                    Uuid::parse_str(raw).expect("the heartbeat key names a uuid")
+                })
+                .collect();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no {expected} heartbeat records appeared under sys/maintain/workers/");
+}
+
+/// Assert a HEAD a running server's scheduled fold published covers exactly
+/// the one segment [`seed_sealed_metric_segment`] seeded, and return its
+/// folder id.
+///
+/// The watermark is only bounded below: unlike the [`fold::run_tick`] tests
+/// above, a running server folds on the wall clock, so its sealed frontier is
+/// the current hour rather than [`SEALED_HOUR`]. What is exact is the work the
+/// fold captured, which is the one seeded commit.
+fn assert_folded_the_seeded_segment(head_bytes: &[u8]) -> Uuid {
+    let head = decode_head(head_bytes).expect("HEAD decodes");
+    assert_eq!(
+        head.parts.len(),
+        1,
+        "one part covers the one seeded segment"
+    );
+    assert_eq!(
+        head.parts[0].entry_count, 1,
+        "the one seeded commit is the one folded entry"
+    );
+    assert!(
+        head.watermark_hour >= SEALED_HOUR,
+        "the wall-clock sealed frontier covers the seeded hour, got {}",
+        head.watermark_hour
+    );
+    Uuid::from_slice(&head.folder_id).expect("folder id is a uuid")
+}
+
+/// A `Mode::Maintain` server whose heartbeat runs and whose scheduled fold
+/// ticks fast, with no tenant restriction (an empty `fold_tenants` means every
+/// discovered tenant is maintained). The maintenance sweep interval is long
+/// enough that only the fold acts within a test.
+fn maintain_test_config(tenant: &TenantId, fold_interval: Duration) -> ServerConfig {
+    let mut config = test_config(Mode::Maintain, tenant, fold_interval);
+    config.fold_tenants = Vec::new();
+    config.maintain = ravel_server::MaintenanceTaskConfig {
+        enabled: true,
+        interval: Duration::from_secs(3_600),
+        shard_count: 1,
+        heartbeat_interval: HEARTBEAT,
+        ..Default::default()
+    };
+    config
+}
+
+/// ADR-1693 decision 1, wired end to end rather than by calling [`fold::run_tick`]
+/// with a hand-made live set: a running `Mode::Maintain` server folds exactly
+/// the pairs it owns under the live set its OWN heartbeat loop published, and
+/// leaves the rest to the peer whose heartbeat it read.
+///
+/// The tenants are chosen after the server's process id is known, so both
+/// sides of the partition are non-empty by construction rather than by luck.
+/// Every tenant left unfolded here is one this process WOULD own under its
+/// solo set, which is what makes this a test of the published live set and not
+/// of ownership in general.
+#[tokio::test]
+async fn a_maintain_server_folds_the_partition_its_published_live_set_defines() {
+    let inner = Arc::new(MemoryStore::new());
+    seed_worker_heartbeat(inner.as_ref(), FOREIGN_WORKER).await;
+
+    let store_dyn: Arc<dyn ObjectStoreBackend> = inner.clone();
+    let config = maintain_test_config(&TenantId::new("fold-maintain"), Duration::from_millis(250));
+    let running = ravel_server::start(
+        config,
+        store_dyn.clone(),
+        store_dyn.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts");
+
+    // The server's own id, learned from the heartbeat it just wrote. Its
+    // heartbeat loop publishes the live set immediately after writing that
+    // key; the pause covers the gap before any tenant exists to fold.
+    let ids = worker_ids(inner.as_ref(), 2).await;
+    let own = *ids
+        .iter()
+        .find(|id| **id != FOREIGN_WORKER)
+        .expect("the server minted its own process id");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let worker = WorkerSet::new(
+        wall_now_ns(),
+        HEARTBEAT,
+        DEFAULT_LIVENESS_FACTOR,
+        DEFAULT_UNIT_CONCURRENCY,
+    )
+    .with_process_id(own);
+    let live_set = vec![own, FOREIGN_WORKER];
+
+    // Three tenants on each side of the rendezvous split, walked in a fixed
+    // order so the choice is a pure function of the server's own id.
+    let mut mine: Vec<TenantHash> = Vec::new();
+    let mut theirs: Vec<TenantHash> = Vec::new();
+    for i in 0..1_000 {
+        if mine.len() == 3 && theirs.len() == 3 {
+            break;
+        }
+        let tenant = TenantId::new(format!("fold-live-{i}")).hash();
+        if worker.owns_unit(&live_set, &tenant, Signal::Metrics, FOLD_UNIT_SHARD) {
+            if mine.len() < 3 {
+                mine.push(tenant);
+            }
+        } else if theirs.len() < 3 {
+            theirs.push(tenant);
+        }
+    }
+    assert_eq!(mine.len(), 3, "three tenants this process owns");
+    assert_eq!(theirs.len(), 3, "three tenants the foreign worker owns");
+    for tenant in &theirs {
+        assert!(
+            worker.owns_unit(&[own], tenant, Signal::Metrics, FOLD_UNIT_SHARD),
+            "a process that ignored the published live set would fold this pair too"
+        );
+    }
+
+    for tenant in mine.iter().chain(theirs.iter()) {
+        seed_sealed_metric_segment(inner.as_ref(), tenant).await;
+    }
+    // Ten fold intervals: every owned pair has been ticked many times over.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    running.shutdown().await.expect("graceful shutdown");
+
+    let mut folders: Vec<Uuid> = Vec::new();
+    for tenant in &mine {
+        let key = format!("t/{}/catalog/m/HEAD", tenant.to_hex());
+        let bytes = inner
+            .get(&key, GetRange::Full)
+            .await
+            .unwrap_or_else(|err| panic!("the maintain server folds a pair it owns: {err}"))
+            .data;
+        folders.push(assert_folded_the_seeded_segment(&bytes));
+    }
+    folders.dedup();
+    assert_eq!(
+        folders.len(),
+        1,
+        "one folder id (one process start) folded every pair this process owns"
+    );
+    for tenant in &theirs {
+        let key = format!("t/{}/catalog/m/HEAD", tenant.to_hex());
+        assert!(
+            inner.get(&key, GetRange::Full).await.is_err(),
+            "a pair the published live set gives to the foreign worker is left alone"
+        );
+    }
+}
+
+/// ADR-1693 decision 3: a `Mode::All` process publishes no heartbeat and keeps
+/// its solo live set for its whole lifetime, so it owns and folds every unit.
+/// A foreign heartbeat sits in the store throughout: an `all` process that
+/// partitioned against what it found there would fold only about half of these
+/// tenants.
+#[tokio::test]
+async fn an_all_mode_server_folds_every_unit() {
+    let inner = Arc::new(MemoryStore::new());
+    seed_worker_heartbeat(inner.as_ref(), FOREIGN_WORKER).await;
+    let tenants: Vec<TenantHash> = TENANTS.iter().map(|t| TenantId::new(*t).hash()).collect();
+    for tenant in &tenants {
+        seed_sealed_metric_segment(inner.as_ref(), tenant).await;
+    }
+
+    let store_dyn: Arc<dyn ObjectStoreBackend> = inner.clone();
+    let mut config = test_config(
+        Mode::All,
+        &TenantId::new("fold-all"),
+        Duration::from_millis(250),
+    );
+    config.fold_tenants = Vec::new();
+    let running = ravel_server::start(
+        config,
+        store_dyn.clone(),
+        store_dyn.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts");
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    running.shutdown().await.expect("graceful shutdown");
+
+    // No heartbeat of its own, so nothing ever replaces the solo set the watch
+    // channel starts on. This is what makes the partition inert here rather
+    // than merely unobserved.
+    assert_eq!(
+        worker_ids(inner.as_ref(), 1).await,
+        vec![FOREIGN_WORKER],
+        "an all-mode process publishes no heartbeat"
+    );
+
+    // Exactly one folder id across every tenant, and it is not the foreign
+    // worker: one process folded the whole set.
+    let mut folders: Vec<Uuid> = Vec::new();
+    for tenant in &tenants {
+        let key = format!("t/{}/catalog/m/HEAD", tenant.to_hex());
+        let bytes = inner
+            .get(&key, GetRange::Full)
+            .await
+            .unwrap_or_else(|err| panic!("an all-mode process folds every unit: {err}"))
+            .data;
+        folders.push(assert_folded_the_seeded_segment(&bytes));
+    }
+    folders.dedup();
+    assert_eq!(folders.len(), 1, "one process folded every tenant");
+    assert_ne!(
+        folders[0], FOREIGN_WORKER,
+        "the folder is the running process, not the heartbeat record it ignored"
+    );
 }
 
 /// ADR-1693 decision 2: a gateway process runs no scheduled fold. Counted, not
