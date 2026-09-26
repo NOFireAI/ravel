@@ -213,11 +213,15 @@ struct Args {
     /// This is what selects the read shape: `request-minimal` reads every
     /// object whole in one covering GET with no probe and no ranged read;
     /// `byte-minimal` is the byte-leaning shape, ranged reads wherever they save
-    /// more bytes than a request costs; `cost-based` (the default, as on the
-    /// server) derives the rate from the pass's store cost profile, which at the
-    /// reference intra-region profile resolves to request-minimal behaviour.
+    /// more bytes than a request costs; `cost-based` (the default here) derives
+    /// the rate from the pass's store cost profile, which at the reference
+    /// intra-region profile resolves to request-minimal behaviour.
     ///
-    /// The default therefore measures the shape a stock server produces. Before
+    /// The default therefore measures the shape a stock server produces against
+    /// a non-loopback S3 endpoint. A stock server whose `--s3-endpoint` is
+    /// loopback derives `byte-minimal` instead (ADR-2014); this bench has no
+    /// endpoint to derive from, so pass `--logs-fetch-policy byte-minimal` to
+    /// measure that server's shape in process. Before
     /// this flag existed the bench routed at a fixed 512 KiB threshold whatever
     /// the request cost said, so a full-scan statement range-read every object
     /// per block while the server read each one whole; pass `byte-minimal` to
@@ -1207,7 +1211,9 @@ mod tests {
     }
 
     /// At default flags against the reference (intra-region) profile, the bench
-    /// resolves the server's shape: a saturated request cost AND a saturated
+    /// resolves the shape a server on a non-loopback endpoint resolves (a
+    /// loopback endpoint derives `byte-minimal` there, ADR-2014): a saturated
+    /// request cost AND a saturated
     /// routing threshold, so every object is read whole in one covering GET.
     /// Before the policy was reachable the threshold stayed at 512 KiB whatever
     /// the request cost said, so a full-scan statement range-read every larger

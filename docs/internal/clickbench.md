@@ -453,14 +453,18 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   through the same resolution the server runs at startup. `request-minimal`
   reads every log object whole in one covering GET, with no tail probe and no
   ranged read; `byte-minimal` uses ranged reads wherever they save more bytes
-  than a request costs; `cost-based` (the default, as on the server) derives the
+  than a request costs; `cost-based` (the bench's default) derives the
   choice from the pass's store cost profile, which at the shipped reference
   intra-region profile resolves to request-minimal behaviour; `latency-first`
   resolves the byte-minimizing quantities as an intent rather than from prices,
   and pays off only at the concurrency its trade was measured at, which a pass
   sets with `--fetch-concurrency`. So a bench run at
-  default flags measures the shape a stock server produces: roughly one GET per
-  object for a full-scan statement, not one per block. Before the flag existed
+  default flags measures the shape a stock server produces against a
+  non-loopback S3 endpoint: roughly one GET per object for a full-scan
+  statement, not one per block. A stock server whose `--s3-endpoint` is
+  loopback, as the ClickBench entry's local RustFS is, derives `byte-minimal`
+  instead (ADR-2014), so pass `--logs-fetch-policy byte-minimal` to measure
+  that shape. Before the flag existed
   the bench routed at a fixed 512 KiB threshold, which range-read every larger
   object per block and made an in-process table incomparable with the server's;
   pass `byte-minimal` to reach that older shape deliberately. The requested

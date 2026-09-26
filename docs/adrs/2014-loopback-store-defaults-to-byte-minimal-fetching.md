@@ -108,6 +108,12 @@ machine state at boot. Locality is a stable property; bandwidth is not.
 - Deployments against any non-loopback endpoint, including every real S3
   deployment, see no change in behaviour or bill.
 - The request count on a loopback store rises, as `byte-minimal` spends requests
-  to save bytes. A loopback store bills no requests, so this is not a cost.
+  to save bytes. A store running on this host bills no requests, so there this
+  is not a cost.
+- The predicate reads the endpoint's authority, not what answers there. A
+  loopback endpoint that fronts a tunnel or proxy to a remote, request-billed
+  store also derives `byte-minimal`, and there the extra requests are billed.
+  That deployment keeps the old behaviour with an explicit
+  `--logs-fetch-policy cost-based`, which always wins.
 - One more derived default is on the startup log, with its source, and the
   tests pin all three sources and that an explicit flag wins on loopback.

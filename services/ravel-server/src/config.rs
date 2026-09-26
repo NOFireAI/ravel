@@ -963,7 +963,8 @@ pub struct Cli {
     /// The operator's logs fetch-policy intent (ADR-0996 decision 2), resolved
     /// at startup into the byte quantities the fetch layer runs on
     /// (`--logs-request-cost-bytes` and `--logs-block-range-threshold`'s
-    /// engine-side fields) by `ravel_query::resolve_logs_fetch`.
+    /// engine-side fields) by `ravel_query::resolve_logs_fetch`. Unset, it is
+    /// `cost-based`, or `byte-minimal` against a loopback `--s3-endpoint`.
     ///
     /// `request-minimal` reads every object whole in one covering GET (the
     /// cost-preferring shape where transfer is free and the bill is requests);
@@ -979,9 +980,8 @@ pub struct Cli {
     /// `--store s3` deployment whose `--s3-endpoint` is loopback (`localhost`
     /// or a loopback IPv4/IPv6 literal) defaults to `byte-minimal` instead,
     /// because on a local store the cold path is disk-bound rather than
-    /// network-bound: on the ClickBench reference machine `byte-minimal`
-    /// measured 1,186.6 s cold and 88.5 s hot against `cost-based`'s
-    /// 1,720.4 s and 272.3 s (42 statements, RustFS on loopback). Every other
+    /// network-bound, and `byte-minimal` measured faster there both cold and
+    /// hot (ADR-2014 records the figures). Every other
     /// unset case keeps `cost-based`, exactly as before. An explicit flag
     /// always wins, including an explicit `cost-based` on a loopback endpoint.
     /// [`crate::config::Cli::resolve_logs_fetch_policy`] is the one place this
