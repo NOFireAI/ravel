@@ -396,6 +396,119 @@ fn decode_any_value(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// The reserved attribute key whose value carries the span's links as a hex
+/// blob (`ravel_otlp::traces_normalize::ATTR_LINKS_RAW`), encoded exactly like
+/// [`EVENTS_RAW_KEY`]. Unlike events, a links value is never promoted into
+/// nested RSPAN columns: the segment format is a frozen contract, and adding a
+/// column for it needs an ADR. [`ravel_sql`] decodes this attribute directly
+/// at scan time instead, on every RSPAN version, so a value that is not a
+/// valid links blob simply stays an ordinary attribute, same as an
+/// unpromoted `_events_raw` value.
+pub const LINKS_RAW_KEY: &str = "_links_raw";
+
+/// One span link, decoded from the `_links_raw` blob. `attrs_blob` is the
+/// link's opaque serialized bytes (the whole OTLP `Span.Link` message);
+/// `trace_id`, `span_id`, and `trace_state` are projected out of it for
+/// columnar access, mirroring how [`SpanEvent`] projects `ts_ns`/`name` out of
+/// its own blob.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanLink {
+    pub trace_id: [u8; TRACE_ID_WIDTH],
+    pub span_id: [u8; SPAN_ID_WIDTH],
+    pub trace_state: String,
+    pub attrs_blob: Vec<u8>,
+}
+
+/// Parses a `_links_raw` attribute value into span links, or `None` when the
+/// value is not a valid links blob (invalid hex, malformed length-delimited
+/// framing, trailing bytes, or zero links). Mirrors [`parse_events`] exactly:
+/// the value is the hex encoding of a concatenation of length-delimited OTLP
+/// `Span.Link` messages (`ravel_otlp::traces_normalize::encode_blob`), and
+/// this splits on that self-describing framing alone, keeping each link's
+/// payload verbatim as `attrs_blob`.
+pub fn parse_links(value: &str) -> Option<Vec<SpanLink>> {
+    let bytes = hex_decode(value)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut links = Vec::new();
+    while pos < bytes.len() {
+        let len = get_uvarint(&bytes, &mut pos).ok()?;
+        let len = usize::try_from(len).ok()?;
+        let end = pos.checked_add(len)?;
+        let chunk = bytes.get(pos..end)?;
+        pos = end;
+        links.push(scan_link_fields(chunk));
+    }
+    if pos != bytes.len() || links.is_empty() {
+        return None;
+    }
+    Some(links)
+}
+
+/// `Span.Link.trace_id`, field 1 (length-delimited).
+const LINK_TRACE_ID_FIELD: u64 = 1;
+/// `Span.Link.span_id`, field 2 (length-delimited).
+const LINK_SPAN_ID_FIELD: u64 = 2;
+/// `Span.Link.trace_state`, field 3 (length-delimited).
+const LINK_TRACE_STATE_FIELD: u64 = 3;
+/// `Span.Link.attributes`, field 4 (repeated `KeyValue`).
+const LINK_ATTRIBUTES_FIELD: u64 = 4;
+
+/// Best-effort scan of one serialized OTLP `Span.Link` for its `trace_id`
+/// (field 1), `span_id` (field 2), and `trace_state` (field 3), mirroring
+/// [`scan_event_ts_name`]'s total, never-failing contract: a field that is
+/// absent, or a `trace_id`/`span_id` of the wrong byte width, simply keeps its
+/// zero-filled or empty default rather than failing the scan. `attrs_blob`
+/// remains the authoritative copy regardless of what this projects.
+fn scan_link_fields(chunk: &[u8]) -> SpanLink {
+    let mut trace_id = [0u8; TRACE_ID_WIDTH];
+    let mut span_id = [0u8; SPAN_ID_WIDTH];
+    let mut trace_state = String::new();
+    let mut pos = 0usize;
+    while let Some((field, value)) = next_wire_field(chunk, &mut pos) {
+        match (field, value) {
+            (LINK_TRACE_ID_FIELD, WireField::Len(b)) if b.len() == TRACE_ID_WIDTH => {
+                trace_id.copy_from_slice(b);
+            }
+            (LINK_SPAN_ID_FIELD, WireField::Len(b)) if b.len() == SPAN_ID_WIDTH => {
+                span_id.copy_from_slice(b);
+            }
+            (LINK_TRACE_STATE_FIELD, WireField::Len(b)) => {
+                if let Ok(s) = std::str::from_utf8(b) {
+                    trace_state = s.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    SpanLink {
+        trace_id,
+        span_id,
+        trace_state,
+        attrs_blob: chunk.to_vec(),
+    }
+}
+
+/// Decodes one [`SpanLink`]'s `attrs_blob` into the link's own attribute
+/// pairs, in the order the sender encoded them. Mirrors [`event_attrs`]
+/// exactly, reading field 4 (repeated `KeyValue`) instead of field 3, and
+/// dropping the same unrepresentable `AnyValue` kinds.
+pub fn link_attrs(blob: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some((field, value)) = next_wire_field(blob, &mut pos) {
+        if field == LINK_ATTRIBUTES_FIELD
+            && let WireField::Len(kv) = value
+            && let Some(pair) = decode_key_value(kv)
+        {
+            out.push(pair);
+        }
+    }
+    out
+}
+
 /// Renders a `double_value` exactly as `ravel_otlp::promcompat::format_float`
 /// does, so the same number reads identically whether it arrived as a span
 /// attribute or as an event attribute. Duplicated rather than imported:

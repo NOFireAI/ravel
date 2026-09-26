@@ -21,6 +21,7 @@
 //! | service_name   | Utf8, nullable                | `attrs["service.name"]`              |
 //! | duration_ns    | Int64                         | computed: `end_ts - start_ts`        |
 //! | events         | List(Struct), nullable        | `attrs["_events_raw"]` (RSPAN v4 event columns) |
+//! | links          | List(Struct), nullable        | `attrs["_links_raw"]` (decoded at scan time)  |
 //!
 //! `status_code` is a small integer (`0=Unset`, `1=Ok`, `2=Error`), the exact
 //! byte [`ravel_rspan::StatusCode::to_u8`] emits, chosen over a
@@ -61,6 +62,19 @@
 //! it (an event attribute whose OTLP `AnyValue` is an array or a kvlist has no
 //! `Map(Utf8, Utf8)` spelling and does not appear here). A caller that needs
 //! the unabridged bytes still reads the hex attribute.
+//!
+//! `links` (issue #1710 part B) is `events`'s symmetric sibling for OTLP span
+//! links, with one deliberate difference: it is decoded purely from the plain
+//! `attrs['_links_raw']` attribute at scan time
+//! ([`ravel_rspan::record::parse_links`]), on every RSPAN version, rather than
+//! from any nested on-disk column. RSPAN is a frozen persistent format
+//! (docs/segment-format.md) and adding a links-specific block layout needs an
+//! ADR, so this column adds no bytes to the segment; it costs a protobuf decode
+//! per row instead. Each element is `Struct{trace_id FixedSizeBinary(16),
+//! span_id FixedSizeBinary(8), trace_state Utf8, attrs Map(Utf8, Utf8)}`, and
+//! the column is NULL (not an empty list) for a span that carried no links,
+//! matching `events`'s convention. `attrs['_links_raw']` stays queryable
+//! unchanged for the same lossy-projection reason `_events_raw` does.
 
 use std::sync::Arc;
 
@@ -80,6 +94,7 @@ pub const SPAN_COL_ATTRS: usize = 8;
 pub const SPAN_COL_SERVICE_NAME: usize = 9;
 pub const SPAN_COL_DURATION_NS: usize = 10;
 pub const SPAN_COL_EVENTS: usize = 11;
+pub const SPAN_COL_LINKS: usize = 12;
 
 /// Byte width of a trace id (`ravel_rspan::record::TRACE_ID_WIDTH`).
 pub const TRACE_ID_WIDTH: i32 = 16;
@@ -128,6 +143,10 @@ fn spans_fields() -> Vec<Field> {
         // RSPAN v4's nested event columns (issue #1710). NULL, not an empty
         // list, when the span carried no events.
         Field::new("events", span_events_type(), true),
+        // Decoded from attrs["_links_raw"] at scan time (issue #1710 part B),
+        // never promoted into RSPAN storage. NULL, not an empty list, when the
+        // span carried no links.
+        Field::new("links", span_links_type(), true),
     ]
 }
 
@@ -161,6 +180,41 @@ pub fn span_events_type() -> DataType {
     DataType::List(span_events_item_field())
 }
 
+/// The four fields of one `links` element, in OTLP `Span.Link` field order.
+/// `trace_id`/`span_id` identify the linked span in FixedSizeBinary form, same
+/// widths as the span-level `trace_id`/`span_id` columns; `trace_state` is
+/// empty (never NULL) when the link carried none; `attrs` is the link's own
+/// attributes in the same map type the span-level `attrs` column uses.
+pub fn span_link_fields() -> Fields {
+    Fields::from(vec![
+        Field::new(
+            "trace_id",
+            DataType::FixedSizeBinary(TRACE_ID_WIDTH),
+            false,
+        ),
+        Field::new("span_id", DataType::FixedSizeBinary(SPAN_ID_WIDTH), false),
+        Field::new("trace_state", DataType::Utf8, false),
+        Field::new("attrs", label_map_type(), false),
+    ])
+}
+
+/// The `links` list element field. Named `item` and non-nullable: a list slot
+/// always holds a real link struct, and the list itself is NULL when a span
+/// has none.
+pub fn span_links_item_field() -> Arc<Field> {
+    Arc::new(Field::new(
+        "item",
+        DataType::Struct(span_link_fields()),
+        false,
+    ))
+}
+
+/// The `links` column type: `List(Struct{trace_id, span_id, trace_state,
+/// attrs})`.
+pub fn span_links_type() -> DataType {
+    DataType::List(span_links_item_field())
+}
+
 /// The public `spans` table schema.
 pub fn spans_schema() -> SchemaRef {
     Arc::new(Schema::new(spans_fields()))
@@ -174,7 +228,7 @@ mod tests {
     #[test]
     fn schema_columns_are_in_the_documented_order_and_type() {
         let s = spans_schema();
-        assert_eq!(s.fields().len(), 12);
+        assert_eq!(s.fields().len(), 13);
 
         assert_eq!(s.field(SPAN_COL_TRACE_ID).name(), "trace_id");
         assert_eq!(
@@ -257,6 +311,37 @@ mod tests {
             "event attrs use the same map type as the span-level attrs column"
         );
         assert!(!fields[2].is_nullable());
+
+        assert_eq!(s.field(SPAN_COL_LINKS).name(), "links");
+        assert!(s.field(SPAN_COL_LINKS).is_nullable());
+        let DataType::List(item) = s.field(SPAN_COL_LINKS).data_type() else {
+            panic!(
+                "links must be a List, got {}",
+                s.field(SPAN_COL_LINKS).data_type()
+            );
+        };
+        assert_eq!(item.name(), "item");
+        assert!(!item.is_nullable());
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("links elements must be Structs, got {}", item.data_type());
+        };
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0].name(), "trace_id");
+        assert_eq!(fields[0].data_type(), &DataType::FixedSizeBinary(16));
+        assert!(!fields[0].is_nullable());
+        assert_eq!(fields[1].name(), "span_id");
+        assert_eq!(fields[1].data_type(), &DataType::FixedSizeBinary(8));
+        assert!(!fields[1].is_nullable());
+        assert_eq!(fields[2].name(), "trace_state");
+        assert_eq!(fields[2].data_type(), &DataType::Utf8);
+        assert!(!fields[2].is_nullable());
+        assert_eq!(fields[3].name(), "attrs");
+        assert_eq!(
+            fields[3].data_type(),
+            &label_map_type(),
+            "link attrs use the same map type as the span-level attrs column"
+        );
+        assert!(!fields[3].is_nullable());
     }
 
     #[test]
@@ -266,6 +351,14 @@ mod tests {
         let s = spans_schema();
         assert_eq!(SPAN_COL_EVENTS, 11);
         assert_eq!(SPAN_COL_EVENTS, SPAN_COL_DURATION_NS + 1);
-        assert_eq!(SPAN_COL_EVENTS, s.fields().len() - 1);
+        assert_eq!(SPAN_COL_EVENTS, s.fields().len() - 2);
+    }
+
+    #[test]
+    fn links_is_appended_after_events_so_earlier_indices_are_stable() {
+        let s = spans_schema();
+        assert_eq!(SPAN_COL_LINKS, 12);
+        assert_eq!(SPAN_COL_LINKS, SPAN_COL_EVENTS + 1);
+        assert_eq!(SPAN_COL_LINKS, s.fields().len() - 1);
     }
 }
