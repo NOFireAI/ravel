@@ -431,28 +431,41 @@ pub struct ScrubTarget {
     pub object_size: u64,
 }
 
-/// The bounded amount of work one content-tier tick may do. Every tick scrubs
-/// at least one object even when a single object exceeds the byte budget, so
-/// the cursor always makes progress and can never wedge on an oversized object.
+/// The bounded amount of work one content-tier tick may do (ADR-1686 decision
+/// 2). A tick consumes listing entries in key order until the budget is
+/// filled, and always consumes at least one, so the cursor makes progress
+/// even when a single entry's objects exceed the budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrubBudget {
-    /// At most this many objects per tick.
+    /// At most this many listing entries per tick: the budget of a rotation
+    /// that has no previous rotation's byte total to size from.
     MaxObjects(u64),
-    /// At most this many bytes per tick.
+    /// Stop once the slice holds at least this many object bytes.
     MaxBytes(u64),
 }
 
-/// The rotating content-tier cursor (ADR-0059 decision 1). A small plain-data
-/// record the follow-up task persists to object storage the same way the fold
-/// watermark is; this task implements only the pure advancement logic, so the
-/// struct carries no I/O and every field is public.
+impl ScrubBudget {
+    /// Whether a slice that has consumed `entries` listing entries naming
+    /// `bytes` object bytes has filled this budget. An empty slice never has.
+    pub fn is_filled(self, entries: u64, bytes: u64) -> bool {
+        if entries == 0 {
+            return false;
+        }
+        match self {
+            ScrubBudget::MaxObjects(max) => entries >= max,
+            ScrubBudget::MaxBytes(max) => bytes >= max,
+        }
+    }
+}
+
+/// The rotating content-tier cursor (ADR-0059 decision 1, ADR-1686). Plain
+/// data with no I/O; the scheduled wrapper persists it to object storage.
 ///
-/// `last_object_key` is the position within the current rotation: the next tick
-/// resumes at the first object whose key sorts strictly after it. `None` means
-/// "start of a rotation" (either the very first tick or a just-completed
-/// rotation that wrapped). `rotation_started_unix_ns` anchors the current
-/// rotation's start for the `ravel_scrub_cursor_position` gauge the follow-up
-/// exposes.
+/// The position is a start-after marker over the commit shard prefix: the
+/// next tick lists strictly after `last_commit_key`, so the store's listing
+/// order is the rotation order and no corpus is ever materialised. `None`
+/// means "start of a rotation". The byte and entry totals size each tick's
+/// budget ([`ScrubCursor::tick_budget`]) and feed the position gauge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrubCursor {
     /// Tenant this cursor rotates over.
@@ -461,11 +474,21 @@ pub struct ScrubCursor {
     pub signal: Signal,
     /// Shard this cursor rotates over.
     pub shard: u32,
-    /// Position within the current rotation: resume after this key. `None` at a
+    /// The last commit-shard-prefix key this rotation consumed. `None` at a
     /// rotation boundary.
-    pub last_object_key: Option<String>,
+    pub last_commit_key: Option<String>,
     /// Unix-ns anchor for the current rotation's start.
     pub rotation_started_unix_ns: i64,
+    /// Sum of `object_size` over the objects this rotation has consumed.
+    pub rotation_bytes_seen: u64,
+    /// `rotation_bytes_seen` at the end of the previous completed rotation;
+    /// `None` until one completes.
+    pub last_rotation_bytes: Option<u64>,
+    /// Listing entries the LIST-only count at this rotation's start found;
+    /// `None` until this rotation has been counted.
+    pub rotation_total_entries: Option<u64>,
+    /// Listing entries this rotation has consumed so far.
+    pub rotation_entries_visited: u64,
 }
 
 impl ScrubCursor {
@@ -475,104 +498,60 @@ impl ScrubCursor {
             tenant_hash,
             signal,
             shard,
-            last_object_key: None,
+            last_commit_key: None,
             rotation_started_unix_ns: now_ns,
+            rotation_bytes_seen: 0,
+            last_rotation_bytes: None,
+            rotation_total_entries: None,
+            rotation_entries_visited: 0,
         }
     }
-}
 
-/// One tick's plan: the objects to scrub now and the cursor to persist after.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScrubSlice {
-    /// Object keys to scrub this tick, in corpus order.
-    pub scrub_keys: Vec<String>,
-    /// The cursor to persist once this slice's objects have been scrubbed.
-    pub next_cursor: ScrubCursor,
-    /// `true` when this slice reached the corpus tail: the rotation is complete
-    /// and `next_cursor` has wrapped to the start with a fresh
-    /// `rotation_started_unix_ns`.
-    pub rotation_complete: bool,
-}
-
-/// Compute the next content-tier slice given the current cursor, the corpus to
-/// rotate over (in key order, as a strongly consistent LIST returns it), a
-/// per-tick budget, and the current wall-clock ns for stamping a new rotation.
-///
-/// Pure and I/O-free: the scheduled wrapper LISTs the corpus, calls this,
-/// scrubs `scrub_keys` via [`scrub_one_object`], then persists `next_cursor`.
-/// Deletions and insertions between ticks are tolerated because the resume
-/// point is a key comparison, not an index: the cursor simply resumes at the
-/// first surviving key after `last_object_key`.
-pub fn advance_cursor(
-    cursor: &ScrubCursor,
-    corpus: &[ScrubTarget],
-    budget: ScrubBudget,
-    now_ns: i64,
-) -> ScrubSlice {
-    if corpus.is_empty() {
-        // Nothing to rotate over: the rotation is trivially complete.
-        return ScrubSlice {
-            scrub_keys: Vec::new(),
-            next_cursor: ScrubCursor {
-                last_object_key: None,
-                rotation_started_unix_ns: now_ns,
-                ..cursor.clone()
-            },
-            rotation_complete: true,
-        };
+    /// Whether this rotation still needs its LIST-only entry count.
+    pub fn needs_entry_count(&self) -> bool {
+        self.rotation_total_entries.is_none()
     }
 
-    let mut rotation_started = cursor.rotation_started_unix_ns;
-    let mut start = match &cursor.last_object_key {
-        None => 0,
-        // First index whose key sorts strictly after the resume point.
-        Some(last) => corpus.partition_point(|target| &target.object_key <= last),
-    };
-    if start >= corpus.len() {
-        // The resume point sits past the current tail (every trailing object
-        // was swept since the last tick): wrap into a fresh rotation.
-        start = 0;
-        rotation_started = now_ns;
+    /// Open a rotation from the start of the prefix with the entry count its
+    /// LIST-only pass found. Keeps `last_rotation_bytes`, which sizes it.
+    pub fn start_rotation(&mut self, total_entries: u64, now_ns: i64) {
+        self.last_commit_key = None;
+        self.rotation_started_unix_ns = now_ns;
+        self.rotation_bytes_seen = 0;
+        self.rotation_total_entries = Some(total_entries);
+        self.rotation_entries_visited = 0;
     }
 
-    let mut scrub_keys = Vec::new();
-    let mut bytes = 0u64;
-    let mut index = start;
-    while index < corpus.len() {
-        let target = &corpus[index];
-        if !scrub_keys.is_empty() {
-            let over_budget = match budget {
-                ScrubBudget::MaxObjects(max) => scrub_keys.len() as u64 >= max,
-                ScrubBudget::MaxBytes(max) => bytes.saturating_add(target.object_size) > max,
-            };
-            if over_budget {
-                break;
-            }
+    /// This tick's budget: the byte budget from the previous rotation's total
+    /// when one completed, else an entry budget from this rotation's count.
+    pub fn tick_budget(&self, period_secs: u64, tick_secs: u64) -> ScrubBudget {
+        match self.last_rotation_bytes {
+            Some(bytes) => per_tick_byte_budget(bytes, period_secs, tick_secs),
+            None => per_tick_entry_budget(
+                self.rotation_total_entries.unwrap_or(0),
+                period_secs,
+                tick_secs,
+            ),
         }
-        scrub_keys.push(target.object_key.clone());
-        bytes = bytes.saturating_add(target.object_size);
-        index += 1;
     }
 
-    let rotation_complete = index >= corpus.len();
-    let next_cursor = if rotation_complete {
-        ScrubCursor {
-            last_object_key: None,
-            rotation_started_unix_ns: now_ns,
-            ..cursor.clone()
-        }
-    } else {
-        ScrubCursor {
-            last_object_key: Some(corpus[index - 1].object_key.clone()),
-            rotation_started_unix_ns: rotation_started,
-            ..cursor.clone()
-        }
-    };
+    /// Advance the marker past `entries` consumed listing entries ending at
+    /// `last_key`, whose objects total `bytes`.
+    pub fn consume(&mut self, last_key: String, entries: u64, bytes: u64) {
+        self.last_commit_key = Some(last_key);
+        self.rotation_entries_visited = self.rotation_entries_visited.saturating_add(entries);
+        self.rotation_bytes_seen = self.rotation_bytes_seen.saturating_add(bytes);
+    }
 
-    ScrubSlice {
-        scrub_keys,
-        next_cursor,
-        rotation_complete,
+    /// The listing ended: roll the byte total over and return to the start of
+    /// the prefix. The next tick counts the new rotation's entries.
+    pub fn complete_rotation(&mut self, now_ns: i64) {
+        self.last_commit_key = None;
+        self.rotation_started_unix_ns = now_ns;
+        self.last_rotation_bytes = Some(self.rotation_bytes_seen);
+        self.rotation_bytes_seen = 0;
+        self.rotation_total_entries = None;
+        self.rotation_entries_visited = 0;
     }
 }
 
@@ -593,6 +572,18 @@ pub fn per_tick_byte_budget(
         .div_ceil(period)
         .max(1);
     ScrubBudget::MaxBytes(per_tick)
+}
+
+/// The entry budget of a rotation with no previous byte total (ADR-1686
+/// decision 3): `ceil(total_entries * tick_secs / P)` listing entries, at
+/// least one, so the rotation still completes in about `P`.
+pub fn per_tick_entry_budget(total_entries: u64, period_secs: u64, tick_secs: u64) -> ScrubBudget {
+    let period = period_secs.max(1);
+    let per_tick = total_entries
+        .saturating_mul(tick_secs)
+        .div_ceil(period)
+        .max(1);
+    ScrubBudget::MaxObjects(per_tick)
 }
 
 #[cfg(test)]
@@ -884,130 +875,123 @@ mod tests {
         );
     }
 
-    fn corpus(n: usize) -> Vec<ScrubTarget> {
-        // Keys are zero-padded so lexical order matches numeric order.
-        (0..n)
-            .map(|i| ScrubTarget {
-                object_key: format!("obj-{i:04}"),
-                object_size: 1,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn cursor_covers_the_whole_corpus_in_ceil_n_over_budget_ticks() {
-        let corpus = corpus(10);
-        let budget = ScrubBudget::MaxObjects(3);
-        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-
-        let mut scrubbed: Vec<String> = Vec::new();
-        let mut ticks = 0;
-        let mut completed = false;
-        for _ in 0..100 {
-            let slice = advance_cursor(&cursor, &corpus, budget, 1_000 + ticks as i64);
-            scrubbed.extend(slice.scrub_keys.iter().cloned());
-            cursor = slice.next_cursor.clone();
-            ticks += 1;
-            if slice.rotation_complete {
-                completed = true;
-                break;
-            }
+    /// One tick of the marker walk over `keys` (every entry naming one object
+    /// of `size` bytes), driven only through the cursor's own methods the way
+    /// the scheduled wrapper drives them. Returns the keys consumed.
+    fn walk_tick(
+        cursor: &mut ScrubCursor,
+        keys: &[String],
+        size: u64,
+        period_secs: u64,
+        tick_secs: u64,
+        now_ns: i64,
+    ) -> Vec<String> {
+        if cursor.needs_entry_count() {
+            cursor.start_rotation(keys.len() as u64, now_ns);
         }
+        let budget = cursor.tick_budget(period_secs, tick_secs);
+        let start = match &cursor.last_commit_key {
+            Some(last) => keys.partition_point(|key| key <= last),
+            None => 0,
+        };
+        let mut consumed = Vec::new();
+        let mut index = start;
+        while index < keys.len() && !budget.is_filled(consumed.len() as u64, size * consumed.len() as u64) {
+            cursor.consume(keys[index].clone(), 1, size);
+            consumed.push(keys[index].clone());
+            index += 1;
+        }
+        if index >= keys.len() {
+            cursor.complete_rotation(now_ns);
+        }
+        consumed
+    }
 
-        // ceil(10 / 3) == 4 ticks.
-        assert_eq!(ticks, 4);
-        assert!(completed);
-        // Every object visited exactly once, in order.
-        let expected: Vec<String> = corpus.iter().map(|t| t.object_key.clone()).collect();
-        assert_eq!(scrubbed, expected);
-        // The completed rotation wraps to the start.
-        assert_eq!(cursor.last_object_key, None);
+    fn entry_keys(n: usize) -> Vec<String> {
+        // Zero-padded so lexical order matches numeric order.
+        (0..n).map(|i| format!("c/0000/{i:04}.cmt")).collect()
     }
 
     #[test]
-    fn cursor_always_advances_even_when_one_object_exceeds_the_byte_budget() {
-        // Budget is 1 byte but every object is 100 bytes: each tick must still
-        // scrub exactly one object rather than wedging.
-        let corpus: Vec<ScrubTarget> = (0..3)
-            .map(|i| ScrubTarget {
-                object_key: format!("big-{i:02}"),
-                object_size: 100,
-            })
+    fn a_first_rotation_covers_every_entry_once_in_ceil_n_over_budget_ticks() {
+        // ceil(10 * 1 / 4) = 3 entries per tick, so ceil(10 / 3) = 4 ticks.
+        let keys = entry_keys(10);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let mut visited: Vec<String> = Vec::new();
+        let mut per_tick: Vec<usize> = Vec::new();
+        for tick in 0..4 {
+            let consumed = walk_tick(&mut cursor, &keys, 5, 4, 1, 1_000 + tick);
+            per_tick.push(consumed.len());
+            visited.extend(consumed);
+        }
+        assert_eq!(per_tick, vec![3, 3, 3, 1]);
+        assert_eq!(visited, keys, "every entry consumed exactly once, in order");
+        assert_eq!(cursor.last_commit_key, None, "the rotation wrapped");
+        assert_eq!(cursor.last_rotation_bytes, Some(50));
+        assert_eq!(cursor.rotation_bytes_seen, 0);
+        assert_eq!(cursor.rotation_total_entries, None);
+        assert_eq!(cursor.rotation_entries_visited, 0);
+        assert_eq!(cursor.rotation_started_unix_ns, 1_003);
+    }
+
+    #[test]
+    fn a_completed_rotation_sizes_the_next_by_its_bytes() {
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        cursor.start_rotation(4, 1);
+        assert_eq!(cursor.tick_budget(2, 1), ScrubBudget::MaxObjects(2));
+        cursor.consume("c/0000/a.cmt".to_string(), 3, 700);
+        assert_eq!(cursor.rotation_entries_visited, 3);
+        assert_eq!(cursor.rotation_bytes_seen, 700);
+        cursor.complete_rotation(9);
+        assert!(cursor.needs_entry_count());
+        cursor.start_rotation(4, 10);
+        // ceil(700 * 1 / 2) = 350 bytes, whatever the entry count.
+        assert_eq!(cursor.tick_budget(2, 1), ScrubBudget::MaxBytes(350));
+        assert_eq!(cursor.last_rotation_bytes, Some(700));
+        assert_eq!(cursor.rotation_bytes_seen, 0);
+        assert_eq!(cursor.rotation_total_entries, Some(4));
+    }
+
+    #[test]
+    fn every_tick_consumes_at_least_one_entry_even_past_a_tiny_byte_budget() {
+        // A one-byte budget over 100-byte objects: one entry per tick.
+        assert!(!ScrubBudget::MaxBytes(1).is_filled(0, 0));
+        assert!(ScrubBudget::MaxBytes(1).is_filled(1, 100));
+        assert!(!ScrubBudget::MaxObjects(0).is_filled(0, 0));
+        assert!(ScrubBudget::MaxObjects(0).is_filled(1, 0));
+        let keys = entry_keys(3);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        cursor.last_rotation_bytes = Some(1);
+        let per_tick: Vec<usize> = (0..3)
+            .map(|tick| walk_tick(&mut cursor, &keys, 100, 1_000, 1, tick).len())
             .collect();
-        let budget = ScrubBudget::MaxBytes(1);
-        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-
-        let mut ticks = 0;
-        loop {
-            let slice = advance_cursor(&cursor, &corpus, budget, 5);
-            assert_eq!(
-                slice.scrub_keys.len(),
-                1,
-                "one object per tick under a tiny byte budget"
-            );
-            cursor = slice.next_cursor.clone();
-            ticks += 1;
-            if slice.rotation_complete {
-                break;
-            }
-            assert!(ticks < 10, "cursor failed to converge");
-        }
-        assert_eq!(ticks, 3);
+        assert_eq!(per_tick, vec![1, 1, 1]);
+        assert_eq!(cursor.last_rotation_bytes, Some(300));
     }
 
     #[test]
     fn period_sized_budget_completes_one_rotation_in_about_p_over_tick_ticks() {
-        // 100 one-byte objects, P = 7 days, tick = 1 hour. per-tick byte budget
-        // = ceil(100 * 3600 / 604800) = ceil(0.595) = 1 byte, so a full rotation
-        // takes ~100 ticks; assert it completes within P/tick + a small slack
-        // and covers everything exactly once.
-        let corpus = corpus(100);
-        let total_bytes: u64 = corpus.iter().map(|t| t.object_size).sum();
+        // 100 entries, P = 7 days, tick = 1 hour. The first rotation's entry
+        // budget is ceil(100 * 3600 / 604800) = 1 entry, so it takes 100 ticks;
+        // the second's byte budget is ceil(100 * 3600 / 604800) = 1 byte over
+        // one-byte objects, 100 ticks again. Both fit in P / tick = 168.
+        let keys = entry_keys(100);
         let period_secs = 7 * 86_400;
         let tick_secs = 3_600;
-        let budget = per_tick_byte_budget(total_bytes, period_secs, tick_secs);
-        let ticks_per_period = period_secs / tick_secs; // 168
-
         let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-        let mut scrubbed: Vec<String> = Vec::new();
-        let mut ticks = 0u64;
-        let mut completed = false;
-        while ticks < ticks_per_period + 5 {
-            let slice = advance_cursor(&cursor, &corpus, budget, 42);
-            scrubbed.extend(slice.scrub_keys.iter().cloned());
-            cursor = slice.next_cursor.clone();
-            ticks += 1;
-            if slice.rotation_complete {
-                completed = true;
-                break;
+        for rotation in 0..2 {
+            let mut visited: Vec<String> = Vec::new();
+            let mut ticks = 0u64;
+            while ticks < period_secs / tick_secs {
+                visited.extend(walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, 42));
+                ticks += 1;
+                if cursor.last_commit_key.is_none() {
+                    break;
+                }
             }
+            assert_eq!(ticks, 100, "rotation {rotation}");
+            assert_eq!(visited, keys, "rotation {rotation}: every entry once");
         }
-
-        assert!(completed, "rotation did not complete within one period");
-        assert!(
-            ticks <= ticks_per_period,
-            "rotation took {ticks} ticks, expected <= {ticks_per_period}"
-        );
-        let expected: Vec<String> = corpus.iter().map(|t| t.object_key.clone()).collect();
-        assert_eq!(
-            scrubbed, expected,
-            "every object scrubbed exactly once, in order"
-        );
-    }
-
-    #[test]
-    fn cursor_resumes_after_a_swept_tail() {
-        // The resume key points past the current tail (its object was swept):
-        // the cursor must wrap into a fresh rotation rather than stall.
-        let corpus = corpus(3);
-        let cursor = ScrubCursor {
-            last_object_key: Some("obj-9999".to_string()),
-            rotation_started_unix_ns: 1,
-            ..ScrubCursor::new(tenant(), Signal::Metrics, 0, 1)
-        };
-        let slice = advance_cursor(&cursor, &corpus, ScrubBudget::MaxObjects(10), 500);
-        assert!(slice.rotation_complete);
-        assert_eq!(slice.scrub_keys.len(), 3);
-        assert_eq!(slice.next_cursor.rotation_started_unix_ns, 500);
+        assert_eq!(cursor.last_rotation_bytes, Some(100));
     }
 }
