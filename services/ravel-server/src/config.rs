@@ -359,6 +359,16 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1:4317")]
     pub listen_grpc: SocketAddr,
 
+    /// Dedicated liveness and readiness listener (ADR-1702 decision 8),
+    /// served from its own thread and runtime so a busy or wedged main
+    /// runtime cannot stop it answering. Serves `/healthz`, `/readyz`,
+    /// `/-/healthy` and `/-/ready` only, and fails them once the main
+    /// runtime's heartbeat is older than 60 s (liveness) or 30 s (readiness).
+    /// Unset, nothing binds; the same routes stay on `--listen-http` either
+    /// way.
+    #[arg(long = "listen-health", value_name = "ADDR")]
+    pub listen_health: Option<SocketAddr>,
+
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
 

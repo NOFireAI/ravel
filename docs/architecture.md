@@ -141,6 +141,16 @@ costs traces and a clean exit, not buffered records, which the drain has
 already attempted to flush. The operator half of this work sets the pod grace
 period above 32.5s accordingly.
 
+Those routes share the application runtime, so a node whose workers are all
+busy cannot answer them. `--listen-health <addr>`, off by default, adds a
+listener served by its own single-threaded runtime on a dedicated OS thread
+(ADR-1702 decisions 8 and 9). It serves only `/healthz`, `/readyz`,
+`/-/healthy` and `/-/ready`, with no tenant identity, and reads a heartbeat a
+task on the main runtime refreshes once per second: its `/healthz` returns 503
+once that heartbeat is older than 60 s, and its `/readyz` returns 503 when
+readiness above says not ready or the heartbeat is older than 30 s. The copies
+on the main HTTP listener keep the behavior described above.
+
 `/metrics` is the third unconditional route, rendering a fixed and
 deliberately small label set so Ravel's own telemetry cannot explode
 ([guides/observability.md](guides/observability.md)).

@@ -267,6 +267,12 @@ latch are one-way, and a condemned ingest shard cannot recover in-process, so a
 restarts the process: a 503 sheds traffic (Kubernetes removes the pod from its
 Service endpoints), which is why liveness is the separate `/healthz` route.
 
+The same four probe routes, and no others, are also served on the optional
+`--listen-health` listener, which runs on its own thread and answers even when
+every main-runtime worker is busy. There `/healthz` and `/-/healthy` also
+return 503 once the main runtime's heartbeat is older than 60 s, and `/readyz`
+and `/-/ready` also return 503 once it is older than 30 s.
+
 `/metrics` is the Prometheus scrape endpoint. It is unauthenticated, so
 per-tenant labels on the admission and query families are opt-in
 (`--metrics-tenant-labels`); by default every tenant folds into a single

@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`ravel-server --listen-health <addr>` serves liveness and readiness from
+  its own thread** (ADR-1702). The listener runs on a dedicated
+  single-threaded runtime and serves only `/healthz`, `/readyz`, `/-/healthy`
+  and `/-/ready`, so a node whose main-runtime workers are all busy still
+  answers its probes. A heartbeat task on the main runtime keeps it honest:
+  `/healthz` there returns 503 once the heartbeat is older than 60 s, and
+  `/readyz` once it is older than 30 s or any existing readiness condition
+  fails. The flag is unset by default, so nothing binds, and the routes on
+  `--listen-http` are unchanged.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed
