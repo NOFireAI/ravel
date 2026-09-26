@@ -288,12 +288,17 @@ draws, every context page an hour re-list costs, and every record GET
 attempt, successful or not, is charged against `max_requests`, as is
 `SCRUB_REQUESTS_PER_OBJECT` for each object handed to `scrub_one_object`.
 The walk stops when either cap is filled. A unit whose record GET fails with
-anything other than `NotFound` does not advance the marker: the unit is
-retried on the next tick rather than left unverified for a whole rotation.
-This is the split decision 2 did not make. A record whose DECODE fails still
-advances the marker, so one permanently bad record cannot pin the rotation,
-and `NotFound` still advances it, so retention deleting a listed record is
-not a fault to retry.
+a retryable error (`StoreError::is_retryable`: `Throttled`, `Timeout`,
+`Transient`) does not advance the marker: the unit is retried on the next
+tick rather than left unverified for a whole rotation. This is the split
+decision 2 did not make. Every other failure advances the marker, so one
+permanently bad record cannot pin the rotation. A record GET that fails with
+an error retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`, and
+every other kind except `NotFound`) is a scrub finding: it is logged at error
+and counted on `ravel_scrub_checksum_mismatch_total{signal, level}` at the
+level of the objects the record names. A record that is `NotFound` is
+skipped without a finding, since retention deleting a listed record is not a
+fault, and a record whose decode fails is logged and skipped.
 
 **A late record is judged against its whole hour.** Decision 4 sent every
 record that lands behind the marker to the next rotation. That is true only

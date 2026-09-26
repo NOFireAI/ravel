@@ -70,9 +70,16 @@
 //!    page, every record GET attempt, and
 //!    [`ravel_maintain::SCRUB_REQUESTS_PER_OBJECT`] per object verified count
 //!    against the request cap, so a tick whose GETs all fail still stops.
-//! 5. A unit whose record GET failed with a transient store error is not
-//!    consumed: the marker stays behind it and the tick ends, so the next tick
-//!    retries it rather than skipping its objects for a whole rotation.
+//! 5. A unit whose record GET failed with a retryable store error
+//!    ([`StoreError::is_retryable`]: `Throttled`, `Timeout`, `Transient`) is
+//!    not consumed: the marker stays behind it and the tick ends, so the next
+//!    tick retries it rather than skipping its objects for a whole rotation.
+//!    Every other failure moves the marker on. A record GET that fails with an
+//!    error retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`,
+//!    and every other kind but `NotFound`) is counted on
+//!    `ravel_scrub_checksum_mismatch_total` at the level of the objects the
+//!    record names; a record that is `NotFound` (deleted after it was listed)
+//!    or fails to decode is logged and skipped.
 //! 6. Verify each object via
 //!    [`scrub_one_object`](ravel_maintain::scrub_one_object) and record any
 //!    anomaly on the metrics counters below.
@@ -727,15 +734,17 @@ async fn run_shard_tick(
     // Consume the listing in units until either cap of the budget is filled,
     // verifying each unit's objects before moving on so the verification GETs
     // are charged to this tick's request cap rather than running unbounded
-    // after the walk. The marker advances past a unit whose records failed to
-    // DECODE (one bad record must not pin the rotation), but not past one
-    // whose records failed to GET: that is a transient fault, and skipping it
-    // would leave its objects unverified for a whole rotation.
+    // after the walk. The marker stays behind a unit only when one of its GETs
+    // failed with a retryable error: skipping it would leave its objects
+    // unverified for a whole rotation, and retrying can clear the error. A
+    // record that failed to decode, was not found, or failed with an error
+    // retrying cannot clear moves the marker on, so one bad record cannot pin
+    // the rotation; the last of those is counted as a finding.
     let mut listing = MarkerListing::new(store, &prefix, cursor.last_commit_key.clone());
     let mut slice_entries = 0u64;
     let mut requests = 0u64;
     let mut listing_failed = false;
-    let mut unit_get_failed = false;
+    let mut unit_held = false;
     while !plan.budget.is_filled(slice_entries, requests) {
         let pages_before = listing.pages;
         let unit = match next_unit(store, &mut listing).await {
@@ -756,10 +765,19 @@ async fn run_shard_tick(
             .saturating_add(unit.context_pages);
         let outcome = unit_targets(store, &unit).await;
         requests = requests.saturating_add(outcome.gets);
-        if outcome.get_failed {
+        if outcome.retry {
             // Leave the marker where it is: this unit is retried next tick.
-            unit_get_failed = true;
+            unit_held = true;
             break;
+        }
+        for (key, level, error) in &outcome.unreadable {
+            tracing::error!(
+                tenant = %tenant.to_hex(), signal = ?signal, shard, record_key = %key,
+                level = level.as_str(), error = %error,
+                "scrub: record unreadable at rest (non-retryable store error); counted as a \
+                 checksum mismatch"
+            );
+            metrics.record_checksum_mismatch(signal, *level);
         }
         let bytes = outcome.targets.iter().fold(0u64, |sum, entry| {
             sum.saturating_add(entry.target.object_size)
@@ -784,7 +802,7 @@ async fn run_shard_tick(
         )
         .await;
     }
-    let rotation_complete = !listing_failed && !unit_get_failed && listing.ended();
+    let rotation_complete = !listing_failed && !unit_held && listing.ended();
 
     // Cursor-position gauge (ADR-1686 decision 5): listing entries consumed
     // this rotation over the rotation's estimated entry count. A completed
@@ -1127,19 +1145,82 @@ async fn next_unit(
 }
 
 /// What decoding one unit produced: the objects to verify, the GET attempts it
-/// made, and whether any of them failed transiently.
+/// made, whether any of them failed retryably, and the records it could not
+/// read at all.
 struct UnitOutcome {
     targets: Vec<SliceEntry>,
     /// Record GET attempts, successful or not. Every attempt is charged to the
     /// tick's request budget, since a failing GET costs a request and moves no
     /// bytes.
     gets: u64,
-    /// A record GET failed with something other than `NotFound`. The caller
-    /// leaves the marker behind this unit and retries it next tick, rather than
-    /// skipping objects it never verified. `NotFound` is excluded on purpose:
-    /// retention deleting a listed record is not a fault to retry, and pinning
-    /// the marker on it would stall the rotation for good.
-    get_failed: bool,
+    /// A record GET failed with a retryable error ([`StoreError::is_retryable`]:
+    /// throttled, timeout, transient). The caller leaves the marker behind this
+    /// unit and retries it next tick, rather than skipping objects it never
+    /// verified.
+    retry: bool,
+    /// Records of this unit's `advance` set whose GET failed with an error
+    /// retrying cannot clear (anything but `NotFound` and the retryable kinds),
+    /// with the level of the objects each names and the error. Each is a
+    /// finding once the unit is consumed, and the marker moves past it, so one
+    /// record unreadable at rest cannot pin the rotation.
+    unreadable: Vec<(String, ScrubLevel, String)>,
+}
+
+/// How a failed GET affects the scrub (ADR-1686 amendment).
+enum GetFailure {
+    /// Retryable ([`StoreError::is_retryable`]): hold the marker and retry
+    /// the unit next tick.
+    Retry,
+    /// `NotFound`: retention deleted the object after it was listed. Not a
+    /// fault to retry and not a finding.
+    Gone,
+    /// Any other error. Retrying cannot clear it, so it is a finding and the
+    /// marker moves on.
+    Finding,
+}
+
+fn classify_get_failure(err: &StoreError) -> GetFailure {
+    if err.is_retryable() {
+        GetFailure::Retry
+    } else if matches!(err, StoreError::NotFound) {
+        GetFailure::Gone
+    } else {
+        GetFailure::Finding
+    }
+}
+
+/// Apply [`classify_get_failure`] to one failed record GET. A finding is kept
+/// only for a record in the unit's `advance` set: a context record an earlier
+/// tick consumed was already counted then.
+fn note_record_get_failure(
+    key: &str,
+    what: &str,
+    err: &StoreError,
+    level: ScrubLevel,
+    advancing: bool,
+    retry: &mut bool,
+    unreadable: &mut Vec<(String, ScrubLevel, String)>,
+) {
+    match classify_get_failure(err) {
+        GetFailure::Retry => {
+            *retry = true;
+            tracing::warn!(
+                key = %key, error = %err,
+                "scrub: {what} GET failed with a retryable error; unit held, retried next tick"
+            );
+        }
+        GetFailure::Gone => {
+            tracing::warn!(
+                key = %key,
+                "scrub: {what} not found (deleted after it was listed); skipping it"
+            );
+        }
+        GetFailure::Finding => {
+            if advancing {
+                unreadable.push((key.to_string(), level, err.to_string()));
+            }
+        }
+    }
 }
 
 /// The objects one unit of listing entries names: the L0 data object behind
@@ -1156,7 +1237,8 @@ struct UnitOutcome {
 /// no object is verified twice in one rotation.
 async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcome {
     let mut gets = 0u64;
-    let mut get_failed = false;
+    let mut retry = false;
+    let mut unreadable: Vec<(String, ScrubLevel, String)> = Vec::new();
     let lineage: &[String] = if unit.context.is_empty() {
         &unit.advance
     } else {
@@ -1203,10 +1285,14 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                 let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
-                        get_failed |= !matches!(err, StoreError::NotFound);
-                        tracing::warn!(
-                            key = %key, error = %err,
-                            "scrub: commit record GET failed; skipping this object this tick"
+                        note_record_get_failure(
+                            key,
+                            "commit record",
+                            &err,
+                            ScrubLevel::L0,
+                            advancing.contains(key.as_str()),
+                            &mut retry,
+                            &mut unreadable,
                         );
                         continue;
                     }
@@ -1248,10 +1334,14 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                 let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
-                        get_failed |= !matches!(err, StoreError::NotFound);
-                        tracing::warn!(
-                            key = %key, error = %err,
-                            "scrub: compaction record GET failed; skipping this tick"
+                        note_record_get_failure(
+                            key,
+                            "compaction record",
+                            &err,
+                            ScrubLevel::L1,
+                            advancing.contains(key.as_str()),
+                            &mut retry,
+                            &mut unreadable,
                         );
                         continue;
                     }
@@ -1276,10 +1366,14 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                 let got = match store.get(key, GetRange::Full).await {
                     Ok(got) => got,
                     Err(err) => {
-                        get_failed |= !matches!(err, StoreError::NotFound);
-                        tracing::warn!(
-                            key = %key, error = %err,
-                            "scrub: rewrite record GET failed; skipping this tick"
+                        note_record_get_failure(
+                            key,
+                            "rewrite record",
+                            &err,
+                            ScrubLevel::Rewrite,
+                            advancing.contains(key.as_str()),
+                            &mut retry,
+                            &mut unreadable,
                         );
                         continue;
                     }
@@ -1431,7 +1525,8 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
     UnitOutcome {
         targets: out,
         gets,
-        get_failed,
+        retry,
+        unreadable,
     }
 }
 
@@ -3109,7 +3204,7 @@ mod tests {
     /// A delegating store that records the key of every whole-object GET, so a
     /// test can name exactly which objects the content tier read.
     struct FullGetLog {
-        inner: Arc<MemoryStore>,
+        inner: Arc<dyn ObjectStoreBackend>,
         full_gets: parking_lot::Mutex<Vec<String>>,
     }
 
@@ -3512,6 +3607,107 @@ mod tests {
             metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
             0,
             "a transient GET fault is never an anomaly"
+        );
+    }
+
+    /// A record GET that fails with an error retrying cannot clear is a
+    /// finding, not a reason to hold the marker: holding it would retry the
+    /// same unit on every tick and verify nothing after it again. The unit is
+    /// counted as a checksum mismatch at the level of the objects it names,
+    /// the marker moves past it in the same tick, and the next unit's object
+    /// is still verified.
+    #[tokio::test]
+    async fn a_permanent_record_get_error_is_a_finding_and_the_marker_moves_on() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let mut data_keys = Vec::new();
+        for seq in 1..=8u64 {
+            data_keys.push(publish_segment(&memory, seq, &["cpu"]).await);
+        }
+        let tenant_hash = tenant().hash();
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(listed.len(), 8, "eight commit records");
+        let failing = listed[2].key.clone();
+        // Commit keys and data keys both order by writer id, and every seq
+        // here has its own writer, so listing entry `i` names `data_keys[i]`.
+        let mut sorted_data_keys = data_keys.clone();
+        sorted_data_keys.sort();
+        assert_eq!(sorted_data_keys, data_keys);
+
+        let faulted = Arc::new(FaultStore::new(
+            memory.clone(),
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Permanent("scrub: injected record GET fault".to_string()),
+                )
+                .with_key_contains(failing.clone()),
+            ),
+        ));
+        let store = FullGetLog {
+            inner: faulted.clone(),
+            full_gets: parking_lot::Mutex::new(Vec::new()),
+        };
+        let clock = ravel_maintain::FixedClock::new(500_001 * NS_PER_HOUR);
+        let metrics = ScrubMetrics::default();
+
+        // Four entries a tick (`ceil(8 / 2)` over a two-tick rotation).
+        run_shard_tick(
+            &store,
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            2,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+        assert_eq!(
+            faulted.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "the injected fault must have fired exactly once"
+        );
+
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[3].key.as_str()),
+            "the marker must move past the unreadable record in the same tick"
+        );
+        assert_eq!(cursor.rotation_entries_visited, 4);
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            1,
+            "the unreadable record is exactly one finding"
+        );
+
+        let verified: Vec<String> = store
+            .full_gets
+            .lock()
+            .iter()
+            .filter(|key| !key.contains("/c/") && !key.contains("/maint/"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            verified,
+            vec![
+                data_keys[0].clone(),
+                data_keys[1].clone(),
+                data_keys[3].clone()
+            ],
+            "the objects before and after the unreadable record are verified"
         );
     }
 
