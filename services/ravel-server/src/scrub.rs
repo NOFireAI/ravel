@@ -769,8 +769,9 @@ async fn run_shard_tick(
             cursor.consume(last, entries, bytes);
         }
         slice_entries = slice_entries.saturating_add(entries);
-        requests = requests
-            .saturating_add((outcome.targets.len() as u64).saturating_mul(SCRUB_REQUESTS_PER_OBJECT));
+        requests = requests.saturating_add(
+            (outcome.targets.len() as u64).saturating_mul(SCRUB_REQUESTS_PER_OBJECT),
+        );
         verify_slice(
             store,
             clock,
@@ -3361,5 +3362,615 @@ mod tests {
         );
         assert_eq!(cursor.rotation_entries_visited, 1);
         assert_eq!(cursor.rotation_started_unix_ns, 500_003 * NS_PER_HOUR);
+    }
+
+    /// ADR-1686 amendment, decision 2: a record GET that fails transiently
+    /// stops the tick at that unit. The marker stays behind the failed record,
+    /// so the unit is retried next tick instead of being skipped for a whole
+    /// rotation, and the tick's requests stay inside the plan's request cap
+    /// (every GET attempt, failed included, is charged to it).
+    #[tokio::test]
+    async fn a_failed_record_get_holds_the_marker_and_the_tick_stays_in_budget() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        for seq in 1..=8u64 {
+            publish_segment(&memory, seq, &["cpu"]).await;
+        }
+        let tenant_hash = tenant().hash();
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(listed.len(), 8, "eight commit records");
+        let failing = listed[2].key.clone();
+
+        // The tick's plan, computed from the same inputs the tick sees: four
+        // entries (`ceil(8 / 2)` a tick over a two-tick rotation) and, at eight
+        // requests an entry, a cap of 32 requests.
+        let clock = ravel_maintain::FixedClock::new(500_001 * NS_PER_HOUR);
+        let mut probe = ScrubCursor::new(tenant_hash, Signal::Metrics, 0, clock.now_ns());
+        probe.start_rotation(8, Some(listed[7].key.clone()), clock.now_ns());
+        let plan = probe.plan_tick(2, 1, None, clock.now_ns());
+        assert_eq!(plan.budget.max_entries, 4);
+        assert_eq!(plan.budget.max_requests, 32);
+
+        let faulted = Arc::new(FaultStore::new(
+            memory.clone(),
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Transient("scrub: injected record GET fault".to_string()),
+                )
+                .with_key_contains(failing.clone()),
+            ),
+        ));
+        let store = ravel_object_store::InstrumentedStore::new(faulted.clone());
+        let counters = store.metrics();
+        let metrics = ScrubMetrics::default();
+
+        let before = counters.snapshot();
+        run_shard_tick(
+            &store,
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            2,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+        let after = counters.snapshot();
+        assert_eq!(
+            faulted.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the injected fault must have fired exactly once"
+        );
+
+        // Three LIST-only counting pages plus the walk's one page; one cursor
+        // GET, then per consumed record one record GET and the scrub's footer
+        // and whole-object GETs, then the failed record's own GET:
+        // `1 + 2 * 3 + 1 = 8`.
+        let lists = after.list.calls - before.list.calls;
+        let gets = after.get.calls - before.get.calls;
+        assert_eq!((lists, gets), (4, 8), "the tick's LIST and GET counts");
+        // The walk's own requests: everything but the cursor GET, the cursor
+        // PUT, and the three counting pages.
+        let walk_requests = lists + gets - 5;
+        assert_eq!(walk_requests, 7);
+        assert!(
+            walk_requests <= plan.budget.max_requests,
+            "the tick issued {walk_requests} requests against a cap of {}",
+            plan.budget.max_requests
+        );
+
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[1].key.as_str()),
+            "the marker must stop behind the record whose GET failed"
+        );
+        assert_eq!(cursor.rotation_entries_visited, 2);
+        assert_eq!(cursor.rotation_total_entries, Some(8));
+
+        // The same fault next tick leaves the marker where it is: the unit is
+        // retried, never skipped.
+        run_shard_tick(
+            &store,
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            2,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[1].key.as_str())
+        );
+        assert_eq!(cursor.rotation_entries_visited, 2);
+
+        // Once the fault clears, the retried unit is consumed and the walk
+        // moves on: four more entries at this budget.
+        run_shard_tick(
+            memory.as_ref(),
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            2,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[5].key.as_str())
+        );
+        assert_eq!(cursor.rotation_entries_visited, 6);
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0,
+            "a transient GET fault is never an anomaly"
+        );
+    }
+
+    /// ADR-1686 amendment, decision 3: a compaction record that lands in an
+    /// hour the marker has already passed is judged against that hour's whole
+    /// lineage set, not against itself alone. It loses the overlap against the
+    /// record already there, so its part is left out of the corpus exactly as
+    /// it would have been had both been listed in one unit.
+    #[tokio::test]
+    async fn a_late_landing_compaction_record_is_judged_against_its_whole_hour() {
+        use ravel_commit::erasure;
+        use ravel_proto::commit::v1::{CompactionPart, CompactionRecord};
+
+        let memory = Arc::new(MemoryStore::new());
+        let tenant_id = tenant();
+        let tenant_hash = tenant_id.hash();
+        let shard = 0u32;
+        let ingest_hour_bucket = 500_000u32;
+        let created_unix_ns = 500_000 * NS_PER_HOUR;
+
+        publish_segment_at(&memory, 1, &["cpu"], 500_000).await;
+        publish_segment_at(&memory, 2, &["mem"], 500_000).await;
+        let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, shard, 500_000);
+        let compact_clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let outcome = ravel_maintain::compact_bucket(
+            memory.as_ref(),
+            &compact_clock,
+            &ravel_maintain::CompactorConfig::default(),
+            &bucket,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+            "two sealed L0 inputs must compact, got {outcome:?}"
+        );
+        // A second hour, so consuming hour 500_000's last entry leaves the
+        // marker sitting on it rather than ending the rotation.
+        publish_segment_at(&memory, 3, &["cpu"], 500_001).await;
+        publish_segment_at(&memory, 4, &["mem"], 500_001).await;
+
+        let hour_prefix =
+            keys::commit_shard_hour_prefix(&tenant_hash, Signal::Metrics, shard, 500_000)
+                .expect("hour prefix");
+        let winner_record_key = list_all(memory.as_ref(), &hour_prefix)
+            .await
+            .expect("list bucket")
+            .iter()
+            .map(|m| m.key.clone())
+            .find(|k| {
+                matches!(
+                    keys::partition_bucket_entry(k),
+                    Ok(keys::BucketEntry::CompactionRecord(_))
+                )
+            })
+            .expect("a compaction record was published");
+        let winner_bytes = memory
+            .get(&winner_record_key, GetRange::Full)
+            .await
+            .expect("get compaction record")
+            .data;
+        let winner =
+            ravel_commit::record::decode_compaction(&winner_bytes).expect("decode compaction");
+        assert_eq!(winner.inputs.len(), 2, "the compactor named both inputs");
+
+        // The late arrival: a second compaction record in the same hour naming
+        // one of the winner's two inputs, so the two overlap and the winner's
+        // strictly larger input set decides the tie. Its own part is a real
+        // segment, so an unfiltered corpus would really scrub it.
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "cpu".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&tenant_id, "cpu", &labels).expect("series id");
+        let series = vec![SeriesInput {
+            series_id,
+            labels,
+            samples: vec![Sample {
+                ts_ns: created_unix_ns,
+                value: 1.0,
+            }],
+        }];
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: Uuid::from_u128(4_000).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let late_part_bytes = written.bytes;
+        let late_part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: written.summary.blake3.to_vec(),
+            object_size: late_part_bytes.len() as u64,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            run_count: 1,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            declared_column_stats: Vec::new(),
+        };
+        let build_late = |inputs: Vec<_>| CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            input_set_hash: erasure::compute_compaction_input_set_hash(&inputs).to_vec(),
+            inputs,
+            parts: vec![late_part.clone()],
+            created_unix_ns,
+        };
+        // The record key is ordered by the input set's hash, and the walk only
+        // ever reaches a key that sorts after the marker. Either single-input
+        // variant overlaps the winner and loses to it, so take the one whose
+        // key the marker has not already passed.
+        let late = [0usize, 1]
+            .into_iter()
+            .map(|i| build_late(vec![winner.inputs[i].clone()]))
+            .find(|record| {
+                keys::compaction_record_key_for(record).is_ok_and(|key| key > winner_record_key)
+            })
+            .expect("one single-input variant sorts after the record already in the hour");
+        let late_record_key = keys::compaction_record_key_for(&late).expect("late record key");
+        let late_part_key =
+            keys::reconstruct_l1_part_key(&late, &late_part).expect("late l1 part key");
+
+        let store = FullGetLog {
+            inner: memory.clone(),
+            full_gets: parking_lot::Mutex::new(Vec::new()),
+        };
+        let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let metrics = ScrubMetrics::default();
+        // Five listing entries, one a tick: the two commit records, then the
+        // hour's compaction record, which leaves the marker on it.
+        for tick in 1..=3u64 {
+            run_shard_tick(
+                &store,
+                &clock,
+                &tenant_hash,
+                Signal::Metrics,
+                0,
+                5,
+                1,
+                None,
+                None,
+                &metrics,
+            )
+            .await;
+            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+                .await
+                .expect("cursor loads");
+            assert_eq!(cursor.rotation_entries_visited, tick, "tick {tick}");
+        }
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(winner_record_key.as_str()),
+            "the marker sits on the hour's last entry"
+        );
+
+        memory
+            .put(&late_part_key, late_part_bytes, PutOptions::default())
+            .await
+            .expect("put the late record's l1 part");
+        memory
+            .put(
+                &late_record_key,
+                ravel_commit::record::encode_compaction(&late),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put the late compaction record");
+        corrupt_first_byte(&memory, &late_part_key).await;
+        store.full_gets.lock().clear();
+
+        run_shard_tick(
+            &store,
+            &clock,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            5,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+
+        let visited: Vec<String> = store
+            .full_gets
+            .lock()
+            .iter()
+            .filter(|key| !key.contains("/c/") && !key.contains("/maint/"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            visited,
+            Vec::<String>::new(),
+            "the late record loses its overlap, so the tick verifies no object at all"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L1),
+            0,
+            "the late record's corrupt part must be left out of the corpus"
+        );
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(late_record_key.as_str()),
+            "the marker still advances past the entry it judged"
+        );
+        assert_eq!(cursor.rotation_entries_visited, 4);
+    }
+
+    /// ADR-1686 amendment, decision 4: a cursor GET that fails for any reason
+    /// other than `NotFound` skips the shard's tick and leaves the stored
+    /// cursor alone. Starting a fresh rotation there would rewind the marker to
+    /// the head of the listing and drop the rotation's progress on a transient
+    /// throttle.
+    #[tokio::test]
+    async fn a_failed_cursor_get_skips_the_tick_and_keeps_the_stored_cursor() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let memory = Arc::new(MemoryStore::new());
+        for seq in 1..=3u64 {
+            publish_segment(&memory, seq, &["cpu"]).await;
+        }
+        let tenant_hash = tenant().hash();
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(listed.len(), 3);
+
+        let opened_at = 500_001 * NS_PER_HOUR;
+        let clock = ravel_maintain::FixedClock::new(opened_at);
+        let metrics = ScrubMetrics::default();
+        for _ in 0..2 {
+            run_shard_tick(
+                memory.as_ref(),
+                &clock,
+                &tenant_hash,
+                Signal::Metrics,
+                0,
+                3,
+                1,
+                None,
+                None,
+                &metrics,
+            )
+            .await;
+        }
+        let before = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            before.last_commit_key.as_deref(),
+            Some(listed[1].key.as_str())
+        );
+        assert_eq!(before.rotation_entries_visited, 2);
+
+        let faulted = Arc::new(FaultStore::new(
+            memory.clone(),
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Transient("scrub: injected cursor GET fault".to_string()),
+                )
+                .with_key_contains(".cursor"),
+            ),
+        ));
+        // A later clock, so a tick that wrongly opened a fresh rotation would
+        // stamp this time on the stored cursor.
+        let later = ravel_maintain::FixedClock::new(500_002 * NS_PER_HOUR);
+        run_shard_tick(
+            faulted.as_ref(),
+            &later,
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            3,
+            1,
+            None,
+            None,
+            &metrics,
+        )
+        .await;
+        assert_eq!(
+            faulted.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the injected fault must have fired exactly once"
+        );
+
+        let after = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            after.last_commit_key.as_deref(),
+            Some(listed[1].key.as_str()),
+            "the stored marker must not move when the cursor could not be read"
+        );
+        assert_eq!(after.rotation_entries_visited, 2);
+        assert_eq!(after.rotation_total_entries, Some(3));
+        assert_eq!(
+            after.rotation_started_unix_ns, opened_at,
+            "the rotation must not restart on a transient cursor read failure"
+        );
+    }
+
+    /// ADR-1686 decision 3 and its amendment: records committed mid-rotation
+    /// are covered by the rotation that is running only when they sort after
+    /// its marker. One lands ahead of the marker and one behind it; the
+    /// rotation in flight verifies every object from its marker on, including
+    /// the one that arrived ahead of it, and the record that landed behind the
+    /// marker waits for the next rotation, which then verifies all six.
+    #[tokio::test]
+    async fn records_committed_mid_rotation_split_across_the_marker() {
+        let memory = Arc::new(MemoryStore::new());
+        let tenant_hash = tenant().hash();
+        // `publish_segment` derives the writer id from the sequence number, and
+        // a commit record key leads with it, so a higher sequence sorts later.
+        let mut data_keys: Vec<(u64, String)> = Vec::new();
+        for seq in 2..=5u64 {
+            data_keys.push((seq, publish_segment(&memory, seq, &["cpu"]).await));
+        }
+
+        let store = FullGetLog {
+            inner: memory.clone(),
+            full_gets: parking_lot::Mutex::new(Vec::new()),
+        };
+        let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
+        let metrics = ScrubMetrics::default();
+        async fn tick(
+            store: &FullGetLog,
+            memory: &MemoryStore,
+            clock: &ravel_maintain::FixedClock,
+            tenant_hash: &TenantHash,
+            metrics: &ScrubMetrics,
+        ) -> ScrubCursor {
+            run_shard_tick(
+                store,
+                clock,
+                tenant_hash,
+                Signal::Metrics,
+                0,
+                5,
+                1,
+                None,
+                None,
+                metrics,
+            )
+            .await;
+            load_cursor(memory, tenant_hash, Signal::Metrics, 0, 0)
+                .await
+                .expect("cursor loads")
+        }
+
+        // Two ticks of the four-entry rotation, one entry each.
+        for expected in 1..=2u64 {
+            let cursor = tick(&store, memory.as_ref(), &clock, &tenant_hash, &metrics).await;
+            assert_eq!(cursor.rotation_entries_visited, expected);
+            assert_eq!(cursor.rotation_total_entries, Some(4));
+        }
+
+        // Mid-rotation commits: sequence 6 sorts after the marker (and after
+        // the rotation's tail), sequence 1 before it.
+        data_keys.push((6, publish_segment(&memory, 6, &["cpu"]).await));
+        data_keys.push((1, publish_segment(&memory, 1, &["cpu"]).await));
+        let key_for = |seq: u64| -> String {
+            data_keys
+                .iter()
+                .find(|(s, _)| *s == seq)
+                .map(|(_, key)| key.clone())
+                .expect("published sequence")
+        };
+
+        let cursor = tick(&store, memory.as_ref(), &clock, &tenant_hash, &metrics).await;
+        assert_eq!(
+            cursor.rotation_appended_entries, 1,
+            "only the record that landed after the rotation's tail is an append"
+        );
+        assert_eq!(cursor.rotation_entries_visited, 3);
+
+        let mut ticks = 3;
+        loop {
+            let cursor = tick(&store, memory.as_ref(), &clock, &tenant_hash, &metrics).await;
+            ticks += 1;
+            if cursor.last_commit_key.is_none() {
+                break;
+            }
+            assert!(ticks < 10, "the rotation must finish");
+        }
+        assert_eq!(ticks, 5, "five one-entry ticks cover the five entries");
+
+        let mut first_rotation: Vec<String> = store
+            .full_gets
+            .lock()
+            .iter()
+            .filter(|key| !key.contains("/c/") && !key.contains("/maint/"))
+            .cloned()
+            .collect();
+        first_rotation.sort();
+        let mut expected: Vec<String> = (2..=6u64).map(key_for).collect();
+        expected.sort();
+        assert_eq!(
+            first_rotation, expected,
+            "the rotation in flight verifies every record from its marker on, the one \
+             committed ahead of the marker included, and not the one committed behind it"
+        );
+
+        store.full_gets.lock().clear();
+        let mut ticks = 0;
+        loop {
+            let cursor = tick(&store, memory.as_ref(), &clock, &tenant_hash, &metrics).await;
+            ticks += 1;
+            if cursor.last_commit_key.is_none() {
+                break;
+            }
+            assert!(ticks < 10, "the next rotation must finish");
+        }
+        assert_eq!(ticks, 3, "six entries at two a tick");
+
+        let mut second_rotation: Vec<String> = store
+            .full_gets
+            .lock()
+            .iter()
+            .filter(|key| !key.contains("/c/") && !key.contains("/maint/"))
+            .cloned()
+            .collect();
+        second_rotation.sort();
+        let mut expected: Vec<String> = (1..=6u64).map(key_for).collect();
+        expected.sort();
+        assert_eq!(
+            second_rotation, expected,
+            "the next rotation verifies all six, the record that landed behind the old \
+             marker included"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0
+        );
     }
 }
