@@ -74,7 +74,7 @@ services:
   # already-qualified bucket it reports the existing record and exits 0, so this
   # tolerates a populated `rustfs-data/` across runs.
   qualify:
-    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.17.0}
+    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.18.0}
     depends_on:
       createbucket:
         condition: service_completed_successfully
@@ -99,7 +99,7 @@ services:
   # container boundary forbids, so the demo authenticates with a real bearer
   # token against a real tenant map, exactly as a deployment does.
   ravel-server:
-    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.17.0}
+    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.18.0}
     depends_on:
       qualify:
         condition: service_completed_successfully

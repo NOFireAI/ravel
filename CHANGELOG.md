@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-26
+
 ### Changed
 
 - **`ravel-server` defaults to `byte-minimal` logs fetching against a
