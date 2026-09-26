@@ -82,6 +82,18 @@ fn now_ns() -> i64 {
 /// window covering it resolves the snapshot, opens the segment, and (on the
 /// distributed server) produces at least one slice to fan out.
 async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) {
+    publish_segment_seq(store, tenant, base_ns, 1).await;
+}
+
+/// [`publish_segment`] with the flush sequence number exposed, so one test can
+/// land several distinct L0 segments in a single ingest-hour bucket (two
+/// segments sharing a `writer_seq` would share a commit key and a data key).
+async fn publish_segment_seq(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    base_ns: i64,
+    writer_seq: u64,
+) {
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {
         name: "__name__".to_string(),
@@ -116,7 +128,7 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
         shard: 0,
         writer_id: writer_id.to_string(),
         writer_epoch: 1,
-        writer_seq: 1,
+        writer_seq,
     };
     let written = SegmentWriter::write(
         series,
@@ -134,7 +146,7 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
         shard: 0,
         writer_id,
         writer_epoch: 1,
-        writer_seq: 1,
+        writer_seq,
         object_size: written.bytes.len() as u64,
         content_hash: written.summary.blake3,
         sample_count: written.summary.sample_count,
@@ -2051,4 +2063,445 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
         0,
         "no coordinator-local fallback masks the corruption"
     );
+}
+
+/// A worker-side store wrapper that splits what the worker reads into two
+/// counters -- catalog-shaped requests (any listing, and any read of something
+/// that is not an `.rseg` data object) and data-object reads -- and can hold
+/// the worker's first tenant read shut so a compaction can be committed while
+/// a fragment is in flight. `sys/` keys (heartbeats, the store probe, the
+/// tenancy marker) are the server's own background traffic and are counted
+/// under neither, so the tenant-prefixed counters stay attributable.
+struct WorkerProbeStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    catalog_requests: AtomicU64,
+    data_object_gets: AtomicU64,
+    armed: std::sync::atomic::AtomicBool,
+    blocked: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+impl WorkerProbeStore {
+    fn new(inner: Arc<dyn ObjectStoreBackend>) -> Self {
+        Self {
+            inner,
+            catalog_requests: AtomicU64::new(0),
+            data_object_gets: AtomicU64::new(0),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            blocked: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn note_read(&self, key: &str) {
+        if key.starts_with("sys/") {
+            return;
+        }
+        if key.ends_with(".rseg") {
+            self.data_object_gets.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.catalog_requests.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn note_list(&self, prefix: &str) {
+        if !prefix.starts_with("sys/") {
+            self.catalog_requests.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn reset_counters(&self) {
+        self.catalog_requests.store(0, Ordering::SeqCst);
+        self.data_object_gets.store(0, Ordering::SeqCst);
+    }
+
+    fn catalog_requests(&self) -> u64 {
+        self.catalog_requests.load(Ordering::SeqCst)
+    }
+
+    fn data_object_gets(&self) -> u64 {
+        self.data_object_gets.load(Ordering::SeqCst)
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn blocked(&self) -> usize {
+        self.blocked.load(Ordering::SeqCst)
+    }
+
+    fn release_all(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for WorkerProbeStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.note_read(key);
+        if !key.starts_with("sys/") {
+            loop {
+                if !self.armed.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Register the waiter before re-checking, so a release between
+                // the check and the await still wakes it.
+                let notified = self.release.notified();
+                if !self.armed.load(Ordering::SeqCst) {
+                    break;
+                }
+                self.blocked.fetch_add(1, Ordering::SeqCst);
+                notified.await;
+                self.blocked.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.note_read(key);
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.note_list(prefix);
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.note_list(prefix);
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// ADR-0071's reconstruct-don't-trust rule, end to end: a compaction that
+/// commits between the coordinator's resolve and the worker's fetch cannot
+/// change what the worker reads, and the worker issues no catalog request at
+/// all while serving the fragment.
+///
+/// The compaction is real: two L0 segments land in one sealed ingest-hour
+/// bucket and `compact_bucket` publishes an L1 part plus its compaction record
+/// over them, which is exactly the catalog change that makes a re-resolve on
+/// the worker return a different segment set from the one the coordinator
+/// pinned. It is committed while the fragment is genuinely in flight -- the
+/// worker's store holds its first tenant read shut until the compaction record
+/// is published.
+///
+/// NON-VACUITY: the row-equality assertion alone does not pin this. A worker
+/// that re-resolves and misses its pinned segments answers
+/// `SNAPSHOT_INVALIDATED`, which the coordinator folds into one re-resolve and
+/// re-dispatch (`crates/ravel-query/src/distrib/mod.rs`), so the second round
+/// succeeds over the newly compacted L1 part and the rows still match. The
+/// assertion that flips is the exact-zero worker catalog-request count: with a
+/// per-request `catalog.resolve` on the worker path it is nonzero regardless of
+/// what the rows say.
+#[tokio::test]
+async fn compaction_between_resolve_and_fetch_returns_local_rows() {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_maintain::{Bucket, CompactionOutcome, CompactorConfig, FixedClock, compact_bucket};
+    use ravel_query::distrib::codec;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_server::distrib::{
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+    // The coordinator and the local oracle read the backing store directly; the
+    // worker process reads it through the counting, holdable wrapper, so every
+    // counter below is attributable to the worker alone.
+    let backing: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let worker_store = Arc::new(WorkerProbeStore::new(Arc::clone(&backing)));
+    let worker_backend: Arc<dyn ObjectStoreBackend> = worker_store.clone();
+
+    let tenant = TenantId::new(TENANT);
+    let tenant_hash = tenant.hash();
+    let now = now_ns();
+    // An hour-aligned anchor three hours back: both L0 segments land in one
+    // ingest-hour bucket, and that bucket is already sealed at `now`
+    // (hour end plus `max_flush_lifetime + clock_skew_allowance`), so the
+    // compaction below really compacts instead of returning `NotSealed`.
+    let anchor = (now - 3 * NS_PER_HOUR) / NS_PER_HOUR * NS_PER_HOUR;
+    publish_segment_seq(backing.as_ref(), &tenant, anchor + 5 * NS_PER_MIN, 1).await;
+    publish_segment_seq(backing.as_ref(), &tenant, anchor + 20 * NS_PER_MIN, 2).await;
+    let (start_ms, end_ms, step_ms) = (
+        anchor / NS_PER_SEC * 1000,
+        (anchor + 40 * NS_PER_MIN) / NS_PER_SEC * 1000,
+        60_000,
+    );
+
+    // The worker: a real --distributed-query process serving `SeriesFetch`.
+    let server_a = start_server(
+        Arc::clone(&worker_backend),
+        Some(always_distribute_settings()),
+    )
+    .await;
+    let a_grpc = server_a.grpc_addr.expect("gRPC listener binds in All mode");
+
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
+    let fallback_catalog = ravel_server::query::build_catalog(
+        Arc::clone(&backing),
+        1,
+        false,
+        CACHE_BYTES,
+        None,
+        None,
+        None,
+        Duration::from_secs(2),
+    )
+    .expect("catalog");
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let fallback_service = FragmentService::new(
+        Arc::new(vec![FRAGMENT_KEY]),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            HashMap::new(),
+        )),
+        admission,
+        fallback_catalog,
+        Arc::clone(&backing),
+        None,
+        clock,
+        metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+    );
+    let self_cell = Arc::new(OnceLock::new());
+    self_cell
+        .set(uuid::Uuid::from_u128(0xF00D))
+        .expect("set self id");
+    let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+        process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
+        fragment_endpoint: a_grpc.to_string(),
+        flight_sql_endpoint: a_grpc.to_string(),
+        protocol_version: codec::PROTOCOL_VERSION,
+        started_unix_ns: 0,
+    }])));
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        Arc::new(vec![FRAGMENT_KEY]),
+        fallback_service,
+        metrics.clone(),
+    ));
+    let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+        fetcher,
+        always_distribute_settings().thresholds,
+    ));
+    let coordinator_catalog = ravel_server::query::build_catalog(
+        Arc::clone(&backing),
+        1,
+        false,
+        CACHE_BYTES,
+        None,
+        None,
+        None,
+        Duration::from_secs(2),
+    )
+    .expect("catalog");
+    let coordinator = Arc::new(
+        QueryEngine::new(
+            coordinator_catalog,
+            Arc::clone(&backing),
+            EngineConfig::default(),
+        )
+        .with_distributed(distributed),
+    );
+
+    // Everything the worker process read while starting up (the store probe,
+    // the tenancy marker) is not this test's subject: count from here on.
+    worker_store.reset_counters();
+    worker_store.arm();
+
+    let deadline = EngineConfig::default().deadline;
+    let query = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .range_with_stats(
+                    tenant_hash,
+                    METRIC,
+                    start_ms,
+                    end_ms,
+                    step_ms,
+                    &[],
+                    now,
+                    deadline,
+                )
+                .await
+        }
+    });
+
+    let parked = tokio::time::timeout(Duration::from_secs(30), async {
+        while worker_store.blocked() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        parked.is_ok(),
+        "the worker must reach a held tenant read while the fragment is in flight"
+    );
+
+    // The catalog changes under the in-flight fragment: an L1 part plus its
+    // compaction record now cover both pinned L0 segments.
+    let hour = u32::try_from(anchor / NS_PER_HOUR).expect("hour bucket fits u32");
+    let compactor = CompactorConfig {
+        compactor_writer_id: uuid::Uuid::from_u128(9_000),
+        ..CompactorConfig::default()
+    };
+    let bucket = Bucket::new(tenant_hash, Signal::Metrics, 0, hour);
+    let outcome = compact_bucket(
+        backing.as_ref(),
+        &FixedClock::new(now),
+        &compactor,
+        &bucket,
+    )
+    .await
+    .expect("compacting the sealed bucket succeeds");
+    match outcome {
+        CompactionOutcome::Compacted { parts, .. } => assert_eq!(
+            parts, 1,
+            "the two pinned L0 segments compact into exactly one L1 part"
+        ),
+        other => panic!("the sealed two-segment bucket must compact, got {other:?}"),
+    }
+
+    worker_store.release_all();
+    let (remote_value, _) = query
+        .await
+        .expect("the coordinator task joins")
+        .expect("the distributed query succeeds across the compaction");
+
+    // The oracle runs after the compaction, over the compacted catalog: the
+    // distributed answer must equal local execution regardless of which
+    // physical objects each side read.
+    let oracle_catalog = ravel_server::query::build_catalog(
+        Arc::clone(&backing),
+        1,
+        false,
+        CACHE_BYTES,
+        None,
+        None,
+        None,
+        Duration::from_secs(2),
+    )
+    .expect("catalog");
+    let plain = QueryEngine::new(
+        oracle_catalog,
+        Arc::clone(&backing),
+        EngineConfig::default(),
+    );
+    let (local_value, _) = plain
+        .range_with_stats(
+            tenant_hash,
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            deadline,
+        )
+        .await
+        .expect("the local query succeeds");
+
+    assert_eq!(
+        remote_value, local_value,
+        "a compaction committed between the coordinator's resolve and the \
+         worker's fetch must not change the rows the distributed query returns"
+    );
+    // Pin the rows themselves, so the equality above cannot pass on two empty
+    // results. One series, and the 5-minute lookback carries each of the four
+    // samples across the 60s grid: 1.0 from +5m, 2.5 from +8m, then the second
+    // segment's 1.0 from +20m and 2.5 from +23m.
+    let series = match &remote_value {
+        ravel_promql::Value::Matrix(matrix) => matrix,
+        other => panic!("a range query returns a matrix, got {}", other.type_name()),
+    };
+    assert_eq!(
+        series.len(),
+        1,
+        "both segments carry the same single series"
+    );
+    let points: Vec<(i64, u64)> = series[0]
+        .1
+        .iter()
+        .map(|sample| ((sample.ts_ns - anchor) / NS_PER_MIN, sample.value.to_bits()))
+        .collect();
+    let expected: Vec<(i64, u64)> = [5, 6, 7]
+        .into_iter()
+        .map(|m| (m, 1.0f64.to_bits()))
+        .chain([8, 9, 10, 11, 12].into_iter().map(|m| (m, 2.5f64.to_bits())))
+        .chain([20, 21, 22].into_iter().map(|m| (m, 1.0f64.to_bits())))
+        .chain(
+            [23, 24, 25, 26, 27]
+                .into_iter()
+                .map(|m| (m, 2.5f64.to_bits())),
+        )
+        .collect();
+    assert_eq!(
+        points, expected,
+        "the distributed result is the exact grid the two pinned segments produce"
+    );
+    assert_eq!(
+        worker_store.catalog_requests(),
+        0,
+        "the worker reconstructs object keys from the pinned identities and \
+         issues no catalog request; data-object reads were {}",
+        worker_store.data_object_gets(),
+    );
+    assert_eq!(
+        worker_store.data_object_gets(),
+        2,
+        "the worker reads exactly the two pinned L0 objects, once each, and \
+         never the compaction's L1 part"
+    );
+    assert_eq!(
+        metrics.slices_remote_total(),
+        1,
+        "the single ingest shard maps to exactly one remote slice"
+    );
+    assert_eq!(
+        metrics.slices_local_total(),
+        0,
+        "no slice is self-mapped: the coordinator's id is absent from the \
+         worker set"
+    );
+    assert_eq!(
+        metrics.slices_fallback_total(),
+        0,
+        "the worker is reachable and answers, so nothing falls back to local"
+    );
+
+    server_a.shutdown().await.expect("the worker shuts down");
 }

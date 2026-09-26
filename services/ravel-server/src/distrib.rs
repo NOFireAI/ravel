@@ -10,12 +10,13 @@
 //!   [`AdmissionClasses`] (`Pinned` or `Resolve`, selected by request scope;
 //!   never the client-query cap), so a federation-heavy peer cluster queuing
 //!   on the `Resolve` class can never delay this cluster's own intra-cluster
-//!   `Pinned` slices. Per request it
-//!   resolves a snapshot for the request's tenant over the request's event-time
-//!   window, builds an interim content-hash
-//!   [`SnapshotSegmentResolver`], and delegates to the in-crate
-//!   [`SeriesFetchService`] so a fragment fetch is byte-identical to what the
-//!   local path would read.
+//!   `Pinned` slices. An intra-cluster pinned slice rebuilds each segment's
+//!   object key from the shipped identity
+//!   ([`ReconstructingSegmentResolver`]) and issues no catalog request at all;
+//!   only a cross-cluster resolve scope resolves a snapshot here, over which it
+//!   builds a [`SnapshotSegmentResolver`]. Either way it delegates to the
+//!   in-crate [`SeriesFetchService`] so a fragment fetch is byte-identical to
+//!   what the local path would read.
 //! * [`RoutingSliceFetcher`] -- the coordinator side. It implements the
 //!   [`SliceFetcher`] seam the engine dispatches each slice through. It
 //!   rendezvous-maps a slice's `(tenant_hash, signal, shard)` unit onto the live
@@ -77,7 +78,9 @@ use ravel_query::distrib::client::{
 use ravel_query::distrib::codec;
 use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
-use ravel_query::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
+use ravel_query::distrib::service::{
+    ReconstructingSegmentResolver, SegmentResolver, SeriesFetchService, SnapshotSegmentResolver,
+};
 use ravel_query::http::TenantResolver;
 use ravel_types::accounting::QueryAccountingSnapshot;
 use ravel_types::{Signal, TenantHash, TimeRange};
@@ -831,53 +834,36 @@ impl FragmentService {
             .inspect_err(|_| self.inner.metrics.record_fragment_auth_failure())
     }
 
-    /// Build the interim content-hash resolver for one request by resolving a
-    /// snapshot for the request's tenant and metrics signal over the request's
-    /// event-time window.
+    /// Build the resolver for one intra-cluster pinned request.
     ///
-    /// The coordinator carries the event-time envelope of the slice's pinned
-    /// segments in `window_start_ns`/`window_end_ns` (see
-    /// [`ravel_query::distrib`]'s `slice_event_window`). That envelope contains
-    /// every pinned segment's own event range, so a resolve bounded to it still
-    /// returns every pinned segment (a `Catalog::resolve` over a window returns
-    /// every segment whose events overlap it): the resolved snapshot stays a
-    /// superset of the dispatched pins, and the fetch reads exactly the pinned
-    /// segments (byte-identical to the local path), while no longer paying a
-    /// whole-history catalog resolve on the query critical path. A tenant we
-    /// cannot decode, or a signal other than metrics, yields an empty resolver:
-    /// the delegate service then returns the same typed status
-    /// (`BadData`/`Unsupported`) it would for any such request, which the
-    /// coordinator handles.
-    async fn build_resolver(&self, request: &pb::FetchRequest) -> Arc<SnapshotSegmentResolver> {
-        let Some(tenant_hash) = decode_tenant_hash(&request.tenant_hash) else {
-            return Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
-        };
+    /// ADR-0071 is reconstruct-don't-trust: the coordinator ships each pinned
+    /// segment's durable identity, and the worker rebuilds that segment's object
+    /// key from the identity with `ravel_commit::keys`, verifying the rebuilt key
+    /// parses back to the same identity. No catalog request is issued on this
+    /// path at all, so a compaction committed between the coordinator's resolve
+    /// and this fetch cannot change which objects are read: object keys and the
+    /// objects under them are immutable, and the coordinator's pins name them
+    /// directly.
+    ///
+    /// Returns `None` for a tenant hash we cannot decode or a signal other than
+    /// metrics. The delegate service rejects both with the same typed status
+    /// (`BadData`/`Unsupported`) before it ever consults a resolver, so the
+    /// caller's stand-in is never asked to resolve anything.
+    fn build_resolver(
+        &self,
+        request: &pb::FetchRequest,
+    ) -> Option<Arc<ReconstructingSegmentResolver>> {
+        let tenant_hash = decode_tenant_hash(&request.tenant_hash)?;
         // Only metrics are distributed; for any other signal the delegate
-        // returns Unsupported regardless of the resolver, so skip the resolve.
-        if codec::signal_from_u32(request.signal) != Ok(Signal::Metrics) {
-            return Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
+        // returns Unsupported regardless of the resolver.
+        let signal = codec::signal_from_u32(request.signal).ok()?;
+        if signal != Signal::Metrics {
+            return None;
         }
-        let window = TimeRange {
-            start_ns: request.window_start_ns,
-            end_ns: request.window_end_ns,
-        };
-        let now_ns = self.inner.clock.now_ns();
-        match self
-            .inner
-            .catalog
-            .resolve(&tenant_hash, Signal::Metrics, window, &[], now_ns)
-            .await
-        {
-            Ok(snapshot) => Arc::new(SnapshotSegmentResolver::new(snapshot.segments)),
-            // A resolve failure leaves an empty resolver: the delegate maps the
-            // unknown pinned segments to SnapshotInvalidated, and the
-            // coordinator re-resolves and retries once, the same recovery a
-            // genuinely vanished segment takes.
-            Err(err) => {
-                tracing::warn!(error = %err, "fragment snapshot resolve failed; returning empty resolver");
-                Arc::new(SnapshotSegmentResolver::new(std::iter::empty()))
-            }
-        }
+        Some(Arc::new(ReconstructingSegmentResolver::new(
+            tenant_hash,
+            signal,
+        )))
     }
 
     /// Rewrite a cross-cluster resolve-scope request into a pinned one over this
@@ -959,16 +945,35 @@ impl FragmentService {
     /// (after auth and admission) and the coordinator's no-hop local path.
     async fn resolve_and_run(&self, request: pb::FetchRequest) -> Vec<pb::FetchResponse> {
         // A cross-cluster resolve scope is rewritten to a pinned scope over this
-        // cluster's own snapshot; a pinned scope (intra-cluster) uses the
-        // full-window content-hash resolver unchanged.
-        let federated = matches!(request.scope, Some(pb::fetch_request::Scope::Resolve(_)));
-        let (request, resolver) = match &request.scope {
-            Some(pb::fetch_request::Scope::Resolve(_)) => self.resolve_scope(request).await,
-            _ => {
-                let resolver = self.build_resolver(&request).await;
-                (request, resolver)
+        // cluster's own snapshot, and keeps the snapshot resolver that rewrite
+        // built. An intra-cluster pinned scope reconstructs each object key from
+        // the shipped identity and resolves no catalog.
+        match &request.scope {
+            Some(pb::fetch_request::Scope::Resolve(_)) => {
+                let (request, resolver) = self.resolve_scope(request).await;
+                self.run_slice(request, resolver, true).await
             }
-        };
+            _ => match self.build_resolver(&request) {
+                Some(resolver) => self.run_slice(request, resolver, false).await,
+                // The delegate refuses an undecodable tenant hash or a
+                // non-metrics signal with a typed status before any resolver
+                // call, so this stand-in is never consulted.
+                None => {
+                    let resolver = Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
+                    self.run_slice(request, resolver, false).await
+                }
+            },
+        }
+    }
+
+    /// Run one slice through the in-crate [`SeriesFetchService`] with the
+    /// resolver its scope selected, collecting the response frames.
+    async fn run_slice<R: SegmentResolver + 'static>(
+        &self,
+        request: pb::FetchRequest,
+        resolver: Arc<R>,
+        federated: bool,
+    ) -> Vec<pb::FetchResponse> {
         let mut fetcher = SegmentFetcher::new(self.inner.store.clone())
             .with_get_limiter(self.inner.get_limiter.clone());
         if let Some(cache) = &self.inner.cache {

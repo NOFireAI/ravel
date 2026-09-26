@@ -39,12 +39,30 @@
 //! # Segment identity resolution
 //!
 //! A worker receives durable [`pb::SegmentIdentity`] values, not object keys or
-//! trusted bytes (ADR-0071 reconstruct-don't-trust). Turning an identity back
-//! into the [`SegmentRef`] to fetch needs the `ravel-commit` key
-//! reconstruction that is not yet implemented. Until that lands, a [`SegmentResolver`]
-//! maps an identity to a ref by its content hash; [`SnapshotSegmentResolver`]
-//! is the interim implementation, resolving against the same pinned snapshot
-//! the coordinator dispatched from.
+//! trusted bytes (ADR-0071 reconstruct-don't-trust). An intra-cluster pinned
+//! slice resolves them with [`ReconstructingSegmentResolver`], which rebuilds
+//! each data-object key from the identity with `ravel_commit::keys`
+//! (`data_key` for L0, `l1_part_key` for an L1 part), parses the rebuilt key
+//! back, and requires every component to equal the identity's before the ref is
+//! handed to the fetch. That is the whole resolution: the worker issues no
+//! catalog request, so a compaction or a GC committed between the
+//! coordinator's resolve and this fetch cannot change which object is read.
+//! Object keys and the objects under them are immutable, so the pinned key
+//! stays readable regardless of what the catalog now says.
+//!
+//! An identity that cannot be reconstructed, or whose rebuilt key does not
+//! parse back to the same identity, is [`ResolveIdentityError::Invalid`] and
+//! fails the slice with `BAD_DATA`. That is terminal on purpose: a tampered or
+//! internally inconsistent identity reproduces on every worker, so re-dispatch
+//! would only spread it, and the one outcome the rule forbids is reading some
+//! other object instead.
+//!
+//! Cross-cluster federation is the exception, and stays one: a resolve-scope
+//! request is authoritative on the remote cluster, which resolves its OWN
+//! snapshot and pins it before the fetch runs. [`SnapshotSegmentResolver`]
+//! serves that path, mapping an identity to a ref of that snapshot by content
+//! hash; an identity outside it is [`ResolveIdentityError::Unknown`] and maps
+//! to `SNAPSHOT_INVALIDATED`, which the coordinator retries once.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -52,7 +70,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use ravel_catalog::SegmentRef;
+use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_commit::keys;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{SeriesId, Signal, TenantHash};
@@ -71,20 +90,227 @@ use crate::fetcher::{
 use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
 use crate::span_fetcher::{SpanFetchError, SpanSegmentFetcher};
 
-/// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
-/// worker fetches. The production resolver reconstructs the
-/// object key from the identity and verifies the footer; see the module docs
-/// for why an interim content-hash resolver stands in for now.
-pub trait SegmentResolver: Send + Sync {
-    /// The ref this identity names, or `None` if it is unknown to this worker
-    /// (the segment vanished under a concurrent GC/compaction, which the
-    /// coordinator maps to a snapshot invalidation).
-    fn resolve(&self, identity: &pb::SegmentIdentity) -> Option<SegmentRef>;
+/// Why a shipped [`pb::SegmentIdentity`] could not be turned into the
+/// [`SegmentRef`] a worker fetches.
+///
+/// The two variants are the two recoveries, and keeping them apart is the
+/// point: one is terminal for the query, the other is a retry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResolveIdentityError {
+    /// The identity is malformed or internally inconsistent: no object key can
+    /// be built from it, or the key built from it does not parse back to the
+    /// same identity. A tampered identity lands here. Terminal: every worker
+    /// reproduces it, so the slice fails with `BAD_DATA` rather than being
+    /// re-dispatched, and nothing else is read in its place.
+    #[error("segment identity cannot be reconstructed: {reason}")]
+    Invalid { reason: String },
+    /// The identity is well formed but names a segment this worker cannot
+    /// serve. Only the federation path can raise this (its resolver answers
+    /// from a locally resolved snapshot); the coordinator maps it to a single
+    /// re-resolve and re-dispatch.
+    #[error("pinned segment not found on worker: {reason}")]
+    Unknown { reason: String },
 }
 
-/// Interim [`SegmentResolver`] that resolves identities by content hash against
-/// a fixed set of known segments (the pinned snapshot the coordinator
-/// dispatched from). Stands in for the reconstruct-from-identity path.
+impl ResolveIdentityError {
+    fn invalid(reason: impl Into<String>) -> Self {
+        ResolveIdentityError::Invalid {
+            reason: reason.into(),
+        }
+    }
+
+    /// The wire status this failure fails its slice with.
+    pub fn status_code(&self) -> pb::status::Code {
+        match self {
+            ResolveIdentityError::Invalid { .. } => pb::status::Code::BadData,
+            ResolveIdentityError::Unknown { .. } => pb::status::Code::SnapshotInvalidated,
+        }
+    }
+}
+
+/// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
+/// worker fetches. See the module docs for which resolver serves which path.
+pub trait SegmentResolver: Send + Sync {
+    /// The ref this identity names, or a typed refusal. A resolver never
+    /// substitutes a different segment for one it cannot resolve.
+    fn resolve(&self, identity: &pb::SegmentIdentity) -> Result<SegmentRef, ResolveIdentityError>;
+}
+
+/// The intra-cluster [`SegmentResolver`]: rebuilds each data-object key from
+/// the identity alone (ADR-0071 reconstruct-don't-trust, ADR-0010 §7 key
+/// discipline), consulting no catalog.
+///
+/// Built for one (tenant, signal) pair, which the fetch request names and the
+/// gRPC handler has already re-derived from the presented credential. Those two
+/// therefore never come from an identity, so a coordinator cannot point a
+/// worker at another tenant's objects by rewriting the pins.
+pub struct ReconstructingSegmentResolver {
+    tenant_hash: TenantHash,
+    signal: Signal,
+}
+
+impl ReconstructingSegmentResolver {
+    pub fn new(tenant_hash: TenantHash, signal: Signal) -> Self {
+        ReconstructingSegmentResolver {
+            tenant_hash,
+            signal,
+        }
+    }
+
+    /// Reconstruct the L0 data-object key and verify it parses back to this
+    /// identity.
+    fn l0_key(
+        &self,
+        identity: &pb::SegmentIdentity,
+        writer_id: uuid::Uuid,
+        content_hash: &[u8; 32],
+    ) -> Result<String, ResolveIdentityError> {
+        if !identity.input_set_hash.is_empty() || identity.part_index != 0 {
+            return Err(ResolveIdentityError::invalid(
+                "an L0 identity carries L1 compaction fields (input_set_hash/part_index)",
+            ));
+        }
+        let key = keys::data_key(
+            &self.tenant_hash,
+            self.signal,
+            identity.shard,
+            writer_id,
+            identity.writer_epoch,
+            identity.writer_seq,
+            content_hash,
+        )
+        .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        let parsed =
+            keys::parse_data_key(&key).map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        // The L0 key shape does not encode the ingest hour, so every component
+        // it does encode is checked here and the hour rides on the identity.
+        let expected = keys::ParsedDataKey {
+            tenant_hash: self.tenant_hash,
+            signal: self.signal,
+            shard: identity.shard,
+            writer_id,
+            epoch: identity.writer_epoch,
+            seq: identity.writer_seq,
+            hash16: hex::encode(&content_hash[..8]),
+        };
+        if parsed != expected {
+            return Err(ResolveIdentityError::invalid(format!(
+                "reconstructed L0 key {key} does not parse back to its identity"
+            )));
+        }
+        Ok(key)
+    }
+
+    /// Reconstruct the L1 part key and verify it parses back to this identity.
+    fn l1_key(
+        &self,
+        identity: &pb::SegmentIdentity,
+        input_set_hash: &[u8; 32],
+        content_hash: &[u8; 32],
+    ) -> Result<String, ResolveIdentityError> {
+        let input_set_hash16 = hex::encode(&input_set_hash[..8]);
+        let hash16 = hex::encode(&content_hash[..8]);
+        let key = keys::l1_part_key(
+            &self.tenant_hash,
+            self.signal,
+            identity.shard,
+            identity.ingest_hour_bucket,
+            &input_set_hash16,
+            identity.part_index,
+            &hash16,
+        )
+        .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        let parsed = keys::parse_l1_part_key(&key)
+            .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        let expected = keys::ParsedL1PartKey {
+            tenant_hash: self.tenant_hash,
+            signal: self.signal,
+            shard: identity.shard,
+            ingest_hour_bucket: identity.ingest_hour_bucket,
+            input_set_hash16,
+            part_index: identity.part_index,
+            hash16,
+        };
+        if parsed != expected {
+            return Err(ResolveIdentityError::invalid(format!(
+                "reconstructed L1 part key {key} does not parse back to its identity"
+            )));
+        }
+        Ok(key)
+    }
+}
+
+impl SegmentResolver for ReconstructingSegmentResolver {
+    fn resolve(&self, identity: &pb::SegmentIdentity) -> Result<SegmentRef, ResolveIdentityError> {
+        let content_hash = codec::identity_content_hash(identity)
+            .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        let (level, data_object_key, writer_id) = match identity.level {
+            0 => {
+                let writer_id = uuid::Uuid::parse_str(&identity.writer_id).map_err(|_| {
+                    ResolveIdentityError::invalid(format!(
+                        "writer_id {:?} is not a uuid",
+                        identity.writer_id
+                    ))
+                })?;
+                let key = self.l0_key(identity, writer_id, &content_hash)?;
+                (SegmentLevel::L0, key, writer_id)
+            }
+            1 => {
+                let input_set_hash: [u8; 32] =
+                    identity.input_set_hash.as_slice().try_into().map_err(|_| {
+                        ResolveIdentityError::invalid(format!(
+                            "L1 input_set_hash is {} bytes, expected 32",
+                            identity.input_set_hash.len()
+                        ))
+                    })?;
+                let key = self.l1_key(identity, &input_set_hash, &content_hash)?;
+                (
+                    SegmentLevel::L1 {
+                        input_set_hash,
+                        part_index: identity.part_index,
+                    },
+                    key,
+                    // An L1 part has no writer identity of its own
+                    // (`SegmentLevel::L1`); nothing reads these for a part.
+                    uuid::Uuid::nil(),
+                )
+            }
+            other => {
+                return Err(ResolveIdentityError::invalid(format!(
+                    "unknown segment level {other}"
+                )));
+            }
+        };
+        Ok(SegmentRef {
+            data_object_key,
+            object_size: identity.object_size,
+            min_event_ts_ns: identity.min_event_ts_ns,
+            max_event_ts_ns: identity.max_event_ts_ns,
+            ingest_hour_bucket: identity.ingest_hour_bucket,
+            sample_count: identity.sample_count,
+            series_count: identity.series_count,
+            shard: identity.shard,
+            content_hash,
+            writer_id,
+            writer_epoch: identity.writer_epoch,
+            writer_seq: identity.writer_seq,
+            created_unix_ns: identity.created_unix_ns,
+            level,
+            segment_format_version: identity.segment_format_version,
+            // Declared column statistics are a resolve-time pruning aid a
+            // reader may always do without ("absence is never an error",
+            // `DeclaredColumnStats`), and they are permanently empty for every
+            // metrics segment, which is the only signal a pinned slice serves.
+            // Shipping them would put catalog-derived bytes on a wire the
+            // worker is required not to trust, for no read it changes.
+            declared_column_stats: Default::default(),
+        })
+    }
+}
+
+/// The federation [`SegmentResolver`]: resolves identities by content hash
+/// against a fixed set of known segments, the snapshot the REMOTE cluster
+/// resolved for itself before pinning the slice (see the module docs).
 pub struct SnapshotSegmentResolver {
     by_content_hash: HashMap<[u8; 32], SegmentRef>,
 }
@@ -103,9 +329,15 @@ impl SnapshotSegmentResolver {
 }
 
 impl SegmentResolver for SnapshotSegmentResolver {
-    fn resolve(&self, identity: &pb::SegmentIdentity) -> Option<SegmentRef> {
-        let hash = codec::identity_content_hash(identity).ok()?;
-        self.by_content_hash.get(&hash).cloned()
+    fn resolve(&self, identity: &pb::SegmentIdentity) -> Result<SegmentRef, ResolveIdentityError> {
+        let hash = codec::identity_content_hash(identity)
+            .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        self.by_content_hash
+            .get(&hash)
+            .cloned()
+            .ok_or_else(|| ResolveIdentityError::Unknown {
+                reason: "identity is outside this cluster's resolved snapshot".to_string(),
+            })
     }
 }
 
@@ -500,18 +732,17 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         };
 
-        // Reconstruct each ref from its shipped identity. An unknown identity
-        // means the pinned segment vanished under a concurrent GC/compaction:
-        // the coordinator's single re-resolve/retry handles it.
+        // Reconstruct each ref from its shipped identity, consulting no
+        // catalog. The typed refusal carries its own status: an identity that
+        // does not reconstruct fails the slice outright, while one a federation
+        // resolver does not recognise takes the coordinator's single
+        // re-resolve/retry.
         let mut segments = Vec::with_capacity(identities.len());
         for identity in &identities {
             match self.resolver.resolve(identity) {
-                Some(seg) => segments.push(seg),
-                None => {
-                    return Err(SliceFailure::from((
-                        pb::status::Code::SnapshotInvalidated,
-                        "pinned segment not found on worker".to_string(),
-                    )));
+                Ok(seg) => segments.push(seg),
+                Err(err) => {
+                    return Err(SliceFailure::from((err.status_code(), err.to_string())));
                 }
             }
         }
@@ -774,12 +1005,9 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         let mut segments = Vec::with_capacity(identities.len());
         for identity in &identities {
             match self.resolver.resolve(identity) {
-                Some(seg) => segments.push(seg),
-                None => {
-                    return Err(SliceFailure::from((
-                        pb::status::Code::SnapshotInvalidated,
-                        "pinned segment not found on worker".to_string(),
-                    )));
+                Ok(seg) => segments.push(seg),
+                Err(err) => {
+                    return Err(SliceFailure::from((err.status_code(), err.to_string())));
                 }
             }
         }
@@ -913,12 +1141,9 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         let mut segments = Vec::with_capacity(identities.len());
         for identity in &identities {
             match self.resolver.resolve(identity) {
-                Some(seg) => segments.push(seg),
-                None => {
-                    return Err(SliceFailure::from((
-                        pb::status::Code::SnapshotInvalidated,
-                        "pinned segment not found on worker".to_string(),
-                    )));
+                Ok(seg) => segments.push(seg),
+                Err(err) => {
+                    return Err(SliceFailure::from((err.status_code(), err.to_string())));
                 }
             }
         }
