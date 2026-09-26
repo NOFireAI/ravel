@@ -687,12 +687,12 @@ mod tests {
 
     use bytes::Bytes;
     use parking_lot::Mutex;
+    use ravel_test_support::{ParkOnFirstArmedCall, run_with_watchdog};
     use tempfile::TempDir;
     use tokio::sync::oneshot;
 
     use super::fixtures::{generous_limits, test_key};
     use super::*;
-    use crate::test_support::{ParkOnFirstArmedCall, run_with_watchdog};
     use crate::{CacheLimits, Clock};
 
     /// A RAM hit is the fast path: it returns the RAM bytes and never consults

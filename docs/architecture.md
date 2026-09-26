@@ -382,7 +382,7 @@ and recovering a whole deployment from the bucket alone is
 
 ## Crate map
 
-The workspace has 32 members: 28 crates under `crates/` and four binaries
+The workspace has 33 members: 29 crates under `crates/` and four binaries
 under `services/`. Grouped by dependency layer, so a crate depends only on
 crates in its own group or above:
 
@@ -399,7 +399,7 @@ paths             ravel-ingest, ravel-maintain, ravel-query, ravel-sql
 binaries          ravel-server, ravel-cli, ravel-ingest-router,
                   ravel-operator
 test and bench    ravel-bench, ravel-failure-tests, ravel-promql-difftest,
-                  ravel-sim
+                  ravel-sim, ravel-test-support
 ```
 
 The last group is development-only and no shipping crate depends on it.

@@ -4594,6 +4594,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "parking_lot",
+ "ravel-test-support",
  "tempfile",
  "tokio",
 ]
@@ -5261,6 +5262,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "ravel-test-support"
+version = "0.18.0"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]
