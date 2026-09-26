@@ -148,6 +148,8 @@ The shape of decision 1 is unchanged: a per-shard allowance times the shard
 count, plus the fixed overhead, with an explicit `--max-s3-requests` used
 verbatim. At 4 shards and a 2 s flush cadence the derived default goes from
 15,800 to 47,300 requests.
+(The ADR-1306 measured-cost amendment below sets the factor at 2, its measured
+value, which makes that default 89,600.)
 
 The first Consequences bullet held only for one hour of unsealed data. Under
 ADR-1306 the claim becomes: no query is refused for fold lag before the
@@ -161,3 +163,18 @@ so the stall alert never fires; ADR-1306's Consequences carry both. The
 remaining decisions and rejected alternatives stand as written.
 See ADR-1306 for the proof, the rejected alternatives, and the acceptance
 tests.
+
+## Amendment (ADR-1306 measured-cost amendment, 2026-09-26): REQUESTS_PER_UNSEALED_FLUSH is 2
+
+<!-- amendment-applies: sections="Amendment (ADR-1306, 2026-09-26): the budget covers the unsealed tail and the fold-stall alert window" pointer="ADR-1306 measured-cost amendment" -->
+
+ADR-1306 follow-up task 1 measured the cold cost of one unsealed flush on
+`MemoryStore` (`cold_recent_query_requests_per_unsealed_flush_by_phase`): one
+commit-record GET for a flush outside the query's event range, and that GET
+plus one whole-object data GET for a flush inside it. The factor the amendment
+above introduced at 1 is therefore 2. At 4 shards and a 2 s flush cadence the
+derived default is `ceil(14,100 / 2) x 2 x 3/2 x 4 + 5,000` = 89,600
+requests, not 47,300. The figure is a measured cost for unsealed segments at
+or under the fetcher's 512 KiB whole-object threshold, not an upper bound
+above it. ADR-1306's "Amendment (2026-09-26)" carries the recomputed figures,
+the above-threshold cost and what follow-up task 2 must decide about it.
