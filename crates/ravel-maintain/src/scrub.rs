@@ -1478,8 +1478,8 @@ mod tests {
         // three records into the hour the last tick saw and three into the
         // next hour. The `0a` records landing in the hour the last tick saw
         // sort below that tick's greatest key, and a count that only looks
-        // above that key misses them. The rotation must either finish inside
-        // its 168 ticks or report that it cannot.
+        // above that key misses them. Counted exactly, the rotation finishes
+        // inside its 168 ticks without ever reporting behind.
         let period_secs = 7 * 86_400;
         let tick_secs = 3_600;
         let deadline_ticks = period_secs / tick_secs;
@@ -1525,13 +1525,14 @@ mod tests {
             commit(&mut keys, hour, 3);
         }
         assert!(
-            completed || behind > 0,
-            "after {ticks} ticks the rotation neither finished nor reported behind: marker \
-             at {:?}, {} entries listed, estimate {}",
+            completed,
+            "after {ticks} ticks the rotation did not finish: marker at {:?}, {} entries \
+             listed, estimate {}",
             cursor.last_commit_key,
             keys.len(),
             cursor.estimated_rotation_entries()
         );
+        assert_eq!(behind, 0, "an exact count keeps the rotation on schedule");
     }
 
     #[test]
