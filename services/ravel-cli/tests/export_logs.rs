@@ -133,27 +133,25 @@ column = "blob_col"
 type = "bytes"
 "#;
 
-/// Four source rows: three inside the export window (`T0`, `T1`, `T2`,
-/// spread across two resources so `export_logs` decodes and caches
-/// `StreamAttrs` for more than one stream) and one before it (`T_OUT`),
-/// written to the source Parquet in a shuffled row order so a passing test
-/// proves the export sorts its output by event time rather than by accident
-/// preserving load order. `T2` carries a null trace/span id and an empty
-/// (not null) `blob` attribute, to prove those are round-tripped as
-/// null-vs-empty rather than collapsed to the same thing.
-#[tokio::test]
-async fn load_then_export_round_trips_logs_field_by_field() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let source_pq = dir.path().join("source.parquet");
-    let export_pq = dir.path().join("export.parquet");
+/// The three in-window event times the fixture below uses, and the one
+/// before the window.
+const T0: i64 = BASE_NS;
+const T1: i64 = BASE_NS + ONE_SEC_NS;
+const T2: i64 = BASE_NS + 2 * ONE_SEC_NS;
+const T_OUT: i64 = BASE_NS - 10 * ONE_SEC_NS;
 
-    let t0 = BASE_NS;
-    let t1 = BASE_NS + ONE_SEC_NS;
-    let t2 = BASE_NS + 2 * ONE_SEC_NS;
-    let t_out = BASE_NS - 10 * ONE_SEC_NS;
-
+/// Four source rows for [`SHARED_MAPPING`]: three inside the export window
+/// (`T0`, `T1`, `T2`, spread across two resources so `export_logs` decodes
+/// and caches `StreamAttrs` for more than one stream) and one before it
+/// (`T_OUT`), in a shuffled row order so a passing test proves the export
+/// sorts its output by event time rather than by accident preserving load
+/// order. `T2` carries a null trace/span id and an empty (not null) `blob`
+/// attribute, to prove those are round-tripped as null-vs-empty rather than
+/// collapsed to the same thing.
+fn shared_source_batch() -> RecordBatch {
+    let (t0, t1, t2, t_out) = (T0, T1, T2, T_OUT);
     // Row order on disk: T1, T0, T_OUT, T2.
-    let batch = RecordBatch::try_from_iter(vec![
+    RecordBatch::try_from_iter(vec![
         ("ts".to_string(), i64_col(vec![t1, t0, t_out, t2])),
         (
             "body".to_string(),
@@ -207,8 +205,19 @@ async fn load_then_export_round_trips_logs_field_by_field() {
             binary_col(vec![vec![4, 5], vec![1, 2, 3], vec![9], vec![]]),
         ),
     ])
-    .expect("batch");
-    write_parquet(&source_pq, &batch);
+    .expect("batch")
+}
+
+/// The whole-file `load` -> `export` path over [`shared_source_batch`],
+/// asserting every column of the output by value.
+#[tokio::test]
+async fn load_then_export_round_trips_logs_field_by_field() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_pq = dir.path().join("source.parquet");
+    let export_pq = dir.path().join("export.parquet");
+
+    let (t0, t1, t2) = (T0, T1, T2);
+    write_parquet(&source_pq, &shared_source_batch());
 
     let m = mapping(SHARED_MAPPING);
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -375,6 +384,266 @@ async fn load_then_export_round_trips_logs_field_by_field() {
     );
 
     // The out-of-window row's distinguishing values are absent everywhere.
+    assert!(!tag.iter().flatten().any(|v| v == "delta"));
+    assert!(!count.values().contains(&4));
+}
+
+/// Every column [`SHARED_MAPPING`] writes, in the order `build_batch`
+/// emits them.
+const SHARED_MAPPING_COLUMNS: [&str; 12] = [
+    "ts",
+    "body",
+    "sev_num",
+    "sev_text",
+    "trace_id",
+    "span_id",
+    "svc",
+    "tag_col",
+    "count_col",
+    "ratio_col",
+    "flag_col",
+    "blob_col",
+];
+
+/// ADR-1751 follow-up 3's `load(export(x))` round trip, end to end: the file
+/// the export writes is fed back through `ravel-cli load` into a second,
+/// fresh tenant, and that tenant is exported again.
+///
+/// This is the claim the CHANGELOG, the `--mapping` flag help and the ingest
+/// guide all make -- that `load` reads an exported file back -- and nothing
+/// was asserting it. The first export was only ever opened with an Arrow
+/// reader, which proves the file is well-formed Parquet and nothing about
+/// whether the loader accepts it.
+///
+/// Both exports are asserted column by column against each other, so a field
+/// that survives the first trip and not the second fails by name, and the
+/// second tenant's export is asserted by value as well, so a round trip that
+/// agreed on being wrong twice would still fail. The null trace and span ids
+/// and the empty-but-not-null `blob` are carried through deliberately: null
+/// and absent are the two values a lossy reload is most likely to collapse.
+#[tokio::test]
+async fn export_reloads_into_a_second_tenant_field_for_field() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_pq = dir.path().join("source.parquet");
+    let first_pq = dir.path().join("first.parquet");
+    let second_pq = dir.path().join("second.parquet");
+
+    write_parquet(&source_pq, &shared_source_batch());
+    let m = mapping(SHARED_MAPPING);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    let first_load = load::load(
+        Arc::clone(&store),
+        &source_pq,
+        "acme",
+        &m,
+        1,
+        10_000,
+        None,
+        1,
+        T2,
+        Arc::new(FixedClock(T2)),
+    )
+    .await
+    .expect("the source file loads");
+    assert_eq!(first_load.rows_processed, 4);
+
+    let first_export = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        T0,
+        T2 + 1,
+        &m,
+        &first_pq,
+        1,
+        export::CatalogWindow::default(),
+        T2,
+    )
+    .await
+    .expect("the first export succeeds");
+    assert_eq!(first_export.rows_written, 3);
+
+    // The claim under test: `load` reads the exported file back, under the
+    // same mapping, with no conversion step in between.
+    let reload = load::load(
+        Arc::clone(&store),
+        &first_pq,
+        "acme-copy",
+        &m,
+        1,
+        10_000,
+        None,
+        1,
+        T2,
+        Arc::new(FixedClock(T2)),
+    )
+    .await
+    .expect("the exported file loads back");
+    assert_eq!(
+        reload.rows_processed, 3,
+        "every exported row must be readable by load, not merely most of them"
+    );
+
+    let second_export = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme-copy",
+        T0,
+        T2 + 1,
+        &m,
+        &second_pq,
+        1,
+        export::CatalogWindow::default(),
+        T2,
+    )
+    .await
+    .expect("the second export succeeds");
+    assert_eq!(second_export.rows_written, 3);
+
+    let first = read_parquet(&first_pq);
+    let second = read_parquet(&second_pq);
+    assert_eq!(first.num_rows(), 3);
+    assert_eq!(second.num_rows(), 3);
+
+    for name in SHARED_MAPPING_COLUMNS {
+        let a = first
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("the first export has no column {name}"));
+        let b = second
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("the second export has no column {name}"));
+        assert_eq!(
+            a.to_data(),
+            b.to_data(),
+            "column {name} differs between the two tenants' exports"
+        );
+    }
+
+    // ... and the value the two agree on is the right one, per column.
+    let ts = second
+        .column_by_name("ts")
+        .expect("ts")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("ts is Int64");
+    assert_eq!(ts.values(), &[T0, T1, T2]);
+
+    assert_eq!(
+        exported_bodies(&second_pq),
+        vec![
+            "a-body".to_string(),
+            "b-body".to_string(),
+            "c-body".to_string()
+        ]
+    );
+
+    let sev_num = second
+        .column_by_name("sev_num")
+        .expect("sev_num")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sev_num is Int64");
+    assert_eq!(sev_num.values(), &[9, 5, 13]);
+
+    let sev_text = second
+        .column_by_name("sev_text")
+        .expect("sev_text")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("sev_text is Utf8");
+    assert_eq!(
+        (0..3).map(|i| sev_text.value(i)).collect::<Vec<_>>(),
+        vec!["INFO", "DEBUG", "WARN"]
+    );
+
+    let trace_id = second
+        .column_by_name("trace_id")
+        .expect("trace_id")
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("trace_id is FixedSizeBinary");
+    assert_eq!(trace_id.value(0), [0xAA; 16]);
+    assert_eq!(trace_id.value(1), [0xBB; 16]);
+    assert!(
+        trace_id.is_null(2),
+        "a null trace_id must survive the reload as null, not as 16 zero bytes"
+    );
+
+    let span_id = second
+        .column_by_name("span_id")
+        .expect("span_id")
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("span_id is FixedSizeBinary");
+    assert_eq!(span_id.value(0), [0xAA; 8]);
+    assert_eq!(span_id.value(1), [0xBB; 8]);
+    assert!(span_id.is_null(2));
+
+    let svc = second
+        .column_by_name("svc")
+        .expect("svc")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("svc is Utf8");
+    assert_eq!(
+        (0..3).map(|i| svc.value(i)).collect::<Vec<_>>(),
+        vec!["api", "api", "worker"],
+        "the resource attribute that decides stream identity survives the reload"
+    );
+
+    let tag = second
+        .column_by_name("tag_col")
+        .expect("tag_col")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("tag_col is Utf8");
+    assert_eq!(
+        (0..3).map(|i| tag.value(i)).collect::<Vec<_>>(),
+        vec!["alpha", "beta", "gamma"]
+    );
+
+    let count = second
+        .column_by_name("count_col")
+        .expect("count_col")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count_col is Int64");
+    assert_eq!(count.values(), &[1, 2, 3]);
+
+    let ratio = second
+        .column_by_name("ratio_col")
+        .expect("ratio_col")
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("ratio_col is Float64");
+    assert_eq!(ratio.values(), &[1.5, 2.5, 3.5]);
+
+    let flag = second
+        .column_by_name("flag_col")
+        .expect("flag_col")
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("flag_col is Boolean");
+    assert_eq!(
+        (0..3).map(|i| flag.value(i)).collect::<Vec<_>>(),
+        vec![true, false, true]
+    );
+
+    let blob = second
+        .column_by_name("blob_col")
+        .expect("blob_col")
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("blob_col is Binary");
+    assert_eq!(blob.value(0), &[1u8, 2, 3][..]);
+    assert_eq!(blob.value(1), &[4u8, 5][..]);
+    assert!(
+        !blob.is_null(2) && blob.value(2).is_empty(),
+        "an empty byte string must not come back as null after the reload"
+    );
+
+    // The row outside the first export's window never entered the copy.
     assert!(!tag.iter().flatten().any(|v| v == "delta"));
     assert!(!count.values().contains(&4));
 }
