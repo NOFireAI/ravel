@@ -21,11 +21,16 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use ravel_cli::export;
 use ravel_cli::load::{self, Mapping};
-use ravel_cli::maintain::SignalArg;
+use ravel_cli::maintain::{SignalArg, compact_tenant};
 use ravel_cli::store::{StoreKind, StoreSelection};
+use ravel_cli::{erase, maintain};
+use ravel_commit::keys;
 use ravel_ingest::Clock;
-use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
+use ravel_proto::commit::v1::RetentionTombstone;
+use ravel_types::Signal;
+use uuid::Uuid;
 
 /// A fixed, plausible (post-2020) base clock, matching `tests/load.rs`'s
 /// convention: the RLOG flush buckets by this reading, so a window near it
@@ -945,6 +950,405 @@ async fn a_failing_export_leaves_an_existing_output_file_byte_identical() {
         Vec::<String>::new(),
         "the temporary file a failed export wrote into must be removed"
     );
+}
+
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// A mapping with one string attribute, which is the shape an ADR-0064
+/// erasure predicate matches on: its matchers compare string-valued record
+/// attributes.
+const TS_BODY_SUBJECT_MAPPING: &str = "ts_column = \"ts\"\nts_unit = \"nanos\"\n\
+     body_column = \"body\"\n\n\
+     [[attribute]]\nkey = \"subject\"\ncolumn = \"subject_col\"\ntype = \"str\"\n";
+
+/// The exported `subject_col` column, in file order.
+fn exported_subjects(path: &Path) -> Vec<String> {
+    let out = read_parquet(path);
+    let col = out
+        .column_by_name("subject_col")
+        .expect("subject_col")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("subject_col is Utf8");
+    (0..col.len()).map(|i| col.value(i).to_string()).collect()
+}
+
+/// Load `(ts, body, subject)` rows under [`TS_BODY_SUBJECT_MAPPING`].
+async fn load_subject_rows(
+    store: &Arc<dyn ObjectStoreBackend>,
+    dir: &Path,
+    tenant: &str,
+    rows: &[(i64, &str, &str)],
+    batch_rows: usize,
+    load_now_ns: i64,
+) {
+    let source_pq = dir.join(format!("subjects-{tenant}-{load_now_ns}.parquet"));
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "ts".to_string(),
+            i64_col(rows.iter().map(|(ts, _, _)| *ts).collect()),
+        ),
+        (
+            "body".to_string(),
+            str_col(rows.iter().map(|(_, body, _)| *body).collect()),
+        ),
+        (
+            "subject_col".to_string(),
+            str_col(rows.iter().map(|(_, _, subject)| *subject).collect()),
+        ),
+    ])
+    .expect("batch");
+    write_parquet(&source_pq, &batch);
+    let report = load::load(
+        Arc::clone(store),
+        &source_pq,
+        tenant,
+        &mapping(TS_BODY_SUBJECT_MAPPING),
+        1,
+        batch_rows,
+        None,
+        1,
+        load_now_ns,
+        Arc::new(FixedClock(load_now_ns)),
+    )
+    .await
+    .expect("load succeeds");
+    assert_eq!(report.rows_processed, rows.len() as u64);
+}
+
+/// A pending selective-erasure request (ADR-0064) excludes exactly the
+/// records its predicate matches, and leaves every other record in place.
+///
+/// This is the guide's "Deleted data does not come back" section and the
+/// CHANGELOG's "a record a query cannot see is a record the export does not
+/// write", and nothing was failing if `export_logs` stopped attaching the
+/// snapshot's predicates to its fetch. The raw RLOG objects still hold the
+/// erased rows here -- `erase submit` writes a request, it does not rewrite
+/// any object -- so the export reading them back is exactly the exposure this
+/// pins.
+#[tokio::test]
+async fn a_pending_erasure_request_excludes_exactly_its_subject() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let export_pq = dir.path().join("export.parquet");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    load_subject_rows(
+        &store,
+        dir.path(),
+        "acme",
+        &[
+            (T0, "first", "keeper"),
+            (T1, "second", "erase-me"),
+            (T2, "third", "keeper"),
+            (T2 + 1, "fourth", "erase-me"),
+        ],
+        10_000,
+        T2 + 1,
+    )
+    .await;
+
+    // Unbounded window: the predicate is the subject alone, so the test is
+    // about matcher exclusion rather than about the request's own time range.
+    erase::submit(
+        Arc::clone(&store),
+        "acme",
+        SignalArg::Logs,
+        vec![("subject".to_string(), "erase-me".to_string())],
+        0,
+        0,
+        "issue #1712 test".to_string(),
+        Uuid::from_u128(0x1712),
+        T2 + 1,
+    )
+    .await
+    .expect("the erasure request is recorded");
+
+    let report = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        T0,
+        T2 + 2,
+        &mapping(TS_BODY_SUBJECT_MAPPING),
+        &export_pq,
+        1,
+        export::CatalogWindow::default(),
+        T2 + 1,
+    )
+    .await
+    .expect("export succeeds");
+
+    assert_eq!(
+        report.erasure_predicates, 1,
+        "the snapshot's pending request must reach the fetch as one predicate"
+    );
+    assert_eq!(
+        report.rows_written, 2,
+        "both matching records are excluded and both others are kept"
+    );
+    assert_eq!(
+        exported_bodies(&export_pq),
+        vec!["first".to_string(), "third".to_string()],
+        "exactly the two records the predicate does not match"
+    );
+    assert_eq!(
+        exported_subjects(&export_pq),
+        vec!["keeper".to_string(), "keeper".to_string()]
+    );
+    assert_eq!(exported_timestamps(&export_pq), vec![T0, T2]);
+}
+
+/// A retention tombstone (ADR-0019 decision 3) removes exactly its own
+/// bucket's records from the export, and leaves another bucket's alone.
+///
+/// The two loads run an hour apart on the injected clock, so they land in
+/// different ingest-hour buckets while their event times stay inside one
+/// export window. Tombstoning the first bucket is then observable as the
+/// disappearance of its records and nothing else. The tombstone is written
+/// exactly as ravel-maintain's retention sweep writes one; the objects it
+/// retires are still in the store, which is what makes this a visibility
+/// assertion rather than a deletion one.
+#[tokio::test]
+async fn a_retention_tombstone_removes_exactly_its_buckets_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let export_pq = dir.path().join("export.parquet");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    let first_load_ns = T0;
+    let second_load_ns = T0 + NS_PER_HOUR;
+    let first_hour = u32::try_from(first_load_ns / NS_PER_HOUR).expect("hour fits u32");
+    let second_hour = u32::try_from(second_load_ns / NS_PER_HOUR).expect("hour fits u32");
+    assert_ne!(
+        first_hour, second_hour,
+        "the fixture needs the two loads in different ingest-hour buckets"
+    );
+
+    load_ts_body_rows(
+        &store,
+        dir.path(),
+        "acme",
+        &[(T0, "older-bucket-a"), (T1, "older-bucket-b")],
+        10_000,
+        first_load_ns,
+    )
+    .await;
+    load_ts_body_rows(
+        &store,
+        dir.path(),
+        "acme",
+        &[(T2, "newer-bucket-a"), (T2 + 1, "newer-bucket-b")],
+        10_000,
+        second_load_ns,
+    )
+    .await;
+
+    let window = export::CatalogWindow::default();
+    let export_now_ns = second_load_ns + NS_PER_HOUR;
+
+    // Baseline: without the tombstone all four records export.
+    let before = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        T0,
+        T2 + 2,
+        &mapping(TS_BODY_MAPPING),
+        &export_pq,
+        1,
+        window,
+        export_now_ns,
+    )
+    .await
+    .expect("export succeeds");
+    assert_eq!(
+        before.rows_written, 4,
+        "the fixture must reach both buckets before the tombstone is written"
+    );
+
+    write_retention_tombstone(store.as_ref(), "acme", 0, first_hour).await;
+
+    let after = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        T0,
+        T2 + 2,
+        &mapping(TS_BODY_MAPPING),
+        &export_pq,
+        1,
+        window,
+        export_now_ns,
+    )
+    .await
+    .expect("export succeeds");
+
+    assert_eq!(
+        after.rows_written, 2,
+        "exactly the tombstoned bucket's two records are gone"
+    );
+    assert_eq!(
+        exported_bodies(&export_pq),
+        vec!["newer-bucket-a".to_string(), "newer-bucket-b".to_string()],
+        "the untombstoned bucket's records are untouched"
+    );
+    assert_eq!(exported_timestamps(&export_pq), vec![T2, T2 + 1]);
+}
+
+/// Write a retention tombstone into one (shard, ingest-hour) bucket, the way
+/// ravel-maintain's retention sweep does.
+async fn write_retention_tombstone(
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    shard: u32,
+    ingest_hour_bucket: u32,
+) {
+    let tombstone = RetentionTombstone {
+        format_version: 1,
+        tenant_hash: ravel_types::TenantId::new(tenant).hash().0.to_vec(),
+        signal: ravel_commit::signal::to_proto(Signal::Logs) as i32,
+        shard,
+        ingest_hour_bucket,
+        retired_at_ns: 0,
+        retention_window_ns: 0,
+        record_count_observed: 0,
+    };
+    let key = keys::retention_tombstone_key_for(&tombstone).expect("tombstone key");
+    store
+        .put(
+            &key,
+            ravel_commit::record::encode_tombstone(&tombstone),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put tombstone");
+}
+
+/// After a compaction, an L1 part and the L0 objects it merged are both in
+/// the store, and the export writes each record exactly once.
+///
+/// Supersession is `Catalog::resolve`'s job, not the export's, but the export
+/// is what a duplicate would be visible in, and the guide claims it: "objects
+/// superseded by compaction are already absent from the snapshot the export
+/// resolves". The fixture asserts the shape it rests on -- the compaction
+/// really ran, and the L0 inputs really are still there -- so a run where
+/// nothing compacted cannot pass as a supersession result.
+#[tokio::test]
+async fn a_compacted_bucket_exports_each_record_exactly_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let export_pq = dir.path().join("export.parquet");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    let load_now_ns = T0;
+    load_ts_body_rows(
+        &store,
+        dir.path(),
+        "acme",
+        &[(T0, "row-a"), (T1, "row-b"), (T2, "row-c")],
+        1,
+        load_now_ns,
+    )
+    .await;
+
+    let tenant_hash = ravel_types::TenantId::new("acme").hash();
+    let l0_prefix = format!(
+        "t/{}/{}/l0/",
+        tenant_hash.to_hex(),
+        Signal::Logs.key_prefix()
+    );
+    let l1_prefix = format!(
+        "t/{}/{}/l1/",
+        tenant_hash.to_hex(),
+        Signal::Logs.key_prefix()
+    );
+    let l0_before = list_all(store.as_ref(), &l0_prefix)
+        .await
+        .expect("list the tenant's L0 objects");
+    assert_eq!(
+        l0_before.len(),
+        3,
+        "one object per row, so the compaction has more than one input"
+    );
+
+    // An hour past the loaded hour's end, with the flush-lifetime override at
+    // zero, so the bucket is sealed and compactable.
+    let compact_now_ns = (load_now_ns / NS_PER_HOUR + 2) * NS_PER_HOUR;
+    let report = compact_tenant(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        SignalArg::Logs,
+        Some(1),
+        None,
+        None,
+        false,
+        Some(0),
+        None,
+        None,
+        None,
+        1,
+        compact_now_ns,
+    )
+    .await
+    .expect("compaction runs");
+    assert_eq!(
+        report.compacted, 1,
+        "exactly the loaded bucket must compact, or this test proves nothing"
+    );
+    assert_eq!(report.parts_written, 1);
+
+    let l0_after = list_all(store.as_ref(), &l0_prefix)
+        .await
+        .expect("list the tenant's L0 objects");
+    let l1_after = list_all(store.as_ref(), &l1_prefix)
+        .await
+        .expect("list the tenant's L1 parts");
+    assert_eq!(
+        l1_after.len(),
+        1,
+        "the compaction wrote its L1 part where the resolve will find it"
+    );
+    assert_eq!(
+        l0_after.len(),
+        3,
+        "compaction never deletes: all three L0 inputs are still in the store beside the L1 \
+         part, which is what makes a double-counting resolve visible here"
+    );
+    for l0 in &l0_before {
+        assert!(
+            l0_after.iter().any(|meta| meta.key == l0.key),
+            "L0 input {} must still be in the store for this test to mean anything",
+            l0.key
+        );
+    }
+
+    let export_report = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        T0,
+        T2 + 1,
+        &mapping(TS_BODY_MAPPING),
+        &export_pq,
+        1,
+        export::CatalogWindow::default(),
+        compact_now_ns,
+    )
+    .await
+    .expect("export succeeds");
+
+    assert_eq!(
+        export_report.rows_written, 3,
+        "each record exactly once: the L0 inputs are superseded, not added to the L1 part"
+    );
+    assert_eq!(
+        exported_bodies(&export_pq),
+        vec![
+            "row-a".to_string(),
+            "row-b".to_string(),
+            "row-c".to_string()
+        ]
+    );
+    assert_eq!(exported_timestamps(&export_pq), vec![T0, T1, T2]);
 }
 
 /// `--signal metrics` (and, by the same code path, `spans`) is refused by
