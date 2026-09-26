@@ -276,16 +276,42 @@ content hash. The [observability guide](../observability.md) records the
 lineage filter and the `level` label a mismatch is counted under. A
 persisted per-shard cursor in object storage holds a start-after marker: each
 tick lists the shard's commit records strictly after it and stops once the tick's
-budget is filled, so a tick's LIST and GET count follows its budget, not the
-corpus size. When the listing runs out past the marker, the rotation rolls over
-and the next tick starts again from the head, so a full rotation over the corpus
-completes in about the configured period and visits every object once.
+budget is filled, so apart from the count that opens a rotation, a tick's LIST
+and GET count follows its budget, not the corpus size. When the listing runs out
+past the marker, the rotation rolls over and the next tick starts again from the
+head, so every object is visited once per rotation.
 
-A rotation's budget is sized from the one before it: that rotation's bytes
-divided across the ticks in `P`. A rotation with no predecessor (the first on a
-shard, or the first after upgrading from a build with an object-based cursor)
-opens with one LIST-only pass that counts the shard's listing entries, then
-consumes `ceil(count * tick / P)` entries per tick.
+The budget is recomputed every tick (hourly, or every `P` when `P` is shorter)
+from what the rotation has observed:
+
+- Every rotation opens with one LIST-only pass that counts the shard's listing
+  entries. This pass lists the whole commit prefix, once per rotation.
+- Every later tick recounts the rotation's tail window, the last two ingest
+  hours the previous count met plus anything after them, with another
+  LIST-only pass, and adds the window's growth to the rotation's estimate. A
+  shard that keeps committing raises its own budget; a commit from any writer
+  in those hours is counted, and one that lands behind the marker is counted
+  too although it waits for the next rotation, so the estimate errs high.
+- The rotation is allotted `min(P, retention / 2)` (see below). A tick may
+  consume the entries still to cover divided by the ticks left before that
+  deadline, never fewer than the sustained rate `ceil(estimate * tick /
+  window)` and never more than four times it, and it may issue eight store
+  requests per allowed entry. Every listing page the walk draws (an hour
+  re-list included), every record GET attempt whether it succeeded or not, and
+  four requests per object verified count against the request cap; the
+  LIST-only count passes do not. A tick always attempts at least one unit, even
+  one that alone exceeds the budget.
+- When the entries a tick would need exceed four times the sustained rate, the
+  rotation cannot finish inside its window: the tick logs both numbers with
+  the window and `--scrub-period`, and increments `ravel_scrub_behind_total`.
+
+A GET that fails with a retryable error (throttled, timeout, transient), of a
+commit record or of an object it names, stops the tick with the marker behind
+that unit, and the next tick retries all of it. Any other GET error except
+not-found is counted on `ravel_scrub_checksum_mismatch_total` and the marker
+moves past it, so one unreadable record cannot pin the rotation. A record or
+object deleted after it was listed, and a record that fails to decode, are
+logged and skipped.
 
 It detects and never repairs. An anomaly is reported; there is no redundant copy
 to repair a corrupt segment from.
