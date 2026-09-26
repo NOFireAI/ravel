@@ -96,8 +96,8 @@ pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
 /// epoch is rejected: `SystemTime::duration_since` returns `Err` rather than a
 /// negative duration, and `export`'s window has no use for one.
 pub fn parse_rfc3339_ns(s: &str) -> Result<i64, String> {
-    let system_time =
-        humantime::parse_rfc3339(s).map_err(|e| format!("invalid RFC 3339 timestamp '{s}': {e}"))?;
+    let system_time = humantime::parse_rfc3339(s)
+        .map_err(|e| format!("invalid RFC 3339 timestamp '{s}': {e}"))?;
     let dur = system_time
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| format!("timestamp '{s}' is before the Unix epoch"))?;

@@ -51,9 +51,9 @@ fn write_parquet(path: &Path, batch: &RecordBatch) {
 fn read_parquet(path: &Path) -> RecordBatch {
     let file = std::fs::File::open(path).expect("open exported parquet");
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("reader builder");
-    let mut reader = builder.build().expect("build reader");
+    let reader = builder.build().expect("build reader");
     let mut batches: Vec<RecordBatch> = Vec::new();
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         batches.push(batch.expect("read batch"));
     }
     assert_eq!(batches.len(), 1, "expected exactly one output batch");
@@ -197,10 +197,7 @@ async fn load_then_export_round_trips_logs_field_by_field() {
             str_col(vec!["beta", "alpha", "delta", "gamma"]),
         ),
         ("count_col".to_string(), i64_col(vec![2, 1, 4, 3])),
-        (
-            "ratio_col".to_string(),
-            f64_col(vec![2.5, 1.5, 4.5, 3.5]),
-        ),
+        ("ratio_col".to_string(), f64_col(vec![2.5, 1.5, 4.5, 3.5])),
         (
             "flag_col".to_string(),
             bool_col(vec![false, true, false, true]),
