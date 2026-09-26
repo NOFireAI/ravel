@@ -57,14 +57,16 @@ Fields on a rule:
 
 - `tenant` (required): the tenant id this rule belongs to, matching a
   `--tenant-token` or `--tenant-token-file` tenant.
-- `rule_id` (required): a stable operator-chosen identifier. Together with
-  `labels` it forms the alert's identity, so keep it stable across restarts.
+- `rule_id` (required): a stable operator-chosen identifier, unique within a
+  tenant. Together with each alert's label set it forms that alert's identity,
+  so keep it stable across restarts.
 - Exactly one of `promql` or `sql` (required): the query text. Naming both, or
   neither, fails startup.
 - `condition` (required): a tagged object.
-  - `{"type": "threshold", "op": "gt", "value": 0.9}` for a PromQL rule. The
-    rule fires when any series value satisfies `value <op> threshold`. `op` is
-    one of `gt`, `ge`, `lt`, `le`, `eq`, `ne`.
+  - `{"type": "threshold", "op": "gt", "value": 0.9}` for a PromQL rule. Every
+    series whose value satisfies `value <op> threshold` raises its own alert;
+    see [One alert per matching series](#one-alert-per-matching-series). `op`
+    is one of `gt`, `ge`, `lt`, `le`, `eq`, `ne`.
   - `{"type": "non_empty_result"}` for a SQL rule. The rule fires when the query
     returns at least one row, so write the query to return no rows when
     nothing matched: a bare aggregate such as `count(*)` always returns one
@@ -73,7 +75,8 @@ Fields on a rule:
     `non_empty_result` condition. The other pairing fails startup, not once per
     tick.
 - `labels` (optional): a string map attached to every alert the rule produces.
-  Part of the alert's identity.
+  A rule label replaces a series label of the same name. Part of every alert's
+  identity.
 - `annotations` (optional): a string map carried on the notification (a summary,
   a runbook link). Not part of identity.
 - `for` (optional): a humantime duration (`5m`, `30s`), the pending-before-firing
@@ -88,8 +91,75 @@ Fields on a rule:
 Validation is strict and happens once at startup, not every tick: an unknown
 field, a rule naming neither or both query languages, an unparseable `for` or
 `repeat_interval`, a condition that cannot apply to its query shape, or two
-rules in one tenant that would produce the same alert identity all fail the
-process at load time.
+rules in one tenant sharing a `rule_id` all fail the process at load time. A
+`rule_id` must be unique within its tenant even when the rules carry different
+labels, because the evaluator resolves every alert of a `rule_id` that its
+query no longer matches, so two rules sharing one would resolve each other's
+alerts on every tick.
+
+## One alert per matching series
+
+A PromQL rule raises one alert per series that satisfies its condition. The
+guide's `max by (instance) (cpu_usage)` example raises one alert per hot
+instance, not one alert for the whole rule, and each alert moves through
+pending, firing, and resolved on its own.
+
+- **Identity.** An alert's label set is the series labels without `__name__`,
+  overlaid by the rule's `labels`, with the rule label winning when both name
+  the same label. Its `alert_id` is the hash of the `rule_id` and that label
+  set, and the same set is what the notification carries, so Alertmanager
+  grouping and silences match on the series labels. A query that returns a
+  scalar has no series labels, so its one alert carries the rule labels alone.
+  A SQL rule has no series either: it raises one alert with the rule labels.
+- **Two series with one identity.** If two matched series produce the same
+  label set, for example two metric names that differ only in the dropped
+  `__name__`, the rule fails that tick with `DuplicateAlertIdentity` rather than
+  let one alert hide the other. Aggregate or add a distinguishing label.
+- **Resolution.** An alert whose series stops matching, because its value no
+  longer satisfies the condition or because the series stopped reporting,
+  resolves on the next tick. The other alerts of the rule are unaffected.
+- **The cap.** A rule may raise at most 1000 alerts per evaluation. The cap
+  counts matching series, not the size of the query result. A rule that
+  matches more fails the tick with `TooManyAlerts`: it writes no record, its
+  existing alerts keep their state, `ravel_alert_rules_failed_total` rises,
+  and the warning names the count and the limit. Narrow the selector or
+  aggregate. The cap is fixed, not a flag.
+- **Churning labels.** The evaluator keeps one state entry per alert identity
+  it has ever seen, and nothing prunes those entries yet. A rule over a label
+  whose values churn, such as a pod name or a request id, adds an entry for
+  every series that comes and goes. Per-series rules over churning label sets
+  wait on alert state pruning (see [Background](#background)); until it lands,
+  aggregate the churning label away instead.
+
+The labels a rule's query returns are retained with every alert record it
+writes, alongside the rule's own labels, and no erasure path reaches alert
+history today.
+
+### Upgrading from one alert per rule
+
+Releases before per-series evaluation raised one alert per rule, carrying the
+rule labels only. Three things change for an existing rules file on upgrade:
+
+- **A notification burst on the first tick.** A PromQL rule whose matching
+  series carry labels besides `__name__` that the rule labels do not override
+  gets a new identity for each series. If its single rule-level alert is
+  pending or firing at upgrade, that tick writes one Resolved transition for
+  it and one new transition per matching series. The webhook sink receives a
+  notification for every one of them, and the Alertmanager sink for every one
+  except a pending transition (a rule with a nonzero `for` starts its new
+  alerts pending).
+- **Rules that fire today can start failing every tick.** A rule fails with
+  `DuplicateAlertIdentity` when two matching series merge to one label set,
+  for example a selector over several metric names (`{__name__=~"a|b"}`)
+  whose series differ only in `__name__`, or a rule label that overrides the
+  series label that told them apart. It fails with `TooManyAlerts` when more
+  than 1000 series match. On every tick it fails, the rule writes no record,
+  its existing alerts keep their state, and `ravel_alert_rules_failed_total`
+  rises. Check that counter and the evaluator's warnings after upgrading.
+- **Duplicate rule ids fail startup.** Two rules of one tenant sharing a
+  `rule_id` stop the process at load with `rule id "<id>" is used by more than
+  one rule in tenant "<tenant>"`. Give each rule its own `rule_id` before
+  upgrading.
 
 A SQL detection rule reads the same tables the `POST /api/v1/sql` endpoint
 serves (`samples`, `logs`, `spans`, `audit`), under the same
@@ -207,7 +277,7 @@ never arrived, which is indistinguishable from a condition that never occurred.
 | Metric | Meaning |
 |---|---|
 | `ravel_alert_rules_evaluated_total` | Rules whose query ran and whose condition was decided. |
-| `ravel_alert_rules_failed_total` | Rules skipped because the query, the condition, or the write failed. Each is logged with its `rule_id` and retried next tick. |
+| `ravel_alert_rules_failed_total` | Rules skipped because the query, the condition, or the write failed, including a rule over the 1000-alert cap (`TooManyAlerts`) or with two series sharing one alert identity (`DuplicateAlertIdentity`). Each is logged with its `rule_id` and retried next tick. |
 | `ravel_alert_records_written_total` | Transition records durably written. |
 | `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record. |
 | `ravel_alert_notifications_delivered_total` | Notifications accepted by every configured sink. |
@@ -258,17 +328,19 @@ The table has these columns:
 | `attrs`        | `Map(Utf8, Utf8)`   | every attribute of the record, merged into one map  |
 
 `alert_id` is the stable hash of the rule id and the alert's label set, so every
-record for one alerting condition carries the same value across restarts and
-across rule reloads. The record's severity mirrors `state` (firing at the ERROR
+record for one alert (one matching series of one rule) carries the same value
+across restarts and across rule reloads. The record's severity mirrors `state` (firing at the ERROR
 level, pending at WARN, resolved and suppressed at INFO), but the table exposes
 no severity column: filter on `state` itself.
 
-`attrs` carries the four promoted keys above plus everything a rule attached:
-one entry per rule label under `label.<name>`, and one per annotation under
-`annotation.<name>`. Read a single one with a subscript, for example
-`attrs['label.severity'] = 'page'` or `attrs['annotation.summary']`. The label
-and annotation key sets are per-rule and open-ended, which is why they are a map
-and not columns.
+`attrs` carries the four promoted keys above plus the alert's labels and the
+rule's annotations: one entry per alert label under `label.<name>` (the series
+labels and the rule labels, merged as described in
+[One alert per matching series](#one-alert-per-matching-series)), and one per
+annotation under `annotation.<name>`. Read a single one with a subscript, for
+example `attrs['label.instance'] = 'host-1'` or `attrs['annotation.summary']`.
+The label and annotation key sets are per-rule and open-ended, which is why they
+are a map and not columns.
 
 ### One row per transition, and how to fold it
 
@@ -384,3 +456,10 @@ No retention rule covers the alerts signal today. A transition record is
 written once and is never swept, so alert history grows with the number of
 transitions and nothing trims it. A future retention rule that covers the
 signal would change that; until then, plan for the records to stay.
+
+## Background
+
+Per-series evaluation, the identity rule, and the 1000-alert cap are
+[ADR-0117](../adrs/0117-per-series-alert-evaluation.md). Pruning the alert
+state memo, which per-series rules over churning label sets wait on, is issue
+#1438.

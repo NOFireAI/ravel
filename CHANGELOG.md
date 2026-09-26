@@ -6,6 +6,44 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A PromQL alert rule raises one alert per matching series** (issue #117,
+  ADR-0117). A rule used to collapse its result vector into one alert with
+  the rule's labels; each series that satisfies the condition is now its own
+  alert, whose labels are the series labels without `__name__` overlaid by
+  the rule labels, and whose identity hashes those labels. A series that
+  stops matching resolves only its own alert. A rule matching more than 1000
+  series fails the tick with `TooManyAlerts`, and two series merging to one
+  label set fail it with `DuplicateAlertIdentity`; neither writes a record,
+  and both count in `ravel_alert_rules_failed_total`. A scalar query and a
+  SQL rule keep their existing single alert and identity. Two rules in one
+  tenant may no longer share a `rule_id`, even with different labels: such a
+  rules file now fails startup. Per-series rules over churning label sets
+  should wait for alert state pruning (#1438). A rule whose write fails
+  partway through its alerts now counts the records already written in
+  `ravel_alert_records_written_total`.
+
+  Upgrade notes:
+  - Expect a notification burst on the first tick. A PromQL rule whose
+    matching series carry labels besides `__name__` that the rule labels do
+    not override gets a new identity for each series. If its single
+    rule-level alert is pending or firing at upgrade, that tick writes one
+    Resolved transition for it and one new transition per matching series.
+    The webhook sink is notified of every one of them, and the Alertmanager
+    sink of every one except a pending transition.
+  - A rule that fires today can start failing every tick. It fails with
+    `DuplicateAlertIdentity` when two matching series merge to one label
+    set, for example a selector over several metric names
+    (`{__name__=~"a|b"}`) whose series differ only in `__name__`, or a rule
+    label that overrides the series label that told them apart. It fails
+    with `TooManyAlerts` when more than 1000 series match. On every tick it
+    fails, the rule writes no record, and its existing alerts keep their
+    state.
+  - A rules file in which two rules of one tenant share a `rule_id` now
+    fails startup with `rule id "<id>" is used by more than one rule in
+    tenant "<tenant>"`. Give each rule its own `rule_id` before upgrading.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed
