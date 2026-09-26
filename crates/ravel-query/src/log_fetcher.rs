@@ -2339,11 +2339,12 @@ impl LogSegmentFetcher {
                 accounting.record_cache_miss();
                 fetch_span.record("s3_requests", 1u64);
                 fetch_span.record("s3_bytes", bytes.len() as u64);
-                // The fetched buffer was just admitted to the read cache, which
+                // The fetched buffer was just offered to the read cache, which
                 // has its own byte ledger (ADR-1170 decision 2's handoff rule):
-                // mark this reservation handed off so the transient overlap is
-                // visible while both this returned buffer and the cache entry
-                // hold the same bytes. The overlap clears when this guard drops.
+                // mark this reservation handed off, whether or not the cache
+                // admitted it, so the transient overlap is visible while both
+                // this returned buffer and the cache entry hold the same bytes.
+                // The overlap clears when this guard drops.
                 reservation.mark_handed_off();
             }
         }

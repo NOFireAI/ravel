@@ -693,10 +693,12 @@ tied to the buffer it accounts for:
 The guard is never released because a GET completed; it releases only when the
 buffer it accounts for drops.
 
-**Handoff.** When a fetched buffer is admitted to the read cache -- a consumer
+**Handoff.** When a fetched buffer goes through the read cache -- a consumer
 with its own byte ledger -- the reservation is marked handed off
 (`Reservation::mark_handed_off`) rather than released, so the transient overlap
-(both ledgers holding the same bytes) stays visible until this guard drops.
+(both ledgers holding the same bytes) stays visible until this guard drops. The
+mark is made on a hit and on a miss alike, whether or not the cache admitted a
+missed buffer.
 Buffers returned across the crate boundary to a consumer that reserves under its
 own ledger (the SQL scan's `try_grow`) instead carry their guard inside the
 returned `Bytes`; that guard releases when the consumer drops the bytes, so the
@@ -918,7 +920,8 @@ unconditionally in every mode: `ravel_memory_budget_bytes`,
 `ravel_memory_reserved_bytes{component="sql"|"fetch"}`
 (bytes currently reserved against the budget, split by which side reserved
 them), and `ravel_memory_handoff_overlap_bytes` (how many of the fetch share's
-bytes the read cache's own cap counts too, defined below).
+bytes went through the read cache, an upper bound on what its own cap counts
+too, defined below).
 
 `ravel_memory_budget_bytes` is the ceiling of the shared accountant, which is
 the POST-carve remainder: the startup log's `memory_remainder_bytes`, not the
@@ -954,10 +957,14 @@ against the same remainder as before.
 
 `ravel_memory_handoff_overlap_bytes` is `MemoryBudget::handoff_overlap()`:
 the summed sizes of live fetch reservations that a fetcher marked handed off
-because the bytes they cover go through the read cache (a cache hit, or a miss
-the cache admits), so the cache's own byte cap counts the same bytes the fetch
-share counts. Each marked reservation counts at its full size from the mark
-until the reservation drops; a cache eviction in between does not lower it.
+because the bytes they cover go through the read cache. Whenever a cache is
+configured the fetchers mark every hit and every miss, whether or not the cache
+admitted the missed bytes (`SegmentFetcher::ensure_ranges` marks the whole
+batch; the RLOG whole-object path marks both its `Source::Cache` and
+`Source::Upstream` arms), so this is an upper bound on the bytes the cache's own
+byte cap counts alongside the fetch share, over by any miss the cache declined.
+Each marked reservation counts at its full size from the mark until the
+reservation drops; a cache eviction in between does not lower it.
 It is a subset of `component="fetch"`, not an addition to the reserved total,
 and it reads `0` when no read cache is configured.
 

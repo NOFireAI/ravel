@@ -21,9 +21,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ravel_memory_reserved_bytes{component="fetch"}` is the bytes held by live
   fetch reservations, `component="sql"` is the rest of the budget's reserved
   total rather than all of it, and `ravel_memory_handoff_overlap_bytes` is
-  the part of the fetch share that the read cache's own byte cap also
-  counts. The SQL path's own RSEG, RLOG and RSPAN fetchers still reserve
-  against private unlimited budgets.
+  the part of the fetch share whose bytes went through the read cache, hit
+  or miss, whether or not the cache kept them. The SQL path's own RSEG,
+  RLOG and RSPAN fetchers still reserve against private unlimited budgets.
 
 ## [0.18.0] - 2026-09-26
 

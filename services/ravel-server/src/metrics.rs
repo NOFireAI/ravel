@@ -428,8 +428,9 @@ impl AllocatorStat {
 /// (`ravel_memory::TenantMemoryAccountant`), all sharing the one process
 /// `MemoryBudget` through its raw `try_reserve`/`reserve_unchecked`/`release`
 /// counter API; `Fetch` is the fetch layer's own reservation against that
-/// same budget (`ravel_query`'s `SegmentFetcher`, `LogSegmentFetcher`, and
-/// `SpanSegmentFetcher`, through the RAII `reserve`/`Reservation` API).
+/// same budget (`ravel_query`'s `SegmentFetcher` and `LogSegmentFetcher`,
+/// through the RAII `reserve`/`Reservation` API). `SpanSegmentFetcher` uses
+/// the same API but is not wired to this budget.
 /// `ravel_memory::MemoryBudget` tracks the fetch share in its own counter, so
 /// the two never double-count (see [`Label::MemoryComponent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2122,15 +2123,17 @@ fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
 /// `ravel_memory_handoff_overlap_bytes` is `MemoryBudget::handoff_overlap()`:
 /// the summed sizes of live fetch `Reservation`s that a fetcher marked handed
 /// off (`Reservation::mark_handed_off`) because the bytes they cover are
-/// routed through the ADR-0046 read cache, a hit or a miss the cache admits,
-/// so the cache's own byte cap counts the same bytes the budget's
-/// `component="fetch"` share counts. Each marked reservation contributes its
-/// full size exactly once, from the mark until the reservation drops; a cache
-/// eviction in between does not lower it, and the drop clears it whether or
-/// not the cache still holds the bytes. It is a subset of
+/// routed through the ADR-0046 read cache. Whenever a cache is configured the
+/// fetchers mark every hit and every miss, whether or not the cache admitted
+/// the missed bytes, so this is the part of the budget's `component="fetch"`
+/// share the cache's own byte cap may also count: it over-states that
+/// overlap by any miss the cache declined to keep. Each marked reservation
+/// contributes its full size exactly once, from the mark until the
+/// reservation drops; a cache eviction in between does not lower it, and the
+/// drop clears it whether or not the cache still holds the bytes. It is a subset of
 /// `component="fetch"`, never added to the reserved total: the budget counts
-/// those bytes once, and this gauge says how many of them the cache cap
-/// counts too. It reads `0` when no read cache is configured.
+/// those bytes once, and this gauge says how many of them went through the
+/// cache. It reads `0` when no read cache is configured.
 fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudgetSnapshot) {
     write_header(
         out,
@@ -2173,7 +2176,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_handoff_overlap_bytes",
-        "Bytes of live fetch reservations marked handed off to the ADR-0046 read cache (Reservation::mark_handed_off), i.e. counted both by component=\"fetch\" and by the cache's own byte cap; each counts at full size from the mark until the reservation drops, regardless of cache eviction. A subset of component=\"fetch\", not an addition to it; 0 when no read cache is configured.",
+        "Bytes of live fetch reservations marked handed off to the ADR-0046 read cache (Reservation::mark_handed_off): every cache hit and every cache miss while a cache is configured, whether or not the cache admitted the missed bytes, so an upper bound on what component=\"fetch\" and the cache's own byte cap both count; each counts at full size from the mark until the reservation drops, regardless of cache eviction. A subset of component=\"fetch\", not an addition to it; 0 when no read cache is configured.",
         "gauge",
     );
     write_sample(

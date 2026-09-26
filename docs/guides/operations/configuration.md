@@ -1197,13 +1197,13 @@ MINUS the two cache ceilings, not the pre-carve `memory_budget_bytes` figure
 logged beside it; `u64::MAX` means unlimited, which is what any host with
 unreadable memory reports regardless of the caps set on it),
 `ravel_memory_reserved_bytes` split by a
-`component` label (`sql` or `fetch`; `fetch` reads `0` today because no
-fetcher this process builds reserves against this budget, an honest gap
-rather than a bug, and `sql` is correspondingly the whole reserved total
-rather than one component's share of it), and `ravel_memory_handoff_overlap_bytes` (the bytes a
-handoff between components would double-count in the budget's accounting
-window; inactive, always `0`, until fetch handoff accounting reaches this
-budget).
+`component` label (`fetch` is the bytes held by PromQL-path fetch
+reservations, including distributed fragment slices and the startup cache
+warm pass; `sql` is the rest of the reserved total; the SQL path's own
+fetchers do not reserve against this budget yet), and
+`ravel_memory_handoff_overlap_bytes` (the part of the `fetch` share whose
+bytes went through the read cache, hit or miss, whether or not the cache
+kept them; `0` when no read cache is configured).
 `--cache-max-bytes` changes less than it used to about how many times a logs
 statement moves a given object's bytes: a query's plan-phase whole-object
 read (the `has_word`/text and other skip-index-undecidable fallback) is now

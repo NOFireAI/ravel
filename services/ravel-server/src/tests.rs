@@ -850,9 +850,12 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
     let response = promql.clone().oneshot(request).await.expect("oneshot");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    // The process keeps serving: a query resolving no segment at all (an
-    // unpublished metric) needs no reservation and still answers, through the
-    // SAME engine and the SAME exhausted budget.
+    // The refusal left nothing behind: the shared budget reads 0 again, so the
+    // next query's reservations start from the full limit. That is the proof
+    // the process keeps serving. The query below resolves no segment (an unpublished metric) and
+    // needs no reservation, so it shows only that the same engine still routes
+    // and answers after a refusal, not that the budget admits a new charge.
+    assert_eq!(budget.reserved(), 0);
     let request = Request::builder()
         .method("GET")
         .uri(format!(
@@ -865,7 +868,7 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "the process must keep answering after a refusal"
+        "the engine must still answer a query that needs no reservation after a refusal"
     );
 }
 
