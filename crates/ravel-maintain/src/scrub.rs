@@ -431,31 +431,72 @@ pub struct ScrubTarget {
     pub object_size: u64,
 }
 
+/// Worst-case store requests verifying one object issues: the footer suffix
+/// probe, the ranged footer chase the probe grows to when it missed, the
+/// whole-object read of the content tier, and the postings tier's one
+/// re-derivation read. Charged per object so a unit naming an unusual number
+/// of parts fills the request budget instead of running unbounded.
+pub const SCRUB_REQUESTS_PER_OBJECT: u64 = 4;
+
+/// Request allowance per listing entry a tick is budgeted. An ordinary commit
+/// record costs one record GET plus one object, so the request cap leaves
+/// headroom above that and binds only on a unit that names several objects.
+pub const SCRUB_REQUESTS_PER_ENTRY: u64 = SCRUB_REQUESTS_PER_OBJECT + 4;
+
+/// How far above the sustained rate a tick may go to catch a rotation up with
+/// its deadline. Above this the rotation cannot finish in time and the scrub
+/// reports it instead of doing one unbounded tick.
+pub const SCRUB_MAX_CATCHUP: u64 = 4;
+
 /// The bounded amount of work one content-tier tick may do (ADR-1686 decision
-/// 2). A tick consumes listing entries in key order until the budget is
-/// filled, and always consumes at least one, so the cursor makes progress
-/// even when a single entry's objects exceed the budget.
+/// 2, amended). A tick consumes listing entries in key order until either cap
+/// is reached, and always consumes at least one unit, so the cursor makes
+/// progress even when one unit alone exceeds the budget.
+///
+/// Both caps are counted, not estimated: every listing entry the walk consumes
+/// counts against `max_entries`, and every store request the tick issues
+/// counts against `max_requests` whether or not it succeeded. A byte cap
+/// cannot do that job, because a failing GET moves no bytes, and a tick that
+/// stops on bytes alone walks and GETs the rest of the prefix during a store
+/// outage while its marker skips all of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScrubBudget {
-    /// At most this many listing entries per tick: the budget of a rotation
-    /// that has no previous rotation's byte total to size from.
-    MaxObjects(u64),
-    /// Stop once the slice holds at least this many object bytes.
-    MaxBytes(u64),
+pub struct ScrubBudget {
+    /// Listing entries this tick may consume.
+    pub max_entries: u64,
+    /// Store requests this tick may issue: listing pages, record GETs, and
+    /// [`SCRUB_REQUESTS_PER_OBJECT`] for each object it verifies.
+    pub max_requests: u64,
 }
 
 impl ScrubBudget {
-    /// Whether a slice that has consumed `entries` listing entries naming
-    /// `bytes` object bytes has filled this budget. An empty slice never has.
-    pub fn is_filled(self, entries: u64, bytes: u64) -> bool {
+    /// Whether a tick that has consumed `entries` listing entries and issued
+    /// `requests` store requests has filled this budget. An empty slice never
+    /// has, so every tick consumes at least one unit.
+    pub fn is_filled(self, entries: u64, requests: u64) -> bool {
         if entries == 0 {
             return false;
         }
-        match self {
-            ScrubBudget::MaxObjects(max) => entries >= max,
-            ScrubBudget::MaxBytes(max) => bytes >= max,
-        }
+        entries >= self.max_entries || requests >= self.max_requests
     }
+}
+
+/// One tick's budget together with the rotation numbers it was derived from,
+/// so the caller can report a rotation that cannot finish in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TickPlan {
+    /// The caps this tick runs under.
+    pub budget: ScrubBudget,
+    /// The rotation's allotted length in seconds: the scrub period `P`, or the
+    /// operator's retention window when that is shorter (an object deleted
+    /// before the rotation reaches it is never verified at all).
+    pub rotation_secs: u64,
+    /// Entries this tick would have had to consume for the rotation to reach
+    /// the end of the listing by its deadline.
+    pub needed_entries: u64,
+    /// `needed_entries` exceeded the catch-up ceiling, so this rotation will
+    /// not finish within `rotation_secs`: the scrub cannot keep up at the
+    /// configured period.
+    pub behind: bool,
 }
 
 /// The rotating content-tier cursor (ADR-0059 decision 1, ADR-1686). Plain
@@ -464,8 +505,10 @@ impl ScrubBudget {
 /// The position is a start-after marker over the commit shard prefix: the
 /// next tick lists strictly after `last_commit_key`, so the store's listing
 /// order is the rotation order and no corpus is ever materialised. `None`
-/// means "start of a rotation". The byte and entry totals size each tick's
-/// budget ([`ScrubCursor::tick_budget`]) and feed the position gauge.
+/// means "start of a rotation". The entry totals size each tick's budget
+/// ([`ScrubCursor::plan_tick`]) and feed the position gauge; the byte totals
+/// report the rotation's read bandwidth (ADR-0059 decision 1) and no longer
+/// bound a tick, since bytes cannot bound one whose GETs fail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrubCursor {
     /// Tenant this cursor rotates over.
@@ -489,6 +532,16 @@ pub struct ScrubCursor {
     pub rotation_total_entries: Option<u64>,
     /// Listing entries this rotation has consumed so far.
     pub rotation_entries_visited: u64,
+    /// Listing entries appended past `rotation_tail_key` since this rotation
+    /// began, counted by a LIST-only pass over the tail each tick. Added to
+    /// `rotation_total_entries` so the budget is sized from what the walk has
+    /// actually observed rather than from a total that went stale the moment
+    /// the rotation opened.
+    pub rotation_appended_entries: u64,
+    /// The greatest key seen under the prefix when the appended-entry count
+    /// last ran. `None` means the prefix was empty then, so the next count
+    /// covers the whole prefix.
+    pub rotation_tail_key: Option<String>,
 }
 
 impl ScrubCursor {
@@ -504,6 +557,8 @@ impl ScrubCursor {
             last_rotation_bytes: None,
             rotation_total_entries: None,
             rotation_entries_visited: 0,
+            rotation_appended_entries: 0,
+            rotation_tail_key: None,
         }
     }
 
@@ -513,25 +568,84 @@ impl ScrubCursor {
     }
 
     /// Open a rotation from the start of the prefix with the entry count its
-    /// LIST-only pass found. Keeps `last_rotation_bytes`, which sizes it.
-    pub fn start_rotation(&mut self, total_entries: u64, now_ns: i64) {
+    /// LIST-only pass found and the greatest key that pass saw. Keeps
+    /// `last_rotation_bytes`, which reports the previous rotation's bandwidth.
+    pub fn start_rotation(&mut self, total_entries: u64, tail_key: Option<String>, now_ns: i64) {
         self.last_commit_key = None;
         self.rotation_started_unix_ns = now_ns;
         self.rotation_bytes_seen = 0;
         self.rotation_total_entries = Some(total_entries);
         self.rotation_entries_visited = 0;
+        self.rotation_appended_entries = 0;
+        self.rotation_tail_key = tail_key;
     }
 
-    /// This tick's budget: the byte budget from the previous rotation's total
-    /// when one completed, else an entry budget from this rotation's count.
-    pub fn tick_budget(&self, period_secs: u64, tick_secs: u64) -> ScrubBudget {
-        match self.last_rotation_bytes {
-            Some(bytes) => per_tick_byte_budget(bytes, period_secs, tick_secs),
-            None => per_tick_entry_budget(
-                self.rotation_total_entries.unwrap_or(0),
-                period_secs,
-                tick_secs,
-            ),
+    /// Record `count` entries found past `rotation_tail_key` by this tick's
+    /// LIST-only tail count, and move the tail mark to `tail_key`. `count` is
+    /// the growth since the last tick, so the running total is every entry
+    /// appended since the rotation began.
+    pub fn observe_appended(&mut self, count: u64, tail_key: Option<String>) {
+        self.rotation_appended_entries = self.rotation_appended_entries.saturating_add(count);
+        if tail_key.is_some() {
+            self.rotation_tail_key = tail_key;
+        }
+    }
+
+    /// Entries this rotation is expected to cover: the count its opening
+    /// LIST-only pass found plus everything appended since.
+    pub fn estimated_rotation_entries(&self) -> u64 {
+        self.rotation_total_entries
+            .unwrap_or(0)
+            .saturating_add(self.rotation_appended_entries)
+    }
+
+    /// This tick's plan (ADR-1686 decision 3, amended). The rotation is
+    /// allotted `min(period_secs, retention_secs)`, since an object deleted by
+    /// retention before the walk reaches it is never verified at all. What is
+    /// left to cover is divided by the ticks left before that deadline, so a
+    /// rotation that has fallen behind speeds up instead of running forever:
+    /// on the last tick before the deadline the whole remainder is budgeted.
+    ///
+    /// The estimate is recomputed every tick from
+    /// [`estimated_rotation_entries`](Self::estimated_rotation_entries), which
+    /// tracks appends, so a shard that keeps committing cannot outrun the
+    /// walk. [`SCRUB_MAX_CATCHUP`] caps how far above the sustained rate one
+    /// tick may go; past that cap the returned plan is `behind` and the
+    /// caller reports that the scrub cannot keep up.
+    pub fn plan_tick(
+        &self,
+        period_secs: u64,
+        tick_secs: u64,
+        retention_secs: Option<u64>,
+        now_ns: i64,
+    ) -> TickPlan {
+        let tick_secs = tick_secs.max(1);
+        let rotation_secs = match retention_secs {
+            Some(retention) => period_secs.max(1).min(retention.max(1)),
+            None => period_secs.max(1),
+        };
+        let deadline_ticks = rotation_secs.div_ceil(tick_secs).max(1);
+        let elapsed_ns = now_ns.saturating_sub(self.rotation_started_unix_ns).max(0) as u64;
+        let ticks_elapsed = elapsed_ns / tick_secs.saturating_mul(1_000_000_000).max(1);
+        let ticks_remaining = deadline_ticks.saturating_sub(ticks_elapsed).max(1);
+
+        let estimated = self.estimated_rotation_entries();
+        let remaining = estimated.saturating_sub(self.rotation_entries_visited);
+        let needed_entries = remaining.div_ceil(ticks_remaining).max(1);
+        let sustained = estimated
+            .saturating_mul(tick_secs)
+            .div_ceil(rotation_secs)
+            .max(1);
+        let ceiling = sustained.saturating_mul(SCRUB_MAX_CATCHUP);
+        let max_entries = needed_entries.max(sustained).min(ceiling).max(1);
+        TickPlan {
+            budget: ScrubBudget {
+                max_entries,
+                max_requests: max_entries.saturating_mul(SCRUB_REQUESTS_PER_ENTRY),
+            },
+            rotation_secs,
+            needed_entries,
+            behind: needed_entries > ceiling,
         }
     }
 
@@ -552,38 +666,9 @@ impl ScrubCursor {
         self.rotation_bytes_seen = 0;
         self.rotation_total_entries = None;
         self.rotation_entries_visited = 0;
+        self.rotation_appended_entries = 0;
+        self.rotation_tail_key = None;
     }
-}
-
-/// Size one content-tier tick's byte budget so a full rotation over
-/// `total_corpus_bytes` completes in about the scrub period `P`: sustained read
-/// bandwidth is `total_corpus_bytes / P`, so one tick of length `tick_secs`
-/// reads `total_corpus_bytes * tick_secs / P` (rounded up, and at least one
-/// byte so a tiny corpus still advances). This is the explicit, operator-sized
-/// budget ADR-0059 decision 1 calls for.
-pub fn per_tick_byte_budget(
-    total_corpus_bytes: u64,
-    period_secs: u64,
-    tick_secs: u64,
-) -> ScrubBudget {
-    let period = period_secs.max(1);
-    let per_tick = total_corpus_bytes
-        .saturating_mul(tick_secs)
-        .div_ceil(period)
-        .max(1);
-    ScrubBudget::MaxBytes(per_tick)
-}
-
-/// The entry budget of a rotation with no previous byte total (ADR-1686
-/// decision 3): `ceil(total_entries * tick_secs / P)` listing entries, at
-/// least one, so the rotation still completes in about `P`.
-pub fn per_tick_entry_budget(total_entries: u64, period_secs: u64, tick_secs: u64) -> ScrubBudget {
-    let period = period_secs.max(1);
-    let per_tick = total_entries
-        .saturating_mul(tick_secs)
-        .div_ceil(period)
-        .max(1);
-    ScrubBudget::MaxObjects(per_tick)
 }
 
 #[cfg(test)]
@@ -886,21 +971,45 @@ mod tests {
         tick_secs: u64,
         now_ns: i64,
     ) -> Vec<String> {
+        walk_tick_with_retention(cursor, keys, size, period_secs, tick_secs, None, now_ns)
+    }
+
+    /// [`walk_tick`] with an operator retention window, which shortens the
+    /// rotation's deadline.
+    fn walk_tick_with_retention(
+        cursor: &mut ScrubCursor,
+        keys: &[String],
+        size: u64,
+        period_secs: u64,
+        tick_secs: u64,
+        retention_secs: Option<u64>,
+        now_ns: i64,
+    ) -> Vec<String> {
         if cursor.needs_entry_count() {
-            cursor.start_rotation(keys.len() as u64, now_ns);
+            cursor.start_rotation(keys.len() as u64, keys.last().cloned(), now_ns);
+        } else {
+            // The LIST-only tail count the scheduled wrapper runs each tick:
+            // everything appended past the mark the last count left.
+            let appended = match &cursor.rotation_tail_key {
+                Some(tail) => keys.len() - keys.partition_point(|key| key <= tail),
+                None => keys.len(),
+            };
+            cursor.observe_appended(appended as u64, keys.last().cloned());
         }
-        let budget = cursor.tick_budget(period_secs, tick_secs);
+        let plan = cursor.plan_tick(period_secs, tick_secs, retention_secs, now_ns);
         let start = match &cursor.last_commit_key {
             Some(last) => keys.partition_point(|key| key <= last),
             None => 0,
         };
         let mut consumed = Vec::new();
+        let mut requests = 0u64;
         let mut index = start;
-        while index < keys.len()
-            && !budget.is_filled(consumed.len() as u64, size * consumed.len() as u64)
-        {
+        while index < keys.len() && !plan.budget.is_filled(consumed.len() as u64, requests) {
             cursor.consume(keys[index].clone(), 1, size);
             consumed.push(keys[index].clone());
+            // One record GET plus one object's verification, the cost of an
+            // ordinary commit-record entry.
+            requests += 1 + SCRUB_REQUESTS_PER_OBJECT;
             index += 1;
         }
         if index >= keys.len() {
@@ -937,33 +1046,42 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_rotation_sizes_the_next_by_its_bytes() {
+    fn a_completed_rotation_reports_its_bytes_and_sizes_the_next_by_entries() {
         let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-        cursor.start_rotation(4, 1);
-        assert_eq!(cursor.tick_budget(2, 1), ScrubBudget::MaxObjects(2));
+        cursor.start_rotation(4, Some("c/0000/d.cmt".to_string()), 1);
+        // ceil(4 * 1 / 2) = 2 entries, the sustained rate over the count.
+        assert_eq!(cursor.plan_tick(2, 1, None, 1).budget.max_entries, 2);
         cursor.consume("c/0000/a.cmt".to_string(), 3, 700);
         assert_eq!(cursor.rotation_entries_visited, 3);
         assert_eq!(cursor.rotation_bytes_seen, 700);
         cursor.complete_rotation(9);
         assert!(cursor.needs_entry_count());
-        cursor.start_rotation(4, 10);
-        // ceil(700 * 1 / 2) = 350 bytes, whatever the entry count.
-        assert_eq!(cursor.tick_budget(2, 1), ScrubBudget::MaxBytes(350));
+        cursor.start_rotation(4, Some("c/0000/d.cmt".to_string()), 10);
+        // The next rotation is sized by entries, not by the 700 bytes the
+        // previous one read: those are reported, never a budget.
+        assert_eq!(cursor.plan_tick(2, 1, None, 10).budget.max_entries, 2);
         assert_eq!(cursor.last_rotation_bytes, Some(700));
         assert_eq!(cursor.rotation_bytes_seen, 0);
         assert_eq!(cursor.rotation_total_entries, Some(4));
     }
 
     #[test]
-    fn every_tick_consumes_at_least_one_entry_even_past_a_tiny_byte_budget() {
-        // A one-byte budget over 100-byte objects: one entry per tick.
-        assert!(!ScrubBudget::MaxBytes(1).is_filled(0, 0));
-        assert!(ScrubBudget::MaxBytes(1).is_filled(1, 100));
-        assert!(!ScrubBudget::MaxObjects(0).is_filled(0, 0));
-        assert!(ScrubBudget::MaxObjects(0).is_filled(1, 0));
+    fn every_tick_consumes_at_least_one_entry_even_past_a_tiny_budget() {
+        let tiny = ScrubBudget {
+            max_entries: 1,
+            max_requests: 1,
+        };
+        assert!(!tiny.is_filled(0, 0));
+        assert!(tiny.is_filled(1, 0));
+        // The request cap fills a tick whose entries alone have not.
+        let wide = ScrubBudget {
+            max_entries: 100,
+            max_requests: 8,
+        };
+        assert!(!wide.is_filled(1, 7));
+        assert!(wide.is_filled(1, 8));
         let keys = entry_keys(3);
         let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-        cursor.last_rotation_bytes = Some(1);
         let per_tick: Vec<usize> = (0..3)
             .map(|tick| walk_tick(&mut cursor, &keys, 100, 1_000, 1, tick).len())
             .collect();
@@ -973,10 +1091,9 @@ mod tests {
 
     #[test]
     fn period_sized_budget_completes_one_rotation_in_about_p_over_tick_ticks() {
-        // 100 entries, P = 7 days, tick = 1 hour. The first rotation's entry
-        // budget is ceil(100 * 3600 / 604800) = 1 entry, so it takes 100 ticks;
-        // the second's byte budget is ceil(100 * 3600 / 604800) = 1 byte over
-        // one-byte objects, 100 ticks again. Both fit in P / tick = 168.
+        // 100 entries, P = 7 days, tick = 1 hour. Each rotation's entry budget
+        // is ceil(100 * 3600 / 604800) = 1 entry, so it takes 100 ticks, which
+        // fits in P / tick = 168.
         let keys = entry_keys(100);
         let period_secs = 7 * 86_400;
         let tick_secs = 3_600;
@@ -995,5 +1112,142 @@ mod tests {
             assert_eq!(visited, keys, "rotation {rotation}: every entry once");
         }
         assert_eq!(cursor.last_rotation_bytes, Some(100));
+    }
+
+    /// The bound in the property below: a shard appending fewer entries per
+    /// tick than a tick's own sustained rate over the rotation.
+    const APPENDS_PER_TICK: usize = 1;
+
+    #[test]
+    fn a_rotation_completes_while_the_shard_keeps_committing_below_the_bound() {
+        // P = 7 days, tick = 1 hour, so a rotation is allotted 168 ticks. The
+        // shard holds 100 entries when the rotation opens and appends
+        // `APPENDS_PER_TICK` more every tick, which is below the sustained rate
+        // the deadline demands (100 entries over 168 ticks is well under one
+        // entry per tick once the catch-up allowance applies). The rotation
+        // must still reach the end of the listing inside its 168 ticks.
+        let period_secs = 7 * 86_400;
+        let tick_secs = 3_600;
+        let deadline_ticks = period_secs / tick_secs;
+        let mut keys = entry_keys(100);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let mut ticks = 0u64;
+        while ticks < deadline_ticks {
+            let now_ns = ticks as i64 * tick_secs as i64 * 1_000_000_000;
+            walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, now_ns);
+            ticks += 1;
+            if cursor.last_commit_key.is_none() {
+                break;
+            }
+            for append in 0..APPENDS_PER_TICK {
+                keys.push(format!(
+                    "c/0000/{:04}.cmt",
+                    100 + ticks as usize * APPENDS_PER_TICK + append
+                ));
+            }
+        }
+        assert!(
+            cursor.last_commit_key.is_none(),
+            "rotation did not complete in {deadline_ticks} ticks: marker still at {:?} with \
+             {} entries listed",
+            cursor.last_commit_key,
+            keys.len()
+        );
+        assert!(ticks <= deadline_ticks, "took {ticks} ticks");
+    }
+
+    #[test]
+    fn the_budget_follows_entries_appended_after_the_rotation_began() {
+        // 10 entries when the rotation opens, P = 20 ticks: the sustained rate
+        // is ceil(10 / 20) = 1 entry per tick. Appending 20 more entries on the
+        // first tick must raise the budget within this same rotation rather
+        // than waiting for the next one to be sized from it.
+        let period_secs = 20;
+        let tick_secs = 1;
+        let mut keys = entry_keys(10);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let first = walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, 0).len();
+        assert_eq!(first, 1, "sustained rate over the entries counted at start");
+        keys.extend((10..30).map(|i| format!("c/0000/{i:04}.cmt")));
+        let second = walk_tick(
+            &mut cursor,
+            &keys,
+            1,
+            period_secs,
+            tick_secs,
+            1_000_000_000,
+        )
+        .len();
+        assert!(
+            second > first,
+            "the budget ignored the 20 entries appended after the rotation began: \
+             tick 1 consumed {first}, tick 2 consumed {second}"
+        );
+    }
+
+    #[test]
+    fn a_rotation_never_runs_longer_than_the_configured_retention() {
+        // P = 7 days but retention is 24 hours: an object older than 24 hours
+        // is deleted, so a rotation that takes longer than that leaves objects
+        // unscrubbed for their whole life. The rotation must finish inside
+        // `retention / tick` = 24 ticks.
+        let period_secs = 7 * 86_400;
+        let tick_secs = 3_600;
+        let retention_secs = 24 * 3_600;
+        let deadline_ticks = retention_secs / tick_secs;
+        let keys = entry_keys(100);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let mut ticks = 0u64;
+        while ticks < deadline_ticks {
+            let now_ns = ticks as i64 * tick_secs as i64 * 1_000_000_000;
+            walk_tick_with_retention(
+                &mut cursor,
+                &keys,
+                1,
+                period_secs,
+                tick_secs,
+                Some(retention_secs),
+                now_ns,
+            );
+            ticks += 1;
+            if cursor.last_commit_key.is_none() {
+                break;
+            }
+        }
+        assert!(
+            cursor.last_commit_key.is_none(),
+            "a rotation sized only by P = {period_secs}s did not finish inside the \
+             {retention_secs}s retention window ({deadline_ticks} ticks)"
+        );
+        assert_eq!(ticks, 20, "100 entries at ceil(100 * 3600 / 86400) = 5 a tick");
+    }
+
+    #[test]
+    fn a_rotation_that_cannot_finish_by_its_deadline_reports_behind() {
+        // 100 entries, retention 24 hours, tick 1 hour, and the walk has
+        // consumed nothing 23 hours in: one tick is left and it would have to
+        // take all 100 entries, five times the catch-up ceiling of
+        // 4 * ceil(100 * 3600 / 86400) = 20.
+        let period_secs = 7 * 86_400;
+        let tick_secs = 3_600;
+        let retention_secs = 24 * 3_600;
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        cursor.start_rotation(100, Some("c/0000/0099.cmt".to_string()), 0);
+        let plan = cursor.plan_tick(
+            period_secs,
+            tick_secs,
+            Some(retention_secs),
+            23 * tick_secs as i64 * 1_000_000_000,
+        );
+        assert_eq!(plan.rotation_secs, retention_secs);
+        assert_eq!(plan.needed_entries, 100);
+        assert_eq!(plan.budget.max_entries, 20);
+        assert!(plan.behind);
+
+        // The same rotation at its start is on schedule and not behind.
+        let on_schedule = cursor.plan_tick(period_secs, tick_secs, Some(retention_secs), 0);
+        assert_eq!(on_schedule.needed_entries, 5);
+        assert_eq!(on_schedule.budget.max_entries, 5);
+        assert!(!on_schedule.behind);
     }
 }
