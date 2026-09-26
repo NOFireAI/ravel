@@ -19,11 +19,11 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
-use ravel_cache::{Cache, CacheLimits};
 use ravel_ingest::{AdmissionController, AdmissionLimits, Clock, SystemClock};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
@@ -275,7 +275,12 @@ const LARGE_SEGMENT_QUERY_OFFSET_S: i64 = 300;
 /// budget at all, rather than reading the whole object in one unbudgeted GET.
 /// Asserts the threshold was really crossed rather than assuming it from the
 /// sample count.
-async fn publish_large_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, metric: &str, now: i64) {
+async fn publish_large_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    metric: &str,
+    now: i64,
+) {
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {
         name: "__name__".to_string(),
@@ -370,8 +375,7 @@ fn promql_harness(
     let query_accounting = Arc::new(QueryAccountingMetrics::new(HashSet::new()));
     let tokens: HashMap<String, TenantId> =
         HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
-    let tenant_resolver: Arc<dyn TenantResolver> =
-        Arc::new(StaticBearerTokenResolver::new(tokens));
+    let tenant_resolver: Arc<dyn TenantResolver> = Arc::new(StaticBearerTokenResolver::new(tokens));
 
     let state = crate::query::build_app_state(
         Arc::clone(&catalog),
@@ -718,7 +722,11 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
         .await;
     match result {
         Err(QueryError::Fetch(FetchError::FetchMemoryExhausted { limit, .. })) => {
-            assert_eq!(limit, 4 * 1024, "the refusal must name the configured limit");
+            assert_eq!(
+                limit,
+                4 * 1024,
+                "the refusal must name the configured limit"
+            );
         }
         other => panic!("expected FetchMemoryExhausted, got {other:?}"),
     }
