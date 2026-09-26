@@ -103,7 +103,10 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // typed-attr-column hashes a tenant (unlike gc-config, whose object is
         // at the bucket root).
         | Command::TypedAttrColumn { .. }
-        | Command::Load { .. } => true,
+        | Command::Load { .. }
+        // `export` resolves the catalog under `t/<tenant_hash>/logs/...` from
+        // its `--tenant`, exactly as `catalog list` does.
+        | Command::Export { .. } => true,
         // `commit reconstruct` computes a `t/<tenant_hash>/` prefix from its
         // `--tenant`, so it needs the bucket's scheme resolved first; the
         // other `commit` variants take an explicit key/path and do not.
@@ -149,6 +152,9 @@ fn command_hashes_tenant(command: &Command) -> bool {
 fn command_is_write(command: &Command) -> bool {
     match command {
         Command::Load { .. } => true,
+        // `export` reads a resolved snapshot's objects and writes only to the
+        // local `--parquet` path; it publishes nothing to object storage.
+        Command::Export { .. } => false,
         // Both `provision` shapes write a durable record (or, for `adopt`, a
         // control record and audit entry via `reshard`); neither has a
         // read-only variant.
@@ -551,6 +557,55 @@ enum Command {
         /// slower idle timer instead).
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_flush_delay)]
         max_flush_delay: Option<Duration>,
+    },
+    /// Bulk-export a tenant's stored logs to a Parquet file (ADR-1751).
+    ///
+    /// The inverse of `load`: it resolves the catalog once, reads the RLOG
+    /// objects that snapshot names, and writes the columns the same
+    /// `--mapping` TOML describes, sorted by event time, so `load --parquet
+    /// <out> --mapping <same file>` reads the file back. This is a store read,
+    /// not a query: no SQL is planned and no server is contacted, but the
+    /// visibility rules are the query path's own, so retention tombstones,
+    /// compacted-away objects, and pending selective-erasure requests exclude
+    /// the same records they exclude from a query.
+    ///
+    /// `--start`/`--end` are a half-open event-time window `[start, end)`: a
+    /// record at exactly `--end` is not exported.
+    ///
+    /// Only `--signal logs` works today. Metrics and spans are refused by
+    /// name: ADR-1751 sequences bulk import for each of them ahead of export
+    /// for that signal, and neither import path exists yet.
+    Export {
+        /// Signal to export. Only `logs` is supported; `metrics` and `spans`
+        /// are refused with the follow-up each one waits on. No default: a
+        /// command that chooses for you which data it touches is a silent
+        /// wrong answer on a tenant that holds more than one signal.
+        #[arg(long, value_enum)]
+        signal: SignalArg,
+        /// Source tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        /// Inclusive start of the event-time window, RFC 3339
+        /// (`2024-01-01T00:00:00Z`).
+        #[arg(long, value_name = "RFC3339", value_parser = ravel_cli::parse_rfc3339_ns)]
+        start: i64,
+        /// Exclusive end of the event-time window, RFC 3339. Must be after
+        /// `--start`.
+        #[arg(long, value_name = "RFC3339", value_parser = ravel_cli::parse_rfc3339_ns)]
+        end: i64,
+        /// Path of the Parquet file to write. Overwritten if it exists.
+        #[arg(long, value_name = "FILE")]
+        parquet: std::path::PathBuf,
+        /// Path to the `--mapping` TOML naming the output columns. The same
+        /// file a `load` of this data used produces a file that load reads
+        /// back.
+        #[arg(long, value_name = "TOML")]
+        mapping: std::path::PathBuf,
+        /// Configured shard count, used to resolve the catalog. The tenant's
+        /// durable provisioning record supplies the real per-hour shard
+        /// generations on top of it. Defaults to the server's default of 4.
+        #[arg(long, default_value_t = 4)]
+        shards: u32,
     },
 }
 
@@ -1860,6 +1915,29 @@ async fn main() -> anyhow::Result<()> {
             .await;
             profile.finish();
             result
+        }
+        Command::Export {
+            signal,
+            tenant,
+            start,
+            end,
+            parquet,
+            mapping,
+            shards,
+        } => {
+            ravel_cli::export::run(
+                store::build_store(&cli.store)?,
+                cli.store.selection(),
+                &tenant,
+                signal,
+                start,
+                end,
+                &mapping,
+                &parquet,
+                shards,
+                now_ns()?,
+            )
+            .await
         }
     }
 }
