@@ -50,11 +50,14 @@ Take the issue's own cost model: one request per unsealed flush per shard. At
 4 shards and 2 s that is 7,200 requests per hour of tail. This model is not
 yet measured (follow-up task 1), so the figures below are conditional on it.
 
-| Tail | Requests | Against 15,800 |
+The 5,000 fixed overhead is never available to the tail (decision 2), so
+the tail's share of 15,800 is 10,800.
+
+| Tail | Tail requests | Against the tail's 10,800 |
 |---|---|---|
-| 1 h 20 m (just after a seal) | 9,600 | fits, 6,200 spare |
-| 2 h 11 m 40 s | 15,800 | the budget is exhausted |
-| 2 h 20 m (just before a seal) | 16,800 | refused by 1,000 |
+| 1 h 20 m (just after a seal) | 9,600 | fits, 1,200 spare |
+| 1 h 30 m | 10,800 | the budget is exhausted |
+| 2 h 20 m (just before a seal) | 16,800 | refused by 6,000 |
 
 The issue computed 52 minutes of headroom from the first row. That is the best
 point in the hour. At the worst point in the hour the headroom is negative,
@@ -183,9 +186,10 @@ What a query can now rely on, at the modelled per-flush cost:
   clock_skew_allowance`, which is 3 h 55 m at `W` = 50 m. A larger
   `--max-ingest-lag` shrinks that window one for one.
 - A wider query can still be refused once the stall runs long enough. That
-  refusal comes after the page. At 4 shards and 2 s, with every request in
-  the budget spent on the tail, it comes when the tail reaches 47,300 / 7,200
-  = 6 h 34 m. That is about 2 h 45 m after the alert fires.
+  refusal comes after the page. At 4 shards and 2 s, with the 5,000 fixed
+  overhead reserved for requests outside the tail, it comes when the tail
+  reaches 42,300 / 7,200 = 5 h 52 m. That is about 2 h 03 m after the alert
+  fires.
 
 ```mermaid
 gantt
@@ -206,12 +210,14 @@ gantt
     section Unsealed tail a wide query resolves
     Tail at the last fold, 2h19m          :t1, 09:00, 139m
     covered_span, 3h55m                   :t2, 09:00, 235m
-    Today's budget exhausted              :milestone, q0, 11:11, 0m
-    New budget exhausted                  :milestone, q1, 15:34, 0m
+    Today's budget exhausted              :milestone, q0, 10:30, 0m
+    New budget exhausted                  :milestone, q1, 14:52, 0m
 ```
 
-Today's budget runs out at 11:11, before the fold has even stalled. The new
-budget runs out at 15:34, about 2 h 45 m after the alert fires.
+Today's budget runs out at 10:30, ten minutes after a seal and before the
+fold has even stalled. The new budget runs out at 14:52, about 2 h 03 m after
+the alert fires. Both times reserve the 5,000 fixed overhead for requests
+outside the tail.
 
 ## Rejected alternatives
 
