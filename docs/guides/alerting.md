@@ -108,9 +108,13 @@ pending, firing, and resolved on its own.
   overlaid by the rule's `labels`, with the rule label winning when both name
   the same label. Its `alert_id` is the hash of the `rule_id` and that label
   set, and the same set is what the notification carries, so Alertmanager
-  grouping and silences match on the series labels. A query that returns a
-  scalar has no series labels, so its one alert carries the rule labels alone.
-  A SQL rule has no series either: it raises one alert with the rule labels.
+  grouping and silences match on the series labels. The Alertmanager sink sets
+  `alertname` to the `rule_id`, or to the rule's own `alertname` label when the
+  rule sets one. A series label named `alertname` (a recording rule's output,
+  say) stays in the alert's identity and in the webhook payload, but never
+  replaces the Alertmanager `alertname`. A query that returns a scalar has no
+  series labels, so its one alert carries the rule labels alone. A SQL rule
+  has no series either: it raises one alert with the rule labels.
 - **Two series with one identity.** If two matched series produce the same
   label set, for example two metric names that differ only in the dropped
   `__name__`, the rule fails that tick with `DuplicateAlertIdentity` rather than
@@ -129,7 +133,10 @@ pending, firing, and resolved on its own.
   whose values churn, such as a pod name or a request id, adds an entry for
   every series that comes and goes. Per-series rules over churning label sets
   wait on alert state pruning (see [Background](#background)); until it lands,
-  aggregate the churning label away instead.
+  aggregate the churning label away instead. A sink that keeps failing grows
+  the evaluator's in-memory retry queue the same way, one notification per
+  identity that fires or resolves, until it accepts them;
+  `ravel_alert_undelivered_notifications` reports that queue's size.
 
 The labels a rule's query returns are retained with every alert record it
 writes, alongside the rule's own labels, and no erasure path reaches alert
@@ -282,6 +289,7 @@ never arrived, which is indistinguishable from a condition that never occurred.
 | `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record. |
 | `ravel_alert_notifications_delivered_total` | Notifications accepted by every configured sink. |
 | `ravel_alert_notifications_failed_total` | Notifications still undelivered after a tick's attempt, counted once per tick while they are retried. |
+| `ravel_alert_undelivered_notifications` | Gauge. Notifications not yet accepted by every configured sink, at most one per alert identity. While a sink keeps failing it grows by one for every identity that transitions, without bound. |
 | `ravel_alert_ticks_total` | Evaluation ticks, split by an `outcome` label: `evaluated`, `lease_not_held`, `lease_unavailable`, `history_unavailable`. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Unix time this process last completed a tick. Its age is the liveness signal. |
 
