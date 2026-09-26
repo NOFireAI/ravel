@@ -10,10 +10,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **PromQL fetches now reserve against the same process-wide memory budget
   as SQL execution** (issue #1255). `ravel-server` hands the PromQL engine
-  the one `MemoryBudget` its SQL executor already uses, and with
-  `--distributed-query` on it hands the same budget to the fragment service
-  that runs metrics slices, both for remote workers and for the
-  coordinator's own no-hop local path, and to the startup cache warm pass.
+  and the startup cache warm pass the one `MemoryBudget` its SQL executor
+  already uses, and with `--distributed-query` on it hands the same budget
+  to the fragment service that runs metrics slices, both for remote workers
+  and for the coordinator's own no-hop local path.
   An RSEG or RLOG fetch for a PromQL query that needs more than the budget's
   remainder fails with `FetchMemoryExhausted` (HTTP 503 on the PromQL API)
   instead of running unbounded, and the next query is admitted as before.
