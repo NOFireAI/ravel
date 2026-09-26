@@ -347,9 +347,10 @@ reaches every object by about half its retained life, while the rotation keeps
 pace. A 7-day
 retention with the default `P` therefore rotates every 3.5 days, at twice the
 read bandwidth the formula above gives for `P`. A retention window shorter than
-a tick (more precisely, one whose half fits in a single tick) makes every tick
-a full rotation, including the LIST-only count of the whole commit prefix that
-opens it, and that count's cost is not charged against the tick's budget.
+a tick (more precisely, one whose half fits in a single tick) gives every tick
+the budget of a whole rotation, so every tick normally walks a full rotation,
+including the LIST-only count of the whole commit prefix that opens it, and
+that count's cost is not charged against the tick's budget.
 
 This is the one scheduled task whose cost scales with data volume rather than
 metadata volume, so size `P` against the corpus you actually have, and watch

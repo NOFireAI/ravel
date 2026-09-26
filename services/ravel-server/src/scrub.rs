@@ -262,9 +262,10 @@ fn reason_index(reason: UnreadableReason) -> usize {
 /// Structural corruption and a content-hash mismatch are bytes that were read
 /// and did not verify, so both increment `checksum_mismatch`. An object or
 /// record the store refuses with an error retrying cannot clear
-/// ([`ScrubResult::Unreadable`]), or a record that does not decode, was never
-/// verified at all and increments `unreadable` under its
-/// [`UnreadableReason`]; a [`ScrubResult::ReadError`] increments nothing. Both
+/// ([`ScrubResult::Unreadable`]), a record that does not decode, and one that
+/// still fails retryably when its unit's hold runs out were never verified at
+/// all and increment `unreadable` under their [`UnreadableReason`]; any other
+/// [`ScrubResult::ReadError`] increments nothing. Both
 /// carry a [`ScrubLevel`] dimension (`l0`/`l1`/`rewrite`, [`level_index`]):
 /// the postings tier only ever runs against L0 objects, so
 /// `postings_disagreement` stays signal-only.
