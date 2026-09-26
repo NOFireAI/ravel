@@ -11,39 +11,43 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly seventeen label keys: `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`,
+//! renders exactly eighteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
+//! `error_kind`, `workload_class`, `level`, `reason`, `shard`, `cache`, `tier`,
 //! `kind`, `outcome`, `allocator`, `stat`, `component`, `class`, and `carrier`
 //! (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
-//! seal-divergence family, `cache` to split the read-cache family into the
-//! fetcher and catalog byte caches, `tier` added by #97 to split each of those
-//! into its RAM and local-disk tiers when a disk tier is configured, `kind`
-//! added by ADR-0065 decision 4 to split the maintenance merge-memory gauge into
-//! its transient and total high-water marks, `outcome` added by #532 to split
-//! the alert-tick family by how one evaluation tick ended, `allocator`/`stat`
-//! added by #1170 for the process allocator gauges, `component` added by
-//! ADR-1170 decision 4 to split the process memory budget's reserved-bytes
-//! gauge by which side reserved it, `class` added by ADR-0071's admission
-//! disjointness deliverable (issue #1722) to split the fragment in-flight
-//! gauge and admission-wait counters into their `Pinned` and `Resolve`
-//! classes, and `carrier` added by ADR-0873 decision 2 to split the
-//! declared-statistics drop tally across its four carriers). The seventeen
-//! keys come from twenty `Label` variants, because three pairs share a key:
-//! `RejectReason` and `ScrubReason` both render `reason`, `Level`
-//! (log/tracing severity) and `ScrubLevel` (issue #1686, which part of the
-//! commit lineage -- `l0`/`l1`/`rewrite` -- a scrub target came from) both
-//! render `level`, and `MergeMemoryKind` and `DeletedObjectKind` both render
-//! `kind`.
+//! seal-divergence family, `shard` added by ADR-1692 decision 2 as the ninth
+//! key for the per-shard ingest-skew family, `cache` to split the read-cache
+//! family into the fetcher and catalog byte caches, `tier` added by #97 to
+//! split each of those into its RAM and local-disk tiers when a disk tier is
+//! configured, `kind` added by ADR-0065 decision 4 to split the maintenance
+//! merge-memory gauge into its transient and total high-water marks,
+//! `outcome` added by #532 to split the alert-tick family by how one
+//! evaluation tick ended, `allocator`/`stat` added by #1170 for the process
+//! allocator gauges, `component` added by ADR-1170 decision 4 to split the
+//! process memory budget's reserved-bytes gauge by which side reserved it,
+//! `class` added by ADR-0071's admission disjointness deliverable (issue
+//! #1722) to split the fragment in-flight gauge and admission-wait counters
+//! into their `Pinned` and `Resolve` classes, and `carrier` added by
+//! ADR-0873 decision 2 to split the declared-statistics drop tally across
+//! its four carriers). The eighteen keys come from twenty-one `Label`
+//! variants, because three pairs share a key: `RejectReason` and
+//! `ScrubReason` both render `reason`, `Level` (log/tracing severity) and
+//! `ScrubLevel` (issue #1686, which part of the commit lineage --
+//! `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`, and
+//! `MergeMemoryKind` and `DeletedObjectKind` both render `kind`.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
 //! variant is a compile error everywhere this module matches on `Label`
-//! exhaustively. `shard` is
-//! deliberately absent: shard count times tenant count times operation count
-//! is unbounded in the dimension Ravel controls least (ADR-0044, rejected
-//! alternative 6). Query text, metric names, label values beyond the closed
-//! sets above, stream ids, trace ids, and object keys are never labels.
+//! exhaustively. A per-shard family is permitted when it carries no tenant
+//! label and no operation label (ADR-1692 decision 1, narrowing ADR-0044
+//! rejected alternative 6): `shard` is never combined with `tenant_hash` on
+//! any sample, whatever `--metrics-tenant-labels` is set to, and the bare
+//! `Label::Shard(u32)` payload is bounded by `MAX_SHARD_COUNT` so its own
+//! cardinality cannot grow unbounded. Query text, metric names, label values
+//! beyond the closed sets above, stream ids, trace ids, and object keys are
+//! never labels.
 //!
 //! Every sample this module renders carries `mode`, so one Prometheus job can
 //! scrape a fleet of `--mode` processes without their series colliding.
@@ -258,6 +262,15 @@ pub enum Label {
     Level(Level),
     RejectReason(RejectReason),
     ScrubReason(ScrubReason),
+    /// One shard index of the per-shard ingest-skew family (ADR-1692
+    /// decision 2). The payload is a bare `u32`, not a closed enum, but stays
+    /// within the closed-payload rule because [`Label::shard`] is the only
+    /// constructor and refuses any index at or above
+    /// [`ravel_catalog::MAX_SHARD_COUNT`], so the rendered cardinality is
+    /// bounded by the same cap the accumulator is preallocated to
+    /// (crates/ravel-ingest/src/metrics.rs). Never combined with
+    /// [`Label::TenantHash`] on any sample (ADR-1692 decision 1).
+    Shard(u32),
     /// Which commit-lineage part a scrub target came from (issue #1686):
     /// `l0`, `l1`, or `rewrite`. Shares the `level` key with [`Label::Level`]
     /// (log/tracing severity), the same shared-key discipline
@@ -458,6 +471,7 @@ impl Label {
             Label::Level(_) => "level",
             Label::RejectReason(_) => "reason",
             Label::ScrubReason(_) => "reason",
+            Label::Shard(_) => "shard",
             Label::ScrubLevel(_) => "level",
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
@@ -483,6 +497,7 @@ impl Label {
             Label::Level(level) => level.name().to_string(),
             Label::RejectReason(reason) => reason.name().to_string(),
             Label::ScrubReason(reason) => reason.name().to_string(),
+            Label::Shard(index) => index.to_string(),
             Label::ScrubLevel(level) => level.as_str().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
@@ -495,6 +510,14 @@ impl Label {
             Label::AdmissionClass(class) => admission_class_name(*class).to_string(),
             Label::StatCarrier(carrier) => carrier.label().to_string(),
         }
+    }
+
+    /// Bounded constructor for [`Label::Shard`] (ADR-1692 decision 2): refuses
+    /// any index at or above [`ravel_catalog::MAX_SHARD_COUNT`] rather than
+    /// rendering it, so a caller cannot smuggle an unbounded shard index onto
+    /// the scrape.
+    pub fn shard(index: u32) -> Option<Label> {
+        (index < ravel_catalog::MAX_SHARD_COUNT).then_some(Label::Shard(index))
     }
 }
 
@@ -884,6 +907,18 @@ pub struct IngestPipelineSnapshot {
     /// signal for the same reason `flushes_queued_total` is: all three
     /// pipelines run the same teardown path.
     pub flush_all_residue_tenants: u64,
+    /// Per-shard ingest-skew figures (issue #865, ADR-1692), one entry per
+    /// shard with recorded activity; an idle shard is simply absent here and
+    /// the renderer fills it with zeros. Empty for a pipeline whose router is
+    /// not configured on this process, the same structural-absence
+    /// convention `postings` uses.
+    pub shard_skew: Vec<(u32, ravel_ingest::ShardSkewStats)>,
+    /// This pipeline's router's current active shard count (ADR-1692
+    /// decision 4), the upper bound the renderer zero-fills up to. A shard
+    /// index in `shard_skew` at or above this count is a retiring
+    /// generation (ADR-0052) still carrying recorded activity, and renders
+    /// too.
+    pub active_shard_count: u32,
 }
 
 /// Exemplar admission counters, mirroring
@@ -985,6 +1020,8 @@ impl IngestPipelineSnapshot {
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
+            shard_skew: Vec::new(),
+            active_shard_count: 0,
         }
     }
 
@@ -1026,6 +1063,8 @@ impl IngestPipelineSnapshot {
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
+            shard_skew: Vec::new(),
+            active_shard_count: 0,
         }
     }
 
@@ -1058,6 +1097,8 @@ impl IngestPipelineSnapshot {
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
+            shard_skew: Vec::new(),
+            active_shard_count: 0,
         }
     }
 }
@@ -1606,6 +1647,174 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             &labels(mode, pipeline.signal),
             pipeline.flush_all_residue_tenants,
         );
+    }
+}
+
+/// Per-shard skew figures for one pipeline (ADR-1692 decision 4): every index
+/// below the router's active shard count, in order, plus any index at or
+/// above it that still carries recorded activity (a retiring generation,
+/// ADR-0052). A shard absent from `shard_skew` renders the zero
+/// `ShardSkewStats::default()` rather than being omitted: an idle shard is
+/// the finding this family exists to show.
+fn shard_stats(pipeline: &IngestPipelineSnapshot) -> Vec<(u32, ravel_ingest::ShardSkewStats)> {
+    let by_shard: HashMap<u32, ravel_ingest::ShardSkewStats> =
+        pipeline.shard_skew.iter().copied().collect();
+    let mut indices: Vec<u32> = (0..pipeline.active_shard_count).collect();
+    for (shard, _) in &pipeline.shard_skew {
+        if *shard >= pipeline.active_shard_count {
+            indices.push(*shard);
+        }
+    }
+    indices.sort_unstable();
+    indices
+        .into_iter()
+        .map(|shard| (shard, by_shard.get(&shard).copied().unwrap_or_default()))
+        .collect()
+}
+
+/// The per-shard ingest-skew family (ADR-1692): six samples per configured
+/// shard, labelled `mode`, `signal`, `shard`, fed from each router's
+/// `shard_skew_by_shard` and active shard count. No tenant and no operation
+/// label ever joins `shard` on these samples (decision 1). An index at or
+/// above `MAX_SHARD_COUNT` is refused by `Label::shard` rather than rendered;
+/// `shard_stats` never produces one in practice, since the accumulator itself
+/// is capped there, but the renderer stays defensive rather than trusting it.
+fn render_ingest_shard_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelineSnapshot]) {
+    fn labels(mode: Mode, signal: Signal, shard: Label) -> [Label; 3] {
+        [Label::Mode(mode), Label::Signal(signal), shard]
+    }
+
+    let per_pipeline: Vec<(Signal, Vec<(u32, ravel_ingest::ShardSkewStats)>)> = pipelines
+        .iter()
+        .map(|pipeline| (pipeline.signal, shard_stats(pipeline)))
+        .collect();
+
+    write_header(
+        out,
+        "ravel_ingest_shard_messages_enqueued_total",
+        "Write messages the router sent into this shard's channel, by signal and shard \
+         (issue #865, ADR-1692). Every configured shard renders, idle ones at zero.",
+        "counter",
+    );
+    for (signal, stats) in &per_pipeline {
+        for (shard, s) in stats {
+            let Some(label) = Label::shard(*shard) else {
+                continue;
+            };
+            write_sample(
+                out,
+                "ravel_ingest_shard_messages_enqueued_total",
+                &labels(mode, *signal, label),
+                s.messages_enqueued,
+            );
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_shard_messages_processed_total",
+        "Write messages this shard's actor pulled off its channel and handled, by signal \
+         and shard (issue #865, ADR-1692). messages_enqueued minus this is the channel depth.",
+        "counter",
+    );
+    for (signal, stats) in &per_pipeline {
+        for (shard, s) in stats {
+            let Some(label) = Label::shard(*shard) else {
+                continue;
+            };
+            write_sample(
+                out,
+                "ravel_ingest_shard_messages_processed_total",
+                &labels(mode, *signal, label),
+                s.messages_processed,
+            );
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_shard_queue_depth",
+        "This shard's channel depth: messages_enqueued minus messages_processed at scrape \
+         time, by signal and shard (issue #865, ADR-1692). A gauge.",
+        "gauge",
+    );
+    for (signal, stats) in &per_pipeline {
+        for (shard, s) in stats {
+            let Some(label) = Label::shard(*shard) else {
+                continue;
+            };
+            write_sample(
+                out,
+                "ravel_ingest_shard_queue_depth",
+                &labels(mode, *signal, label),
+                s.queue_depth,
+            );
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_shard_on_actor_seconds_total",
+        "Total seconds this shard's actor has spent handling write messages, excluding \
+         both the flush-permit wait and the flush itself, by signal and shard (issue #865, \
+         ADR-1692).",
+        "counter",
+    );
+    for (signal, stats) in &per_pipeline {
+        for (shard, s) in stats {
+            let Some(label) = Label::shard(*shard) else {
+                continue;
+            };
+            write_sample_f64(
+                out,
+                "ravel_ingest_shard_on_actor_seconds_total",
+                &labels(mode, *signal, label),
+                s.on_actor_ns as f64 / 1_000_000_000.0,
+            );
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_shard_flush_permit_wait_seconds_total",
+        "Total seconds flush tasks on this shard have spent waiting for a \
+         max_inflight_flushes permit, by signal and shard (issue #865, ADR-1692). A sum \
+         over concurrently waiting tasks, so it can exceed wall time (ADR-1642).",
+        "counter",
+    );
+    for (signal, stats) in &per_pipeline {
+        for (shard, s) in stats {
+            let Some(label) = Label::shard(*shard) else {
+                continue;
+            };
+            write_sample_f64(
+                out,
+                "ravel_ingest_shard_flush_permit_wait_seconds_total",
+                &labels(mode, *signal, label),
+                s.flush_permit_wait_ns as f64 / 1_000_000_000.0,
+            );
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_shard_off_actor_seconds_total",
+        "Total seconds this shard's flush tasks have spent flushing off the actor, by \
+         signal and shard (issue #865, ADR-1692).",
+        "counter",
+    );
+    for (signal, stats) in &per_pipeline {
+        for (shard, s) in stats {
+            let Some(label) = Label::shard(*shard) else {
+                continue;
+            };
+            write_sample_f64(
+                out,
+                "ravel_ingest_shard_off_actor_seconds_total",
+                &labels(mode, *signal, label),
+                s.off_actor_ns as f64 / 1_000_000_000.0,
+            );
+        }
     }
 }
 
@@ -5061,6 +5270,7 @@ pub fn render(
     render_store_family(&mut out, mode, store);
     if !ingest.is_empty() {
         render_ingest_family(&mut out, mode, ingest);
+        render_ingest_shard_family(&mut out, mode, ingest);
         render_logs_postings_family(&mut out, mode, ingest);
     }
     render_catalog_family(&mut out, mode, catalog);
@@ -5418,19 +5628,22 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
 
     let mut pipelines = Vec::new();
     if let Some(router) = &state.ingest_router {
-        pipelines.push(IngestPipelineSnapshot::from_metrics(
-            router.metrics().snapshot(),
-        ));
+        let mut pipeline = IngestPipelineSnapshot::from_metrics(router.metrics().snapshot());
+        pipeline.shard_skew = router.metrics().shard_skew_by_shard();
+        pipeline.active_shard_count = router.shard_count();
+        pipelines.push(pipeline);
     }
     if let Some(router) = &state.log_ingest_router {
-        pipelines.push(IngestPipelineSnapshot::from_log_metrics(
-            router.metrics().snapshot(),
-        ));
+        let mut pipeline = IngestPipelineSnapshot::from_log_metrics(router.metrics().snapshot());
+        pipeline.shard_skew = router.metrics().shard_skew_by_shard();
+        pipeline.active_shard_count = router.shard_count();
+        pipelines.push(pipeline);
     }
     if let Some(router) = &state.span_ingest_router {
-        pipelines.push(IngestPipelineSnapshot::from_span_metrics(
-            router.metrics().snapshot(),
-        ));
+        let mut pipeline = IngestPipelineSnapshot::from_span_metrics(router.metrics().snapshot());
+        pipeline.shard_skew = router.metrics().shard_skew_by_shard();
+        pipeline.active_shard_count = router.shard_count();
+        pipelines.push(pipeline);
     }
 
     let catalog_snapshot = CatalogCountersSnapshot::from_catalog(state.catalog.as_ref());
@@ -5798,20 +6011,22 @@ mod tests {
         // compile until a case is added here, and the fixed array below then
         // fails the length assertion until it is extended too -- two
         // independent breaks for one added variant, by design. `reason` is the
-        // eighth, added by ADR-0051 section 6 for the admission family; `cache`
-        // is the ninth, added to split the read-cache family into
-        // the fetcher and catalog byte caches; `kind` is the tenth, added by
+        // eighth, added by ADR-0051 section 6 for the admission family;
+        // `shard` is the ninth, added by ADR-1692 decision 2 for the
+        // per-shard ingest skew family; `cache`
+        // is the tenth, added to split the read-cache family into
+        // the fetcher and catalog byte caches; `kind` is the eleventh, added by
         // ADR-0065 decision 4 for the RLOG merge-memory gauge; `tier` is the
-        // eleventh, added by #97 to split each read cache into its RAM and
-        // local-disk tiers; `allocator` and `stat` are the twelfth and
-        // thirteenth, added by #1170 for the process allocator gauges;
-        // `outcome` is the fourteenth, added by #532 to split the alert
-        // evaluation tick counter; `component` is the fifteenth, added by
+        // twelfth, added by #97 to split each read cache into its RAM and
+        // local-disk tiers; `allocator` and `stat` are the thirteenth and
+        // fourteenth, added by #1170 for the process allocator gauges;
+        // `outcome` is the fifteenth, added by #532 to split the alert
+        // evaluation tick counter; `component` is the sixteenth, added by
         // ADR-1170 decision 4 for the process memory budget's reserved-bytes
-        // gauge; `class` is the sixteenth, added by ADR-0071's admission
+        // gauge; `class` is the seventeenth, added by ADR-0071's admission
         // disjointness deliverable (issue #1722) to split the fragment
         // in-flight gauge and admission-wait counters into their `Pinned`
-        // and `Resolve` classes; `carrier` is the seventeenth, added by
+        // and `Resolve` classes; `carrier` is the eighteenth, added by
         // ADR-0873 decision 2 to split the declared-statistics drop tally
         // across its four carriers.
         let one_of_each = [
@@ -5824,6 +6039,7 @@ mod tests {
             Label::Level(Level::Info),
             Label::RejectReason(RejectReason::ByteRate),
             Label::ScrubReason(ScrubReason::Missing),
+            Label::Shard(0),
             Label::ScrubLevel(ScrubLevel::L0),
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
@@ -5848,6 +6064,7 @@ mod tests {
                 Label::Level(_) => "level",
                 Label::RejectReason(_) => "reason",
                 Label::ScrubReason(_) => "reason",
+                Label::Shard(_) => "shard",
                 Label::ScrubLevel(_) => "level",
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
@@ -5876,6 +6093,10 @@ mod tests {
                 // the allowlist of distinct keys is unchanged; two variants map
                 // to it.
                 "reason",
+                // Shard (ADR-1692 decision 2) is the ninth key, for the
+                // per-shard ingest skew family only; never combined with
+                // tenant_hash.
+                "shard",
                 // ScrubLevel (issue #1686) reuses the `level` key, so the
                 // allowlist of distinct keys is unchanged; two variants map to
                 // it.
@@ -5895,16 +6116,17 @@ mod tests {
                 "carrier",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
-             ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
+             ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
+             for the per-shard ingest skew family, the `cache` label, #97's `tier` \
              label, ADR-0065 decision 4's `kind` (also reused by issue #1729's deleted-objects \
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
              `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, and \
-             issue #1686's `level` reuse by `ScrubLevel`; `shard` must never appear here"
+             issue #1686's `level` reuse by `ScrubLevel`"
         );
         assert_eq!(
             one_of_each.len(),
-            20,
-            "exactly 20 label variants, 17 distinct keys"
+            21,
+            "exactly 21 label variants, 18 distinct keys"
         );
     }
 
@@ -10329,5 +10551,308 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             .expect("deferred write task")
             .expect("deferred write acks once the cap clears");
         router.flush_all().await;
+    }
+
+    /// ADR-1692 acceptance test: a four-shard log router with three writes
+    /// driven to one shard renders exactly four series per family through the
+    /// same `render()` the `/metrics` handler calls, idle shards at zero and
+    /// the busy shard at the exact enqueued and processed count.
+    #[tokio::test]
+    async fn metrics_render_one_series_per_configured_log_shard_idle_ones_included() {
+        use std::time::Duration;
+
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use ravel_ingest::{AdmissionController, AdmissionLimits, IngestConfig, SystemClock, WriteMode};
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+        use ravel_types::{TenantId, shard_for_log};
+
+        use crate::logs_ingest::{LogIngestState, handle_export_logs};
+        use crate::normalize_reject_metrics::NormalizeRejectMetrics;
+
+        const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
+        const SHARD_COUNT: u32 = 4;
+        const BUSY_SHARD: u32 = 2;
+        const WRITES: u32 = 3;
+
+        fn string_kv(key: &str, value: &str) -> KeyValue {
+            KeyValue {
+                key: key.to_string(),
+                value: Some(AnyValue {
+                    value: Some(AnyValueVariant::StringValue(value.to_string())),
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn host_for_shard(want_shard: u32, shard_count: u32) -> String {
+            for i in 0..100_000u32 {
+                let host = i.to_string();
+                let attrs = vec![
+                    ("service.name".to_string(), AttrValue::Str("api".to_string())),
+                    ("host".to_string(), AttrValue::Str(host.clone())),
+                ];
+                let stream_id = log_stream_id(&attrs, "", "", &[]);
+                if shard_for_log(&stream_id, shard_count) == want_shard {
+                    return host;
+                }
+            }
+            panic!("no host found for shard {want_shard} of {shard_count}");
+        }
+
+        let host = host_for_shard(BUSY_SHARD, SHARD_COUNT);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = Arc::new(LogIngestRouter::new(
+            IngestConfig {
+                shard_count: SHARD_COUNT,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            Arc::new(SystemClock),
+        ));
+        let state = LogIngestState {
+            router: router.clone(),
+            limits: ravel_otlp::LogIngestLimits::default(),
+            ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            store,
+            recovery: None,
+            provisioning: None,
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+        };
+
+        for i in 0..WRITES {
+            let request = ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![
+                            string_kv("service.name", "api"),
+                            string_kv("host", &host),
+                        ],
+                        ..Default::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        log_records: vec![LogRecord {
+                            time_unix_nano: BASE_TS_NS as u64,
+                            observed_time_unix_nano: BASE_TS_NS as u64,
+                            severity_number: 9,
+                            severity_text: "INFO".to_string(),
+                            body: Some(AnyValue {
+                                value: Some(AnyValueVariant::StringValue(format!("line-{i}"))),
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            };
+            handle_export_logs(
+                &state,
+                TenantId::new("acme"),
+                WriteMode::Strict,
+                request,
+                BASE_TS_NS,
+                None,
+            )
+            .await
+            .expect("write must succeed");
+        }
+
+        // Cooperative polling only: the actor records `messages_processed`
+        // just after it sends the caller's ack, so waiting for the ack alone
+        // races the actor's own bookkeeping. No wall-clock wait.
+        async fn until(mut probe: impl FnMut() -> bool) {
+            while !probe() {
+                tokio::task::yield_now().await;
+            }
+        }
+        until(|| {
+            router
+                .metrics()
+                .shard_skew_by_shard()
+                .into_iter()
+                .find(|(shard, _)| *shard == BUSY_SHARD)
+                .is_some_and(|(_, s)| s.messages_processed == u64::from(WRITES))
+        })
+        .await;
+
+        let mut pipeline = IngestPipelineSnapshot::from_log_metrics(router.metrics().snapshot());
+        pipeline.shard_skew = router.metrics().shard_skew_by_shard();
+        pipeline.active_shard_count = router.shard_count();
+        let ingest = vec![pipeline];
+
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            true,
+        );
+
+        const FAMILIES: [&str; 6] = [
+            "ravel_ingest_shard_messages_enqueued_total",
+            "ravel_ingest_shard_messages_processed_total",
+            "ravel_ingest_shard_queue_depth",
+            "ravel_ingest_shard_on_actor_seconds_total",
+            "ravel_ingest_shard_flush_permit_wait_seconds_total",
+            "ravel_ingest_shard_off_actor_seconds_total",
+        ];
+        for family in FAMILIES {
+            let count = body
+                .matches(&format!("{family}{{mode=\"gateway\",signal=\"logs\","))
+                .count();
+            assert_eq!(
+                count, SHARD_COUNT as usize,
+                "{family} must render exactly {SHARD_COUNT} series, one per configured \
+                 shard:\n{body}"
+            );
+        }
+        for shard in 0..SHARD_COUNT {
+            if shard == BUSY_SHARD {
+                continue;
+            }
+            assert_eq!(
+                body.matches(&format!(
+                    "ravel_ingest_shard_messages_enqueued_total{{mode=\"gateway\",\
+                     signal=\"logs\",shard=\"{shard}\"}} 0"
+                ))
+                .count(),
+                1,
+                "idle shard {shard} must render zero enqueued:\n{body}"
+            );
+        }
+        assert_eq!(
+            body.matches(&format!(
+                "ravel_ingest_shard_messages_enqueued_total{{mode=\"gateway\",\
+                 signal=\"logs\",shard=\"{BUSY_SHARD}\"}} {WRITES}"
+            ))
+            .count(),
+            1,
+            "the busy shard must render the exact enqueued count:\n{body}"
+        );
+        assert_eq!(
+            body.matches(&format!(
+                "ravel_ingest_shard_messages_processed_total{{mode=\"gateway\",\
+                 signal=\"logs\",shard=\"{BUSY_SHARD}\"}} {WRITES}"
+            ))
+            .count(),
+            1,
+            "the busy shard must render the exact processed count:\n{body}"
+        );
+    }
+
+    /// ADR-1692 decision 2: a shard index at or above `MAX_SHARD_COUNT` is
+    /// refused by `Label::shard` rather than rendered, even when it is
+    /// synthetically present in a pipeline's `shard_skew` (a corrupt or
+    /// future-format snapshot). The in-bound neighbor still renders, so this
+    /// pins refusal of the one index, not suppression of the whole family.
+    #[test]
+    fn shard_at_or_above_max_shard_count_is_refused_not_rendered() {
+        assert_eq!(
+            Label::shard(ravel_catalog::MAX_SHARD_COUNT),
+            None,
+            "the cap itself must be refused"
+        );
+        assert!(
+            Label::shard(ravel_catalog::MAX_SHARD_COUNT - 1).is_some(),
+            "the index just under the cap must still be accepted"
+        );
+
+        let mut pipeline = IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+            ..Default::default()
+        });
+        pipeline.shard_skew = vec![
+            (0, ravel_ingest::ShardSkewStats {
+                messages_enqueued: 5,
+                ..Default::default()
+            }),
+            (
+                ravel_catalog::MAX_SHARD_COUNT,
+                ravel_ingest::ShardSkewStats {
+                    messages_enqueued: 9,
+                    ..Default::default()
+                },
+            ),
+        ];
+        pipeline.active_shard_count = 1;
+        let ingest = vec![pipeline];
+
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            true,
+        );
+
+        assert_eq!(
+            body.matches(
+                "ravel_ingest_shard_messages_enqueued_total{mode=\"gateway\",signal=\"logs\",shard=\"0\"} 5"
+            )
+            .count(),
+            1,
+            "the in-bound shard must still render:\n{body}"
+        );
+        assert!(
+            !body.contains(&format!("shard=\"{}\"", ravel_catalog::MAX_SHARD_COUNT)),
+            "an index at MAX_SHARD_COUNT must never render, got:\n{body}"
+        );
     }
 }
