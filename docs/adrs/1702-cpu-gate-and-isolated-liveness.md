@@ -198,6 +198,9 @@ rule on thread placement.
 
 9. **A runtime heartbeat keeps liveness honest.** A task on the main
    runtime stores the injected clock's time into an atomic once per second.
+   The atomic is stamped with the current time at startup, before the health
+   listener binds, so a fresh process reads an age near zero rather than the
+   whole epoch.
    The dedicated listener reads its age. `/healthz` there returns 503 when
    the age exceeds 60 s, so a deadlocked main runtime is still restarted.
    `/readyz` there returns 503 when one of today's four flags says not
@@ -233,8 +236,10 @@ rule on thread placement.
     and `ravel_cpu_gate_run_seconds_sum` / `ravel_cpu_gate_run_seconds_count`
     (the `_seconds_sum` / `_seconds_count` shape the server already uses), and
     `ravel_cpu_gate_abandoned_total`. Per call site:
-    `ravel_cpu_gate_jobs_total{gate,site}`, where `site` is a static string
-    set at the call. The gate measures with an injected monotonic clock.
+    `ravel_cpu_gate_jobs_total{gate,site}` and
+    `ravel_cpu_gate_inline_total{gate,site}` (decision 4), where `site` is a
+    static string set at the call. The gate measures with an injected
+    monotonic clock.
     From the stable tokio `RuntimeMetrics` set: `ravel_runtime_workers`,
     `ravel_runtime_alive_tasks`, `ravel_runtime_global_queue_depth` and, on
     64-bit targets, `ravel_runtime_worker_busy_seconds_total{worker}`.
@@ -479,12 +484,12 @@ change, shown by reverting the change under test.
     expected count. It also asserts that the maximum probe latency sits
     inside a band written on #1702 before the first run. A second scenario
     runs concurrent PromQL and SQL queries, one per core, and asserts that
-    `ravel_health_heartbeat_age_seconds` stays under a bound written on
-    #1702 before the first run and well below the 60 s liveness threshold.
+    `ravel_health_heartbeat_age_seconds` stays below 10 s, a third of the
+    30 s readiness threshold, as decision 9 requires.
     Both are advisory, like the other bench lanes.
 12. **Flip the operator default** to `dedicatedHealthPort: true` one
     release after task 3 ships, and only once task 11's second scenario has
-    run inside its bound; if it has not, the 60 s liveness threshold is
-    revisited first. Acceptance test: the default-render test
+    run inside its 10 s bound; if it has not, the 30 s readiness threshold
+    is revisited first, since it binds before the 60 s liveness one. Acceptance test: the default-render test
     from task 3 expects 4316 and the `--listen-health` argument, and the
     release notes carry the image requirement.
