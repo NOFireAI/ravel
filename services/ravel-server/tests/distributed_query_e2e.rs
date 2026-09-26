@@ -82,7 +82,11 @@ fn now_ns() -> i64 {
 /// window covering it resolves the snapshot, opens the segment, and (on the
 /// distributed server) produces at least one slice to fan out.
 /// Returns the published commit record's key.
-async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) -> String {
+async fn publish_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    base_ns: i64,
+) -> String {
     publish_segment_seq(store, tenant, base_ns, 1).await
 }
 

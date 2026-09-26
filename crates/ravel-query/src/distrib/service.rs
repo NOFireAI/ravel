@@ -208,7 +208,11 @@ pub struct ReconstructingSegmentResolver {
 }
 
 impl ReconstructingSegmentResolver {
-    pub fn new(store: Arc<dyn ObjectStoreBackend>, tenant_hash: TenantHash, signal: Signal) -> Self {
+    pub fn new(
+        store: Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        signal: Signal,
+    ) -> Self {
         ReconstructingSegmentResolver {
             store,
             tenant_hash,
@@ -272,7 +276,8 @@ impl ReconstructingSegmentResolver {
             key: key.clone(),
             reason,
         };
-        let record = ravel_commit::record::decode(&bytes).map_err(|err| invalid(err.to_string()))?;
+        let record =
+            ravel_commit::record::decode(&bytes).map_err(|err| invalid(err.to_string()))?;
         // The body must be the commit its key addresses: this binds the
         // record's tenant, signal, shard, hour, writer, epoch and seq to the
         // identity's.
@@ -1892,7 +1897,11 @@ mod reconstruct_tests {
         keys::rewrite_record_key_for(record).expect("rewrite record key")
     }
 
-    fn l1_identity(input_set_hash: &[u8], part_index: u32, object_size: u64) -> pb::SegmentIdentity {
+    fn l1_identity(
+        input_set_hash: &[u8],
+        part_index: u32,
+        object_size: u64,
+    ) -> pb::SegmentIdentity {
         pb::SegmentIdentity {
             level: 1,
             shard: 7,
@@ -1992,8 +2001,16 @@ mod reconstruct_tests {
         assert_eq!(seg, expected);
         assert_eq!(
             seg.data_object_key,
-            keys::data_key(&tenant(), Signal::Metrics, 7, writer(), 3, 11, &CONTENT_HASH)
-                .expect("data key")
+            keys::data_key(
+                &tenant(),
+                Signal::Metrics,
+                7,
+                writer(),
+                3,
+                11,
+                &CONTENT_HASH
+            )
+            .expect("data key")
         );
         let spend = accounting.snapshot();
         assert_eq!(spend.s3_requests(AccountedOp::Get), 1);
@@ -2254,7 +2271,10 @@ mod reconstruct_tests {
             &hex::encode(&INPUT_SET_HASH[..8]),
         )
         .expect("rewrite key");
-        assert_eq!(err, ResolveIdentityError::RecordMissing { key: rewrite_key });
+        assert_eq!(
+            err,
+            ResolveIdentityError::RecordMissing { key: rewrite_key }
+        );
         assert_eq!(err.status_code(), pb::status::Code::Unsupported);
         assert_eq!(gets, 2);
     }
@@ -2306,7 +2326,11 @@ mod reconstruct_tests {
     }
 
     async fn store_with_compaction() -> Arc<dyn ObjectStoreBackend> {
-        store_with(vec![(compaction_key(), compaction_record().encode_to_vec())]).await
+        store_with(vec![(
+            compaction_key(),
+            compaction_record().encode_to_vec(),
+        )])
+        .await
     }
 
     /// The last byte differs, past the 8 bytes the record key embeds, so the
