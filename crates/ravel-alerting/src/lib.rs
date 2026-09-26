@@ -30,7 +30,8 @@
 //!   - `rule_id` — the producing rule's id.
 //!   - `state` — one of `pending` / `firing` / `resolved` / `suppressed`.
 //!   - `generation` — an `i64`-typed attr, the alerts-on-alerts generation.
-//!   - `label.<name>` — one entry per rule label.
+//!   - `label.<name>` — one entry per alert label: the matched series' labels
+//!     without `__name__`, overlaid by the rule's labels (ADR-0117).
 //!   - `annotation.<name>` — one entry per annotation.
 //!
 //! Labels and annotations are namespaced under `label.` / `annotation.` so a
@@ -57,17 +58,19 @@
 mod condition;
 mod error;
 mod generation;
+mod instance;
 mod record;
 mod rule;
 mod state;
 
-pub use condition::{QueryResultSummary, condition_met};
+pub use condition::{QueryResultSummary, condition_met, matching_series};
 pub use error::AlertError;
 pub use generation::{DEFAULT_MAX_ALERT_GENERATION, compute_generation, guard_generation};
+pub use instance::{AlertInstance, MAX_ALERTS_PER_RULE, alert_instances, merged_alert_labels};
 pub use record::{
     ANNOTATION_PREFIX, ATTR_ALERT_ID, ATTR_GENERATION, ATTR_RULE_ID, ATTR_STATE, AlertId,
-    AlertRecord, LABEL_PREFIX, build_transition_record, compute_alert_id, encode_record_object,
-    write_alert_record,
+    AlertRecord, LABEL_PREFIX, build_instance_transition_record, build_transition_record,
+    compute_alert_id, encode_record_object, write_alert_record,
 };
 pub use rule::{DEFAULT_REPEAT_INTERVAL, Rule, RuleCondition, RuleQuery, ThresholdOp};
 pub use state::{AlertState, StateTransition, evaluate_suppression, evaluate_transition};
