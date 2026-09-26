@@ -73,7 +73,7 @@ minutes. That is 5,400 s after the last successful fold.
 
 The issue asks for the metric to move, and the alert to fire, before the first
 422. Under the current budget the order is the reverse. A fold that stalls at
-the best point in the hour exhausts the budget about 52 minutes later. The
+the best point in the hour exhausts the budget about 10 minutes later. The
 alert fires 90 minutes later. A fold that stalls at the worst point exhausts it
 at once. The closing comment on #1636 inferred a wide margin in the other
 direction; the arithmetic above does not support it. No test states or checks
@@ -222,8 +222,8 @@ outside the tail.
 ## Rejected alternatives
 
 - **Keep the budget and rely on the alert (option 3).** Lost because the alert
-  is not first. Under today's budget a cold wide query is refused 52 minutes
-  into a stall at best and at once at worst. The alert needs 90 minutes. A
+  is not first. Under today's budget a cold wide query is refused about 10
+  minutes into a stall at best and at once at worst. The alert needs 90 minutes. A
   documented "422s during fold lag are expected" would describe an outage that
   pages after the users notice it. It would also leave the refusals at the top
   of every healthy hour unexplained.
@@ -291,8 +291,9 @@ outside the tail.
 - The guarantee is per signal lane and per fleet-wide fold. It does not cover
   a single tenant whose fold is stuck while its signal's gauge stays fresh.
   It does not cover a query with both a metrics and a log selector, which
-  spends one budget across two tails. Both are stated in the observability
-  guide, not hidden.
+  spends one budget across two tails. The observability guide states the
+  per-tenant case today (`docs/guides/observability.md:517-525`); task 7
+  adds the two-lane case.
 - The per-flush term counts the age trigger only. A tenant that also flushes
   on the 8 MiB size trigger produces more records per shard-hour than
   `ceil(3600 / max_flush_delay)`. That under-count exists in ADR-0075 already
