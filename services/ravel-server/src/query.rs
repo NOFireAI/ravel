@@ -91,24 +91,27 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// background fold task: one instance
 /// per process so its decoded HEAD/part caches serve both paths.
 ///
-/// `disable_cache` and `cache_max_bytes` are the CLI's `--disable-cache` and
-/// `--cache-max-bytes`, the same flags that govern the fetcher cache in
-/// [`crate::store::build_cache`]. They reach the catalog's ADR-0046 byte cache
-/// too: `--disable-cache` builds a catalog with no byte cache at
-/// all (the `byte_cache_max_bytes: 0` sentinel), so a memory-constrained
-/// `--disable-cache` deployment no longer silently keeps a 512 MiB catalog
-/// byte cache; otherwise `cache_max_bytes` is the catalog byte cache's total
-/// budget, sharing one number with the fetcher cache. The other two byte-cache
-/// bounds keep their catalog defaults (the CLI has no flag for them).
+/// `disable_cache` is the CLI's `--disable-cache`, the same flag that governs
+/// the fetcher cache in [`crate::store::build_cache`]. `cache_max_bytes` here
+/// is `ServerConfig::catalog_cache_max_bytes`: the catalog byte cache's OWN
+/// resolved budget, from `--catalog-cache-max-bytes` or its own derived share
+/// (ADR-2023) -- a separate ceiling from the fetcher cache's
+/// `--cache-max-bytes`, which does not reach this parameter. `--disable-cache`
+/// builds a catalog with no byte cache at all (the `byte_cache_max_bytes: 0`
+/// sentinel), so a memory-constrained `--disable-cache` deployment no longer
+/// silently keeps a 512 MiB catalog byte cache; otherwise `cache_max_bytes` is
+/// the catalog byte cache's total budget. The other two byte-cache bounds keep
+/// their catalog defaults (the CLI has no flag for them).
 ///
 /// `cache_dir` is the CLI's `--cache-dir` (#97). When present and the byte cache
 /// is not disabled, the catalog byte cache gains an ADR-0046 local-disk tier at
 /// that path. Its [`CacheLimits`] reuse the SAME `cache_max_bytes` number for
 /// both the RAM and disk tiers (there is no separate disk-tier capacity flag),
-/// with this crate's own byte-cache entry-count/max-entry-bytes defaults, so the
-/// disk tier shares the one `--cache-max-bytes` number the fetcher cache and the
-/// catalog RAM tier already share. `--disable-cache` (the `0` sentinel) wins
-/// over a configured `cache_dir`: no cache of either tier is built.
+/// with this crate's own byte-cache entry-count/max-entry-bytes defaults. The
+/// fetcher cache's own disk tier is sized from `--cache-max-bytes` instead
+/// (a different cache; see [`crate::store::build_cache`]). `--disable-cache`
+/// (the `0` sentinel) wins over a configured `cache_dir`: no cache of either
+/// tier is built.
 ///
 /// `resolve_ceiling` is the per-process ceiling on resolve-path object-store
 /// requests (ADR-1733 decision 2). It is a resolved value, not a raw flag:
@@ -663,10 +666,10 @@ mod catalog_cache_tests {
         );
     }
 
-    /// with caching on, `--cache-max-bytes` must bound the catalog
-    /// byte cache, not just the fetcher cache. The value reaches
-    /// `CatalogConfig::byte_cache_max_bytes`, and the byte cache (with its
-    /// counters handle) is constructed.
+    /// with caching on, `build_catalog`'s `cache_max_bytes` argument (the
+    /// resolved `--catalog-cache-max-bytes`, ADR-2023) must bound the catalog
+    /// byte cache. The value reaches `CatalogConfig::byte_cache_max_bytes`,
+    /// and the byte cache (with its counters handle) is constructed.
     #[test]
     fn build_catalog_wires_cache_max_bytes_through_to_the_byte_cache() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -685,7 +688,7 @@ mod catalog_cache_tests {
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             budget,
-            "--cache-max-bytes must bound the catalog byte cache, not only the fetcher cache"
+            "the catalog cache argument must bound the catalog byte cache"
         );
         assert!(
             catalog.byte_cache_metrics().is_some(),
@@ -706,7 +709,9 @@ mod catalog_cache_tests {
     /// budget resolves to 5% for the catalog cache (1,503,238,553) while the
     /// fetcher cache `store::build_cache` bounds stays at 25%
     /// (7,516,192,768), so the two independent LRU caches do not each claim
-    /// the full share. An explicit `--cache-max-bytes` sets both equal.
+    /// the full share. Since ADR-2023 an explicit `--cache-max-bytes` bounds
+    /// the fetcher cache only: the catalog cache keeps deriving its own 5%
+    /// share unless `--catalog-cache-max-bytes` is set.
     ///
     /// Prove-the-test: pass `resolved.cache_max_bytes` (the fetcher 25% number)
     /// to `build_catalog` here and the first assertion reads 7,516,192,768
@@ -744,21 +749,33 @@ mod catalog_cache_tests {
              memory_budget_bytes), not the fetcher cache's 25% and not the compiled-in 256 MiB"
         );
 
-        // An explicit --cache-max-bytes couples both caches at that one value.
+        // ADR-2023: an explicit --cache-max-bytes no longer reaches the
+        // catalog cache; only --catalog-cache-max-bytes does.
         let flagged = crate::Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "4096"])
             .expect("flag parses");
         let resolved = flagged
             .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
             .expect("performance defaults resolve");
         assert_eq!(resolved.cache_max_bytes, 4096);
+        assert_eq!(
+            resolved.catalog_cache_max_bytes, 1_503_238_553,
+            "--cache-max-bytes must not disturb the catalog cache's own derived share"
+        );
+
+        let catalog_flagged =
+            crate::Cli::try_parse_from(["ravel-server", "--catalog-cache-max-bytes", "4096"])
+                .expect("flag parses");
+        let resolved = catalog_flagged
+            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
         assert_eq!(resolved.catalog_cache_max_bytes, 4096);
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog = build_catalog(
             store,
             1,
-            flagged.disable_cache,
+            catalog_flagged.disable_cache,
             resolved.catalog_cache_max_bytes,
-            flagged.cache_dir.clone(),
+            catalog_flagged.cache_dir.clone(),
             None,
             None,
             Duration::from_secs(2),
@@ -767,7 +784,7 @@ mod catalog_cache_tests {
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             4096,
-            "an explicit --cache-max-bytes bounds the catalog byte cache at the flag value"
+            "an explicit --catalog-cache-max-bytes bounds the catalog byte cache at the flag value"
         );
     }
 

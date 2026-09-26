@@ -834,16 +834,18 @@ query still answers, so the process looks healthy and then fails every
 non-trivial query permanently.
 
 Two things are carved from `memory_budget_bytes`, not from raw effective
-memory: the fetcher (RSEG) read cache takes 25%, and the catalog byte cache
-takes a separate 5%. Rebasing both onto the budget instead of raw memory
+memory: the fetcher (RSEG) read cache takes 25%, or 40% when `--store` is
+`s3` and the `--s3-endpoint` is loopback (logged with the source
+`budget-carve-loopback`), and the catalog byte cache takes a separate 5%. Rebasing both onto the budget instead of raw memory
 keeps the percentages meaningful once the reserve is subtracted; deriving
 25% of raw `MemTotal` on a host that is mostly cgroup-limited would size the
 cache against memory the process can never actually use. Neither percentage
 is taken on the unmeasured-memory path: a share of an unknown total is not a
 number, so when memory cannot be read each cache falls back to a flat
 compiled-in 256 MiB (`268435456`) rather than carving from the `u64::MAX`
-budget above. An explicit `--cache-max-bytes` bounds both caches at that one
-value on either path. Whatever remains
+budget above. An explicit `--cache-max-bytes` bounds the fetcher cache and an
+explicit `--catalog-cache-max-bytes` bounds the catalog byte cache, each on
+either path; neither flag reaches the other cache. Whatever remains
 after both carves (`memory_budget_bytes` minus the sum of the two resolved
 cache ceilings) sizes a single shared `ravel_memory::MemoryBudget`
 accountant, one instance per process, that the SQL executor's per-tenant
@@ -854,14 +856,15 @@ budget, not only strictly above it (see ADR-1170's 2026-09-07 amendment): a
 remainder of exactly `0` is exactly as unusable as a negative one, since it
 builds the same refuse-everything `MemoryBudget::new(0)`. A typed
 `MemoryBudgetExceeded` error names both figures so the fix is in the error
-message: lower `--cache-max-bytes`, or, when the budget itself derived to
-`0` (the host's effective memory is at or below the overhead reserve, and no
-value of that flag can satisfy the check), give the process more memory or
-raise its cgroup memory limit.
+message: lower `--cache-max-bytes` or `--catalog-cache-max-bytes`, or, when
+the budget itself derived to `0` (the host's effective memory is at or below
+the overhead reserve, and no value of either flag can satisfy the check), give
+the process more memory or raise its cgroup memory limit.
 
 `--disable-cache` is outside that check entirely. It builds neither cache, so
 neither resolved ceiling holds any memory: the hard-caps figure is `0`
-regardless of `--cache-max-bytes`, the remainder is the whole budget, and
+regardless of `--cache-max-bytes` and `--catalog-cache-max-bytes`, the
+remainder is the whole budget, and
 startup never refuses. That is what keeps the flag usable as the remedy the
 caching guide names it as, and it is the one path that can start with a
 remainder of `0`: a container whose effective memory is at or below the 2 GiB

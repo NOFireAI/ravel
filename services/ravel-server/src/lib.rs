@@ -608,9 +608,10 @@ pub struct ServerConfig {
     /// (`ResolvedPerformanceDefaults::catalog_cache_max_bytes`), a SEPARATE LRU
     /// ceiling from [`Self::cache_max_bytes`]. `main` fills it from the resolved
     /// struct; [`start`] passes THIS value, not `cache_max_bytes`, to
-    /// [`query::build_catalog`]. Unset, it derives to a smaller share than the
-    /// fetcher cache; an explicit `--cache-max-bytes` sets both equal. Ignored
-    /// when `disable_cache` is set.
+    /// [`query::build_catalog`]. Resolved from its own `--catalog-cache-max-bytes`
+    /// flag or, unset, its own derived share of `memory_budget_bytes`; since
+    /// ADR-2023, `--cache-max-bytes` never reaches this field, on a loopback
+    /// store or otherwise. Ignored when `disable_cache` is set.
     pub catalog_cache_max_bytes: u64,
     /// The ADR-1170 decisions 1/3/4 process-wide memory budget: the shared
     /// remainder left after both hard cache carves
