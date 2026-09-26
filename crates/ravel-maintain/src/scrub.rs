@@ -1169,15 +1169,7 @@ mod tests {
         let first = walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, 0).len();
         assert_eq!(first, 1, "sustained rate over the entries counted at start");
         keys.extend((10..30).map(|i| format!("c/0000/{i:04}.cmt")));
-        let second = walk_tick(
-            &mut cursor,
-            &keys,
-            1,
-            period_secs,
-            tick_secs,
-            1_000_000_000,
-        )
-        .len();
+        let second = walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, 1_000_000_000).len();
         assert!(
             second > first,
             "the budget ignored the 20 entries appended after the rotation began: \
@@ -1219,7 +1211,10 @@ mod tests {
             "a rotation sized only by P = {period_secs}s did not finish inside the \
              {retention_secs}s retention window ({deadline_ticks} ticks)"
         );
-        assert_eq!(ticks, 20, "100 entries at ceil(100 * 3600 / 86400) = 5 a tick");
+        assert_eq!(
+            ticks, 20,
+            "100 entries at ceil(100 * 3600 / 86400) = 5 a tick"
+        );
     }
 
     #[test]
