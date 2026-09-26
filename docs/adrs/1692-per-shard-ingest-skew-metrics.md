@@ -82,10 +82,14 @@ number the operator chooses: `shard_count` defaults to 4
    activity; the renderer fills them with zeros. An idle shard is the
    finding this family exists to show, and a series that appears only once
    a shard has worked cannot show it.
+   (See the shard-count amendment below: the count used is the configured
+   default, not a per-tenant active count.)
 
 5. **The span pipeline records the two missing spans.** `span_shard.rs`
    gains the on-actor and off-actor recording the other two actors already
    have, so all three pipelines render the same six samples.
+   (See the shard-count amendment below: the span router also lacked the
+   enqueue count.)
 
 6. **No cap on the rendered shard count.** The exposition grows linearly
    with `--shards`, and the ADR-0075 request budget already scales with the
@@ -158,3 +162,26 @@ flowchart LR
      docs/guides/observability.md (family, size, and a pinned-shard alert
      example), and the docs/guides/ingest.md precondition paragraph on top
      of T7f's text.
+
+## Amendment (2026-09-26): the rendered shard count is the configured default
+
+<!-- amendment-applies: sections="Decision" pointer="shard-count amendment" -->
+
+Decision 4 said the renderer zero-fills every index below "the router's
+current active shard count". Each router's `shard_count()` returns the
+configured default (`--shards`), not a per-tenant live count: the live count
+differs per tenant and sits in each tenant's cached generation view, and
+reading it at scrape time would mean walking every tenant's view under new
+locking on the render path. So the family zero-fills shards 0 to
+`shard_count - 1` of the configured default. A tenant resharded above the
+default renders its extra shard indices only once they have recorded
+activity, and one shard index sums every generation's actor at that index.
+Decision 6's per-scrape size of `6 * signals * shards` series therefore holds
+only while no tenant's shard count differs from the configured one.
+
+Decision 5 said the span pipeline lacked only the on-actor and off-actor
+spans. It also lacked the enqueue count, so for spans
+`ravel_ingest_shard_messages_enqueued_total` and `ravel_ingest_shard_queue_depth`
+always read 0. `span_router.rs` now records an enqueue after each successful
+send into a shard channel, at the same point the metrics and log routers do,
+and all three pipelines render the same six samples.

@@ -383,6 +383,23 @@ the downward API). A static or unset value collapses every replica of a job
 onto one `instance` label, and one pod's broken clock becomes
 indistinguishable from the rest of the fleet.
 
+### Per-pod resource attributes and shard spread
+
+A distinct per-pod resource attribute is not only a skew-attribution aid: it
+is the precondition for `--shards` to spread log ingest across shards at
+all. A log stream id is the hash of its resource attributes plus scope
+([docs/ingest.md](../ingest.md)), and `shard_for_log` routes on that hash
+modulo the shard count. A collector fleet where every pod sends the same
+resource attribute set (a static or unset `service.instance.id`, the same
+`host.name` behind a shared load balancer, and so on) hashes to one stream
+id and therefore one shard actor, however high `--shards` is raised: raising
+the count moves the whole tenant to a different single shard, it does not
+divide the tenant's writes across more of them. The
+[`ravel_ingest_shard_*` family](observability.md#per-shard-ingest-skew-ravel_ingest_shard_)
+shows this directly: one `shard` series carries the load and the rest read
+zero. Fix the collector config to give each pod a distinct
+`service.instance.id`, not the `--shards` flag.
+
 ## Commit tokens and read-your-write
 
 ![ingest commit sequence](../diagrams/ingest-commit-sequence.svg)

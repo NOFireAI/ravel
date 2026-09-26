@@ -667,7 +667,14 @@ impl SpanShardActor {
                 msg = self.rx.recv() => {
                     match msg {
                         Some(SpanShardMsg::Write { tenant, spans, ack, charge }) => {
+                            // Per-shard skew (issue #865, ADR-1692): time the
+                            // serial on-actor section only, matching
+                            // `crate::shard`'s own on-actor span.
+                            let started_ns = self.clock.now_ns();
                             self.handle_write(tenant, spans, ack, charge).await;
+                            let on_actor_ns =
+                                self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+                            self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(SpanShardMsg::FlushNow { done }) => {
                             // Not a teardown: this arm does not break, so the
@@ -1220,7 +1227,12 @@ impl SpanShardActor {
                 .clock
                 .now_ns()
                 .saturating_add(ctx.config.max_flush_lifetime.as_nanos() as i64);
+            // Per-shard skew (issue #865, ADR-1692): time the whole flush,
+            // matching `crate::shard`'s own off-actor span.
+            let started_ns = ctx.clock.now_ns();
             ctx.run_flush(pinned).await;
+            let off_actor_ns = ctx.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+            metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
         self.record_queued_flushes();
     }

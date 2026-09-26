@@ -210,6 +210,47 @@ the same `--metrics-tenant-labels` allowlist and the same `tenant_hash="other"`
 fold described above. A tenant outside the allowlist never gets a series of its
 own here, regardless of how much it contributes to the top-K table.
 
+### Per-shard ingest skew (`ravel_ingest_shard_*`)
+
+Labels: `mode`, `signal`, `shard`. `shard` is never combined with
+`tenant_hash` on any sample; this is the one family that carries a per-shard
+dimension without a tenant or operation dimension.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_ingest_shard_messages_enqueued_total` | Write messages the router sent into this shard's channel (`Write` on every signal, plus `WriteColumnar` on logs). |
+| `ravel_ingest_shard_messages_processed_total` | Write messages this shard's actor pulled and handled. |
+| `ravel_ingest_shard_queue_depth` | Gauge. `messages_enqueued - messages_processed` at read time, saturating at zero: write messages still in the channel. Flush and shutdown requests are not counted. |
+| `ravel_ingest_shard_on_actor_seconds_total` | Merge-and-pin work the single-threaded shard actor genuinely serialises, nanoseconds rendered as seconds. |
+| `ravel_ingest_shard_flush_permit_wait_seconds_total` | This shard's flush backpressure: a sum over concurrently waiting tasks, so it can exceed wall time. |
+| `ravel_ingest_shard_off_actor_seconds_total` | The whole of this shard's flushes once their permit is granted: encode, the data-object PUT, and the commit-record publish on every signal, plus exemplar admission on the metrics pipeline only. |
+
+Idle shards render at zero rather than being omitted, up to the configured
+`--shards` count: the renderer emits a sample for every index from 0 to
+`--shards - 1`, plus any index at or above it that has recorded activity. The
+bound is the configured default (each router's `shard_count()`), not any
+tenant's live shard count, so a tenant resharded above the default renders its
+extra shards only once they have recorded something, and an idle shard above
+the default does not render. The accumulator is keyed by shard index alone:
+during a reshard, or when tenants run different shard counts, one
+`shard` value sums every generation's actor at that index. An idle shard
+reading zero is the finding this family exists to show, not an absent series.
+Each gateway or `all` process adds `6 * signals * shards` series to its scrape
+(three signals and the `--shards` default of 4 make 72) when no tenant's shard
+count differs from the configured one, and more once a tenant resharded above
+it records activity on a higher index. See [docs/ingest.md's per-shard
+skew section](../ingest.md#per-shard-skew) for what each of the six
+underlying `ShardSkewStats` fields means and the ordering guarantees a
+single read does and does not carry.
+
+A pinned shard shows up as one `shard` value carrying the load the others
+do not: compare `rate(ravel_ingest_shard_messages_enqueued_total[5m])`
+across `shard` for a fixed `signal`, and a collector sending every stream
+from one resource attribute set lands entirely on one series. Raising
+`--shards` does not spread that load; see [the ingest
+guide](ingest.md#per-pod-resource-attributes-and-shard-spread) for the
+collector-side fix.
+
 ### Log postings and dynamic columns (`ravel_logs_postings_*`, `ravel_logs_dynamic_columns_*`)
 
 Labels: `mode` and `signal`. One series per pipeline that builds a POSTINGS
@@ -1923,4 +1964,6 @@ ownership, merge memory, and the at-rest scrubber: ADR-0048, ADR-0058,
 ADR-0059, ADR-0065. Log POSTINGS and dynamic columns: ADR-0049, ADR-0100.
 Distributed read fan-out: ADR-0071. Wire-byte accounting: ADR-0084. The metric
 metadata cache: ADR-0085. Alert evaluation and its at-least-once notification
-contract: ADR-0043.
+contract: ADR-0043. Per-shard ingest skew metrics and the `shard` label:
+ADR-1692. The retiring-generation shard set that family also renders:
+ADR-0052.
