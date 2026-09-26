@@ -647,6 +647,23 @@ fn find_spans_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<SpanQuery> {
     None
 }
 
+/// Find the `SpansScanExec` leaf node itself anywhere in `plan`'s tree (unlike
+/// `find_spans_scan`, which returns only the issued `SpanQuery`). Its own
+/// `ExecutionPlan::schema()` is the scan's actual output schema, independent
+/// of anything a wrapping node (a `ProjectionExec`) narrows above it.
+fn find_spans_scan_node(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    let any_ref: &dyn std::any::Any = plan.as_ref();
+    if any_ref.downcast_ref::<SpansScanExec>().is_some() {
+        return Some(Arc::clone(plan));
+    }
+    for child in plan.children() {
+        if let Some(scan) = find_spans_scan_node(child) {
+            return Some(scan);
+        }
+    }
+    None
+}
+
 /// Reduce `SELECT trace_id, span_id, start_ts, name FROM spans ...` output
 /// batches to the set of rows they contain, in that exact column order.
 /// Unlike `batches_to_rows` above, this does not assert the full public
@@ -749,6 +766,39 @@ async fn trace_id_hex_string_literal_plans_and_takes_the_trace_fast_path() {
     assert_eq!(
         string_rows, binary_rows,
         "the string and binary trace_id literal forms must return identical rows"
+    );
+}
+
+/// Issue #1710 fix round: a query ineligible for the columnar fast path
+/// (`attrs` is projected, forcing the row path, ADR-0110 decision 4) but
+/// which does not itself project `events` or `links` must not decode either.
+/// The scan leaf's own emitted schema is the proof: `build_row_batch` builds
+/// exactly one array per schema field (asserted by its own
+/// `debug_assert_eq!(schema.fields().len(), columns.len())`), and
+/// `events_column`/`links_column` (the expensive per-row protobuf-into-Arrow
+/// decode) run only for a `SPAN_COL_EVENTS`/`SPAN_COL_LINKS` index present in
+/// that schema. Before the provider pushed the real projection into the row
+/// path, it always built the full thirteen-column schema and relied on a
+/// `ProjectionExec` above the scan to drop the rest, so the leaf itself
+/// still decoded events and links on every row regardless.
+#[tokio::test]
+async fn ineligible_scan_skips_events_and_links_decode_when_not_projected() {
+    let mut record = span([0x11u8; 16], 0, 100, 110, "root");
+    record.attrs = vec![("svc".to_string(), "api".to_string())];
+    let executor = executor_with_spans(&[record]).await;
+
+    // `attrs` forces the row path (ineligible for the columnar fast path);
+    // `events`/`links` are not selected at all.
+    let plan = spans_physical_plan(&executor, "SELECT trace_id, attrs FROM spans").await;
+    let scan = find_spans_scan_node(&plan).expect("plan contains a SpansScanExec");
+    let schema = scan.schema();
+    let fields: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        fields,
+        vec!["trace_id", "attrs"],
+        "the scan leaf must emit exactly the projected columns, proving it built \
+         neither the events nor the links column for a query that selected \
+         neither"
     );
 }
 

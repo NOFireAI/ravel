@@ -226,8 +226,17 @@ duration_ns` never touches the dynamic attribute pages, the `attrs_raw` page,
 or the four `COL_EVENT_*` pages, so their bytes are neither decompressed nor
 allocated, and `decode_events` never runs.
 
-The ineligible path keeps today's `ProjectionExec` wrapping unchanged, so the
-provider has one behavior per path and neither is a special case of the other.
+Amended (issue #1710): the ineligible path also carries the projection into
+the scan now, rather than keeping a `ProjectionExec` above a scan built with
+no projection. `SpansScanExec`'s row-path batch builder already only builds
+the schema columns the pushed projection names, so a projection that excludes
+`events`/`links` skips their decode there too, not only on the fast path
+above. Only the union in the paragraph above (the fast-path-specific page
+skip) remains fast-path-only: the row path still fetches and decodes every
+RSPAN page of every scanned block regardless of projection (issue #669), the
+saving here is in never rebuilding the `events`/`links` Arrow columns from
+already-decoded attributes. The provider now has one projection behavior for
+both paths.
 
 ### 5. The chosen path is observable
 
@@ -315,9 +324,10 @@ as follow-up work once the columnar path exists to carry it.
   differential proptest must run over both, and the eligibility rule must be
   asserted through the new metrics, or the two drift apart silently. This is
   the same cost ADR-0099 accepted for logs.
-- **The provider has two projection behaviors.** Eligible queries carry the
-  projection into the scan; ineligible ones keep the `ProjectionExec`. A test
-  asserts the plan shape for both.
+- **The provider has one projection behavior.** Amended (issue #1710): both
+  eligible and ineligible queries carry the projection straight into the
+  scan; no path wraps a `ProjectionExec` above it. A test asserts the
+  scan leaf's own emitted schema for both.
 - **No frozen format is touched.** Read path and query API only. No version
   bump, no writer change, no migration.
 - **`attrs`-projecting queries are unchanged.** The epic's win is on queries

@@ -206,11 +206,12 @@ pub struct SpansScanExec {
     /// [`is_erased_span`] immediately after `fetcher.fetch_accounted` returns, before
     /// rows are sorted or built into batches. A no-op when empty.
     erasure: Arc<Vec<ErasurePredicate>>,
-    /// The pushed-down column projection (ADR-0110 decision 4). `Some` for the
-    /// eligible fast path: the scan emits `schema` (already the projected
-    /// schema) and the provider adds no `ProjectionExec`. `None` reproduces the
-    /// pre-ADR-0110 behavior: the full thirteen-column schema, with the provider
-    /// wrapping a `ProjectionExec` above the scan for any column selection.
+    /// The pushed-down column projection (ADR-0110 decision 4). `SpansTableProvider`
+    /// pushes whatever `DataFusion` asked for here unconditionally (eligible or
+    /// not for the columnar fast path), so `schema` is already the projected
+    /// schema and no `ProjectionExec` is ever needed above this scan; `None` is
+    /// only the full thirteen-column schema, used by the no-projection test
+    /// entry points (`plan`/`plan_filters`) and the distributed worker fragment.
     projection: Option<Arc<Vec<usize>>>,
     /// Whether this scan may attempt the columnar fast path: the query-shape
     /// clauses of [`columnar_static_eligible`] (projection excludes `attrs`
@@ -895,12 +896,15 @@ impl RecordBatchStream for SpanScanStream {
 /// Build one `spans` [`RecordBatch`] from a slice of [`SpanRow`]s, the row path
 /// (ADR-0110's fallback and the ineligible path).
 ///
-/// `projection` `None` builds the full thirteen-column schema (the ineligible
-/// path, where a `ProjectionExec` above the scan does the column selection);
-/// `Some(indices)` builds exactly those schema columns in order, so an eligible
-/// query that fell back on an `attrs_raw` block still emits the projected schema
-/// the plan advertises. `schema` must match: the full schema for `None`, the
-/// projected schema for `Some`.
+/// `projection` `None` builds the full thirteen-column schema (only `plan`/
+/// `plan_filters`, the no-projection test entry points, take this); `Some(indices)`
+/// builds exactly those schema columns in order, whether the query was
+/// ineligible for the columnar fast path from the start or fell back to the
+/// row path mid-scan (an `attrs_raw` overflow block). Either way this builds
+/// only the projected columns: an index absent from `indices` never reaches
+/// [`events_column`]/[`links_column`], so a projection that excludes
+/// `events`/`links` skips decoding them. `schema` must match: the full schema
+/// for `None`, the projected schema for `Some`.
 fn build_row_batch(
     rows: &[SpanRow],
     schema: SchemaRef,
