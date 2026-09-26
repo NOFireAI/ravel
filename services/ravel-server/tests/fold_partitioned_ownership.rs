@@ -649,6 +649,81 @@ async fn worker_ids(store: &MemoryStore, expected: usize) -> Vec<Uuid> {
     panic!("no {expected} heartbeat records appeared under sys/maintain/workers/");
 }
 
+/// The ceiling on every bounded wait below. Generous, because the figure that
+/// matters is the state each wait names, not how long it took to appear: a
+/// healthy run reaches it in well under a second and a loaded machine is
+/// allowed to be slow. Passing this is a failure, never a flake to retry.
+const WAIT_BUDGET: Duration = Duration::from_secs(30);
+
+/// How often a bounded wait re-reads the state it is waiting on.
+const WAIT_POLL: Duration = Duration::from_millis(25);
+
+/// One `/metrics` scrape of a running server.
+async fn scrape(running: &ravel_server::Running) -> String {
+    reqwest::Client::new()
+        .get(format!("http://{}/metrics", running.http_addr))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text")
+}
+
+/// Waits until this maintain server's own heartbeat task has computed and
+/// published a live set of `expected` workers.
+///
+/// `ravel_maintain_workers_live` is set from the computed set on the statement
+/// before the one that publishes it on the `watch` channel the fold reads, so
+/// a scrape reporting `expected` proves the fold's next tick partitions
+/// against that set. That is the state the test needs; a heartbeat RECORD
+/// existing in the store is a weaker fact, since it is written before the
+/// listing that computes the set.
+///
+/// Bounded and driven by that state rather than by a fixed sleep: a sleep
+/// sized to a healthy machine asserts nothing the state had not already
+/// reached, and flakes on a loaded one.
+async fn wait_for_published_live_set(running: &ravel_server::Running, expected: usize) {
+    let want = format!("ravel_maintain_workers_live{{mode=\"maintain\"}} {expected}");
+    let deadline = std::time::Instant::now() + WAIT_BUDGET;
+    loop {
+        if scrape(running).await.lines().any(|line| line == want) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {WAIT_BUDGET:?} waiting for the heartbeat task to publish a live \
+             set of {expected} workers (no `{want}` sample)"
+        );
+        tokio::time::sleep(WAIT_POLL).await;
+    }
+}
+
+/// Waits until every named tenant's metrics `HEAD` exists, the durable state a
+/// completed fold of that pair leaves behind. Bounded, and a timeout names the
+/// tenants still missing rather than failing later on a bare `get` error.
+async fn wait_for_folded_metrics_heads(store: &MemoryStore, tenants: &[TenantHash]) {
+    let deadline = std::time::Instant::now() + WAIT_BUDGET;
+    loop {
+        let mut missing = Vec::new();
+        for tenant in tenants {
+            let key = format!("t/{}/catalog/m/HEAD", tenant.to_hex());
+            if store.get(&key, GetRange::Full).await.is_err() {
+                missing.push(tenant.to_hex());
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {WAIT_BUDGET:?} waiting for the scheduled fold to publish a HEAD \
+             for every pair this process owns; still unfolded: {missing:?}"
+        );
+        tokio::time::sleep(WAIT_POLL).await;
+    }
+}
+
 /// Assert a HEAD a running server's scheduled fold published covers exactly
 /// the one segment [`seed_sealed_metric_segment`] seeded, and return its
 /// folder id.
@@ -720,15 +795,15 @@ async fn a_maintain_server_folds_the_partition_its_published_live_set_defines() 
     .await
     .expect("server starts");
 
-    // The server's own id, learned from the heartbeat it just wrote. Its
-    // heartbeat loop publishes the live set immediately after writing that
-    // key; the pause covers the gap before any tenant exists to fold.
+    // The server's own id, learned from the heartbeat it just wrote. The
+    // record exists before the listing that computes the live set, so the
+    // wait below is on the published set rather than on the record.
     let ids = worker_ids(inner.as_ref(), 2).await;
     let own = *ids
         .iter()
         .find(|id| **id != FOREIGN_WORKER)
         .expect("the server minted its own process id");
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_for_published_live_set(&running, 2).await;
 
     let worker = WorkerSet::new(
         wall_now_ns(),
@@ -768,8 +843,11 @@ async fn a_maintain_server_folds_the_partition_its_published_live_set_defines() 
     for tenant in mine.iter().chain(theirs.iter()) {
         seed_sealed_metric_segment(inner.as_ref(), tenant).await;
     }
-    // Ten fold intervals: every owned pair has been ticked many times over.
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    // Every pair this process owns has been folded. The pairs the foreign
+    // worker owns are asserted unfolded below, and they stay so for as long as
+    // this process runs: ownership is decided before any per-tenant read, so
+    // there is no later moment at which this process would fold one.
+    wait_for_folded_metrics_heads(inner.as_ref(), &mine).await;
     running.shutdown().await.expect("graceful shutdown");
 
     let mut folders: Vec<Uuid> = Vec::new();
@@ -828,7 +906,7 @@ async fn an_all_mode_server_folds_every_unit() {
     .await
     .expect("server starts");
 
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    wait_for_folded_metrics_heads(inner.as_ref(), &tenants).await;
     running.shutdown().await.expect("graceful shutdown");
 
     // No heartbeat of its own, so nothing ever replaces the solo set the watch
