@@ -84,19 +84,19 @@ const GUIDE_FILE: &str = concat!(
 /// no longer resolves) would otherwise leave every assertion below passing
 /// vacuously over an empty set. Adding a rule that names a new metric fails
 /// here until this number is updated.
-const EXPECTED_METRIC_NAMES: usize = 38;
+const EXPECTED_METRIC_NAMES: usize = 39;
 
 /// Groups and alert rules in the shipped file, counted off the parsed
 /// structure. Pinned for the same reason as the name count: a file that lost
 /// a group, or a group that lost a rule, must fail rather than shrink the
 /// scan. `deploy/README.md` states both figures.
 const EXPECTED_GROUPS: usize = 8;
-const EXPECTED_ALERTS: usize = 32;
+const EXPECTED_ALERTS: usize = 33;
 
 /// Rules transcribed from a troubleshooting-table row that states no
 /// duration, so they carry no `for:` and say so in an `as_documented`
 /// annotation. `deploy/README.md` states this figure too.
-const EXPECTED_ALERTS_WITHOUT_FOR: usize = 15;
+const EXPECTED_ALERTS_WITHOUT_FOR: usize = 16;
 
 /// Alerts whose `for:` value is checked against Prometheus's duration
 /// grammar: every alert that carries one at all. Pinned for the same reason
@@ -132,8 +132,8 @@ const DASHBOARD_FILE: &str = concat!(
 /// nothing. `deploy/README.md` states the row and name figures.
 const EXPECTED_DASHBOARD_ROWS: usize = 6;
 const EXPECTED_DASHBOARD_PANELS: usize = 36;
-const EXPECTED_DASHBOARD_TARGETS: usize = 105;
-const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 108;
+const EXPECTED_DASHBOARD_TARGETS: usize = 106;
+const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 109;
 
 /// Families the dashboard graphs that no shipped rule alerts on.
 ///

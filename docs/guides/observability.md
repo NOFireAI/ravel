@@ -1454,12 +1454,14 @@ ticks here is the same evidence six missed cycles is there.
 
 ### At-rest scrubber (`ravel_scrub_*`)
 
-Labels: `mode` and `signal`, plus `level` on the checksum-mismatch counter and
-`reason` on the seal-divergence counter. These carry no `tenant_hash` label.
+Labels: `mode` and `signal`, plus `level` on the checksum-mismatch and
+unreadable counters and `reason` on the seal-divergence and unreadable
+counters. These carry no `tenant_hash` label.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), or an object or record GET the store refused with an error retrying cannot clear (anything but not-found, throttled, timeout, or transient), by signal and level. |
+| `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), by signal and level. Only bytes that were read and did not match count here. |
+| `ravel_scrub_unreadable_total` | Objects and records the scrub could not read, and so could not verify, by signal, level, and reason. `reason="access_denied"` is a GET the store refused as access denied (a bucket or key policy, or a credential fault); `reason="permanent"` is any other GET error retrying cannot clear, or a record whose bytes do not decode. An object counts once at its own level; a record counts once at its own level (`l0` a commit record, `l1` a compaction record, `rewrite` a rewrite record) however many objects it names. An object or record deleted after it was listed is not counted. |
 | `ravel_scrub_postings_disagreement_total` | Objects whose covering name-postings object omitted a `__name__` the object really carries (a false negative), by signal. |
 | `ravel_scrub_seal_divergence_total` | Divergences between the folded snapshot and the re-listed sealed commit history, by signal and reason. |
 | `ravel_scrub_cursor_position` | Gauge. Fraction of the current scrub rotation's commit shard listing entries the content-tier cursor has consumed so far, by signal, in [0,1]. The unit is listing entries (commit, compaction, and rewrite records and tombstones), not data objects: one compaction record can name several parts. |
@@ -1473,6 +1475,12 @@ corrupt object came from: `l0` an original ingested segment, `l1` a compaction
 output part, or `rewrite` a selective-erasure rewrite output part. The scrub
 corpus now covers all three: a compaction or rewrite output part that a record
 still lists as live joins the same rotation an L0 segment does.
+
+`ravel_scrub_unreadable_total` is not corruption: the bytes were never read.
+Alert on any increase all the same, because what it counts stays unverified
+until a later rotation reads it, and an access denial, from a key policy, a
+bucket policy, or credentials the maintain process lost, recurs every rotation
+until it is fixed.
 
 The lineage filter applies to those output parts only, and it leaves out three
 shapes. A compaction or rewrite record that a later rewrite record names in

@@ -308,9 +308,12 @@ from what the rotation has observed:
 A GET that fails with a retryable error (throttled, timeout, transient), of a
 commit record or of an object it names, stops the tick with the marker behind
 that unit, and the next tick retries all of it. Any other GET error except
-not-found is counted on `ravel_scrub_checksum_mismatch_total` and the marker
-moves past it, so one unreadable record cannot pin the rotation. A record or
-object deleted after it was listed, and a record that fails to decode, are
+not-found, and a record whose bytes do not decode, is counted once on
+`ravel_scrub_unreadable_total` (at the level of the object or record that
+failed, `reason="access_denied"` or `reason="permanent"`) and the marker moves
+past it, so one unreadable record cannot pin the rotation. These are not
+counted on `ravel_scrub_checksum_mismatch_total`, which counts only bytes that
+were read and did not match. A record or object deleted after it was listed is
 logged and skipped.
 
 It detects and never repairs. An anomaly is reported; there is no redundant copy

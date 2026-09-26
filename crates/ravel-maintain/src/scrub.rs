@@ -88,12 +88,13 @@ pub struct CoveringPostings<'a> {
     pub max_postings_bytes: u64,
 }
 
-/// The outcome of scrubbing one object. Anomalies (structural corruption,
-/// checksum mismatch, postings disagreement, an object the store refuses to
-/// return) are distinguished from a [`ScrubResult::ReadError`], which is a
-/// retryable store error, a missing object, or an input/decode inconsistency,
-/// and is deliberately *not* a corruption finding: a throttle or a timeout
-/// must not be counted as bit rot.
+/// The outcome of scrubbing one object. Corruption findings (structural
+/// corruption, checksum mismatch, postings disagreement) are distinguished
+/// from an object the store refuses to return ([`ScrubResult::Unreadable`]),
+/// whose bytes were never read, and from a [`ScrubResult::ReadError`], which
+/// is a retryable store error, a missing object, or an input/decode
+/// inconsistency. Neither of the last two is a corruption finding: a
+/// throttle, a timeout or an access denial must not be counted as bit rot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScrubResult {
     /// Every requested check passed.
@@ -138,12 +139,60 @@ pub enum ScrubResult {
     /// A GET of the object itself (the footer probe, the footer range chase,
     /// or the whole-object read) failed with a store error retrying cannot
     /// clear: anything but `NotFound` and the retryable kinds, such as
-    /// `Permanent`, `AccessDenied` or `Corrupted`. The object cannot be
-    /// verified, now or later, so this is a finding like a checksum mismatch.
+    /// `Permanent`, `AccessDenied` or `Corrupted`. The object's bytes were
+    /// never read, so this is not a checksum mismatch: an access denial can be
+    /// a key policy or a credential fault rather than damage at rest.
     Unreadable {
         /// The failed GET and its error, rendered for reporting.
         detail: String,
+        /// Which kind of non-retryable error it was.
+        reason: UnreadableReason,
     },
+}
+
+/// Why an object or record could not be read at all, the `reason` label of
+/// `ravel_scrub_unreadable_total`. [`scrub_one_object`] only ever reports
+/// [`AccessDenied`](Self::AccessDenied) or [`Permanent`](Self::Permanent);
+/// [`RetryExhausted`](Self::RetryExhausted) is the scheduled cursor's own
+/// verdict on a unit it stopped retrying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreadableReason {
+    /// The store refused the GET as `AccessDenied` (a bucket or key policy,
+    /// or a credential fault).
+    AccessDenied,
+    /// Any other error retrying cannot clear, or bytes that were read and do
+    /// not decode.
+    Permanent,
+    /// Retryable errors that kept recurring until the cursor gave up holding
+    /// its marker on the unit.
+    RetryExhausted,
+}
+
+impl UnreadableReason {
+    /// Every reason, in label order.
+    pub const ALL: [UnreadableReason; 3] = [
+        UnreadableReason::AccessDenied,
+        UnreadableReason::Permanent,
+        UnreadableReason::RetryExhausted,
+    ];
+
+    /// The label value this reason renders as on `/metrics`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnreadableReason::AccessDenied => "access_denied",
+            UnreadableReason::Permanent => "permanent",
+            UnreadableReason::RetryExhausted => "retry_exhausted",
+        }
+    }
+
+    /// The reason for a GET that failed with `err`, an error retrying cannot
+    /// clear.
+    pub fn of(err: &StoreError) -> Self {
+        match err {
+            StoreError::AccessDenied(_) => UnreadableReason::AccessDenied,
+            _ => UnreadableReason::Permanent,
+        }
+    }
 }
 
 /// Classify a failed GET of the object under scrub: a retryable error or
@@ -157,7 +206,10 @@ fn get_failure(what: &str, err: StoreError) -> ScrubResult {
             retryable: err.is_retryable(),
         }
     } else {
-        ScrubResult::Unreadable { detail }
+        ScrubResult::Unreadable {
+            reason: UnreadableReason::of(&err),
+            detail,
+        }
     }
 }
 
@@ -259,7 +311,7 @@ pub async fn scrub_one_object(
 /// Log an [`ScrubResult::Unreadable`] outcome the way the other anomalies are
 /// logged; any other result is left to the caller.
 fn log_unreadable(clock: &dyn Clock, key: &str, result: &ScrubResult) {
-    if let ScrubResult::Unreadable { detail } = result {
+    if let ScrubResult::Unreadable { detail, .. } = result {
         tracing::warn!(
             object_key = key,
             detected_unix_ns = clock.now_ns(),
@@ -1052,8 +1104,14 @@ mod tests {
         let permanent = faulted(ScriptedFault::Permanent("injected".to_string()));
         let result = scrub_one_object(&permanent, &clock, &record, None).await;
         assert!(
-            matches!(result, ScrubResult::Unreadable { .. }),
-            "a permanent GET error is a finding, got {result:?}"
+            matches!(
+                result,
+                ScrubResult::Unreadable {
+                    reason: UnreadableReason::Permanent,
+                    ..
+                }
+            ),
+            "a permanent GET error makes the object unreadable, got {result:?}"
         );
         assert_eq!(permanent.fault_count(Op::Get, FaultKind::Permanent), 1);
 

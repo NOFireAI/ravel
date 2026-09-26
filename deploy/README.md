@@ -5,13 +5,13 @@ the IAM policy documents the operator renders into Secrets.
 
 ## Prometheus alerting rules (`prometheus/ravel.rules.yaml`)
 
-`prometheus/ravel.rules.yaml` is the shipped alert rule file: 32 alerts in 8
+`prometheus/ravel.rules.yaml` is the shipped alert rule file: 33 alerts in 8
 groups. Each carries the threshold its source document states, and the
 duration that document states where it states one. The sources are
 [the observability guide](../docs/guides/observability.md), which explains the
 groups it states durations for, and
 [the troubleshooting guide](../docs/guides/operations/troubleshooting.md),
-whose symptom table states the rest. 15 of the 32 carry no `for:` because the
+whose symptom table states the rest. 16 of the 33 carry no `for:` because the
 row they come from states no duration; each of those says so in an
 `as_documented` annotation, and every rule carries a `runbook` annotation
 naming the section to read when it fires.
@@ -29,13 +29,13 @@ scrape configuration: point your own Prometheus at the Ravel processes you
 run.
 
 `services/ravel-server/tests/shipped_rules_name_emitted_metrics.rs` pins the
-names. It parses this file into its 8 groups and 32 rules, extracts the 38
+names. It parses this file into its 8 groups and 33 rules, extracts the 39
 distinct `ravel_` metric names their expressions and annotations reference,
 and asserts each one appears on a `# TYPE` line of a `/metrics` body rendered
 by a running server, so renaming a metric in the code fails the test instead
 of leaving a rule here matching no series. Parsing rather than scanning is
 what makes the rule count mean something: a corruption that leaves the
-`- alert:` lines intact keeps a string count at 32 while Prometheus refuses
+`- alert:` lines intact keeps a string count at 33 while Prometheus refuses
 the whole file, and the reader the test uses refuses any line it cannot
 account for, so that corruption fails there instead. It also checks the
 `for:` duration against Prometheus's duration grammar and parses every
@@ -54,7 +54,7 @@ ships.
 `grafana/dashboards-standalone/ravel.json` is the shipped dashboard over Ravel's own
 `ravel_` families: 36 panels in 6 rows, named Ingest, Query, Catalog fold,
 Maintenance, Object store and probe, and Alerting. Between them the panels
-reference 107 distinct `ravel_` metric names. Import it into Grafana and pick
+reference 109 distinct `ravel_` metric names. Import it into Grafana and pick
 the Prometheus data source that scrapes your Ravel processes; the dashboard
 carries a single `ds` data-source variable and no hardcoded data-source uid.
 
@@ -80,9 +80,9 @@ dashboard's. It parses the JSON, walks every object carrying a `targets`
 array, extracts the metric names from each target's PromQL expression, and
 asserts each one appears on a `# TYPE` line of a `/metrics` body rendered by a
 running server, through the same scanner and the same rendered bodies the rule
-file goes through. It also asserts that every one of the 37 metric names the
+file goes through. It also asserts that every one of the 39 metric names the
 shipped rules alert on is graphed by some panel here, so a page always has a
-panel to land on. The 6 rows, 36 panels, 104 targets and 107 names are pinned
+panel to land on. The 6 rows, 36 panels, 106 targets and 109 names are pinned
 as literals, so a walk that stops finding panels fails rather than checking an
 empty set.
 

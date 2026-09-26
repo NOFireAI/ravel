@@ -312,16 +312,20 @@ tick rather than left unverified for a whole rotation. This is the split
 decision 2 did not make. Every other failure advances the marker, so one
 permanently bad record cannot pin the rotation. A record GET that fails with
 an error retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`, and
-every other kind except `NotFound`) is a scrub finding: it is logged at error
-and counted on `ravel_scrub_checksum_mismatch_total{signal, level}` at the
-level of the objects the record names. A record that is `NotFound` is
-skipped without a finding, since retention deleting a listed record is not a
-fault, and a record whose decode fails is logged and skipped. The GETs of the
-objects a unit names (the footer probe, the footer range chase, and the
+every other kind except `NotFound`), and a record whose bytes do not decode,
+make the record unreadable: it is logged at error and counted once on
+`ravel_scrub_unreadable_total{signal, level, reason}` at the record's own
+level, with `reason="access_denied"` for `AccessDenied` and
+`reason="permanent"` for everything else. It is not counted on
+`ravel_scrub_checksum_mismatch_total`, which counts only bytes that were read
+and did not match: an access denial is as likely a key policy or a credential
+fault as damage at rest. A record that is `NotFound` is skipped and not
+counted, since retention deleting a listed record is not a fault. The GETs of
+the objects a unit names (the footer probe, the footer range chase, and the
 whole-object read) follow the same rule: a retryable error holds the marker
 behind the unit, `NotFound` is skipped, and any other error is counted on
-`ravel_scrub_checksum_mismatch_total` at the object's level. A held unit
-counts nothing it found, since the next tick verifies all of it again.
+`ravel_scrub_unreadable_total` at the object's level. A held unit counts
+nothing it found, since the next tick verifies all of it again.
 
 **A late record is judged against its whole hour.** Decision 4 sent every
 record that lands behind the marker to the next rotation. That is true only

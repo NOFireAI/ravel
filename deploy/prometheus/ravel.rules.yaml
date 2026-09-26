@@ -623,6 +623,26 @@ groups:
             The guide states this condition with no duration, so no for: is
             set.
           runbook: docs/guides/operations/troubleshooting.md#data-integrity-and-correctness-alarms
+      - alert: RavelScrubUnreadable
+        expr: |
+          increase(ravel_scrub_unreadable_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The Ravel scrubber could not read a {{ $labels.signal }} object or
+            record, so it went unverified
+          description: >-
+            Not corruption: the bytes were never read. reason="access_denied"
+            is a key policy, bucket policy or credential fault on the maintain
+            process and recurs every rotation until fixed; reason="permanent"
+            is any other store error retrying cannot clear, or a record that
+            does not decode. The ERROR log line beside each count names the
+            key.
+          as_documented: >-
+            The guide states this condition with no duration, so no for: is
+            set.
+          runbook: docs/guides/operations/troubleshooting.md#maintenance-is-not-running-or-not-finishing
       - alert: RavelScrubPostingsDisagreement
         expr: |
           increase(ravel_scrub_postings_disagreement_total[1h]) > 0

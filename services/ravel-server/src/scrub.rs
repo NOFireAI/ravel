@@ -85,12 +85,14 @@
 //!    the whole unit rather than skipping its objects for a whole rotation.
 //!    Every other failure moves the marker on. A GET that fails with an error
 //!    retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`, and
-//!    every other kind but `NotFound`) is counted on
-//!    `ravel_scrub_checksum_mismatch_total`, at the object's level or, for a
-//!    record, at the level of the objects it names. A record or object that
-//!    is `NotFound` (deleted after it was listed), a record that fails to
-//!    decode, and an object whose check hit an input inconsistency are logged
-//!    and skipped.
+//!    every other kind but `NotFound`), and a record whose bytes do not
+//!    decode, are counted once each on `ravel_scrub_unreadable_total` at the
+//!    level of the object or record that failed, with `reason` telling an
+//!    access denial from every other kind. They are not checksum mismatches:
+//!    `ravel_scrub_checksum_mismatch_total` counts only bytes that were read
+//!    and did not verify. A record or object that is `NotFound` (deleted after
+//!    it was listed) and an object whose check hit an input inconsistency are
+//!    logged and skipped.
 //! 7. Persist the cursor with the marker on the last entry consumed. When the
 //!    listing ended past the marker, the rotation rolls over instead: the
 //!    marker clears and the next rotation is counted afresh, completing a full
@@ -142,7 +144,9 @@
 //! segment from, ADR-0058). A [`ScrubResult::ReadError`] is a retryable store
 //! error, a missing object, or a decode inconsistency, not corruption: it is
 //! logged and never counted as an anomaly, and only the retryable kind holds
-//! the marker for a retry on the next tick.
+//! the marker for a retry on the next tick. A [`ScrubResult::Unreadable`]
+//! object is not corruption either, since its bytes were never read; it is
+//! counted apart from the corruption counters.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -152,7 +156,7 @@ use ravel_commit::keys;
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::{
     Clock, RetentionConfig, SCRUB_REQUESTS_PER_OBJECT, ScrubLevel, ScrubResult, ScrubTarget,
-    WorkerSet, scrub_one_object,
+    UnreadableReason, WorkerSet, scrub_one_object,
 };
 use ravel_maintain::{ScrubCursor, TailTally};
 use ravel_object_store::{
@@ -213,6 +217,19 @@ fn level_index(level: ScrubLevel) -> usize {
     }
 }
 
+/// Number of [`UnreadableReason`] variants, the innermost width of
+/// [`ScrubMetrics`]'s `unreadable` array.
+const UNREADABLE_REASONS: usize = UnreadableReason::ALL.len();
+
+/// Position of `reason` within one (signal, level) cell of `unreadable`.
+fn reason_index(reason: UnreadableReason) -> usize {
+    match reason {
+        UnreadableReason::AccessDenied => 0,
+        UnreadableReason::Permanent => 1,
+        UnreadableReason::RetryExhausted => 2,
+    }
+}
+
 /// Process-global counters for the scrubber (ADR-0059 decision 3), rendered on
 /// the existing `GET /metrics` endpoint by
 /// [`crate::metrics::render_scrub_family`] with no second registry, following
@@ -221,13 +238,15 @@ fn level_index(level: ScrubLevel) -> usize {
 /// `tenant_hash` label (ADR-0044 section 4 blocks per-tenant series on the
 /// unauthenticated `/metrics` route).
 ///
-/// Structural corruption, a content-hash mismatch, and an object or record the
-/// store refuses with an error retrying cannot clear
-/// ([`ScrubResult::Unreadable`]) are all at-rest integrity failures, so all
-/// increment `checksum_mismatch`; a [`ScrubResult::ReadError`] increments
-/// nothing. `checksum_mismatch` also carries a [`ScrubLevel`] dimension
-/// (`l0`/`l1`/`rewrite`, [`level_index`]): the postings tier only ever runs
-/// against L0 objects, so `postings_disagreement` stays signal-only.
+/// Structural corruption and a content-hash mismatch are bytes that were read
+/// and did not verify, so both increment `checksum_mismatch`. An object or
+/// record the store refuses with an error retrying cannot clear
+/// ([`ScrubResult::Unreadable`]), or a record that does not decode, was never
+/// verified at all and increments `unreadable` under its
+/// [`UnreadableReason`]; a [`ScrubResult::ReadError`] increments nothing. Both
+/// carry a [`ScrubLevel`] dimension (`l0`/`l1`/`rewrite`, [`level_index`]):
+/// the postings tier only ever runs against L0 objects, so
+/// `postings_disagreement` stays signal-only.
 ///
 /// Seal divergence (ADR-0059 decision 2) is a distinct, metadata-cost
 /// check on the same tick: sealed commit records re-listed and diffed against the
@@ -237,6 +256,9 @@ fn level_index(level: ScrubLevel) -> usize {
 #[derive(Debug, Default)]
 pub struct ScrubMetrics {
     checksum_mismatch: [[AtomicU64; SCRUB_LEVELS]; MAINTAINED_SIGNALS.len()],
+    /// Objects and records the scrub could not read at all, per signal, level
+    /// and [`UnreadableReason`]: `ravel_scrub_unreadable_total`.
+    unreadable: [[[AtomicU64; UNREADABLE_REASONS]; SCRUB_LEVELS]; MAINTAINED_SIGNALS.len()],
     postings_disagreement: [AtomicU64; MAINTAINED_SIGNALS.len()],
     /// Sealed commit records absent from the folded snapshot (an under-count),
     /// per signal. The `reason="missing"` value of
@@ -266,6 +288,11 @@ pub struct ScrubMetrics {
 impl ScrubMetrics {
     pub fn checksum_mismatch(&self, signal: Signal, level: ScrubLevel) -> u64 {
         self.checksum_mismatch[signal_index(signal)][level_index(level)].load(Ordering::Relaxed)
+    }
+
+    pub fn unreadable(&self, signal: Signal, level: ScrubLevel, reason: UnreadableReason) -> u64 {
+        self.unreadable[signal_index(signal)][level_index(level)][reason_index(reason)]
+            .load(Ordering::Relaxed)
     }
 
     pub fn postings_disagreement(&self, signal: Signal) -> u64 {
@@ -303,6 +330,11 @@ impl ScrubMetrics {
 
     fn record_checksum_mismatch(&self, signal: Signal, level: ScrubLevel) {
         self.checksum_mismatch[signal_index(signal)][level_index(level)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_unreadable(&self, signal: Signal, level: ScrubLevel, reason: UnreadableReason) {
+        self.unreadable[signal_index(signal)][level_index(level)][reason_index(reason)]
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -749,8 +781,8 @@ async fn run_shard_tick(
     // unverified for a whole rotation, and retrying can clear the error. A
     // record or object that was not found or failed with an error retrying
     // cannot clear, and a record that failed to decode, move the marker on, so
-    // one bad record cannot pin the rotation; a GET error retrying cannot
-    // clear is counted as a finding.
+    // one bad record cannot pin the rotation; those that were found but could
+    // not be read are counted as unreadable.
     let mut listing = MarkerListing::new(store, &prefix, cursor.last_commit_key.clone());
     let mut slice_entries = 0u64;
     let mut requests = 0u64;
@@ -800,14 +832,14 @@ async fn run_shard_tick(
             unit_held = true;
             break;
         };
-        for (key, level, error) in &outcome.unreadable {
+        for record in &outcome.unreadable {
             tracing::error!(
-                tenant = %tenant.to_hex(), signal = ?signal, shard, record_key = %key,
-                level = level.as_str(), error = %error,
-                "scrub: record unreadable at rest (non-retryable store error); counted as a \
-                 checksum mismatch"
+                tenant = %tenant.to_hex(), signal = ?signal, shard, record_key = %record.key,
+                level = record.level.as_str(), reason = record.reason.as_str(),
+                error = %record.error,
+                "scrub: record unreadable; the objects it names are not verified this rotation"
             );
-            metrics.record_checksum_mismatch(signal, *level);
+            metrics.record_unreadable(signal, record.level, record.reason);
         }
         record_verdicts(tenant, signal, shard, &outcome.targets, verdicts, metrics);
         let bytes = outcome.targets.iter().fold(0u64, |sum, entry| {
@@ -914,14 +946,14 @@ fn record_verdicts(
                 );
                 metrics.record_checksum_mismatch(signal, level);
             }
-            ScrubResult::Unreadable { detail } => {
+            ScrubResult::Unreadable { detail, reason } => {
                 tracing::error!(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, object_key = %key,
-                    level = level.as_str(), detail = %detail,
-                    "scrub: object unreadable at rest (non-retryable store error); counted as \
-                     a checksum mismatch"
+                    level = level.as_str(), reason = reason.as_str(), detail = %detail,
+                    "scrub: object unreadable (non-retryable store error); not verified this \
+                     rotation"
                 );
-                metrics.record_checksum_mismatch(signal, level);
+                metrics.record_unreadable(signal, level, reason);
             }
             ScrubResult::PostingsDisagreement { name, ordinal } => {
                 tracing::error!(
@@ -1215,12 +1247,20 @@ struct UnitOutcome {
     /// unit and retries it next tick, rather than skipping objects it never
     /// verified.
     retry: bool,
-    /// Records of this unit's `advance` set whose GET failed with an error
-    /// retrying cannot clear (anything but `NotFound` and the retryable kinds),
-    /// with the level of the objects each names and the error. Each is a
-    /// finding once the unit is consumed, and the marker moves past it, so one
-    /// record unreadable at rest cannot pin the rotation.
-    unreadable: Vec<(String, ScrubLevel, String)>,
+    /// Records of this unit's `advance` set that could not be read: a GET that
+    /// failed with an error retrying cannot clear (anything but `NotFound` and
+    /// the retryable kinds), or bytes that do not decode. Each counts once on
+    /// `ravel_scrub_unreadable_total` once the unit is consumed, and the marker
+    /// moves past it, so one unreadable record cannot pin the rotation.
+    unreadable: Vec<UnreadableRecord>,
+}
+
+/// One record a unit could not read, counted at the record's own level.
+struct UnreadableRecord {
+    key: String,
+    level: ScrubLevel,
+    reason: UnreadableReason,
+    error: String,
 }
 
 /// How a failed GET affects the scrub (ADR-1686 amendment).
@@ -1229,11 +1269,11 @@ enum GetFailure {
     /// the unit next tick.
     Retry,
     /// `NotFound`: retention deleted the object after it was listed. Not a
-    /// fault to retry and not a finding.
+    /// fault to retry and not counted.
     Gone,
-    /// Any other error. Retrying cannot clear it, so it is a finding and the
-    /// marker moves on.
-    Finding,
+    /// Any other error. Retrying cannot clear it, so the object is counted as
+    /// unreadable and the marker moves on.
+    Unreadable(UnreadableReason),
 }
 
 fn classify_get_failure(err: &StoreError) -> GetFailure {
@@ -1242,13 +1282,13 @@ fn classify_get_failure(err: &StoreError) -> GetFailure {
     } else if matches!(err, StoreError::NotFound) {
         GetFailure::Gone
     } else {
-        GetFailure::Finding
+        GetFailure::Unreadable(UnreadableReason::of(err))
     }
 }
 
-/// Apply [`classify_get_failure`] to one failed record GET. A finding is kept
-/// only for a record in the unit's `advance` set: a context record an earlier
-/// tick consumed was already counted then.
+/// Apply [`classify_get_failure`] to one failed record GET. An unreadable
+/// record is kept only when it is in the unit's `advance` set: a context
+/// record an earlier tick consumed was already counted then.
 fn note_record_get_failure(
     key: &str,
     what: &str,
@@ -1256,7 +1296,7 @@ fn note_record_get_failure(
     level: ScrubLevel,
     advancing: bool,
     retry: &mut bool,
-    unreadable: &mut Vec<(String, ScrubLevel, String)>,
+    unreadable: &mut Vec<UnreadableRecord>,
 ) {
     match classify_get_failure(err) {
         GetFailure::Retry => {
@@ -1272,11 +1312,43 @@ fn note_record_get_failure(
                 "scrub: {what} not found (deleted after it was listed); skipping it"
             );
         }
-        GetFailure::Finding => {
+        GetFailure::Unreadable(reason) => {
             if advancing {
-                unreadable.push((key.to_string(), level, err.to_string()));
+                unreadable.push(UnreadableRecord {
+                    key: key.to_string(),
+                    level,
+                    reason,
+                    error: err.to_string(),
+                });
             }
         }
+    }
+}
+
+/// A record whose bytes were read and do not decode. Counted like a
+/// non-retryable GET failure, under `reason="permanent"`, when the record is
+/// in the unit's `advance` set; a context record was counted when an earlier
+/// tick consumed it, so it is only logged.
+fn note_record_decode_failure(
+    key: &str,
+    what: &str,
+    err: &dyn std::fmt::Display,
+    level: ScrubLevel,
+    advancing: bool,
+    unreadable: &mut Vec<UnreadableRecord>,
+) {
+    if advancing {
+        unreadable.push(UnreadableRecord {
+            key: key.to_string(),
+            level,
+            reason: UnreadableReason::Permanent,
+            error: format!("{what} decode failed: {err}"),
+        });
+    } else {
+        tracing::warn!(
+            key = %key, error = %err,
+            "scrub: {what} decode failed; lineage selection runs without it this tick"
+        );
     }
 }
 
@@ -1285,8 +1357,8 @@ fn note_record_get_failure(
 /// is not superseded, not an overlap loser, and not in a tombstoned bucket.
 /// The commit record (for an L0 object) or the `CompactionPart` (for a part)
 /// carries the object's size and the content hash `scrub_one_object`
-/// re-verifies against. A record whose decode fails is logged and names
-/// nothing this tick.
+/// re-verifies against. A record whose decode fails names nothing; when it is
+/// in the unit's `advance` set it is reported in [`UnitOutcome::unreadable`].
 ///
 /// Exclusions are resolved over the unit's whole ingest-hour lineage set
 /// ([`Unit::context`]), which can hold records an earlier tick already
@@ -1295,7 +1367,7 @@ fn note_record_get_failure(
 async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcome {
     let mut gets = 0u64;
     let mut retry = false;
-    let mut unreadable: Vec<(String, ScrubLevel, String)> = Vec::new();
+    let mut unreadable: Vec<UnreadableRecord> = Vec::new();
     let lineage: &[String] = if unit.context.is_empty() {
         &unit.advance
     } else {
@@ -1357,9 +1429,13 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                 let record = match ravel_commit::record::decode(&got.data) {
                     Ok(record) => record,
                     Err(err) => {
-                        tracing::warn!(
-                            key = %key, error = %err,
-                            "scrub: commit record decode failed; skipping this object this tick"
+                        note_record_decode_failure(
+                            key,
+                            "commit record",
+                            &err,
+                            ScrubLevel::L0,
+                            advancing.contains(key.as_str()),
+                            &mut unreadable,
                         );
                         continue;
                     }
@@ -1406,9 +1482,13 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                 let rec = match ravel_commit::record::decode_compaction(&got.data) {
                     Ok(rec) => rec,
                     Err(err) => {
-                        tracing::warn!(
-                            key = %key, error = %err,
-                            "scrub: compaction record decode failed; skipping this tick"
+                        note_record_decode_failure(
+                            key,
+                            "compaction record",
+                            &err,
+                            ScrubLevel::L1,
+                            advancing.contains(key.as_str()),
+                            &mut unreadable,
                         );
                         continue;
                     }
@@ -1438,9 +1518,13 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                 let rec = match ravel_commit::erasure::decode_rewrite(&got.data) {
                     Ok(rec) => rec,
                     Err(err) => {
-                        tracing::warn!(
-                            key = %key, error = %err,
-                            "scrub: rewrite record decode failed; skipping this tick"
+                        note_record_decode_failure(
+                            key,
+                            "rewrite record",
+                            &err,
+                            ScrubLevel::Rewrite,
+                            advancing.contains(key.as_str()),
+                            &mut unreadable,
                         );
                         continue;
                     }
@@ -3838,14 +3922,14 @@ mod tests {
         );
     }
 
-    /// A record GET that fails with an error retrying cannot clear is a
-    /// finding, not a reason to hold the marker: holding it would retry the
-    /// same unit on every tick and verify nothing after it again. The unit is
-    /// counted as a checksum mismatch at the level of the objects it names,
-    /// the marker moves past it in the same tick, and the next unit's object
-    /// is still verified.
+    /// A record GET that fails with an error retrying cannot clear makes the
+    /// record unreadable, and is not a reason to hold the marker: holding it
+    /// would retry the same unit on every tick and verify nothing after it
+    /// again. The record counts once on the unreadable counter at its own
+    /// level and nothing on the checksum-mismatch counter, the marker moves
+    /// past it in the same tick, and the next unit's object is still verified.
     #[tokio::test]
-    async fn a_permanent_record_get_error_is_a_finding_and_the_marker_moves_on() {
+    async fn a_permanent_record_get_error_is_unreadable_and_the_marker_moves_on() {
         use ravel_object_store::fault::{
             FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
         };
@@ -3916,10 +4000,12 @@ mod tests {
         );
         assert_eq!(cursor.rotation_entries_visited, 4);
         assert_eq!(
-            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            metrics.unreadable(Signal::Metrics, ScrubLevel::L0, UnreadableReason::Permanent),
             1,
-            "the unreadable record is exactly one finding"
+            "the unreadable record counts exactly once"
         );
+        assert_eq!(unreadable_total(&metrics), 1);
+        assert_eq!(mismatch_total(&metrics), 0);
 
         let verified: Vec<String> = store
             .full_gets
@@ -4050,11 +4136,12 @@ mod tests {
         );
     }
 
-    /// A data-object GET that fails with an error retrying cannot clear is a
-    /// finding, counted as a checksum mismatch at the object's level, and the
-    /// marker moves past its unit in the same tick.
+    /// A data-object GET that fails with an error retrying cannot clear counts
+    /// once as unreadable under `reason="permanent"` at the object's level,
+    /// never as a checksum mismatch, and the marker moves past its unit in the
+    /// same tick.
     #[tokio::test]
-    async fn a_permanent_data_object_get_error_is_a_finding() {
+    async fn a_permanent_data_object_get_error_is_unreadable() {
         use ravel_object_store::fault::{FaultKind, Op, ScriptedFault};
 
         let (memory, faulted, listed, _, metrics) = tick_with_data_object_fault(
@@ -4077,9 +4164,237 @@ mod tests {
         );
         assert_eq!(cursor.rotation_entries_visited, 4);
         assert_eq!(
-            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            metrics.unreadable(Signal::Metrics, ScrubLevel::L0, UnreadableReason::Permanent),
             1,
-            "the unreadable object is exactly one finding"
+            "the unreadable object counts exactly once"
+        );
+        assert_eq!(unreadable_total(&metrics), 1);
+        assert_eq!(mismatch_total(&metrics), 0);
+    }
+
+    /// A delegating store that fails a GET with whatever `fault` returns for
+    /// it. `fault` sees the key and how many earlier GETs named that same key,
+    /// and every error it returns is counted in `fired`, so a test can prove
+    /// its fault fired. Unlike [`FaultStore`](ravel_object_store::fault), it
+    /// can return any [`StoreError`], `AccessDenied` included.
+    struct GetFaults {
+        inner: Arc<dyn ObjectStoreBackend>,
+        #[allow(clippy::type_complexity)]
+        fault: Box<dyn Fn(&str, u64) -> Option<StoreError> + Send + Sync>,
+        calls: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+        fired: AtomicU64,
+    }
+
+    impl GetFaults {
+        fn new(
+            inner: Arc<dyn ObjectStoreBackend>,
+            fault: impl Fn(&str, u64) -> Option<StoreError> + Send + Sync + 'static,
+        ) -> Self {
+            GetFaults {
+                inner,
+                fault: Box::new(fault),
+                calls: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                fired: AtomicU64::new(0),
+            }
+        }
+
+        fn fired(&self) -> u64 {
+            self.fired.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for GetFaults {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            let earlier = {
+                let mut calls = self.calls.lock();
+                let count = calls.entry(key.to_string()).or_insert(0);
+                let earlier = *count;
+                *count += 1;
+                earlier
+            };
+            if let Some(err) = (self.fault)(key, earlier) {
+                self.fired.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Eight one-object commit records in shard 0, listed four per page.
+    /// Returns the listing and the data keys, both in listing order.
+    async fn eight_record_shard(
+        memory: &MemoryStore,
+    ) -> (Vec<ravel_object_store::ObjectMeta>, Vec<String>) {
+        let mut data_keys = Vec::new();
+        for seq in 1..=8u64 {
+            data_keys.push(publish_segment(memory, seq, &["cpu"]).await);
+        }
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant().hash(), Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory, &shard_prefix).await.expect("list shard");
+        assert_eq!(listed.len(), 8, "eight commit records");
+        (listed, data_keys)
+    }
+
+    /// One tick over [`eight_record_shard`] at four entries a tick
+    /// (`ceil(8 / 2)` over a two-tick rotation).
+    async fn tick_eight(store: &dyn ObjectStoreBackend, metrics: &ScrubMetrics) {
+        let clock = ravel_maintain::FixedClock::new(500_001 * NS_PER_HOUR);
+        run_shard_tick(
+            store,
+            &clock,
+            &tenant().hash(),
+            Signal::Metrics,
+            0,
+            2,
+            1,
+            None,
+            None,
+            metrics,
+        )
+        .await;
+    }
+
+    /// Every (level, reason) cell of `ravel_scrub_unreadable_total` for the
+    /// metrics signal, summed.
+    fn unreadable_total(metrics: &ScrubMetrics) -> u64 {
+        let mut total = 0;
+        for level in [ScrubLevel::L0, ScrubLevel::L1, ScrubLevel::Rewrite] {
+            for reason in UnreadableReason::ALL {
+                total += metrics.unreadable(Signal::Metrics, level, reason);
+            }
+        }
+        total
+    }
+
+    /// Every level of `ravel_scrub_checksum_mismatch_total` for the metrics
+    /// signal, summed.
+    fn mismatch_total(metrics: &ScrubMetrics) -> u64 {
+        [ScrubLevel::L0, ScrubLevel::L1, ScrubLevel::Rewrite]
+            .into_iter()
+            .map(|level| metrics.checksum_mismatch(Signal::Metrics, level))
+            .sum()
+    }
+
+    /// An access denial on a data-object GET is not corruption: the bytes were
+    /// never read. It counts once on the unreadable counter under
+    /// `reason="access_denied"`, nothing on the checksum-mismatch counter, and
+    /// the marker moves past the unit.
+    #[tokio::test]
+    async fn an_access_denied_data_object_get_is_unreadable_not_a_mismatch() {
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let (listed, data_keys) = eight_record_shard(&memory).await;
+        let denied = data_keys[2].clone();
+        let store = GetFaults::new(memory.clone(), move |key, _| {
+            (key == denied).then(|| StoreError::AccessDenied("injected KMS denial".to_string()))
+        });
+        let metrics = ScrubMetrics::default();
+        tick_eight(&store, &metrics).await;
+
+        assert_eq!(
+            store.fired(),
+            1,
+            "the footer GET is denied and nothing else of that object is tried"
+        );
+        assert_eq!(
+            metrics.unreadable(
+                Signal::Metrics,
+                ScrubLevel::L0,
+                UnreadableReason::AccessDenied
+            ),
+            1
+        );
+        assert_eq!(unreadable_total(&metrics), 1);
+        assert_eq!(mismatch_total(&metrics), 0, "an access denial is not rot");
+        let cursor = load_cursor(memory.as_ref(), &tenant().hash(), Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[3].key.as_str())
+        );
+    }
+
+    /// A commit record whose bytes were read and do not decode counts once on
+    /// the unreadable counter under `reason="permanent"`, at the record's own
+    /// level, and the marker moves past it.
+    #[tokio::test]
+    async fn a_record_that_does_not_decode_is_unreadable_permanent() {
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let (listed, _) = eight_record_shard(&memory).await;
+        memory
+            .put(
+                &listed[2].key,
+                Bytes::from_static(b"not a commit record"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite record");
+        let metrics = ScrubMetrics::default();
+        tick_eight(memory.as_ref(), &metrics).await;
+
+        assert_eq!(
+            metrics.unreadable(Signal::Metrics, ScrubLevel::L0, UnreadableReason::Permanent),
+            1
+        );
+        assert_eq!(unreadable_total(&metrics), 1);
+        assert_eq!(mismatch_total(&metrics), 0);
+        let cursor = load_cursor(memory.as_ref(), &tenant().hash(), Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[3].key.as_str())
         );
     }
 

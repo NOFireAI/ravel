@@ -31,9 +31,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   object GET failed with a retryable error (throttled, timeout, transient) does
   not move the marker past it and counts nothing from it, so the next tick
   retries the whole unit. A record or object GET that fails with any other
-  error except not-found is a finding, counted on
-  `ravel_scrub_checksum_mismatch_total`, and the marker moves on, so one
-  unreadable record cannot pin the rotation. A compaction record that lands in
+  error except not-found, and a record whose bytes do not decode, is counted
+  once on the new `ravel_scrub_unreadable_total{signal, level, reason}` (with
+  `reason="access_denied"` or `reason="permanent"`, at the level of the object
+  or record that failed), and the marker moves on, so one unreadable record
+  cannot pin the rotation. Neither is counted on
+  `ravel_scrub_checksum_mismatch_total`, which counts only bytes that were read
+  and did not match; a new `RavelScrubUnreadable` warning alert fires on any
+  increase of the unreadable counter over an hour. A compaction record that lands in
   an hour the marker has already passed is still judged against that whole
   hour, and a tick whose cursor GET fails for any reason other than `NotFound`
   is skipped with the stored cursor left alone. The cursor gains serde-default
