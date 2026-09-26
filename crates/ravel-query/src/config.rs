@@ -33,6 +33,12 @@ pub const REQUEST_BUDGET_HEADROOM_DEN: u64 = 2;
 /// count. Added once, not per shard.
 pub const REQUEST_BUDGET_FIXED_OVERHEAD: u64 = 5_000;
 
+/// Cold requests one unsealed flush inside the query's range costs, per shard
+/// (ADR-1306 decision 4), for a segment at or under the fetcher's 512 KiB
+/// whole-object threshold; a larger segment pays a footer read and range reads
+/// on top. `cold_recent_query_requests_per_unsealed_flush_by_phase` pins it.
+pub const REQUESTS_PER_UNSEALED_FLUSH: u64 = 2;
+
 /// Reference inputs for [`EngineConfig::default`]'s S3 request budget. The
 /// running server does NOT use these: it derives the budget from its actual
 /// `--shards` and ingest flush cadence (see [`derive_max_s3_requests`], wired
