@@ -120,8 +120,8 @@ pub use scan::{
     ScanReport, SeedStats, scan_and_compact, scan_and_maintain,
 };
 pub use scrub::{
-    CoveringPostings, ScrubBudget, ScrubCursor, ScrubLevel, ScrubResult, ScrubSlice, ScrubTarget,
-    advance_cursor, per_tick_byte_budget, scrub_one_object,
+    CoveringPostings, SCRUB_MAX_CATCHUP, SCRUB_REQUESTS_PER_ENTRY, SCRUB_REQUESTS_PER_OBJECT,
+    ScrubBudget, ScrubCursor, ScrubLevel, ScrubResult, ScrubTarget, TickPlan, scrub_one_object,
 };
 pub use sweep::{
     CatalogSweepOutcome, ErasureRequestSweepOutcome, HeldBucket, IdemSweepOutcome, LeaseCheck,

@@ -80,6 +80,9 @@ approved decision is the cheaper form: resume the listing itself.
    fill it, plus at most one partial page. A record whose GET or decode fails
    is skipped and logged exactly as today (`scrub.rs:599-604`), and the marker
    still advances past it, so one bad record cannot pin the rotation.
+   (See the 2026-09-26 amendment below: the budget is no longer a byte
+   budget, and whether the marker advances now depends on which of the two
+   failures happened.)
 
 3. **The budget's corpus total comes from the previous rotation, and a
    rotation starts with one LIST-only count.** `per_tick_byte_budget` needs
@@ -96,6 +99,8 @@ approved decision is the cheaper form: resume the listing itself.
    GETs, once per rotation, which is what the position gauge needs anyway
    (point 5). Every later rotation has a byte total and uses the byte budget
    ADR-0059 specifies.
+   The byte budget is withdrawn and every rotation now opens with the
+   LIST-only count: see the 2026-09-26 amendment below.
 
 4. **A rotation ends when the listing ends, and the next one starts from the
    beginning.** `list_after` returning an empty final page past the marker
@@ -108,6 +113,9 @@ approved decision is the cheaper form: resume the listing itself.
    Records deleted ahead of the marker (a swept L0 input) simply do not appear,
    exactly as `advance_cursor`'s key-comparison resume tolerates today
    (`crates/ravel-maintain/src/scrub.rs:470-472`).
+   Only an entry that sorts before the marker waits for the next rotation, and
+   a late compaction record that sorts after it is judged against its whole
+   hour: see the 2026-09-26 amendment below.
 
 5. **The position gauge counts entries.** `ravel_scrub_cursor_position`
    (ADR-0059 decision 3) becomes `entries_visited_this_rotation /
@@ -196,14 +204,19 @@ flowchart TD
   plus one LIST-only count pass per rotation. The 7-day rotation completes in
   7 days on the corpus size it was sized for, which is what ADR-0059 promised
   and what the operator guide's sizing formula
-  (`docs/guides/operations/maintenance.md:279-297`) already states.
+  (`docs/guides/operations/maintenance.md:279-297`) already states. A tick
+  also pays a LIST-only tail count and a rotation can be capped below
+  `--scrub-period` by the tenant's retention window: see the 2026-09-26
+  amendment below.
 - The rotation order changes from data-object key order to commit key order,
   which is ingest-hour order. Corruption is still found within one period;
   which slice finds it changes.
 - The first rotation after upgrade starts from the beginning of every shard's
   prefix and runs on an entry-count budget until it completes, then switches
-  to the byte budget. An operator sees `ravel_scrub_cursor_position` drop to
-  zero once at upgrade. The troubleshooting row for a cursor "stuck near 0"
+  to the byte budget (every rotation now runs on the entry-count budget: see
+  the 2026-09-26 amendment below). An operator sees
+  `ravel_scrub_cursor_position` drop to zero once at upgrade. The
+  troubleshooting row for a cursor "stuck near 0"
   (`docs/guides/operations/troubleshooting.md:281`) stays valid: a position
   that does not climb across ticks still means the budget is too small for the
   corpus.
@@ -229,3 +242,74 @@ flowchart TD
      and `docs/guides/observability.md` in the same change.
   3. The corpus widening to compaction and rewrite parts, with level labels
      on the scrub counters, lands as its own task and plugs into point 6.
+
+## Amendment (2026-09-26): the tick is sized by entries and requests against a retention-capped deadline
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="2026-09-26 amendment" -->
+<!-- amendment-supersedes: phrase="the marker still advances past it" pointer="2026-09-26 amendment" -->
+
+Implementing decisions 2, 3 and 4 showed three ways a rotation could fail to
+finish, or could verify something it must not. Each is corrected here; the
+marker walk of decision 1 and the gauge of decision 5 are unchanged.
+
+**The budget is a pair of caps, recomputed every tick from what the walk has
+observed.** Decision 3's byte budget is withdrawn: a byte total cannot bound
+a tick whose GETs fail, since a failing GET moves no bytes and still costs a
+request. `per_tick_byte_budget` and `ScrubBudget::MaxObjects` are gone.
+`ScrubBudget` is now `{ max_entries, max_requests }` and
+`ScrubCursor::plan_tick` returns it with the numbers it came from. Every
+rotation opens with the LIST-only entry count decision 3 reserved for a first
+rotation, and every later tick adds a LIST-only count of the entries appended
+past the greatest key the previous count saw (`rotation_tail_key`). The
+rotation's expected size is therefore the opening count plus every append the
+walk has since observed, not a total that went stale the moment the rotation
+opened. A shard that keeps committing raises its own budget.
+
+**A rotation is sized by a deadline, and the deadline is the shorter of the
+period and the tenant's retention window.** An object retention deletes
+before the walk reaches it is never verified at all, so a rotation must not
+outlive the data it verifies. The rotation window is `min(--scrub-period,
+RetentionConfig::window_for(tenant))`, and `None` (unlimited retention) caps
+nothing. Within that window a tick takes `ceil(remaining entries / ticks
+remaining)`, floored at the sustained rate `ceil(estimated * tick /
+rotation)` so an early tick never coasts, and capped at `SCRUB_MAX_CATCHUP`
+(4) times that sustained rate so one late tick cannot ask for the whole
+corpus at once. Termination: the walk consumes at least the sustained rate
+every tick, and the sustained rate is computed from the current estimate, so
+a shard appending fewer entries per tick than the sustained rate strictly
+closes the gap every tick and the rotation reaches the end of the listing
+inside its window. A shard appending faster than that cannot be caught, and
+that case is reported rather than hidden: when the needed rate exceeds the
+catch-up ceiling the tick logs both numbers with the rotation window and the
+configured period, and increments `ravel_scrub_behind_total{signal}`.
+
+**Requests are bounded, not just entries.** Every listing page the walk
+draws, every context page an hour re-list costs, and every record GET
+attempt, successful or not, is charged against `max_requests`, as is
+`SCRUB_REQUESTS_PER_OBJECT` for each object handed to `scrub_one_object`.
+The walk stops when either cap is filled. A unit whose record GET fails with
+anything other than `NotFound` does not advance the marker: the unit is
+retried on the next tick rather than left unverified for a whole rotation.
+This is the split decision 2 did not make. A record whose DECODE fails still
+advances the marker, so one permanently bad record cannot pin the rotation,
+and `NotFound` still advances it, so retention deleting a listed record is
+not a fault to retry.
+
+**A late record is judged against its whole hour.** Decision 4 sent every
+record that lands behind the marker to the next rotation. That is true only
+of a record whose key sorts before the marker. A compaction record can land
+in an hour the marker has already passed and still sort after it, since
+compaction, rewrite and tombstone records all sort after the hour's commit
+records. Consuming such a record alone would run overlap and supersession
+selection without its rivals, which makes it authoritative by default and
+scrubs the parts of a record the read path never serves. So when the tick's
+start-after marker lies inside an hour's own lineage set, the hour is listed
+again from its start and the whole set becomes the unit's selection context,
+while only the entries past the marker are consumed. The common case, a
+marker on a commit record or outside the hour, costs no extra LIST.
+
+**A cursor that cannot be read skips the tick.** Only `NotFound` means there
+is no cursor. Any other GET failure leaves the stored cursor untouched and
+the shard's tick is skipped, because starting a fresh rotation there would
+rewind the marker to the head of the listing and drop the rotation's progress
+on a transient throttle.

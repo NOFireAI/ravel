@@ -1462,7 +1462,7 @@ Labels: `mode` and `signal`, plus `level` on the checksum-mismatch counter and
 | `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), by signal and level. |
 | `ravel_scrub_postings_disagreement_total` | Objects whose covering name-postings object omitted a `__name__` the object really carries (a false negative), by signal. |
 | `ravel_scrub_seal_divergence_total` | Divergences between the folded snapshot and the re-listed sealed commit history, by signal and reason. |
-| `ravel_scrub_cursor_position` | Gauge. Fraction of the current scrub rotation the content-tier cursor has covered so far, by signal, in [0,1]. |
+| `ravel_scrub_cursor_position` | Gauge. Fraction of the current scrub rotation's commit shard listing entries the content-tier cursor has consumed so far, by signal, in [0,1]. The unit is listing entries (commit, compaction, and rewrite records and tombstones), not data objects: one compaction record can name several parts. |
 
 `ravel_scrub_checksum_mismatch_total` is the one to alert on for any increase:
 Ravel keeps no redundant copy to repair a corrupt object from, so a nonzero
@@ -1501,7 +1501,9 @@ whose content hash disagrees with the sealed record); an orphaned entry, a
 snapshot entry with no surviving commit record, is the expected
 retention-after-fold shape and is never counted. A `ravel_scrub_cursor_position`
 stuck near 0 means scrubbing is not keeping pace with the configured
-`--scrub-period`.
+`--scrub-period`. The gauge drops to 0 once when a rotation rolls over, and once
+after an upgrade from a build that kept an object-based cursor, since that
+cursor's position is discarded and the first tick starts a fresh rotation.
 
 ### Read cache (`ravel_cache_*`)
 
