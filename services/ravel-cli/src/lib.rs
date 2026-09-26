@@ -8,6 +8,7 @@
 pub mod catalog;
 pub mod cli_profiling;
 pub mod erase;
+pub mod export;
 pub mod gc_config;
 pub mod hold;
 pub mod idem;
@@ -84,6 +85,23 @@ pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
         Ok(ns) if ns <= ceiling => Ok(dur),
         _ => Err(format!("--max-flush-delay '{s}' is too large")),
     }
+}
+
+/// Parse an `export --start`/`--end` value: an RFC 3339 timestamp, to
+/// nanoseconds since the Unix epoch.
+///
+/// `chrono` is not a workspace dependency; `humantime::parse_rfc3339` covers
+/// the same grammar (`2026-01-02T03:04:05Z`, with optional fractional seconds
+/// and a numeric offset) without adding one. A timestamp before the Unix
+/// epoch is rejected: `SystemTime::duration_since` returns `Err` rather than a
+/// negative duration, and `export`'s window has no use for one.
+pub fn parse_rfc3339_ns(s: &str) -> Result<i64, String> {
+    let system_time =
+        humantime::parse_rfc3339(s).map_err(|e| format!("invalid RFC 3339 timestamp '{s}': {e}"))?;
+    let dur = system_time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| format!("timestamp '{s}' is before the Unix epoch"))?;
+    i64::try_from(dur.as_nanos()).map_err(|_| format!("timestamp '{s}' is too far in the future"))
 }
 
 #[cfg(test)]
