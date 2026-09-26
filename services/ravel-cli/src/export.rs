@@ -10,9 +10,12 @@
 //! # What makes this a store read rather than a query
 //!
 //! The export resolves the catalog once, at a single snapshot, and reads the
-//! RLOG objects that snapshot names. It runs no SQL and issues no remote read:
-//! the decoders and the segment fetcher are the same ones the query path uses,
-//! so a record excluded from a query is excluded here too. Concretely, the two
+//! RLOG objects that snapshot names. It plans no SQL and contacts no
+//! `ravel-server`; it does read object storage directly, one LIST wave per
+//! resolve and a GET per surviving segment, so against S3 it is as remote as
+//! any other read. What it shares with a query is the visibility layer: the
+//! decoders and the segment fetcher are the same ones the query path uses, so
+//! a record excluded from a query is excluded here too. Concretely, the two
 //! exclusion mechanisms both apply:
 //!
 //! - Retention tombstones and superseded (compacted-away) objects never enter
@@ -22,6 +25,19 @@
 //!   [`ravel_query::erasure::ErasurePredicate`]s, which excludes matching rows
 //!   after the fetch and after any cache tier, exactly as the SQL log scan
 //!   does.
+//!
+//! # Memory and mid-export store changes
+//!
+//! Every decoded record in the window is held in memory at once, because the
+//! output is sorted by event time before the first row is written. Peak memory
+//! is therefore proportional to the window, not to the output batch size;
+//! export a wide range in several narrower windows rather than in one call.
+//!
+//! The snapshot is resolved once, so a compaction or a flush landing while the
+//! export runs does not change what it writes. Garbage collection is the one
+//! mid-export change that is not invisible: a GC pass that deletes an object
+//! this snapshot already named makes its GET fail with not-found, and the
+//! export fails with that error rather than retrying or skipping the object.
 //!
 //! # Window semantics
 //!
@@ -85,6 +101,30 @@ pub struct ExportReport {
     pub erasure_predicates: usize,
 }
 
+/// The two `CatalogConfig` knobs that decide which ingest-hour buckets a
+/// resolve even lists, exposed so an export can be told what the server it
+/// reads behind was configured with.
+///
+/// `Catalog::resolve` lists buckets from `--start` minus `max_ingest_lag`
+/// forward, and skips history below the fold watermark, whose seal margin is
+/// `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`. Both
+/// default to the same values the server defaults to (2 h and 1 h), so an
+/// export against a default deployment needs neither flag. A deployment
+/// running `ravel-server --max-ingest-lag` above 2 h accepts records whose
+/// event time is further behind their ingest hour than this default reaches
+/// back, and an export left on the default would silently not list the bucket
+/// those records landed in. Passing the server's own value is what makes the
+/// window complete; nothing here can read that value off the bucket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogWindow {
+    /// `--max-ingest-lag`, in nanoseconds. `None` keeps
+    /// `CatalogConfig::default()`'s 2 hours.
+    pub max_ingest_lag_ns: Option<i64>,
+    /// `--max-flush-lifetime`, in nanoseconds. `None` keeps
+    /// `CatalogConfig::default()`'s 1 hour.
+    pub max_flush_lifetime_ns: Option<i64>,
+}
+
 /// Why `signal` cannot be exported yet, or `None` when it can.
 ///
 /// `logs` is the only supported signal. ADR-1751 sequences bulk import for
@@ -119,6 +159,7 @@ pub async fn run(
     mapping_path: &Path,
     out: &Path,
     shards: u32,
+    window: CatalogWindow,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     if let Some(message) = unsupported_signal_message(signal) {
@@ -129,7 +170,7 @@ pub async fn run(
     let mapping = crate::load::parse_mapping(&text)?;
     selection.print_header();
     let report = export_logs(
-        store, selection, tenant, start_ns, end_ns, &mapping, out, shards, now_ns,
+        store, selection, tenant, start_ns, end_ns, &mapping, out, shards, window, now_ns,
     )
     .await?;
     println!("output: {}", out.display());
@@ -156,6 +197,7 @@ pub async fn export_logs(
     mapping: &Mapping,
     out: &Path,
     shards: u32,
+    window: CatalogWindow,
     now_ns: i64,
 ) -> anyhow::Result<ExportReport> {
     if end_ns <= start_ns {
@@ -171,10 +213,16 @@ pub async fn export_logs(
     // tenant's real shard-generation history decides which shards each hour is
     // scanned across, instead of short-circuiting to generation 0 and
     // under-scanning `0..--shards` after a reshard-increase.
-    let catalog_config = ravel_catalog::CatalogConfig {
+    let mut catalog_config = ravel_catalog::CatalogConfig {
         shard_count: shards,
         ..ravel_catalog::CatalogConfig::default()
     };
+    if let Some(ns) = window.max_ingest_lag_ns {
+        catalog_config.max_ingest_lag_ns = ns;
+    }
+    if let Some(ns) = window.max_flush_lifetime_ns {
+        catalog_config.max_flush_lifetime_ns = ns;
+    }
     let catalog = ravel_catalog::Catalog::new(Arc::clone(&store), catalog_config)
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
         .with_provisioning_enforcement();
@@ -247,6 +295,14 @@ fn decode_resources(
 /// Writes `records` to `out` in `EXPORT_BATCH_ROWS`-row batches and returns
 /// the row count written. An empty export still writes a schema-only file, so
 /// a loader pointed at it reads zero rows rather than failing to open it.
+///
+/// `out` is only ever replaced by a `rename` of a finished file. The rows are
+/// written to a sibling temporary file in the same directory and renamed over
+/// `out` after the Parquet writer closes, so a failure part-way through (a
+/// stored attribute whose type the mapping does not declare, a full disk)
+/// leaves any pre-existing `out` exactly as it was instead of having truncated
+/// it into a footer-less fragment. The temporary file is removed on every
+/// failure path, including a failed rename.
 fn write_parquet(
     mapping: &Mapping,
     records: &[LogRecord],
@@ -254,8 +310,81 @@ fn write_parquet(
     out: &Path,
 ) -> anyhow::Result<u64> {
     let empty = build_batch(mapping, &[])?;
-    let file = std::fs::File::create(out)
-        .with_context(|| format!("failed to create {}", out.display()))?;
+    let (tmp_path, file) = create_temp_output(out)?;
+    let rows_written = match write_batches(file, &empty, mapping, records, resource_by_stream, out) {
+        Ok(rows) => rows,
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+    };
+    if let Err(err) = std::fs::rename(&tmp_path, out) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(anyhow::Error::new(err).context(format!(
+            "failed to move the finished export from {} into place at {}",
+            tmp_path.display(),
+            out.display()
+        )));
+    }
+    Ok(rows_written)
+}
+
+/// Creates the sibling temporary file [`write_parquet`] writes into, and
+/// returns its path alongside the open handle.
+///
+/// The name is derived from `out` and made unique with the process id and an
+/// attempt counter, and every attempt opens with `create_new`, so two exports
+/// racing on one output directory never share a temporary file. Creating it
+/// beside `out` rather than in the system temp directory is what keeps the
+/// final step a rename within one filesystem, which is the atomic replace this
+/// relies on.
+fn create_temp_output(out: &Path) -> anyhow::Result<(std::path::PathBuf, std::fs::File)> {
+    let name = out
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} names no output file", out.display()))?;
+    let dir = match out.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let pid = std::process::id();
+    for attempt in 0..1024u32 {
+        let mut candidate_name = std::ffi::OsString::from(".");
+        candidate_name.push(name);
+        candidate_name.push(format!(".{pid}.{attempt}.tmp"));
+        let candidate = dir.join(candidate_name);
+        match std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "failed to create the temporary export file {}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    anyhow::bail!(
+        "failed to create a temporary export file beside {}: 1024 candidate names were all taken",
+        out.display()
+    )
+}
+
+/// Writes every batch into the already-open `file` and returns the row count.
+/// `out` is the final destination, used only to name the file in error
+/// messages: an operator reading one wants the path they passed, not the
+/// temporary name it is on its way through.
+fn write_batches(
+    file: std::fs::File,
+    empty: &RecordBatch,
+    mapping: &Mapping,
+    records: &[LogRecord],
+    resource_by_stream: &HashMap<LogStreamId, Vec<(String, AttrValue)>>,
+    out: &Path,
+) -> anyhow::Result<u64> {
     let mut writer = ArrowWriter::try_new(file, empty.schema(), None)
         .with_context(|| format!("failed to open a Parquet writer on {}", out.display()))?;
     let mut rows_written = 0u64;

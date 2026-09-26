@@ -564,13 +564,16 @@ enum Command {
     /// objects that snapshot names, and writes the columns the same
     /// `--mapping` TOML describes, sorted by event time, so `load --parquet
     /// <out> --mapping <same file>` reads the file back. This is a store read,
-    /// not a query: no SQL is planned and no server is contacted, but the
+    /// not a query: no SQL is planned and no `ravel-server` is contacted, but
+    /// the objects themselves are read from object storage as usual, and the
     /// visibility rules are the query path's own, so retention tombstones,
     /// compacted-away objects, and pending selective-erasure requests exclude
     /// the same records they exclude from a query.
     ///
     /// `--start`/`--end` are a half-open event-time window `[start, end)`: a
-    /// record at exactly `--end` is not exported.
+    /// record at exactly `--end` is not exported. The whole window is held in
+    /// memory before the first row is written, so export a wide range in
+    /// several narrower windows.
     ///
     /// Only `--signal logs` works today. Metrics and spans are refused by
     /// name: ADR-1751 sequences bulk import for each of them ahead of export
@@ -593,7 +596,10 @@ enum Command {
         /// `--start`.
         #[arg(long, value_name = "RFC3339", value_parser = ravel_cli::parse_rfc3339_ns)]
         end: i64,
-        /// Path of the Parquet file to write. Overwritten if it exists.
+        /// Path of the Parquet file to write. Replaced only once the export
+        /// finishes: the rows go to a temporary file beside it which is
+        /// renamed over it at the end, so a failed export leaves an existing
+        /// file untouched.
         #[arg(long, value_name = "FILE")]
         parquet: std::path::PathBuf,
         /// Path to the `--mapping` TOML naming the output columns. The same
@@ -606,6 +612,21 @@ enum Command {
         /// generations on top of it. Defaults to the server's default of 4.
         #[arg(long, default_value_t = 4)]
         shards: u32,
+        /// The deployment's `ravel-server --max-ingest-lag` (humantime
+        /// duration, e.g. `6h`). The catalog lists ingest-hour buckets from
+        /// `--start` minus this value forward, so a server configured above
+        /// the 2h default accepts records whose bucket a defaulted export
+        /// would not list. Pass the server's own value when it differs.
+        #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_ingest_lag_ns)]
+        max_ingest_lag: Option<i64>,
+        /// Override the resolve's `max_flush_lifetime` (humantime duration,
+        /// e.g. `2h`; same grammar as ravel-server's
+        /// `--gc-max-flush-lifetime`). It sets the seal margin below which
+        /// the resolve skips folded history; raise it to match a deployment
+        /// whose writers hold flushes open longer than the 1h default.
+        #[arg(long, value_name = "DURATION",
+              value_parser = ravel_cli::parse_max_flush_lifetime_ns)]
+        max_flush_lifetime: Option<i64>,
     },
 }
 
@@ -1924,6 +1945,8 @@ async fn main() -> anyhow::Result<()> {
             parquet,
             mapping,
             shards,
+            max_ingest_lag,
+            max_flush_lifetime,
         } => {
             ravel_cli::export::run(
                 store::build_store(&cli.store)?,
@@ -1935,6 +1958,10 @@ async fn main() -> anyhow::Result<()> {
                 &mapping,
                 &parquet,
                 shards,
+                ravel_cli::export::CatalogWindow {
+                    max_ingest_lag_ns: max_ingest_lag,
+                    max_flush_lifetime_ns: max_flush_lifetime,
+                },
                 now_ns()?,
             )
             .await

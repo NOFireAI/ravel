@@ -87,6 +87,23 @@ pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
     }
 }
 
+/// Parse an `export --max-ingest-lag` value into nanoseconds.
+///
+/// Same humantime grammar as [`parse_max_flush_lifetime_ns`], naming the flag
+/// it belongs to in its errors. It mirrors ravel-server's `--max-ingest-lag`,
+/// whose parser lives in a crate ravel-cli does not depend on at build time,
+/// so the grammar is matched here rather than shared. Zero is accepted: it is
+/// the value that narrows the resolve's listing window to exactly the
+/// requested `--start`, which is a legitimate thing to ask of a tenant known
+/// to have no late arrivals. Negative values are unrepresentable in humantime,
+/// so the only rejections are an unparseable spelling and a value too large
+/// for `i64` nanoseconds.
+pub fn parse_max_ingest_lag_ns(s: &str) -> Result<i64, String> {
+    let dur = humantime::parse_duration(s)
+        .map_err(|e| format!("invalid --max-ingest-lag '{s}': {e}"))?;
+    i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-ingest-lag '{s}' is too large"))
+}
+
 /// Parse an `export --start`/`--end` value: an RFC 3339 timestamp, to
 /// nanoseconds since the Unix epoch.
 ///

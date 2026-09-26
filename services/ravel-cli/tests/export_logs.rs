@@ -238,6 +238,7 @@ async fn load_then_export_round_trips_logs_field_by_field() {
         &m,
         &export_pq,
         1,
+        export::CatalogWindow::default(),
         load_now_ns,
     )
     .await
@@ -395,6 +396,7 @@ async fn export_refuses_unsupported_signal_metrics() {
         Path::new("/nonexistent/mapping.toml"),
         Path::new("/nonexistent/out.parquet"),
         1,
+        export::CatalogWindow::default(),
         BASE_NS,
     )
     .await
