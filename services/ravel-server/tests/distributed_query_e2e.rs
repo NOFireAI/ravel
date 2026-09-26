@@ -81,8 +81,9 @@ fn now_ns() -> i64 {
 /// at `base_ns`. Mirrors `query_byte_budget_e2e.rs`'s helper so a query over a
 /// window covering it resolves the snapshot, opens the segment, and (on the
 /// distributed server) produces at least one slice to fan out.
-async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) {
-    publish_segment_seq(store, tenant, base_ns, 1).await;
+/// Returns the published commit record's key.
+async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) -> String {
+    publish_segment_seq(store, tenant, base_ns, 1).await
 }
 
 /// [`publish_segment`] with the flush sequence number exposed, so one test can
@@ -93,7 +94,7 @@ async fn publish_segment_seq(
     tenant: &TenantId,
     base_ns: i64,
     writer_seq: u64,
-) {
+) -> String {
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {
         name: "__name__".to_string(),
@@ -169,6 +170,7 @@ async fn publish_segment_seq(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish");
+    keys::commit_key_for_record(&rec).expect("commit record key")
 }
 
 /// Zero thresholds force the cost gate open: every query with any in-scope
@@ -364,7 +366,7 @@ async fn distributed_query_http_equals_local_http() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new(TENANT);
     let now = now_ns();
-    publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+    let record_key = publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
     let (start, end) = ((now - 15 * NS_PER_MIN) / NS_PER_SEC, now / NS_PER_SEC);
 
     // Server A distributes every query; server B is local-only. Same store,
@@ -396,19 +398,54 @@ async fn distributed_query_http_equals_local_http() {
     // `stats.accounting` totals those phases sum to, is still compared
     // byte-for-byte, so a real divergence in the fanned-out result still flips
     // this assertion.
+    //
+    // The pooled GET totals are compared separately below, not byte-for-byte:
+    // the worker GETs each pinned L0 segment's own commit record to verify the
+    // shipped identity against it (ADR-0071 reconstruct-don't-trust), a request
+    // the local path does not repeat after its own resolve.
     let strip_phases = |body: &serde_json::Value| -> serde_json::Value {
         let mut data = body["data"].clone();
-        data["stats"]
-            .as_object_mut()
-            .expect("stats is an object")
+        let stats = data["stats"].as_object_mut().expect("stats is an object");
+        stats
             .remove("phases")
             .expect("stats carries the per-phase cost split");
+        let accounting = stats["accounting"]
+            .as_object_mut()
+            .expect("stats carries pooled accounting");
+        accounting
+            .remove("s3GetRequests")
+            .expect("accounting carries GET requests");
+        accounting
+            .remove("s3GetBytes")
+            .expect("accounting carries GET bytes");
         data
     };
     assert_eq!(
         strip_phases(&distributed_body),
         strip_phases(&local_body),
         "distributed `data` must be byte-identical to local outside the per-phase cost attribution:\n  distributed={distributed_body}\n  local={local_body}"
+    );
+    // Exactly one extra GET, of exactly the one pinned segment's commit record.
+    let record_len = store
+        .get(&record_key, GetRange::Full)
+        .await
+        .expect("commit record is present")
+        .data
+        .len() as u64;
+    let get_total = |body: &serde_json::Value, field: &str| -> u64 {
+        body["data"]["stats"]["accounting"][field]
+            .as_u64()
+            .expect("GET totals are integers")
+    };
+    assert_eq!(
+        get_total(&distributed_body, "s3GetRequests"),
+        get_total(&local_body, "s3GetRequests") + 1,
+        "the worker GETs the one pinned L0 segment's commit record once"
+    );
+    assert_eq!(
+        get_total(&distributed_body, "s3GetBytes"),
+        get_total(&local_body, "s3GetBytes") + record_len,
+        "the extra GET moves exactly the commit record's bytes"
     );
     // Sanity: the query actually returned the published series, so the equality
     // above is not the trivial equality of two empty results.
@@ -2065,15 +2102,18 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
     );
 }
 
-/// A worker-side store wrapper that splits what the worker reads into two
-/// counters -- catalog-shaped requests (any listing, and any read of something
-/// that is not an `.rseg` data object) and data-object reads -- and can hold
+/// A worker-side store wrapper that splits what the worker reads into three
+/// counters -- commit-record reads (a GET or HEAD of a `.cmt` key), other
+/// catalog-shaped requests (any listing, and any read of something that is
+/// neither a `.cmt` record nor an `.rseg` data object), and data-object
+/// reads -- and can hold
 /// the worker's first tenant read shut so a compaction can be committed while
 /// a fragment is in flight. `sys/` keys (heartbeats, the store probe, the
 /// tenancy marker) are the server's own background traffic and are counted
 /// under neither, so the tenant-prefixed counters stay attributable.
 struct WorkerProbeStore {
     inner: Arc<dyn ObjectStoreBackend>,
+    commit_record_gets: AtomicU64,
     catalog_requests: AtomicU64,
     data_object_gets: AtomicU64,
     armed: std::sync::atomic::AtomicBool,
@@ -2085,6 +2125,7 @@ impl WorkerProbeStore {
     fn new(inner: Arc<dyn ObjectStoreBackend>) -> Self {
         Self {
             inner,
+            commit_record_gets: AtomicU64::new(0),
             catalog_requests: AtomicU64::new(0),
             data_object_gets: AtomicU64::new(0),
             armed: std::sync::atomic::AtomicBool::new(false),
@@ -2099,6 +2140,8 @@ impl WorkerProbeStore {
         }
         if key.ends_with(".rseg") {
             self.data_object_gets.fetch_add(1, Ordering::SeqCst);
+        } else if key.ends_with(".cmt") {
+            self.commit_record_gets.fetch_add(1, Ordering::SeqCst);
         } else {
             self.catalog_requests.fetch_add(1, Ordering::SeqCst);
         }
@@ -2111,8 +2154,13 @@ impl WorkerProbeStore {
     }
 
     fn reset_counters(&self) {
+        self.commit_record_gets.store(0, Ordering::SeqCst);
         self.catalog_requests.store(0, Ordering::SeqCst);
         self.data_object_gets.store(0, Ordering::SeqCst);
+    }
+
+    fn commit_record_gets(&self) -> u64 {
+        self.commit_record_gets.load(Ordering::SeqCst)
     }
 
     fn catalog_requests(&self) -> u64 {
@@ -2206,8 +2254,9 @@ impl ObjectStoreBackend for WorkerProbeStore {
 
 /// ADR-0071's reconstruct-don't-trust rule, end to end: a compaction that
 /// commits between the coordinator's resolve and the worker's fetch cannot
-/// change what the worker reads, and the worker issues no catalog request at
-/// all while serving the fragment.
+/// change what the worker reads, and the worker's only catalog-shaped requests
+/// while serving the fragment are one GET per pinned L0 segment of that
+/// segment's own commit record, at the key reconstructed from the identity.
 ///
 /// The compaction is real: two L0 segments land in one sealed ingest-hour
 /// bucket and `compact_bucket` publishes an L1 part plus its compaction record
@@ -2222,9 +2271,11 @@ impl ObjectStoreBackend for WorkerProbeStore {
 /// `SNAPSHOT_INVALIDATED`, which the coordinator folds into one re-resolve and
 /// re-dispatch (`crates/ravel-query/src/distrib/mod.rs`), so the second round
 /// succeeds over the newly compacted L1 part and the rows still match. The
-/// assertion that flips is the exact-zero worker catalog-request count: with a
-/// per-request `catalog.resolve` on the worker path it is nonzero regardless of
-/// what the rows say.
+/// assertions that flip are the exact worker request counts: exactly two
+/// commit-record GETs (one per pinned L0 segment) and zero other catalog
+/// requests. A per-request `catalog.resolve` on the worker path lists the
+/// bucket, so the zero fails regardless of what the rows say; a worker that
+/// trusted the identity without reading the record fails the two.
 #[tokio::test]
 async fn compaction_between_resolve_and_fetch_returns_local_rows() {
     use std::sync::OnceLock;
@@ -2477,10 +2528,16 @@ async fn compaction_between_resolve_and_fetch_returns_local_rows() {
         "the distributed result is the exact grid the two pinned segments produce"
     );
     assert_eq!(
+        worker_store.commit_record_gets(),
+        2,
+        "the worker GETs each pinned L0 segment's own commit record exactly \
+         once, at the key reconstructed from the identity, to verify it"
+    );
+    assert_eq!(
         worker_store.catalog_requests(),
         0,
-        "the worker reconstructs object keys from the pinned identities and \
-         issues no catalog request; data-object reads were {}",
+        "beyond those two commit-record GETs the worker issues no catalog \
+         request (no listing, no compaction record); data-object reads were {}",
         worker_store.data_object_gets(),
     );
     assert_eq!(

@@ -65,20 +65,7 @@ use crate::span_fetcher::SpanRow;
 /// coordinator maps to a silent local fallback, so a rolling deploy degrades
 /// to raw fetch, never a corrupt answer -- the same pattern as the 2 -> 3
 /// bump above.
-///
-/// Bumped 4 -> 5 for issue #1721: `SegmentIdentity` carries the `SegmentRef`
-/// fields the fetch path needs that no key reconstruction can produce, so the
-/// worker can resolve a pinned slice from the shipped identities alone and stop
-/// re-resolving the catalog per fragment. `created_unix_ns` is the load-bearing
-/// one: it leads the cross-segment dedup total order an L0 segment stamps onto
-/// its samples and is not recoverable from the object footer, so a version-4
-/// coordinator's identities would leave it zero and silently reorder duplicate
-/// samples. That is why this is a version bump and not a quiet additive field:
-/// a version-4 worker seeing a version-5 request returns `Unsupported` through
-/// [`check_protocol_version`] and the coordinator runs the query locally, and
-/// the routing filter drops a version-4 worker from the worker set entirely, so
-/// no build ever resolves an identity whose provenance it cannot trust.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The ceiling on how many response frames a coordinator accepts for ONE slice
 /// before refusing it (issue #1687 part B). Paired with the per-slice byte cap
@@ -1492,16 +1479,17 @@ pub fn decode_erasure(predicates: Vec<pb::ErasurePredicate>) -> Vec<ErasurePredi
 // ---- SegmentRef -> SegmentIdentity ----------------------------------------
 
 /// Encodes a resolved [`SegmentRef`] as the wire identity a slice ships. Only
-/// durable, reconstructable metadata crosses; the worker rebuilds the object
-/// key from it and verifies the fetched footer against it (ADR-0071
+/// the durable identity fields cross; the worker reconstructs the object key
+/// and verifies the fetched footer against this identity (ADR-0071
 /// reconstruct-don't-trust), so the coordinator never ships a trusted key.
 ///
-/// The reverse map is `ReconstructingSegmentResolver`
-/// (`crate::distrib::service`), which rebuilds the key with
-/// `ravel_commit::keys` and requires it to parse back to this identity. Every
-/// field it needs is written here; adding a `SegmentRef` field that the fetch
-/// path reads means adding it to `SegmentIdentity` too, or the worker resolves
-/// a ref that silently differs from the coordinator's.
+/// The reverse map is not provided here: an identity carries only the durable
+/// key fields, so a full `SegmentRef` needs the segment's own commit (or
+/// compaction) record. The worker's
+/// [`ReconstructingSegmentResolver`](crate::distrib::service::ReconstructingSegmentResolver)
+/// rebuilds that record's key from the identity, GETs and verifies it, and
+/// builds the ref from the record; the identity's `segment_format_version` is
+/// not read there, since the record states the segment's own version.
 pub fn encode_segment_identity(seg: &SegmentRef) -> pb::SegmentIdentity {
     let (level, input_set_hash, part_index) = match &seg.level {
         SegmentLevel::L0 => (0u32, Vec::new(), 0u32),
@@ -1521,25 +1509,15 @@ pub fn encode_segment_identity(seg: &SegmentRef) -> pb::SegmentIdentity {
         part_index,
         content_hash: seg.content_hash.to_vec(),
         object_size: seg.object_size,
-        // This segment's own on-object format version, carried from whichever
-        // record the ref was resolved through. It is a read-shape routing hint
-        // (`SegmentRef::segment_format_version`), so the worker's reconstructed
-        // ref has to carry the same value the coordinator's did: stamping the
-        // newest supported version instead would route a segment written at an
-        // older accepted version down the wrong read shape.
-        segment_format_version: seg.segment_format_version,
-        // The `SegmentRef` fields no key reconstruction can produce.
-        // `created_unix_ns` is correctness-critical: it leads the cross-segment
-        // dedup total order an L0 segment stamps onto every sample it
-        // contributes, and the object footer cannot supply it
-        // (`base_created_unix_ns` is 0 for L0). The event range and counts are
-        // the segment's declared bounds, which the logs and spans fetch paths
-        // prune against before opening the object.
-        created_unix_ns: seg.created_unix_ns,
-        min_event_ts_ns: seg.min_event_ts_ns,
-        max_event_ts_ns: seg.max_event_ts_ns,
-        sample_count: seg.sample_count,
-        series_count: seg.series_count,
+        // The version every current segment is written at, read from the
+        // reader's supported-version window rather than from a version
+        // constant: `SegmentRef` carries no per-segment format version, so the
+        // identity names the version this build writes, and that value must
+        // follow a version bump instead of being restamped by hand (ADR-0092
+        // decision 7). Shipping the real version rather than a meaningless
+        // hardcoded 0 gives the reconstruct-and-verify path the version to
+        // check the fetched footer against.
+        segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
     }
 }
 
@@ -1854,14 +1832,12 @@ mod tests {
         }
     }
 
-    /// The protocol version is 5 (issue #1721): a worker reconstructs every
-    /// pinned object key from `SegmentIdentity` alone, so an identity from a
-    /// coordinator that predates the identity's `created_unix_ns`, event range
-    /// and counts must never reach one. See the doc comment on
-    /// `PROTOCOL_VERSION`.
+    /// ADR-0103 (epic #64): the protocol version is 4 now that the coordinator
+    /// sets `FetchRequest.partial_aggregate` live and `MergedSource` consumes
+    /// the reply -- see the doc comment on `PROTOCOL_VERSION`.
     #[test]
-    fn protocol_version_is_five() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn protocol_version_is_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]

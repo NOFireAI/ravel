@@ -24,17 +24,18 @@ ravel-logseg = { workspace = true }
 # log fetch path uses.
 ravel-rspan = { workspace = true }
 ravel-catalog = { workspace = true }
-# ADR-0010 §7 object-key reconstruction (`keys::data_key`, `keys::l1_part_key`
-# and their parsers). The ADR-0071 worker rebuilds every pinned segment's
-# object key from the shipped identity instead of resolving the catalog
-# (`distrib::service::ReconstructingSegmentResolver`), so this is production
-# code on the distributed read path; it was a dev-dependency before. ravel-commit
-# does not depend on ravel-query, so the edge is acyclic, and ravel-catalog
-# already pulls it into this graph.
+# ADR-0010 §7 record-key reconstruction and verification (`keys::commit_key`,
+# `keys::compaction_record_key`, `keys::verify_object_key` and the record
+# decoders). The ADR-0071 worker rebuilds every pinned segment's own record key
+# from the shipped identity, GETs and verifies that record, and builds the ref
+# from it (`distrib::service::ReconstructingSegmentResolver`), so this is
+# production code on the distributed read path; it was a dev-dependency before.
+# ravel-commit does not depend on ravel-query, so the edge is acyclic, and
+# ravel-catalog already pulls it into this graph.
 ravel-commit = { workspace = true }
-# Lowercase hex for the 8-byte key components the reconstruction compares
-# against a parsed key (`hash16`, `input_set_hash16`). Same workspace pin
-# ravel-commit's own key builders use; no new crate enters Cargo.lock.
+# Lowercase hex for the 8-byte `input_set_hash16` component of an L1 record
+# key. Same workspace pin ravel-commit's own key builders use; no new crate
+# enters Cargo.lock.
 hex = { workspace = true }
 ravel-promql = { workspace = true }
 # ADR-0071 distributed read fan-out: the frozen queryfrag wire

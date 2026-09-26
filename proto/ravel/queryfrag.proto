@@ -133,30 +133,6 @@ message SegmentIdentity {
   bytes content_hash = 9;   // 32 bytes; blake3 of the object
   uint64 object_size = 10;
   uint32 segment_format_version = 11;
-
-  // The `SegmentRef` fields the fetch path needs that no key reconstruction can
-  // produce. The worker rebuilds every object key from the fields above and
-  // issues no catalog request, so whatever the fetch reads before it opens the
-  // object has to travel here.
-  //
-  // `created_unix_ns` is load-bearing for correctness, not an optimization: it
-  // is the leading component of the cross-segment dedup total order
-  // (`created_unix_ns`, `writer_epoch`, `writer_seq`, in-page index) that an L0
-  // segment stamps onto every sample it contributes, and it is NOT recoverable
-  // from the object's own footer, whose `base_created_unix_ns` is 0 for L0. A
-  // zero here would silently reorder duplicate samples, which is the silent
-  // wrong read the reconstruct-don't-trust rule exists to prevent.
-  //
-  // The remaining four are the segment's declared event range and counts. The
-  // logs and spans fetch paths prune whole segments against the range before
-  // opening them, so an absent range there would turn a pruned read into a full
-  // one rather than a wrong one; they are shipped for the same reason, one
-  // round trip that the worker no longer has a catalog to ask for.
-  sint64 created_unix_ns = 12;
-  sint64 min_event_ts_ns = 13;
-  sint64 max_event_ts_ns = 14;
-  uint64 sample_count = 15;
-  uint64 series_count = 16;
 }
 
 // Cross-cluster scope: the remote resolves its own snapshot from these commit
