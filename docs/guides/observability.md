@@ -303,11 +303,17 @@ already carries on the ingest and postings families.
 Each of those loops runs under a supervisor. A panic in a tick body is caught,
 counted on `ravel_catalog_fold_loop_restarts_total` for that signal, logged at
 error level, and the loop is respawned after a bounded backoff that doubles
-from 1 s to 60 s and resets once an attempt completes a tick. A single
-transient panic therefore costs one skipped tick, not the loop. A loop that
-panics every tick keeps restarting and folds nothing, and that state is what
-the restart counter and `RavelCatalogFoldLoopCrashLooping` below exist to
-report. The liveness gauge cannot report it, because the replica keeps
+from 1 s to 60 s and resets once an attempt completes a tick. A respawned
+attempt ticks as soon as its backoff ends, not after a further fold interval.
+A single transient panic therefore costs one skipped tick, not the loop. A
+loop that panics every tick keeps restarting and folds nothing, and that state
+is what the restart counter and `RavelCatalogFoldLoopCrashLooping` below exist
+to report. At the defaults such a loop restarts at 0, 1, 3, 7, 15, 31, 63 and
+123 s after its first panic and every 60 s after that: 20 restarts in its
+first 15 minutes and 15 in every 15 minutes after, against the rule's
+threshold of more than 5 in 15m, which it crosses 31 s after the first panic.
+A single transient panic counts 1, and a loop that panics on every other tick
+counts about 3 per 15 minutes, one per fold interval, so neither fires. The liveness gauge cannot report it, because the replica keeps
 heartbeating and so keeps its pairs while its peers hold the fleet-wide
 maximum fresh.
 
@@ -403,8 +409,19 @@ groups:
         # on heartbeating, so it stays in the live set and keeps its pairs,
         # while its peers' fresh gauges hold max by (signal) under the stalled
         # threshold. This counter is the only figure that moves.
+        # At the defaults (300 s fold interval, restart backoff 1 s doubling
+        # to 60 s) a restarted attempt ticks as soon as its backoff ends, so
+        # a loop panicking on every tick restarts at 0, 1, 3, 7, 15, 31, 63
+        # and 123 s after its first panic and every 60 s after that: 20
+        # restarts in its first 15m and 15 in every 15m after. A single
+        # transient panic is 1, and a loop panicking on every other tick is
+        # about 3, one per fold interval. More than 5 is crossed 31 s into a
+        # crash loop and stays crossed, so the alert fires about 15.5 minutes
+        # after the loop starts panicking, plus scrape and evaluation delay.
+        # Panics only: a tick hung on a store call that never returns moves
+        # no counter here.
         expr: |
-          increase(ravel_catalog_fold_loop_restarts_total[15m]) > 3
+          increase(ravel_catalog_fold_loop_restarts_total[15m]) > 5
         for: 15m
         labels:
           severity: warning

@@ -74,8 +74,19 @@ groups:
         # on heartbeating, so it stays in the live set and keeps its pairs,
         # while its peers' fresh gauges hold max by (signal) under the stalled
         # threshold. This counter is the only figure that moves.
+        # At the defaults (300 s fold interval, restart backoff 1 s doubling
+        # to 60 s) a restarted attempt ticks as soon as its backoff ends, so
+        # a loop panicking on every tick restarts at 0, 1, 3, 7, 15, 31, 63
+        # and 123 s after its first panic and every 60 s after that: 20
+        # restarts in its first 15m and 15 in every 15m after. A single
+        # transient panic is 1, and a loop panicking on every other tick is
+        # about 3, one per fold interval. More than 5 is crossed 31 s into a
+        # crash loop and stays crossed, so the alert fires about 15.5 minutes
+        # after the loop starts panicking, plus scrape and evaluation delay.
+        # Panics only: a tick hung on a store call that never returns moves
+        # no counter here.
         expr: |
-          increase(ravel_catalog_fold_loop_restarts_total[15m]) > 3
+          increase(ravel_catalog_fold_loop_restarts_total[15m]) > 5
         for: 15m
         labels:
           severity: warning

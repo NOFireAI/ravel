@@ -46,14 +46,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   panic in a tick body is caught, counted on the new
   `ravel_catalog_fold_loop_restarts_total{signal}` counter, logged at error
   level, and the loop is respawned after a bounded backoff doubling from 1 s
-  to 60 s and resetting after a completed tick. The supervision is not
+  to 60 s and resetting after a completed tick; the respawned loop ticks as
+  soon as its backoff ends, so a loop panicking on every tick restarts 20
+  times in its first 15 minutes and 15 times in every 15 minutes after at the
+  defaults. The supervision is not
   optional under a partitioned fold: a replica whose loop dies keeps
   heartbeating, so it stays in the live set, keeps its pairs, and leaves them
   unfolded while its peers' fresh gauges hold `RavelCatalogFoldStalled`
   (`max by (signal)`) under its threshold. The new
   `RavelCatalogFoldLoopCrashLooping` rule in
-  `deploy/prometheus/ravel.rules.yaml` fires on more than 3 restarts in 15m,
-  unaggregated, because the condition is about one replica. **On upgrade**, a
+  `deploy/prometheus/ravel.rules.yaml` fires on more than 5 restarts in 15m,
+  unaggregated, because the condition is about one replica; such a loop
+  crosses it 31 s after its first panic, and a single transient panic counts
+  1. **On upgrade**, a
   `RavelCluster` with `spec.gateway.fold` set now fails the render before any
   tier renders, so the whole cluster stops reconciling until the field moves
   to `spec.maintain.fold`; a hand-written manifest passing `--disable-fold` or

@@ -376,7 +376,11 @@ struct LoopOutcome {
 /// the task. The supervisor counts the restart on
 /// [`FoldLoopMetrics::inc_restart`], logs it at error level with the signal,
 /// backs off (bounded, [`RESTART_BACKOFF_INITIAL`]..=[`RESTART_BACKOFF_MAX`])
-/// and spawns the next attempt. A join error (a panic that escaped the guard,
+/// and spawns the next attempt, which ticks as soon as the backoff ends rather
+/// than after a further interval. At the defaults a loop that panics on every
+/// tick therefore restarts at 0, 1, 3, 7, 15, 31, 63 and 123 s after its first
+/// panic and every 60 s after that, which is the rate
+/// `RavelCatalogFoldLoopCrashLooping` is sized against. A join error (a panic that escaped the guard,
 /// or an aborted task) is counted and restarted the same way, so the total
 /// never undercounts.
 ///
@@ -394,6 +398,7 @@ async fn run_supervisor(
     let signal = ctx.signal;
     let mut backoff = initial_backoff;
     let mut pending_backoff: Option<Duration> = None;
+    let mut restarted = false;
     loop {
         if let Some(wait) = pending_backoff.take() {
             tokio::select! {
@@ -402,8 +407,13 @@ async fn run_supervisor(
             }
         }
 
+        // Only a restarted attempt ticks at once: the first attempt waits one
+        // interval as at startup, and a restart that waited the interval too
+        // would bound the restart rate by the interval rather than the backoff.
+        let first_tick_immediate = restarted;
+        restarted = true;
         let (attempt_tx, attempt_rx) = oneshot::channel();
-        let mut attempt = tokio::spawn(run_loop(ctx.clone(), attempt_rx));
+        let mut attempt = tokio::spawn(run_loop(ctx.clone(), attempt_rx, first_tick_immediate));
 
         tokio::select! {
             _ = &mut shutdown => {
@@ -450,12 +460,23 @@ async fn run_supervisor(
 /// shutdown channel fires (returns [`LoopExit::Shutdown`]) or a tick body
 /// panics and is caught (returns [`LoopExit::Panicked`]). The supervisor
 /// ([`run_supervisor`]) owns this task's handle and restarts it on a panic.
-async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> LoopOutcome {
+///
+/// Each tick is preceded by a jittered `interval` sleep, except the first when
+/// `first_tick_immediate` is set, which is how a restarted attempt runs: its
+/// backoff already stood in for that wait.
+async fn run_loop(
+    ctx: LoopContext,
+    mut shutdown: oneshot::Receiver<()>,
+    first_tick_immediate: bool,
+) -> LoopOutcome {
     let mut completed_ticks: u64 = 0;
+    let mut skip_sleep = first_tick_immediate;
     let exit = loop {
-        tokio::select! {
-            _ = tokio::time::sleep(jittered(ctx.interval, ctx.rng.as_ref())) => {}
-            _ = &mut shutdown => break LoopExit::Shutdown,
+        if !std::mem::take(&mut skip_sleep) {
+            tokio::select! {
+                _ = tokio::time::sleep(jittered(ctx.interval, ctx.rng.as_ref())) => {}
+                _ = &mut shutdown => break LoopExit::Shutdown,
+            }
         }
 
         // The whole tick body runs inside `catch_unwind` so a panic anywhere in
@@ -840,6 +861,244 @@ mod tests {
             clock: Arc::new(FixedClock::new(NOW_NS)),
             tick_hook,
         }
+    }
+
+    /// A jitter source that always draws zero, so every sleep the loop takes
+    /// is exactly its base interval and the schedules below are exact.
+    struct ZeroJitter;
+
+    impl RngSource for ZeroJitter {
+        fn jitter_ms(&self, _max_ms: u64) -> u64 {
+            0
+        }
+
+        fn new_uuid(&self) -> Uuid {
+            Uuid::nil()
+        }
+    }
+
+    /// A tick hook that records the virtual instant of every tick it sees,
+    /// then panics on the calls `panics_on` selects (1-based call numbers).
+    fn recording_hook(
+        panics_on: impl Fn(usize) -> bool + Send + Sync + 'static,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+        Arc<dyn Fn() + Send + Sync>,
+    ) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_calls = Arc::clone(&calls);
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let call = {
+                let mut calls = hook_calls.lock().expect("hook lock");
+                calls.push(tokio::time::Instant::now());
+                calls.len()
+            };
+            if panics_on(call) {
+                panic!("injected catalog fold loop panic (test), call {call}");
+            }
+        });
+        (calls, hook)
+    }
+
+    /// Each tick's offset from the first, in whole milliseconds.
+    fn offsets_ms(calls: &[tokio::time::Instant]) -> Vec<u128> {
+        calls
+            .iter()
+            .map(|at| (*at - calls[0]).as_millis())
+            .collect()
+    }
+
+    /// The window `RavelCatalogFoldLoopCrashLooping` takes the increase over.
+    const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+    /// The restart count that window must exceed for the rule to fire.
+    const CRASH_LOOP_THRESHOLD: u64 = 5;
+
+    /// The shipped rule's expression, spelled with the two constants above, so
+    /// a rule edit that is not reflected here fails this test rather than
+    /// leaving it asserting against a threshold nobody ships.
+    #[test]
+    fn the_shipped_crash_loop_rule_uses_the_window_and_threshold_tested_here() {
+        let rules = include_str!("../../../deploy/prometheus/ravel.rules.yaml");
+        let expr = format!(
+            "increase(ravel_catalog_fold_loop_restarts_total[{}m]) > {CRASH_LOOP_THRESHOLD}",
+            CRASH_LOOP_WINDOW.as_secs() / 60
+        );
+        assert_eq!(
+            rules.matches(&expr).count(),
+            1,
+            "the shipped rules file carries `{expr}` exactly once"
+        );
+    }
+
+    /// At the DEFAULT fold interval and the default restart backoff, a loop
+    /// that panics on every tick crosses `RavelCatalogFoldLoopCrashLooping`'s
+    /// threshold well inside the rule's window, at the exact restart rate the
+    /// rule's comment and the observability guide state.
+    ///
+    /// The first attempt ticks after one full interval (300 s), as at startup.
+    /// Every restarted attempt then ticks as soon as its backoff ends, so the
+    /// restarts land at offsets 0, 1, 3, 7, 15, 31, 63 and 123 s from the first
+    /// panic, and every 60 s after that: 20 in the first 15 minutes, 15 in
+    /// every 15 minutes after. The threshold is crossed at the sixth restart,
+    /// 31 s after the first panic.
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_panicking_every_tick_at_the_defaults_crosses_the_crash_loop_threshold() {
+        let (store, catalog, tenant) = seeded_store().await;
+        let metrics = Arc::new(FoldLoopMetrics::default());
+        let (calls, tick_hook) = recording_hook(|_| true);
+        let mut ctx = loop_context(catalog.clone(), store, tenant, tick_hook);
+        ctx.interval = DEFAULT_FOLD_INTERVAL;
+        ctx.rng = Arc::new(ZeroJitter);
+
+        let started = tokio::time::Instant::now();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_supervisor(
+            ctx,
+            shutdown_rx,
+            Arc::clone(&metrics),
+            RESTART_BACKOFF_INITIAL,
+            RESTART_BACKOFF_MAX,
+        ));
+
+        // Two full windows after the first tick, on the paused clock: the
+        // runtime jumps from timer to timer, so every tick below lands at its
+        // exact deadline.
+        tokio::time::sleep_until(started + DEFAULT_FOLD_INTERVAL + 2 * CRASH_LOOP_WINDOW).await;
+        let calls = calls.lock().expect("hook lock").clone();
+        assert!(!calls.is_empty(), "the first attempt must tick and panic");
+        assert_eq!(
+            calls[0] - started,
+            DEFAULT_FOLD_INTERVAL,
+            "the first attempt ticks after one full interval, as at startup"
+        );
+
+        // The schedule the backoff bounds imply: each restart one backoff after
+        // the last, the backoff doubling from 1 s to its 60 s cap.
+        let mut expected: Vec<u128> = vec![0];
+        let mut backoff = RESTART_BACKOFF_INITIAL;
+        let mut at = Duration::ZERO;
+        loop {
+            at += backoff;
+            if at >= 2 * CRASH_LOOP_WINDOW {
+                break;
+            }
+            expected.push(at.as_millis());
+            backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+        }
+        let offsets = offsets_ms(&calls);
+        assert_eq!(
+            offsets, expected,
+            "every restarted attempt ticks as soon as its backoff ends"
+        );
+        assert_eq!(
+            &offsets[..9],
+            &[
+                0, 1_000, 3_000, 7_000, 15_000, 31_000, 63_000, 123_000, 183_000
+            ],
+            "the restart offsets the rule's comment and the guide state"
+        );
+
+        let window_ms = CRASH_LOOP_WINDOW.as_millis();
+        let first_window = offsets.iter().filter(|at| **at < window_ms).count();
+        let second_window = offsets
+            .iter()
+            .filter(|at| (window_ms..2 * window_ms).contains(*at))
+            .count();
+        assert_eq!(
+            first_window, 20,
+            "restarts in the first 15 minutes of panicking"
+        );
+        assert_eq!(
+            second_window, 15,
+            "restarts in each later 15 minutes, one per 60 s cap"
+        );
+        assert!(
+            u64::try_from(second_window).expect("fits") > CRASH_LOOP_THRESHOLD,
+            "the steady-state rate stays over the threshold, so the rule's `for` holds"
+        );
+        assert_eq!(
+            offsets[usize::try_from(CRASH_LOOP_THRESHOLD).expect("fits")],
+            31_000,
+            "the restart that crosses the threshold lands 31 s after the first panic"
+        );
+        assert_eq!(
+            metrics.restarts_for(Signal::Metrics),
+            u64::try_from(calls.len()).expect("fits"),
+            "every panicked tick is counted as exactly one restart"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
+    }
+
+    /// The restart backoff doubles from 1 s across consecutive panics, holds
+    /// at its 60 s cap, and resets to 1 s once an attempt completes a tick.
+    ///
+    /// Calls 1 to 10 panic, call 11 completes (the restarted attempt then
+    /// sleeps one interval), call 12 panics after that completed tick, and
+    /// calls 13 on complete.
+    #[tokio::test(start_paused = true)]
+    async fn the_restart_backoff_doubles_to_its_cap_and_resets_after_a_completed_tick() {
+        let (store, catalog, tenant) = seeded_store().await;
+        let metrics = Arc::new(FoldLoopMetrics::default());
+        let (calls, tick_hook) = recording_hook(|call| call <= 10 || call == 12);
+        let mut ctx = loop_context(catalog.clone(), store, tenant, tick_hook);
+        ctx.rng = Arc::new(ZeroJitter);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_supervisor(
+            ctx,
+            shutdown_rx,
+            Arc::clone(&metrics),
+            RESTART_BACKOFF_INITIAL,
+            RESTART_BACKOFF_MAX,
+        ));
+
+        let reached = async {
+            for _ in 0..2_000 {
+                if calls.lock().expect("hook lock").len() >= 14 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            false
+        }
+        .await;
+        assert!(reached, "the loop reaches its 14th tick");
+
+        let calls = calls.lock().expect("hook lock").clone();
+        let gaps_ms: Vec<u128> = calls[..14]
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).as_millis())
+            .collect();
+        let interval_ms = TEST_INTERVAL.as_millis();
+        assert_eq!(
+            gaps_ms,
+            vec![
+                1_000,
+                2_000,
+                4_000,
+                8_000,
+                16_000,
+                32_000,
+                60_000,
+                60_000,
+                60_000,
+                60_000,
+                // Call 11 completes, then the attempt sleeps one interval.
+                interval_ms,
+                // Call 12 panics after a completed tick: back to 1 s.
+                1_000,
+                // Call 13 completes; call 14 follows one interval later.
+                interval_ms,
+            ],
+            "1, 2, 4 ... capped at 60 s, reset to 1 s after a completed tick"
+        );
+        assert_eq!(metrics.restarts_for(Signal::Metrics), 11);
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
     }
 
     /// A panic in one signal's tick body is caught, counted exactly once on

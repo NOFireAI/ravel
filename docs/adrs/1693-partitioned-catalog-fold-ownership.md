@@ -233,7 +233,10 @@ Two changes, neither of which touches the ownership rule:
 1. **Each signal's fold loop runs under a supervisor.** The tick body is
    guarded, a caught panic ends that attempt rather than the task, and a fresh
    attempt is spawned after a bounded backoff that doubles from 1 s to 60 s
-   and resets once an attempt completes a tick. Each restart is logged at
+   and resets once an attempt completes a tick, and the fresh attempt ticks as
+   soon as its backoff ends rather than after a further fold interval, so the
+   restart rate of a crash loop is set by the backoff and not by the interval.
+   Each restart is logged at
    error level with the signal and counted on a new counter,
    `ravel_catalog_fold_loop_restarts_total{signal}`, rendered beside the
    existing fold families and under the same gate as the liveness gauge:
@@ -244,10 +247,15 @@ Two changes, neither of which touches the ownership rule:
    (`ravel_maintain_loop_panics_total`); the fold simply never got it.
 
 2. **A crash loop is alerted on.** `RavelCatalogFoldLoopCrashLooping` fires on
-   `increase(ravel_catalog_fold_loop_restarts_total[15m]) > 3` held for 15m,
+   `increase(ravel_catalog_fold_loop_restarts_total[15m]) > 5` held for 15m,
    at `warning`. It is deliberately unaggregated: the condition is about one
    replica, and the whole defect above is a peer's health averaging that
-   replica away.
+   replica away. The threshold comes from the restart rate at the defaults: a
+   loop panicking on every tick restarts at 0, 1, 3, 7, 15, 31, 63 and 123 s
+   after its first panic and every 60 s after that, 20 restarts in its first
+   15 minutes and 15 in every 15 minutes after, and crosses more than 5 at the
+   sixth, 31 s in. A single transient panic counts 1, and a loop panicking on
+   every other tick about 3.
 
 A single transient panic is not the target of either change. It costs one
 skipped tick and restarts promptly, which is what the backoff reset is for.
