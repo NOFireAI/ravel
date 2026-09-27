@@ -52,11 +52,21 @@
 //!   so it holds there (issue #928). A backend that issues no HTTP requests (for example
 //!   [`crate::memory::MemoryStore`]) leaves `attempts` at zero: there is no bill
 //!   and nothing retried. Because a single logical read may fan a whole-object
-//!   `GetRange::Full` into several bounded ranged GETs, `attempts` can exceed
-//!   `calls` for `get` even with no retry at all; each ranged request is a real
-//!   billed request. `attempts` for `put` likewise counts every request a
+//!   `GetRange::Full` into an unranged GET cut at the per-request bound plus
+//!   ranged GETs for the rest, `attempts` can exceed `calls` for `get` even
+//!   with no retry at all; each of those requests is a real billed request. `attempts` for `put` likewise counts every request a
 //!   multipart upload issues (create, each part, complete), not one per logical
 //!   `put`.
+//! - `get_unverified` (`ravel_store_get_unverified_total`) is a store-wide total,
+//!   not a per-op block: it counts full-object reads the S3 adapter served
+//!   without checking the body against a stored checksum, because the response
+//!   carried no `x-amz-checksum-*` header, carried one this adapter cannot
+//!   recompute, or arrived as several responses none of which is the
+//!   whole object (ADR-1696 decision 3). Like `attempts`, it is recorded by the
+//!   adapter's HTTP connector's owner rather than by this decorator, through
+//!   [`StoreMetrics::record_get_unverified`]. Zero for a backend that is not the
+//!   S3 adapter. A non-zero and *growing* value against an endpoint that is
+//!   supposed to store checksums is the signal that it is dropping them.
 //! - `errors[class]` is indexed by [`StoreErrorClass`], one slot per
 //!   [`StoreError`] variant. `AlreadyExists` under `CreateIfAbsent` is a
 //!   protocol signal rather than a failure (ADR-0002), so a healthy commit
@@ -409,6 +419,10 @@ impl OpMetricsSnapshot {
 #[derive(Debug, Default)]
 pub struct StoreMetrics {
     ops: [OpMetrics; STORE_OP_COUNT],
+    /// `ravel_store_get_unverified_total`: full-object reads served without a
+    /// checksum check (ADR-1696 decision 3). Store-wide rather than per-op:
+    /// only `get` can move it, so a per-op block would be five permanent zeros.
+    get_unverified: AtomicU64,
 }
 
 impl StoreMetrics {
@@ -432,6 +446,21 @@ impl StoreMetrics {
     /// contend on the same field. See the [module docs](self).
     pub fn record_attempt(&self, op: StoreOp) {
         self.op(op).record_attempt();
+    }
+
+    /// Record one full-object read served without verifying it against a
+    /// stored checksum (`ravel_store_get_unverified_total`, ADR-1696
+    /// decision 3). The S3 adapter records this once per logical full-object
+    /// `get`, not once per HTTP request, so a large object split into several
+    /// bounded requests counts one unverified read rather than one per chunk. It touches no other counter.
+    pub fn record_get_unverified(&self) {
+        self.get_unverified.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current value of `ravel_store_get_unverified_total`, for a caller that
+    /// wants the one counter without taking a whole [`snapshot`](Self::snapshot).
+    pub fn get_unverified(&self) -> u64 {
+        self.get_unverified.load(Ordering::Relaxed)
     }
 
     /// Record one completed call from outside this module, using the same
@@ -461,6 +490,7 @@ impl StoreMetrics {
             list: self.op(StoreOp::List).snapshot(),
             list_delimited: self.op(StoreOp::ListDelimited).snapshot(),
             delete: self.op(StoreOp::Delete).snapshot(),
+            get_unverified: self.get_unverified.load(Ordering::Relaxed),
         }
     }
 }
@@ -476,6 +506,10 @@ pub struct StoreMetricsSnapshot {
     pub list: OpMetricsSnapshot,
     pub list_delimited: OpMetricsSnapshot,
     pub delete: OpMetricsSnapshot,
+    /// `ravel_store_get_unverified_total`: full-object reads the S3 adapter
+    /// served without checking the body against a stored checksum (ADR-1696
+    /// decision 3). Store-wide, not per-op; see the [module docs](self).
+    pub get_unverified: u64,
 }
 
 impl StoreMetricsSnapshot {
@@ -789,6 +823,36 @@ mod tests {
         // never drifts on a backend that issues no HTTP (e.g. MemoryStore).
         assert_eq!(snap.put.attempts, 0);
         assert_eq!(snap.head.attempts, 0);
+    }
+
+    /// `ravel_store_get_unverified_total` is store-wide and independent of
+    /// every per-op counter (ADR-1696 decision 3): a read that was served
+    /// without a checksum check is still an ordinary successful `get`, so
+    /// recording one must not touch `calls`, `ok`, `errors` or `attempts`, and
+    /// the two accessors must agree.
+    #[test]
+    fn get_unverified_is_store_wide_and_touches_no_op_counter() {
+        let metrics = StoreMetrics::default();
+        metrics.record(StoreOp::Get, 10_000, 42, None);
+        metrics.record_get_unverified();
+        metrics.record_get_unverified();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.get_unverified, 2, "two unverified full-object reads");
+        assert_eq!(
+            metrics.get_unverified(),
+            snap.get_unverified,
+            "the direct accessor and the snapshot must read one counter"
+        );
+        assert_eq!(snap.get.calls, 1, "the read itself is one ordinary call");
+        assert_eq!(snap.get.ok, 1);
+        assert_eq!(snap.get.attempts, 0);
+        assert_eq!(snap.get.errors_total(), 0);
+        assert_eq!(
+            StoreMetrics::default().snapshot().get_unverified,
+            0,
+            "a store that recorded nothing reads exactly zero"
+        );
     }
 
     #[test]

@@ -264,6 +264,105 @@ mod tests {
         assert!(matches!(err, PublishError::SplitBrain { .. }));
     }
 
+    /// Byte offset, within an encoded [`sample_record`], of the last byte of
+    /// the `max_event_ts_ns` varint, and the bit inside it whose flip leaves a
+    /// record that still decodes and still validates. Found by flipping every
+    /// bit of the encoding in turn and keeping the ones that decode to a
+    /// different `max_event_ts_ns`; the assertions below re-derive both, so a
+    /// change to the record shape fails loudly here instead of silently
+    /// corrupting a byte that does not matter.
+    const MAX_EVENT_TS_FLIP: (usize, u32) = (233, 6);
+
+    /// ADR-1696 follow-up task 3, the acceptance test from the ticket restated
+    /// for the transport mechanism that replaced the ticket's proposed record
+    /// framing: publish a record, flip one byte of the *stored* object, and the
+    /// read is refused.
+    ///
+    /// The first half of the test is what the fix prevents, asserted rather
+    /// than described. Against the pre-fix tree the flipped object came back
+    /// from the store as an ordinary `Ok`, `record::decode` accepted it, and
+    /// `validate` accepted it too (`min_event_ts_ns` is 0, so 0 <= 36 holds):
+    /// `max_event_ts_ns` read 36 where the writer wrote 100, which moves the
+    /// segment out of any query whose range starts above 36 and makes the
+    /// answer short and error-free. `decode` still accepts those bytes today,
+    /// because the record layout did not change (ADR-1696 decision 6); what
+    /// changed is that the store no longer hands them over.
+    #[tokio::test]
+    async fn a_corrupted_stored_commit_record_reads_as_corrupted() {
+        let store = MemoryStore::new();
+        let record = sample_record([7; 32]);
+        publish(&store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        let key = keys::commit_key_for_record(&record).expect("key");
+        let stored = store.get(&key, GetRange::Full).await.expect("get").data;
+
+        let (offset, bit) = MAX_EVENT_TS_FLIP;
+        let mut flipped = stored.to_vec();
+        flipped[offset] ^= 1u8 << bit;
+        let decoded = record::decode(&flipped)
+            .expect("the flipped bytes are still a decodable, valid CommitRecord");
+        assert_eq!(
+            record.max_event_ts_ns, 100,
+            "the record as written carries the writer's max event timestamp"
+        );
+        assert_eq!(
+            decoded.max_event_ts_ns, 36,
+            "the flip must land inside max_event_ts_ns, which is the whole point \
+             of this offset"
+        );
+        assert_eq!(
+            decoded.content_hash, record.content_hash,
+            "content_hash is untouched, so the publish-time comparison sees a \
+             matching record and never reaches SplitBrain"
+        );
+
+        store
+            .corrupt_stored_byte(&key, offset, bit)
+            .expect("flip one bit of the stored object");
+        let err = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect_err("a corrupted stored record must not be served");
+        assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+    }
+
+    /// The same corruption reached through the production read that motivated
+    /// the ticket: `publish`'s `AlreadyExists` path GETs the stored record whole
+    /// and compares `content_hash`. Pre-fix that GET returned the corrupted
+    /// record, it compared equal, and the publish reported idempotent success
+    /// while the catalog kept a record with a wrong `max_event_ts_ns`. Now the
+    /// GET is refused and the caller sees a store error it can retry or shed,
+    /// which is also why the fatal `SplitBrain` arm can no longer fire on a
+    /// corrupt stored record.
+    #[tokio::test]
+    async fn republishing_over_a_corrupted_stored_record_is_a_store_error() {
+        let store = MemoryStore::new();
+        let record = sample_record([8; 32]);
+        publish(&store, &record, &RetryPolicy::default())
+            .await
+            .expect("first publish");
+        let key = keys::commit_key_for_record(&record).expect("key");
+        let (offset, bit) = MAX_EVENT_TS_FLIP;
+        store
+            .corrupt_stored_byte(&key, offset, bit)
+            .expect("flip one bit of the stored object");
+
+        let err = publish(&store, &record, &RetryPolicy::default())
+            .await
+            .expect_err("the AlreadyExists comparison must not read corrupted bytes");
+        assert!(
+            matches!(
+                err,
+                PublishError::Store {
+                    source: StoreError::Corrupted(_),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn put_data_object_is_idempotent_on_already_exists() {
         let store = MemoryStore::new();
