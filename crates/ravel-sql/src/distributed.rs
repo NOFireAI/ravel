@@ -391,7 +391,8 @@ pub struct DistributedFlightConfig {
     /// default) leaves the service's keys untouched, so a single-process
     /// fixture whose coordinator and worker are the same instance stays
     /// byte-identical. A deployment with a rotating key file installs its keys
-    /// through `RavelFlightSqlService::with_ticket_keys` instead.
+    /// through `RavelFlightSqlService::with_ticket_keys` instead, and those
+    /// keys take precedence over this one in either call order.
     ///
     /// [`SqlTicketKeys::from_file_keys`]: crate::flight_ticket::SqlTicketKeys::from_file_keys
     pub shared_ticket_key: Option<TicketKey>,
