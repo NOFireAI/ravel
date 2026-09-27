@@ -9,6 +9,11 @@
 //! flush lands every time. The ordering is established with a cooperative poll on
 //! the buffered-points counter rather than a real `tokio::time::sleep`, so
 //! the test cannot race.
+//!
+//! The second half pins the flush cadence of the three age tiers (ADR-1737)
+//! over one injected-clock hour on each of the metrics, log, and span
+//! pipelines: the idle clock with `idle_flush_byte_floor` off, the
+//! `max_flush_lifetime` hold below a non-zero floor, and the fast clock.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -16,11 +21,15 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestClock, make_point, tenant};
-use ravel_ingest::{IngestConfig, IngestRouter, WriteMode};
+use common::{TestClock, make_point, span_on_shard, tenant};
+use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, WriteMode};
+use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
-use ravel_types::Signal;
+use ravel_otlp::logs_normalize::NormalizedLogRecord;
+use ravel_otlp::traces_normalize::NormalizedSpan;
+use ravel_types::logstream::{AttrValue, log_stream_id};
+use ravel_types::{Signal, TenantId};
 
 const BASE_NS: i64 = 1_700_000_000_000_000_000;
 
@@ -173,9 +182,6 @@ async fn idle_buffer_defers_age_trigger() {
         // Comfortably above one point's estimated buffered size, so the
         // buffer stays "idle" for the whole test.
         min_flush_bytes: 1_000_000,
-        // Pins the middle band: with the default floor this one-point buffer
-        // would be held toward max_flush_lifetime instead (issue #1737).
-        idle_flush_floor_bytes: 0,
         flush_tick: Duration::from_millis(10),
         ..IngestConfig::default()
     };
@@ -235,150 +241,444 @@ async fn idle_buffer_defers_age_trigger() {
 /// One injected-clock hour at the default 200 ms `flush_tick`, in ticks.
 const TICKS_PER_HOUR: u64 = 18_000;
 
+/// Below the 256 KiB default `min_flush_bytes`, and above the object bytes
+/// any pipeline's near-idle case buffers in an hour: 360 units, each under 128
+/// estimated object bytes (a scalar sample is 16, the log record and span
+/// below are under 100).
+const FLOOR_ABOVE_NEAR_IDLE: usize = 128 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pipeline {
+    Metrics,
+    Logs,
+    Spans,
+}
+
+const PIPELINES: [Pipeline; 3] = [Pipeline::Metrics, Pipeline::Logs, Pipeline::Spans];
+
+/// The flush counters every pipeline's snapshot carries that an age case can
+/// move, plus the size counter so a case proves the size trigger stayed out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FlushCounts {
+    by_size: u64,
+    by_age: u64,
+    by_age_floor: u64,
+}
+
+/// What one pipeline did over one injected-clock hour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HourResult {
+    pipeline: Pipeline,
+    flushes: FlushCounts,
+    data_objects: usize,
+    commit_records: usize,
+}
+
+enum AnyRouter {
+    Metrics(IngestRouter),
+    Logs(LogIngestRouter),
+    Spans(SpanIngestRouter),
+}
+
+fn unit_ts(seq: u64) -> i64 {
+    1_000 + i64::try_from(seq).expect("seq fits i64")
+}
+
+/// A log record on one fixed stream.
+fn log_record(seq: u64) -> NormalizedLogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    let scope_attrs: Vec<(String, AttrValue)> = Vec::new();
+    NormalizedLogRecord {
+        stream_id: log_stream_id(&resource, "scope", "", &scope_attrs),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "", &scope_attrs),
+        ts_ns: unit_ts(seq),
+        observed_ts_ns: unit_ts(seq),
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: "x".to_string(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
+/// A span on one fixed trace, with a span id unique to `seq`.
+fn span(seq: u64) -> NormalizedSpan {
+    let mut span = span_on_shard(0, 1, unit_ts(seq));
+    span.span_id = seq.to_le_bytes();
+    span
+}
+
+impl AnyRouter {
+    fn new(
+        pipeline: Pipeline,
+        config: IngestConfig,
+        store: &Arc<dyn ObjectStoreBackend>,
+        clock: &Arc<TestClock>,
+    ) -> Self {
+        let store = Arc::clone(store);
+        match pipeline {
+            Pipeline::Metrics => AnyRouter::Metrics(IngestRouter::new(
+                config,
+                store,
+                Signal::Metrics,
+                clock.clone(),
+            )),
+            Pipeline::Logs => AnyRouter::Logs(LogIngestRouter::new(config, store, clock.clone())),
+            Pipeline::Spans => {
+                AnyRouter::Spans(SpanIngestRouter::new(config, store, clock.clone()))
+            }
+        }
+    }
+
+    /// Writes `count` units numbered from `first_seq` to one series, stream,
+    /// or trace, and returns the number of commit tokens the receipt carries.
+    async fn write(&self, tenant: &TenantId, first_seq: u64, count: u64, mode: WriteMode) -> usize {
+        let deadline = Duration::from_secs(5);
+        let seqs = first_seq..first_seq + count;
+        match self {
+            AnyRouter::Metrics(router) => {
+                let points = seqs
+                    .map(|s| make_point(tenant, "cpu_usage", &[("host", "a")], unit_ts(s), 1.0))
+                    .collect();
+                router
+                    .write(tenant.clone(), points, mode, deadline)
+                    .await
+                    .expect("metrics write")
+                    .tokens
+                    .len()
+            }
+            AnyRouter::Logs(router) => router
+                .write(
+                    tenant.clone(),
+                    seqs.map(log_record).collect(),
+                    mode,
+                    deadline,
+                )
+                .await
+                .expect("log write")
+                .tokens
+                .len(),
+            AnyRouter::Spans(router) => router
+                .write(tenant.clone(), seqs.map(span).collect(), mode, deadline)
+                .await
+                .expect("span write")
+                .tokens
+                .len(),
+        }
+    }
+
+    /// Units the shard actors have buffered since the router started.
+    fn buffered_units(&self) -> u64 {
+        match self {
+            AnyRouter::Metrics(router) => router.metrics().snapshot().buffered_points_total,
+            AnyRouter::Logs(router) => router.metrics().snapshot().buffered_records_total,
+            AnyRouter::Spans(router) => router.metrics().snapshot().buffered_spans_total,
+        }
+    }
+
+    fn flushes(&self) -> FlushCounts {
+        match self {
+            AnyRouter::Metrics(router) => {
+                let s = router.metrics().snapshot();
+                assert_eq!(
+                    s.flushes_by_age_adaptive, 0,
+                    "adaptive delay is off in every case here"
+                );
+                FlushCounts {
+                    by_size: s.flushes_by_size,
+                    by_age: s.flushes_by_age,
+                    by_age_floor: s.flushes_by_age_floor,
+                }
+            }
+            AnyRouter::Logs(router) => {
+                let s = router.metrics().snapshot();
+                FlushCounts {
+                    by_size: s.flushes_by_size,
+                    by_age: s.flushes_by_age,
+                    by_age_floor: s.flushes_by_age_floor,
+                }
+            }
+            AnyRouter::Spans(router) => {
+                let s = router.metrics().snapshot();
+                FlushCounts {
+                    by_size: s.flushes_by_size,
+                    by_age: s.flushes_by_age,
+                    by_age_floor: s.flushes_by_age_floor,
+                }
+            }
+        }
+    }
+
+    async fn shutdown(self) {
+        match self {
+            AnyRouter::Metrics(router) => router.shutdown().await,
+            AnyRouter::Logs(router) => router.shutdown().await,
+            AnyRouter::Spans(router) => router.shutdown().await,
+        }
+    }
+}
+
+async fn yield_n(n: usize) {
+    for _ in 0..n {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Drives one tenant through one injected-clock hour, one `flush_tick` per
-/// step: every `write_every_ticks` ticks it buffers `points_per_write`
-/// scalar points on one series, then advances the clock by one tick and
+/// step: every `write_every_ticks` ticks it buffers `units_per_write` units,
+/// waits for the actor to hold them, then advances the clock by one tick and
 /// yields so the actor's age check and any flush it opens run before the next
-/// write. Returns `(flushes_by_age, data objects, commit records)`.
+/// write. The objects are counted before shutdown, whose drain would add more.
 async fn one_hour_at_rate(
+    pipeline: Pipeline,
     config: IngestConfig,
-    points_per_write: usize,
+    units_per_write: u64,
     write_every_ticks: u64,
-) -> (u64, usize, usize) {
+) -> HourResult {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let clock = TestClock::new(BASE_NS);
     let tick_ns = i64::try_from(config.flush_tick.as_nanos()).expect("tick fits i64");
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
+    let router = AnyRouter::new(pipeline, config, &store, &clock);
     let tenant = tenant("acme");
     let mut written = 0u64;
     for tick in 0..TICKS_PER_HOUR {
         if tick % write_every_ticks == 0 {
-            let points = (0..points_per_write)
-                .map(|i| {
-                    let ts =
-                        i64::try_from(written).expect("fits") + i64::try_from(i).expect("fits");
-                    make_point(&tenant, "cpu_usage", &[("host", "a")], 1_000 + ts, 1.0)
-                })
-                .collect();
             router
-                .write(
-                    tenant.clone(),
-                    points,
-                    WriteMode::Buffered,
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect("buffered write is acknowledged at enqueue");
-            written += points_per_write as u64;
-            while router.metrics().snapshot().buffered_points_total < written {
+                .write(&tenant, written, units_per_write, WriteMode::Buffered)
+                .await;
+            written += units_per_write;
+            while router.buffered_units() < written {
                 tokio::task::yield_now().await;
             }
         }
         clock.advance_ns(tick_ns);
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
+        yield_n(16).await;
     }
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
-    let snapshot = router.metrics().snapshot();
-    assert_eq!(
-        snapshot.flushes_by_size, 0,
-        "only the age trigger may fire at these rates"
-    );
+    yield_n(64).await;
+    let flushes = router.flushes();
     let objects = list_all(store.as_ref(), "t/").await.expect("list");
-    let data = objects.iter().filter(|o| o.key.contains("/l0/")).count();
-    let commits = objects.iter().filter(|o| o.key.contains("/c/")).count();
+    let data_objects = objects.iter().filter(|o| o.key.contains("/l0/")).count();
+    let commit_records = objects.iter().filter(|o| o.key.contains("/c/")).count();
     router.shutdown().await;
-    (snapshot.flushes_by_age, data, commits)
+    HourResult {
+        pipeline,
+        flushes,
+        data_objects,
+        commit_records,
+    }
 }
 
-/// Issue #1737: a near-idle buffer (one scalar point every 10 s, 16 object
-/// bytes each, so about 5.8 KB in the hour and never at
-/// `idle_flush_floor_bytes`) used to flush on every 40 s idle tick, 90 flushes
-/// and 180 objects an hour. Below the floor it is held until one idle window
-/// short of `max_flush_lifetime` (3560 s), so the hour writes one flush.
-#[tokio::test]
-async fn near_idle_buffer_flushes_once_an_hour() {
-    let (flushes, data, commits) = one_hour_at_rate(IngestConfig::default(), 1, 50).await;
-    assert_eq!(flushes, 1, "one hold-to-lifetime flush in the hour");
-    assert_eq!((data, commits), (1, 1));
+async fn one_hour_on_every_pipeline(
+    config: IngestConfig,
+    units_per_write: u64,
+    write_every_ticks: u64,
+) -> Vec<HourResult> {
+    let mut results = Vec::new();
+    for pipeline in PIPELINES {
+        results.push(one_hour_at_rate(pipeline, config, units_per_write, write_every_ticks).await);
+    }
+    results
 }
 
-/// Middle band: 25 points a second (400 object bytes a second) crosses
-/// `idle_flush_floor_bytes` inside every 40 s idle window without reaching
-/// `min_flush_bytes`, so the buffer keeps today's idle clock: 90 flushes and
-/// 180 objects an hour, unchanged by the floor.
-#[tokio::test]
-async fn middle_band_buffer_keeps_the_idle_clock() {
-    let (flushes, data, commits) = one_hour_at_rate(IngestConfig::default(), 5, 1).await;
-    assert_eq!(flushes, 90, "one flush per 40 s idle window");
-    assert_eq!((data, commits), (90, 90));
+/// The result every pipeline must produce: `flushes` flushes opened, each
+/// writing one data object and one commit record.
+fn on_every_pipeline(flushes: FlushCounts, objects: usize) -> Vec<HourResult> {
+    PIPELINES
+        .iter()
+        .map(|&pipeline| HourResult {
+            pipeline,
+            flushes,
+            data_objects: objects,
+            commit_records: objects,
+        })
+        .collect()
 }
 
-/// Fast band: 32 points per 200 ms tick (2560 object bytes a second) reaches a
-/// 4 KiB `min_flush_bytes` inside every 2 s `max_flush_delay` window, so the
-/// buffer flushes on the fast clock: 1800 flushes and 3600 objects an hour,
-/// unchanged by the floor.
+/// Near idle, floor off (the default): one unit every 10 s never reaches
+/// `min_flush_bytes`, so every pipeline flushes on the 40 s idle clock, 90
+/// times in the hour, exactly as before ADR-1737.
 #[tokio::test]
-async fn fast_band_buffer_keeps_the_fast_clock() {
+async fn near_idle_with_the_floor_off_flushes_on_the_idle_clock() {
+    let config = IngestConfig::default();
+    assert_eq!(config.idle_flush_byte_floor, 0);
+    let results = one_hour_on_every_pipeline(config, 1, 50).await;
+    let expected = FlushCounts {
+        by_size: 0,
+        by_age: 90,
+        by_age_floor: 0,
+    };
+    assert_eq!(results, on_every_pipeline(expected, 90));
+}
+
+/// Near idle, floor on: the same trickle stays below the floor all hour, so
+/// every pipeline holds its buffer for `max_flush_lifetime` from the first
+/// unit, which the hour's last tick reaches. One flush, counted on
+/// `flushes_by_age_floor` and not on `flushes_by_age`.
+#[tokio::test]
+async fn near_idle_below_the_floor_holds_for_the_flush_lifetime() {
     let config = IngestConfig {
-        min_flush_bytes: 4 * 1024,
+        idle_flush_byte_floor: FLOOR_ABOVE_NEAR_IDLE,
         ..IngestConfig::default()
     };
-    let (flushes, data, commits) = one_hour_at_rate(config, 32, 1).await;
-    assert_eq!(flushes, 1800, "one flush per 2 s fast window");
-    assert_eq!((data, commits), (1800, 1800));
+    assert_eq!(config.validate(), Ok(()));
+    assert_eq!(config.max_flush_lifetime, Duration::from_secs(3600));
+    let results = one_hour_on_every_pipeline(config, 1, 50).await;
+    let expected = FlushCounts {
+        by_size: 0,
+        by_age: 0,
+        by_age_floor: 1,
+    };
+    assert_eq!(results, on_every_pipeline(expected, 1));
 }
 
-/// A strict-mode waiter on a one-point buffer, far below
-/// `idle_flush_floor_bytes`, still flushes on the 2 s fast clock: the floor
-/// holds only buffers nobody is blocked on, so acknowledged-write latency is
-/// unchanged.
+/// Middle band, floor on: five units per tick cross a 4 KiB floor inside
+/// every 40 s window without reaching `min_flush_bytes`, so every pipeline
+/// keeps the idle clock: 90 flushes in the hour.
+#[tokio::test]
+async fn middle_band_above_the_floor_keeps_the_idle_clock() {
+    let config = IngestConfig {
+        idle_flush_byte_floor: 4 * 1024,
+        ..IngestConfig::default()
+    };
+    assert_eq!(config.validate(), Ok(()));
+    let results = one_hour_on_every_pipeline(config, 5, 1).await;
+    let expected = FlushCounts {
+        by_size: 0,
+        by_age: 90,
+        by_age_floor: 0,
+    };
+    assert_eq!(results, on_every_pipeline(expected, 90));
+}
+
+/// Fast band, floor on: 32 units per tick reach a 4 KiB `min_flush_bytes`
+/// inside every 2 s `max_flush_delay` window, so every pipeline flushes on the
+/// fast clock: 1800 flushes in the hour.
+#[tokio::test]
+async fn fast_band_keeps_the_fast_clock() {
+    let config = IngestConfig {
+        min_flush_bytes: 4 * 1024,
+        idle_flush_byte_floor: 1024,
+        ..IngestConfig::default()
+    };
+    assert_eq!(config.validate(), Ok(()));
+    let results = one_hour_on_every_pipeline(config, 32, 1).await;
+    let expected = FlushCounts {
+        by_size: 0,
+        by_age: 1800,
+        by_age_floor: 0,
+    };
+    assert_eq!(results, on_every_pipeline(expected, 1800));
+}
+
+/// A strict-mode waiter on a one-unit buffer, far below the floor, still
+/// flushes on the 2 s fast clock on every pipeline: the floor holds only
+/// buffers nobody is blocked on (ADR-1737 decision 4).
 #[tokio::test]
 async fn strict_waiter_below_the_floor_flushes_on_the_fast_clock() {
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let clock = TestClock::new(BASE_NS);
-    let config = IngestConfig::default();
+    let config = IngestConfig {
+        idle_flush_byte_floor: FLOOR_ABOVE_NEAR_IDLE,
+        ..IngestConfig::default()
+    };
     let tick_ns = i64::try_from(config.flush_tick.as_nanos()).expect("tick fits i64");
     let fast_ns = i64::try_from(config.max_flush_delay.as_nanos()).expect("delay fits i64");
-    let router = IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone());
-    let tenant = tenant("acme");
-    let points = vec![make_point(
-        &tenant,
-        "cpu_usage",
-        &[("host", "a")],
-        1_000,
-        1.0,
-    )];
+    for pipeline in PIPELINES {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(BASE_NS);
+        let router = AnyRouter::new(pipeline, config, &store, &clock);
+        let tenant = tenant("acme");
 
-    let (write_result, ()) = tokio::join!(
-        router.write(
-            tenant.clone(),
-            points,
-            WriteMode::Strict,
-            Duration::from_secs(5)
-        ),
-        async {
-            while router.metrics().snapshot().buffered_points_total < 1 {
+        let (tokens, ()) = tokio::join!(router.write(&tenant, 0, 1, WriteMode::Strict), async {
+            while router.buffered_units() < 1 {
                 tokio::task::yield_now().await;
             }
             // Exactly `max_flush_delay` in ticks, then stop: the ack must
-            // arrive without the clock reaching the 40 s idle threshold.
+            // arrive without the clock reaching the idle clock or the hold.
             for _ in 0..fast_ns / tick_ns {
                 clock.advance_ns(tick_ns);
-                for _ in 0..16 {
-                    tokio::task::yield_now().await;
-                }
+                yield_n(16).await;
             }
-        },
-    );
+        });
 
-    let receipt = write_result.expect("the strict waiter flushes on the fast clock");
-    assert_eq!(receipt.tokens.len(), 1);
-    assert_eq!(clock.now(), BASE_NS + fast_ns);
-    let snapshot = router.metrics().snapshot();
-    assert_eq!(snapshot.flushes_by_age, 1);
-    router.shutdown().await;
+        assert_eq!(tokens, 1, "{pipeline:?}");
+        assert_eq!(clock.now(), BASE_NS + fast_ns, "{pipeline:?}");
+        assert_eq!(
+            router.flushes(),
+            FlushCounts {
+                by_size: 0,
+                by_age: 1,
+                by_age_floor: 0,
+            },
+            "{pipeline:?}"
+        );
+        router.shutdown().await;
+    }
+}
+
+/// Writes one metrics point every `write_every_ticks` ticks and returns the
+/// injected-clock time, from the first point, at which the first age flush
+/// opened, with the counters at that moment.
+async fn first_age_flush(config: IngestConfig, write_every_ticks: u64) -> (i64, FlushCounts) {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(BASE_NS);
+    let tick_ns = i64::try_from(config.flush_tick.as_nanos()).expect("tick fits i64");
+    let router = AnyRouter::new(Pipeline::Metrics, config, &store, &clock);
+    let tenant = tenant("acme");
+    let mut written = 0u64;
+    for tick in 0..TICKS_PER_HOUR {
+        if tick % write_every_ticks == 0 {
+            router.write(&tenant, written, 1, WriteMode::Buffered).await;
+            written += 1;
+            while router.buffered_units() < written {
+                tokio::task::yield_now().await;
+            }
+        }
+        clock.advance_ns(tick_ns);
+        yield_n(16).await;
+        let flushes = router.flushes();
+        if flushes.by_age + flushes.by_age_floor > 0 {
+            router.shutdown().await;
+            return (clock.now() - BASE_NS, flushes);
+        }
+    }
+    panic!("no age flush in the hour");
+}
+
+/// A trickle that starts below the floor moves up to the idle tier as its
+/// bytes reach the floor, and the idle clock runs from its oldest point.
+///
+/// One point every 2 s on one series: the first point is 70 estimated object
+/// bytes (32 series overhead, 22 label bytes, one 16-byte sample) and each
+/// later one adds 16, so the buffer holds `54 + 16 * n` bytes after `n` points.
+/// With a 300-byte floor the 16th point, at 30 s, crosses it, and the flush
+/// opens at 40 s. With a 375-byte floor the buffer holds 374 bytes when it
+/// turns 40 s old, so it is still held; the 21st point, written at 40 s,
+/// crosses the floor and the next tick, at 40.2 s, flushes it.
+#[tokio::test]
+async fn a_trickle_that_reaches_the_floor_flushes_on_the_idle_clock() {
+    let on_idle_clock = FlushCounts {
+        by_size: 0,
+        by_age: 1,
+        by_age_floor: 0,
+    };
+    let crossed_at_30s = IngestConfig {
+        idle_flush_byte_floor: 300,
+        ..IngestConfig::default()
+    };
+    assert_eq!(
+        first_age_flush(crossed_at_30s, 10).await,
+        (40_000_000_000, on_idle_clock)
+    );
+    let crossed_at_40s = IngestConfig {
+        idle_flush_byte_floor: 375,
+        ..IngestConfig::default()
+    };
+    assert_eq!(
+        first_age_flush(crossed_at_40s, 10).await,
+        (40_200_000_000, on_idle_clock)
+    );
 }
