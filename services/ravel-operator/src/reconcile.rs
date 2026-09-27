@@ -719,11 +719,23 @@ fn resources(
     }
 }
 
-/// Liveness and readiness probes pointed at `/healthz` and `/readyz` on the
-/// gateway/query/maintain HTTP port ([`HTTP_PORT`], ADR-0034 decision 4).
-/// Returned as `(liveness, readiness)`.
-fn probes() -> (Probe, Probe) {
-    probes_on(HTTP_PORT)
+/// Liveness and readiness probes for the gateway/query/maintain pods, pointed
+/// at `/healthz` and `/readyz` on [`HTTP_PORT`] (ADR-0034 decision 4) or, under
+/// `spec.probes.dedicatedHealthPort`, on [`HEALTH_PORT`] (ADR-1702 decision
+/// 10). Only the port changes: the paths and the timing are the same either
+/// way. Returned as `(liveness, readiness)`.
+fn probes(spec: &RavelClusterSpec) -> (Probe, Probe) {
+    probes_on(server_probe_port(spec))
+}
+
+/// The port the server tiers' probes hit: [`HEALTH_PORT`] when the spec opts
+/// into the dedicated health listener, [`HTTP_PORT`] otherwise.
+fn server_probe_port(spec: &RavelClusterSpec) -> i32 {
+    if spec.probes.dedicated_health_port {
+        HEALTH_PORT
+    } else {
+        HTTP_PORT
+    }
 }
 
 /// [`probes`] parameterized by port, so the ravel-native router (which listens
@@ -850,14 +862,20 @@ fn pod_anti_affinity(instance: &str, component: &str) -> Affinity {
 /// ports, replica count, and strategy. The single place the common container
 /// shape (image, probes, resources) is assembled, so gateway/query/maintain
 /// cannot drift in how they wire the server.
+///
+/// The dedicated health listener is wired here rather than in each tier
+/// (ADR-1702 decision 10): every ravel-server tier serves the same health
+/// routes, so the `--listen-health` argument, the `health` container port, and
+/// the probe port move together for all three. The ingest-router does not go
+/// through this builder and keeps its probes on [`ROUTER_HTTP_PORT`].
 #[allow(clippy::too_many_arguments)]
 fn deployment(
     spec: &RavelClusterSpec,
     instance: &str,
     component: &str,
-    args: Vec<String>,
+    mut args: Vec<String>,
     env: Vec<EnvVar>,
-    ports: Vec<ContainerPort>,
+    mut ports: Vec<ContainerPort>,
     replicas: i32,
     resources_spec: Option<&ResourceRequirementsSpec>,
     default_resources: (&str, &str),
@@ -865,7 +883,16 @@ fn deployment(
     secrets_checksum: &str,
 ) -> Deployment {
     let labels = labels(instance, component);
-    let (liveness, readiness) = probes();
+    if spec.probes.dedicated_health_port {
+        args.push("--listen-health".to_string());
+        args.push(format!("0.0.0.0:{HEALTH_PORT}"));
+        ports.push(ContainerPort {
+            name: Some(HEALTH_PORT_NAME.to_string()),
+            container_port: HEALTH_PORT,
+            ..Default::default()
+        });
+    }
+    let (liveness, readiness) = probes(spec);
     let volume_mount = deployment_key_volume_mount(spec);
     let volume = deployment_key_volume(spec);
     let container = Container {
