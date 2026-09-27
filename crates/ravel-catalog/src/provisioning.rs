@@ -1762,8 +1762,8 @@ pub struct FloorObservation {
     /// compaction and rewrite parts) whose `segment_format_version` is below
     /// the floor being classified.
     pub live_below_floor: u64,
-    /// Newest `created_unix_ns` among every commit-family record enumerated,
-    /// or `None` when there are none.
+    /// Newest `created_unix_ns` among the same live commit-family entries
+    /// (superseded L0 commit records excluded), or `None` when there are none.
     pub newest_created_unix_ns: Option<i64>,
     /// Shard range the audit scanned.
     pub scan_shards: u32,
