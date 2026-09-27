@@ -1967,11 +1967,17 @@ pipeline it never ran.
 | Metric | Meaning |
 |---|---|
 | `ravel_audit_write_failures_total` | Query-audit writes that failed and were released anyway under `--audit-mode best-effort`. Each one is a query that was served with no durable audit record. |
+| `ravel_audit_put_retries_total` | audit PUT attempts retried after a transient object-store error. |
 
 A transient object-store error (a timeout or a throttle response) is retried
-a few times with a short backoff before a write counts as failed here, so
-this counter reflects writes that kept failing across every attempt, not a
-single slow request. Under `--audit-mode required` (the default) a failed audit write fails the
+up to two additional times with a short jittered backoff, all within one
+30-second budget per flush covering both of its PUTs, before a write counts
+as failed here, so `ravel_audit_write_failures_total` reflects writes that
+kept failing until that budget ran out, not a single slow request; each
+individual retried attempt along the way is what
+`ravel_audit_put_retries_total` counts, so a climbing value there with a flat
+`ravel_audit_write_failures_total` means the store is degraded but the
+retries are still absorbing it. Under `--audit-mode required` (the default) a failed audit write fails the
 query with a 503 instead, and is not counted here, so this counter is always
 zero on a fail-closed deployment. On a best-effort one, any increase is the
 audit trail going incomplete while queries keep succeeding, which is why an
