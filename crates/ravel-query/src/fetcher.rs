@@ -4513,6 +4513,121 @@ mod tests {
         );
     }
 
+    /// A 16-series L1 object, one scalar run per series, with an L1
+    /// `SegmentRef`, and the series names in on-disk (series id) order.
+    fn many_run_l1_segment() -> (Bytes, TenantHash, SegmentRef, Vec<String>) {
+        let tenant_hash = TenantHash([14u8; 16]);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let input_set_hash = [0x44u8; 32];
+        let meta = CompactionMetaV4 {
+            ingest_hour_bucket: 0,
+            input_set_hash,
+            part_index: 0,
+            level: 1,
+        };
+        const NS: i64 = 1_000_000_000;
+        let tenant_id = TenantId::new("t".to_string());
+        let mut series: Vec<SeriesInputV7> = (0..16)
+            .map(|i| {
+                let name = format!("s{i:02}");
+                let label_set = labels(&name);
+                let id = SeriesId::compute(&tenant_id, &name, &label_set).expect("series id");
+                let v = f64::from(i);
+                let samples = SeriesValues::Scalar(vec![
+                    Sample {
+                        ts_ns: 1_000 * NS,
+                        value: v,
+                    },
+                    Sample {
+                        ts_ns: 1_001 * NS,
+                        value: v + 0.5,
+                    },
+                ]);
+                let run = encode_run_v4(&id, 100, 0, 0, &samples).expect("frame run");
+                SeriesInputV7 {
+                    series_id: id,
+                    labels: label_set,
+                    runs: vec![RunInputV7 {
+                        run,
+                        provenance: None,
+                    }],
+                }
+            })
+            .collect();
+        series.sort_by_key(|s| s.series_id.0);
+        let order = series
+            .iter()
+            .map(|s| s.labels.get("__name__").expect("metric name").to_string())
+            .collect();
+        let written =
+            SegmentWriter::write_v7_with_provenance(series, identity, bounds, meta, Vec::new())
+                .expect("write L1");
+        let seg_ref = SegmentRef {
+            data_object_key: "test/many-runs-l1.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 100,
+            level: SegmentLevel::L1 {
+                input_set_hash,
+                part_index: 0,
+            },
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (written.bytes, tenant_hash, seg_ref, order)
+    }
+
+    /// An L1 fetch is exempt from `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`: it
+    /// issues one page-range GET per coalesced run however many there are,
+    /// and bridges no gap.
+    #[tokio::test]
+    async fn l1_fetch_issues_one_page_range_get_per_run() {
+        let (bytes, tenant_hash, seg_ref, order) = many_run_l1_segment();
+        assert_eq!(order.len(), 16);
+        // The first GET (16-byte tail), the footer chase and one catalog GET.
+        const OPEN_AND_CATALOG: u64 = 3;
+        let alternate: Vec<&String> = order.iter().step_by(2).collect();
+        assert_eq!(alternate.len(), 8);
+        let one: Vec<&String> = alternate.iter().copied().take(1).collect();
+        // A selected series' TS and VAL pages are separate runs, and an
+        // unselected series sits between consecutive selected ones, so every
+        // other series is 16 runs, four times the L0 bound.
+        let cases: [(&str, &[&String], u64); 2] = [
+            ("one series: a TS and a VAL run", &one, 2),
+            ("every other series: 16 runs", &alternate, 16),
+        ];
+        for (label, names, page_gets) in cases {
+            let (gets, got) = many_run_fetch(&bytes, tenant_hash, &seg_ref, names, false).await;
+            let (whole_gets, truth) =
+                many_run_fetch(&bytes, tenant_hash, &seg_ref, names, true).await;
+            assert_eq!(whole_gets, 1, "{label}: reference read");
+            assert_eq!(got, truth, "{label}: ranged reads decode the same data");
+            assert_eq!(gets, OPEN_AND_CATALOG + page_gets, "{label}: GETs");
+        }
+        let (gets, _) = many_run_fetch(&bytes, tenant_hash, &seg_ref, &alternate, false).await;
+        assert_eq!(gets, 19);
+        assert!(gets > MAX_GETS_PER_L0_SEGMENT_FETCH);
+    }
+
     #[test]
     fn fetched_regions_slice_is_zero_copy_within_one_buffer() {
         let mut regions = FetchedRegions::default();
