@@ -16,7 +16,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/healthz` there returns 503 once the heartbeat is older than 60 s, and
   `/readyz` once it is older than 30 s or any existing readiness condition
   fails. The flag is unset by default, so nothing binds, and the routes on
-  `--listen-http` are unchanged.
+  `--listen-http` are unchanged. Startup refuses a `--listen-health` address
+  equal to any other listener's, and shutdown waits at most 5 s for open
+  health connections before dropping them.
 - **`/metrics` now renders a per-shard ingest skew family** (issue #1692).
   `ravel_ingest_shard_messages_enqueued_total`,
   `ravel_ingest_shard_messages_processed_total`,
