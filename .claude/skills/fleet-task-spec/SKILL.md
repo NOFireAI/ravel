@@ -5,73 +5,55 @@ description: Use when writing a fleet_dispatch spec for this repo - templates th
 
 # Writing a fleet task spec for Ravel
 
-Fleet executors are unattended and context-limited. Two real failures shape
-this skill: an agent finished hours of work, asked "want me to commit?",
-and died unpushed; another burned its entire context window grepping
-arrow-rs sources.
-
-The repo CLAUDE.md already tells executors the gates, commit conventions,
-invariants, testing patterns, and context discipline. Do not restate those
-in specs. A spec carries only what is task-specific.
-
-CLAUDE.md's "Workspace isolation" section tells every agent working in
-this repo to commit inside a dedicated git worktree, never directly on the
-primary checkout. That rule targets local subagents sharing one session's
-tree. A fleet executor's dispatched checkout already is its own isolated
-workspace; if it also obeys the literal instruction and creates a *second*
-worktree/branch inside that checkout, the harness, which only collects
-what ends up on the checkout's own HEAD, never sees those commits.
-`fleet_status` will still report `done` with what looks like a result ref,
-but the ref was never pushed and the workdir is gone: the work is silently
-lost. This has destroyed finished work in practice. Every spec for this
-repo must therefore open with the harness-override paragraph below, not
-just the unattended one.
+Fleet executors are unattended, context-limited, and cannot be woken once
+their turn ends. CLAUDE.md already gives them the gates, commit
+conventions, invariants, testing patterns and context discipline, so a
+spec carries only what is task-specific plus the template's executor-only
+paragraphs. `reference.md` beside this file holds the evidence behind each
+rule; read it when a rule looks wrong for your case.
 
 ## Template
+
+Copy it whole. The HARNESS REQUIREMENT paragraph is not optional: an
+executor that obeys CLAUDE.md's worktree rule literally commits to a side
+branch, `fleet_status` still reports `done`, and the work is lost with the
+workdir. The first line declares `EXPECTS_REF: yes` for an implementation
+task or `EXPECTS_REF: no` for a review, audit or research task.
 
 ```
 EXPECTS_REF: yes
 
 HARNESS REQUIREMENT (overrides CLAUDE.md's workspace-isolation section for
-you specifically -- you are a fleet executor, not a local subagent sharing
-someone else's session tree): commit directly on this dispatched checkout's
-HEAD. Detached HEAD is fine. Do not create a separate git worktree or a
-side branch for your own commits -- the harness only collects what is on
-this checkout's HEAD; anything committed elsewhere is invisible to it and
-lost when your workdir is torn down.
+you: you are a fleet executor, not a local subagent): commit directly on
+this dispatched checkout's HEAD. Detached HEAD is fine. Do not create a
+separate git worktree or side branch: the harness collects only this
+checkout's HEAD, and anything committed elsewhere is lost with the workdir.
 
 UNATTENDED TASK: never ask for confirmation or approval; when your work
-passes the gates, commit it and end with a report. Committing
-(git commit -s) is part of the deliverable.
+passes the gates, commit it (git commit -s) and end with a report.
 
 DEGRADED-BOX TRIPWIRE, your very first command, before reading anything:
 
     time git config user.email "fleet-executor@nofire.ai"
-    time git config user.name "Ravel Fleet Executor"
 
-You need both of these before your first commit anyway. Read the elapsed
-time on the FIRST one before running the second: if it took more than 30
-seconds, stop there. A degraded box takes 90 to 120 seconds per command,
-so waiting for both doubles the time lost.
-
-On a breach, STOP: do not read a file, do not start the work. Report
+If it took more than 30 seconds, STOP: do not read a file or start the
+work. Report
 
     DEGRADED EXECUTOR: git config took <N>s
     <the output of `uname -a`>
     <the output of `nproc`>
 
-and end the task. The two extra lines identify the box, so the
-orchestrator can quarantine it instead of losing another task to it.
+and end the task. That box reaches the four-hour ceiling before a first
+commit, so ending now costs only a redispatch, and the extra lines let the
+orchestrator quarantine it. Otherwise run
+`git config user.name "Ravel Fleet Executor"` and continue.
 
-The four-hour ceiling arrives on that box before a first commit does, so
-COMMIT EARLY below cannot save you. Ending in two minutes with a report
-costs a redispatch; carrying on costs the whole task.
-
-COMMIT EARLY: `git commit -s` the first state that compiles, before you
-go on to the rest. Never put any command in the background and never end
-your turn waiting for one. Nothing will wake you -- your turn ending ends
+COMMIT EARLY: `git commit -s` the first state that compiles, before the
+rest of the work; if a later gate fails, fix it and amend or add a
+commit. Never put any command in the background and never end
+your turn waiting for one. Nothing will wake you: your turn ending ends
 the task, and anything uncommitted is lost with no result ref. A slow cold
-build here is expected; wait for it in the foreground.
+build is expected; wait for it in the foreground.
 
 Implement <issue ref> for the Ravel project: <one sentence>. Work ONLY
 inside <crates/dirs>.
@@ -82,84 +64,59 @@ Already on main: <the building blocks the task consumes, one line each>.
 Deliverables:
 1..n. <numbered, concrete, with file paths and API shapes>
 
-Reachability: <the caller that will exercise this, named. If the task adds
-a capability no existing caller reaches, say so here and say which ticket
-wires it.>
+Reachability: <the caller that will exercise this, named. If none does
+yet, say so and name the ticket that wires it.>
 
 Tests: <the specific behaviors to prove, including failure paths>.
 
-Gates: format and lint IN PLACE before the commit you will gate -- run
-`cargo fmt --all` (not just --check) and, where it applies, scoped
-`cargo clippy --fix -p <crate>` -- then verify with `cargo fmt --all
---check`; cargo clippy --workspace --all-targets -- -D warnings;
-scripts/affected-tests.sh -p <crate> [-p <crate2>].
+Gates, in this order:
+1. Format and lint in place: `cargo fmt --all` and, where it applies,
+   `cargo clippy --fix -p <crate>`. The gated commit must already be
+   formatted; never add a formatting-only fixup commit.
+2. `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --
+   -D warnings`; `scripts/affected-tests.sh -p <crate> [-p <crate2>]`.
+   Do not run `cargo test --workspace`: merge time runs the full suite,
+   and affected-tests.sh covers your crates plus every crate that
+   depends on them.
 
-Build parallelism: prefix every cargo command and every script that runs
-cargo with `CARGO_BUILD_JOBS=<n>`, because `scripts/affected-tests.sh`
-accepts no `--jobs` flag. Compute n on this box, do not assume a machine
-shape: `min(4, max(2, nproc / 4))`, and 2 when total memory
-(`/proc/meminfo` MemTotal, or `sysctl -n hw.memsize`) is 11 GB or less.
-A higher value gets `ld` killed with signal 9 during a cold
-`--all-targets` link, which reads as a compiler error. The value you
-export also overrides the memory-based cap inside `scripts/gates.sh`.
-Report `uname -m`, `nproc`, the memory, the value you used, and which
-bound decided it.
+Prefix every cargo command, and every script that runs cargo, with
+`CARGO_BUILD_JOBS=<n>` (affected-tests.sh has no `--jobs` flag). n is
+`min(4, max(2, nproc / 4))`, or 2 when total memory (`/proc/meminfo`
+MemTotal, or `sysctl -n hw.memsize`) is 11 GB or less: a higher value gets
+`ld` killed with signal 9 mid-link, which reads as a compiler error. The
+value also overrides the cap inside `scripts/gates.sh`. Report `uname -m`,
+`nproc`, the memory, n, and which bound decided it.
 
-Do not run `cargo test --workspace`: full-workspace tests run at merge
-time (verify-dispatch cold gate and PR CI); your job is the blast radius
-of your own change, and affected-tests.sh computes it (the named crates
-plus every crate that depends on them). The commit that gets gated must
-already be formatted; never append a formatting-only fixup commit after
-a failed --check.
-
-Run every gate command unpiped and read its own exit code
-(`cmd; code=$?`), never `| tail` / `| head` / `| grep`: a pipeline
-reports the last stage's exit code, so a failed test can read as passed.
-If the output is long, redirect it to a file and read the file
-separately. Before the first gate, run this as ONE command, substituting
-nothing:
+Run every gate unpiped and read its own exit code (`cmd; code=$?`),
+never `| tail` / `| head` / `| grep`: a pipeline reports the last stage's
+exit code, so a failed test can read as passed. Before the first gate,
+run this as ONE command, substituting nothing:
 
     mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 5 && df -h /tmp . "$HOME"
 
-The `&&` chain fails the command at the first failing step, and
-`git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
-the directory before a log is written there. The path is literal because
-each tool call is its own shell and a variable set in one call is empty
-in the next.
-
-If the guard exits non-zero, say so in your report and stop rather than
-picking another directory: a host without 5 GB for a log has no room for
-the gate either, and the run would die mid-link with a fake compiler
-error. Otherwise redirect every long gate to `.gate-logs/<step>.log`.
-
-Keep logs inside the checkout. HOME on the amd64 executor class is a
-1 GB tmpfs, so the headroom guard fails there before any gate runs.
-`/tmp` is the harness's own capture filesystem: filling it fails every
-later Bash call, including `true` and `df`, while the host's disk
-figures still look healthy. Exporting `CLAUDE_CODE_TMPDIR` from inside
-the task changes nothing, because the harness reads it before your first
-Bash call. The tracked `.gitignore` lists `.gate-logs/` and `.dd-tools/`
-(for any `cargo install --root "$PWD/.dd-tools"` tree), so the harness's
-commit-on-death `git add -A` cannot sweep them into a wip commit. Quote
-all three `df` lines (`/tmp`, `.`, and `"$HOME"`) in your report.
-Commit with trailer "Refs: #N".
+If it fails, report that and stop rather than picking another directory:
+a host without 5 GB for logs has no room for the gate either. Otherwise
+redirect every long gate to `.gate-logs/<step>.log` and read the file.
+Keep logs inside the checkout: HOME on the amd64 class is a 1 GB tmpfs,
+`/tmp` is the harness's capture filesystem and filling it breaks every
+later Bash call, and exporting `CLAUDE_CODE_TMPDIR` from inside the task
+changes nothing. `.gate-logs/` and `.dd-tools/` (for any `cargo install
+--root "$PWD/.dd-tools"` tree) are gitignored; never force-add them. Quote
+the three `df` lines in your report. Commit with trailer "Refs: #N".
 
 CLAIMS AUDIT, before the commit you gate, reported afterwards: list every
 sentence you wrote or edited in docs, HELP text, doc comments or an ADR
 that asserts a property of the system, and name the test or exact code
 line that makes it true. Delete or qualify any you cannot pair with one.
 Do not write "never" or "always" about behaviour you have not checked on
-every path, and recompute every number you state against the tree you are
-committing. Running this after the gated commit means landing a
-documentation fixup on top of it, which is the shape "Format before you
-commit, not after" forbids.
+every path, and recompute every number you state against the tree you
+are committing.
 
 DISTINGUISHING TESTS, when this task delivers an acceptance test for a
 behaviour change: name at least TWO plausible WRONG implementations the
-test rules out, and show it failing against each, not only against deleted
-code. If it passes against either, it does not pin the behaviour. <When
-the shape is known, name them here: e.g. "one that counts per unit instead
-of per signal" and "one that hardcodes 1".>
+test rules out, and show it failing against each, not only against
+deleted code. <When the shape is known, name them here: e.g. "one that
+counts per unit instead of per signal" and "one that hardcodes 1".>
 
 CLASS CLOSURE: <when this change is an instance of a pattern, name the
 grep> -- list every other site, and say fixed, out of scope with the
@@ -169,408 +126,108 @@ OBSERVABILITY, when you add or document a metric family, label, flag or
 report field: a test asserts it appears on the real surface a reader is
 sent to. Name that test in your report.
 
-Self-check before the commit (see the checklist below): no tool-call
-artifacts in files, no debug_assert-only guards, generated docs
-regenerated, tests demonstrated failing, no stray files staged.
+Self-check before the commit: read your own staged hunks
+(`git diff --staged`) for pasted tool output, conflict markers or
+placeholders; no debug_assert-only guard where the condition matters in
+production (make it a runtime check with a typed error); anything a doc
+generator derives regenerated against your tree and committed in the
+same commit; every new test shown failing against the pre-fix code,
+with the flipped line named; nothing staged that the deliverables do not
+name.
+
 Report: <what the orchestrator needs to merge: deviations, counts,
 ambiguities found>.
 ```
 
-## Self-check before the commit
+## Filling the template
 
-Adversarial checkpoint review runs on every result branch before merge,
-and the same defect classes keep coming back as extra review/fix rounds.
-Each item below has blocked a real result branch. Put the self-check line
-in every spec; the executor runs it against its own diff right before the
-commit:
-
-- **Tool-call artifacts in files**: a pasted tool result, a stray
-  transcript fragment, an editor conflict marker, or a placeholder left
-  in committed content. `git diff --staged` and read your own hunks.
-- **`debug_assert`-only guards**: a safety check that compiles out of
-  release builds is not a guard. If the condition matters in production,
-  it is a runtime check with a typed error.
-- **Generated docs**: if the change touches anything a doc generator
-  derives (counts, tables, indexes), regenerate against YOUR tree and
-  commit the output in the same commit. A hand-edit of generated output
-  is undone at the next regeneration.
-- **Vacuous tests**: the prove-the-test skill's rule applies to you -
-  demonstrate the new test failing against the pre-fix code and name the
-  flipped line in your report. A test that cannot fail proves nothing.
-- **Unpaired claims**: a sentence in a doc, HELP string or comment that
-  asserts a property with no test or code line behind it. Half of one
-  epic's review findings were exactly this, and every one cost a round.
-- **A test that only rules out deletion**: if it passes against a plausible
-  wrong implementation (per-unit instead of per-signal, a hardcoded 1, a
-  check that runs after the work it was meant to prevent), it pins nothing.
-- **A pattern fixed at one site**: grep for the other instances before
-  calling the class closed.
-- **A name with no surface**: a metric family, label, flag or report field
-  that a doc or HELP string names and nothing renders or produces. The
-  reader goes looking and finds nothing.
-- **Stray files**: nothing staged that the deliverables do not name
-  (scratch scripts, logs, `__pycache__/`, editor droppings). `.gate-logs/`
-  and `.dd-tools/` are covered by the tracked `.gitignore`; never
-  force-add them (`git add -f`) into a commit.
-
-## Commit before the slow gates, not after
-
-A task is killed mid-run more often than it fails: over one four-day
-window, 27 of 165 dispatched tasks died, and 13 of those were account
-rate limits that kill the agent at provisioning or mid-stream with no
-warning and no result ref. Only committed work survives. So the spec
-orders the work commit-first:
-
-1. Format in place, then make the change compile and pass the scoped
-   tests.
-2. `git commit -s` the working state.
-3. Run the full gate list. Amend or add a fixup commit if a gate fails.
-
-A kill during step 3 then costs a re-run of the gates, not a re-run of
-the whole task. Two tasks in that window were lost the other way round.
-
-Every spec must forbid the executor from backgrounding ANY command and
-must name the consequence, because an executor that only reads "never
-background a gate" will reason its way around it correctly and still die.
-
-An earlier version of this section said exactly that, and a task was lost
-to the gap: 3h29m, 205 turns and $18.29 on a Pi-class ARM host, with zero
-`git commit` calls anywhere in its transcript. It backgrounded a plain
-`cargo check` as a diagnostic, not one of the four named gates, wrote
-"letting it run in the background, waiting for that now instead of polling
-further", and ended its turn. Nothing resumed it: the fleet harness has no
-notification that wakes an executor's own turn the way it wakes an
-orchestrator's. It sat until something outside killed it at the 3.5h mark.
-`git ls-remote` showed only the `start` ref -- no checkpoint, no result, no
-rescue bundle, nothing to recover.
-
-So state it as an absolute and give the reason, in the spec itself:
-
-> Never put any command in the background and never end your turn waiting
-> for one. Nothing will wake you: your turn ending ends the task, and
-> anything not committed is lost with no result ref. A slow cold build on a
-> Pi-class executor is expected -- wait for it in the foreground.
-
-Pair it with an explicit COMMIT EARLY instruction rather than relying on
-the ordering above being followed: the first state that compiles gets
-committed immediately, before any further deliverable. On a host where a
-single cold `cargo check` can run for hours, "commit after step 1" and
-"commit the moment anything works" are different instructions, and only
-the second survives a kill mid-build.
-
-## Executor test scope
-
-The Gates template scopes executor tests with affected-tests.sh on
-purpose. A fleet task used to end with `cargo test --workspace` on an
-8 GB 4-core host (the arm64 Pi class; the 16 vCPU amd64 class is roughly
-four times faster, so size by the slower class): 1-2 hours of cold
-compile and test time per task,
-almost all of it re-verifying crates the change cannot affect, and all
-of it re-verified anyway at merge (the orchestrator's cold
-verify-dispatch run and the PR's required CI checks are the trust
-boundary; the executor's own green is never trusted). The executor-side
-run exists for fast self-feedback, so it covers exactly the changed
-crates and their reverse dependencies. Workspace clippy stays: it is
-check-mode (no codegen or link) and is the cheap whole-workspace
-compile-break detector.
-
-## Format before you commit, not after
-
-The Gates line above says to run `cargo fmt --all` (write mode, not
-`--check`) before the commit for a reason. Executors that gate first and
-format second land a second, formatting-only fixup commit on the result
-branch when the check fails, and those fixups ride the result branch all
-the way toward main. The merge path squashes such commits (see the
-merge-fleet-result skill), but the spec is the right place to stop them
-being created: a result branch should never contain a commit whose only
-content is a formatting fix. Formatting is not a gate you react to; it is
-a step you run before the commit exists.
-
-## Reachability
-
-Every spec names the caller. Tasks have delivered correct, tested code
-that no user could reach: a merged, crate-tested cache that no caller
-constructed; a normalize entry point nothing invoked; an attribute-postings
-index that shipped with nothing in production building an attribute
-predicate; a prune channel whose intended caller still used the old scan
-path. Each passed its own gates. Each looked done on the ticket.
-
-The question is not "does it compile and test". It is "which existing call
-site changes behaviour when this lands". If the honest answer is none, the
-spec says so and names the follow-up, and the orchestrator does not record
-the epic as having closed the gap. A capability with no caller is a
-half-finished feature that reads as a finished one.
-
-## The claims audit: prose is a deliverable, and it is usually wrong
-
-Measured over epic #1678's 13 pull requests (10 review rounds on one, 5 on
-two more, ~60 should_fix findings), roughly HALF of every finding was not a
-defect in the change at all. It was a sentence: a doc, a HELP string, a
-doc comment or an ADR paragraph asserting a property the code does not have.
-A gauge whose doc said a dip "surfaces as units_stalled" when the paths that
-drop the most records never reach that counter. A rule stated as "a worker
-refusal is never a 503" when a fetch-memory refusal is one by design. "A
-worker's own configuration is always an upper bound on what it scans" when
-rendezvous routing gives one worker several slices, each clamped
-independently. A `--max-queued-flushes` help pointing operators at a metric
-family nothing rendered.
-
-Each cost a full round. None would have survived the author reading their own
-sentence next to the code.
-
-The CLAIMS AUDIT paragraph in the Template above is the authoritative
-wording; copy it from there rather than from here, so the two cannot drift.
-Two rules inside it, both learned the expensive way:
-
-- **Never write "never" or "always" about behaviour you have not checked on
-  every path.** The recurring shape is a sentence true of the intra-cluster
-  case and false of the federated one, or true of a cap refusal and false of
-  a memory refusal. If the sentence needs a carve-out, the carve-out is the
-  interesting half.
-- **A number in prose is a claim.** "23 fields", "64 MiB per shard",
-  "shard_count x max_queued_flushes x window": recompute each against the
-  tree you are committing, or remove it. One of these multiplied an
-  instantaneous count by an accumulating one and read as an upper bound while
-  bounding nothing.
-
-## Distinguishing tests: "demonstrate it failing" is not enough
-
-The prove-the-test rule is satisfied formally by a test that fails when the
-fix is deleted, and that is a weaker claim than it sounds. A test can fail
-against deleted code and still pass against every plausible WRONG
-implementation, which is what a reviewer actually probes.
-
-Real examples from one epic: an acceptance test for a per-signal, per-process
-summation used one bucket holding one record on one shard of one tenant, so
-`+= count`, `+= 1` and `= count` all produced the same number. A cache-capacity
-derivation missing its signal multiplier passed a single-signal fixture. A
-stated mutation proof, written in the doc comment, turned out not to hold when
-the reviewer ran it.
-
-So the spec names the alternatives, not just the deletion; the DISTINGUISHING
-TESTS paragraph in the Template above is the wording to copy. Write the two
-alternatives into the spec yourself when you know the shape of the bug:
-"a decoder that enforces the byte cap but not the frame cap" and "one that
-enforces both only after draining the stream" are better instructions than
-"demonstrate the test failing".
-
-## Class closure: did you fix the pattern, or the site you were shown?
-
-A fix that closes two of three sites is the single most repeated way a task
-on this epic earned an extra round. `allow_http` derived from endpoint
-presence was fixed in the server, then found again in ravel-cli, then found a
-third time in the operator's own S3 client, which holds the cluster
-credentials. A "never a 503" carve-out was applied to three intra-cluster
-copies and missed three cross-cluster ones. A scrub corpus covering L0 but
-not the L1 parts that outlive it.
-
-Every spec whose change is an instance of a pattern says so, in the CLASS
-CLOSURE wording the Template above carries.
-
-The orchestrator writes the grep into the spec when the pattern is known
-("every construction of S3Config", "every place a stream is drained before a
-budget check"). An executor that only sees one call site will only fix one.
-
-## Observability a doc names must render
-
-The Template above carries this as its OBSERVABILITY line. If the change adds
-or documents a metric family, a label, a flag or a report field, a test
-scrapes the real surface and asserts it appears. A
-`flush_trigger_deferred_total` that exists in the crate and reaches no
-exposition is not shipped, and the help text that names it sends an operator
-looking for something that is not there. Same for a report row whose only
-producer does not exist: the row reads "not measured" forever and the doc
-says a lane publishes it.
-
-## Soundness claims need a failing test
-
-When a spec asks for a prune, a pushdown, a cache, or any other
-optimization, require the executor to prove the sound case with a test that
-FAILS against the unsound implementation, and to say in its report which
-line it flipped to watch it fail.
-
-"I reasoned it is sound" and "I proved it is unsound" get very different
-scrutiny, and the first is where the defects live. Results that rest on the
-executor's own soundness reasoning have been right, partly right, and wrong;
-the wrong one silently dropped half the rows of a query and was described in
-its own report as unreachable. It was reachable, and a fifteen-line test
-showed it.
-
-The same applies to a test that claims to pin a fix. A tie-break test built
-on two elements passed against the unfixed code, because the standard
-library's unstable sort preserves order on short inputs. Require the test to
-be demonstrated failing, not merely written. The prove-the-test skill (in
-this repo, so executors have it too) lists the known vacuity shapes; point
-the spec's Tests section at it when the task is fix-shaped.
-
-## Numbers need magnitudes, not `> 0`
-
-When a task reports a count, a size, or any other measured quantity, the
-spec must forbid asserting only that it is non-zero or non-empty. A `> 0`
-assertion holds just as well when a figure is a fraction of the truth,
-which is how an accounting bug survives a green suite: a memory-pool charge
-shipped reporting roughly a quarter of its real resident footprint under a
-test that checked exactly that plus return-to-zero. Return-to-zero proves
-you released what you reserved, not that you reserved the right amount.
-
-- Pin an exact value where one exists. Generated 60 records, count 60.
-- Where the exact value moves with encoding or compression, bound it
-  **proportionally to something known** — per object, per row, per shard.
-  A flat floor is the trap: a floor low enough to be safe for one object is
-  also cleared by a figure that counts one object out of three. That exact
-  substitution passed a flat 1 KiB floor and failed a per-object band.
-- Require the magnitude assertion itself to be demonstrated failing, by
-  under-counting the source deliberately. An assertion nobody watched fail
-  is not evidence that it pins anything.
-
-This is also a REVIEWER's instruction, not only the executor's. The
-undercharge above survived its first adversarial review and was caught by a
-second one whose prompt asked, in as many words, whether each assertion
-actually pins a magnitude. Put that question in the review spec: for every
-number the change reports, does a test fail if the number is wrong, or only
-if it is missing?
+- **Reachability.** Name the existing call site whose behaviour changes
+  when this lands. If there is none, say so and name the follow-up
+  ticket; the epic has not closed the gap until a real caller reaches it.
+- **Tests.** For a fix, point at the prove-the-test skill (executors have
+  it too) and require the report to name the flipped line. For a prune,
+  pushdown, cache or other optimization, require a test that fails
+  against the unsound implementation, and the flipped line in the report.
+- **Distinguishing tests.** When you know the bug's shape, write the two
+  wrong implementations in yourself ("a decoder that enforces the byte
+  cap but not the frame cap"); that beats "demonstrate the test failing".
+- **Class closure.** When the pattern is known, write the grep ("every
+  construction of S3Config"). An executor shown one call site fixes one.
+- **Numbers.** When the task reports a count or size, forbid `> 0` and
+  non-empty assertions: pin an exact value where one exists, otherwise
+  bound it proportionally (per object, row or shard, never a flat
+  floor), and require the magnitude assertion itself to be shown failing
+  by under-counting the source. Review specs ask the same question: does
+  a test fail if the number is wrong, or only if it is missing?
+- **Context discipline.** A task near heavy dependencies (arrow,
+  datafusion, tonic internals) names the dependency and forbids reading
+  its sources, even though CLAUDE.md covers it.
+- **No shell substitutions.** fleet-cp rejects a spec containing `$(...)`
+  or a backtick substitution (`400 bad request: spec contains an
+  unexpanded shell substitution`), so every path in a spec is fixed text.
 
 ## Sizing rules
 
-- One task must fit one context window: one crate, or one module cluster
-  within a crate. If deliverables exceed roughly five numbered items or
-  two modules plus tests, split into sequential tasks and dispatch part 2
-  after part 1 merges to main.
-- Tasks that sit near heavy dependencies (arrow, datafusion, tonic
-  internals) get an explicit context-discipline paragraph even though
-  CLAUDE.md covers it: name the dependency and forbid reading its sources.
-- Parallel tasks must have disjoint file scopes. If two tasks need a
-  shared artifact (filenames, trait signatures), fix the names in both
-  specs so merge order does not matter.
-- Split a ticket along the compile/no-compile seam when it bundles a
-  cargo-loop half (code, tests) with a doc/diagram half (spec rewrite,
-  SVG redraw) that needs no cargo at all. Bundled into one task, the doc
-  half serializes behind the build loop for no reason, and one executor
-  holds both for the full duration. Dispatch the doc task in parallel,
-  dependent only on the design decision (the ADR), not on the code
-  landing. Merge order handles any cross-references.
-- A spec must survive whatever hardware it lands on.
-  `label_selector {"arch":"amd64"}` is a preference, not a constraint:
-  after a grace period the scheduler falls back to other hardware. Do not
-  add a stanza that stops the task on an unexpected architecture; a
-  healthy Pi is slow, not broken, and such a stanza turns a slow build
-  into a lost one. The DEGRADED-BOX tripwire is the check to keep: it
-  fires only on a box where `git config` takes 30 seconds or more. For the
-  same reason the Gates paragraph derives the job cap from `nproc` and
-  memory instead of listing machine shapes: an executor on a box the list
-  does not cover has no instruction.
+- One task fits one context window: one crate, or one module cluster.
+  Past roughly five deliverables or two modules plus tests, split into
+  sequential tasks and dispatch part 2 after part 1 merges.
+- Parallel tasks have disjoint file scopes. A shared artifact (filenames,
+  trait signatures) gets fixed names in both specs so merge order does
+  not matter.
+- Split a ticket along the compile/no-compile seam: a doc or diagram half
+  that needs no cargo is its own task, dispatched in parallel and
+  dependent only on the ADR.
+- A spec must survive any hardware. `label_selector {"arch":"amd64"}` is a
+  preference, and the scheduler falls back to other boxes. Do not add a
+  stop on an unexpected architecture (a healthy Pi is slow, not broken);
+  the DEGRADED-BOX tripwire is the check to keep, and the job cap stays
+  derived rather than a list of machine shapes.
 
-fleet-cp rejects any spec whose text contains a dollar-paren command
-substitution (`$(...)`) or a backtick command substitution with `400 bad
-request: spec contains an unexpanded shell substitution`. Write every
-path in a spec as fixed text, never built from a substitution at
-dispatch time. This is why the Gates template's log-directory command
-above uses a literal `.gate-logs` instead of computing a path.
+## Before dispatch
 
-## Before dispatch: two mechanical preflights
+Run both in the same turn as the `fleet_dispatch` call.
 
-Both failure modes below have burned real dispatches. Run both checks in
-the same turn as the `fleet_dispatch` call, every time.
-
-1. **Resolve the ref with git, never from memory.** For the common case:
-   `git fetch origin main --quiet && git rev-parse origin/main`, and pipe
-   that output straight into the `ref` parameter. Never type a 40-char
-   SHA by hand and never complete a short SHA from memory: a dispatch has
-   carried a SHA whose first 8 hex digits were real and whose remaining
-   32 were invented, and the task expired unclaimed. For any other ref
-   shape (a short SHA, a remote-only branch name, another task's result
-   ref) run `git fetch origin <ref> --quiet && git rev-parse FETCH_HEAD`
-   first; dispatch only pushes objects the local repo already has.
-2. **A dirty tree does not block the push; it matters only when the
-   dispatch takes local HEAD.** The dispatch push is ref-based: it pushes
-   the objects behind the `ref` resolved in step 1, and it does not refuse
-   on uncommitted or untracked files. Observed 2026-08-25 (#687): five
-   dispatches pushed fine with three untracked, non-ignored files present
-   the whole time. So do not clean up, wait, or retry over a dirty
-   `git status --short`, and never touch a file you cannot attribute to a
-   command you ran yourself: it is another session's. The caveat that does
-   survive is the HEAD-implicit dispatch: when a dispatch uses local HEAD
-   instead of an explicit ref, uncommitted work decides what gets built,
-   so commit it (or pass the step-1 ref explicitly) first.
+1. **Resolve the ref with git, never from memory:** `git fetch origin
+   main --quiet && git rev-parse origin/main`, straight into `ref`. Never
+   type or complete a SHA by hand. For another ref shape (a short SHA, a
+   remote-only branch, a result ref) run `git fetch origin <ref> --quiet
+   && git rev-parse FETCH_HEAD` first; dispatch only pushes objects the
+   local repo has.
+2. **A dirty tree does not block the push.** The push is ref-based. Do
+   not clean up, wait or retry over `git status --short`, and never touch
+   a file you did not create: it is another session's. Only a dispatch
+   that takes local HEAD instead of an explicit ref builds uncommitted
+   state, so pass the ref.
 
 ## After dispatch
 
-Record the returned task_id, arm the watch command from the dispatch
-response as a persistent Monitor, and merge with the merge-fleet-result
-skill when it lands.
+Record the task_id, arm the watch from the dispatch response under a
+persistent Monitor, and land the result with the merge-fleet-result skill.
 
-**Watch the transcript size, not just the status, and read the HTTP code
-beside it.** A task on a degraded box reports `running` for its whole
-life, then dies at the ceiling with an empty `result_ref` and only a
-start ref. An authorized, empty transcript separates it from a hard task
-within minutes:
+- **Probe the transcript early.** A task on a degraded box reports
+  `running` until the ceiling kills it. Save the per-task JWT from the
+  dispatch response and sample every few minutes for the first quarter
+  hour:
 
-    curl -s -o /dev/null -w "http=%{http_code} bytes=%{size_download}\n" \
-      "$FLEET_CP/v1/tasks/<id>/transcript?token=<per-task-jwt>"
+      curl -s -o /dev/null -w "http=%{http_code} bytes=%{size_download}\n" \
+        "$FLEET_CP/v1/tasks/<id>/transcript?token=<per-task-jwt>"
 
-Save the per-task JWT from the dispatch response; without it this check
-cannot be made. Healthy live task: `http=200 bytes=784005`. Dead box:
-`http=200 bytes=0`. Sample every few minutes for the first quarter hour
-and cancel-and-redispatch on an authorized zero rather than waiting for
-the ceiling.
-
-Read the status code, and do not use the size alone. Fetched with the
-operator token rather than the task's own JWT, the endpoint refuses, and
-the refusal body is the 13-byte string `unauthorized`. Through `wc -c`
-that is a plausible small measurement rather than an error, so a probe
-built on the size alarms on its first sample against every task, healthy
-or dead. It was caught only because a task that had finished SUCCESSFULLY
-also read 13 bytes; two tasks in opposite states with identical readings
-is not a measurement. The status code is what separates a refusal from an
-authorized empty transcript, which is why the command above prints it
-first. The MCP `fleet_transcript` returning nothing carries the same
-ambiguity with no code to inspect, so prefer the HTTP form.
-
-A start-only ref after hours is suggestive, not conclusive: an executor
-commits locally and pushes once at the end, so it can mean a lost final
-push rather than no work. Confirm with the authorized-empty transcript
-before cancelling, because cancelling on the weaker signal destroys
-committed work.
-
-Placement cannot be pre-checked: `GET /v1/tasks/<id>` carries no executor
-field while a task runs, and the executor name appears only in the
-terminal event's `results.executor`. That is why the tripwire in the spec
-and this probe both exist, rather than a label selector. `fleet_status` needs the full task UUID; an 8-char
-short form returns "not found". Result branches appear at
-refs/heads/task/<task-id>/result.
-
-**Every spec declares, in its first line, whether it produces a branch:**
-`EXPECTS_REF: yes` for an implementation task, `EXPECTS_REF: no` for a
-read-only review, audit, or research task. Without that declaration a
-missing result ref is ambiguous, and the ambiguity is not rare: over one
-four-day window, 30 of the 33 no-ref tasks were reviews that produce no
-branch by design, so a blanket "no ref means lost" rule generates 30
-false alarms and trains the orchestrator to ignore the real ones. With
-the declaration:
-
-- `EXPECTS_REF: yes` and no ref = the agent never committed and the
-  workdir is gone. Re-dispatch; do not try to recover.
-- `EXPECTS_REF: no` and no ref = expected. The deliverable is the report.
-
-Do not trust `fleet_status`'s text at face value: it has printed a
-`result at refs/heads/task/<id>/result` line even when that ref was never
-pushed (the executor committed to its own side worktree/branch instead of
-the checkout's HEAD; see the harness-override paragraph above). Verify
-with `git ls-remote origin refs/heads/task/<task-id>/result` before
-fetching; if it's empty, the work is gone and the only path forward is
-re-dispatching the same ticket with the harness-override paragraph in
-place.
-
-Two more verification rules, both learned the expensive way:
-
-- Always use `git ls-remote` for result refs, never
-  `gh api repos/.../branches/<name>`: the REST branch listing lags the
-  git protocol by minutes and has returned 404 on a ref that `ls-remote`
-  showed correctly the whole time.
-- When an executor's report says its final push failed (control-plane
-  502s do this), check `git ls-remote` for the result ref BEFORE
-  re-dispatching: a retried push may have landed after the report was
-  written. Re-dispatching on an assumed loss destroys completed,
-  gate-green work, so confirm loss, never assume it. Repeated 502s from
-  the control plane also warrant a cooldown (minutes, not seconds)
-  before the next dispatch attempt.
+  `http=200 bytes=0` is a dead box: cancel and redispatch. A non-200 is a
+  refused probe (the operator token instead of the task JWT returns the
+  13-byte body `unauthorized`), not a measurement. The MCP
+  `fleet_transcript` has the same ambiguity with no status code, so
+  prefer the HTTP form.
+- **A start-only ref is not proof of loss.** Executors push once, at the
+  end. Confirm with an authorized empty transcript before cancelling;
+  cancelling on the weaker signal destroys committed work.
+- **Missing result ref.** With `EXPECTS_REF: yes` the work is gone:
+  re-dispatch rather than try to recover. With `EXPECTS_REF: no` it is
+  expected, and the report is the deliverable.
+- **Verify refs with `git ls-remote origin refs/heads/task/<task-id>/result`**,
+  never with `fleet_status`'s text (it can name a ref that was never
+  pushed) or `gh api .../branches/<name>` (it lags by minutes). When a
+  report says the final push failed, check ls-remote before
+  re-dispatching: a retried push may have landed. Repeated control-plane
+  502s call for a cooldown of minutes before the next dispatch.
+- `fleet_status` needs the full task UUID; the executor's name appears
+  only in the terminal event's `results.executor`.
