@@ -36,9 +36,10 @@
 //!    held and version-held therefore counts on the legal-hold counter.
 //! 4. **Version hold** (ADR-0066 decisions 1 and 2) runs next, still before
 //!    any delete. Each data object the sweep is about to delete is
-//!    probed for its trailer version through a 16-byte suffix GET, and the
-//!    answer is a typed classification, never a string: readable here, outside
-//!    this build's reader window, or corrupt. An object outside the window is
+//!    probed for its trailer version through a 16-byte suffix GET, through
+//!    the gate of the bucket's own format (RSEG for metrics, RLOG for logs,
+//!    RSPAN for spans), and the answer is a typed classification, never a
+//!    string: readable here, outside this build's reader window, or corrupt. An object outside the window is
 //!    not garbage -- a peer running the other side of a rolling upgrade, or the
 //!    build a rollback returns to, reads it normally -- so the sweep declines to
 //!    delete anything in that bucket this pass, leaves the tombstone in place,
@@ -641,54 +642,111 @@ async fn physical_sweep(
 /// The distinction this draws is the whole point (ADR-0066 decision 2): a
 /// version this build does not admit and bytes no build can read are both
 /// "cannot read this", and collapsing them turns a rolling upgrade into data
-/// loss. It is drawn from [`ravel_segment::classify_trailer`]'s typed answer,
-/// which applies the same version gate a full read applies, so this cannot
-/// disagree with the reader about which versions are admitted. A corrupt object
-/// is deliberately NOT held: no build reads it, so holding it keeps nothing
-/// alive and would only stall the bucket forever.
+/// loss. It is drawn from each format's own trailer gate, the same one a full
+/// read applies, so this cannot disagree with the reader about which versions
+/// are admitted. A corrupt object is deliberately NOT held: no build reads it,
+/// so holding it keeps nothing alive and would only stall the bucket forever.
 ///
-/// Scope: RSEG (metrics) only. RLOG and RSPAN objects carry their own trailers
-/// and their own windows in `ravel-logseg` and `ravel-rspan`; probing them with
-/// the RSEG gate would report every one of them as corrupt, which is the exact
-/// collapse this function exists to prevent. Those two signals keep today's
-/// unconditional sweep until their readers grow the same probe (the remaining
-/// half of issue #530).
+/// The bucket's signal picks the gate: RSEG for metrics, RLOG for logs, RSPAN
+/// for spans. Each format keeps its own trailer and its own window, and probing
+/// one with another's gate would call every object corrupt, which is the exact
+/// collapse this function exists to prevent. Any other signal writes none of
+/// the three formats into a retained bucket and is swept unprobed.
 ///
-/// Cost: one 16-byte suffix GET per data object, charged to the sweep phase,
-/// and only in the pass that would delete (after the tombstone's protection
-/// horizon has elapsed and the HEAD-reachability gate is clear). The GET also
-/// returns the object's total size, so no separate HEAD is needed.
+/// The version comes from the trailer, not from the commit record's
+/// `segment_format_version`: that field is a writer's stamp no reader checks
+/// against the bytes, and the L1 parts are found by LIST, not through a record.
+///
+/// Cost: one 16-byte suffix GET per data object (L0 and L1), charged to the
+/// sweep phase, and only in the pass that would delete (after the tombstone's
+/// protection horizon has elapsed and the HEAD-reachability and legal-hold
+/// gates are clear). The GET also returns the object's total size, so no
+/// separate HEAD is needed, and the gate never asks for the footer.
 async fn held_out_of_window(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
     l0_data_keys: &[String],
     l1_part_keys: &[String],
 ) -> Result<Vec<(String, u16)>> {
-    if bucket.signal != Signal::Metrics {
+    let Some(format) = ProbedFormat::for_signal(bucket.signal) else {
         return Ok(Vec::new());
-    }
+    };
     let mut held = Vec::new();
     for key in l0_data_keys.iter().chain(l1_part_keys.iter()) {
-        if let Some(version) = out_of_window_version(store, key).await? {
+        if let Some(version) = out_of_window_version(store, format, key).await? {
             held.push((key.clone(), version));
         }
     }
     Ok(held)
 }
 
-/// The trailer version of one RSEG object when it is outside this build's
+/// The data-object format whose trailer gate the version hold applies.
+///
+/// One suffix GET of RSEG's [`TRAILER_LEN`] serves all three: the assertion
+/// below fails the build if RLOG's or RSPAN's trailer ever differs in length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbedFormat {
+    Rseg,
+    Rlog,
+    Rspan,
+}
+
+const _: () = assert!(
+    ravel_logseg::footer::TRAILER_LEN as u64 == TRAILER_LEN
+        && ravel_rspan::footer::TRAILER_LEN as u64 == TRAILER_LEN
+);
+
+impl ProbedFormat {
+    fn for_signal(signal: Signal) -> Option<Self> {
+        match signal {
+            Signal::Metrics => Some(Self::Rseg),
+            Signal::Logs => Some(Self::Rlog),
+            Signal::Spans => Some(Self::Rspan),
+            _ => None,
+        }
+    }
+
+    /// The trailer version when `tail` (a suffix of an object of `total_size`
+    /// bytes covering its trailer) is outside this build's window for this
+    /// format, `None` when it is readable here or corrupt.
+    ///
+    /// RLOG and RSPAN have no trailer-only classifier, so this runs their
+    /// suffix open over the trailer alone: it checks magic and then the
+    /// version window before any footer byte, and an in-window trailer comes
+    /// back as `NeedRange` (or a footer-bounds error), never as
+    /// `UnsupportedVersion`.
+    fn out_of_window(self, total_size: u64, tail: &[u8]) -> Option<u16> {
+        match self {
+            Self::Rseg => match classify_trailer(total_size, tail) {
+                TrailerClass::OutsideVersionWindow(version) => Some(version),
+                TrailerClass::Readable(_) | TrailerClass::Corrupt(_) => None,
+            },
+            Self::Rlog => match ravel_logseg::open_from_suffix(tail, total_size) {
+                Err(ravel_logseg::LogSegError::UnsupportedVersion(version)) => Some(version),
+                _ => None,
+            },
+            Self::Rspan => match ravel_rspan::open_from_suffix(tail, total_size) {
+                Err(ravel_rspan::SpanSegError::UnsupportedVersion(version)) => Some(version),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// The trailer version of one data object when it is outside this build's
 /// reader window, `None` when the object is readable here, is corrupt, or is
 /// already gone (a delete that a previous pass completed is not a hold).
-async fn out_of_window_version(store: &dyn ObjectStoreBackend, key: &str) -> Result<Option<u16>> {
+async fn out_of_window_version(
+    store: &dyn ObjectStoreBackend,
+    format: ProbedFormat,
+    key: &str,
+) -> Result<Option<u16>> {
     let got = match store.get(key, GetRange::Suffix(TRAILER_LEN)).await {
         Ok(got) => got,
         Err(StoreError::NotFound) => return Ok(None),
         Err(e) => return Err(MaintainError::Store(e)),
     };
-    match classify_trailer(got.total_size, got.data.as_ref()) {
-        TrailerClass::OutsideVersionWindow(version) => Ok(Some(version)),
-        TrailerClass::Readable(_) | TrailerClass::Corrupt(_) => Ok(None),
-    }
+    Ok(format.out_of_window(got.total_size, got.data.as_ref()))
 }
 
 /// Every key one physical sweep pass would delete, in delete order, tombstone
