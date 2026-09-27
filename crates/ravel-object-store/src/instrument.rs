@@ -879,10 +879,7 @@ mod tests {
         assert_eq!(snap.get.calls, 2, "both pinned reads are GET calls");
         assert_eq!(snap.get.ok, 1);
         assert_eq!(snap.get.bytes, 4, "only the served range is charged");
-        assert_eq!(
-            snap.get.error_count(StoreErrorClass::PreconditionFailed),
-            1
-        );
+        assert_eq!(snap.get.error_count(StoreErrorClass::PreconditionFailed), 1);
         assert_eq!(snap.head.calls, 1, "the head is billed separately");
         assert_eq!(snap.put.calls, 1);
     }

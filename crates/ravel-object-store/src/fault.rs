@@ -1764,10 +1764,8 @@ mod tests {
     /// the wrapped store.
     #[tokio::test]
     async fn scripted_failed_precondition_fires_once_on_get_pinned_and_is_counted() {
-        let plan = FaultPlan::empty().with_rule(Rule::new(
-            Op::Get,
-            ScriptedFault::FailedPrecondition,
-        ));
+        let plan =
+            FaultPlan::empty().with_rule(Rule::new(Op::Get, ScriptedFault::FailedPrecondition));
         let store = FaultStore::new(MemoryStore::new(), plan);
         store
             .put("k", Bytes::from_static(b"v1"), PutOptions::default())

@@ -40,7 +40,9 @@ pub enum PreconditionProbeFailure {
     /// The probe key could not be read at all, so neither half ran. The store
     /// is unqualified because the probe is inconclusive, not because it
     /// answered wrongly.
-    #[error("the probe key {key:?} could not be HEADed, so preconditions were never tested: {source}")]
+    #[error(
+        "the probe key {key:?} could not be HEADed, so preconditions were never tested: {source}"
+    )]
     Head { key: String, source: StoreError },
     /// Matching half: a read carrying the object's own ETag was refused.
     #[error("a ranged read of {key:?} pinned to the object's own ETag was refused: {source}")]
@@ -48,13 +50,17 @@ pub enum PreconditionProbeFailure {
     /// Refusing half: a read carrying a wrong ETag was served anyway, so the
     /// store ignores the precondition. A pinned read against it would return
     /// bytes from whatever version happens to be there.
-    #[error("a ranged read of {key:?} pinned to a wrong ETag was served: the store ignores read preconditions")]
+    #[error(
+        "a ranged read of {key:?} pinned to a wrong ETag was served: the store ignores read preconditions"
+    )]
     WrongPinAccepted { key: String },
     /// Refusing half: the read was refused, but not as a precondition failure.
     /// Not a pass: the caller distinguishes `PreconditionFailed` from every
     /// other error, so a store that reports something else cannot be read
     /// through even though it did refuse.
-    #[error("a ranged read of {key:?} pinned to a wrong ETag failed with {source} instead of a precondition failure")]
+    #[error(
+        "a ranged read of {key:?} pinned to a wrong ETag failed with {source} instead of a precondition failure"
+    )]
     WrongPinWrongError { key: String, source: StoreError },
 }
 
@@ -71,7 +77,8 @@ pub struct PreconditionProbe {
 /// Qualify `store` for pinned reads, using `key` as the subject.
 ///
 /// Three requests: a HEAD to learn the object's identity, then two 1-byte
-/// ranged reads, one carrying that identity and one carrying [`WRONG_ETAG`].
+/// ranged reads, one carrying that identity and one carrying an ETag no store
+/// issues.
 /// The store qualifies only if the first is served and the second is refused
 /// with [`StoreError::PreconditionFailed`]. One byte, because what is being
 /// measured is the header, not the body.
@@ -232,8 +239,9 @@ mod tests {
     use super::*;
     use crate::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use crate::memory::MemoryStore;
-    use crate::{Capabilities, DelimitedList, GetOutcome, ListPage, ObjectMeta, PageToken,
-        PutOutcome};
+    use crate::{
+        Capabilities, DelimitedList, GetOutcome, ListPage, ObjectMeta, PageToken, PutOutcome,
+    };
 
     const SUBJECT: &str = "granted/table/part-0.parquet";
 
@@ -369,8 +377,7 @@ mod tests {
         let store = IgnoresPreconditions(seeded().await);
         let err = probe_preconditions(&store, SUBJECT)
             .await
-            .err()
-            .expect("a store that ignores preconditions must not qualify");
+            .expect_err("a store that ignores preconditions must not qualify");
         assert!(
             matches!(err, PreconditionProbeFailure::WrongPinAccepted { ref key } if key == SUBJECT),
             "got {err:?}"
@@ -382,8 +389,7 @@ mod tests {
         let store = RefusesEveryPin(seeded().await);
         let err = probe_preconditions(&store, SUBJECT)
             .await
-            .err()
-            .expect("a store that refuses its own ETag must not qualify");
+            .expect_err("a store that refuses its own ETag must not qualify");
         assert!(
             matches!(
                 err,
@@ -398,8 +404,7 @@ mod tests {
         let store = RefusesWithTheWrongError(seeded().await);
         let err = probe_preconditions(&store, SUBJECT)
             .await
-            .err()
-            .expect("a refusal reported as something else must not qualify");
+            .expect_err("a refusal reported as something else must not qualify");
         assert!(
             matches!(
                 err,
@@ -414,8 +419,7 @@ mod tests {
         let store = MemoryStore::new();
         let err = probe_preconditions(&store, SUBJECT)
             .await
-            .err()
-            .expect("a missing subject cannot qualify a store");
+            .expect_err("a missing subject cannot qualify a store");
         assert!(
             matches!(err, PreconditionProbeFailure::Head { .. }),
             "got {err:?}"
@@ -442,8 +446,7 @@ mod tests {
 
         let err = probe_not_ravel_bucket(ravel.as_ref(), candidate.as_ref())
             .await
-            .err()
-            .expect("Ravel's own bucket must be detected");
+            .expect_err("Ravel's own bucket must be detected");
         assert!(
             matches!(err, RavelBucketProbeFailure::SameBucket { ref key } if key.starts_with(PROBE_PREFIX)),
             "got {err:?}"
@@ -489,8 +492,7 @@ mod tests {
 
         let err = probe_not_ravel_bucket(&ravel, &candidate)
             .await
-            .err()
-            .expect("an unreadable candidate must not qualify");
+            .expect_err("an unreadable candidate must not qualify");
         assert!(
             matches!(err, RavelBucketProbeFailure::Inconclusive { .. }),
             "got {err:?}"
@@ -561,8 +563,7 @@ mod tests {
 
         let err = probe_not_ravel_bucket(&ravel, &candidate)
             .await
-            .err()
-            .expect("a candidate that served neither the payload nor a 404 is inconclusive");
+            .expect_err("a candidate that served neither the payload nor a 404 is inconclusive");
         assert!(
             matches!(err, RavelBucketProbeFailure::Inconclusive { .. }),
             "got {err:?}"
@@ -583,8 +584,7 @@ mod tests {
 
         let err = probe_not_ravel_bucket(&ravel, &candidate)
             .await
-            .err()
-            .expect("a probe that was never written answers nothing");
+            .expect_err("a probe that was never written answers nothing");
         assert!(
             matches!(err, RavelBucketProbeFailure::ProbeWriteFailed { .. }),
             "got {err:?}"
