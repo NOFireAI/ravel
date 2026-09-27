@@ -2023,9 +2023,26 @@ mod tests {
         metrics: &[&str],
         hour: u32,
     ) -> String {
+        publish_segment_as(
+            store,
+            Uuid::from_u128(u128::from(1_000 + seq)),
+            seq,
+            metrics,
+            hour,
+        )
+        .await
+    }
+
+    /// [`publish_segment_at`] from writer `writer_id`.
+    async fn publish_segment_as(
+        store: &MemoryStore,
+        writer_id: Uuid,
+        seq: u64,
+        metrics: &[&str],
+        hour: u32,
+    ) -> String {
         let tenant_id = tenant();
         let tenant_hash = tenant_id.hash();
-        let writer_id = Uuid::from_u128(u128::from(1_000 + seq));
         let created_unix_ns = i64::from(hour) * NS_PER_HOUR;
         let ingest_hour_bucket = hour;
         let series: Vec<SeriesInput> = metrics
@@ -4387,6 +4404,11 @@ mod tests {
         fn fired(&self) -> u64 {
             self.fired.load(Ordering::Relaxed)
         }
+
+        /// GETs that named `key`, failed or not.
+        fn calls(&self, key: &str) -> u64 {
+            self.calls.lock().get(key).copied().unwrap_or(0)
+        }
     }
 
     #[async_trait::async_trait]
@@ -4660,6 +4682,76 @@ mod tests {
         );
         assert_eq!(unreadable_total(&metrics), 2);
         assert_eq!(mismatch_total(&metrics), 0);
+    }
+
+    /// A compaction record whose own GET times out on every tick holds the
+    /// marker for `MAX_HELD_TICKS` ticks, and the tick after that counts the
+    /// record once as `reason="retry_exhausted"` at its level and moves past
+    /// it. The record never decoded, so none of its parts is fetched.
+    #[tokio::test]
+    async fn a_record_failing_retryably_every_tick_is_given_up_after_the_cap() {
+        let memory = Arc::new(MemoryStore::new());
+        let (record_key, part_keys) = publish_many_part_compaction(&memory, 3).await;
+        for seq in 3..=7u64 {
+            publish_segment_at(&memory, seq, &["cpu"], 500_001).await;
+        }
+        let tenant_hash = tenant().hash();
+        let shard_prefix =
+            keys::commit_shard_prefix(&tenant_hash, Signal::Metrics, 0).expect("prefix");
+        let listed = list_all(memory.as_ref(), &shard_prefix)
+            .await
+            .expect("list shard");
+        assert_eq!(listed.len(), 8, "seven commit records, one compaction");
+        assert_eq!(listed[2].key, record_key, "the compaction unit is third");
+
+        let failing = record_key.clone();
+        let store = GetFaults::new(memory.clone(), move |key, _| {
+            (key == failing).then_some(StoreError::Timeout)
+        });
+        let metrics = ScrubMetrics::default();
+        for tick in 1..=MAX_HELD_TICKS {
+            tick_eight(&store, &metrics).await;
+            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+                .await
+                .expect("cursor loads");
+            assert_eq!(
+                cursor.last_commit_key.as_deref(),
+                Some(listed[1].key.as_str()),
+                "tick {tick} must hold the marker behind the compaction record"
+            );
+            assert_eq!(cursor.held_ticks, tick);
+        }
+        assert_eq!(unreadable_total(&metrics), 0, "a held unit counts nothing");
+
+        tick_eight(&store, &metrics).await;
+        assert_eq!(
+            store.fired(),
+            u64::from(MAX_HELD_TICKS) + 1,
+            "the record GET failed on every held tick and once more on the giving-up tick"
+        );
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(cursor.held_ticks, 0);
+        assert!(
+            cursor.last_commit_key.as_deref() > Some(record_key.as_str()),
+            "the marker moves past the record, got {:?}",
+            cursor.last_commit_key
+        );
+        assert_eq!(
+            metrics.unreadable(
+                Signal::Metrics,
+                ScrubLevel::L1,
+                UnreadableReason::RetryExhausted
+            ),
+            1,
+            "the record counts once at its own level"
+        );
+        assert_eq!(unreadable_total(&metrics), 1);
+        assert_eq!(mismatch_total(&metrics), 0);
+        for part_key in &part_keys {
+            assert_eq!(store.calls(part_key), 0, "no GET of part {part_key}");
+        }
     }
 
     /// A unit that fails retryably twice and then reads clean holds for two
