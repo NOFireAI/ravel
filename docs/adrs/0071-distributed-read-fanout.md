@@ -1662,7 +1662,9 @@ objects were all still readable.
    total S3 request count as reported is identical to local execution, and
    the store serves the record GETs of item 4 on top of it. Reporting them as
    a separate resolve-phase figure needs a `queryfrag` field, which is a
-   separate decision.
+   separate decision. (Still true of the PER-QUERY report; the worker now
+   exports the process-wide totals without one. See the record-GET counter
+   amendment below.)
 
 6. **Unchanged.** The `queryfrag` wire and `PROTOCOL_VERSION` are unchanged.
    Cross-cluster federation is unchanged: a resolve-scope request still
@@ -1676,3 +1678,52 @@ objects were all still readable.
   the `sys/gc` protection horizon the failure semantics above already rely on.
 - A worker's per-slice metadata cost is proportional to its pinned segment
   count, not to the listing of the whole window.
+
+## Amendment (2026-09-27): the worker exports its record-GET totals
+
+<!-- amendment-applies: sections="Amendment (2026-09-26): a worker resolves each pinned segment from its own record" pointer="record-GET counter amendment" -->
+
+Status: Accepted. Issue #1721.
+
+### Context
+
+Decision 5 above keeps record GETs off the query's accounting, for a reason
+that stands: local execution never issues them, so charging them would fail a
+query distributed that succeeds locally. It then observed that reporting them
+as a resolve-phase figure needs a `queryfrag` field, and left them unreported
+entirely. That is one step too far. Every object-store read this system makes
+is reported under the phase that issued it, and a read charged to a handle
+that is then dropped is a read nobody can see: a worker paying two record
+GETs per pinned L1 part, or falling back to rewrite records across a whole
+tenant, looks identical at the `/metrics` surface to one paying none.
+
+### Decision
+
+1. **A worker exports its record-GET totals as process-wide counters.**
+   `ravel_distrib_fragment_record_get_requests_total` and
+   `ravel_distrib_fragment_record_get_bytes_total` render beside the other
+   `ravel_distrib_fragment_*` series, under the same closed `{mode}` label and
+   with no tenant, shard, or worker label (ADR-0044 section 4). The bytes are
+   wire bytes as the store served them, so a GET that missed contributes a
+   request and no bytes.
+
+2. **What decision 5 above still decides, unchanged.** Record GETs remain
+   outside the slice's accounting, outside `max_bytes_scanned` and
+   `max_s3_requests` on both the worker and the coordinator, and absent from
+   the slice summary. A PER-QUERY resolve-phase figure still needs a
+   `queryfrag` field and is still a separate decision; these counters are per
+   process, not per query, and answer a different question.
+
+3. **Every resolve reports, including one that refuses.** The totals are read
+   after the resolve finishes, whether it resolved every identity or stopped
+   at the first refusal, so a slice that failed `Unsupported` on a bad record
+   still reports the GETs the store served for it.
+
+### Consequences
+
+- The resolve phase's request and byte cost is attributable from a scrape,
+  with no wire change and no `PROTOCOL_VERSION` bump.
+- Dividing the two counters gives the mean record size; dividing the request
+  counter by `ravel_distrib_fragment_requests_total` gives the mean pinned
+  segments per slice, against which a rewrite-record fallback shows up as a
+  rise.

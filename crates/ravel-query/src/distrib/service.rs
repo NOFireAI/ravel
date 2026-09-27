@@ -59,7 +59,9 @@
 //! data-object GETs use. Record GETs are not charged to the slice's
 //! accounting, so they count toward neither `max_bytes_scanned` nor
 //! `max_s3_requests` here or on the coordinator, and are not in the slice's
-//! reported cost.
+//! reported cost. They are still reported: every resolve hands its request
+//! and byte totals to the worker's [`RecordGetObserver`], which the embedding
+//! process backs with its own counters.
 //!
 //! A structurally malformed identity is [`ResolveIdentityError::Invalid`] and
 //! fails the slice with `BAD_DATA`. A record that is missing, unreadable,
@@ -153,8 +155,17 @@ impl ResolveIdentityError {
 
     /// The wire status this failure fails its slice with. A retryable record
     /// GET error is `UNAVAILABLE`, which makes the coordinator re-dispatch that
-    /// one slice. Every other record failure is `UNSUPPORTED`, which makes it
-    /// run the whole query locally through its own catalog resolve.
+    /// one slice (a slice the coordinator ran locally has no worker left to
+    /// re-dispatch to, so it maps that status to one re-resolve and retry
+    /// instead; see the local-attempt mapping in `RoutingSliceFetcher`). Every
+    /// other record failure is `UNSUPPORTED`, which makes it run the whole
+    /// query locally through its own catalog resolve.
+    ///
+    /// The `Unknown` to `SNAPSHOT_INVALIDATED` arm is reachable only from
+    /// [`SnapshotSegmentResolver`], the cross-cluster federation resolver:
+    /// only a resolver holding a snapshot of its own can find an identity
+    /// outside it. The intra-cluster [`ReconstructingSegmentResolver`] resolves
+    /// no snapshot and never raises it.
     pub fn status_code(&self) -> pb::status::Code {
         match self {
             ResolveIdentityError::Invalid { .. } => pb::status::Code::BadData,
@@ -182,6 +193,24 @@ pub trait SegmentResolver: Send + Sync {
         identity: &pb::SegmentIdentity,
         accounting: &QueryAccounting,
     ) -> Result<SegmentRef, ResolveIdentityError>;
+}
+
+/// Where a worker reports the record GETs its pinned resolves issue.
+///
+/// Those GETs are deliberately outside the slice's own accounting (ADR-0071
+/// pinned-record amendment decision 5), so nothing on the wire or in the
+/// query's reported cost carries them. That is a reason to keep them off the
+/// budget, not a reason to leave them unreported: every object-store read is
+/// reported under the phase that issued it. The embedding process implements
+/// this over its own counters and wires it with
+/// [`SeriesFetchService::with_record_get_observer`]; a service with no
+/// observer resolves exactly as before.
+pub trait RecordGetObserver: Send + Sync {
+    /// One pinned resolve's totals: the record GETs it issued and the bytes
+    /// they transferred. Called once per resolve, after every identity has
+    /// been resolved or one has refused, so a resolve that failed partway
+    /// still reports what the store served.
+    fn observe_record_gets(&self, requests: u64, bytes: u64);
 }
 
 /// How many pinned identities one slice resolves concurrently. Each costs one
@@ -254,12 +283,22 @@ impl ReconstructingSegmentResolver {
         key: &str,
         accounting: &QueryAccounting,
     ) -> Result<bytes::Bytes, ResolveIdentityError> {
+        // A closed limiter is process shutdown, not a store condition: it
+        // never reopens, so re-dispatching this slice to another worker on
+        // this process's account would fail the same way. It is
+        // `RecordRead`, which runs the whole query locally, not the
+        // retryable `RecordUnavailable`.
         let got = match self.get_limiter.acquire().await {
             Ok(_permit) => {
                 accounting.record_s3_request(AccountedOp::Get);
                 self.store.get(key, GetRange::Full).await
             }
-            Err(closed) => Err(StoreError::Transient(closed.to_string())),
+            Err(closed) => {
+                return Err(ResolveIdentityError::RecordRead {
+                    key: key.to_string(),
+                    reason: closed.to_string(),
+                });
+            }
         };
         match got {
             Ok(outcome) => {
@@ -677,6 +716,11 @@ pub struct SeriesFetchService<R: SegmentResolver + 'static> {
     /// series and samples slice by slice. This worker therefore enforces its
     /// own `max_series`/`max_samples` over what it is about to return.
     resolve_scope: bool,
+    /// Where this worker's pinned-resolve record GETs are reported, wired via
+    /// [`with_record_get_observer`](Self::with_record_get_observer). `None`
+    /// (the default) drops the totals, which is what a caller with no counters
+    /// of its own wants; the server wires its fragment-metrics family here.
+    record_get_observer: Option<Arc<dyn RecordGetObserver>>,
 }
 
 impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
@@ -688,7 +732,18 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             resolver,
             engine: EngineConfig::default(),
             resolve_scope: false,
+            record_get_observer: None,
         }
+    }
+
+    /// Wires where this worker reports the record GETs its pinned resolves
+    /// issue (see [`RecordGetObserver`]). A builder for the same reason
+    /// [`with_engine_config`](Self::with_engine_config) is one: the
+    /// out-of-crate callers of `new` stay unchanged.
+    #[must_use]
+    pub fn with_record_get_observer(mut self, observer: Arc<dyn RecordGetObserver>) -> Self {
+        self.record_get_observer = Some(observer);
+        self
     }
 
     /// Wires this worker's own [`EngineConfig`] onto the service, so every
@@ -961,14 +1016,25 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     /// query distributed that succeeds locally (ADR-0071 pinned-record
     /// amendment). The summary carries one pooled snapshot with no phase
     /// split, so they are not in the slice's reported cost either.
+    ///
+    /// Off the budget is not unreported: the handle's totals go to this
+    /// worker's [`RecordGetObserver`] before the result is returned, whether
+    /// the resolve succeeded or refused partway, so the process exports the
+    /// requests and bytes its resolve phase spent.
     async fn resolve_pinned(
         &self,
         identities: &[pb::SegmentIdentity],
     ) -> Result<Vec<SegmentRef>, SliceFailure> {
         let records = QueryAccounting::new();
-        resolve_identities(self.resolver.as_ref(), identities, &records)
-            .await
-            .map_err(|err| SliceFailure::from((err.status_code(), err.to_string())))
+        let resolved = resolve_identities(self.resolver.as_ref(), identities, &records).await;
+        if let Some(observer) = &self.record_get_observer {
+            let spent = records.snapshot();
+            observer.observe_record_gets(
+                spent.s3_requests(AccountedOp::Get),
+                spent.s3_bytes(AccountedOp::Get),
+            );
+        }
+        resolved.map_err(|err| SliceFailure::from((err.status_code(), err.to_string())))
     }
 
     /// The Metrics slice path: resolve the pinned scope to refs, fetch each
@@ -2590,6 +2656,127 @@ mod reconstruct_tests {
                 "record GETs in flight must be capped at the limiter's {permits} permits"
             );
         }
+    }
+
+    /// A [`RecordGetObserver`] that keeps what it was handed, so a test can
+    /// assert the exact totals rather than that something was reported.
+    #[derive(Default)]
+    struct CapturedRecordGets {
+        calls: std::sync::atomic::AtomicU64,
+        requests: std::sync::atomic::AtomicU64,
+        bytes: std::sync::atomic::AtomicU64,
+    }
+
+    impl RecordGetObserver for CapturedRecordGets {
+        fn observe_record_gets(&self, requests: u64, bytes: u64) {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            self.requests.fetch_add(requests, SeqCst);
+            self.bytes.fetch_add(bytes, SeqCst);
+        }
+    }
+
+    impl CapturedRecordGets {
+        fn totals(&self) -> (u64, u64, u64) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (
+                self.calls.load(SeqCst),
+                self.requests.load(SeqCst),
+                self.bytes.load(SeqCst),
+            )
+        }
+    }
+
+    /// Resolve `identities` through a service wired to a fresh observer, and
+    /// return the observer's totals. The fetcher is never reached: a pinned
+    /// resolve happens before any data object is opened.
+    async fn observed_resolve(
+        store: Arc<dyn ObjectStoreBackend>,
+        identities: &[pb::SegmentIdentity],
+    ) -> (Vec<SegmentRef>, (u64, u64, u64)) {
+        let observer = Arc::new(CapturedRecordGets::default());
+        let service = SeriesFetchService::new(
+            SegmentFetcher::new(Arc::clone(&store)),
+            Arc::new(resolver(store)),
+        )
+        .with_record_get_observer(Arc::clone(&observer) as Arc<dyn RecordGetObserver>);
+        let segments = service
+            .resolve_pinned(identities)
+            .await
+            .unwrap_or_else(|failure| panic!("the pins resolve: {}", failure.message));
+        (segments, observer.totals())
+    }
+
+    /// One pinned L0 segment costs exactly one record GET, and the bytes
+    /// reported are exactly that commit record's encoded length: the counters
+    /// the worker exports are the store's real cost, not a per-segment
+    /// estimate.
+    #[tokio::test]
+    async fn an_l0_pin_reports_one_record_get_and_the_records_bytes() {
+        let encoded = l0_record().encode_to_vec();
+        let store = store_with(vec![(l0_key(), encoded.clone())]).await;
+        let (segments, (calls, requests, bytes)) = observed_resolve(store, &[l0_identity()]).await;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(calls, 1, "one resolve reports once");
+        assert_eq!(requests, 1, "an L0 pin GETs exactly its own commit record");
+        assert_eq!(
+            bytes,
+            encoded.len() as u64,
+            "the reported bytes are the commit record's encoded length"
+        );
+    }
+
+    /// An L1 part only a rewrite record describes costs exactly two record
+    /// GETs: the compaction key misses first. The reported bytes are the
+    /// rewrite record's alone, because the missed compaction key transferred
+    /// none, so the byte figure stays the bytes the store actually served
+    /// rather than a count of GETs issued.
+    #[tokio::test]
+    async fn a_rewrite_only_l1_pin_reports_two_record_gets_and_the_bytes_served() {
+        let record = rewrite_record();
+        let encoded = record.encode_to_vec();
+        let store = store_with(vec![(rewrite_key(&record), encoded.clone())]).await;
+        let input_set_hash: [u8; 32] = record
+            .input_set_hash
+            .as_slice()
+            .try_into()
+            .expect("32 bytes");
+        let identity = l1_identity(&input_set_hash, 1, 8193);
+        let (segments, (calls, requests, bytes)) = observed_resolve(store, &[identity]).await;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(calls, 1, "one resolve reports once");
+        assert_eq!(
+            requests, 2,
+            "the compaction key is GET first and misses, then the rewrite key"
+        );
+        assert_eq!(
+            bytes,
+            encoded.len() as u64,
+            "only the rewrite record's bytes crossed the wire"
+        );
+    }
+
+    /// A resolve that refuses partway still reports what the store served, so
+    /// a failing slice's record GETs are not lost from the worker's counters.
+    #[tokio::test]
+    async fn a_refused_resolve_still_reports_its_record_gets() {
+        let observer = Arc::new(CapturedRecordGets::default());
+        let store = store_with(Vec::new()).await;
+        let service = SeriesFetchService::new(
+            SegmentFetcher::new(Arc::clone(&store)),
+            Arc::new(resolver(store)),
+        )
+        .with_record_get_observer(Arc::clone(&observer) as Arc<dyn RecordGetObserver>);
+        let failure = service
+            .resolve_pinned(&[l0_identity()])
+            .await
+            .err()
+            .expect("a missing commit record refuses the slice");
+        assert_eq!(failure.code, pb::status::Code::Unsupported);
+        let (calls, requests, bytes) = observer.totals();
+        assert_eq!(calls, 1);
+        assert_eq!(requests, 1, "the missing record was still GET once");
+        assert_eq!(bytes, 0, "a miss transfers no bytes");
     }
 
     /// A snapshot resolver miss is retryable, not terminal: the coordinator

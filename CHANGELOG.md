@@ -31,7 +31,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max_bytes_scanned` nor `max_s3_requests` on the worker or the coordinator,
   and a query that fits its budget locally also fits it distributed; they are
   also not in the query's reported cost, which the slice summary carries as
-  one pooled figure. A record that is missing, unreadable, fails verification,
+  one pooled figure. Off the budget is not unreported: a worker exports the
+  totals as `ravel_distrib_fragment_record_get_requests_total` and
+  `ravel_distrib_fragment_record_get_bytes_total`, process-wide counters
+  beside the other `ravel_distrib_fragment_*` series, carrying only the
+  `mode` label. A record that is missing, unreadable, fails verification,
   or disagrees with the identity fails the fragment with `UNSUPPORTED`, and the
   coordinator runs the query locally; a throttled, timed-out or transient
   error on the record GET fails it with `UNAVAILABLE`, and the coordinator

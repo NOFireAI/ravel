@@ -225,6 +225,17 @@ pub struct FragmentMetrics {
     /// `class` label; a class queuing does not mean it rejected anything (this
     /// admission never rejects), only that a caller waited for a permit.
     fragment_admission_waits_total: [AtomicU64; 2],
+    /// Record GETs this worker's pinned resolves issued (ADR-0071
+    /// pinned-record amendment decision 5, and the record-GET counter
+    /// amendment): one per pinned L0 segment, one per pinned L1 part, two for
+    /// an L1 part only a rewrite record describes. Deliberately outside the
+    /// query's accounting and absent from the slice summary, so this counter
+    /// is the only place the resolve phase's request cost is reported.
+    fragment_record_get_requests_total: AtomicU64,
+    /// Bytes those record GETs transferred. Wire bytes as the store served
+    /// them: a GET that missed transferred none, so a rewrite-only L1 part
+    /// adds two requests and one record's bytes.
+    fragment_record_get_bytes_total: AtomicU64,
     /// Slices this coordinator executed locally (self-mapped, no network hop).
     slices_local_total: AtomicU64,
     /// Slices this coordinator dispatched to a remote worker successfully.
@@ -266,6 +277,8 @@ impl Default for FragmentMetrics {
             fragment_capability_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_inflight: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_admission_waits_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            fragment_record_get_requests_total: AtomicU64::new(0),
+            fragment_record_get_bytes_total: AtomicU64::new(0),
             slices_local_total: AtomicU64::new(0),
             slices_remote_total: AtomicU64::new(0),
             slices_redispatched_total: AtomicU64::new(0),
@@ -276,6 +289,20 @@ impl Default for FragmentMetrics {
             quarantine_readmits_total: AtomicU64::new(0),
             quarantine_current: AtomicU64::new(0),
         }
+    }
+}
+
+/// One pinned resolve's record GETs, reported by the in-crate worker service
+/// (ADR-0071 record-GET counter amendment). The slice summary cannot carry
+/// them without a `queryfrag` field, so this process-global pair is where they
+/// surface; the totals are per process, not per query, and carry no tenant
+/// label, exactly like the fragment counters beside them.
+impl ravel_query::distrib::service::RecordGetObserver for FragmentMetrics {
+    fn observe_record_gets(&self, requests: u64, bytes: u64) {
+        self.fragment_record_get_requests_total
+            .fetch_add(requests, Ordering::Relaxed);
+        self.fragment_record_get_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -402,6 +429,17 @@ impl FragmentMetrics {
     /// per class under the `class` label.
     pub fn fragment_admission_waits_by_class(&self) -> [(AdmissionClass, u64); 2] {
         AdmissionClass::ALL.map(|class| (class, self.fragment_admission_waits_total(class)))
+    }
+
+    /// Record GETs this process's pinned resolves have issued.
+    pub fn fragment_record_get_requests_total(&self) -> u64 {
+        self.fragment_record_get_requests_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// Bytes those record GETs transferred.
+    pub fn fragment_record_get_bytes_total(&self) -> u64 {
+        self.fragment_record_get_bytes_total.load(Ordering::Relaxed)
     }
 
     pub fn slices_local_total(&self) -> u64 {
@@ -995,8 +1033,12 @@ impl FragmentService {
         // its scope into a pinned one over the LOCAL snapshot, so the service
         // can no longer tell where the request came from, and the requesting
         // coordinator folds this cluster's whole answer as one lump.
-        let mut service =
-            SeriesFetchService::new(fetcher, resolver).with_engine_config(self.engine);
+        // The resolve phase's record GETs are off the query's budget and off
+        // the wire, so this process's own counters are where they are
+        // reported (ADR-0071 record-GET counter amendment).
+        let mut service = SeriesFetchService::new(fetcher, resolver)
+            .with_engine_config(self.engine)
+            .with_record_get_observer(self.inner.metrics.clone());
         if federated {
             service = service.with_resolve_scope();
         }
@@ -4189,6 +4231,207 @@ mod tests {
         );
         assert_eq!(response.series_returned, 0, "{why}: no rows");
         assert!(response.scalar.is_empty(), "{why}: no frames");
+    }
+
+    /// A [`FragmentService`] over `store` on the pinned path, built with the
+    /// caller's own `metrics` and GET limiter so a test can read either back.
+    fn pinned_service_with(
+        store: Arc<dyn ObjectStoreBackend>,
+        now_ns: i64,
+        metrics: Arc<FragmentMetrics>,
+        get_limiter: Arc<ravel_query::GetLimiter>,
+    ) -> FragmentService {
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        FragmentService::new(
+            test_keys(),
+            empty_resolver(),
+            AdmissionClasses::new(8, 8, metrics.clone()),
+            catalog,
+            store,
+            None,
+            Arc::new(FixedClock(now_ns)),
+            metrics,
+            get_limiter,
+        )
+    }
+
+    /// A pinned L0 slice's one record GET reaches this process's fragment
+    /// counters, with exact values: one request, and the commit record's own
+    /// encoded length in bytes (ADR-0071 record-GET counter amendment). The
+    /// GET is charged to no query, so these counters are the only report of
+    /// it; a resolve that reported nothing leaves both at zero.
+    #[tokio::test]
+    async fn a_pinned_l0_slice_reports_its_record_get_to_the_fragment_counters() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("record-get-counters".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let record_bytes = read_object(&store, &published_commit_key(tenant.hash()))
+            .await
+            .len() as u64;
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = pinned_service_with(
+            store,
+            now,
+            metrics.clone(),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        );
+
+        let response = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "{}",
+            response.status_message
+        );
+        assert_eq!(
+            metrics.fragment_record_get_requests_total(),
+            1,
+            "one pinned L0 segment costs exactly one record GET"
+        );
+        assert_eq!(
+            metrics.fragment_record_get_bytes_total(),
+            record_bytes,
+            "the bytes counter is the commit record's own encoded length"
+        );
+        assert!(
+            record_bytes > 0,
+            "a zero-length record would make the byte assertion vacuous"
+        );
+    }
+
+    /// Records the shared limiter's available permits at the instant a record
+    /// GET is in flight, so a test can prove the resolver drew from it.
+    struct LimiterProbeStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        limiter: Arc<ravel_query::GetLimiter>,
+        available_during_record_get: AtomicU64,
+        record_gets: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for LimiterProbeStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            if key.ends_with(".cmt") {
+                self.record_gets.fetch_add(1, Ordering::SeqCst);
+                self.available_during_record_get
+                    .store(self.limiter.available_permits() as u64, Ordering::SeqCst);
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// `build_resolver` hands the resolver this process's GET limiter, not a
+    /// private one (ADR-1195). The service is built with a single-permit
+    /// limiter, and the probe reads that limiter's available permits from
+    /// inside the record GET: zero, because the in-flight GET is holding the
+    /// only one. A resolver given a limiter of its own leaves the service's
+    /// untouched and the probe reads one.
+    #[tokio::test]
+    async fn record_gets_hold_a_permit_of_the_services_own_get_limiter() {
+        let backing: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("shared-limiter".to_string());
+        publish_metric(backing.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&backing, tenant.hash(), now).await;
+        let limiter = Arc::new(ravel_query::GetLimiter::new(1).expect("nonzero permits"));
+        let probe = Arc::new(LimiterProbeStore {
+            inner: Arc::clone(&backing),
+            limiter: Arc::clone(&limiter),
+            available_during_record_get: AtomicU64::new(u64::MAX),
+            record_gets: AtomicU64::new(0),
+        });
+        let service = pinned_service_with(
+            Arc::clone(&probe) as Arc<dyn ObjectStoreBackend>,
+            now,
+            Arc::new(FragmentMetrics::new()),
+            Arc::clone(&limiter),
+        );
+
+        let response = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "{}",
+            response.status_message
+        );
+        assert_eq!(
+            probe.record_gets.load(Ordering::SeqCst),
+            1,
+            "the pinned L0 segment's commit record is read exactly once"
+        );
+        assert_eq!(
+            probe.available_during_record_get.load(Ordering::SeqCst),
+            0,
+            "the in-flight record GET must hold the service's only permit; a \
+             private limiter would leave it at 1"
+        );
+        assert_eq!(
+            limiter.available_permits(),
+            1,
+            "the permit is released when the record GET completes"
+        );
     }
 
     /// The happy path the rejection tests below perturb: an untouched L0 pin
