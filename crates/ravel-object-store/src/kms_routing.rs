@@ -290,6 +290,16 @@ impl ObjectStoreBackend for KmsRoutingStore {
         self.default.get(key, range).await
     }
 
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<GetOutcome, StoreError> {
+        // Same as `get`: the precondition is a read header, not a key choice.
+        self.default.get_pinned(key, range, pin).await
+    }
+
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
         self.default.head(key).await
     }

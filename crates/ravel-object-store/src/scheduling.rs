@@ -549,6 +549,24 @@ impl ObjectStoreBackend for ScheduledHandle {
         result
     }
 
+    /// Takes a permit and counts as a [`StoreOp::Get`], identically to
+    /// [`Self::get`]: a pinned read is one GET against the same request budget.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<GetOutcome, StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        let start = self.clock.now_nanos();
+        let result = self.inner.get_pinned(key, range, pin).await;
+        let bytes = result
+            .as_ref()
+            .map_or(0, |outcome| outcome.data.len() as u64);
+        self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
     async fn put_multipart<'a>(
         &'a self,
         key: &str,
