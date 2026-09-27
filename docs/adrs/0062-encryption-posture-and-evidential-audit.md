@@ -104,7 +104,7 @@ Gaps closed: per-tenant KMS by 1a-1e; coverage by 2a; lossiness by 2b; unbounded
 - **Two ADR amendments ride along**: ADR-0042 decision 1 (mechanism rewritten to match reality, historical posture stated plainly) and ADR-0055 §1/§3 (deny-delete narrowed to the legal-hold shard; Maintain gains the query-audit-shard delete used by retention). Both are in-place amendments with a dated note, the established pattern in ADR-0055 itself.
 - **New object key `t/<hash>/enc`** (CAS, additive; this ADR authorizes it — no existing layout changes, no version bumps). New config surface: `--s3-kms-key`, `--tenant-kms-key`, `--audit-mode`, `--audit-text`, audit `max_batch`/`max_age`, `audit_retention`, `RAVEL_AUDIT_TOKEN_KEY`.
 - **`RAVEL_AUDIT_TOKEN_KEY` and per-tenant key ARNs are out-of-bucket durability-adjacent state**, same class as the deployment-keyed tenant hash key: losing the token key loses targeted-confirmation ability (records remain valid); losing KMS key config is recoverable from the `enc` records.
-- **Query tail latency gains the audit flush** (<= `max_age` + one dual-PUT RTT) on every audited surface, in `required` mode. Dashboards polling PromQL pay it too; `max_age` tuning and the documented best-effort opt-out are the relief valves. Before/after numbers are recorded when the implementation lands.
+- **Query tail latency gains the audit flush** (<= `max_age` + one dual-PUT RTT) on every audited surface, in `required` mode, except against a degraded store, where the worst case is bounded by `AUDIT_WRITE_BUDGET` (30 s) instead (2026-09-27 amendment). Dashboards polling PromQL pay it too; `max_age` tuning and the documented best-effort opt-out are the relief valves. Before/after numbers are recorded when the implementation lands.
 - **Fail-closed coupling**: in `required` mode an S3 outage now fails queries that the read cache could have served. This is the deliberate trade — the exact complaint was that queries outlive the trail.
 - **KMS cost**: SSE-KMS adds KMS requests per PUT for keyed tenants; S3 Bucket Keys (bucket-side configuration, documented in operations.md) reduce this. MinIO KMS (KES) compatibility gets a docs note; the decorator itself is backend-agnostic since it only builds more `S3Store`s.
 - **IAM/role interaction**: per-tenant BYOK key policies must grant the ADR-0055 role principals (Gateway/Query/Maintain) usage; operations.md's policy templates gain the KMS statements. Revoked key = that tenant fails closed, others unaffected (new failure-path tests with `FaultStore` asserting the injected fault fired).
@@ -160,7 +160,7 @@ surface.
 
 ## Amendment (2026-09-27): a transient PUT is retried before a batch fails closed
 
-<!-- amendment-applies: none reason="section 2b's failed-flush-fails-its-queries rule is unchanged for a genuinely exhausted or non-transient error; this only narrows how a single transient object-store error is classified before that rule is reached, and retires no earlier wording" -->
+<!-- amendment-applies: sections="Consequences" pointer="2026-09-27 amendment" -->
 
 Issue #2035 found that `write_audit_batch` failed a whole batch closed on
 one transient object-store timeout, even though the timeout was often a
@@ -205,3 +205,8 @@ of that hint and the jittered backoff, still subject to the same budget
 check. Every attempt the ladder retries is counted on `/metrics` as
 `ravel_audit_put_retries_total`, alongside the existing
 `ravel_audit_write_failures_total`.
+
+This qualifies the Consequences bullet on query tail latency: the `<=
+max_age` + one dual-PUT RTT bound assumes a healthy store, and against a
+degraded one the worst case is `AUDIT_WRITE_BUDGET` (30 seconds) instead,
+not the unbounded retry ladder the bullet's original wording implied.
