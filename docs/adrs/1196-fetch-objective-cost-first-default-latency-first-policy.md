@@ -47,8 +47,8 @@ Two things this ADR does not claim, both refuted earlier in the investigation:
 
 ## Decision
 
-**Cost-first remains the default** (on a loopback store it no longer is; see
-the loopback amendment below). `cost-based` at the reference profile keeps
+**Cost-first remains the default** (a loopback exception was added and then
+withdrawn; see the loopback amendment and its withdrawal below). `cost-based` at the reference profile keeps
 resolving to whole-object reads. A deployment that has not asked for anything
 else keeps the cheaper S3 bill, and the published stock ClickBench entry
 continues to reflect it.
@@ -98,8 +98,8 @@ bill while the benchmark shows what the engine can do.
 
 ## Rejected alternatives
 
-**Make `byte-minimal` the default** (adopted for loopback stores only; see the
-loopback amendment below). It is the fast configuration and it needs no
+**Make `byte-minimal` the default** (adopted for loopback stores only, then
+withdrawn; see the loopback amendment and its withdrawal below). It is the fast configuration and it needs no
 new policy name. Rejected twice over: at the default concurrency it measured
 712.4 s against 525.0 s, 36% *worse*, so as a default it is a regression for
 anyone who does not also raise concurrency; and at the concurrency where it wins
@@ -158,3 +158,14 @@ faster hot than `cost-based` (#1463). ADR-2014 therefore makes `byte-minimal`
 the default when `--logs-fetch-policy` is not given and the S3 endpoint is
 loopback. For every other endpoint, cost-first stays the default exactly as
 decided above, and concurrency is unchanged everywhere.
+
+## Amendment (2026-09-27, ADR-2023): the loopback exception withdrawn
+
+<!-- amendment-applies: sections="Decision|Rejected alternatives" pointer="withdrawal" -->
+
+The loopback amendment above measured single queries only. Under ten
+concurrent queries on the ClickBench reference machine, the loopback
+`byte-minimal` default cut throughput from about 0.40 to 0.12 queries per
+second, and reached 0.170 even with a corpus-sized fetch cache (#2014, #2023).
+ADR-2023 decision 1 withdraws the exception: with `--logs-fetch-policy` unset,
+every deployment resolves `cost-based` again, as this ADR decided.

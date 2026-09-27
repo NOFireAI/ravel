@@ -704,3 +704,11 @@ ADR-2014 makes `byte-minimal` the default fetch policy when the S3 endpoint is
 loopback. That derives a policy from where the store is, not a price from what
 the endpoint might bill: the stamped cost profile is unchanged, and the policy's
 source is logged as `derived-loopback-endpoint`.
+
+## Amendment (2026-09-27, ADR-2023): the loopback fetch policy withdrawn
+
+<!-- amendment-applies: none reason="alternative 6 stands as written; this records that the ADR-2014 policy derivation described in the amendment above was withdrawn by ADR-2023, so no endpoint now selects a fetch policy, and retires no wording in this ADR" -->
+
+ADR-2023 decision 1 withdraws the loopback default the amendment above
+describes. With `--logs-fetch-policy` unset, every deployment resolves
+`cost-based`, whatever its endpoint, and no policy is derived from an endpoint.
