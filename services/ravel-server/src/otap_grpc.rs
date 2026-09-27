@@ -83,12 +83,14 @@ impl ArrowMetricsService for GrpcArrowMetricsService {
         // exactly as the OTLP gRPC services read them from a unary request's
         // metadata. Both are per-connection: OTAP has no per-batch metadata we
         // interpret (the optional hpack `headers` field is not read here).
+        // `GrpcIngestAdmissionLayer` normally authenticated the tenant on the
+        // stream's request head already (issue #1705).
         let headers = metadata_to_headers(request.metadata());
-        let tenant = self
-            .state
-            .tenant_resolver
-            .resolve(&headers)
-            .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
+        let tenant = crate::ingest_admission::grpc_request_tenant(
+            self.state.tenant_resolver.as_ref(),
+            &request,
+            &headers,
+        )?;
         let mode = write_mode_from_headers(&headers);
         let wire_bytes = wire_byte_counter(&request)?;
 

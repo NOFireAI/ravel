@@ -30,6 +30,7 @@ pub mod health;
 pub mod health_listener;
 pub mod idle_tenant_state;
 pub mod ingest;
+pub mod ingest_admission;
 pub mod ingest_byte_metrics;
 pub mod ingest_concurrency;
 pub mod lifecycle_refresh;
@@ -3173,8 +3174,34 @@ pub async fn start(
         // service shares the listener but is a query surface with no
         // byte-rate admission, so the layer is a no-op cost for it (an unread
         // extension).
+        //
+        // The admission layer takes the process-wide in-flight permit for a
+        // unary OTLP export when its head arrives (issue #1705), then
+        // authenticates the tenant, so a request over the ceiling is refused
+        // RESOURCE_EXHAUSTED, and one without credentials UNAUTHENTICATED,
+        // before tonic reads, decompresses or decodes its message; the handler
+        // behind it reuses that permit and tenant. It authenticates the OTAP
+        // stream's head the same way, without a permit (OTAP takes one per
+        // batch). It leaves every other service on this listener alone, and
+        // no HTTP/2 stream cap is derived from the ingest ceiling: that
+        // setting is per connection, so it would throttle the Flight SQL and
+        // fragment surfaces sharing the listener. It bounds a unary export's
+        // message wait by `INGEST_BODY_READ_TIMEOUT`, since the permit is
+        // held through it, and claims only the ingest paths registered here.
+        let grpc_ingest_services = ingest_admission::GrpcIngestServices {
+            otlp: metrics_service.is_some(),
+            #[cfg(feature = "otap")]
+            otap: arrow_metrics_service.is_some(),
+            #[cfg(not(feature = "otap"))]
+            otap: false,
+        };
         let grpc = tonic::transport::Server::builder()
             .layer(wire_byte_count::WireByteCountLayer)
+            .layer(ingest_admission::GrpcIngestAdmissionLayer::new(
+                ingest_concurrency.clone(),
+                config.tenant_resolver.clone(),
+                grpc_ingest_services,
+            ))
             .add_optional_service(metrics_service)
             .add_optional_service(logs_service)
             .add_optional_service(traces_service);
