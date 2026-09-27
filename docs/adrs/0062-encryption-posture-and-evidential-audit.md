@@ -157,3 +157,34 @@ the audit-failure signal, so a client whose query already failed still
 learns definitively whether that failure was recorded. This records a
 decision already made in #55; it changes no format, key layout, or config
 surface.
+
+## Amendment (2026-09-27): a transient PUT is retried before a batch fails closed
+
+<!-- amendment-applies: none reason="section 2b's failed-flush-fails-its-queries rule is unchanged for a genuinely exhausted or non-transient error; this only narrows how a single transient object-store error is classified before that rule is reached, and retires no earlier wording" -->
+
+Issue #2035 found that `write_audit_batch` failed a whole batch closed on
+one transient object-store timeout, even though the timeout was often a
+single slow request rather than a real outage. The object store's own
+client-side retry does not help here: both of `write_audit_batch`'s PUTs
+(the data object and the commit record) use `PutOptions::create_if_absent()`,
+a conditional write, and `object_store` 0.14's S3 client only marks a
+request idempotent under `PutMode::Overwrite`, never under the conditional
+`PutMode::Create` path a `create_if_absent()` PUT takes, so a `Timeout` on
+either PUT skipped the client's own retry entirely and reached
+`write_audit_batch` on the very first attempt.
+
+Each PUT is now retried up to two additional times (three attempts total)
+when the error is one `StoreError::is_retryable()` already classifies as
+transient (`Timeout`, `Throttled`, `Transient`), with a short jittered
+backoff between attempts. A non-retryable error (`AccessDenied` and
+friends) still fails on the first attempt, exactly as before. Every retry
+sends the identical bytes under the identical key, so an `AlreadyExists` on
+a commit-record retry is checked against what is actually stored: matching
+bytes mean the earlier attempt's write landed and only its acknowledgement
+was lost, and the retry treats that as success rather than as a collision;
+differing bytes still fail closed as a genuine conflict, same as an
+`AlreadyExists` on the first attempt always has. Section 2b's rule that an
+exhausted or non-transient failure fails every awaiting query closed is
+unchanged; this amendment only changes how many attempts happen, and how an
+`AlreadyExists` on a retry is told apart from a real collision, before that
+rule is reached.

@@ -8,6 +8,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A transient object-store error on an audit-record PUT is retried before the
+  batch fails closed** (issue #2035). `write_audit_batch` used to fail an
+  entire batch of queries on a single object-store timeout or throttle
+  response, even though the object store's own client-side retry never covers
+  a conditional PUT (`PutOptions::create_if_absent()`, the mode both the data
+  object and the commit record use, is never marked idempotent by the S3
+  client, so a `Timeout` on it skips the client's retry loop entirely). Each
+  PUT now retries up to two more times with a short jittered backoff when the
+  error is one already classified as transient, and only a non-retryable
+  error or one that keeps failing across every attempt still fails the batch
+  closed, exactly as before.
 - **The scheduled catalog fold now runs only in `--mode maintain` and
   `--mode all`, and a `maintain` fleet partitions it across its replicas**
   (ADR-1693, issue #1693). A `maintain` process folds only the

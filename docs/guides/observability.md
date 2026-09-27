@@ -1968,7 +1968,10 @@ pipeline it never ran.
 |---|---|
 | `ravel_audit_write_failures_total` | Query-audit writes that failed and were released anyway under `--audit-mode best-effort`. Each one is a query that was served with no durable audit record. |
 
-Under `--audit-mode required` (the default) a failed audit write fails the
+A transient object-store error (a timeout or a throttle response) is retried
+a few times with a short backoff before a write counts as failed here, so
+this counter reflects writes that kept failing across every attempt, not a
+single slow request. Under `--audit-mode required` (the default) a failed audit write fails the
 query with a 503 instead, and is not counted here, so this counter is always
 zero on a fail-closed deployment. On a best-effort one, any increase is the
 audit trail going incomplete while queries keep succeeding, which is why an
