@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -496,11 +496,32 @@ pub struct GatewayState {
     pub ingest_concurrency: Arc<IngestConcurrencyController>,
 }
 
+impl crate::ingest_admission::IngestAdmissionState for GatewayState {
+    fn ingest_concurrency(&self) -> &Arc<IngestConcurrencyController> {
+        &self.ingest_concurrency
+    }
+
+    fn tenant_resolver(&self) -> &Arc<dyn TenantResolver> {
+        &self.tenant_resolver
+    }
+}
+
 pub fn router(state: Arc<GatewayState>) -> Router {
     Router::new()
         .route("/v1/metrics", post(export_metrics))
         .route("/v1/logs", post(export_logs))
         .route("/v1/traces", post(export_traces))
+        // Issue #1705: the in-flight permit and the tenant credential check
+        // run here, on the request head, rather than as the first statements
+        // of each handler. A handler's `body: Bytes` argument is an
+        // extractor, so by the time the handler's own first line ran the body
+        // had already been buffered for an as-yet unauthenticated caller.
+        // `route_layer` rather than `layer` so a request to an unrouted path
+        // never takes a permit.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::ingest_admission::admit_ingest_request::<GatewayState>,
+        ))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -534,7 +555,7 @@ const INGEST_CONCURRENCY_RETRY_AFTER_SECONDS: u64 = 1;
 /// 429 for a request shed by the process-wide in-flight ceiling, before
 /// tenant resolution or any per-signal admission check: no shard is touched
 /// and no commit token is issued.
-fn ingest_concurrency_shed_response() -> Response {
+pub(crate) fn ingest_concurrency_shed_response() -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         "process in-flight ingest-request limit reached",
@@ -663,21 +684,18 @@ pub(crate) fn write_mode_from_headers(headers: &HeaderMap) -> WriteMode {
     }
 }
 
+/// The in-flight permit and the tenant both come from
+/// [`crate::ingest_admission::admit_ingest_request`], which ran on this
+/// request's head before `body` was read (issue #1705). `Extension<TenantId>`
+/// is present on every request that reaches here: the middleware is wired
+/// onto these routes in [`router`] and returns 401 itself when it cannot
+/// resolve one.
 async fn export_metrics(
     State(state): State<Arc<GatewayState>>,
+    Extension(tenant): Extension<TenantId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _permit = match state.ingest_concurrency.try_admit() {
-        Ok(permit) => permit,
-        Err(_) => return ingest_concurrency_shed_response(),
-    };
-
-    let tenant = match state.tenant_resolver.resolve(&headers) {
-        Ok(tenant) => tenant,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-    };
-
     let mode = write_mode_from_headers(&headers);
 
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
@@ -751,19 +769,10 @@ async fn export_metrics(
 /// failure.
 async fn export_logs(
     State(state): State<Arc<GatewayState>>,
+    Extension(tenant): Extension<TenantId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _permit = match state.ingest_concurrency.try_admit() {
-        Ok(permit) => permit,
-        Err(_) => return ingest_concurrency_shed_response(),
-    };
-
-    let tenant = match state.tenant_resolver.resolve(&headers) {
-        Ok(tenant) => tenant,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-    };
-
     let mode = write_mode_from_headers(&headers);
 
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
@@ -841,19 +850,10 @@ async fn export_logs(
 /// for a retryable write failure.
 async fn export_traces(
     State(state): State<Arc<GatewayState>>,
+    Extension(tenant): Extension<TenantId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _permit = match state.ingest_concurrency.try_admit() {
-        Ok(permit) => permit,
-        Err(_) => return ingest_concurrency_shed_response(),
-    };
-
-    let tenant = match state.tenant_resolver.resolve(&headers) {
-        Ok(tenant) => tenant,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-    };
-
     let mode = write_mode_from_headers(&headers);
 
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): byte rate
@@ -1216,6 +1216,14 @@ pub(crate) mod tests {
             .find(|row| row.tenant_hash == want && row.signal == Signal::Metrics)
     }
 
+    /// The tenant the admission middleware resolves from the request headers
+    /// before the body extractor runs (issue #1705). A test that calls a
+    /// handler directly stands in for that middleware, since the handler no
+    /// longer resolves a tenant of its own.
+    fn admitted_tenant() -> Extension<TenantId> {
+        Extension(TenantId::new(TENANT))
+    }
+
     fn gzip_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
@@ -1243,6 +1251,7 @@ pub(crate) mod tests {
 
         let response = export_metrics(
             State(state.clone()),
+            admitted_tenant(),
             gzip_headers(),
             Bytes::from(compressed.clone()),
         )
@@ -1295,7 +1304,13 @@ pub(crate) mod tests {
             compressed.len()
         );
 
-        let response = export_metrics(State(state), gzip_headers(), Bytes::from(compressed)).await;
+        let response = export_metrics(
+            State(state),
+            admitted_tenant(),
+            gzip_headers(),
+            Bytes::from(compressed),
+        )
+        .await;
         assert_eq!(
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1334,7 +1349,13 @@ pub(crate) mod tests {
         let one_past_cap = vec![0u8; MAX_DECOMPRESSED_OTLP_BODY_BYTES + 1];
         let compressed = gzip(&one_past_cap);
 
-        let response = export_metrics(State(state), gzip_headers(), Bytes::from(compressed)).await;
+        let response = export_metrics(
+            State(state),
+            admitted_tenant(),
+            gzip_headers(),
+            Bytes::from(compressed),
+        )
+        .await;
         assert_eq!(
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1434,6 +1455,7 @@ pub(crate) mod tests {
 
         let response = export_metrics(
             State(state.clone()),
+            admitted_tenant(),
             gzip_headers(),
             Bytes::from(two_member),
         )
@@ -1460,7 +1482,13 @@ pub(crate) mod tests {
         let mut body = gzip(&encoded);
         body.extend_from_slice(b"trailing junk not a gzip header");
 
-        let response = export_metrics(State(state), gzip_headers(), Bytes::from(body)).await;
+        let response = export_metrics(
+            State(state),
+            admitted_tenant(),
+            gzip_headers(),
+            Bytes::from(body),
+        )
+        .await;
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -1481,7 +1509,13 @@ pub(crate) mod tests {
                 header::CONTENT_ENCODING,
                 HeaderValue::from_str(value).unwrap(),
             );
-            let response = export_metrics(State(state), headers, Bytes::from(gzip(&encoded))).await;
+            let response = export_metrics(
+                State(state),
+                admitted_tenant(),
+                headers,
+                Bytes::from(gzip(&encoded)),
+            )
+            .await;
             assert_eq!(
                 response.status(),
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -1500,6 +1534,7 @@ pub(crate) mod tests {
 
         let response = export_metrics(
             State(state.clone()),
+            admitted_tenant(),
             HeaderMap::new(),
             Bytes::from(encoded.clone()),
         )
@@ -1520,7 +1555,13 @@ pub(crate) mod tests {
         let encoded = compressible_request(50).encode_to_vec();
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("X-Gzip"));
-        let response = export_metrics(State(state), headers, Bytes::from(gzip(&encoded))).await;
+        let response = export_metrics(
+            State(state),
+            admitted_tenant(),
+            headers,
+            Bytes::from(gzip(&encoded)),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK, "x-gzip must be accepted");
     }
 
@@ -1550,7 +1591,13 @@ pub(crate) mod tests {
         // Not a gzip stream at all, and larger than the 16-byte burst.
         let not_gzip = Bytes::from(vec![0x42u8; 1024]);
 
-        let response = export_metrics(State(state.clone()), gzip_headers(), not_gzip).await;
+        let response = export_metrics(
+            State(state.clone()),
+            admitted_tenant(),
+            gzip_headers(),
+            not_gzip,
+        )
+        .await;
         assert_eq!(
             response.status(),
             StatusCode::TOO_MANY_REQUESTS,
@@ -1580,7 +1627,13 @@ pub(crate) mod tests {
         let state = state_with_limits(AdmissionLimits::default());
         let encoded = value_kind_mismatch_request().encode_to_vec();
 
-        let response = export_metrics(State(state), HeaderMap::new(), Bytes::from(encoded)).await;
+        let response = export_metrics(
+            State(state),
+            admitted_tenant(),
+            HeaderMap::new(),
+            Bytes::from(encoded),
+        )
+        .await;
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -1606,7 +1659,13 @@ pub(crate) mod tests {
         let state = state_with_store(store);
         let encoded = compressible_request(10).encode_to_vec();
 
-        let response = export_metrics(State(state), HeaderMap::new(), Bytes::from(encoded)).await;
+        let response = export_metrics(
+            State(state),
+            admitted_tenant(),
+            HeaderMap::new(),
+            Bytes::from(encoded),
+        )
+        .await;
         assert_eq!(
             response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1631,6 +1690,7 @@ pub(crate) mod tests {
 
         let metrics_response = export_metrics(
             State(state.clone()),
+            admitted_tenant(),
             HeaderMap::new(),
             Bytes::from(compressible_request(1).encode_to_vec()),
         )
@@ -1643,6 +1703,7 @@ pub(crate) mod tests {
 
         let logs_response = export_logs(
             State(state.clone()),
+            admitted_tenant(),
             HeaderMap::new(),
             Bytes::from(minimal_log_request().encode_to_vec()),
         )
@@ -1655,6 +1716,7 @@ pub(crate) mod tests {
 
         let traces_response = export_traces(
             State(state),
+            admitted_tenant(),
             HeaderMap::new(),
             Bytes::from(minimal_trace_request().encode_to_vec()),
         )

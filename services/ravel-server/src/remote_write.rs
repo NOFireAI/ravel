@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ingest_concurrency::IngestConcurrencyController;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -165,6 +165,12 @@ impl IntoResponse for DecodeChargeError {
     }
 }
 
+/// A fixed `Retry-After` for the admission sheds that carry no per-caller
+/// refill estimate: no refill time is tracked, and a slot or budget can free
+/// up as soon as any in-flight request completes, so a short fixed wait is
+/// the right shape.
+const INGEST_CONCURRENCY_RETRY_AFTER_SECONDS: u64 = 1;
+
 /// 429 for a request shed by the process-wide ingest buffer byte budget
 /// (ADR-0069 decision 1, amended by issue #1419): the body was refused before
 /// its snappy expansion was allocated, so no shard was touched and no commit
@@ -302,9 +308,31 @@ pub struct RemoteWriteState {
     pub budget: Arc<IngestByteBudget>,
 }
 
+impl crate::ingest_admission::IngestAdmissionState for RemoteWriteState {
+    fn ingest_concurrency(&self) -> &Arc<IngestConcurrencyController> {
+        &self.ingest_concurrency
+    }
+
+    fn tenant_resolver(&self) -> &Arc<dyn TenantResolver> {
+        &self.tenant_resolver
+    }
+
+    /// This surface counts every whole-request rejection, the 401 included,
+    /// so the middleware records it where the handler used to.
+    fn on_unauthorized(&self) {
+        self.metrics.record_request_rejected();
+    }
+}
+
 pub fn router(state: Arc<RemoteWriteState>) -> Router {
     Router::new()
         .route("/api/v1/write", post(remote_write))
+        // Issue #1705: admission and authentication decide on the request
+        // head, ahead of the `body: Bytes` extractor. See `otlp_http::router`.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::ingest_admission::admit_ingest_request::<RemoteWriteState>,
+        ))
         .layer(DefaultBodyLimit::max(MAX_COMPRESSED_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -395,45 +423,15 @@ fn retry_after_seconds(retry_after_ns: i64) -> u64 {
     ns.div_ceil(1_000_000_000).max(1)
 }
 
-/// A fixed `Retry-After` for the process-wide in-flight shed,
-/// the same rationale as [`RETRY_AFTER_SECONDS`] above: no per-caller refill
-/// time is tracked, and a slot can free up as soon as any in-flight request
-/// completes, so a short fixed wait is the right shape.
-const INGEST_CONCURRENCY_RETRY_AFTER_SECONDS: u64 = 1;
-
-/// 429 for a request shed by the process-wide in-flight ceiling, before
-/// tenant resolution or any per-signal admission check: no shard is touched
-/// and no commit token is issued.
-fn ingest_concurrency_shed_response() -> Response {
-    let mut response = (
-        StatusCode::TOO_MANY_REQUESTS,
-        "process in-flight ingest-request limit reached",
-    )
-        .into_response();
-    if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
-        response.headers_mut().insert(RETRY_AFTER_HEADER, value);
-    }
-    response
-}
-
+/// The in-flight permit and the tenant both come from
+/// [`crate::ingest_admission::admit_ingest_request`], which ran on this
+/// request's head before `body` was read (issue #1705).
 async fn remote_write(
     State(state): State<Arc<RemoteWriteState>>,
+    Extension(tenant): Extension<TenantId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _permit = match state.ingest_concurrency.try_admit() {
-        Ok(permit) => permit,
-        Err(_) => return ingest_concurrency_shed_response(),
-    };
-
-    let tenant: TenantId = match state.tenant_resolver.resolve(&headers) {
-        Ok(tenant) => tenant,
-        Err(_) => {
-            state.metrics.record_request_rejected();
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    };
-
     // Receiver-clock plausibility (ADR-0051 amendment): the injected
     // clock is read once and reused for every admission decision in this
     // handler, checked before any per-record work. Whole-request 503, counted
@@ -770,7 +768,15 @@ mod tests {
 
         // No content-type / version header and an empty body: the clock check
         // runs before version negotiation and decode, so those never matter.
-        let response = remote_write(State(state.clone()), HeaderMap::new(), Bytes::new()).await;
+        // The tenant stands in for `admit_ingest_request`, which resolves it
+        // from the request head before the body extractor runs.
+        let response = remote_write(
+            State(state.clone()),
+            Extension(tenant.clone()),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
 
         // (a) The transport response is 503 / UNAVAILABLE with a Retry-After,
         // as this surface returns for an implausible receiver clock.

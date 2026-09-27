@@ -62,24 +62,32 @@ pub(crate) fn ingest_concurrency_shed_status() -> Status {
     Status::resource_exhausted("process in-flight ingest-request limit reached")
 }
 
+/// A request whose tenant credential did not resolve, as `UNAUTHENTICATED`.
+/// Shared by `GrpcIngestAdmissionLayer` and every gRPC ingest handler, so a
+/// client sees one status and one message whichever of them refused it.
+pub(crate) fn unauthenticated_status() -> Status {
+    Status::unauthenticated("invalid or missing tenant credentials")
+}
+
 #[tonic::async_trait]
 impl MetricsService for GrpcMetricsService {
     async fn export(
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        let _permit = self
-            .state
-            .ingest_concurrency
-            .try_admit()
-            .map_err(|_| ingest_concurrency_shed_status())?;
+        // Normally already taken by `GrpcIngestAdmissionLayer` on the request
+        // head, before tonic read or decoded this message (issue #1705); this
+        // is the direct-call path, where nothing in front of the handler took
+        // one. Either way exactly one permit covers the request.
+        let _permit =
+            crate::ingest_admission::admit_grpc_request(&self.state.ingest_concurrency, &request)?;
 
         let headers = metadata_to_headers(request.metadata());
-        let tenant = self
-            .state
-            .tenant_resolver
-            .resolve(&headers)
-            .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
+        let tenant = crate::ingest_admission::grpc_request_tenant(
+            self.state.tenant_resolver.as_ref(),
+            &request,
+            &headers,
+        )?;
         let mode = write_mode_from_headers(&headers);
 
         // Layer 2 (ADR-0051 section 2): byte rate counted by
