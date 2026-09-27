@@ -48,7 +48,27 @@ use ravel_types::TenantHash;
 
 /// A cheap-to-clone snapshot of one tenant's metric metadata: the decoded
 /// entries behind an `Arc`, so a handler clones a pointer, never the record.
-pub type MetadataSnapshot = Arc<Vec<MetricMetadataEntry>>;
+pub type MetadataSnapshot = Arc<MetadataRecord>;
+
+/// One tenant's decoded metric metadata entries, together with the
+/// reservation that charges them to the process memory budget (ADR-1702
+/// decision 6) for as long as any clone of the snapshot is alive. Derefs to
+/// the entries.
+#[derive(Debug, Default)]
+pub struct MetadataRecord {
+    entries: Vec<MetricMetadataEntry>,
+    /// `None` for an empty snapshot (an absent record or a failed read),
+    /// which decoded nothing.
+    _reservation: Option<ravel_memory::Reservation>,
+}
+
+impl std::ops::Deref for MetadataRecord {
+    type Target = Vec<MetricMetadataEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
 
 /// Tuning for [`MetadataCache`]. Every default is the ADR-0085 value.
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +169,9 @@ struct Inner {
 /// map the foreground `get` reads, without borrowing the `MetadataCache`.
 struct Shared {
     store: Arc<dyn ObjectStoreBackend>,
+    /// Every decoded record reserves its declared size against this budget
+    /// before decoding (ADR-1702 decision 6).
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
     clock: Arc<dyn Clock>,
     config: MetadataCacheConfig,
     inner: std::sync::Mutex<Inner>,
@@ -194,9 +217,28 @@ impl MetadataCache {
         config: MetadataCacheConfig,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        Self::with_memory_budget(
+            store,
+            config,
+            clock,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        )
+    }
+
+    /// [`Self::new`], but every decoded record is charged to `budget`, the
+    /// process [`ravel_memory::MemoryBudget`] (ADR-1702 decision 6). A read
+    /// the budget refuses is handled like any other read failure: counted,
+    /// logged, and served as the stale or empty record.
+    pub fn with_memory_budget(
+        store: Arc<dyn ObjectStoreBackend>,
+        config: MetadataCacheConfig,
+        clock: Arc<dyn Clock>,
+        budget: Arc<ravel_memory::MemoryBudget>,
+    ) -> Self {
         MetadataCache {
             shared: Arc::new(Shared {
                 store,
+                memory_budget: budget,
                 clock,
                 config,
                 inner: std::sync::Mutex::new(Inner {
@@ -308,6 +350,16 @@ impl MetadataCache {
     }
 }
 
+fn charged_snapshot(
+    entries: Vec<MetricMetadataEntry>,
+    reservation: ravel_memory::Reservation,
+) -> MetadataSnapshot {
+    Arc::new(MetadataRecord {
+        entries,
+        _reservation: Some(reservation),
+    })
+}
+
 /// Read a tenant's record into a snapshot. An absent record and any read error
 /// both become an empty snapshot: metadata is best-effort, so its absence or a
 /// transient store failure is not a fault to surface. A read error on the miss
@@ -316,16 +368,20 @@ async fn fetch_snapshot(
     shared: &Shared,
     tenant_hash: TenantHash,
 ) -> (MetadataSnapshot, Option<Version>) {
-    match read_metrics_meta_for_serve(shared.store.as_ref(), &tenant_hash).await {
-        Ok(Some((entries, version))) => (Arc::new(entries), Some(version)),
-        Ok(None) => (Arc::new(Vec::new()), None),
+    match read_metrics_meta_for_serve(shared.store.as_ref(), &tenant_hash, &shared.memory_budget)
+        .await
+    {
+        Ok(Some((entries, version, reservation))) => {
+            (charged_snapshot(entries, reservation), Some(version))
+        }
+        Ok(None) => (MetadataSnapshot::default(), None),
         Err(err) => {
             tracing::warn!(
                 target: "ravel_query::metadata_cache",
                 error = %err,
                 "metric metadata read failed; serving an empty record for this horizon"
             );
-            (Arc::new(Vec::new()), None)
+            (MetadataSnapshot::default(), None)
         }
     }
 }
@@ -344,7 +400,9 @@ async fn fetch_snapshot(
 /// the pre-upgrade snapshot in memory for the life of the process.
 fn spawn_refresh(shared: Arc<Shared>, tenant_hash: TenantHash) {
     tokio::spawn(async move {
-        let result = read_metrics_meta_for_serve(shared.store.as_ref(), &tenant_hash).await;
+        let result =
+            read_metrics_meta_for_serve(shared.store.as_ref(), &tenant_hash, &shared.memory_budget)
+                .await;
         let now = shared.clock.now_ns();
         let mut inner = shared.lock();
         let Some(entry) = inner.tenants.get_mut(&tenant_hash) else {
@@ -353,8 +411,8 @@ fn spawn_refresh(shared: Arc<Shared>, tenant_hash: TenantHash) {
             return;
         };
         match result {
-            Ok(Some((entries, version))) => {
-                entry.snapshot = Arc::new(entries);
+            Ok(Some((entries, version, reservation))) => {
+                entry.snapshot = charged_snapshot(entries, reservation);
                 entry.version = Some(version);
                 entry.fetched_at_ns = now;
             }
@@ -362,7 +420,7 @@ fn spawn_refresh(shared: Arc<Shared>, tenant_hash: TenantHash) {
                 // The record was deleted out from under us (no role holds
                 // delete on this key today, so this is not expected, but it is
                 // representable): serve empty going forward.
-                entry.snapshot = Arc::new(Vec::new());
+                entry.snapshot = MetadataSnapshot::default();
                 entry.version = None;
                 entry.fetched_at_ns = now;
             }

@@ -61,6 +61,55 @@ struct GetCost {
 }
 
 /// Absolute `(offset, len)` of a section by kind, from the footer.
+/// What a catalog decode is charged before it runs (ADR-1702 decision 6): the
+/// footer-declared `uncompressed_len` of every catalog section the object
+/// carries, each clamped to the reader's section ceiling, since the decoder
+/// refuses a larger section before allocating it. On a chunked object the
+/// SERIES_META_CHUNKS descriptor records the stored frames' length, not what
+/// they inflate to; the decoder inflates and drops them one frame at a time.
+fn catalog_decode_len(footer: &Footer, limits: ReaderLimits) -> u64 {
+    footer
+        .sections
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SECTION_LABEL_DICT
+                    | SECTION_SERIES_IDS
+                    | SECTION_SERIES_META
+                    | SECTION_SERIES_IDX
+                    | SECTION_SERIES_META_CHUNKS
+            )
+        })
+        .map(|s| {
+            s.uncompressed_len
+                .min(limits.max_section_uncompressed_bytes)
+        })
+        .fold(0, u64::saturating_add)
+}
+
+/// The series a catalog decode selected, and the reservation charging the
+/// decoded catalog to the memory budget (ADR-1702 decision 6) for as long as
+/// they are held. Derefs to the entries.
+struct DecodedCatalog {
+    entries: Vec<SeriesEntryV4>,
+    reservation: ravel_memory::Reservation,
+}
+
+impl DecodedCatalog {
+    fn into_parts(self) -> (Vec<SeriesEntryV4>, ravel_memory::Reservation) {
+        (self.entries, self.reservation)
+    }
+}
+
+impl std::ops::Deref for DecodedCatalog {
+    type Target = [SeriesEntryV4];
+
+    fn deref(&self) -> &[SeriesEntryV4] {
+        &self.entries
+    }
+}
+
 fn section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
     footer
         .sections
@@ -182,7 +231,8 @@ pub enum FetchError {
     #[error("etag changed between reads of segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
     /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
-    /// reservation for the bytes this GET would materialize. Carries only the
+    /// reservation for the bytes this GET would materialize, or for the bytes
+    /// a catalog decode would produce (ADR-1702 decision 6). Carries only the
     /// three accounting figures, never an object key or tenant value: the
     /// refusal is a resource condition, not data corruption, and its message
     /// must not leak which object or tenant provoked it.
@@ -891,6 +941,17 @@ impl SegmentFetcher {
             })
     }
 
+    /// Reserves [`catalog_decode_len`] for `footer` before a catalog decode
+    /// (ADR-1702 decision 6), refusing with the same typed
+    /// [`FetchError::FetchMemoryExhausted`] a fetch reservation does. The guard
+    /// travels with the decoded entries in a [`DecodedCatalog`].
+    fn reserve_catalog_decode(
+        &self,
+        footer: &Footer,
+    ) -> Result<ravel_memory::Reservation, FetchError> {
+        self.reserve_fetch(catalog_decode_len(footer, self.limits))
+    }
+
     /// One store GET, bounded by the shared in-flight limiter. The permit
     /// is released the moment the GET resolves; callers must
     /// never hold the returned future's permit across another
@@ -1440,7 +1501,7 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
-    ) -> Result<Vec<SeriesEntryV4>, FetchError> {
+    ) -> Result<DecodedCatalog, FetchError> {
         // See `open_segment`'s comment: recorded on this handle directly,
         // never through `tracing::Span::current()`.
         let span = tracing::debug_span!(
@@ -1451,7 +1512,7 @@ impl SegmentFetcher {
         );
         async {
             let key = seg_ref.data_object_key.as_str();
-            let matched: Vec<SeriesEntryV4> = if let Some((sm_off, sm_len)) =
+            let matched: DecodedCatalog = if let Some((sm_off, sm_len)) =
                 section_range(footer, SECTION_SERIES_META)
             {
                 let (ld_off, ld_len) =
@@ -1497,7 +1558,8 @@ impl SegmentFetcher {
                 // label-set materialization of every non-matching series
                 // (issue #1076); otherwise materialize the whole catalog and
                 // filter it.
-                if let Some(equals) = ordinal_equals(matchers) {
+                let reservation = self.reserve_catalog_decode(footer)?;
+                let entries = if let Some(equals) = ordinal_equals(matchers) {
                     let matched = decode_catalog_matching_v4(
                         footer,
                         &dict,
@@ -1517,9 +1579,13 @@ impl SegmentFetcher {
                         .into_iter()
                         .filter(|e| matches_series(matchers, &e.entry.labels))
                         .collect()
+                };
+                DecodedCatalog {
+                    entries,
+                    reservation,
                 }
             } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
-                let entries = self
+                let (entries, reservation) = self
                     .decode_sparse_catalog(
                         seg_ref,
                         tenant_hash,
@@ -1529,12 +1595,16 @@ impl SegmentFetcher {
                         &sparse,
                         accounting,
                     )
-                    .await?;
+                    .await?
+                    .into_parts();
                 self.record_materialized(entries.len());
-                entries
-                    .into_iter()
-                    .filter(|e| matches_series(matchers, &e.entry.labels))
-                    .collect()
+                DecodedCatalog {
+                    entries: entries
+                        .into_iter()
+                        .filter(|e| matches_series(matchers, &e.entry.labels))
+                        .collect(),
+                    reservation,
+                }
             } else {
                 self.ensure_ranges(
                     seg_ref,
@@ -1549,13 +1619,17 @@ impl SegmentFetcher {
                 let object = regions
                     .slice(0, total_size)
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let reservation = self.reserve_catalog_decode(footer)?;
                 let entries = decode_catalog_v5(footer, &object, self.limits)
                     .map_err(|source| corrupt(key, source))?;
                 self.record_materialized(entries.len());
-                entries
-                    .into_iter()
-                    .filter(|e| matches_series(matchers, &e.entry.labels))
-                    .collect()
+                DecodedCatalog {
+                    entries: entries
+                        .into_iter()
+                        .filter(|e| matches_series(matchers, &e.entry.labels))
+                        .collect(),
+                    reservation,
+                }
             };
             accounting.add_series_matched(matched.len() as u64);
             // The catalog decode fetches only catalog sections, not page bytes, so
@@ -1619,7 +1693,7 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         ranges: &SparseCatalogRanges,
         accounting: &QueryAccounting,
-    ) -> Result<Vec<SeriesEntryV4>, FetchError> {
+    ) -> Result<DecodedCatalog, FetchError> {
         let key = seg_ref.data_object_key.as_str();
         let needed = [
             (
@@ -1661,8 +1735,13 @@ impl SegmentFetcher {
         let chunks = regions
             .slice(ranges.meta_chunks.0, ranges.meta_chunks.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-        decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, self.limits)
-            .map_err(|source| corrupt(key, source))
+        let reservation = self.reserve_catalog_decode(footer)?;
+        let entries = decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, self.limits)
+            .map_err(|source| corrupt(key, source))?;
+        Ok(DecodedCatalog {
+            entries,
+            reservation,
+        })
     }
 
     /// Coalesced page ranges for the scalar runs of `scalar` (TS/VAL) and the
@@ -2379,7 +2458,10 @@ impl SegmentFetcher {
                 accounting.probe(),
             )
             .await?;
-        Ok(selected.into_iter().map(|e| e.entry).collect())
+        // The reservation is held until the conversion below finishes; the
+        // returned `Vec<SeriesEntry>` has no slot to carry it further.
+        let (entries, _reservation) = selected.into_parts();
+        Ok(entries.into_iter().map(|e| e.entry).collect())
     }
 
     /// Fetches and decodes the scalar samples of every series in this segment
