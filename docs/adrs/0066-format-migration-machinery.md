@@ -219,7 +219,7 @@ which fails if a new versioned message lands unclassified):
 | `TenantRecoveryManifest` | never rewritten (write-once) | `sys/t/<h>`, CreateIfAbsent | {1} |
 | `AdmissionUsageSnapshot` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0057 snapshot, `PutMode::Overwrite` | {1} |
 | `WorkerHeartbeat` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0065 heartbeat, `PutMode::Overwrite` | {1} |
-| `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2}** |
+| `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2, 3}** (3 read, not written: ADR-1746 Release A) |
 | `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2}** |
 | `MetricMetadataRecord` | **CAS-mutable** | ingest metadata sink read→`merge_entries`→write | **{1, 2}** |
 | `AuthTokenMap` | **CAS-mutable** | `sys/auth` CAS-replace | {1, 2} (managed_by; floor added in R2) |

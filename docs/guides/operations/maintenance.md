@@ -523,6 +523,13 @@ This audits live on-object format versions across all three signals, reading the
 supported window from each reader's own source so a future version bump cannot
 make the audit stale. It exits nonzero on any anomaly.
 
+Beside each signal's histogram it prints every recorded format floor with its
+basis and a classification against the records it just read: `current`,
+`stale` (records newer than the basis, or a wider shard range), `contradicted`
+(a live record below the floor), or `unknown` (the floor records no basis,
+which is true of every floor raised so far). It also exits nonzero when any
+floor is `contradicted`.
+
 Each format supports exactly one version and carries no reader for the
 previous one, so any live object at another version is an anomaly to re-ingest,
 not a migration target:
@@ -669,7 +676,7 @@ list is in [the generated CLI reference](../../reference/ravel-cli-flags.md).
 | `maintain compact-tenant` | Compacts every sealed bucket of one tenant and signal across shards. See [compaction](#compaction). |
 | `maintain sweep --tenant <t> --signal <s> --shard <n> [--dry-run]` | One sweep pass (orphan collection, superseded inputs, unreferenced L1) over a shard, printing the four delete counts. `--dry-run` reports the eligible set and deletes nothing. |
 | `maintain status --tenant <t> --signal <s> --shard <n> --hour <n>` | Reports one bucket's state: sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 segments present, unreferenced count. Read-only. |
-| `maintain audit-versions --tenant <t> [--shards <n>]` | Audits live on-object format versions. Exits nonzero on any anomaly. |
+| `maintain audit-versions --tenant <t> [--shards <n>]` | Audits live on-object format versions and classifies each format floor. Exits nonzero on any anomaly or contradicted floor. |
 | `maintain migrate` | Raises a format floor. See [format migration](#format-migration). |
 | `maintain verify-custody --tenant <t> [--shards <n>]` | Re-verifies the content-addressed chain at rest: every live data object's key-embedded hash against its actual content hash, and every surviving compaction record's referenced inputs. An input the sweeper already legitimately reclaimed past its protection horizon is reported separately, not as an anomaly. Read-only; exits nonzero on any anomaly. |
 | `catalog list --tenant <t> [--hours <n>] [--shards <n>]` | Lists the commit records the catalog resolves for that tenant over the last N hours. `--shards` must match what the data was written with. |

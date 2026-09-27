@@ -1192,7 +1192,8 @@ enum MaintainCommand {
         #[arg(long)]
         hour: u32,
     },
-    /// Audit live on-object format versions for a tenant (both signals).
+    /// Audit live on-object format versions for a tenant (metrics, logs and spans), and
+    /// classify each recorded format floor; exits nonzero on a contradicted one.
     AuditVersions {
         #[arg(long)]
         tenant: String,

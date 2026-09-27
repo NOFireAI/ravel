@@ -224,7 +224,7 @@ Report a bucket's maintenance state (read-only; no --dry-run needed)
 
 ### maintain audit-versions
 
-Audit live on-object format versions for a tenant (both signals)
+Audit live on-object format versions for a tenant (metrics, logs and spans), and classify each recorded format floor; exits nonzero on a contradicted one
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |

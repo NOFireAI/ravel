@@ -65,10 +65,14 @@ pub const PROVISIONING_FORMAT_VERSION: u32 = 2;
 /// which fails a flush closed on a read failure, so a single-release bump that
 /// refused the newer version would have been a fleet-wide ingest outage during
 /// any rolling upgrade. R2 flipped the writer into that already-accepted
-/// ceiling, so the read set is unchanged here and now ends exactly at what the
-/// writer stamps. A future additive field repeats the sequence: raise this
-/// ceiling first, ship it, then raise the writer.
-pub const PROVISIONING_MAX_READ_VERSION: u32 = 2;
+/// ceiling.
+///
+/// ADR-1746 Release A repeats the sequence for the [`FloorBasis`] fields: the
+/// ceiling is 3 while the writer still stamps 2, so a version-3 record a later
+/// release writes is read here, and the rewrite paths refuse it with
+/// [`ProvisioningError::RefusingToRewriteNewerRecord`] rather than strip the
+/// basis. Release B raises the writer to 3.
+pub const PROVISIONING_MAX_READ_VERSION: u32 = 3;
 
 /// Lowest record version a reader accepts: the supported read set is a closed
 /// interval `PROVISIONING_MIN_READ_VERSION..=PROVISIONING_MAX_READ_VERSION`, a
@@ -1667,6 +1671,108 @@ pub struct FormatFloor {
     pub raised_unix_ns: i64,
     /// The job identity that raised this floor; informational.
     pub raised_by: String,
+    /// What the raising audit observed (ADR-1746 decision 1), or `None` when
+    /// the floor carries no basis: every floor raised before ADR-1746 Release
+    /// B, whose basis fields are all zero on the wire.
+    pub basis: Option<FloorBasis>,
+}
+
+/// The observation basis a floor was raised over (ADR-1746 decision 1): the
+/// enumeration the raising audit ran, recorded so a later reader can tell
+/// whether anything has landed since.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FloorBasis {
+    /// Commit-family entries the raising audit enumerated.
+    pub observed_entries: u64,
+    /// Newest `created_unix_ns` among those entries.
+    pub observed_newest_created_unix_ns: i64,
+    /// Shard range the audit scanned.
+    pub observed_shards: u32,
+}
+
+impl FloorBasis {
+    /// Decode the wire basis of one floor entry. All three fields zero is the
+    /// encoding of "basis unknown" (a floor from a build predating the
+    /// fields, or from a writer that does not fill them).
+    fn from_proto(f: &sysproto::FormatFloor) -> Option<Self> {
+        if f.observed_entries == 0
+            && f.observed_newest_created_unix_ns == 0
+            && f.observed_shards == 0
+        {
+            return None;
+        }
+        Some(Self {
+            observed_entries: f.observed_entries,
+            observed_newest_created_unix_ns: f.observed_newest_created_unix_ns,
+            observed_shards: f.observed_shards,
+        })
+    }
+}
+
+/// What current records say about one recorded floor (ADR-1746 decision 2). A
+/// stored floor is a pointer to evidence, never the evidence: only `Current`
+/// counts for any consumer that would act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorEvidence {
+    /// No commit-family record is newer than the basis, the shard range equals
+    /// the basis's, and no live record sits below the floor.
+    Current,
+    /// Records newer than the basis exist, or the shard range differs from the
+    /// basis's, and none sits below the floor. Not known to be false, and not
+    /// evidence either.
+    Stale,
+    /// A live record below the floor exists: the floor is false.
+    Contradicted,
+    /// The floor carries no basis (raised before ADR-1746 Release B).
+    Unknown,
+}
+
+impl FloorEvidence {
+    /// Lowercase label for reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FloorEvidence::Current => "current",
+            FloorEvidence::Stale => "stale",
+            FloorEvidence::Contradicted => "contradicted",
+            FloorEvidence::Unknown => "unknown",
+        }
+    }
+}
+
+/// Current state of a (tenant, signal)'s commit-family records, as a fresh
+/// audit enumerated it, to classify a floor against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorObservation {
+    /// Live commit-family entries (L0 commit records not superseded, L1
+    /// compaction and rewrite parts) whose `segment_format_version` is below
+    /// the floor being classified.
+    pub live_below_floor: u64,
+    /// Newest `created_unix_ns` among every commit-family record enumerated,
+    /// or `None` when there are none.
+    pub newest_created_unix_ns: Option<i64>,
+    /// Shard range the audit scanned.
+    pub scan_shards: u32,
+}
+
+/// Classify one recorded floor against current records (ADR-1746 decision 2).
+///
+/// A live record below the floor is `Contradicted` even when the floor has no
+/// basis: the counterexample falsifies the floor's assertion without anything
+/// to compare against. Otherwise a floor with no basis is `Unknown`.
+pub fn classify_floor(floor: &FormatFloor, observed: &FloorObservation) -> FloorEvidence {
+    if observed.live_below_floor > 0 {
+        return FloorEvidence::Contradicted;
+    }
+    let Some(basis) = floor.basis else {
+        return FloorEvidence::Unknown;
+    };
+    let newer = observed
+        .newest_created_unix_ns
+        .is_some_and(|newest| newest > basis.observed_newest_created_unix_ns);
+    if newer || observed.scan_shards != basis.observed_shards {
+        return FloorEvidence::Stale;
+    }
+    FloorEvidence::Current
 }
 
 /// The outcome of a successful [`raise_format_floor`] append.
@@ -1723,6 +1829,7 @@ pub fn read_floors(
             floor_version: f.floor_version,
             raised_unix_ns: f.raised_unix_ns,
             raised_by: f.raised_by.clone(),
+            basis: FloorBasis::from_proto(f),
         });
     }
     Ok(out)
@@ -1902,6 +2009,9 @@ pub async fn raise_format_floor(
         floor_version,
         raised_unix_ns: now_ns,
         raised_by: raised_by.to_string(),
+        // A version-2 writer records no basis; the basis fields are written
+        // only under a version-3 stamp (ADR-1746 decision 6, Release B).
+        basis: None,
     });
 
     // Persist the full history. shard_count and generations are carried
@@ -1911,11 +2021,17 @@ pub async fn raise_format_floor(
     new_record.format_version = PROVISIONING_FORMAT_VERSION;
     new_record.format_floors = floors
         .iter()
-        .map(|f| sysproto::FormatFloor {
-            family: f.family.clone(),
-            floor_version: f.floor_version,
-            raised_unix_ns: f.raised_unix_ns,
-            raised_by: f.raised_by.clone(),
+        .map(|f| {
+            let basis = f.basis.unwrap_or_default();
+            sysproto::FormatFloor {
+                family: f.family.clone(),
+                floor_version: f.floor_version,
+                raised_unix_ns: f.raised_unix_ns,
+                raised_by: f.raised_by.clone(),
+                observed_entries: basis.observed_entries,
+                observed_newest_created_unix_ns: basis.observed_newest_created_unix_ns,
+                observed_shards: basis.observed_shards,
+            }
         })
         .collect();
 
@@ -4007,6 +4123,7 @@ pub(crate) mod tests {
             floor_version,
             raised_unix_ns: 0,
             raised_by: String::new(),
+            ..Default::default()
         };
         let expect_defect =
             |record: &sysproto::ProvisioningRecord, defect: FloorDefect| match read_floors(
@@ -4143,12 +4260,12 @@ pub(crate) mod tests {
             built.format_floors.is_empty(),
             "a freshly built record carries no floors"
         );
-        // ADR-0066 R2: the writer stamps 2, the ceiling R1 shipped a release
-        // earlier. The read set is unchanged at {1, 2}.
+        // ADR-0066 R2: the writer stamps 2. ADR-1746 Release A widens the read
+        // set to {1, 2, 3} and leaves the writer at 2.
         assert_eq!(built.format_version, 2, "writer stamps version 2 (R2)");
         assert_eq!(PROVISIONING_FORMAT_VERSION, 2);
         assert_eq!(PROVISIONING_MIN_READ_VERSION, 1);
-        assert_eq!(PROVISIONING_MAX_READ_VERSION, 2);
+        assert_eq!(PROVISIONING_MAX_READ_VERSION, 3);
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let floors = read_floors(&built, &key).expect("empty floor history is valid");
         assert!(floors.is_empty(), "empty history reads as no floors");
@@ -4174,25 +4291,45 @@ pub(crate) mod tests {
                 floor_version: 6,
                 raised_unix_ns: 2_000,
                 raised_by: "migrate".to_string(),
+                ..Default::default()
             }],
         }
     }
 
-    /// The read-side supported set is exactly {1, 2}, a closed set with a floor
-    /// and a ceiling: a version-1 and a version-2 record are both accepted at
+    /// [`record_with_floor_at_version`] at version 3 with the floor's basis
+    /// fields filled, the shape a Release B writer persists (ADR-1746 decision
+    /// 1): the raising audit enumerated `entries` records over `shards` shards,
+    /// the newest created at `newest_created`.
+    fn v3_record_with_basis(
+        floor_version: u32,
+        entries: u64,
+        newest_created: i64,
+        shards: u32,
+    ) -> sysproto::ProvisioningRecord {
+        let mut record = record_with_floor_at_version(3);
+        record.format_floors[0].floor_version = floor_version;
+        record.format_floors[0].observed_entries = entries;
+        record.format_floors[0].observed_newest_created_unix_ns = newest_created;
+        record.format_floors[0].observed_shards = shards;
+        record
+    }
+
+    /// The read-side supported set is exactly {1, 2, 3}, a closed set with a
+    /// floor and a ceiling: a version-1, -2 and -3 record are all accepted at
     /// every reader gate (validate_or_adopt's validate_record,
     /// read_generations_checked, read_floors_checked), while both a version-0
     /// record (below the floor: an unstamped record from a writer that never set
-    /// format_version) and a version-3 record (above the ceiling) are refused at
+    /// format_version) and a version-4 record (above the ceiling) are refused at
     /// each, with the two refusals carrying DIFFERENT typed errors:
     /// VersionBelowFloor and UnsupportedVersion. Pins ADR-0066 decision 4's
-    /// supported set for the three provisioning reader sites, and the split
-    /// diagnostic an operator reads off them.
+    /// supported set for the three provisioning reader sites as ADR-1746
+    /// Release A widened it, and the split diagnostic an operator reads off
+    /// them.
     #[tokio::test]
-    async fn reader_accepts_version_one_and_two_and_refuses_zero_and_three() {
+    async fn reader_accepts_versions_one_to_three_and_refuses_zero_and_four() {
         let key = provisioning_key(&tenant(), Signal::Metrics);
 
-        for version in [1u32, 2u32] {
+        for version in [1u32, 2u32, 3u32] {
             let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000);
             record.format_version = version;
 
@@ -4221,36 +4358,36 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| panic!("version {version} must pass validate_record: {e}"));
         }
 
-        // Version 3 (one past the read set) is refused at each gate.
-        let mut v3 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
-        v3.format_version = 3;
+        // Version 4 (one past the read set) is refused at each gate.
+        let mut v4 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        v4.format_version = 4;
         assert!(
             matches!(
-                read_generations_checked(&v3, &key, &tenant(), Signal::Metrics),
+                read_generations_checked(&v4, &key, &tenant(), Signal::Metrics),
                 Err(ProvisioningError::UnsupportedVersion {
-                    got: 3,
-                    ceiling: 2,
+                    got: 4,
+                    ceiling: 3,
                     ..
                 })
             ),
-            "read_generations_checked must refuse version 3"
+            "read_generations_checked must refuse version 4"
         );
         assert!(
             matches!(
-                read_floors_checked(&v3, &key, &tenant(), Signal::Metrics),
+                read_floors_checked(&v4, &key, &tenant(), Signal::Metrics),
                 Err(ProvisioningError::UnsupportedVersion {
-                    got: 3,
-                    ceiling: 2,
+                    got: 4,
+                    ceiling: 3,
                     ..
                 })
             ),
-            "read_floors_checked must refuse version 3"
+            "read_floors_checked must refuse version 4"
         );
         let store = mem();
         store
-            .put(&key, v3.encode_to_vec().into(), PutOptions::default())
+            .put(&key, v4.encode_to_vec().into(), PutOptions::default())
             .await
-            .expect("seed v3");
+            .expect("seed v4");
         assert!(
             matches!(
                 validate_or_adopt(
@@ -4263,12 +4400,12 @@ pub(crate) mod tests {
                 )
                 .await,
                 Err(ProvisioningError::UnsupportedVersion {
-                    got: 3,
-                    ceiling: 2,
+                    got: 4,
+                    ceiling: 3,
                     ..
                 })
             ),
-            "validate_record must refuse version 3"
+            "validate_record must refuse version 4"
         );
 
         // Version 0 (below the floor: an unstamped record from a writer that
@@ -4405,6 +4542,207 @@ pub(crate) mod tests {
             after.as_ref(),
             seeded.as_slice(),
             "the stored version-3 record must be byte-for-byte unchanged"
+        );
+    }
+
+    // ---- ADR-1746 Release A: read version 3, refuse to rewrite it ----
+
+    /// A version-3 record carrying a floor basis (the shape a Release B writer
+    /// persists) is READ by this build, basis included, and REFUSED by both
+    /// CAS rewrite paths with the typed error, leaving its bytes unchanged. A
+    /// version-2 writer re-encoding a version-3 record could drop fields added
+    /// after it, which is the strip hazard ADR-1746 decision 6 bumps the
+    /// version for.
+    #[tokio::test]
+    async fn v3_record_is_read_but_refused_by_both_rewrite_paths() {
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let seeded = v3_record_with_basis(6, 12, 5_000, 4).encode_to_vec();
+        store
+            .put(&key, seeded.clone().into(), PutOptions::default())
+            .await
+            .expect("seed a version-3 record with a floor basis");
+
+        let floors = read_floors_from_store(store.as_ref(), &tenant(), Signal::Metrics)
+            .await
+            .expect("a version-3 record is inside the read set")
+            .expect("the record exists");
+        assert_eq!(floors.len(), 1);
+        assert_eq!(
+            floors[0].basis,
+            Some(FloorBasis {
+                observed_entries: 12,
+                observed_newest_created_unix_ns: 5_000,
+                observed_shards: 4,
+            }),
+            "the basis fields decode from a version-3 record"
+        );
+
+        let err = append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 1_000_000, 0)
+            .await
+            .expect_err("append_generation must refuse a version-3 record");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::RefusingToRewriteNewerRecord { got: 3, .. }
+            ),
+            "got: {err}"
+        );
+        let err = raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            "rseg",
+            9,
+            "job",
+            3_000,
+        )
+        .await
+        .expect_err("raise_format_floor must refuse a version-3 record");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::RefusingToRewriteNewerRecord { got: 3, .. }
+            ),
+            "got: {err}"
+        );
+
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "both refusals must leave the version-3 record byte-for-byte unchanged"
+        );
+    }
+
+    /// A version-2 floor record (every record this build and earlier ones
+    /// write) loads with no basis and classifies `Unknown`, whatever the
+    /// current records say short of a contradiction; so does a floor this
+    /// build raises, since a version-2 writer records no basis. A version-1
+    /// record reads the same way.
+    #[tokio::test]
+    async fn v2_floor_record_loads_and_classifies_unknown() {
+        let observed = FloorObservation {
+            live_below_floor: 0,
+            newest_created_unix_ns: Some(1_000),
+            scan_shards: 4,
+        };
+        for version in [1u32, 2u32] {
+            let store = mem();
+            let key = provisioning_key(&tenant(), Signal::Metrics);
+            store
+                .put(
+                    &key,
+                    record_with_floor_at_version(version).encode_to_vec().into(),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed a floor record");
+            let floors = read_floors_from_store(store.as_ref(), &tenant(), Signal::Metrics)
+                .await
+                .expect("read")
+                .expect("present");
+            assert_eq!(floors.len(), 1);
+            assert_eq!(floors[0].basis, None, "version {version}: no basis");
+            assert_eq!(
+                classify_floor(&floors[0], &observed),
+                FloorEvidence::Unknown,
+                "version {version}"
+            );
+
+            let outcome = raise_format_floor(
+                store.as_ref(),
+                &tenant(),
+                Signal::Metrics,
+                "rseg",
+                7,
+                "job",
+                3_000,
+            )
+            .await
+            .expect("raise on a version-1/2 record");
+            let raised = outcome.floors.last().expect("the new entry");
+            assert_eq!(raised.basis, None, "a version-2 writer records no basis");
+            let reread = read_floors_from_store(store.as_ref(), &tenant(), Signal::Metrics)
+                .await
+                .expect("read")
+                .expect("present");
+            assert!(reread.iter().all(|f| f.basis.is_none()));
+            assert_eq!(
+                classify_floor(&reread[1], &observed),
+                FloorEvidence::Unknown
+            );
+        }
+    }
+
+    fn floor_with_basis(basis: Option<FloorBasis>) -> FormatFloor {
+        FormatFloor {
+            family: RSEG.to_string(),
+            floor_version: 6,
+            raised_unix_ns: 2_000,
+            raised_by: "migrate".to_string(),
+            basis,
+        }
+    }
+
+    const BASIS: FloorBasis = FloorBasis {
+        observed_entries: 10,
+        observed_newest_created_unix_ns: 5_000,
+        observed_shards: 4,
+    };
+
+    /// Each ADR-1746 decision 2 state from the inputs that define it, one
+    /// variable at a time from a `Current` baseline.
+    #[test]
+    fn classify_floor_distinguishes_the_four_states() {
+        let floor = floor_with_basis(Some(BASIS));
+        let current = FloorObservation {
+            live_below_floor: 0,
+            newest_created_unix_ns: Some(5_000),
+            scan_shards: 4,
+        };
+        assert_eq!(classify_floor(&floor, &current), FloorEvidence::Current);
+        // Every record the audit saw has since been retired: still Current.
+        let emptied = FloorObservation {
+            newest_created_unix_ns: None,
+            ..current
+        };
+        assert_eq!(classify_floor(&floor, &emptied), FloorEvidence::Current);
+
+        let newer = FloorObservation {
+            newest_created_unix_ns: Some(5_001),
+            ..current
+        };
+        assert_eq!(classify_floor(&floor, &newer), FloorEvidence::Stale);
+        let grown = FloorObservation {
+            scan_shards: 8,
+            ..current
+        };
+        assert_eq!(classify_floor(&floor, &grown), FloorEvidence::Stale);
+
+        let below = FloorObservation {
+            live_below_floor: 1,
+            ..current
+        };
+        assert_eq!(classify_floor(&floor, &below), FloorEvidence::Contradicted);
+        // A contradiction dominates staleness.
+        let below_and_newer = FloorObservation {
+            live_below_floor: 1,
+            ..newer
+        };
+        assert_eq!(
+            classify_floor(&floor, &below_and_newer),
+            FloorEvidence::Contradicted
+        );
+
+        let no_basis = floor_with_basis(None);
+        assert_eq!(classify_floor(&no_basis, &current), FloorEvidence::Unknown);
+        assert_eq!(classify_floor(&no_basis, &newer), FloorEvidence::Unknown);
+        // A live record below a floor falsifies it whether or not the floor
+        // recorded a basis: the counterexample needs no basis to compare with.
+        assert_eq!(
+            classify_floor(&no_basis, &below),
+            FloorEvidence::Contradicted
         );
     }
 
