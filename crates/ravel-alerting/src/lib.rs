@@ -63,7 +63,7 @@ mod record;
 mod rule;
 mod state;
 
-pub use condition::{QueryResultSummary, condition_met, matching_series};
+pub use condition::{QueryResultSummary, matching_series};
 pub use error::AlertError;
 pub use generation::{DEFAULT_MAX_ALERT_GENERATION, compute_generation, guard_generation};
 pub use instance::{AlertInstance, MAX_ALERTS_PER_RULE, alert_instances, merged_alert_labels};

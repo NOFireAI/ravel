@@ -213,7 +213,7 @@ impl Rule {
     ///   PromQL query yields per-series numeric values and takes a
     ///   [`RuleCondition::Threshold`]; a SQL query yields a row set and takes a
     ///   [`RuleCondition::NonEmptyResult`]. The mismatched pairing would return
-    ///   [`AlertError::ResultShapeMismatch`] from [`crate::condition_met`] on
+    ///   [`AlertError::ResultShapeMismatch`] from [`crate::matching_series`] on
     ///   every tick, so it is caught once here.
     ///
     /// This is the in-crate equivalent of the startup check `ravel-server`'s

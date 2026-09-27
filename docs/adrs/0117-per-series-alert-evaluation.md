@@ -222,4 +222,6 @@ Two code citations above have moved: the startup duplicate check cited in
 Consequences now lives in `parse_rules` in
 `services/ravel-server/src/alerting.rs`, and the `RowCount` summary cited in
 decision 5 is the `QueryResultSummary::RowCount` variant in
-`crates/ravel-alerting/src/condition.rs`.
+`crates/ravel-alerting/src/condition.rs`. The `condition_met` function that
+decision 1 keeps for the SQL path was removed once nothing called it: the SQL
+path goes through `matching_series` like the PromQL one.

@@ -90,15 +90,6 @@ pub fn matching_series(
     }
 }
 
-/// Decides whether `condition` is met by `result`: whether
-/// [`matching_series`] matches at least one series. Same errors.
-pub fn condition_met(
-    condition: &RuleCondition,
-    result: &QueryResultSummary,
-) -> Result<bool, AlertError> {
-    Ok(!matching_series(condition, result)?.is_empty())
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -164,46 +155,58 @@ mod tests {
         }
     }
 
+    /// The matched values of an unlabelled numeric result, as bit patterns.
+    fn matched_bits(cond: &RuleCondition, vs: &[f64]) -> Vec<u64> {
+        matching_series(cond, &numeric(vs))
+            .expect("threshold over numeric")
+            .iter()
+            .map(|(labels, v)| {
+                assert!(labels.is_empty());
+                v.to_bits()
+            })
+            .collect()
+    }
+
     #[test]
-    fn threshold_fires_when_any_series_exceeds() {
+    fn threshold_matches_only_the_series_that_exceed() {
         let cond = RuleCondition::Threshold {
             op: ThresholdOp::Gt,
             threshold: 10.0,
         };
-        assert!(condition_met(&cond, &numeric(&[1.0, 5.0, 11.0])).expect("met"));
-        assert!(!condition_met(&cond, &numeric(&[1.0, 5.0, 9.0])).expect("met"));
-        // Boundary: strictly greater does not fire at exactly the threshold.
-        assert!(!condition_met(&cond, &numeric(&[10.0])).expect("met"));
+        assert_eq!(
+            matched_bits(&cond, &[1.0, 5.0, 11.0, 12.0]),
+            vec![11.0f64.to_bits(), 12.0f64.to_bits()]
+        );
+        assert_eq!(matched_bits(&cond, &[1.0, 5.0, 9.0]), Vec::<u64>::new());
+        // Boundary: strictly greater does not match exactly the threshold.
+        assert_eq!(matched_bits(&cond, &[10.0]), Vec::<u64>::new());
     }
 
     #[test]
     fn threshold_covers_every_comparator() {
-        let met = |op, vs: &[f64]| {
-            condition_met(
-                &RuleCondition::Threshold { op, threshold: 5.0 },
-                &numeric(vs),
-            )
-            .expect("met")
-        };
-        assert!(met(ThresholdOp::Ge, &[5.0]));
-        assert!(met(ThresholdOp::Lt, &[4.9]));
-        assert!(met(ThresholdOp::Le, &[5.0]));
-        assert!(met(ThresholdOp::Eq, &[5.0]));
-        assert!(!met(ThresholdOp::Eq, &[5.1]));
-        assert!(met(ThresholdOp::Ne, &[5.1]));
+        let matched =
+            |op, vs: &[f64]| matched_bits(&RuleCondition::Threshold { op, threshold: 5.0 }, vs);
+        let bits = |vs: &[f64]| vs.iter().map(|v| v.to_bits()).collect::<Vec<u64>>();
+        let all = [4.9, 5.0, 5.1];
+        assert_eq!(matched(ThresholdOp::Gt, &all), bits(&[5.1]));
+        assert_eq!(matched(ThresholdOp::Ge, &all), bits(&[5.0, 5.1]));
+        assert_eq!(matched(ThresholdOp::Lt, &all), bits(&[4.9]));
+        assert_eq!(matched(ThresholdOp::Le, &all), bits(&[4.9, 5.0]));
+        assert_eq!(matched(ThresholdOp::Eq, &all), bits(&[5.0]));
+        assert_eq!(matched(ThresholdOp::Ne, &all), bits(&[4.9, 5.1]));
     }
 
     #[test]
-    fn empty_numeric_result_never_fires() {
+    fn empty_numeric_result_never_matches() {
         let cond = RuleCondition::Threshold {
             op: ThresholdOp::Gt,
             threshold: 0.0,
         };
-        assert!(!condition_met(&cond, &numeric(&[])).expect("met"));
+        assert_eq!(matched_bits(&cond, &[]), Vec::<u64>::new());
     }
 
     #[test]
-    fn nan_series_value_never_fires_ordering_comparators() {
+    fn nan_series_value_never_matches_ordering_comparators() {
         for op in [
             ThresholdOp::Gt,
             ThresholdOp::Ge,
@@ -212,15 +215,16 @@ mod tests {
             ThresholdOp::Eq,
         ] {
             let cond = RuleCondition::Threshold { op, threshold: 0.0 };
-            assert!(
-                !condition_met(&cond, &numeric(&[f64::NAN])).expect("met"),
-                "NaN must not fire {op:?}"
+            assert_eq!(
+                matched_bits(&cond, &[f64::NAN]),
+                Vec::<u64>::new(),
+                "NaN must not match {op:?}"
             );
         }
     }
 
     #[test]
-    fn nan_series_value_does_fire_ne() {
+    fn nan_series_value_does_match_ne() {
         // IEEE-754: NaN != x is true for every x, including NaN itself. This
         // repo's own PromQL evaluator already relies on the same rule
         // (binop.rs's `!=` keeps a NaN sample); alerting matches it rather
@@ -229,44 +233,59 @@ mod tests {
             op: ThresholdOp::Ne,
             threshold: 0.0,
         };
-        assert!(
-            condition_met(&cond, &numeric(&[f64::NAN])).expect("met"),
-            "NaN must fire Ne, matching IEEE-754 and this repo's own PromQL != semantics"
+        assert_eq!(
+            matched_bits(&cond, &[f64::NAN]),
+            vec![f64::NAN.to_bits()],
+            "NaN must match Ne, matching IEEE-754 and this repo's own PromQL != semantics"
         );
     }
 
     #[test]
-    fn nonempty_result_fires_on_any_row() {
+    fn nonempty_result_matches_one_unlabelled_series_carrying_the_row_count() {
+        let matched = matching_series(
+            &RuleCondition::NonEmptyResult,
+            &QueryResultSummary::RowCount(3),
+        )
+        .expect("nonempty over row count");
+        assert_eq!(matched.len(), 1);
+        assert!(matched[0].0.is_empty());
+        assert_eq!(matched[0].1.to_bits(), 3.0f64.to_bits());
         assert!(
-            condition_met(
-                &RuleCondition::NonEmptyResult,
-                &QueryResultSummary::RowCount(1)
-            )
-            .expect("met")
-        );
-        assert!(
-            !condition_met(
+            matching_series(
                 &RuleCondition::NonEmptyResult,
                 &QueryResultSummary::RowCount(0)
             )
-            .expect("met")
+            .expect("nonempty over row count")
+            .is_empty()
         );
     }
 
     #[test]
     fn mismatched_condition_and_result_shape_is_a_typed_error() {
         // Threshold against a row count.
-        let err = condition_met(
+        let err = matching_series(
             &RuleCondition::Threshold {
                 op: ThresholdOp::Gt,
                 threshold: 1.0,
             },
             &QueryResultSummary::RowCount(3),
         );
-        assert!(matches!(err, Err(AlertError::ResultShapeMismatch { .. })));
+        assert!(matches!(
+            err,
+            Err(AlertError::ResultShapeMismatch {
+                condition: "threshold",
+                result: "row-count"
+            })
+        ));
 
         // Nonempty-result against a numeric vector.
-        let err = condition_met(&RuleCondition::NonEmptyResult, &numeric(&[1.0]));
-        assert!(matches!(err, Err(AlertError::ResultShapeMismatch { .. })));
+        let err = matching_series(&RuleCondition::NonEmptyResult, &numeric(&[1.0]));
+        assert!(matches!(
+            err,
+            Err(AlertError::ResultShapeMismatch {
+                condition: "nonempty-result",
+                result: "numeric"
+            })
+        ));
     }
 }

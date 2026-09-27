@@ -1979,7 +1979,7 @@ pub fn parse_rules(text: &str) -> anyhow::Result<HashMap<TenantHash, Vec<Rule>>>
         };
         // The two shapes are not interchangeable: a threshold reads per-series
         // values (PromQL) and a nonempty-result reads a row count (SQL).
-        // `condition_met` would return a typed error every tick; catch it once,
+        // `matching_series` would return a typed error every tick; catch it once,
         // here.
         match (&query, &condition) {
             (RuleQuery::Promql(_), RuleCondition::NonEmptyResult) => anyhow::bail!(
