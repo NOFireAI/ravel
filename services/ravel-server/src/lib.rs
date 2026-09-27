@@ -486,6 +486,16 @@ pub struct ServerConfig {
     /// [`ravel_ingest::IngestConfig::min_flush_bytes`] on all three ingest
     /// pipelines (ADR-0076 decision 4). See `--min-flush-bytes`.
     pub min_flush_bytes: usize,
+    /// Opt-in sub-floor age tier, forwarded to
+    /// [`ravel_ingest::IngestConfig::idle_flush_byte_floor`] on all three
+    /// ingest pipelines (ADR-1737 decision 1). `0` disables it, which is the
+    /// shipped default and leaves every buffer on today's two clocks. A
+    /// non-zero value must be below `min_flush_bytes`;
+    /// [`ravel_ingest::IngestConfig::validate`] is called on each pipeline's
+    /// config in [`start`] and refuses startup otherwise. See
+    /// `--idle-flush-byte-floor`, whose help states the buffered-mode loss
+    /// window a non-zero floor accepts.
+    pub idle_flush_byte_floor: usize,
     pub tenant_resolver: Arc<dyn TenantResolver>,
     /// The dedicated mTLS listener (ADR-0050 section 1), `None` unless
     /// `--mtls-enabled`. Serves the same ingest and query surface as the
@@ -1763,6 +1773,26 @@ fn mcp_settings(
     })
 }
 
+/// Checks one pipeline's [`IngestConfig`] cross-field constraints before a
+/// router is built from it (ADR-1737 decision 1), and turns a violation into a
+/// startup refusal that names the flags an operator set rather than the struct
+/// fields they map to.
+///
+/// Called once per pipeline rather than once on a shared value: the three
+/// configs are built separately here, so a constraint checked on only one of
+/// them would pass a config the other two never saw.
+fn validated_ingest_config(config: IngestConfig, signal: Signal) -> anyhow::Result<IngestConfig> {
+    config.validate().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid ingest configuration for the {} pipeline: {e}. \
+             --idle-flush-byte-floor must be below --min-flush-bytes, or 0 to disable the \
+             sub-floor hold",
+            crate::metrics::signal_name(signal)
+        )
+    })?;
+    Ok(config)
+}
+
 /// Binds both listeners (as configured by `mode`) and starts serving in the
 /// background. Returns immediately; call [`Running::shutdown`] to stop.
 ///
@@ -1807,29 +1837,34 @@ pub async fn start(
         ravel_ingest::IngestByteBudget::shared(config.ingest_buffer_budget_limit);
 
     let ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
+        let ingest_config = validated_ingest_config(
+            IngestConfig {
+                shard_count: config.shard_count,
+                max_inflight_flushes: config.max_inflight_flushes,
+                max_queued_flushes: config.max_queued_flushes as usize,
+                adaptive_flush_delay: config.adaptive_flush_delay,
+                max_flush_delay: config.max_flush_delay,
+                max_flush_delay_idle: config.max_flush_delay_idle,
+                min_flush_bytes: config.min_flush_bytes,
+                idle_flush_byte_floor: config.idle_flush_byte_floor,
+                // ADR-0076 decision 4: follows the actually-configured
+                // max_flush_delay, not just its default, so the adaptive
+                // corridor never contradicts the operator's chosen budget.
+                // Must exceed max_flush_delay by the same reserve
+                // IngestConfig::default() uses -- setting it equal (as
+                // this call site once did) collapses the adaptive
+                // corridor to the floor unconditionally.
+                strict_visibility_budget_ns: crate::config::duration_nanos_saturating(
+                    config.max_flush_delay,
+                )
+                .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
+                ..IngestConfig::default()
+            },
+            Signal::Metrics,
+        )?;
         Some(Arc::new(
             IngestRouter::new(
-                IngestConfig {
-                    shard_count: config.shard_count,
-                    max_inflight_flushes: config.max_inflight_flushes,
-                    max_queued_flushes: config.max_queued_flushes as usize,
-                    adaptive_flush_delay: config.adaptive_flush_delay,
-                    max_flush_delay: config.max_flush_delay,
-                    max_flush_delay_idle: config.max_flush_delay_idle,
-                    min_flush_bytes: config.min_flush_bytes,
-                    // ADR-0076 decision 4: follows the actually-configured
-                    // max_flush_delay, not just its default, so the adaptive
-                    // corridor never contradicts the operator's chosen budget.
-                    // Must exceed max_flush_delay by the same reserve
-                    // IngestConfig::default() uses -- setting it equal (as
-                    // this call site once did) collapses the adaptive
-                    // corridor to the floor unconditionally.
-                    strict_visibility_budget_ns: crate::config::duration_nanos_saturating(
-                        config.max_flush_delay,
-                    )
-                    .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
-                    ..IngestConfig::default()
-                },
+                ingest_config,
                 store.clone(),
                 Signal::Metrics,
                 Arc::new(SystemClock),
@@ -1894,17 +1929,22 @@ pub async fn start(
         let indexed_fields_base: Arc<dyn ravel_ingest::LogIndexedFields> =
             Arc::new(config.indexed_fields.clone());
         let indexed_fields = Arc::new(ravel_ingest::IndexedFieldsOverlay::new(indexed_fields_base));
+        let log_ingest_config = validated_ingest_config(
+            IngestConfig {
+                shard_count: config.shard_count,
+                max_inflight_flushes: config.max_inflight_flushes,
+                max_queued_flushes: config.max_queued_flushes as usize,
+                max_flush_delay: config.max_flush_delay,
+                max_flush_delay_idle: config.max_flush_delay_idle,
+                min_flush_bytes: config.min_flush_bytes,
+                idle_flush_byte_floor: config.idle_flush_byte_floor,
+                ..IngestConfig::default()
+            },
+            Signal::Logs,
+        )?;
         Some(Arc::new(
             LogIngestRouter::new_with_indexed_fields(
-                IngestConfig {
-                    shard_count: config.shard_count,
-                    max_inflight_flushes: config.max_inflight_flushes,
-                    max_queued_flushes: config.max_queued_flushes as usize,
-                    max_flush_delay: config.max_flush_delay,
-                    max_flush_delay_idle: config.max_flush_delay_idle,
-                    min_flush_bytes: config.min_flush_bytes,
-                    ..IngestConfig::default()
-                },
+                log_ingest_config,
                 store.clone(),
                 Arc::new(SystemClock),
                 indexed_fields,
@@ -1921,21 +1961,22 @@ pub async fn start(
     // (ADR-0041). It exists in exactly the modes that serve ingest, so all
     // three options are always Some together.
     let span_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
+        let span_ingest_config = validated_ingest_config(
+            IngestConfig {
+                shard_count: config.shard_count,
+                max_inflight_flushes: config.max_inflight_flushes,
+                max_queued_flushes: config.max_queued_flushes as usize,
+                max_flush_delay: config.max_flush_delay,
+                max_flush_delay_idle: config.max_flush_delay_idle,
+                min_flush_bytes: config.min_flush_bytes,
+                idle_flush_byte_floor: config.idle_flush_byte_floor,
+                ..IngestConfig::default()
+            },
+            Signal::Spans,
+        )?;
         Some(Arc::new(
-            SpanIngestRouter::new(
-                IngestConfig {
-                    shard_count: config.shard_count,
-                    max_inflight_flushes: config.max_inflight_flushes,
-                    max_queued_flushes: config.max_queued_flushes as usize,
-                    max_flush_delay: config.max_flush_delay,
-                    max_flush_delay_idle: config.max_flush_delay_idle,
-                    min_flush_bytes: config.min_flush_bytes,
-                    ..IngestConfig::default()
-                },
-                store.clone(),
-                Arc::new(SystemClock),
-            )
-            .with_budget(ingest_buffer_budget.clone()),
+            SpanIngestRouter::new(span_ingest_config, store.clone(), Arc::new(SystemClock))
+                .with_budget(ingest_buffer_budget.clone()),
         ))
     } else {
         None

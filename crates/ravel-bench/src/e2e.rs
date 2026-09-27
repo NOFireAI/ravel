@@ -372,8 +372,11 @@ pub async fn run(config: &E2eConfig) -> Report {
     } else {
         bytes_written as f64 / logical_bytes as f64
     };
-    let estimated_put_count =
-        2 * (metrics.flushes_by_size + metrics.flushes_by_age + metrics.flushes_manual);
+    let estimated_put_count = 2
+        * (metrics.flushes_by_size
+            + metrics.flushes_by_age
+            + metrics.flushes_by_age_floor
+            + metrics.flushes_manual);
 
     // Query phase: wraps the same (now-populated) store in a fresh
     // `InstrumentedStore` (the one object-store counter this crate uses, shared

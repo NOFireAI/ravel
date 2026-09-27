@@ -72,9 +72,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max_flush_lifetime` old when its flush opens, which is the figure
   `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. A
   buffer that reaches the floor goes back to the idle clock, and strict-mode
-  writes keep the fast clock. `ravel-server` does not expose the knob yet, so
-  no deployment's flush cadence or buffered-mode loss window changes with this
-  release.
+  writes keep the fast clock. The `ravel-server` flag that turns it on is the
+  next entry.
+- **`ravel-server --idle-flush-byte-floor` exposes that floor, and
+  `/metrics` reports what it holds** (ADR-1737, issue #1737). The flag takes a
+  byte count, defaults to 0 (the sub-floor hold disabled), and reaches the
+  `IngestConfig` of all three ingest pipelines, so a deployment that does not
+  set it keeps today's flush cadence and buffered-mode loss window exactly.
+  `IngestConfig::validate` now runs on each pipeline's config before its
+  router is built, so a floor at or above `--min-flush-bytes` refuses startup
+  with a message naming both flags rather than silently putting every
+  sub-`min_flush_bytes` buffer on the hour-long hold. The new
+  `ravel_ingest_flushes_by_age_floor_total` family renders for every signal
+  beside `ravel_ingest_flushes_by_age_total`, which is how an operator sees
+  the floor holding buffers and sizes the buffered-mode loss window they
+  accepted: a row acknowledged in buffered mode in a buffer below the floor
+  can sit in memory for up to an hour before its flush opens, and a crash in
+  that window loses it. Strict mode is unaffected at any setting. The
+  ravel-bench PUT-count estimates count the new trigger too.
 
 ## [0.19.0] - 2026-09-27
 
