@@ -473,6 +473,22 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to resolve flush-cadence flags")?;
     let flush_concurrency = cli.resolve_flush_concurrency();
 
+    // The per-query S3 request budget (ADR-1306 decisions 3 and 5), resolved
+    // with the seal margin of the catalog this process folds and resolves
+    // with, so the span the budget covers is the span this catalog's fold
+    // really leaves unsealed. Logged with that span in seconds: an explicit
+    // --max-s3-requests is used verbatim, and this is the only place that
+    // tells the operator which span their value is measured against.
+    let seal_margin = ravel_server::query::server_seal_margin();
+    let max_s3_requests = cli
+        .resolve_max_s3_requests_with(seal_margin)
+        .context("failed to resolve --max-s3-requests")?;
+    ravel_server::log_resolved_request_budget(
+        max_s3_requests,
+        seal_margin,
+        cli.max_s3_requests.is_some(),
+    );
+
     let config = ServerConfig {
         mode: cli.mode,
         listen_http: cli.listen_http,
@@ -526,9 +542,7 @@ async fn main() -> anyhow::Result<()> {
         query_concurrency_limit: cli
             .parse_query_concurrency_limit()
             .context("failed to parse --max-concurrent-queries")?,
-        max_s3_requests: cli
-            .resolve_max_s3_requests()
-            .context("failed to resolve --max-s3-requests")?,
+        max_s3_requests,
         query_budgets: cli
             .query_budgets(&performance)
             .context("failed to resolve the query budgets and logs fetch policy")?,

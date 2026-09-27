@@ -137,6 +137,51 @@ pub fn warn_dev_insecure_tenant_header(enabled: bool) {
     }
 }
 
+/// Report the resolved per-query S3 request budget at startup, with the span
+/// it is measured against (ADR-1306 decision 5).
+///
+/// `covered_span` is the tail the derived budget is sized to cover: the
+/// longest tail a healthy catalog carries plus the time a stalled fold takes
+/// to page an operator. It is logged for an explicit `--max-s3-requests` too,
+/// because that is the case where it is load-bearing: an explicit value is
+/// used verbatim, so an operator who sets one below what the span costs gets
+/// queries refused for fold lag before the fold-stall alert reaches them, and
+/// nothing else in the process tells them which span their value undercuts.
+/// `source` says which of the two happened, so the pair is readable without
+/// knowing the flag's default.
+///
+/// The margin is passed in rather than read from [`crate::query::server_seal_margin`]
+/// here so the span reported is the one the budget was actually resolved
+/// with. Call this once at startup, with the same margin the resolution used.
+pub fn log_resolved_request_budget(
+    limit: ravel_query::RequestLimit,
+    seal_margin: ravel_query::SealMargin,
+    explicit: bool,
+) {
+    let covered_span_secs = ravel_query::covered_span(seal_margin).as_secs();
+    let source = if explicit {
+        "explicit --max-s3-requests"
+    } else {
+        "derived"
+    };
+    match limit {
+        ravel_query::RequestLimit::Bounded(max_s3_requests) => tracing::info!(
+            max_s3_requests,
+            source,
+            covered_span_secs,
+            seal_margin_secs = seal_margin.total().as_secs(),
+            "per-query S3 request budget resolved"
+        ),
+        ravel_query::RequestLimit::Unlimited => tracing::info!(
+            max_s3_requests = "unlimited",
+            source,
+            covered_span_secs,
+            seal_margin_secs = seal_margin.total().as_secs(),
+            "per-query S3 request budget resolved"
+        ),
+    }
+}
+
 /// Warn loudly when `--mtls-enabled` trusts a header for tenant identity
 /// (ADR-0042 decision 6). Unlike `--dev-insecure-tenant-header`, this is a
 /// legitimate production configuration, not a dev-only bypass. Since

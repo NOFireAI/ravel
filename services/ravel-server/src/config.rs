@@ -881,14 +881,20 @@ pub struct Cli {
     pub max_concurrent_queries: Option<u64>,
 
     /// Per-query cap on total S3 requests a single query may issue (ADR-0073
-    /// decision 3, ADR-0075). Omitted (the default): the cap is DERIVED from
-    /// `--shards` and the ingest flush cadence, so the worst legitimate open
-    /// hour fits at any shard count while a runaway query stays bounded
-    /// (`ravel_query::derive_max_s3_requests`). The old flat 25,000 default
-    /// was a per-query total against a per-shard-hour cost, so it rejected the
-    /// worst legitimate open hour above 3 shards; the derivation scales it with
-    /// the shard count. Set this flag to override the derivation with an exact
-    /// count, used verbatim. `0` is rejected: it would reject every query.
+    /// decision 3, ADR-0075, ADR-1306). Omitted (the default): the cap is
+    /// DERIVED from `--shards`, the ingest flush cadence, and the seal margin
+    /// of the catalog this process actually folds and resolves with
+    /// (`ravel_query::derive_max_s3_requests_for`), so it covers the worst
+    /// unsealed tail a healthy catalog carries plus the time a stalled fold
+    /// takes to page an operator, while a runaway query stays bounded. A
+    /// deployment whose catalog seals on a different margin gets a budget
+    /// sized for its own tail, with no hand recomputation. That is 343,400 at
+    /// the default 4 shards, the 2s flush cadence and the catalog's default
+    /// 4,800s seal margin. The old flat 25,000 default was a per-query total
+    /// against a per-shard-hour cost, so it rejected the worst legitimate open
+    /// hour above 3 shards; the derivation scales it with the shard count. Set
+    /// this flag to override the derivation with an exact count, used
+    /// verbatim. `0` is rejected: it would reject every query.
     #[arg(long = "max-s3-requests", value_name = "COUNT")]
     pub max_s3_requests: Option<u64>,
 
@@ -4618,17 +4624,58 @@ impl Cli {
     /// cadence ([`Self::resolve_flush_cadence`], the value the server's own
     /// ingest pipelines run with -- not `IngestConfig::default()`, so an
     /// operator who raises `--max-flush-delay` gets a budget derived from
-    /// what they configured, not the shipped default). This is the one place
-    /// the derivation is wired into the real startup path: `main.rs` calls it
-    /// to fill [`crate::ServerConfig::max_s3_requests`], which `start` threads
+    /// what they configured, not the shipped default). The resolved value
+    /// fills [`crate::ServerConfig::max_s3_requests`], which `start` threads
     /// into the process-wide `EngineConfig` both query surfaces share. A `0`
     /// override is rejected by [`Self::validate`], not here.
+    ///
+    /// The span the derivation sizes the per-shard allowance from is
+    /// `covered_span`, which is built out of the fold's seal margin (ADR-1306
+    /// decisions 1 and 3). That margin comes from
+    /// [`crate::query::server_seal_margin`], the seal margin of the
+    /// `CatalogConfig` [`crate::query::build_catalog`] constructs, not from
+    /// `ravel_query`'s `SealMargin::REFERENCE` constants: a deployment whose
+    /// catalog folds on a different margin gets a budget covering ITS tail,
+    /// with no hand recomputation.
+    /// `derived_request_budget_uses_the_catalogs_seal_margin`
+    /// (`src/query.rs`, where the catalog this derivation must agree with is
+    /// built) pins that agreement.
+    ///
+    /// This is that margin applied to [`Self::resolve_max_s3_requests_with`].
+    /// `main.rs` calls the seam directly, with the same margin, because it
+    /// also logs the span that margin covers (ADR-1306 decision 5) and the
+    /// two must be the one value.
     pub fn resolve_max_s3_requests(&self) -> anyhow::Result<ravel_query::RequestLimit> {
+        self.resolve_max_s3_requests_with(crate::query::server_seal_margin())
+    }
+
+    /// [`Self::resolve_max_s3_requests`] with the seal margin as an argument
+    /// rather than read from [`crate::query::server_seal_margin`].
+    ///
+    /// The margin is a real input here, not a constant this function could
+    /// recover on its own, which is what makes the wiring testable: every
+    /// server path pins the catalog's compiled-in margin today and
+    /// `SealMargin::REFERENCE` holds those same three durations, so a
+    /// derivation that quietly fell back to the reference constants would
+    /// return the identical number on every production input.
+    /// `derived_request_budget_uses_the_catalogs_seal_margin`
+    /// (`src/query.rs`) calls this with a margin an hour longer than the
+    /// reference and pins the budget to the derivation at THAT margin, so
+    /// ignoring the argument is a failing test rather than an invisible
+    /// revert.
+    ///
+    /// An explicit `--max-s3-requests` is used verbatim whatever the margin
+    /// is (ADR-1306 decision 5); the margin only sizes the derived default.
+    pub fn resolve_max_s3_requests_with(
+        &self,
+        seal_margin: ravel_query::SealMargin,
+    ) -> anyhow::Result<ravel_query::RequestLimit> {
         Ok(match self.max_s3_requests {
             Some(n) => ravel_query::RequestLimit::Bounded(n),
-            None => ravel_query::RequestLimit::Bounded(ravel_query::derive_max_s3_requests(
+            None => ravel_query::RequestLimit::Bounded(ravel_query::derive_max_s3_requests_for(
                 self.shards,
                 self.resolve_flush_cadence()?.max_flush_delay,
+                seal_margin,
             )),
         })
     }
@@ -7866,7 +7913,11 @@ mod tests {
             "guards the shard default this test is pinned to"
         );
         let flush = ravel_ingest::IngestConfig::default().max_flush_delay;
-        let expected = ravel_query::derive_max_s3_requests(cli.shards, flush);
+        // The seal margin is the running catalog's, not `SealMargin::REFERENCE`
+        // (ADR-1306 decision 3); `derived_request_budget_uses_the_catalogs_seal_margin`
+        // in `src/query.rs` is the test that holds those two together.
+        let seal_margin = crate::query::server_seal_margin();
+        let expected = ravel_query::derive_max_s3_requests_for(cli.shards, flush, seal_margin);
         assert_eq!(
             cli.resolve_max_s3_requests()
                 .expect("defaults resolve a bounded budget"),
@@ -7886,10 +7937,8 @@ mod tests {
         // covers covered_span of flushes at the budgeted per-flush cost plus
         // headroom, so the runaway is three times that covered-span cost across
         // every shard.
-        let covered_ms = u64::try_from(
-            ravel_query::covered_span(ravel_query::SealMargin::REFERENCE).as_millis(),
-        )
-        .expect("covered span fits u64");
+        let covered_ms = u64::try_from(ravel_query::covered_span(seal_margin).as_millis())
+            .expect("covered span fits u64");
         let runaway_cost = 3
             * covered_ms.div_ceil(flush_ms)
             * ravel_query::BUDGETED_REQUESTS_PER_UNSEALED_FLUSH
@@ -7932,7 +7981,7 @@ mod tests {
         .expect("flush-cadence override parses");
         let configured_flush = std::time::Duration::from_secs(1);
         let expected_for_override =
-            ravel_query::derive_max_s3_requests(cli.shards, configured_flush);
+            ravel_query::derive_max_s3_requests_for(cli.shards, configured_flush, seal_margin);
         assert_ne!(
             expected_for_override, expected,
             "guard: the override must actually change the derived budget vs. the default flush delay"

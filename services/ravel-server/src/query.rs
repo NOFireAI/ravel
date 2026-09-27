@@ -149,8 +149,10 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// binds before the estimate at the shipped defaults, the cadence term
 /// counts the age flush trigger only, so a size-triggered tenant seals more
 /// records per shard-hour than it assumes, the three unsealed hours assume
-/// the default seal parameters, which a longer `--gc-max-flush-lifetime`
-/// stretches, and the capacity is an entry CAP rather than a guaranteed
+/// the seal parameters of the catalog this server folds with
+/// ([`server_catalog_config_base`]), which no flag moves today
+/// (`--gc-max-flush-lifetime` feeds `CompactorConfig::max_flush_lifetime_ns`,
+/// not the catalog's), and the capacity is an entry CAP rather than a guaranteed
 /// residency: a tenant whose records carry declared column statistics hits its
 /// byte budget first and holds proportionally fewer. See
 /// [`ravel_catalog::DEFAULT_CACHE_CAPACITY_PER_TENANT`] for both limits and
@@ -197,7 +199,7 @@ pub fn build_catalog(
         shard_count,
         byte_cache_max_bytes,
         cache_capacity_per_tenant,
-        ..CatalogConfig::default()
+        ..server_catalog_config_base()
     };
     // The catalog listing window (ADR-0051 section 4), from `--max-ingest-lag`.
     // `None` leaves `CatalogConfig`'s own 2h default; `Some(ns)` is the value
@@ -242,6 +244,34 @@ pub fn build_catalog(
         _ => catalog,
     };
     Ok(Arc::new(catalog))
+}
+
+/// The `CatalogConfig` the server's catalog starts from, before the fields
+/// [`build_catalog`] derives from a deployment's flags.
+///
+/// The fold's three seal durations (`max_flush_lifetime_ns`,
+/// `clock_skew_allowance_ns`, `fold_safety_margin_ns`) are decided here and
+/// nowhere else on the server's path: [`build_catalog`] overrides none of
+/// them, so their sum is the seal margin the fold and resolve actually run
+/// with (ADR-1306 decision 3). The derived per-query request budget reads that
+/// margin off [`server_seal_margin`], which reads it off this function, so
+/// there is no second copy of the three durations on the budget path and a
+/// flag that later sets one of them here carries the budget with it.
+pub fn server_catalog_config_base() -> CatalogConfig {
+    CatalogConfig::default()
+}
+
+/// The seal margin of the catalog [`build_catalog`] constructs, for the
+/// derived per-query S3 request budget (ADR-1306 decision 3).
+///
+/// [`crate::config::Cli::resolve_max_s3_requests`] passes this to
+/// `ravel_query::derive_max_s3_requests_for` instead of letting the derivation
+/// fall back to `SealMargin::REFERENCE`, so the span the budget covers is the
+/// one the running catalog's fold seals against.
+/// `derived_request_budget_uses_the_catalogs_seal_margin` fails if this and
+/// the catalog [`build_catalog_for_server`] returns ever diverge.
+pub fn server_seal_margin() -> ravel_query::SealMargin {
+    ravel_query::SealMargin::from_catalog_config(&server_catalog_config_base())
 }
 
 /// The one place a `ServerConfig` becomes a `Catalog`: every field
@@ -1031,6 +1061,162 @@ mod catalog_cache_tests {
             catalog.config().resolve_get_concurrency,
             derived,
             "the resolved per-process ceiling must reach the catalog the server queries"
+        );
+    }
+
+    /// ADR-1306 follow-up task 5: the per-query S3 request budget a running
+    /// server enforces is derived with the seal margin of the catalog that
+    /// server folds and resolves with, not with `ravel_query`'s
+    /// `SealMargin::REFERENCE` constants.
+    ///
+    /// Both halves come from the production paths. The budget comes from the
+    /// real `Cli::resolve_max_s3_requests`, which is
+    /// `resolve_max_s3_requests_with(server_seal_margin())`, the exact call
+    /// `main.rs` makes to fill `ServerConfig::max_s3_requests`; the margin
+    /// comes from the
+    /// `CatalogConfig` `build_catalog_for_server` returns, which is the config
+    /// `start` hands to both resolve and `fold::spawn`. The three durations
+    /// are restated nowhere here, so a flag that later moves one of them on
+    /// the catalog and not on the budget path fails this test rather than
+    /// leaving the budget sized for a span the fold no longer seals against.
+    ///
+    /// Every server path pins the catalog's compiled-in margin today, and
+    /// `SealMargin::REFERENCE` holds those same three durations, so at the
+    /// production inputs the resolution returns the same number whether it
+    /// reads the margin off the catalog or falls back to the reference
+    /// constants. The equality between the resolved budget and
+    /// `derive_max_s3_requests_for` at the running margin therefore cannot,
+    /// on its own, tell those two apart. The assertion that can is the one
+    /// over the seam: `Cli::resolve_max_s3_requests_with` is called with a
+    /// margin an hour longer than the reference, and the budget it returns is
+    /// pinned to `derive_max_s3_requests_for` at THAT margin and asserted
+    /// different from `derive_max_s3_requests`, the reference-margin wrapper.
+    /// A resolution that ignores the margin it is handed fails the first of
+    /// those two; the second is not a restatement of it, because it is what
+    /// fails if `derive_max_s3_requests_for` itself stops reading its margin,
+    /// which would make both derivations agree and leave the first passing.
+    ///
+    /// RED: replace `seal_margin` in the body of
+    /// `Cli::resolve_max_s3_requests_with` (`src/config.rs`) with
+    /// `crate::query::server_seal_margin()`, which is exactly the revert to
+    /// the reference derivation that changes no production number. The
+    /// `resolved_at_longer` equality below then reports
+    /// `left: Bounded(343400)` against `right: Bounded(516200)`, the budget
+    /// the hour-longer margin was required to produce.
+    ///
+    /// The `server_seal_margin() == running` assertion is the other direction:
+    /// it fails if the catalog `build_catalog_for_server` returns ever seals
+    /// on a margin the budget path does not read.
+    #[test]
+    fn derived_request_budget_uses_the_catalogs_seal_margin() {
+        use clap::Parser;
+
+        let cli = crate::config::Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.shards, 4,
+            "guards the shard default this test is pinned to"
+        );
+        let cadence = cli
+            .resolve_flush_cadence()
+            .expect("server defaults resolve a flush cadence");
+
+        // The catalog the server really queries and folds with, built through
+        // the one `ServerConfig` -> `Catalog` mapping `start` uses.
+        let config = crate::ServerConfig {
+            shard_count: cli.shards,
+            max_flush_delay: cadence.max_flush_delay,
+            ..server_config()
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &config, 7_200_000_000_000).expect("catalog builds");
+        let running = ravel_query::SealMargin::from_catalog_config(catalog.config());
+
+        assert_eq!(
+            server_seal_margin(),
+            running,
+            "the seal margin the derived budget is sized from must be the seal margin of \
+             the catalog `build_catalog_for_server` returns"
+        );
+
+        let expected =
+            ravel_query::derive_max_s3_requests_for(cli.shards, cadence.max_flush_delay, running);
+        assert_eq!(
+            cli.resolve_max_s3_requests()
+                .expect("server defaults resolve a bounded budget"),
+            ravel_query::RequestLimit::Bounded(expected),
+            "the budget a running server enforces must be the derivation at the running \
+             catalog's own seal margin"
+        );
+        assert_eq!(
+            expected, 343_400,
+            "sanity: at 4 shards, the 2s cadence and the catalog's 4,800s seal margin the \
+             derivation is the figure ADR-1306's 2026-09-27 amendment states, and the figure \
+             the flag help text and docs/query-engine.md give an operator"
+        );
+
+        // The equality above holds just as well if the resolution ignores the
+        // margin and falls back to `SealMargin::REFERENCE`, because the
+        // running margin IS the reference triple today. The seam is what
+        // separates them: resolve at a margin no production input produces,
+        // one hour of extra `fold_safety_margin`, and require the budget to
+        // follow it.
+        let longer = ravel_query::SealMargin {
+            fold_safety_margin: running.fold_safety_margin + Duration::from_secs(3_600),
+            ..running
+        };
+        let at_longer =
+            ravel_query::derive_max_s3_requests_for(cli.shards, cadence.max_flush_delay, longer);
+        let at_reference = ravel_query::derive_max_s3_requests(cli.shards, cadence.max_flush_delay);
+        let resolved_at_longer = cli
+            .resolve_max_s3_requests_with(longer)
+            .expect("an hour-longer seal margin resolves a bounded budget");
+        assert_eq!(
+            resolved_at_longer,
+            ravel_query::RequestLimit::Bounded(at_longer),
+            "`resolve_max_s3_requests_with` must derive at the seal margin it is handed, \
+             not at one it reads back from the catalog or from SealMargin::REFERENCE"
+        );
+        assert_ne!(
+            resolved_at_longer,
+            ravel_query::RequestLimit::Bounded(at_reference),
+            "a budget resolved at an hour-longer seal margin must differ from \
+             `derive_max_s3_requests`, the reference-margin wrapper: if these agree, the \
+             resolution ignored its margin argument and the equality above is checking \
+             nothing"
+        );
+
+        // What that hour is worth, so the assertions above are pinned to a
+        // figure and not just to each other. A `fold_safety_margin` one hour
+        // longer adds an hour to `healthy_tail_max` and an hour to
+        // `lag_allowance`, so `covered_span` grows by 7,200s: 3,600 more
+        // flushes per shard at the 2s cadence, each budgeted at 8 requests,
+        // with the 3/2 headroom over 4 shards.
+        assert_eq!(
+            at_longer - expected,
+            3_600 * ravel_query::BUDGETED_REQUESTS_PER_UNSEALED_FLUSH * 3 / 2
+                * u64::from(cli.shards),
+            "an hour of extra seal margin must widen the derived budget by an hour of tail \
+             on every shard"
+        );
+
+        // ADR-1306 decision 5: an explicit flag is still used verbatim, seal
+        // margin or not. Checked on both the no-argument path and the seam,
+        // since the seam is the one a margin could leak into.
+        let cli = crate::config::Cli::try_parse_from(["ravel-server", "--max-s3-requests", "999"])
+            .expect("explicit flag parses");
+        assert_eq!(
+            cli.resolve_max_s3_requests()
+                .expect("explicit override resolves"),
+            ravel_query::RequestLimit::Bounded(999),
+            "an explicit --max-s3-requests is used verbatim, not re-derived"
+        );
+        assert_eq!(
+            cli.resolve_max_s3_requests_with(longer)
+                .expect("explicit override resolves at any seal margin"),
+            ravel_query::RequestLimit::Bounded(999),
+            "an explicit --max-s3-requests stays verbatim whatever seal margin the \
+             resolution is handed"
         );
     }
 
