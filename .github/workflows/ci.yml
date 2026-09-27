@@ -253,6 +253,11 @@ jobs:
       # on.
       - name: Disaster-recovery harness helper cases (issue #814)
         run: bash scripts/dr/lib.test.sh
+      # The chaos lane's helper suite, for the same reason: the scenarios run
+      # only in k8s-nightly.yml, and a parser that never matches would first
+      # show up there as a nightly failure with the wrong cause.
+      - name: Chaos-lane helper cases (issue #534)
+        run: bash scripts/chaos/lib.test.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is
       # the last stage's, so a real failure piped through tail/grep would report
       # as a pass. No cargo toolchain, matching this job.
