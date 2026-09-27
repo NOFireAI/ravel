@@ -110,8 +110,15 @@ rationale.
 
 ECR Public does throttle unauthenticated pulls per source IP on its own
 terms, answering a burst with `toomanyrequests: Rate exceeded`, which
-`docker run` reports as exit 125. The CI steps that start the AWS CLI retry
-that exit code alone, with backoff.
+`docker run` reports as exit 125. CI therefore does not pull the AWS CLI
+image at all: its jobs create their bucket with the aws CLI the GitHub
+runner image ships (`scripts/ci-create-bucket.sh`), and the CI quickstart
+applies `docker-compose/ci-host-bucket.yml`, a CI-only override that turns
+`createbucket` into a no-op on the locally built server image after the job
+creates `ravel-dev` from the host (issue #2036). The documented quickstart
+still runs `createbucket` from ECR Public, as do `docker-compose/rustfs.yml`,
+`deploy/k8s`, `scripts/demo.sh`, `scripts/dr`, `scripts/chaos`, the
+MetricsBench compose file, and the interop-nightly Flight SQL test.
 
 The object store used to be MinIO on quay.io. MinIO withdrew anonymous
 access to its public images on 2026-09-24, from Docker Hub and quay.io

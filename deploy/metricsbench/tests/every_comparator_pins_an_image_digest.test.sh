@@ -191,13 +191,13 @@ check "a missing rustfs.yml also fails the total-count assertion" "${d}" 1 \
 # --- fifth category: docker run/pull/create image pins in workflow run: ----
 # --- blocks (issue #1338) ---------------------------------------------------
 
-# A bare-tag image on a single-line docker run fails naming the unpinned
-# reference. This is the acceptance test for issue #1338.
+# A bare-tag image on a docker run fails naming the unpinned reference. This
+# is the acceptance test for issue #1338.
 d="$(new_tree docker-run-image-with-tag-only-fails)"
 mutate "${d}/.github/workflows/ci.yml" \
-  's#public\.ecr\.aws/aws-cli/aws-cli:2\.37\.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed#public.ecr.aws/aws-cli/aws-cli:latest#'
+  's#ghcr\.io/rustfs/rustfs:1\.0\.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff#ghcr.io/rustfs/rustfs:latest#'
 check "docker_run_image_with_tag_only_fails" "${d}" 1 \
-  "public.ecr.aws/aws-cli/aws-cli:latest"
+  "ghcr.io/rustfs/rustfs:latest"
 
 # The three shell-variable image references this static scan cannot resolve
 # ("$RAVEL_SERVER_IMAGE"/"$RAVEL_OPERATOR_IMAGE" in ci.yml and k8s-nightly.yml,
@@ -228,9 +228,9 @@ check "docker_run_with_line_continuation_is_scanned" "${d}" 1 \
 # not silently scan fewer references.
 d="$(new_tree docker-run-wrong-count)"
 mutate "${d}/.github/workflows/metricsbench-nightly.yml" \
-  '/^            docker run --rm --network host \\$/,/^              public\.ecr\.aws\/aws-cli\/aws-cli:2\.37\.2@sha256:/d'
+  '/^          docker run -d --name rustfs \\$/,/^            ghcr\.io\/rustfs\/rustfs:1\.0\.0@sha256:/d'
 check "removing a docker run line fails the docker-run-image count assertion" \
-  "${d}" 1 "found 17 docker run/pull/create image references, expected exactly 18"
+  "${d}" 1 "found 14 docker run/pull/create image references, expected exactly 15"
 
 # A second invocation on the same logical line is scanned too. Chaining with
 # && is ordinary shell, and a scanner that stops at the first `docker` on the

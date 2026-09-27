@@ -6,6 +6,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI no longer pulls the AWS CLI image from ECR Public to create a test
+  bucket** (issue #2036). ECR Public caps anonymous pulls per source IP, and
+  hitting that cap failed `bench-smoke`, `quickstart` and
+  `object-store-contract`. Those jobs and the MetricsBench nightly now create
+  their RustFS bucket with the runner's own `aws` CLI through
+  `scripts/ci-create-bucket.sh`, which retries only the create call's own
+  transient failures. The CI quickstart applies a CI-only compose override,
+  `deploy/docker-compose/ci-host-bucket.yml`, that turns `createbucket` into a
+  no-op on the locally built image; the documented quickstart command is
+  unchanged. `demo/kill-and-recover.sh` now restarts `ravel-server` with
+  `--no-deps`, so replacing the server no longer re-runs the stack's one-shot
+  services.
+
 ### Added
 
 - **`ravel-cli export --signal logs` writes a tenant's stored logs back out to

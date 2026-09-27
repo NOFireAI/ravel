@@ -171,14 +171,18 @@ RAVEL_IMAGE_VAR_REF='${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.18.0}'
 # 17->18 when the dr-rehearsal workflow was added (issue #814): it starts one
 # object-store container in a `run:` block. Its bucket-management invocations
 # live in scripts/dr/lib.sh, outside this scan's scope, and are pinned by
-# DR_AWS_CLI_IMAGE's own default there.
-RUN_IMAGE_EXPECTED_COUNT=18
+# DR_AWS_CLI_IMAGE's own default there. Lowered 18->15 when the three
+# AWS CLI container runs that created a RustFS bucket (ci.yml's
+# object-store-contract and bench-smoke, metricsbench-nightly.yml) moved to
+# the runner's own aws CLI (issue #2036).
+RUN_IMAGE_EXPECTED_COUNT=15
 
 # Of those, the number that must carry a digest pin: every reference except
 # the three shell-variable exemptions below. Update deliberately alongside
 # RUN_IMAGE_EXPECTED_COUNT. Raised 11->12 with the dr-rehearsal object-store run,
-# which is digest pinned.
-RUN_IMAGE_EXPECTED_PINNED_COUNT=12
+# which is digest pinned. Lowered 12->9 with the three AWS CLI runs above,
+# all of which were digest pinned.
+RUN_IMAGE_EXPECTED_PINNED_COUNT=9
 
 # The exact text of an extracted image argument (same stripping as the
 # extraction below: the whitespace-delimited token itself, quotes included
