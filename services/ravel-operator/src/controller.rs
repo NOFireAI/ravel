@@ -2882,7 +2882,7 @@ pub async fn run() -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::crd::{
-        GatewaySpec, IngestAffinitySpec, MaintainSpec, QuerySpec, S3Spec, StorageSpec,
+        GatewaySpec, IngestAffinitySpec, MaintainSpec, ProbesSpec, QuerySpec, S3Spec, StorageSpec,
     };
     use kube::Config;
 
@@ -3138,6 +3138,7 @@ mod tests {
             },
             query: QuerySpec::default(),
             maintain: MaintainSpec::default(),
+            probes: ProbesSpec::default(),
             gc: None,
             retention: None,
             shard_overrides: None,
@@ -4975,6 +4976,7 @@ mod tests {
                 gateway: Default::default(),
                 query: Default::default(),
                 maintain: Default::default(),
+                probes: Default::default(),
                 gc: None,
                 retention: None,
                 shard_overrides: None,

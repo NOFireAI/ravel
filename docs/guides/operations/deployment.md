@@ -252,7 +252,10 @@ numbers cannot drift apart:
   (gateway, query, and maintain). Kubernetes runs the `preStop` hook inside the
   grace period and only sends SIGTERM once it returns, so the grace period has
   to cover the `preStop` sleep plus the `32.5s` server budget plus headroom:
-  `10s + 32.5s + 2.5s`, rounded up. The error is deliberately on the long side.
+  `10s + 32.5s + 2.5s`, rounded up. With `spec.probes.dedicatedHealthPort`
+  set, stopping the health listener adds up to 6s to the server's budget
+  (38.5s), and the operator sets **51s** instead: `10s + 38.5s + 2.5s`. The
+  error is deliberately on the long side.
   A grace period shorter than the server's budget lets SIGKILL land mid-drain
   and lose buffered data, which is irreversible; a longer one only slows a
   rolling update's pod turnover by a few seconds.
@@ -267,7 +270,8 @@ numbers cannot drift apart:
   filesystem and every Linux capability dropped.
 
 The operator renders no `--shutdown-timeout` flag, so the server runs at its
-compiled default and `45s` is the correct grace period today. `--shutdown-timeout`
+compiled default and `45s` (`51s` with the dedicated health port) is the correct
+grace period today. `--shutdown-timeout`
 is configurable on the server itself; if a future CRD field exposes it, the grace
 period must track it, staying above the new server budget plus the `preStop`
 sleep.

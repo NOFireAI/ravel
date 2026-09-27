@@ -157,6 +157,17 @@ pub const HTTP_PORT: i32 = 4318;
 /// gRPC listener port (OTLP/gRPC), exposed by the gateway tier only.
 pub const GRPC_PORT: i32 = 4317;
 
+/// Dedicated health listener port (ADR-1702 decision 8): the port
+/// `--listen-health` binds, served by its own `current_thread` runtime on its
+/// own OS thread, carrying `/healthz`, `/readyz` and their `/-/` aliases and
+/// nothing else. Rendered only when `spec.probes.dedicatedHealthPort` is set
+/// (ADR-1702 decision 10); the same routes stay on [`HTTP_PORT`] either way.
+pub const HEALTH_PORT: i32 = 4316;
+
+/// Container-port name for [`HEALTH_PORT`], alongside the existing `http` and
+/// `grpc` names.
+pub const HEALTH_PORT_NAME: &str = "health";
+
 /// `preStop` sleep, in seconds, on every ravel-server pod.
 ///
 /// Endpoint deregistration and SIGTERM are concurrent, not ordered: when a pod
@@ -186,7 +197,9 @@ pub const PRE_STOP_DRAIN_DELAY_SECONDS: i64 = 10;
 /// check -- which only reads the apiserver version -- cannot see it.
 pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 30;
 
-/// `terminationGracePeriodSeconds` on every ravel-server pod.
+/// `terminationGracePeriodSeconds` on every ravel-server pod, unless
+/// `spec.probes.dedicatedHealthPort` selects
+/// [`POD_TERMINATION_GRACE_PERIOD_WITH_HEALTH_PORT_SECONDS`].
 ///
 /// Kubernetes runs `preStop` inside the grace period and only sends SIGTERM
 /// after it returns, so the grace period must cover the `preStop` sleep plus the
@@ -204,6 +217,19 @@ pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 30;
 /// SIGKILL land mid-drain and lose buffered-mode ingest data, an irreversible
 /// loss, while a longer one only slows a rolling update's pod turnover.
 pub const POD_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 45;
+
+/// `terminationGracePeriodSeconds` on every ravel-server pod when
+/// `spec.probes.dedicatedHealthPort` is true.
+///
+/// That field renders `--listen-health` (ADR-1702 decision 8), and a server
+/// with the health listener bound stops it between the drain and the trace
+/// flush, taking up to 6s (5s shutdown deadline + 1s join margin). The
+/// SIGTERM-to-exit worst case therefore grows from 32.5s to 38.5s.
+///
+/// 10s `preStop` + 38.5s server budget = 48.5s, plus the same 2.5s headroom
+/// as [`POD_TERMINATION_GRACE_PERIOD_SECONDS`] = 51s. At 45s SIGKILL could land
+/// during the health-listener stop or the trace flush.
+pub const POD_TERMINATION_GRACE_PERIOD_WITH_HEALTH_PORT_SECONDS: i64 = 51;
 
 /// Secret key holding the S3 access key id.
 pub(crate) const S3_ACCESS_KEY_ID_KEY: &str = "accessKeyId";
@@ -708,11 +734,35 @@ fn resources(
     }
 }
 
-/// Liveness and readiness probes pointed at `/healthz` and `/readyz` on the
-/// gateway/query/maintain HTTP port ([`HTTP_PORT`], ADR-0034 decision 4).
-/// Returned as `(liveness, readiness)`.
-fn probes() -> (Probe, Probe) {
-    probes_on(HTTP_PORT)
+/// Liveness and readiness probes for the gateway/query/maintain pods, pointed
+/// at `/healthz` and `/readyz` on [`HTTP_PORT`] (ADR-0034 decision 4) or, under
+/// `spec.probes.dedicatedHealthPort`, on [`HEALTH_PORT`] (ADR-1702 decision
+/// 10). Only the port changes in the render: the paths and the timing are the
+/// same either way, though the endpoints on the health port also fail on a
+/// stale main-runtime heartbeat (ADR-1702 decision 9). Returned as
+/// `(liveness, readiness)`.
+fn probes(spec: &RavelClusterSpec) -> (Probe, Probe) {
+    probes_on(server_probe_port(spec))
+}
+
+/// The port the server tiers' probes hit: [`HEALTH_PORT`] when the spec opts
+/// into the dedicated health listener, [`HTTP_PORT`] otherwise.
+fn server_probe_port(spec: &RavelClusterSpec) -> i32 {
+    if spec.probes.dedicated_health_port {
+        HEALTH_PORT
+    } else {
+        HTTP_PORT
+    }
+}
+
+/// The server tiers' grace period: longer when the dedicated health listener
+/// adds its stop to the server's shutdown budget.
+fn termination_grace_period_seconds(spec: &RavelClusterSpec) -> i64 {
+    if spec.probes.dedicated_health_port {
+        POD_TERMINATION_GRACE_PERIOD_WITH_HEALTH_PORT_SECONDS
+    } else {
+        POD_TERMINATION_GRACE_PERIOD_SECONDS
+    }
 }
 
 /// [`probes`] parameterized by port, so the ravel-native router (which listens
@@ -839,14 +889,20 @@ fn pod_anti_affinity(instance: &str, component: &str) -> Affinity {
 /// ports, replica count, and strategy. The single place the common container
 /// shape (image, probes, resources) is assembled, so gateway/query/maintain
 /// cannot drift in how they wire the server.
+///
+/// The dedicated health listener is wired here rather than in each tier
+/// (ADR-1702 decision 10): every ravel-server tier serves the same health
+/// routes, so the `--listen-health` argument, the `health` container port, and
+/// the probe port move together for all three. The ingest-router does not go
+/// through this builder and keeps its probes on [`ROUTER_HTTP_PORT`].
 #[allow(clippy::too_many_arguments)]
 fn deployment(
     spec: &RavelClusterSpec,
     instance: &str,
     component: &str,
-    args: Vec<String>,
+    mut args: Vec<String>,
     env: Vec<EnvVar>,
-    ports: Vec<ContainerPort>,
+    mut ports: Vec<ContainerPort>,
     replicas: i32,
     resources_spec: Option<&ResourceRequirementsSpec>,
     default_resources: (&str, &str),
@@ -854,7 +910,16 @@ fn deployment(
     secrets_checksum: &str,
 ) -> Deployment {
     let labels = labels(instance, component);
-    let (liveness, readiness) = probes();
+    if spec.probes.dedicated_health_port {
+        args.push("--listen-health".to_string());
+        args.push(format!("0.0.0.0:{HEALTH_PORT}"));
+        ports.push(ContainerPort {
+            name: Some(HEALTH_PORT_NAME.to_string()),
+            container_port: HEALTH_PORT,
+            ..Default::default()
+        });
+    }
+    let (liveness, readiness) = probes(spec);
     let volume_mount = deployment_key_volume_mount(spec);
     let volume = deployment_key_volume(spec);
     let container = Container {
@@ -906,7 +971,7 @@ fn deployment(
                 spec: Some(PodSpec {
                     containers: vec![container],
                     volumes: volume.map(|v| vec![v]),
-                    termination_grace_period_seconds: Some(POD_TERMINATION_GRACE_PERIOD_SECONDS),
+                    termination_grace_period_seconds: Some(termination_grace_period_seconds(spec)),
                     security_context: Some(pod_security_context()),
                     affinity: Some(pod_anti_affinity(instance, component)),
                     ..Default::default()
@@ -3136,8 +3201,8 @@ mod tests {
     use crate::crd::{
         AffinityBackend, AffinityKeySpec, DEFAULT_AFFINITY_SUBSET_SIZE, FoldSpec,
         GatewayApiExposureSpec, GatewayExposureSpec, GatewayReference, GatewaySpec, GcSpec,
-        IngestAffinitySpec, LocalSecretRef, MaintainSpec, QuerySpec, RetentionSpec, S3Spec,
-        StorageSpec,
+        IngestAffinitySpec, LocalSecretRef, MaintainSpec, ProbesSpec, QuerySpec, RetentionSpec,
+        S3Spec, StorageSpec,
     };
     use std::collections::BTreeMap;
 
@@ -3189,6 +3254,7 @@ mod tests {
                 resources: None,
                 credentials_secret_ref: None,
             },
+            probes: ProbesSpec::default(),
             gc: None,
             retention: Some(RetentionSpec {
                 default: Some("30d".to_string()),
@@ -4011,6 +4077,170 @@ mod tests {
                 .expect("httpGet");
             assert_eq!(ready.path.as_deref(), Some("/readyz"));
             assert_eq!(ready.port, IntOrString::Int(HTTP_PORT));
+        }
+    }
+
+    #[test]
+    fn probes_render_on_health_port_when_enabled() {
+        // ADR-1702 decisions 8 and 10, follow-up task 3. The three server
+        // tiers share the `deployment` builder, so all three are rendered
+        // here: a field wired on only some of them regresses the rest
+        // silently.
+        let off = base_spec();
+        let mut on = base_spec();
+        on.probes.dedicated_health_port = true;
+
+        // An existing RavelCluster carries no `probes` block at all. It must
+        // deserialize to the same spec the default gives.
+        let mut without = serde_json::to_value(&off).expect("serialize spec");
+        without
+            .as_object_mut()
+            .expect("spec object")
+            .remove("probes")
+            .expect("probes serialized");
+        let without: RavelClusterSpec =
+            serde_json::from_value(without).expect("deserialize a spec with no probes block");
+        assert_eq!(without, off);
+
+        let render = |spec: &RavelClusterSpec| {
+            vec![
+                desired_gateway_deployment(spec, "prod", &ctx()),
+                desired_query_deployment(spec, "prod", &ctx()),
+                desired_maintain_deployment(spec, "prod", &ctx())
+                    .expect("no gc render error")
+                    .expect("maintain enabled"),
+            ]
+        };
+
+        // Disabled (this release's default): the render is what it is today,
+        // whole object for whole object.
+        assert_eq!(render(&off), render(&without));
+        for dep in render(&off) {
+            let container = container_of(&dep);
+            assert!(
+                !args_of(&dep).iter().any(|arg| arg == "--listen-health"),
+                "the disabled render must pass no --listen-health"
+            );
+            let ports = container.ports.as_ref().expect("container ports");
+            assert!(
+                ports.iter().all(|port| port.container_port != HEALTH_PORT),
+                "the disabled render must expose no health port"
+            );
+            for probe in [&container.liveness_probe, &container.readiness_probe] {
+                let get = probe
+                    .as_ref()
+                    .expect("probe")
+                    .http_get
+                    .as_ref()
+                    .expect("httpGet");
+                assert_eq!(get.port, IntOrString::Int(HTTP_PORT));
+            }
+        }
+
+        // Enabled: the argument, a named container port, and both probes on
+        // 4316, keeping today's period, timeout and failure threshold.
+        for (dep, today) in render(&on).into_iter().zip(render(&off)) {
+            let args = args_of(&dep);
+            let flag = args
+                .iter()
+                .position(|arg| arg == "--listen-health")
+                .expect("--listen-health rendered");
+            assert_eq!(args[flag + 1], format!("0.0.0.0:{HEALTH_PORT}"));
+
+            let container = container_of(&dep);
+            let ports = container.ports.as_ref().expect("container ports");
+            let health = ports
+                .iter()
+                .find(|port| port.container_port == HEALTH_PORT)
+                .expect("health container port");
+            assert_eq!(health.name.as_deref(), Some(HEALTH_PORT_NAME));
+            let today_container = container_of(&today);
+            for port in today_container.ports.as_ref().expect("container ports") {
+                assert!(
+                    ports.contains(port),
+                    "enabling the health port must not drop {port:?}"
+                );
+            }
+
+            for (probe, today_probe, path) in [
+                (
+                    &container.liveness_probe,
+                    &today_container.liveness_probe,
+                    "/healthz",
+                ),
+                (
+                    &container.readiness_probe,
+                    &today_container.readiness_probe,
+                    "/readyz",
+                ),
+            ] {
+                let probe = probe.as_ref().expect("probe");
+                let today_probe = today_probe.as_ref().expect("probe");
+                let get = probe.http_get.as_ref().expect("httpGet");
+                assert_eq!(get.path.as_deref(), Some(path));
+                assert_eq!(get.port, IntOrString::Int(HEALTH_PORT));
+                assert_eq!(probe.period_seconds, today_probe.period_seconds);
+                assert_eq!(probe.timeout_seconds, today_probe.timeout_seconds);
+                assert_eq!(probe.failure_threshold, today_probe.failure_threshold);
+            }
+        }
+
+        // The ingest-router runs a different binary that has no health
+        // listener, so its render is unchanged either way (ADR-1702
+        // decision 10).
+        let router = |dedicated: bool| {
+            let mut spec = ravel_native_spec(3, AffinityKeySource::AuthorizationHeader);
+            spec.probes.dedicated_health_port = dedicated;
+            desired_router_deployment(&spec, "prod", "default", &ctx())
+                .expect("router renders")
+                .expect("ravelNative renders a router Deployment")
+        };
+        let router_off = router(false);
+        assert_eq!(router(true), router_off);
+        let router_container = container_of(&router_off);
+        assert!(
+            !args_of(&router_off)
+                .iter()
+                .any(|arg| arg == "--listen-health")
+        );
+        for probe in [
+            &router_container.liveness_probe,
+            &router_container.readiness_probe,
+        ] {
+            let get = probe
+                .as_ref()
+                .expect("probe")
+                .http_get
+                .as_ref()
+                .expect("httpGet");
+            assert_eq!(get.port, IntOrString::Int(ROUTER_HTTP_PORT));
+        }
+    }
+
+    #[test]
+    fn dedicated_health_port_lengthens_every_server_tier_grace_period() {
+        // With `--listen-health` rendered, the server stops the health
+        // listener (up to 6s) between the drain and the trace flush, so its
+        // SIGTERM-to-exit budget grows to 38.5s and the grace period with it
+        // (POD_TERMINATION_GRACE_PERIOD_WITH_HEALTH_PORT_SECONDS). Disabled,
+        // the value stays exactly today's 45.
+        for (dedicated, expected) in [(false, 45), (true, 51)] {
+            let mut spec = base_spec();
+            spec.probes.dedicated_health_port = dedicated;
+            let ctx = ctx();
+            for dep in [
+                desired_gateway_deployment(&spec, "prod", &ctx),
+                desired_query_deployment(&spec, "prod", &ctx),
+                desired_maintain_deployment(&spec, "prod", &ctx)
+                    .expect("no gc render error")
+                    .expect("enabled"),
+            ] {
+                assert_eq!(
+                    pod_spec_of(&dep).termination_grace_period_seconds,
+                    Some(expected),
+                    "dedicatedHealthPort={dedicated}: wrong terminationGracePeriodSeconds"
+                );
+            }
         }
     }
 
