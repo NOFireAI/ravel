@@ -46,7 +46,8 @@ const MAX_PUT_ATTEMPTS: u32 = RETRY_BACKOFF_BASE_MS.len() as u32 + 1;
 const RETRY_BACKOFF_BASE_MS: [u64; 2] = [50, 200];
 
 /// Total wall-clock budget for one [`write_audit_batch`] call, covering every
-/// attempt of both PUTs (data object, then commit record). Sized as room for
+/// attempt of both PUTs (data object, then commit record) and the
+/// `AlreadyExists`-on-retry read-back GET of the commit key. Sized as room for
 /// one full object-store request timeout (`DEFAULT_REQUEST_TIMEOUT`, 20 s in
 /// `ravel-object-store`'s S3 backend) plus a retry of that same PUT, and
 /// still leave the commit PUT its own attempt, while keeping the worst case
@@ -270,11 +271,15 @@ pub(crate) async fn write_audit_object(
 /// (`AccessDenied`, an invariant breach, `AlreadyExists` on the commit
 /// record's first attempt) fails immediately, never retried, and so does a
 /// retryable one once [`AUDIT_WRITE_BUDGET`]'s total wall-clock budget for
-/// the whole call -- both PUTs, every attempt -- runs out: the last error
-/// observed is what the batch fails closed with. `put_retries`, when
-/// supplied, counts every retried attempt; it is rendered on `/metrics` as
-/// `ravel_audit_put_retries_total` (see
-/// [`crate::audit_pipeline::AuditPipeline::put_retries`]).
+/// the whole call -- both PUTs, every attempt, and the `AlreadyExists`
+/// read-back GET below -- runs out: the last error observed is what the
+/// batch fails closed with, or, if the budget runs out while the read-back
+/// GET itself is still in flight, the invariant error that GET's own
+/// completion would otherwise have resolved. `put_retries`, when supplied,
+/// counts only the attempts that actually retry (a retryable error observed
+/// too late for another attempt to fit the remaining budget is not
+/// counted); it is rendered on `/metrics` as `ravel_audit_put_retries_total`
+/// (see [`crate::audit_pipeline::AuditPipeline::put_retries`]).
 ///
 /// The tenant is taken from the records themselves, never from a parameter a
 /// caller resolved once at construction time: the object identity, the data
@@ -384,9 +389,10 @@ pub(crate) async fn write_audit_batch_with_rng(
         ingest_hour_bucket,
     })?;
 
-    // One budget for the whole call: both PUTs, every attempt. See
-    // `AUDIT_WRITE_BUDGET` for why 30 s keeps a hung store's worst case below
-    // the pre-retry-ladder worst case of two un-retried 20 s timeouts.
+    // One budget for the whole call: both PUTs, every attempt, and the
+    // AlreadyExists-on-retry read-back GET below. See `AUDIT_WRITE_BUDGET`
+    // for why 30 s keeps a hung store's worst case below the pre-retry-ladder
+    // worst case of two un-retried 20 s timeouts.
     let deadline = tokio::time::Instant::now() + AUDIT_WRITE_BUDGET;
 
     let data_key = keys::data_key(
@@ -422,12 +428,12 @@ pub(crate) async fn write_audit_batch_with_rng(
             // ever republish this same content-addressed object.
             Some(Err(StoreError::AlreadyExists)) => break,
             Some(Err(e)) if attempt < MAX_PUT_ATTEMPTS && e.is_retryable() => {
-                note_put_retry(AuditPut::Data, attempt, &e, put_retries);
                 let delay = retry_delay(&e, RETRY_BACKOFF_BASE_MS[(attempt - 1) as usize], rng);
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if delay > remaining {
                     return Err(e.into());
                 }
+                note_put_retry(AuditPut::Data, attempt, &e, put_retries);
                 tokio::time::sleep(delay).await;
                 attempt += 1;
                 last_error = Some(e);
@@ -482,31 +488,39 @@ pub(crate) async fn write_audit_batch_with_rng(
             // the earlier attempt already succeeded; anything else fails
             // closed rather than assuming it.
             Some(Err(StoreError::AlreadyExists)) => {
-                match store.get(&commit_key, GetRange::Full).await {
-                    Ok(existing) if existing.data == commit_bytes => break,
-                    Ok(_) => {
+                match bound_to_deadline(deadline, store.get(&commit_key, GetRange::Full)).await {
+                    Some(Ok(existing)) if existing.data == commit_bytes => break,
+                    Some(Ok(_)) => {
                         return Err(MaintainError::Invariant(format!(
                             "audit commit record {commit_key} already exists with different \
                              content after a retry - record_id {record_id} collided with an \
                              unrelated commit record"
                         )));
                     }
-                    Err(get_err) => {
+                    Some(Err(get_err)) => {
                         return Err(MaintainError::Invariant(format!(
                             "audit commit record {commit_key} already exists after a retry, and \
                              confirming its content failed ({get_err}) - failing closed rather \
                              than assuming the retry's own write landed"
                         )));
                     }
+                    None => {
+                        return Err(MaintainError::Invariant(format!(
+                            "audit commit record {commit_key} already exists after a retry, and \
+                             confirming its content failed (the {AUDIT_WRITE_BUDGET:?} write \
+                             budget ran out before the read-back answered) - failing closed \
+                             rather than assuming the retry's own write landed"
+                        )));
+                    }
                 }
             }
             Some(Err(e)) if attempt < MAX_PUT_ATTEMPTS && e.is_retryable() => {
-                note_put_retry(AuditPut::Commit, attempt, &e, put_retries);
                 let delay = retry_delay(&e, RETRY_BACKOFF_BASE_MS[(attempt - 1) as usize], rng);
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if delay > remaining {
                     return Err(e.into());
                 }
+                note_put_retry(AuditPut::Commit, attempt, &e, put_retries);
                 tokio::time::sleep(delay).await;
                 attempt += 1;
                 last_error = Some(e);
@@ -531,12 +545,14 @@ pub(crate) async fn write_audit_batch_with_rng(
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use ravel_commit::SeededRng;
     use ravel_commit::keys;
     use ravel_commit::record;
     use ravel_logseg::{LogRecord, Predicate, RlogReader, stream_attrs_bytes};
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, list_all};
@@ -816,7 +832,9 @@ mod tests {
     /// Finding 6, other half: a `Throttled` hint that does not fit inside the
     /// remaining write budget stops retrying immediately rather than sleeping
     /// past the deadline, and the throttle error itself is what the batch
-    /// fails closed with.
+    /// fails closed with. Also finding 2 (review round 2): `put_retries` must
+    /// stay at zero, since the abandoned retry never actually happens -
+    /// counting it here would report a retry that was never attempted.
     #[tokio::test(start_paused = true)]
     async fn a_throttle_hint_that_does_not_fit_the_budget_fails_closed_without_retrying() {
         let mem = MemoryStore::new();
@@ -832,13 +850,14 @@ mod tests {
         );
         let store = FaultStore::new(mem, plan);
         let tenant = TenantHash([63u8; 16]);
+        let put_retries = AtomicU64::new(0);
 
         let err = write_audit_batch_with_rng(
             &store,
             AUDIT_SHARD,
             Uuid::new_v4(),
             vec![test_record(tenant, 11 * NS_PER_HOUR, 1)],
-            None,
+            Some(&put_retries),
             &SeededRng::new(1),
         )
         .await
@@ -858,5 +877,83 @@ mod tests {
             1,
             "no retry was attempted, so the fault fired exactly once"
         );
+        assert_eq!(
+            put_retries.load(Ordering::Relaxed),
+            0,
+            "the abandoned retry must not be counted: no further attempt was ever made"
+        );
+    }
+
+    /// Finding 1 (review round 2, issue #2035): the `AlreadyExists`-on-retry
+    /// read-back GET of the commit key is the one store call in
+    /// `write_audit_batch_with_rng` not raced against `AUDIT_WRITE_BUDGET`. A
+    /// GET is idempotent, so the object-store client's own retry loop runs
+    /// over it, and an unbounded GET can hold the whole batch open long past
+    /// the write budget. A commit PUT that times out once, then reports
+    /// `AlreadyExists` on its retry, whose read-back GET then never returns,
+    /// must still fail the batch closed at exactly the budget rather than
+    /// hanging past it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_commit_readback_get_fails_closed_within_the_write_budget() {
+        let mem = MemoryStore::new();
+        // Only the commit PUT (key contains "/u/c/") is scripted: the data
+        // PUT (key contains "/u/l0/") must succeed normally so the batch
+        // reaches the commit loop's AlreadyExists-on-retry path.
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Put)
+                .with_key_contains("/u/c/")
+                .then_fault(ScriptedFault::Timeout)
+                .then_fault(ScriptedFault::FailedConditionalWrite),
+        );
+        let store = Arc::new(FaultStore::new(mem, plan));
+        let held = store.hold(Op::Get, Some("/u/c/".to_string()), Occurrence::Always);
+        let tenant = TenantHash([64u8; 16]);
+
+        let started = tokio::time::Instant::now();
+        let task_store = Arc::clone(&store);
+        let handle = tokio::spawn(async move {
+            write_audit_batch_with_rng(
+                task_store.as_ref(),
+                AUDIT_SHARD,
+                Uuid::new_v4(),
+                vec![test_record(tenant, 12 * NS_PER_HOUR, 1)],
+                None,
+                &SeededRng::new(1),
+            )
+            .await
+        });
+
+        // Confirm the read-back GET is the call actually stuck, before
+        // letting the paused clock run the write budget out from under it.
+        held.wait_until_held(1).await;
+        let details = held.held_details();
+        assert_eq!(details.len(), 1, "exactly one call is held");
+        assert_eq!(details[0].1, Op::Get, "the held call is a GET");
+        assert!(
+            details[0].2.contains("/u/c/"),
+            "the held GET is the commit key's read-back, key was {}",
+            details[0].2
+        );
+
+        let err = handle
+            .await
+            .expect("write_audit_batch_with_rng task did not panic")
+            .expect_err("a commit read-back GET that never returns must fail the batch closed");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            AUDIT_WRITE_BUDGET,
+            "the paused clock advances exactly to the budget deadline, no further"
+        );
+        match &err {
+            MaintainError::Invariant(msg) => {
+                assert!(
+                    msg.contains("confirming its content failed"),
+                    "message was: {msg}"
+                );
+                assert!(msg.contains("budget ran out"), "message was: {msg}");
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
     }
 }

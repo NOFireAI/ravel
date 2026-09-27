@@ -750,6 +750,11 @@ async fn query_mode_installs_a_pipeline_and_maintain_and_gateway_do_not() {
             "mode {mode:?} installs no pipeline, so it must render no \
              audit-failure family at all"
         );
+        assert!(
+            !metrics.contains("ravel_audit_put_retries_total"),
+            "mode {mode:?} installs no pipeline, so it must render no \
+             audit-put-retry family at all"
+        );
 
         running.shutdown().await.expect("graceful shutdown");
     }
