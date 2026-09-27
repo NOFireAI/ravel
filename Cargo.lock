@@ -5160,6 +5160,7 @@ dependencies = [
  "ravel-segment",
  "ravel-sql",
  "ravel-tenant-resolve",
+ "ravel-test-support",
  "ravel-tracing-export",
  "ravel-types",
  "reqwest 0.13.4",

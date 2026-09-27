@@ -566,9 +566,29 @@ async fn main() -> anyhow::Result<()> {
         max_ingest_lag,
     };
 
+    // The --listen-health listener (ADR-1702 decisions 8 and 9) binds before
+    // `start` so the kubelet can probe liveness during a long startup; its
+    // `/readyz` stays 503 until the readiness handle is attached below. The
+    // heartbeat is stamped when constructed, before the bind, and ticks on
+    // this (the main) runtime.
+    let health_listener = match cli.listen_health {
+        Some(addr) => {
+            let heartbeat =
+                ravel_server::health_listener::Heartbeat::new(Arc::new(ravel_ingest::SystemClock));
+            let heartbeat_task = heartbeat.spawn();
+            let listener = ravel_server::health_listener::HealthListener::bind(addr, heartbeat)?;
+            tracing::info!(health = %listener.local_addr(), "health listener bound");
+            Some((listener, heartbeat_task))
+        }
+        None => None,
+    };
+
     let running =
         ravel_server::start(config, store, store_background, store_metrics, cache).await?;
     tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
+    if let Some((listener, _)) = &health_listener {
+        listener.attach_readiness(running.readiness());
+    }
 
     wait_for_shutdown_signal().await;
     tracing::info!("shutdown signal received, draining");
@@ -579,6 +599,13 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = running.shutdown().await {
         tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
         return Err(err);
+    }
+    // Stopped after the drain so its `/readyz` reports 503 throughout it.
+    if let Some((listener, heartbeat_task)) = health_listener {
+        heartbeat_task.abort();
+        tokio::task::spawn_blocking(move || listener.shutdown())
+            .await
+            .context("health listener shutdown task failed")??;
     }
     tracing::info!("shutdown complete");
     // Flush the OTLP trace exporter AFTER draining (ADR-0060 decision 7): a
