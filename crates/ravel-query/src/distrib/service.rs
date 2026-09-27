@@ -2816,8 +2816,7 @@ mod reconstruct_tests {
         let failure = service
             .resolve_pinned(&[l0_identity()])
             .await
-            .err()
-            .expect("a missing commit record refuses the slice");
+            .expect_err("a missing commit record refuses the slice");
         assert_eq!(failure.code, pb::status::Code::Unsupported);
         let (calls, requests, bytes) = observer.totals();
         assert_eq!(calls, 1);
@@ -2842,8 +2841,7 @@ mod reconstruct_tests {
         service
             .resolve_pinned(std::slice::from_ref(identity))
             .await
-            .err()
-            .expect("the resolve must refuse")
+            .expect_err("the resolve must refuse")
     }
 
     /// A store fault that makes every record GET fail retryably.
