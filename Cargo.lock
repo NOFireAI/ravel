@@ -4881,6 +4881,7 @@ version = "0.18.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.23.0",
  "bytes",
  "crc32c",
  "futures",

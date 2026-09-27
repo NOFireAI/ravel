@@ -19,6 +19,14 @@ struct Entry {
     etag: Etag,
     version: Version,
     last_modified_unix_ms: i64,
+    /// CRC-32C of `data` as it was written, the oracle's stand-in for the
+    /// checksum S3 stores beside an object at upload (ADR-1696 decision 5).
+    /// Recorded on every write, not only when the caller supplied a
+    /// [`UploadChecksum`], because the real store computes one either way; a
+    /// full-object [`ObjectStoreBackend::get`] checks the bytes against it.
+    /// [`MemoryStore::corrupt_stored_byte`] is the only thing that can make the
+    /// two disagree.
+    stored_checksum: u32,
 }
 
 impl Entry {
@@ -63,6 +71,46 @@ impl MemoryStore {
     /// Advance the fake clock (tests exercising GC grace periods).
     pub fn set_clock_ms(&self, ms: u64) {
         self.clock_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Flip one bit of a stored object *without* touching the checksum recorded
+    /// when it was written: bit rot at rest, the corruption ADR-1696's read-side
+    /// verification exists to catch.
+    ///
+    /// This is the only way the oracle's stored bytes and stored checksum can
+    /// disagree, so it is what makes that verification testable. Nothing else
+    /// mutates an entry in place: a `put` rewrites the whole entry, checksum
+    /// included, which is a new object rather than a corrupted one, and is why
+    /// re-putting flipped bytes cannot stand in for this.
+    ///
+    /// `offset` is a byte index into the object and `bit` selects the bit
+    /// within it; both are checked, so a test cannot silently corrupt nothing.
+    /// Returns [`StoreError::NotFound`] for an absent key and
+    /// [`StoreError::InvalidRange`] for an offset past the object's end or a
+    /// bit index above 7.
+    pub fn corrupt_stored_byte(
+        &self,
+        key: &str,
+        offset: usize,
+        bit: u32,
+    ) -> Result<(), StoreError> {
+        if bit > 7 {
+            return Err(StoreError::InvalidRange(format!(
+                "bit {bit} is not a bit index of a byte"
+            )));
+        }
+        let mut objects = self.objects.write();
+        let entry = objects.get_mut(key).ok_or(StoreError::NotFound)?;
+        if offset >= entry.data.len() {
+            return Err(StoreError::InvalidRange(format!(
+                "offset {offset} of a {}-byte object",
+                entry.data.len()
+            )));
+        }
+        let mut bytes = entry.data.to_vec();
+        bytes[offset] ^= 1u8 << bit;
+        entry.data = Bytes::from(bytes);
+        Ok(())
     }
 
     fn next_id(&self) -> u64 {
@@ -238,6 +286,7 @@ impl ObjectStoreBackend for MemoryStore {
         }
         let id = self.next_id();
         let entry = Entry {
+            stored_checksum: crc32c(&data),
             data,
             etag: Etag(format!("mem-etag-{id}")),
             version: Version(format!("mem-v-{id}")),
@@ -254,6 +303,24 @@ impl ObjectStoreBackend for MemoryStore {
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        // Read-side verification (ADR-1696 decision 5), the oracle's form of
+        // what the S3 adapter does with the checksum S3 stored at upload: a
+        // full-object read is checked against the checksum recorded when the
+        // object was written, so bytes that changed at rest are refused with
+        // `Corrupted` instead of handed to a decoder. A ranged read is not
+        // checked, matching decision 4: the stored checksum covers the whole
+        // object and a slice cannot be compared against it.
+        if range == GetRange::Full {
+            let actual = crc32c(&entry.data);
+            if actual != entry.stored_checksum {
+                return Err(StoreError::Corrupted(format!(
+                    "get of {key}: stored crc32c {:08x} does not match {actual:08x} computed \
+                     over the {} stored bytes",
+                    entry.stored_checksum,
+                    entry.data.len()
+                )));
+            }
+        }
         Ok(GetOutcome {
             data: Self::slice(&entry.data, range)?,
             etag: entry.etag.clone(),

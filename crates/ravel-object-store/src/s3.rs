@@ -65,6 +65,23 @@
 //!   below. The multipart per-part path keeps only the local pre-flight: a
 //!   multipart `UploadPart` takes no `with_checksum_algorithm` value in this
 //!   client, and there is no whole-object digest to attach at `complete`.
+//! - **Read-side checksum verification is header-driven, and a whole-object
+//!   read is only verifiable when one response carried the whole object**
+//!   (ADR-1696 decisions 2 to 4). `object_store` 0.14's `GetResult` exposes no
+//!   response headers, so the stored `x-amz-checksum-*` is read in the HTTP
+//!   connector below the retry loop ([`connector`]) and handed back to
+//!   [`S3Store::get_one`] through a per-request slot. Two consequences a reader
+//!   should not have to rediscover. The request header that asks for the stored
+//!   checksum (`x-amz-checksum-mode: ENABLED`) must be signed, and the
+//!   connector runs after signing, so it rides on `ClientOptions`' default
+//!   headers instead --- which means it is attached to every request, not only
+//!   to GETs (see [`client_options`]). And [`GetRange::Full`] is served as
+//!   *bounded* ranged requests ([`S3Store::get_whole_object`]), so an object
+//!   above [`S3HttpConfig::max_request_body_bytes`] arrives in pieces that no
+//!   whole-object checksum covers: that read is counted on
+//!   [`S3Store::get_unverified`] rather than verified. Every commit-family
+//!   record is orders of magnitude below that bound, so it is always one
+//!   request and always verifiable.
 //! - **Multipart completion is unconditional.** `object_store` 0.14's
 //!   `put_multipart_opts` takes a `PutMultipartOptions` carrying tags,
 //!   attributes, and extensions --- no `PutMode` --- so no
@@ -90,6 +107,7 @@ use object_store::{
     MultipartUpload as OsMultipartUpload, ObjectStore, ObjectStoreExt, PutMode as OsPutMode,
     PutOptions as OsPutOptions, PutPayload, UpdateVersion,
 };
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
@@ -103,8 +121,11 @@ use credentials::FileCredentialProvider;
 mod instance_role;
 use instance_role::{DEFAULT_IMDS_ENDPOINT, InstanceRoleCredentialProvider};
 
-mod attempts;
-use attempts::AttemptCountingConnector;
+mod checksum;
+use checksum::{CHECKSUM_MODE_ENABLED, CHECKSUM_MODE_HEADER, ObservedChecksum};
+
+mod connector;
+use connector::{GetObservation, S3HttpConnector};
 
 use crate::instrument::{StoreMetrics, StoreOp};
 
@@ -762,7 +783,24 @@ impl Default for S3HttpConfig {
 /// `pool_max_idle_per_host` is deliberately left unset (no cap): hundreds of
 /// concurrent per-query fetches want a large warm pool, and an idle cap would
 /// force reconnect churn under exactly the load this deployment runs.
+///
+/// **`x-amz-checksum-mode: ENABLED` rides on the default headers** (ADR-1696
+/// decision 2), which is the only hook in `object_store` 0.14 that lands a
+/// header in the request *before* SigV4 signs it (`S3Client::request` and the
+/// GET path both apply `ClientOptions::get_default_headers` ahead of
+/// `with_aws_sigv4`). S3 requires every `x-amz-*` header to be signed, so the
+/// counting HTTP connector below the retry loop --- which sees the response
+/// headers and is where the verification itself lives --- cannot add it: a
+/// header inserted there would be unsigned and every request would fail
+/// `SignatureDoesNotMatch`. The hook is whole-client, so the header also rides
+/// on PUT, LIST, and DELETE, where it is meaningless and ignored; that is the
+/// cost of the only signed placement available.
 fn client_options(http: &S3HttpConfig) -> ClientOptions {
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(
+        HeaderName::from_static(CHECKSUM_MODE_HEADER),
+        HeaderValue::from_static(CHECKSUM_MODE_ENABLED),
+    );
     ClientOptions::new()
         .with_timeout(http.request_timeout)
         .with_connect_timeout(http.connect_timeout)
@@ -770,6 +808,7 @@ fn client_options(http: &S3HttpConfig) -> ClientOptions {
         .with_http2_keep_alive_interval(http.http2_keep_alive_interval)
         .with_http2_keep_alive_timeout(http.http2_keep_alive_timeout)
         .with_http2_keep_alive_while_idle()
+        .with_default_headers(default_headers)
 }
 
 /// S3 backend implementing [`ObjectStoreBackend`] over
@@ -811,6 +850,14 @@ pub struct S3Store {
     /// mode configured `object_store` to attach a server-verified checksum in
     /// [`S3Store::builder`], so the capability reports `true` truthfully.
     upload_integrity: UploadIntegrity,
+    /// Where this store records billed HTTP requests and
+    /// `ravel_store_get_unverified_total` (ADR-1696 decision 3). Always present:
+    /// the HTTP connector is always installed, because the read-side checksum
+    /// verification lives in it and a store without it could not verify
+    /// anything. A caller that supplied no handle gets a private one, readable
+    /// through [`S3Store::get_unverified`] but shared with nothing, so a
+    /// scrape path still sees only what it wired up.
+    metrics: Arc<StoreMetrics>,
 }
 
 impl S3Store {
@@ -838,8 +885,10 @@ impl S3Store {
     /// the same `Arc` to
     /// [`InstrumentedStore::with_metrics`](crate::InstrumentedStore::with_metrics)
     /// so `attempts` and `calls` share one snapshot. `new`/`with_http_config`
-    /// install no connector and record no attempts, byte-for-byte the historical
-    /// build path.
+    /// install the same connector over a *private* handle, so they record
+    /// attempts nowhere a caller can read them beyond this store's own
+    /// accessors; the connector itself is unconditional because the read-side
+    /// checksum verification (ADR-1696 decision 2) lives in it.
     pub fn with_metrics(config: S3Config, metrics: Arc<StoreMetrics>) -> Result<Self, StoreError> {
         Self::build(config, S3HttpConfig::default(), Some(metrics))
     }
@@ -853,27 +902,25 @@ impl S3Store {
         Self::build(config, http, Some(metrics))
     }
 
-    /// The shared build path. When `attempt_metrics` is `Some`, an
-    /// [`AttemptCountingConnector`] is installed so every HTTP request the
-    /// client issues is counted; when `None`, the default `object_store`
-    /// connector is used and no attempts are recorded.
+    /// The shared build path. [`S3HttpConnector`] is always installed: it
+    /// counts billed HTTP requests into `attempt_metrics` when a caller
+    /// supplied a handle (#928), and it is the only layer that sees a GET
+    /// response's `x-amz-checksum-*` header, which the read-side verification
+    /// needs (ADR-1696 decision 2). With no caller handle the attempts land in
+    /// a private one instead of nowhere.
     fn build(
         config: S3Config,
         http: S3HttpConfig,
         attempt_metrics: Option<Arc<StoreMetrics>>,
     ) -> Result<Self, StoreError> {
         let upload_integrity = http.upload_integrity;
-        let (mut builder, credential_provider, instance_role_provider) =
-            Self::builder(&config, &http)?;
-        // Count billed HTTP requests below `object_store`'s retry loop (#928).
-        // The connector wraps the default reqwest client and delegates unchanged,
-        // so this changes what is measured, never how a request runs; `retry`/
-        // `RetryConfig` stay at `object_store`'s defaults. Absent a sink, the
-        // default connector is used and no attempts are recorded.
-        if let Some(metrics) = attempt_metrics {
-            builder = builder.with_http_connector(AttemptCountingConnector::new(metrics));
-        }
+        let (builder, credential_provider, instance_role_provider) = Self::builder(&config, &http)?;
+        // The connector wraps the default reqwest client and delegates
+        // unchanged, so this changes what is observed, never how a request
+        // runs; `retry`/`RetryConfig` stay at `object_store`'s defaults.
+        let metrics = attempt_metrics.unwrap_or_default();
         let store = builder
+            .with_http_connector(S3HttpConnector::new(Arc::clone(&metrics)))
             .build()
             .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
         Ok(S3Store {
@@ -885,7 +932,28 @@ impl S3Store {
             multipart_abort_failures: AtomicU64::new(0),
             multipart_uploads_unreaped: AtomicU64::new(0),
             upload_integrity,
+            metrics,
         })
+    }
+
+    /// Value of `ravel_store_get_unverified_total` for this store: full-object
+    /// reads served without checking the body against a stored checksum
+    /// (ADR-1696 decision 3).
+    ///
+    /// A read counts here when the GET response carried no `x-amz-checksum-*`
+    /// header (an endpoint that stores no checksum, or ignored
+    /// `x-amz-checksum-mode`), when it carried a digest this adapter cannot
+    /// recompute (SHA-256, or a composite multipart digest), or when the object
+    /// was large enough that the whole-object read was split into bounded
+    /// ranged requests, none of which is the whole object a whole-object
+    /// checksum covers. Ranged reads the *caller* asked for never count: they
+    /// are outside the check by decision 4, not a gap in it.
+    ///
+    /// Reads the same counter [`StoreMetrics::get_unverified`] exposes, so a
+    /// store built with [`S3Store::with_metrics`] reports it both here and in
+    /// that handle's snapshot.
+    pub fn get_unverified(&self) -> u64 {
+        self.metrics.get_unverified()
     }
 
     /// Count of [`S3Config::credentials_file`] rotation attempts (a
@@ -1661,18 +1729,19 @@ impl S3Store {
         range: Option<OsGetRange>,
         if_match: Option<String>,
     ) -> Result<GetChunk, StoreError> {
-        let result = self
-            .store
-            .get_opts(
-                &path_of(key),
-                OsGetOptions {
-                    range,
-                    if_match,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(map_get_error)?;
+        // The observation slot is scoped to this one request, so the
+        // concurrently-polled ranged GETs of a split whole-object read do not
+        // overwrite each other's response headers.
+        let (result, observation) = connector::observe_get(self.store.get_opts(
+            &path_of(key),
+            OsGetOptions {
+                range,
+                if_match,
+                ..Default::default()
+            },
+        ))
+        .await;
+        let result = result.map_err(map_get_error)?;
         let etag = result
             .meta
             .e_tag
@@ -1687,7 +1756,29 @@ impl S3Store {
             data,
             etag,
             total_size,
+            observation,
         })
+    }
+
+    /// Read-side verification for one full-object read (ADR-1696 decisions 2
+    /// and 3): recompute the stored checksum over the bytes received, or count
+    /// the read unverified when there is nothing to recompute.
+    ///
+    /// `chunk` must be a response that carried the *entire* object; a caller
+    /// that assembled the object from several ranged responses has no
+    /// whole-object body to check and passes `None`, which counts unverified.
+    fn verify_full_read(&self, key: &str, chunk: Option<&GetChunk>) -> Result<(), StoreError> {
+        if let Some(chunk) = chunk
+            && let Some(observation) = chunk.observation.as_ref()
+            && observation.whole_object
+            && let ObservedChecksum::Verifiable(stored) = &observation.checksum
+        {
+            return stored.verify(key, &chunk.data);
+        }
+        // No checksum, one this adapter cannot recompute, or a body that is not
+        // the whole object: serve and count, never refuse (decision 3).
+        self.metrics.record_get_unverified();
+        Ok(())
     }
 
     /// [`GetRange::Full`] as bounded requests: complete-object semantics for
@@ -1728,6 +1819,7 @@ impl S3Store {
             // an unsatisfiable range here can only mean an empty object.
             Err(StoreError::InvalidRange(_)) => {
                 let whole = self.get_one(key, None, None).await?;
+                self.verify_full_read(key, Some(&whole))?;
                 return Ok(GetOutcome {
                     data: whole.data,
                     etag: Etag(whole.etag.clone()),
@@ -1740,6 +1832,9 @@ impl S3Store {
 
         let total_size = first.total_size;
         if first.data.len() as u64 >= total_size {
+            // One request carried the whole object, so the stored whole-object
+            // checksum applies to exactly these bytes.
+            self.verify_full_read(key, Some(&first))?;
             return Ok(GetOutcome {
                 data: first.data,
                 etag: Etag(first.etag.clone()),
@@ -1792,6 +1887,11 @@ impl S3Store {
                 data.len()
             )));
         }
+        // Assembled from several ranged responses: S3 returns the whole-object
+        // checksum, which no single response's body covers, so this read is
+        // unverified and says so (ADR-1696 decisions 3 and 4). It is counted
+        // once for the logical read, not once per chunk.
+        self.verify_full_read(key, None)?;
         Ok(GetOutcome {
             data: data.freeze(),
             etag: Etag(first.etag.clone()),
@@ -1809,6 +1909,10 @@ struct GetChunk {
     data: Bytes,
     etag: String,
     total_size: u64,
+    /// What the HTTP connector saw on this response: the stored checksum
+    /// header, and whether the body is the whole object (ADR-1696). `None` when
+    /// no response was observed at all, which counts as unverified.
+    observation: Option<GetObservation>,
 }
 
 #[async_trait::async_trait]
@@ -1819,7 +1923,7 @@ impl ObjectStoreBackend for S3Store {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
-        attempts::scope(StoreOp::Put, async move {
+        connector::scope(StoreOp::Put, async move {
             preflight_checksum(&data, opts.checksum)?;
             // Large payloads go out as a multipart upload, but only under
             // `Overwrite`: `object_store` 0.14 has no conditional
@@ -1911,7 +2015,7 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        attempts::scope(StoreOp::Get, async move {
+        connector::scope(StoreOp::Get, async move {
             let os_range = match range {
                 // The one request whose size the caller does not choose, so the one
                 // that has to be bounded here to stay inside
@@ -1942,7 +2046,7 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
-        attempts::scope(StoreOp::Head, async move {
+        connector::scope(StoreOp::Head, async move {
             let path = path_of(key);
             let meta = self.store.head(&path).await.map_err(map_error_common)?;
             map_meta(meta)
@@ -1951,7 +2055,7 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        attempts::scope(StoreOp::List, async move {
+        connector::scope(StoreOp::List, async move {
             let prefix_path = prefix_of(prefix);
             let mut stream = match &page {
                 Some(PageToken(after)) => {
@@ -1984,7 +2088,7 @@ impl ObjectStoreBackend for S3Store {
         start_after: Option<&str>,
         page: Option<PageToken>,
     ) -> Result<ListPage, StoreError> {
-        attempts::scope(StoreOp::List, async move {
+        connector::scope(StoreOp::List, async move {
             let prefix_path = prefix_of(prefix);
             // A page token resumes strictly after the previous page's last key;
             // on the first page `start_after` plays the same role. Both map to
@@ -2020,7 +2124,7 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        attempts::scope(StoreOp::ListDelimited, async move {
+        connector::scope(StoreOp::ListDelimited, async move {
             let prefix_path = prefix_of(prefix);
             let result = self
                 .store
@@ -2046,7 +2150,7 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        attempts::scope(StoreOp::Delete, async move {
+        connector::scope(StoreOp::Delete, async move {
             let path = path_of(key);
             match self.store.delete(&path).await {
                 Ok(()) => Ok(()),

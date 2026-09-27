@@ -57,6 +57,16 @@
 //!   billed request. `attempts` for `put` likewise counts every request a
 //!   multipart upload issues (create, each part, complete), not one per logical
 //!   `put`.
+//! - `get_unverified` (`ravel_store_get_unverified_total`) is a store-wide total,
+//!   not a per-op block: it counts full-object reads the S3 adapter served
+//!   without checking the body against a stored checksum, because the response
+//!   carried no `x-amz-checksum-*` header, carried one this adapter cannot
+//!   recompute, or arrived as several ranged responses none of which is the
+//!   whole object (ADR-1696 decision 3). Like `attempts`, it is recorded by the
+//!   adapter's HTTP connector's owner rather than by this decorator, through
+//!   [`StoreMetrics::record_get_unverified`]. Zero for a backend that is not the
+//!   S3 adapter. A non-zero and *growing* value against an endpoint that is
+//!   supposed to store checksums is the signal that it is dropping them.
 //! - `errors[class]` is indexed by [`StoreErrorClass`], one slot per
 //!   [`StoreError`] variant. `AlreadyExists` under `CreateIfAbsent` is a
 //!   protocol signal rather than a failure (ADR-0002), so a healthy commit
@@ -409,6 +419,10 @@ impl OpMetricsSnapshot {
 #[derive(Debug, Default)]
 pub struct StoreMetrics {
     ops: [OpMetrics; STORE_OP_COUNT],
+    /// `ravel_store_get_unverified_total`: full-object reads served without a
+    /// checksum check (ADR-1696 decision 3). Store-wide rather than per-op:
+    /// only `get` can move it, so a per-op block would be five permanent zeros.
+    get_unverified: AtomicU64,
 }
 
 impl StoreMetrics {
@@ -432,6 +446,22 @@ impl StoreMetrics {
     /// contend on the same field. See the [module docs](self).
     pub fn record_attempt(&self, op: StoreOp) {
         self.op(op).record_attempt();
+    }
+
+    /// Record one full-object read served without verifying it against a
+    /// stored checksum (`ravel_store_get_unverified_total`, ADR-1696
+    /// decision 3). The S3 adapter records this once per logical full-object
+    /// `get`, not once per HTTP request, so a large object split into several
+    /// bounded ranged requests counts one unverified read rather than one per
+    /// chunk. It touches no other counter.
+    pub fn record_get_unverified(&self) {
+        self.get_unverified.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current value of `ravel_store_get_unverified_total`, for a caller that
+    /// wants the one counter without taking a whole [`snapshot`](Self::snapshot).
+    pub fn get_unverified(&self) -> u64 {
+        self.get_unverified.load(Ordering::Relaxed)
     }
 
     /// Record one completed call from outside this module, using the same
@@ -461,6 +491,7 @@ impl StoreMetrics {
             list: self.op(StoreOp::List).snapshot(),
             list_delimited: self.op(StoreOp::ListDelimited).snapshot(),
             delete: self.op(StoreOp::Delete).snapshot(),
+            get_unverified: self.get_unverified.load(Ordering::Relaxed),
         }
     }
 }
@@ -476,6 +507,10 @@ pub struct StoreMetricsSnapshot {
     pub list: OpMetricsSnapshot,
     pub list_delimited: OpMetricsSnapshot,
     pub delete: OpMetricsSnapshot,
+    /// `ravel_store_get_unverified_total`: full-object reads the S3 adapter
+    /// served without checking the body against a stored checksum (ADR-1696
+    /// decision 3). Store-wide, not per-op; see the [module docs](self).
+    pub get_unverified: u64,
 }
 
 impl StoreMetricsSnapshot {

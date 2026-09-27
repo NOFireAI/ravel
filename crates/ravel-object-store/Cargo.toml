@@ -17,6 +17,10 @@ futures = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 crc32c = { workspace = true }
+# S3 returns a stored upload checksum base64-encoded in `x-amz-checksum-*`;
+# the read-side verification in crates/ravel-object-store/src/s3/checksum.rs
+# (ADR-1696 decision 2) decodes it before recomputing the digest.
+base64 = { workspace = true }
 # Serde derive for the durable `sys/qualification` record (ADR-0050 section 6),
 # relocated here from ravel-cli so ravel-server and ravel-cli share one
 # definition, and for S3Config::credentials_file's rotating-credentials JSON
