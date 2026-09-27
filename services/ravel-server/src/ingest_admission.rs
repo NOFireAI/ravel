@@ -37,15 +37,24 @@
 //! are unchanged: this is an ordering fix, so a refusal here is the same
 //! refusal, counted by the same
 //! `ravel_ingest_concurrency_shed_total`.
+//!
+//! Because the permit is now taken before the body arrives, it is held while
+//! the body is received, so both layers also bound that wait with
+//! [`INGEST_BODY_READ_TIMEOUT`]. Without the bound a client could hold every
+//! permit by sending request heads and then trickling their bodies.
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use ravel_query::http::TenantResolver;
 use ravel_types::TenantId;
 use tonic::Status;
@@ -86,6 +95,101 @@ const OTAP_ARROW_METRICS_PATH: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestPermitHeld;
 
+/// How long an admitted ingest request may take to deliver its whole body,
+/// counted from the moment its head was admitted. A request that has not
+/// finished by then is refused (408 on HTTP, `DEADLINE_EXCEEDED` on gRPC) and
+/// its permit returns to the ceiling.
+///
+/// 30 s is Prometheus' default `remote_timeout`, the most generous default
+/// deadline among the senders this ingests from (the OpenTelemetry
+/// Collector's OTLP exporters default to 5 s), so a sender still inside its
+/// own deadline is never cut off, and a 16 MiB body fits in it at about
+/// 4.5 Mbit/s.
+pub const INGEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The error a [`DeadlineBody`] yields once [`INGEST_BODY_READ_TIMEOUT`]
+/// passes. Callers never see it: the layer that installed the body replaces
+/// whatever response the body's reader built from it.
+#[derive(Debug)]
+struct BodyReadTimedOut;
+
+impl std::fmt::Display for BodyReadTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request body not received within {}s",
+            INGEST_BODY_READ_TIMEOUT.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for BodyReadTimedOut {}
+
+/// A request body that fails with [`BodyReadTimedOut`] if its last frame has
+/// not arrived by `deadline`, and records in `expired` that it did, so the
+/// layer that owns the permit can answer with the timeout status.
+struct DeadlineBody<B> {
+    inner: B,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    expired: Arc<AtomicBool>,
+}
+
+impl<B> DeadlineBody<B> {
+    fn new(inner: B, expired: Arc<AtomicBool>) -> Self {
+        DeadlineBody {
+            inner,
+            deadline: Box::pin(tokio::time::sleep(INGEST_BODY_READ_TIMEOUT)),
+            expired,
+        }
+    }
+}
+
+impl<B> HttpBody for DeadlineBody<B>
+where
+    B: HttpBody<Data = Bytes> + Unpin,
+    B::Error: Into<axum::BoxError>,
+{
+    type Data = Bytes;
+    type Error = axum::BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(frame) => Poll::Ready(frame.map(|frame| frame.map_err(Into::into))),
+            Poll::Pending => match this.deadline.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    this.expired.store(true, Ordering::SeqCst);
+                    Poll::Ready(Some(Err(Box::new(BodyReadTimedOut))))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// 408 for an HTTP ingest upload whose body did not arrive within
+/// [`INGEST_BODY_READ_TIMEOUT`].
+fn body_timeout_response() -> Response {
+    (StatusCode::REQUEST_TIMEOUT, BodyReadTimedOut.to_string()).into_response()
+}
+
+/// `DEADLINE_EXCEEDED` for a gRPC ingest export whose message did not arrive
+/// within [`INGEST_BODY_READ_TIMEOUT`].
+fn body_timeout_status() -> Status {
+    Status::deadline_exceeded(BodyReadTimedOut.to_string())
+}
+
 /// What the axum admission middleware needs from the state of whichever
 /// ingest surface it is wrapping: the shared ceiling and the tenant resolver.
 /// Implemented by `otlp_http::GatewayState` and
@@ -113,10 +217,12 @@ pub trait IngestAdmissionState: Send + Sync + 'static {
 /// The permit is bound for the whole of `next.run(...)`, so it covers the
 /// body read, the decode, and the durable write, and its RAII drop returns
 /// the slot on every exit path including a client disconnect that cancels
-/// this future.
+/// this future. The body read is bounded by [`INGEST_BODY_READ_TIMEOUT`]: a
+/// body still incomplete then fails the handler's body extractor, so the
+/// handler never runs, and the request is answered 408.
 pub async fn admit_ingest_request<S: IngestAdmissionState>(
     State(state): State<Arc<S>>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
     let _permit = match state.ingest_concurrency().try_admit() {
@@ -132,10 +238,17 @@ pub async fn admit_ingest_request<S: IngestAdmissionState>(
         }
     };
 
+    let expired = Arc::new(AtomicBool::new(false));
+    let mut request = request
+        .map(|body| axum::body::Body::new(DeadlineBody::new(body, expired.clone())));
     let extensions = request.extensions_mut();
     extensions.insert(IngestPermitHeld);
     extensions.insert(tenant);
-    next.run(request).await
+    let response = next.run(request).await;
+    if expired.load(Ordering::SeqCst) {
+        return body_timeout_response();
+    }
+    response
 }
 
 /// Takes the in-flight permit for a gRPC ingest request, unless
@@ -200,24 +313,43 @@ fn grpc_head_tenant(
 /// The ordering is the HTTP middleware's: the ceiling decides first, so a
 /// request over it is shed even when its credentials are also bad.
 ///
+/// An admitted unary export whose message has not fully arrived within
+/// [`INGEST_BODY_READ_TIMEOUT`] is refused `DEADLINE_EXCEEDED` and its permit
+/// released. The OTAP stream is not bounded this way: it holds no permit
+/// while it waits for a frame, and a stream is expected to stay open.
+///
 /// Install it on the same `Server::builder()` as
 /// [`crate::wire_byte_count::WireByteCountLayer`]; it wraps whichever
-/// services are added after, and passes every non-ingest path straight
-/// through.
+/// services are added after, and passes every other path straight through,
+/// including an ingest path whose service this listener does not register,
+/// so that path still answers tonic's `UNIMPLEMENTED`.
 #[derive(Clone)]
 pub struct GrpcIngestAdmissionLayer {
     controller: Arc<IngestConcurrencyController>,
     resolver: Arc<dyn TenantResolver>,
+    services: GrpcIngestServices,
+}
+
+/// Which ingest services the listener behind a [`GrpcIngestAdmissionLayer`]
+/// registers. The layer only claims the paths of the ones that are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrpcIngestServices {
+    /// The unary OTLP metrics, logs and traces export services.
+    pub otlp: bool,
+    /// The OTAP `ArrowMetricsService` stream.
+    pub otap: bool,
 }
 
 impl GrpcIngestAdmissionLayer {
     pub fn new(
         controller: Arc<IngestConcurrencyController>,
         resolver: Arc<dyn TenantResolver>,
+        services: GrpcIngestServices,
     ) -> Self {
         GrpcIngestAdmissionLayer {
             controller,
             resolver,
+            services,
         }
     }
 }
@@ -230,6 +362,7 @@ impl<S> Layer<S> for GrpcIngestAdmissionLayer {
             inner,
             controller: self.controller.clone(),
             resolver: self.resolver.clone(),
+            services: self.services,
         }
     }
 }
@@ -239,6 +372,7 @@ pub struct GrpcIngestAdmissionService<S> {
     inner: S,
     controller: Arc<IngestConcurrencyController>,
     resolver: Arc<dyn TenantResolver>,
+    services: GrpcIngestServices,
 }
 
 impl<S> Service<http::Request<TonicBody>> for GrpcIngestAdmissionService<S>
@@ -260,8 +394,9 @@ where
 
     fn call(&mut self, req: http::Request<TonicBody>) -> Self::Future {
         let path = req.uri().path();
-        let unary = path.starts_with(OTLP_UNARY_INGEST_PATH_PREFIX);
-        if !unary && path != OTAP_ARROW_METRICS_PATH {
+        let unary = self.services.otlp && path.starts_with(OTLP_UNARY_INGEST_PATH_PREFIX);
+        let otap = self.services.otap && path == OTAP_ARROW_METRICS_PATH;
+        if !unary && !otap {
             return Box::pin(self.inner.call(req));
         }
         let permit = if unary {
@@ -285,17 +420,26 @@ where
                 return Box::pin(async move { Ok(response) });
             }
         };
-        if permit.is_some() {
-            parts.extensions.insert(IngestPermitHeld);
-        }
         parts.extensions.insert(tenant);
+        if permit.is_none() {
+            return Box::pin(self.inner.call(http::Request::from_parts(parts, body)));
+        }
+        parts.extensions.insert(IngestPermitHeld);
+        let expired = Arc::new(AtomicBool::new(false));
+        let body = TonicBody::new(DeadlineBody::new(body, expired.clone()));
         let future = self.inner.call(http::Request::from_parts(parts, body));
         Box::pin(async move {
             // Held for the whole inner call: the body read, tonic's decode,
             // and the handler's durable write. Dropped when this future
             // finishes or is cancelled.
             let _permit = permit;
-            future.await
+            let response = future.await?;
+            // An expired body failed tonic's decode, so the handler never
+            // ran; answer with the timeout rather than the decode error.
+            if expired.load(Ordering::SeqCst) {
+                return Ok(body_timeout_status().into_http());
+            }
+            Ok(response)
         })
     }
 }
@@ -331,8 +475,13 @@ mod tests {
         )])))
     }
 
+    const ALL_INGEST_SERVICES: GrpcIngestServices = GrpcIngestServices {
+        otlp: true,
+        otap: true,
+    };
+
     fn layer(controller: &Arc<IngestConcurrencyController>) -> GrpcIngestAdmissionLayer {
-        GrpcIngestAdmissionLayer::new(controller.clone(), resolver())
+        GrpcIngestAdmissionLayer::new(controller.clone(), resolver(), ALL_INGEST_SERVICES)
     }
 
     /// The status a gRPC client decodes from a trailers-only refusal.

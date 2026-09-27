@@ -3146,12 +3146,22 @@ pub async fn start(
         // batch). It leaves every other service on this listener alone, and
         // no HTTP/2 stream cap is derived from the ingest ceiling: that
         // setting is per connection, so it would throttle the Flight SQL and
-        // fragment surfaces sharing the listener.
+        // fragment surfaces sharing the listener. It bounds a unary export's
+        // message wait by `INGEST_BODY_READ_TIMEOUT`, since the permit is
+        // held through it, and claims only the ingest paths registered here.
+        let grpc_ingest_services = ingest_admission::GrpcIngestServices {
+            otlp: metrics_service.is_some(),
+            #[cfg(feature = "otap")]
+            otap: arrow_metrics_service.is_some(),
+            #[cfg(not(feature = "otap"))]
+            otap: false,
+        };
         let grpc = tonic::transport::Server::builder()
             .layer(wire_byte_count::WireByteCountLayer)
             .layer(ingest_admission::GrpcIngestAdmissionLayer::new(
                 ingest_concurrency.clone(),
                 config.tenant_resolver.clone(),
+                grpc_ingest_services,
             ))
             .add_optional_service(metrics_service)
             .add_optional_service(logs_service)
