@@ -154,6 +154,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     series.
 ### Added
 
+- **`ObjectStoreBackend::get_pinned` reads an object only while it still has
+  the identity the catalog recorded, and `ravel-object-store` gains read-only
+  external stores per credential profile** (ADR-2040, issue #2065). A pinned
+  read asserts the recorded ETag (and the backend's version, when the store
+  issues one) on the wire and fails with `PreconditionFailed` when the object
+  was replaced; the default implementation refuses with the new
+  `Unsupported` error rather than falling back to an unconditional read.
+  `external::ExternalStore` opens one granted bucket per `ExternalProfile`
+  read-only, refusing every write with the new `ReadOnly` error and holding
+  only where its secrets live, never their values, and `external::probe`
+  qualifies a candidate bucket for preconditions and against being Ravel's
+  own bucket under another name. `ravel_cache::CacheKey::pinned` keys such an
+  object by profile, bucket, key, ETag, version and size. No shipping binary
+  reaches any of it yet; the callers are #2052, #2051 and #2054.
 - **`ravel-server` builds a read and a write CPU gate and reports their
   queueing on `/metrics`** (ADR-1702, issue #1702). A new crate,
   `ravel-cpu-gate`, holds the gate: a job at or above its inline floor

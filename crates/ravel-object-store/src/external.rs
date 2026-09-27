@@ -34,11 +34,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::{ObjectStore as OsObjectStore, ObjectStoreExt as _};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as OsPath;
 use object_store::{GetOptions as OsGetOptions, GetRange as OsGetRange};
+use object_store::{ObjectStore as OsObjectStore, ObjectStoreExt as _};
 use serde::Deserialize;
 
 use crate::s3::{S3AuthMode, S3Config, S3Store};
@@ -299,8 +299,10 @@ enum Backend {
 impl ExternalStore {
     /// Open `bucket` through `profile`, read-only.
     ///
-    /// Resolves the profile's secrets once, here, so an unreadable secret fails
-    /// at open rather than on the first read.
+    /// Resolves every [`SecretSource`] the profile carries once, here, so an
+    /// unreadable secret fails at open rather than on the first read. The GCS
+    /// service-account key file is the one credential Ravel does not read
+    /// itself: its path goes to `object_store`'s builder.
     pub fn open(
         profile: &ExternalProfile,
         bucket: &str,
@@ -326,9 +328,7 @@ impl ExternalStore {
                 *allow_http,
                 credentials,
             )?),
-            ExternalKind::Gcs { credentials } => {
-                Backend::Generic(open_gcs(bucket, credentials)?)
-            }
+            ExternalKind::Gcs { credentials } => Backend::Generic(open_gcs(bucket, credentials)?),
             ExternalKind::Azure {
                 account,
                 credentials,
@@ -377,7 +377,10 @@ fn open_s3(
             } => (
                 access_key_id.resolve()?,
                 secret_access_key.resolve()?,
-                session_token.as_ref().map(SecretSource::resolve).transpose()?,
+                session_token
+                    .as_ref()
+                    .map(SecretSource::resolve)
+                    .transpose()?,
                 None,
                 S3AuthMode::Static,
             ),
@@ -415,7 +418,10 @@ fn open_s3(
     Ok(S3Store::new(config)?)
 }
 
-fn open_gcs(bucket: &str, credentials: &GcsProfileCredentials) -> Result<GenericStore, ProfileError> {
+fn open_gcs(
+    bucket: &str,
+    credentials: &GcsProfileCredentials,
+) -> Result<GenericStore, ProfileError> {
     let builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
     let builder = match credentials {
         GcsProfileCredentials::ServiceAccount { path } => {
@@ -765,7 +771,11 @@ mod tests {
         assert_read_only(&err, "put of a/b");
 
         let err = store
-            .put("a/b", Bytes::from_static(b"x"), PutOptions::create_if_absent())
+            .put(
+                "a/b",
+                Bytes::from_static(b"x"),
+                PutOptions::create_if_absent(),
+            )
             .await
             .expect_err("a conditional put must be refused too");
         assert_read_only(&err, "put of a/b");
@@ -777,7 +787,10 @@ mod tests {
             .expect("multipart must be refused");
         assert_read_only(&err, "multipart upload of a/b");
 
-        let err = store.delete("a/b").await.expect_err("delete must be refused");
+        let err = store
+            .delete("a/b")
+            .await
+            .expect_err("delete must be refused");
         assert_read_only(&err, "delete of a/b");
     }
 
@@ -900,9 +913,7 @@ mod tests {
             ExternalProfile {
                 name: "warehouse".to_string(),
                 kind: ExternalKind::Gcs {
-                    credentials: GcsProfileCredentials::ServiceAccount {
-                        path: path.clone(),
-                    },
+                    credentials: GcsProfileCredentials::ServiceAccount { path: path.clone() },
                 },
             },
             ExternalProfile {
@@ -948,7 +959,10 @@ mod tests {
         // `SecretSource`, so its own `Debug` is the only thing between that
         // path and a log line.
         let gcs = GcsProfileCredentials::ServiceAccount { path: path.clone() };
-        assert_eq!(format!("{gcs:?}"), "GcsCredentials(service_account, redacted)");
+        assert_eq!(
+            format!("{gcs:?}"),
+            "GcsCredentials(service_account, redacted)"
+        );
     }
 
     /// Resolving a missing secret fails, and the error names the kind of source
@@ -958,7 +972,7 @@ mod tests {
         let source = SecretSource::File {
             path: PathBuf::from(format!("/nonexistent/{MARKER}")),
         };
-        let err = source.resolve().err().expect("the file does not exist");
+        let err = source.resolve().expect_err("the file does not exist");
         assert!(matches!(
             err,
             ProfileError::SecretUnavailable { kind: "file" }
@@ -1016,8 +1030,7 @@ mod tests {
             e_tag: None,
             version: None,
         })
-        .err()
-        .expect("an object with no ETag cannot be pinned");
+        .expect_err("an object with no ETag cannot be pinned");
         assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
     }
 }

@@ -4717,7 +4717,11 @@ mod tests {
         for (name, store) in pinned_read_subjects() {
             let key = "pinned/exact";
             store
-                .put(key, Bytes::from_static(b"0123456789"), PutOptions::default())
+                .put(
+                    key,
+                    Bytes::from_static(b"0123456789"),
+                    PutOptions::default(),
+                )
                 .await
                 .expect("put");
             let pin = pin_of(store.as_ref(), key).await;
@@ -4743,7 +4747,11 @@ mod tests {
         for (name, store) in pinned_read_subjects() {
             let key = "pinned/wrong";
             store
-                .put(key, Bytes::from_static(b"0123456789"), PutOptions::default())
+                .put(
+                    key,
+                    Bytes::from_static(b"0123456789"),
+                    PutOptions::default(),
+                )
                 .await
                 .expect("put");
             let pin = pin_of(store.as_ref(), key).await;
@@ -4800,13 +4808,21 @@ mod tests {
         for (name, store) in pinned_read_subjects() {
             let key = "pinned/overwritten";
             store
-                .put(key, Bytes::from_static(b"old-bytes!"), PutOptions::default())
+                .put(
+                    key,
+                    Bytes::from_static(b"old-bytes!"),
+                    PutOptions::default(),
+                )
                 .await
                 .expect("put the first version");
             let stale = crate::Pin::etag(pin_of(store.as_ref(), key).await.etag);
 
             store
-                .put(key, Bytes::from_static(b"new-bytes!"), PutOptions::default())
+                .put(
+                    key,
+                    Bytes::from_static(b"new-bytes!"),
+                    PutOptions::default(),
+                )
                 .await
                 .expect("overwrite");
 
