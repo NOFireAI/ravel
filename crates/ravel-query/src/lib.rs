@@ -24,18 +24,23 @@ pub mod span_fetcher;
 pub(crate) mod test_tracing;
 
 pub use config::{
-    ByteLimit, DEFAULT_BUDGET_REFERENCE_SHARDS, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY,
+    ALERT_DELIVERY_SLACK, BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, ByteLimit,
+    DEFAULT_BUDGET_REFERENCE_SHARDS, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY,
     DEFAULT_LOG_MAX_FETCH_RUN_BYTES, DEFAULT_MAX_SAMPLES, DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES,
-    EngineConfig, EngineConfigError, LATENCY_FIRST_MEASURED_CONCURRENCY, LogsFetchPolicy,
-    REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH, RequestLimit, ResolvedLogsFetch,
-    derive_max_s3_requests, resolve_logs_fetch,
+    EngineConfig, EngineConfigError, FOLD_STALL_ALERT_FOR, LATENCY_FIRST_MEASURED_CONCURRENCY,
+    LogsFetchPolicy, MAX_REQUESTS_PER_UNSEALED_FLUSH, REFERENCE_CLOCK_SKEW_ALLOWANCE,
+    REFERENCE_FOLD_SAFETY_MARGIN, REFERENCE_MAX_FLUSH_LIFETIME, REQUEST_BUDGET_FIXED_OVERHEAD,
+    REQUESTS_PER_UNSEALED_FLUSH, RequestBudgetParts, RequestLimit, ResolvedLogsFetch, SealMargin,
+    covered_span, derive_max_s3_requests, derive_max_s3_requests_for, healthy_tail_max,
+    request_budget_parts, resolve_logs_fetch,
 };
 pub use engine::{
     Coverage, LiveQueryAccounting, QueryEngine, QueryStats, snapshot_erasure_predicates,
 };
 pub use error::QueryError;
 pub use fetcher::{
-    CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, ReadCache,
+    CacheFetchError, DEFAULT_WHOLE_OBJECT_THRESHOLD, FetchError, FetchStats, FetchedSeries,
+    FetchedSeriesSoa, MAX_GETS_PER_L0_SEGMENT_FETCH, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache,
     SamplePriority, SegmentFetcher,
 };
 pub use limiter::{GetLimiter, GetLimiterClosed};

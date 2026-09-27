@@ -149,7 +149,8 @@ count, plus the fixed overhead, with an explicit `--max-s3-requests` used
 verbatim. At 4 shards and a 2 s flush cadence the derived default goes from
 15,800 to 47,300 requests.
 (The ADR-1306 measured-cost amendment below sets the factor at 2, its measured
-value, which makes that default 89,600.)
+value, which makes that default 89,600. The ADR-1306 flush-ceiling amendment
+below budgets 8 per flush instead, which makes it 343,400.)
 
 The first Consequences bullet held only for one hour of unsealed data. Under
 ADR-1306 the claim becomes: no query is refused for fold lag before the
@@ -178,3 +179,22 @@ requests, not 47,300. The figure is a measured cost for unsealed segments at
 or under the fetcher's 512 KiB whole-object threshold, not an upper bound
 above it. ADR-1306's "Amendment (2026-09-26)" carries the recomputed figures,
 the above-threshold cost and what follow-up task 2 must decide about it.
+(The ADR-1306 flush-ceiling amendment below records that decision: 89,600 is
+superseded by 343,400.)
+
+## Amendment (ADR-1306 flush-ceiling amendment, 2026-09-27): each unsealed flush is budgeted at 8
+
+<!-- amendment-applies: sections="Amendment (ADR-1306, 2026-09-26): the budget covers the unsealed tail and the fold-stall alert window|Amendment (ADR-1306 measured-cost amendment, 2026-09-26): REQUESTS_PER_UNSEALED_FLUSH is 2" pointer="ADR-1306 flush-ceiling amendment" -->
+
+ADR-1306 follow-up task 2 left unsealed flush size uncapped, as the project
+owner decided on issue #1306, and sized the per-flush factor for flushes above
+the 512 KiB whole-object threshold instead. The fetcher now issues at most 4
+page-range GETs per L0 segment fetch, so one fetch costs at most 7 GETs and one
+unsealed flush at most 8 requests per selector fetch, its commit-record GET
+included. The factor is 8, and at 4 shards and a 2 s flush cadence the derived
+default is `ceil(14,100 / 2) x 8 x 3/2 x 4 + 5,000` = 343,400 requests, not
+89,600. The shape of decision 1 is still unchanged. The factor covers one
+selector per signal lane: an N-selector query can spend up to `1 + 7N` per
+flush, which the budget does not scale for. ADR-1306's
+"Amendment (2026-09-27)" carries the measurement, the recomputed figures, the
+byte cost of the page-range bound and that gap.

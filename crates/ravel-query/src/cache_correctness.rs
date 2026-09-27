@@ -763,7 +763,7 @@ async fn corrupted_page_hit_behind_clean_footer_fails_closed() {
         .expect("uncached fetch");
     truth.sort_by_key(|s| s.series_id.0);
 
-    // Recompute the exact byte range `fetch_scalar_pages` will plan for the
+    // Recompute the exact byte range `fetch_pages` will plan for the
     // scalar run's VAL page, by decoding the catalog and re-running
     // `plan_ranges_v4` and `coalesce_ranges` the same way the fetcher itself
     // does (reading the object directly from the store, bypassing the
