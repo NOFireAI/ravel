@@ -8,6 +8,7 @@
 pub mod catalog;
 pub mod cli_profiling;
 pub mod erase;
+pub mod export;
 pub mod gc_config;
 pub mod hold;
 pub mod idem;
@@ -86,11 +87,140 @@ pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
     }
 }
 
+/// Parse an `export --max-ingest-lag` value into nanoseconds.
+///
+/// Same humantime grammar as [`parse_max_flush_lifetime_ns`], naming the flag
+/// it belongs to in its errors. It mirrors ravel-server's `--max-ingest-lag`,
+/// whose parser lives in a crate ravel-cli does not depend on at build time,
+/// so the grammar is matched here rather than shared. Zero is refused, as the
+/// server refuses it: no deployment runs with a zero lag, so a zero here could
+/// only resolve a window no server's own queries resolve. Negative
+/// values are unrepresentable in humantime, so the other rejections are an
+/// unparseable spelling and a value too large for `i64` nanoseconds.
+pub fn parse_max_ingest_lag_ns(s: &str) -> Result<i64, String> {
+    let dur =
+        humantime::parse_duration(s).map_err(|e| format!("invalid --max-ingest-lag '{s}': {e}"))?;
+    if dur.is_zero() {
+        return Err(format!(
+            "--max-ingest-lag '{s}' must be a positive duration: ravel-server refuses a zero \
+             lag, so no deployment's queries resolve the window a zero lag would"
+        ));
+    }
+    i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-ingest-lag '{s}' is too large"))
+}
+
+/// Parse an `export --start`/`--end` value: an RFC 3339 timestamp with any
+/// offset, to nanoseconds since the Unix epoch.
+///
+/// `chrono` is not a workspace dependency, and `humantime::parse_rfc3339`
+/// accepts only a UTC designator (`Z` or `+00:00`). So the offset is split off
+/// here, the local date-time is parsed by humantime as if it were UTC, and the
+/// offset is subtracted: `2026-01-02T05:04:05+02:00` is
+/// `2026-01-02T03:04:05Z`. Fractional seconds are kept. An instant before the
+/// Unix epoch is rejected, since `export`'s window has no use for one.
+pub fn parse_rfc3339_ns(s: &str) -> Result<i64, String> {
+    let invalid = |why: &dyn std::fmt::Display| format!("invalid RFC 3339 timestamp '{s}': {why}");
+    let (local, offset_secs) = split_rfc3339_offset(s)
+        .ok_or_else(|| invalid(&"expected a trailing `Z` or a `+HH:MM`/`-HH:MM` offset"))?;
+    let system_time = humantime::parse_rfc3339(&format!("{local}Z")).map_err(|e| invalid(&e))?;
+    let too_far = || format!("timestamp '{s}' is too far in the future");
+    let local_ns = match system_time.duration_since(UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).map_err(|_| too_far())?,
+        Err(before) => -i128::try_from(before.duration().as_nanos()).map_err(|_| too_far())?,
+    };
+    let utc_ns = local_ns - i128::from(offset_secs) * 1_000_000_000;
+    if utc_ns < 0 {
+        return Err(format!("timestamp '{s}' is before the Unix epoch"));
+    }
+    i64::try_from(utc_ns).map_err(|_| too_far())
+}
+
+/// Split an RFC 3339 timestamp into its local date-time and its offset east
+/// of UTC in seconds. `Z`/`z` is offset zero; otherwise the last six
+/// characters must be `+HH:MM` or `-HH:MM` with `HH` at most 23 and `MM` at
+/// most 59. `None` for anything else.
+fn split_rfc3339_offset(s: &str) -> Option<(&str, i64)> {
+    if let Some(local) = s.strip_suffix(['Z', 'z']) {
+        return Some((local, 0));
+    }
+    let at = s.len().checked_sub(6)?;
+    let (local, offset) = (s.get(..at)?, s.get(at..)?);
+    let &[sign, h1, h2, b':', m1, m2] = offset.as_bytes() else {
+        return None;
+    };
+    let digit = |b: u8| b.is_ascii_digit().then(|| i64::from(b - b'0'));
+    let hours = digit(h1)? * 10 + digit(h2)?;
+    let minutes = digit(m1)? * 10 + digit(m2)?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let magnitude = hours * 3600 + minutes * 60;
+    match sign {
+        b'+' => Some((local, magnitude)),
+        b'-' => Some((local, -magnitude)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// 2026-01-02T03:04:05Z in nanoseconds since the Unix epoch.
+    const T_UTC_NS: i64 = 1_767_323_045_000_000_000;
+
+    /// A UTC timestamp parses exactly, in each UTC spelling RFC 3339 allows.
+    #[test]
+    fn parse_rfc3339_ns_reads_utc_exactly() {
+        for utc in [
+            "2026-01-02T03:04:05Z",
+            "2026-01-02T03:04:05z",
+            "2026-01-02T03:04:05+00:00",
+            "2026-01-02T03:04:05-00:00",
+        ] {
+            assert_eq!(parse_rfc3339_ns(utc), Ok(T_UTC_NS), "{utc}");
+        }
+        assert_eq!(
+            parse_rfc3339_ns("2026-01-02T03:04:05.000000123Z"),
+            Ok(T_UTC_NS + 123)
+        );
+    }
+
+    /// A numeric offset is converted to UTC: `05:04:05+02:00` and
+    /// `22:34:05-04:30` of the previous day are both `03:04:05Z`, and the
+    /// fractional seconds survive the conversion.
+    #[test]
+    fn parse_rfc3339_ns_converts_a_numeric_offset_to_utc() {
+        assert_eq!(parse_rfc3339_ns("2026-01-02T05:04:05+02:00"), Ok(T_UTC_NS));
+        assert_eq!(parse_rfc3339_ns("2026-01-01T22:34:05-04:30"), Ok(T_UTC_NS));
+        assert_eq!(
+            parse_rfc3339_ns("2026-01-02T05:04:05.5+02:00"),
+            Ok(T_UTC_NS + 500_000_000)
+        );
+    }
+
+    /// A missing or malformed offset, an out-of-range offset, and an instant
+    /// that lands before the Unix epoch once converted are each a typed `Err`.
+    #[test]
+    fn parse_rfc3339_ns_rejects_bad_offsets_and_pre_epoch_instants() {
+        for bad in [
+            "2026-01-02T03:04:05",
+            "2026-01-02T03:04:05+0200",
+            "2026-01-02T03:04:05+24:00",
+            "2026-01-02T03:04:05+02:60",
+            "2026-01-02T03:04:05*02:00",
+            "2026-01-02T03:04:05+2:00",
+            "",
+            "Z",
+        ] {
+            let err = parse_rfc3339_ns(bad).expect_err(bad);
+            assert!(err.contains("invalid RFC 3339"), "{bad}: {err}");
+        }
+        let err = parse_rfc3339_ns("1970-01-01T00:30:00+01:00").expect_err("pre-epoch");
+        assert!(err.contains("before the Unix epoch"), "{err}");
+    }
 
     /// `--max-flush-delay` parses humantime and returns an exact `Duration`
     /// (issue #801, deliverable 2's parse half).

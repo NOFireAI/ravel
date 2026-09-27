@@ -43,6 +43,15 @@ ravel-cache = { workspace = true }
 # already a workspace pin (ravel-otap/ravel-bench use it), adds no new external
 # crate.
 ravel-otlp = { workspace = true }
+# `export --signal logs` reads RLOG objects through the same fetch and
+# visibility layer the query path uses (`log_fetcher::LogSegmentFetcher`,
+# `erasure::snapshot_pending_erasure_predicates`), so a record excluded from a
+# query is excluded from an export. Was a dev-dependency here (the ADR-0089
+# reachability test builds a SqlExecutor's fetchers from it); promoted to a
+# normal dependency rather than reimplementing the ADR-0064 exclusion rules in
+# this crate, where a second copy could drift and resurrect erased data.
+# Workspace pin, no new external crate.
+ravel-query = { workspace = true }
 prost = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
@@ -110,10 +119,6 @@ tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 # `flight-sql` feature only gates the Flight transport), so no feature is
 # needed here.
 ravel-sql = { path = "../../crates/ravel-sql", version = "0.18.0" }
-# The reachability test builds a SqlExecutor's segment fetchers from ravel-query
-# (SegmentFetcher/LogSegmentFetcher/SpanSegmentFetcher); ravel-catalog is
-# already a normal dependency. Workspace pin, test construction only.
-ravel-query = { workspace = true }
 # build_sql_state's process_memory_budget argument (ADR-1170) needs an
 # Arc<MemoryBudget> at test call sites. Workspace pin, test construction only.
 ravel-memory = { workspace = true }
