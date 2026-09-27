@@ -62,6 +62,46 @@ not get a permit is shed immediately, never queued: HTTP 429 with
 `Retry-After`, gRPC `RESOURCE_EXHAUSTED`. Query, health, and `/metrics` are
 not covered.
 
+For OTLP metrics, logs and traces on both transports and for Remote Write,
+the permit is taken from the request head, before the request body is read or
+decoded, and the tenant credential is checked right after it in the same
+place: on the HTTP surfaces by a middleware layer that runs ahead of the body
+extractor, and on the gRPC OTLP services by a tower layer on the listener that
+runs before tonic reads a body frame. So a shed request costs this process the
+bytes of one request head, an unauthenticated caller cannot make it buffer a
+body or inflate a compressed one, and the ceiling bounds concurrent decode
+rather than following it. A refusal keeps its status and message:
+`RESOURCE_EXHAUSTED` for a shed, and `UNAUTHENTICATED` with "invalid or
+missing tenant credentials" for bad credentials on gRPC.
+
+Because the permit is taken before the body arrives, the ceiling counts
+concurrent uploads plus concurrent decodes and writes: a request holds its
+slot while its body is still being received. That wait is bounded by
+`INGEST_BODY_READ_TIMEOUT`, 30 seconds from admission (a fixed constant in
+`ingest_admission.rs`, not a flag). A body that has not fully arrived by then
+is refused with HTTP 408, or gRPC `DEADLINE_EXCEEDED` for a unary OTLP export,
+the handler never runs, and the slot returns to the ceiling, so a client that
+sends request heads and trickles the bodies can hold a slot for at most 30
+seconds each. 30 seconds is Prometheus' default `remote_timeout`, the most
+generous default deadline among the senders Ravel ingests from, so a sender
+inside its own deadline is not cut off; a 16 MiB body fits in it at about
+4.5 Mbit/s. The OTAP stream is not bounded this way: it holds no permit while
+it waits for a frame.
+
+The OTAP `ArrowMetricsService` stream differs. The same tower layer checks its
+tenant credential on the stream's request head, before any frame is read, but
+takes no permit there: OTAP takes one permit per `BatchArrowRecords`, after
+tonic has read and decoded that batch's protobuf frame (up to the 16 MiB
+message cap) and before its Arrow payloads are decompressed or decoded. An
+authenticated OTAP client over the ceiling therefore still costs one decoded
+frame per shed batch, which is answered with a `RESOURCE_EXHAUSTED` batch
+status and ends the stream.
+
+No HTTP/2 stream cap is derived from this ceiling:
+`SETTINGS_MAX_CONCURRENT_STREAMS` applies to a whole connection, and the gRPC
+listener also serves Flight SQL and fragment fetches, which keep their
+previous stream limits.
+
 Worst-case memory bound at the default: each in-flight request holds at most
 one decoded request body. The largest such body on any covered route is not
 Remote Write's 64 MiB post-decompression cap (`MAX_DECOMPRESSED_PAYLOAD_BYTES`)
