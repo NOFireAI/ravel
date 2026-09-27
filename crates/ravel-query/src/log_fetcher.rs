@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
-use crate::fetcher::ReadCache;
+use crate::fetcher::{MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache, bound_runs};
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
@@ -5319,7 +5319,20 @@ impl BlockRangeFetcher {
         // whole candidate blocks, so a narrow projection stays far below the
         // threshold even when every block survives, and an all-columns read of
         // every block reaches ~1.0 and takes the single GET.
-        let wanted_bytes: u64 = wanted.iter().map(|e| e.len).sum();
+        //
+        // Computed against the BRIDGED run set (ADR-2066 decision 1), not the
+        // raw `wanted` extents: bridging a projection down to
+        // `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs can itself push the byte
+        // count over the threshold, and the covering-read check must still
+        // apply after that bridging, not before it. Deliberately NOT filtered
+        // by what `asm` already covers (unlike `bounded_chunk_runs`): this
+        // query's own projected footprint against the object's size is what
+        // the crossover decides on, and an unrelated probe that already
+        // brought some or all of those bytes (a small object's suffix probe
+        // routinely covers the whole object) must not shrink that footprint,
+        // or an all-columns read of such an object would skip `covering_read`
+        // and its whole-object cache admission entirely.
+        let wanted_bytes: u64 = self.bridged_run_bytes(&wanted);
         let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
             // `wanted` is already owned (resolved above from the decoded skip
@@ -5387,9 +5400,9 @@ impl BlockRangeFetcher {
         }
 
         // The two front sections (STREAM_DIR/FIELD_DIR): one coalesced GET over
-        // their adjacent span (deliverable 4). On the narrow-projection path
-        // `place_and_decode_field_dir` already brought both, so this is a no-op
-        // there; on an all-columns v4 read it is the read's one front GET.
+        // their adjacent span (ADR-2066 decision 1). On the narrow-projection
+        // path `place_and_decode_field_dir` already brought both, so this is a
+        // no-op there; on an all-columns v4 read it is the read's one front GET.
         self.place_front_sections(
             seg_ref,
             tenant_hash,
@@ -5440,6 +5453,58 @@ impl BlockRangeFetcher {
         Ok((asm.into_bytes(), stats))
     }
 
+    /// The coalesced, already-covered-filtered, request-bounded byte ranges a
+    /// version-4 chunk fetch will actually issue for `wanted`: at most
+    /// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] runs, the metrics path's own
+    /// cap (ADR-2066 decision 1), bridging the smallest gaps first
+    /// ([`bound_runs`]) when coalescing leaves more runs than that. This
+    /// answers "what does this fetch still need to GET", so
+    /// [`fetch_chunk_ranges`](Self::fetch_chunk_ranges) is the only caller;
+    /// the coverage crossover in [`fetch_object_v4`] uses
+    /// [`bridged_run_bytes`](Self::bridged_run_bytes) instead, which answers
+    /// a different question and must not filter by `asm` coverage.
+    fn bounded_chunk_runs(&self, wanted: &[ByteExtent], asm: &ObjectAssembler) -> Vec<ByteExtent> {
+        let runs: Vec<(u64, u64)> = coalesce_byte_extents(wanted, self.effective_coalesce_gap())
+            .into_iter()
+            .filter(|r| !asm.covers(r.abs_start, r.abs_end()))
+            .map(|r| (r.abs_start, r.abs_end()))
+            .collect();
+        bound_runs(runs, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT)
+            .into_iter()
+            .map(|(start, end)| ByteExtent {
+                abs_start: start,
+                len: end - start,
+            })
+            .collect()
+    }
+
+    /// The coalesced, request-bounded byte total a version-4 chunk fetch
+    /// would need for `wanted` on its own, before subtracting whatever `asm`
+    /// already holds: at most [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] runs,
+    /// bridging the smallest gaps first ([`bound_runs`]) when coalescing
+    /// leaves more runs than that (ADR-2066 decision 1). Used only by the
+    /// coverage crossover in [`fetch_object_v4`]: that decision is about this
+    /// query's own projected footprint against the object's size, and must
+    /// not shrink just because an unrelated earlier read (a suffix probe, on
+    /// a small object, routinely covers the whole thing) already brought some
+    /// of those bytes -- an all-columns read must still take the crossover
+    /// and admit the object under `covering_read`'s own whole-object cache
+    /// key, or a second full read of the same object never gets a
+    /// whole-object cache hit.
+    /// [`bounded_chunk_runs`](Self::bounded_chunk_runs) answers the different
+    /// question of what an actual fetch still needs to GET, and keeps its own
+    /// `asm`-covers filter for that.
+    fn bridged_run_bytes(&self, wanted: &[ByteExtent]) -> u64 {
+        let runs: Vec<(u64, u64)> = coalesce_byte_extents(wanted, self.effective_coalesce_gap())
+            .into_iter()
+            .map(|r| (r.abs_start, r.abs_end()))
+            .collect();
+        bound_runs(runs, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT)
+            .into_iter()
+            .map(|(start, end)| end - start)
+            .sum()
+    }
+
     /// Fetch the coalesced page ranges into `asm`, every run concurrently,
     /// through the same [`cached_extent`](Self::cached_extent) path every other
     /// GET here takes: concurrent partitions striping one segment resolve the
@@ -5451,7 +5516,11 @@ impl BlockRangeFetcher {
     /// These are the BLOCKS-section data ranges, so `phase` is the read's
     /// [`ReadPhases::blocks`] and the WIRE bytes recorded here are the
     /// numerator of fetch amplification (#913). A run's coalescing holes are
-    /// included, because the store transferred them.
+    /// included, because the store transferred them, and so are any bytes a
+    /// gap bridged to hold the run count at
+    /// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] (ADR-2066 decision 1): those
+    /// bytes are real transfer too, reserved and charged the same as any
+    /// other run's.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_chunk_ranges(
         &self,
@@ -5465,12 +5534,13 @@ impl BlockRangeFetcher {
         stats: &mut BlockRangeStats,
     ) -> Result<(), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
-        let runs: Vec<ByteExtent> = coalesce_byte_extents(wanted, self.effective_coalesce_gap())
-            .into_iter()
-            // A run the probe already brought costs nothing: its bytes are in
-            // `asm` at the right offsets already.
-            .filter(|r| !asm.covers(r.abs_start, r.abs_end()))
-            .collect();
+        // A run the probe already brought costs nothing: its bytes are in
+        // `asm` at the right offsets already. Bounding to at most
+        // `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs happens AFTER that filter,
+        // per ADR-2066 decision 1: an already-covered run should never count
+        // against the cap or force a bridge a genuinely uncovered run set
+        // would not have needed.
+        let runs: Vec<ByteExtent> = self.bounded_chunk_runs(wanted, &*asm);
         // Reserve the transient wire buffers the coalesced runs materialize
         // before `join_all` issues a GET (ADR-1170 decision 2): a refusal fails
         // typed with zero GETs. Held to the end of this call, covering the
@@ -5632,10 +5702,14 @@ impl BlockRangeFetcher {
     /// a byte volume that is a rounding error against one request cost; presenting
     /// them together to one GET removes one whole request per object. A section
     /// already resident (an earlier call, or a footer that omits one of the two)
-    /// costs nothing, and the span then covers only whichever remains. Counts one
-    /// [`BlockRangeStats::metadata_gets`] when it fetches, never a `probe_miss`
-    /// (the front is unreachable by any probe, so counting it there would put a
-    /// floor under that metric -- see the `probe_misses` field doc).
+    /// costs nothing, and the span then covers only whichever remains. A section
+    /// resident in the shared read cache under its OWN per-section key (a plan
+    /// read that fetched it alone) is also served from there and dropped from
+    /// the span, so a scan never re-fetches live bytes the plan phase already
+    /// cached under a narrower key. Counts one [`BlockRangeStats::metadata_gets`]
+    /// when it fetches, never a `probe_miss` (the front is unreachable by any
+    /// probe, so counting it there would put a floor under that metric -- see
+    /// the `probe_misses` field doc).
     #[allow(clippy::too_many_arguments)]
     async fn place_front_sections(
         &self,
@@ -5649,8 +5723,7 @@ impl BlockRangeFetcher {
         stats: &mut BlockRangeStats,
     ) -> Result<(), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
-        let mut start = u64::MAX;
-        let mut end = 0u64;
+        let mut missing: Vec<SectionDesc> = Vec::new();
         for k in [kind::STREAM_DIR, kind::FIELD_DIR] {
             let Some(desc) = footer.section(k) else {
                 continue;
@@ -5658,12 +5731,29 @@ impl BlockRangeFetcher {
             if asm.covers(desc.offset, desc.offset + desc.len) {
                 continue;
             }
-            start = start.min(desc.offset);
-            end = end.max(desc.offset + desc.len);
+            // A section already resident under its OWN per-section cache key
+            // (an earlier plan-phase read that fetched it alone, e.g.
+            // `plan_section_raw`'s FIELD_DIR read) is placed straight from
+            // the cache instead of being folded into the combined span
+            // below: asking for the wider span uses a different cache key
+            // and would re-fetch live bytes the cache already holds.
+            if let Some(cache) = &self.cache {
+                let cache_key =
+                    CacheKey::new(tenant_hash.0, seg_ref.content_hash, desc.offset, desc.len);
+                if let Some(bytes) = cache.get(&cache_key).await {
+                    accounting.record_cache_hit();
+                    accounting.add_cache_bytes(bytes.len() as u64);
+                    asm.place(key, desc.offset, &bytes)?;
+                    continue;
+                }
+            }
+            missing.push(*desc);
         }
-        if start >= end {
+        if missing.is_empty() {
             return Ok(());
         }
+        let start = missing.iter().map(|d| d.offset).min().unwrap_or(0);
+        let end = missing.iter().map(|d| d.offset + d.len).max().unwrap_or(0);
         let (bytes, live) = self
             .cached_extent(
                 seg_ref,
@@ -5682,22 +5772,28 @@ impl BlockRangeFetcher {
         asm.place(key, start, &bytes)
     }
 
-    /// Place FIELD_DIR into `asm` (via [`place_section`](Self::place_section), on
-    /// its own per-section cache key, so a subset scan reuses the FIELD_DIR the
-    /// plan phase already cached under that key) and decode it, so the caller can
-    /// resolve a query's prune-only NumRange arms and its projection to this
-    /// object's own column ids before the candidate set is chosen.
+    /// Place FIELD_DIR (and, when not already resident, STREAM_DIR alongside
+    /// it in the same GET -- ADR-2066 decision 1) into `asm` and decode
+    /// FIELD_DIR, so the caller can resolve a query's prune-only NumRange arms
+    /// and its projection to this object's own column ids before the
+    /// candidate set is chosen.
     ///
-    /// STREAM_DIR is deliberately NOT coalesced in here: this runs BEFORE the
-    /// coverage crossover, and a query that then crosses over to a whole-object
-    /// read never needs STREAM_DIR, so bringing it eagerly would move directory
-    /// bytes the crossover discards. STREAM_DIR is instead brought by
-    /// [`place_front_sections`](Self::place_front_sections) after the crossover,
-    /// where -- with FIELD_DIR already resident -- it is the only remaining front
-    /// section and coalesces with nothing; on an all-columns read that skips this
-    /// method both front sections arrive cold there and coalesce into one GET.
-    /// FIELD_DIR is compressed as a whole section (docs/log-segment-format.md),
-    /// the same shape SKIP_IDX is decoded with just above.
+    /// Before ADR-2066 this fetched FIELD_DIR alone (via
+    /// [`place_section`](Self::place_section)), on the reasoning that a query
+    /// which later crosses over to a whole-object read never needs STREAM_DIR
+    /// fetched here at all. That left STREAM_DIR to
+    /// [`place_front_sections`](Self::place_front_sections), called once more
+    /// after the crossover decision -- a second GET whenever this path ran,
+    /// since FIELD_DIR was already resident and STREAM_DIR was the only
+    /// section left for it to coalesce with. Calling `place_front_sections`
+    /// here instead brings both sections in the one GET their adjacency
+    /// allows: a query that crosses over afterward reads STREAM_DIR bytes it
+    /// does not need, the same bridged-bytes-for-requests trade ADR-2066
+    /// makes for chunk runs, but a narrow projection of a one-row-group
+    /// object -- the case that never crosses over -- costs one front-section
+    /// GET instead of two. FIELD_DIR is compressed as a whole section
+    /// (docs/log-segment-format.md), the same shape SKIP_IDX is decoded with
+    /// just above.
     #[allow(clippy::too_many_arguments)]
     async fn place_and_decode_field_dir(
         &self,
@@ -5714,10 +5810,10 @@ impl BlockRangeFetcher {
         let desc = *footer
             .section(kind::FIELD_DIR)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing FIELD_DIR".into())))?;
-        self.place_section(
+        self.place_front_sections(
             seg_ref,
             tenant_hash,
-            &desc,
+            footer,
             phase,
             pin,
             asm,

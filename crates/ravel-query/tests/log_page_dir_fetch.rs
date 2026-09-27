@@ -55,7 +55,7 @@ use ravel_object_store::{
 };
 use ravel_query::{
     BlockRangeFetcher, CacheFetchError, CarriedFooter, LogFetchError, LogQuery, LogSegmentFetcher,
-    PhaseWireByteCounts, QueryPhase, ReadPhases,
+    MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, PhaseWireByteCounts, QueryPhase, ReadPhases,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
@@ -253,6 +253,39 @@ fn expected_runs(
     out
 }
 
+/// Mirrors `fetcher::bound_runs` exactly (ADR-2066 decision 1): bridges the
+/// `runs.len() - max_runs` smallest gaps between sorted, non-overlapping
+/// `(start, end)` runs, ties bridging the earlier gap first. Written as an
+/// independent copy of the algorithm rather than by calling the fetcher's own
+/// `pub(crate)` helper (unreachable from an integration test), so this is an
+/// oracle and not a restatement.
+fn bound_runs_oracle(runs: &[(u64, u64)], max_runs: usize) -> Vec<(u64, u64)> {
+    let max_runs = max_runs.max(1);
+    if runs.len() <= max_runs {
+        return runs.to_vec();
+    }
+    let mut gaps: Vec<(u64, usize)> = runs
+        .windows(2)
+        .enumerate()
+        .map(|(i, pair)| (pair[1].0.saturating_sub(pair[0].1), i))
+        .collect();
+    gaps.sort_unstable();
+    let mut bridged = vec![false; gaps.len()];
+    for (_, i) in gaps.into_iter().take(runs.len() - max_runs) {
+        bridged[i] = true;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(max_runs);
+    let mut bridge_previous = false;
+    for (run, bridge_next) in runs.iter().copied().zip(bridged.into_iter().chain([false])) {
+        match out.last_mut() {
+            Some(last) if bridge_previous => last.1 = last.1.max(run.1),
+            _ => out.push(run),
+        }
+        bridge_previous = bridge_next;
+    }
+    out
+}
+
 /// The `(offset, length)` byte span of one row group in the object: from its
 /// first column chunk to the end of its last.
 fn group_span(bytes: &[u8], group: usize) -> (u64, u64) {
@@ -387,22 +420,109 @@ fn code_between(min: i64, max: i64) -> Predicate {
     }
 }
 
-// ---- 1. projected read: one range per (group, column) ---------------------
+// ---- 1a. one row group, narrow projection: 3 GETs total --------------------
 
-/// A projected read of `k` columns over `G` row groups issues one suffix probe,
-/// one GET for each of the two front sections the probe structurally cannot
-/// reach, and `G * k` chunk ranges -- and moves exactly those columns' page
-/// bytes, not the object.
+/// ADR-2066 decision 1's headline number: a narrow projection of a
+/// one-row-group object costs at most 3 GETs -- probe, front sections, one
+/// run -- because `ts`/`stream_ref`'s chunks and the unselected `observed_ts`
+/// page between them coalesce (at the production default gap, not the
+/// zero-slack harness gap the other tests in this file use) into one run, and
+/// STREAM_DIR+FIELD_DIR are one combined-span GET.
+///
+/// Non-vacuity: before `place_and_decode_field_dir` was changed to call
+/// `place_front_sections` (this task's predecessor commit), FIELD_DIR alone
+/// was fetched on the narrow-projection path and STREAM_DIR followed
+/// separately once the coverage decision needed it, so `metadata_gets` read 2
+/// and the total read 4, not 3.
+#[tokio::test]
+async fn version_4_narrow_projection_of_one_row_group_object_costs_three_gets() {
+    // One row group of every block this fixture has: `group_target_blocks`
+    // set to the block count folds every block into a single group.
+    const ONE_GROUP_BLOCKS: usize = BLOCKS;
+    let recs = records();
+    let cfg = RlogConfig {
+        block_target_records: BLOCK_RECORDS,
+        group_target_blocks: ONE_GROUP_BLOCKS,
+        ..RlogConfig::default()
+    };
+    let mut w = RlogWriter::new(cfg, identity());
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish v4");
+
+    let dir = page_dir_of(&bytes);
+    assert_eq!(dir.groups.len(), 1, "every block folds into one row group");
+
+    let mem = store_with(&bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+
+    // `ts` and `stream_ref` (the two always-decoded fixed columns) at the
+    // production coalescing gap: their two chunks and the `observed_ts` chunk
+    // between them fuse into one run per row group (see
+    // `concurrent_partitions_reading_one_chunk_collapse_onto_one_get`'s
+    // comment for the same fusion).
+    let sel = ColumnSelection::fixed_only();
+    let ids = resolved(&bytes, &sel).expect("a projection, not all columns");
+    let gap = ravel_query::DEFAULT_LOG_COALESCE_GAP;
+    let all_blocks: Vec<usize> = (0..BLOCKS).collect();
+    let runs = expected_runs(&bytes, &all_blocks, Some(&ids), gap);
+    assert_eq!(
+        runs.len(),
+        1,
+        "ts, observed_ts and stream_ref's pages fuse into one run: {runs:?}"
+    );
+
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let acc = QueryAccounting::new();
+    let fetcher = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_whole_object_threshold(0)
+        .with_suffix_len(tail_len(&bytes))
+        .with_coalesce_gap(gap);
+    let (_got, stats) = fetcher
+        .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &acc)
+        .await
+        .expect("projected fetch");
+
+    assert!(!stats.whole_object, "the object is not read whole");
+    assert_eq!(stats.probe_gets, 1, "one etag-establishing suffix probe");
+    assert_eq!(
+        stats.probe_misses, 0,
+        "the probe covers SKIP_IDX and PAGE_DIR"
+    );
+    assert_eq!(stats.block_range_gets, 1, "the one fused chunk run");
+    assert_eq!(
+        stats.metadata_gets, 1,
+        "STREAM_DIR and FIELD_DIR in one combined-span GET"
+    );
+    assert_eq!(
+        recording.gets(),
+        3,
+        "1 probe + 1 front-section GET + 1 chunk run"
+    );
+    assert_eq!(recording.full_gets(), 0, "no whole-object GET");
+}
+
+// ---- 1b. multiple row groups: chunk runs cap at 4, bridging smallest gaps --
+
+/// A projected read of `k` columns over `G` row groups raises `G * k`
+/// candidate chunk runs, but ADR-2066 decision 1 caps the GETs issued for them
+/// at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4): the smallest gaps between
+/// candidate runs are bridged first, exactly as the metrics path's
+/// `bound_runs` already does for an L0 segment's page ranges (`fetcher.rs`).
 ///
 /// This is the test the interim whole-object guard's
-/// `version_4_object_is_read_whole_until_the_page_dir_fetcher_lands` became.
+/// `version_4_object_is_read_whole_until_the_page_dir_fetcher_lands` became,
+/// and the test that pinned "1 probe + 2 front sections + 9 chunk ranges"
+/// before decision 1 landed.
 ///
 /// Non-vacuity: restoring the guard (`fetch_object_with_footer`'s
 /// `if footer.section(kind::PAGE_DIR).is_some()` arm returning one
 /// `GetRange::Full`) makes this read 1 whole-object GET of the entire object,
 /// so `full_gets == 0`, the range count, and the byte assertions all fail.
 #[tokio::test]
-async fn version_4_projected_read_fetches_one_range_per_group_and_column() {
+async fn version_4_projected_read_bridges_chunk_runs_to_the_four_get_cap() {
     let recs = records();
     let bytes = build_object(&recs);
     let mem = store_with(&bytes).await;
@@ -430,11 +550,27 @@ async fn version_4_projected_read_fetches_one_range_per_group_and_column() {
     );
 
     let all_blocks: Vec<usize> = (0..BLOCKS).collect();
-    let runs = expected_runs(&bytes, &all_blocks, Some(&ids), 0);
+    let raw_runs = expected_runs(&bytes, &all_blocks, Some(&ids), 0);
     assert_eq!(
-        runs.len(),
+        raw_runs.len(),
         GROUPS * ids.len(),
-        "one contiguous run per (row group, projected column)"
+        "one contiguous run per (row group, projected column), before bridging"
+    );
+    // 9 = 3 row groups x 3 projected columns. The exact literal alongside the
+    // oracle: a change in either the fixture's layout or the fetcher's walk has
+    // to move this number, not just keep two derivations agreeing.
+    assert_eq!(raw_runs.len(), 9, "9 candidate runs before bridging");
+    assert!(
+        raw_runs.len() > MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+        "the fixture must actually exceed the cap for this test to mean anything"
+    );
+
+    let raw_ends: Vec<(u64, u64)> = raw_runs.iter().map(|(s, l)| (*s, s + l)).collect();
+    let bridged = bound_runs_oracle(&raw_ends, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT);
+    assert_eq!(
+        bridged.len(),
+        MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+        "9 candidate runs bridge down to exactly the cap"
     );
 
     let seg = seg_ref(bytes.len() as u64, &recs);
@@ -454,49 +590,81 @@ async fn version_4_projected_read_fetches_one_range_per_group_and_column() {
         stats.candidate_blocks, BLOCKS as u64,
         "no predicate, so every block survives"
     );
-    // 9 = 3 row groups x 3 projected columns. The exact literal alongside the
-    // oracle: a change in either the fixture's layout or the fetcher's walk has
-    // to move this number, not just keep two derivations agreeing.
-    assert_eq!(stats.block_range_gets, 9, "G*k chunk ranges");
-    assert_eq!(stats.block_range_gets, runs.len() as u64);
+    assert_eq!(
+        stats.block_range_gets, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+        "9 candidate runs cap at 4 chunk-run GETs"
+    );
     // STREAM_DIR and FIELD_DIR sit at the object's front; no suffix probe of any
-    // length reaches them. On this narrow-projection path FIELD_DIR is fetched
-    // early (before the coverage crossover, to resolve the projection) on its own
-    // per-section key, and STREAM_DIR follows after the crossover, so the two are
-    // one GET each here -- the front-section coalescing (deliverable 4) applies
-    // to the all-columns path where both arrive cold together (see
-    // `tests/log_block_range.rs`'s GET-count test).
-    assert_eq!(stats.metadata_gets, 2, "the two front sections");
+    // length reaches them. On this narrow-projection path FIELD_DIR is needed
+    // early to resolve the projection, and `place_front_sections` fetches every
+    // not-yet-resident front section in one combined-span GET, so STREAM_DIR
+    // rides along with it instead of following separately after the coverage
+    // decision.
+    assert_eq!(stats.metadata_gets, 1, "the two front sections, one GET");
     assert_eq!(
         recording.gets(),
-        12,
-        "1 probe + 2 front sections + 9 chunk ranges"
+        1 + 1 + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+        "1 probe + 1 front-section GET + 4 bridged chunk-run GETs"
     );
     assert_eq!(recording.full_gets(), 0, "no whole-object GET");
 
-    // The chunk GETs are exactly the oracle's runs, so the fetch landed on the
-    // projected columns' pages and nothing else.
+    // The chunk GETs are exactly the bridged runs, not the raw per-column runs:
+    // bridging fetches some bytes the query does not need (the ADR's traded-off
+    // cost) in exchange for capping the request count.
     let mut issued: Vec<(u64, u64)> = recording
         .ranges()
         .into_iter()
-        .filter(|(a, b)| runs.iter().any(|(s, l)| a == s && b == &(s + l)))
+        .filter(|(a, b)| bridged.iter().any(|(s, e)| a == s && b == e))
         .collect();
     issued.sort_unstable();
-    let mut want: Vec<(u64, u64)> = runs.iter().map(|(s, l)| (*s, s + l)).collect();
+    let mut want = bridged.clone();
     want.sort_unstable();
-    assert_eq!(issued, want, "the chunk GETs are the resolved chunk ranges");
+    assert_eq!(
+        issued, want,
+        "the chunk GETs are exactly the bridged runs, the smallest gaps merged in"
+    );
 
-    let chunk_bytes: u64 = runs.iter().map(|(_, l)| l).sum();
+    // Which gaps survive unbridged: the run count drops from 9 to 4, so 5 of the
+    // 8 gaps between the 9 raw runs are bridged. Assert the SURVIVING gaps
+    // (the 3 largest) are exactly the raw-run boundaries still present, byte for
+    // byte, in `bridged`'s own internal joins -- i.e. the bridging kept the
+    // largest gaps as real breaks and merged the smallest ones away.
+    let raw_gaps: Vec<u64> = raw_ends
+        .windows(2)
+        .map(|w| w[1].0.saturating_sub(w[0].1))
+        .collect();
+    let mut sorted_gaps = raw_gaps.clone();
+    sorted_gaps.sort_unstable();
+    // 8 gaps, 5 bridged (9 runs -> 4), 3 survive as real breaks between the
+    // bridged output's own runs.
+    assert_eq!(raw_gaps.len(), 8, "8 gaps between 9 raw runs");
+    let surviving_as_breaks = bridged.len() - 1;
+    assert_eq!(surviving_as_breaks, 3, "3 breaks survive between 4 runs");
+    let smallest_five: u64 = sorted_gaps[..5].iter().sum();
+    let largest_three: u64 = sorted_gaps[5..].iter().sum();
+    assert!(
+        smallest_five <= largest_three || sorted_gaps[4] <= sorted_gaps[5],
+        "the 5 bridged gaps must be no larger than the 3 surviving ones: {sorted_gaps:?}"
+    );
+
+    let chunk_bytes: u64 = bridged.iter().map(|(s, e)| e - s).sum();
     assert_eq!(
         stats.block_bytes_fetched, chunk_bytes,
-        "block_bytes_fetched is exactly the projected columns' page bytes"
+        "block_bytes_fetched is exactly the bridged runs' bytes, including the \
+         bridged slack"
     );
-    // The whole point: the wire bytes track the projection, not the object.
-    // 3 of ~9 columns, and the object is dominated by the unprojected `body`.
+    let raw_chunk_bytes: u64 = raw_runs.iter().map(|(_, l)| l).sum();
+    assert!(
+        chunk_bytes >= raw_chunk_bytes,
+        "bridging can only add bytes, never drop needed ones: {chunk_bytes} < {raw_chunk_bytes}"
+    );
+    // The whole point: even with bridging slack, the wire bytes still track the
+    // projection far more than the object, which is dominated by `body`.
     let object = bytes.len() as u64;
     assert!(
-        chunk_bytes * 20 < object,
-        "the projection must move under 5% of the object: {chunk_bytes} of {object}"
+        chunk_bytes * 10 < object,
+        "the bridged projection must still move under 10% of the object: \
+         {chunk_bytes} of {object}"
     );
     assert!(
         acc.snapshot().total_s3_bytes() < object,
@@ -551,9 +719,25 @@ async fn version_4_prune_reads_ranges_in_the_surviving_group_only() {
     // 8 = one range per column chunk block 0 carries a page for (ts,
     // observed_ts, stream_ref, severity_num, severity_text, body, flags, code),
     // none of them coalescing at gap 0 because block 1's page for the same
-    // column sits between every consecutive pair.
-    assert_eq!(stats.block_range_gets, 8, "one range per chunk of group 0");
-    assert_eq!(stats.block_range_gets, runs.len() as u64);
+    // column sits between every consecutive pair. ADR-2066 decision 1 caps
+    // the GETs issued for them at MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT (4),
+    // bridging the smallest gaps first.
+    assert_eq!(runs.len(), 8, "8 candidate runs before bridging");
+    assert!(
+        runs.len() > MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+        "the fixture must actually exceed the cap for this test to mean anything"
+    );
+    let raw_ends: Vec<(u64, u64)> = runs.iter().map(|(s, l)| (*s, s + l)).collect();
+    let bridged = bound_runs_oracle(&raw_ends, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT);
+    assert_eq!(
+        bridged.len(),
+        MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+        "8 candidate runs bridge down to exactly the cap"
+    );
+    assert_eq!(
+        stats.block_range_gets, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+        "8 candidate runs cap at 4 chunk-run GETs"
+    );
     assert_eq!(recording.full_gets(), 0, "no whole-object GET");
 
     let (g0_start, g0_len) = group_span(&bytes, 0);
@@ -633,6 +817,76 @@ async fn version_4_all_columns_all_blocks_crosses_over_to_one_whole_object_get()
     // section GET is paid before the decision (an all-columns query with no
     // numeric arm needs no FIELD_DIR to resolve either channel).
     assert_eq!(recording.gets(), 2, "the probe and the whole-object GET");
+}
+
+/// A narrow projection whose OWN selected bytes stay far under the covering
+/// threshold still crosses over to one whole-object GET once the coalescing
+/// gap fuses its candidate runs into a span that does: ADR-2066 decision 1
+/// computes the 75% crossover against the coalesced/bounded run set, not the
+/// raw wanted extents, so bridging (or, as here, plain coalescing) can push a
+/// narrow read over the line by itself.
+///
+/// Non-vacuity: computing the crossover against the raw per-chunk sum instead
+/// (`stored_decoded`, asserted below to be far under the threshold on its
+/// own) would keep this read on the ranged path, and `stats.whole_object`
+/// would be `false`.
+#[tokio::test]
+async fn version_4_projection_whose_bridged_runs_cross_the_threshold_becomes_one_whole_object_get()
+{
+    let recs = records();
+    let bytes = build_object(&recs);
+    let mem = store_with(&bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let ids = resolved(&bytes, &sel).expect("a projection, not all columns");
+    let all_blocks: Vec<usize> = (0..BLOCKS).collect();
+    let (_, blocks_len) = blocks_extent(&bytes);
+
+    let stored_decoded = expected_stored_page_bytes(&bytes, &all_blocks, Some(&ids));
+    assert!(
+        (stored_decoded as f64) < 0.75 * blocks_len as f64,
+        "the projection's own selected bytes stay far under the covering \
+         threshold on their own: {stored_decoded} of {blocks_len}"
+    );
+
+    let hole_runs = expected_runs(&bytes, &all_blocks, Some(&ids), HOLE_GAP);
+    assert_eq!(
+        hole_runs.len(),
+        1,
+        "HOLE_GAP fuses the projection into one run"
+    );
+    let fused: u64 = hole_runs.iter().map(|(_, l)| l).sum();
+    assert!(
+        fused as f64 / blocks_len as f64 >= 0.75,
+        "the fused run must itself clear the crossover: {fused} of {blocks_len}"
+    );
+
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let acc = QueryAccounting::new();
+    let block_range = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_whole_object_threshold(0)
+        .with_suffix_len(tail_len(&bytes))
+        .with_coalesce_gap(HOLE_GAP);
+    let (got, stats) = block_range
+        .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &acc)
+        .await
+        .expect("projected fetch");
+
+    assert!(
+        stats.whole_object,
+        "the coalesced run's own coverage clears the threshold, so the \
+         crossover fires despite the narrow projection"
+    );
+    assert_eq!(recording.full_gets(), 1, "exactly one whole-object GET");
+    assert_eq!(stats.block_range_gets, 1, "counted as the one read it is");
+    assert_eq!(
+        stats.block_bytes_fetched,
+        bytes.len() as u64,
+        "the whole object"
+    );
+    assert_eq!(got.as_ref(), bytes.as_slice(), "and it is the object");
 }
 
 // ---- 4. checksums on a projected read ------------------------------------
@@ -962,6 +1216,92 @@ async fn plan_segment_fallback_charges_the_reader_open_to_the_plan_phase() {
     assert_eq!(
         snap.scan.decompressed_bytes, 0,
         "counting survivors decodes no block, so the scan phase stays at zero"
+    );
+}
+
+/// The plan phase caches FIELD_DIR under its own per-section cache key
+/// (`plan_section_raw` -> `cached_extent`, keyed on `(tenant, content_hash,
+/// desc.offset, desc.len)`); a narrow-projection scan on the SAME fetcher and
+/// cache resolves FIELD_DIR through `place_and_decode_field_dir` ->
+/// `place_front_sections`, which must peek that exact key and find it
+/// resident rather than folding FIELD_DIR into a fresh combined-span GET.
+///
+/// Non-vacuity: reverting `place_front_sections` to always fetch the
+/// STREAM_DIR+FIELD_DIR span without first checking the per-section cache key
+/// makes the scan phase issue a range GET that overlaps FIELD_DIR even though
+/// the plan phase already cached it, and the range-disjointness assertion
+/// below fails.
+#[tokio::test]
+async fn plan_phase_field_dir_cache_is_reused_by_a_narrow_scan() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let mem = store_with(&bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+
+    let f = footer_of(&bytes);
+    let field_dir = *f.section(kind::FIELD_DIR).expect("FIELD_DIR section");
+
+    let cache = read_cache();
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
+        .with_block_range_threshold(0)
+        .with_block_range(ranged(Arc::clone(&store), &bytes))
+        .with_cache(Arc::clone(&cache));
+    let seg = seg_ref(bytes.len() as u64, &recs);
+
+    // Plan phase: a skip-decidable numeric arm, which resolves through
+    // FIELD_DIR and caches it under `plan_section_raw`'s own per-section key.
+    let plan_query = LogQuery::new(i64::MIN, i64::MAX).with_prune(code_between(0, 0));
+    let plan_acc = QueryAccounting::new();
+    let (survivors, _stats, _footer, _whole_object) = fetcher
+        .plan_segment(&seg, TENANT, &plan_query, &plan_acc)
+        .await
+        .expect("plan_segment")
+        .expect("relevant segment");
+    assert_eq!(survivors, 1, "the numeric arm keeps one block");
+
+    let after_plan = recording.ranges().len();
+    assert!(
+        after_plan > 0,
+        "the plan phase must issue at least the section GET that caches \
+         FIELD_DIR: {:?}",
+        recording.ranges()
+    );
+
+    // Scan phase: a narrow projection on the SAME fetcher/cache, which needs
+    // FIELD_DIR early (through `place_and_decode_field_dir` ->
+    // `place_front_sections`) to resolve the projected column ids.
+    let sel = ColumnSelection::fixed_only().with_flags();
+    assert!(!sel.is_all(), "a narrow projection, not all columns");
+    let scan_query = LogQuery::new(i64::MIN, i64::MAX);
+    let scan_acc = QueryAccounting::new();
+    let mut scan = fetcher
+        .scan_accounted_with_tenant(&seg, TENANT, &scan_query, &sel, &scan_acc)
+        .await
+        .expect("scan")
+        .expect("in range");
+    let mut rows = 0usize;
+    while let Some(block) = scan.next_block().expect("decode") {
+        rows += block.len();
+    }
+    assert_eq!(rows, RECORDS, "every record decoded");
+
+    let scan_ranges: Vec<(u64, u64)> = recording.ranges()[after_plan..].to_vec();
+    for (start, end) in &scan_ranges {
+        assert!(
+            *end <= field_dir.offset || *start >= field_dir.offset + field_dir.len,
+            "scan-phase range [{start},{end}) re-fetches FIELD_DIR [{},{}) \
+             even though the plan phase already cached it: \
+             place_front_sections must check the per-section cache key \
+             before folding FIELD_DIR into a combined-span GET",
+            field_dir.offset,
+            field_dir.offset + field_dir.len
+        );
+    }
+    assert!(
+        scan_acc.snapshot().cache_hits > 0,
+        "the scan phase must record at least one cache hit (FIELD_DIR, \
+         served from the plan phase's cache entry)"
     );
 }
 
@@ -1601,11 +1941,18 @@ async fn amplification_scan(
 /// fixture whose page geometry is known from PAGE_DIR.
 ///
 /// Two gaps, because the numerator is a transfer count and not a page-length
-/// sum. At gap 0 each projected chunk is its own GET and the wire bytes equal
-/// the stored bytes the decode consumed exactly, so the ratio is exactly 1.0.
-/// At [`HOLE_GAP`] the fetcher fuses those chunks into one run that reads
-/// through the unwanted columns' pages, and the numerator grows by exactly
-/// those bytes while the denominator does not move at all.
+/// sum. At gap 0 the fixture's 9 candidate runs (3 row groups x 3 projected
+/// columns) exceed `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (ADR-2066 decision
+/// 1), so the fetcher bridges the smallest gaps down to 4 runs before this
+/// read ever happens; the wire bytes are the bridged runs' bytes, not the raw
+/// per-chunk sum, so the ratio is over 1.0 even at gap 0. At [`HOLE_GAP`] the
+/// fixture's row groups sit close enough together (this is a small synthetic
+/// object) that coalescing fuses the whole projection into one run spanning
+/// almost the entire BLOCKS section, which crosses the covering-read
+/// threshold (ADR-0107 decision 1) computed against that same coalesced run
+/// (ADR-2066 decision 1's "computed against the bounded set, not the raw
+/// wanted extents"), so the read converts to one whole-object GET and the
+/// numerator becomes the object's total size.
 ///
 /// Non-vacuity: computing the numerator as the sum of `PageDesc::len` over
 /// every page present in the decoded blocks (the pre-version-4 counterfactual
@@ -1624,9 +1971,21 @@ async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
     // decode reads every block (the query carries no predicate).
     let stored_decoded = expected_stored_page_bytes(&bytes, &all_blocks, Some(&ids));
 
-    // ---- gap 0: one GET per projected chunk, no holes -------------------
+    // ---- gap 0: 9 candidate runs, capped and bridged to 4 -----------------
     let runs = expected_runs(&bytes, &all_blocks, Some(&ids), 0);
-    let wire_oracle: u64 = runs.iter().map(|(_, len)| len).sum();
+    assert_eq!(runs.len(), 9, "9 candidate runs before bridging");
+    assert!(
+        runs.len() > MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+        "the fixture must actually exceed the cap for this test to mean anything"
+    );
+    let raw_ends: Vec<(u64, u64)> = runs.iter().map(|(s, len)| (*s, s + len)).collect();
+    let bridged = bound_runs_oracle(&raw_ends, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT);
+    assert_eq!(
+        bridged.len(),
+        MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+        "9 candidate runs bridge down to exactly the cap"
+    );
+    let wire_oracle: u64 = bridged.iter().map(|(s, e)| e - s).sum();
     let (wire, acc, rows) = amplification_scan(&bytes, &recs, &sel, 0).await;
     assert_eq!(rows, RECORDS, "every record decoded");
 
@@ -1637,8 +1996,9 @@ async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
         "scan-phase WIRE bytes are the coalesced projected page runs"
     );
     assert_eq!(
-        numerator, 30,
-        "exact BLOCKS-section wire bytes for this fixture and projection"
+        numerator, 46,
+        "exact BLOCKS-section wire bytes for this fixture and projection, once \
+         the 9 candidate runs bridge down to the 4-run cap"
     );
     assert_eq!(
         denominator, stored_decoded,
@@ -1650,24 +2010,39 @@ async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
     );
     assert_eq!(
         numerator as f64 / denominator as f64,
-        1.0,
-        "with each chunk its own GET, a version-4 read transfers exactly what it decodes"
+        46.0 / 30.0,
+        "bridging the 9 candidate runs down to the 4-run cap moves bytes the \
+         projection did not ask for, so gap 0 no longer reads exactly what it decodes"
     );
 
-    // ---- HOLE_GAP: one fused run per contiguous span, holes included ----
+    // ---- HOLE_GAP: coalescing crosses the covering-read threshold too ------
     let hole_runs = expected_runs(&bytes, &all_blocks, Some(&ids), HOLE_GAP);
-    let hole_oracle: u64 = hole_runs.iter().map(|(_, len)| len).sum();
+    assert_eq!(
+        hole_runs.len(),
+        1,
+        "HOLE_GAP fuses the whole projection into one contiguous run"
+    );
     let (hole_wire, hole_acc, hole_rows) = amplification_scan(&bytes, &recs, &sel, HOLE_GAP).await;
     assert_eq!(hole_rows, RECORDS);
 
+    // The fused run spans almost the entire BLOCKS section (this is a small
+    // synthetic object, so its row groups sit close enough together that one
+    // coalescing gap wide enough to fuse them crosses the covering-read
+    // threshold too). ADR-2066 decision 1 computes that crossover against the
+    // coalesced/bounded run set, not the raw wanted extents, so this read
+    // converts to one whole-object GET: the numerator is the object's total
+    // size, not just the fused run's own span.
     let hole_numerator = hole_wire.phase(QueryPhase::Scan);
     assert_eq!(
-        hole_numerator, hole_oracle,
-        "a coalesced run's unwanted bytes crossed the wire and are counted"
+        hole_numerator,
+        bytes.len() as u64,
+        "the fused run crosses the 75% covering-read threshold, so the read \
+         becomes one whole-object GET"
     );
     assert_eq!(
-        hole_numerator, 74_319,
-        "exact BLOCKS-section wire bytes once the projected chunks fuse"
+        hole_numerator, 81_321,
+        "exact object size for this fixture, once coalescing crosses the \
+         covering-read threshold"
     );
     assert_eq!(
         hole_acc.page_bytes_decoded, stored_decoded,
@@ -1675,8 +2050,8 @@ async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
     );
     assert_eq!(
         hole_numerator as f64 / hole_acc.page_bytes_decoded as f64,
-        74_319.0 / 30.0,
-        "exact amplification once a run reads through unwanted pages"
+        81_321.0 / 30.0,
+        "exact amplification once coalescing crosses the covering-read threshold"
     );
 }
 
@@ -1738,12 +2113,15 @@ async fn per_phase_wire_bytes_sum_to_the_pooled_object_store_bytes() {
 
 /// The property this metric exists to expose: on a narrow projection over a
 /// version-4 object the new ratio is strictly below the legacy
-/// `page_bytes_fetched / page_bytes_decoded` ratio, and the gap is exactly the
-/// bytes the mandatory PAGE_DIR lets the read never fetch.
+/// `page_bytes_fetched / page_bytes_decoded` ratio, and the gap is the bytes
+/// the mandatory PAGE_DIR lets the read never fetch, less the bridging slack
+/// ADR-2066 decision 1's 4-run cap adds back on this fixture (9 candidate
+/// runs bridge down to 4, so gap 0 is no longer a bytes-in-equals-bytes-out
+/// read).
 ///
-/// Equality would mean either the fetcher is not narrowing as
-/// docs/log-segment-format.md claims, or the numerator is being computed from
-/// page descriptors rather than from transfers.
+/// Equality (of the two ratios) would mean either the fetcher is not
+/// narrowing as docs/log-segment-format.md claims, or the numerator is being
+/// computed from page descriptors rather than from transfers.
 #[tokio::test]
 async fn narrow_projection_amplification_is_below_the_legacy_page_byte_ratio() {
     let recs = records();
@@ -1766,19 +2144,31 @@ async fn narrow_projection_amplification_is_below_the_legacy_page_byte_ratio() {
     let legacy = acc.page_bytes_fetched as f64 / acc.page_bytes_decoded as f64;
     let measured = wire.phase(QueryPhase::Scan) as f64 / acc.page_bytes_decoded as f64;
     assert_eq!(legacy, 74_321.0 / 30.0, "exact legacy ratio");
-    assert_eq!(measured, 1.0, "exact measured ratio");
+    assert_eq!(
+        measured,
+        46.0 / 30.0,
+        "exact measured ratio: 9 candidate runs bridge down to the 4-run cap, \
+         so gap 0 moves 46 wire bytes for 30 decoded bytes, not 1:1"
+    );
     assert!(
         measured < legacy,
         "measured amplification {measured} must be strictly below the legacy {legacy}"
     );
 
-    // The gap is not incidental: it is exactly the stored bytes of the pages
-    // the projection dropped, which a version-4 read never asks the store for.
+    // The gap is the stored bytes of the pages the projection dropped, which a
+    // version-4 read never asks the store for, less the bridging slack the
+    // 4-run cap adds back on this fixture (9 candidate runs bridge down to 4).
     let never_fetched = acc.page_bytes_fetched - acc.page_bytes_decoded;
     assert_eq!(never_fetched, 74_291);
+    let bridging_slack = wire.phase(QueryPhase::Scan) - acc.page_bytes_decoded;
+    assert_eq!(
+        bridging_slack, 16,
+        "the 4-run cap re-fetches 16 bytes of unwanted pages to stay under it"
+    );
     assert_eq!(
         acc.page_bytes_fetched - wire.phase(QueryPhase::Scan),
-        never_fetched,
-        "the legacy numerator overstates by exactly the bytes version 4 avoids"
+        never_fetched - bridging_slack,
+        "the legacy numerator overstates by exactly the bytes version 4 avoids, \
+         less the bridging slack this read paid to stay under the cap"
     );
 }

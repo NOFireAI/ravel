@@ -406,10 +406,12 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     // (footer probe, then a separate range GET for the front STREAM_DIR
     // section the probe's tail suffix does not cover) and Scan phase (its
     // own footer probe, then the BLOCKS range reads for the 4 blocks
-    // `small_blocks()` cuts across 11 records) are each pinned exactly, so a
-    // regression that adds or removes a GET on this path is caught by name.
-    // `with_suffix_len(300)` fixes the probe window so these counts do not
-    // depend on the object's incidental total size.
+    // `small_blocks()` cuts 11 records into, bridged and bounded to at most
+    // `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4) chunk-run GETs per ADR-2066
+    // decision 1) are each pinned exactly, so a regression that adds or
+    // removes a GET on this path is caught by name. `with_suffix_len(300)`
+    // fixes the probe window so these counts do not depend on the object's
+    // incidental total size.
     let snap = accounting.snapshot();
     let plan_gets = snap.phase(QueryPhase::Plan).s3_requests(AccountedOp::Get);
     let scan_gets = snap.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get);
@@ -423,8 +425,8 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
         "Plan: one footer probe GET, one STREAM_DIR section GET"
     );
     assert_eq!(
-        scan_gets, 6,
-        "Scan: one footer probe GET, plus one BLOCKS range GET per surviving block"
+        scan_gets, 5,
+        "Scan: one footer probe GET, plus at most MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT (4) bridged BLOCKS range GETs across the 4 surviving blocks"
     );
 
     let plan_bytes = snap.phase(QueryPhase::Plan).total_s3_bytes();
@@ -573,8 +575,8 @@ async fn log_series_samples_budget_trips_exactly() {
 }
 
 /// `max_s3_requests` trips at the exact request count `log_series_fetch_counts_lines_and_bytes_exactly`
-/// pins for this same fixture and window (2 Plan GETs + 6 Scan GETs = 8 for
-/// object A's one segment): `Bounded(7)` is one under that total, so the
+/// pins for this same fixture and window (2 Plan GETs + 5 Scan GETs = 7 for
+/// object A's one segment): `Bounded(6)` is one under that total, so the
 /// check after the segment completes must fail with the exact count, never
 /// silently truncate or round down to the budget.
 #[tokio::test]
@@ -595,24 +597,24 @@ async fn log_series_request_budget_trips_exactly() {
         end_ns: 120,
     };
     let req = LogSeriesRequest {
-        max_s3_requests: RequestLimit::Bounded(7),
+        max_s3_requests: RequestLimit::Bounded(6),
         ..lines_request(&matchers, window)
     };
     let accounting = PhaseAccounting::new();
 
     let err = fetch_log_series(&fetcher, TENANT, &[ref_a], &req, &accounting)
         .await
-        .expect_err("8 requests exceed max_s3_requests=7");
+        .expect_err("7 requests exceed max_s3_requests=6");
     match err {
         LogSeriesError::RequestsExceeded { requests, max } => {
-            assert_eq!(requests, 8);
-            assert_eq!(max, 7);
+            assert_eq!(requests, 7);
+            assert_eq!(max, 6);
         }
         other => panic!("expected RequestsExceeded, got {other:?}"),
     }
     assert_eq!(
         counting.get_count(),
-        8,
+        7,
         "accounted request count must equal the store's real GET count"
     );
 }
