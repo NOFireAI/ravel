@@ -52,7 +52,8 @@ message ParquetTableManifest {
   // Statement text that produced this version, as the writer supplies it
   // (ADR-2040 has the SQL writer render it through `redact`).
   string statement = 11;
-  // Per-apply nonce, 16 bytes. Distinguishes two writers that would otherwise
+  // Per-apply nonce, 16 random bytes drawn once per apply and reused across
+  // its retries. Distinguishes two writers that would otherwise
   // encode byte-identical bodies for the same version, so a refused
   // CreateIfAbsent whose stored bytes differ is another writer's version and
   // not this writer's own retried write.

@@ -32,10 +32,10 @@
 //! recognises that write.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use rand::RngExt;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
 use ravel_types::TenantHash;
 
@@ -55,10 +55,6 @@ pub const MAX_APPLY_ATTEMPTS: usize = 8;
 /// difference between this process's clock and the store's, which stamps the
 /// `last_modified` a sweep measures grace from.
 pub const PUT_SKEW_ALLOWANCE_MS: u64 = 30_000;
-
-/// Distinguishes two applies started in the same process in the same clock
-/// tick; the rest of the nonce's input distinguishes processes and callers.
-static APPLY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A parsed DDL statement, applied by [`apply`]. The files are external: they
 /// live in the tenant's own bucket and Ravel only records where they are and
@@ -147,17 +143,13 @@ enum Step {
     Write(Manifest),
 }
 
-/// 16 bytes of BLAKE3 over the caller, the clock, this process and a counter.
-/// Generated once per [`apply`] call and reused across its retries, so a retry
-/// recognises its own earlier write and a second caller never does.
-fn apply_nonce(created_by: &str, now_ns: i64, table: &str) -> Vec<u8> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(created_by.as_bytes());
-    hasher.update(&now_ns.to_le_bytes());
-    hasher.update(&std::process::id().to_le_bytes());
-    hasher.update(&APPLY_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-    hasher.update(table.as_bytes());
-    hasher.finalize().as_bytes()[..APPLY_NONCE_LEN].to_vec()
+/// 16 random bytes from `rand::rng()` (ChaCha12 seeded from the OS), so two
+/// callers share a nonce only by a 128-bit collision whatever their caller
+/// name, clock or process. Generated once per [`apply`] call and reused across
+/// its retries, so a retry recognises its own earlier write.
+fn apply_nonce() -> Vec<u8> {
+    let nonce: [u8; APPLY_NONCE_LEN] = rand::rng().random();
+    nonce.to_vec()
 }
 
 fn plan_step(
@@ -286,23 +278,14 @@ pub async fn apply(
     min_grace_ms: u64,
 ) -> Result<Outcome, WriteError> {
     validate_table(table)?;
-    let created_by = match &intent {
-        Intent::Create {
-            files, created_by, ..
-        }
-        | Intent::CreateOrReplace {
-            files, created_by, ..
-        } => {
-            if files.is_empty() {
-                return Err(WriteError::EmptyFileList {
-                    table: table.to_string(),
-                });
-            }
-            created_by
-        }
-        Intent::Drop { created_by, .. } => created_by,
-    };
-    let nonce = apply_nonce(created_by, clock.now_ns(), table);
+    if let Intent::Create { files, .. } | Intent::CreateOrReplace { files, .. } = &intent
+        && files.is_empty()
+    {
+        return Err(WriteError::EmptyFileList {
+            table: table.to_string(),
+        });
+    }
+    let nonce = apply_nonce();
     let budget_ms = (min_grace_ms / 2).saturating_sub(PUT_SKEW_ALLOWANCE_MS);
     if budget_ms == 0 {
         return Err(WriteError::NoPutBudget { min_grace_ms });
@@ -834,6 +817,40 @@ mod tests {
                 store.listed_prefixes()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_apply_nonce_is_not_derivable_from_the_callers_inputs() {
+        // Two processes with the same pid (pid 1 in two containers), the
+        // same caller, clock tick and table, and the same count of earlier
+        // applies would share any nonce computed from those inputs. Search
+        // every counter value this test binary could have reached.
+        let store = MemoryStore::new();
+        apply_at(&store, "hits", create(false, &[1], "a"), 7)
+            .await
+            .expect("create");
+        let nonce = read_version(&store, &TENANT_A, "hits", 1)
+            .await
+            .expect("read")
+            .expect("present")
+            .apply_nonce;
+        assert_eq!(nonce.len(), APPLY_NONCE_LEN);
+        for counter in 0u64..200_000 {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"a");
+            hasher.update(&7i64.to_le_bytes());
+            hasher.update(&std::process::id().to_le_bytes());
+            hasher.update(&counter.to_le_bytes());
+            hasher.update(b"hits");
+            assert_ne!(
+                &hasher.finalize().as_bytes()[..APPLY_NONCE_LEN],
+                nonce.as_slice(),
+                "nonce reproduced from its inputs at counter {counter}"
+            );
+        }
+
+        let nonces: std::collections::HashSet<Vec<u8>> = (0..64).map(|_| apply_nonce()).collect();
+        assert_eq!(nonces.len(), 64);
     }
 
     /// Half the grace floor less the skew allowance, in nanoseconds.
