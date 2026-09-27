@@ -157,6 +157,17 @@ pub const HTTP_PORT: i32 = 4318;
 /// gRPC listener port (OTLP/gRPC), exposed by the gateway tier only.
 pub const GRPC_PORT: i32 = 4317;
 
+/// Dedicated health listener port (ADR-1702 decision 8): the port
+/// `--listen-health` binds, served by its own `current_thread` runtime on its
+/// own OS thread, carrying `/healthz`, `/readyz` and their `/-/` aliases and
+/// nothing else. Rendered only when `spec.probes.dedicatedHealthPort` is set
+/// (ADR-1702 decision 10); the same routes stay on [`HTTP_PORT`] either way.
+pub const HEALTH_PORT: i32 = 4316;
+
+/// Container-port name for [`HEALTH_PORT`], alongside the existing `http` and
+/// `grpc` names.
+pub const HEALTH_PORT_NAME: &str = "health";
+
 /// `preStop` sleep, in seconds, on every ravel-server pod.
 ///
 /// Endpoint deregistration and SIGTERM are concurrent, not ordered: when a pod
@@ -3136,8 +3147,8 @@ mod tests {
     use crate::crd::{
         AffinityBackend, AffinityKeySpec, DEFAULT_AFFINITY_SUBSET_SIZE, FoldSpec,
         GatewayApiExposureSpec, GatewayExposureSpec, GatewayReference, GatewaySpec, GcSpec,
-        IngestAffinitySpec, LocalSecretRef, MaintainSpec, QuerySpec, RetentionSpec, S3Spec,
-        StorageSpec,
+        IngestAffinitySpec, LocalSecretRef, MaintainSpec, ProbesSpec, QuerySpec, RetentionSpec,
+        S3Spec, StorageSpec,
     };
     use std::collections::BTreeMap;
 
@@ -3189,6 +3200,7 @@ mod tests {
                 resources: None,
                 credentials_secret_ref: None,
             },
+            probes: ProbesSpec::default(),
             gc: None,
             retention: Some(RetentionSpec {
                 default: Some("30d".to_string()),
@@ -4011,6 +4023,143 @@ mod tests {
                 .expect("httpGet");
             assert_eq!(ready.path.as_deref(), Some("/readyz"));
             assert_eq!(ready.port, IntOrString::Int(HTTP_PORT));
+        }
+    }
+
+    #[test]
+    fn probes_render_on_health_port_when_enabled() {
+        // ADR-1702 decisions 8 and 10, follow-up task 3. The three server
+        // tiers share the `deployment` builder, so all three are rendered
+        // here: a field wired on only some of them regresses the rest
+        // silently.
+        let off = base_spec();
+        let mut on = base_spec();
+        on.probes.dedicated_health_port = true;
+
+        // An existing RavelCluster carries no `probes` block at all. It must
+        // deserialize to the same spec the default gives.
+        let mut without = serde_json::to_value(&off).expect("serialize spec");
+        without
+            .as_object_mut()
+            .expect("spec object")
+            .remove("probes")
+            .expect("probes serialized");
+        let without: RavelClusterSpec =
+            serde_json::from_value(without).expect("deserialize a spec with no probes block");
+        assert_eq!(without, off);
+
+        let render = |spec: &RavelClusterSpec| {
+            vec![
+                desired_gateway_deployment(spec, "prod", &ctx()),
+                desired_query_deployment(spec, "prod", &ctx()),
+                desired_maintain_deployment(spec, "prod", &ctx())
+                    .expect("no gc render error")
+                    .expect("maintain enabled"),
+            ]
+        };
+
+        // Disabled (this release's default): the render is what it is today,
+        // whole object for whole object.
+        assert_eq!(render(&off), render(&without));
+        for dep in render(&off) {
+            let container = container_of(&dep);
+            assert!(
+                !args_of(&dep).iter().any(|arg| arg == "--listen-health"),
+                "the disabled render must pass no --listen-health"
+            );
+            let ports = container.ports.as_ref().expect("container ports");
+            assert!(
+                ports.iter().all(|port| port.container_port != HEALTH_PORT),
+                "the disabled render must expose no health port"
+            );
+            for probe in [&container.liveness_probe, &container.readiness_probe] {
+                let get = probe
+                    .as_ref()
+                    .expect("probe")
+                    .http_get
+                    .as_ref()
+                    .expect("httpGet");
+                assert_eq!(get.port, IntOrString::Int(HTTP_PORT));
+            }
+        }
+
+        // Enabled: the argument, a named container port, and both probes on
+        // 4316, keeping today's period, timeout and failure threshold.
+        for (dep, today) in render(&on).into_iter().zip(render(&off)) {
+            let args = args_of(&dep);
+            let flag = args
+                .iter()
+                .position(|arg| arg == "--listen-health")
+                .expect("--listen-health rendered");
+            assert_eq!(args[flag + 1], format!("0.0.0.0:{HEALTH_PORT}"));
+
+            let container = container_of(&dep);
+            let ports = container.ports.as_ref().expect("container ports");
+            let health = ports
+                .iter()
+                .find(|port| port.container_port == HEALTH_PORT)
+                .expect("health container port");
+            assert_eq!(health.name.as_deref(), Some(HEALTH_PORT_NAME));
+            let today_container = container_of(&today);
+            for port in today_container.ports.as_ref().expect("container ports") {
+                assert!(
+                    ports.contains(port),
+                    "enabling the health port must not drop {port:?}"
+                );
+            }
+
+            for (probe, today_probe, path) in [
+                (
+                    &container.liveness_probe,
+                    &today_container.liveness_probe,
+                    "/healthz",
+                ),
+                (
+                    &container.readiness_probe,
+                    &today_container.readiness_probe,
+                    "/readyz",
+                ),
+            ] {
+                let probe = probe.as_ref().expect("probe");
+                let today_probe = today_probe.as_ref().expect("probe");
+                let get = probe.http_get.as_ref().expect("httpGet");
+                assert_eq!(get.path.as_deref(), Some(path));
+                assert_eq!(get.port, IntOrString::Int(HEALTH_PORT));
+                assert_eq!(probe.period_seconds, today_probe.period_seconds);
+                assert_eq!(probe.timeout_seconds, today_probe.timeout_seconds);
+                assert_eq!(probe.failure_threshold, today_probe.failure_threshold);
+            }
+        }
+
+        // The ingest-router runs a different binary that has no health
+        // listener, so its render is unchanged either way (ADR-1702
+        // decision 10).
+        let router = |dedicated: bool| {
+            let mut spec = ravel_native_spec(3, AffinityKeySource::AuthorizationHeader);
+            spec.probes.dedicated_health_port = dedicated;
+            desired_router_deployment(&spec, "prod", "default", &ctx())
+                .expect("router renders")
+                .expect("ravelNative renders a router Deployment")
+        };
+        let router_off = router(false);
+        assert_eq!(router(true), router_off);
+        let router_container = container_of(&router_off);
+        assert!(
+            !args_of(&router_off)
+                .iter()
+                .any(|arg| arg == "--listen-health")
+        );
+        for probe in [
+            &router_container.liveness_probe,
+            &router_container.readiness_probe,
+        ] {
+            let get = probe
+                .as_ref()
+                .expect("probe")
+                .http_get
+                .as_ref()
+                .expect("httpGet");
+            assert_eq!(get.port, IntOrString::Int(ROUTER_HTTP_PORT));
         }
     }
 
