@@ -374,8 +374,8 @@ async fn metrics_declared_stats_families_render_once_where_the_fold_runs() {
 
 /// ADR-1170 decision 4: the three process memory budget gauges must render
 /// with real values read from the same `MemoryBudget` the server was started
-/// with, not zeroed placeholders. `component="fetch"` reads `0` because
-/// decision 2 (fetch-layer reservation) has not landed upstream.
+/// with, not zeroed placeholders. `component="fetch"` reads `0` because the
+/// server is idle: no fetch reservation is held when the body is scraped.
 #[tokio::test]
 async fn metrics_memory_budget_family_reflects_configured_budget() {
     const BUDGET_BYTES: u64 = 123_456_789;
@@ -404,7 +404,7 @@ async fn metrics_memory_budget_family_reflects_configured_budget() {
     );
     assert!(
         body.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"fetch\"} 0"),
-        "metrics body missing fetch reserved gauge (must be 0 until decision 2 lands):\n{body}"
+        "metrics body missing fetch reserved gauge (must be 0 while no fetch is in flight):\n{body}"
     );
     assert!(
         body.contains("ravel_memory_handoff_overlap_bytes{mode=\"all\"} 0"),
