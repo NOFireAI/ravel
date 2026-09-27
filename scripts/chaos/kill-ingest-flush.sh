@@ -120,7 +120,7 @@ log "bringing up RustFS and qualifying the store"
 rustfs_up
 
 log "generating OTLP fixture"
-cargo run --quiet -p ravel-server --example gen_otlp_fixture > "$FIXTURE_PATH"
+chaos_gen_fixture > "$FIXTURE_PATH"
 
 log "starting ravel-server (pre-kill instance)"
 start_server_bg
@@ -128,21 +128,24 @@ chaos_wait_for "server to accept connections" 60 server_reachable
 
 # Record the flush baseline before driving load, so "flush started" is a
 # rise past this value.
-FLUSH_BASELINE="$(metric_value "$BASE_URL" "$CHAOS_FLUSH_METRIC")" || FLUSH_BASELINE=0
+FLUSH_BASELINE="$(metric_value "$BASE_URL" "$CHAOS_FLUSH_METRIC" "$CHAOS_FLUSH_SELECTOR")" \
+  || FLUSH_BASELINE=0
 [[ "${FLUSH_BASELINE%.*}" =~ ^[0-9]+$ ]] || FLUSH_BASELINE=0
 
 log "driving ${EXPORT_COUNT} strict-ack exports"
 # Commit tokens are opaque base64 strings, not integers (see
 # oracle_strict_ack_implies_durable in lib.sh): collect them verbatim and never
-# compare or increment them numerically. Each is an acked-before-kill write the
-# oracle re-queries after restart.
+# compare or increment them numerically. An export that flushed through more
+# than one shard returns one token per shard; each is an acked-before-kill
+# write the oracle re-queries after restart.
 ACKED_TOKENS=()
 for _ in $(seq 1 "$EXPORT_COUNT"); do
-  token="$(drive_one_export "$HTTP_ADDR" "$FIXTURE_PATH")" || {
+  tokens="$(drive_one_export "$HTTP_ADDR" "$FIXTURE_PATH")" || {
     log "export failed before kill; aborting scenario setup"
     exit 1
   }
-  ACKED_TOKENS+=("$token")
+  mapfile -t export_tokens <<<"$tokens"
+  ACKED_TOKENS+=("${export_tokens[@]}")
 done
 log "recorded ${#ACKED_TOKENS[@]} strict-ack commit token(s) before kill"
 

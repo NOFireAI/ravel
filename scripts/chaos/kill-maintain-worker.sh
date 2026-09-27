@@ -125,6 +125,11 @@ cleanup() {
   rustfs_down
 }
 trap cleanup EXIT
+# A setup step that fails under `set -e` would otherwise exit with its own
+# status, often 1, which the contract above reserves for an oracle failure.
+# Every setup failure exits 3 instead; the oracle calls below carry `|| true`
+# and never reach this trap.
+trap 'exit 3' ERR
 
 # Start a maintain-role worker. $1=http $2=grpc $3=logfile; echoes the PID via
 # the named global set by the caller. We set the PID through a nameref so the
@@ -170,7 +175,7 @@ log "bringing up RustFS and qualifying the store"
 rustfs_up
 
 log "generating OTLP fixture"
-cargo run --quiet -p ravel-server --example gen_otlp_fixture > "$FIXTURE_PATH"
+chaos_gen_fixture > "$FIXTURE_PATH"
 
 # Actually drive the generated load: start an ingest server and POST the
 # fixture through it so the bucket carries real, compactable data. A prior
@@ -189,7 +194,7 @@ for _ in $(seq 1 "$EXPORT_COUNT"); do
 done
 if [[ "$SENT" -eq 0 ]]; then
   log "no exports were accepted; the maintain workers would own nothing"
-  exit 1
+  exit 3
 fi
 log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports into the ingest server"
 
