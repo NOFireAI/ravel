@@ -31,74 +31,35 @@ engine itself chooses, and one flag moves it.
 ## The formula
 
 ```
-PUTs/day = 2 x tenants x signals x shards x replicas x (86400 / interval_s(r))
-r        = one buffer's object bytes per second
-         = tenant object bytes per second / (shards x replicas it spreads over)
+PUTs/day = 2 x tenants x signals x shards x replicas x (86400 / age_threshold_s)
 ```
 
-`interval_s(r)` is the time between one buffer's flushes. A buffer is one
-`(tenant, signal, shard)` per ingest replica, and its interval depends on
-whether a strict-mode export is waiting on it and, when none is, on its byte
-rate `r` (the volume term). Bytes here are the estimated object bytes the
-flush would write: a scalar metric sample counts 16 bytes, and each series
-adds 32 bytes plus its label bytes once per flush. With `F` the metrics idle
-floor, `idle_flush_floor_bytes` (13,107 bytes, about 12.8KiB, by default),
-and `M` = `min_flush_bytes` (256KiB default), the bands are:
+`age_threshold_s` is decided per `(tenant, signal, shard)` buffer, per flush.
+A buffer has priority when a strict-mode export is waiting on its flush, or
+when its estimated flush size has reached `min_flush_bytes` (256KiB default).
+Either condition is enough, and the two share one threshold:
 
-- **Fast clock**: `max_flush_delay` (2s default). Applies to a buffer with a
-  strict-mode waiter, whatever its size, and to a buffer that reaches `M`
-  within 2s (`r` at least 128KiB/s). A buffer that crossed `M` with no waiter
-  flushes on the same clock as a strict-mode one; the two cases cannot drift
-  apart.
-- **Byte-rate middle band**: `interval_s = M / r`, from 2s up to
-  `max_flush_delay_idle` (40s default), for `r` from 128KiB/s down to 6.4KiB/s.
-  The buffer flushes on the first tick after it reaches `M`. Below 6.4KiB/s it
-  sits on the idle clock: `interval_s = 40` while it still gathers at least
-  `F` per 40s window, down to about 328 bytes a second.
-- **Idle band** (metrics only): below `F / 40s`, about 328 bytes a second,
-  `interval_s = F / r`, the time to gather `F`, capped at the hold bound
-  `max_flush_lifetime - max_flush_delay_idle` (3,560s at the defaults). At
-  near-zero volume a buffer flushes once per 3,560s: about 24 flushes, or 48
-  PUTs, a day, where the 40s idle clock alone paid 2,160 flushes, or 4,320
-  PUTs. Log and span buffers have no floor and stay on the 40s idle clock.
-- **Adaptive fast clock** (off by default, metrics only): with adaptive flush
-  delay on, the metrics actor widens the fast-clock threshold inside a
-  corridor from `max_flush_delay` up to a ceiling. The ceiling comes from the
-  shard's observed PUT round-trip time and the strict-visibility budget. Where
-  the threshold lands inside the corridor is per tenant, from the tenant's
+- **Idle clock**: `max_flush_delay_idle` (40s default). Applies to a buffer
+  with no priority: no waiter, and not yet at `min_flush_bytes`.
+- **Priority**: `max_flush_delay` (2s default). Applies to a buffer with a
+  waiter, with enough bytes, or both. A buffer that crossed `min_flush_bytes`
+  with no waiter flushes on the same clock as a strict-mode one; the two
+  cases cannot drift apart.
+- **Adaptive priority** (off by default, metrics only): with adaptive flush
+  delay on, the metrics actor widens the priority threshold inside a corridor
+  from `max_flush_delay` up to a ceiling. The ceiling comes from the shard's
+  observed PUT round-trip time and the strict-visibility budget. Where the
+  threshold lands inside the corridor is per tenant, from the tenant's
   observed arrival gap. Log and span shards have no corridor and always use
-  the fixed values above.
+  the fixed pair above.
 
-In one expression, for a metrics buffer with no waiter:
-
-```
-interval_s(r) = clamp(M / r, 2, 40)      when r >= F / 40
-              = min(F / r, 3560)         when r <  F / 40
-```
-
-For a log or span buffer with no waiter the first line applies at every `r`.
-A strict-mode buffer flushes on the fast clock.
-
-Worked example, metrics only, at the shipped defaults with 4 shards and 2
-replicas, so each tenant spreads over 8 buffers:
-
-| tenant | series, scrape interval | `r` per buffer | band | `interval_s` | PUTs/day per tenant |
-|---|---|---|---|---|---|
-| tiny | 5 series, 60s | 0.17 B/s | idle, capped | 3,560 | 388 |
-| small | 50 series, 15s | 6.7 B/s | idle, `F / r` | 1,966 | 703 |
-| medium | 2,000 series, 15s | 267 B/s | idle, `F / r` | 49 | 28,125 |
-| large | 50,000 series, 15s | 6,667 B/s | middle, `M / r` | 39 | 35,156 |
-
-Each figure is `2 x 8 x 86400 / interval_s`, with `r = series x 16 /
-interval / 8` (the once-per-flush series bytes are left out). The first
-three tenants paid 34,560 PUTs/day each on the 40s idle clock before the
-floor; the large tenant is unchanged. A fleet of 100 tiny tenants therefore
-writes about 38,800 metrics PUTs/day instead of 3,456,000.
+A low-volume buffer that never gains priority flushes on the idle clock; a
+strict-mode buffer flushes on the priority threshold.
 
 Age is not the only trigger. A buffer also flushes as soon as its estimated
 object size reaches `target_bytes` (8MiB default), without waiting for any
 clock. For a busy buffer that is the trigger that fires, so its PUT rate is
-its byte rate divided by `target_bytes`, not `86400 / interval_s(r)`. Use
+its byte rate divided by `target_bytes`, not `86400 / age_threshold_s`. Use
 the age formula for buffers that flush on a clock, which is the low-volume
 and strict-mode cases, and the byte rate for buffers that reach the target
 size within their flush window.
@@ -150,9 +111,11 @@ backend's own price sheet, which the read-side section below applies.
 ## Predicting your bill
 
 Given a workload, estimate PUTs/day from the formula above using your
-`shards`, `replicas`, and each tenant's per-buffer byte rate `r` to pick its
-band (a strict-mode buffer always takes the fast clock), and multiply by your
-object-storage provider's per-1k-request price. Keyed log and span requests add a per-request idempotency-marker PUT
+`shards`, `replicas`, `max_flush_delay` (or `max_flush_delay_idle` for a low
+per-tenant volume, since the idle ceiling, not the strict floor, bounds a
+buffer that never crosses `min_flush_bytes` before its strict waiter, if any,
+resolves), and multiply by your object-storage provider's per-1k-request
+price. Keyed log and span requests add a per-request idempotency-marker PUT
 and a dedup-window LIST beyond this formula (see the
 [consistency model](../consistency-model.md)); no lever in this guide touches
 that cost, since it is per-request rather than per-flush.

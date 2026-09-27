@@ -80,6 +80,10 @@ pub enum FlushTrigger {
     /// adaptive-delay corridor (ADR-0067 decision 3), rather than the fixed
     /// `max_flush_delay` constant.
     AgeAdaptive,
+    /// Buffer below a non-zero `idle_flush_byte_floor` aged past
+    /// `max_flush_lifetime`, the hold tier of ADR-1737. Raised by all three
+    /// shard actors.
+    AgeFloor,
     Manual,
 }
 
@@ -102,6 +106,11 @@ pub struct IngestMetrics {
     /// Zero unless adaptive delay is enabled. Attempt-time, same as
     /// `flushes_by_size`.
     flushes_by_age_adaptive: AtomicU64,
+    /// Flushes opened because a tenant buffer below a non-zero
+    /// `idle_flush_byte_floor` aged past `max_flush_lifetime` (ADR-1737
+    /// decision 6). Zero while the floor is 0. Attempt-time, same as
+    /// `flushes_by_size`.
+    flushes_by_age_floor: AtomicU64,
     /// Flushes opened by any `FlushTrigger::Manual` path: an explicit
     /// `FlushNow`, the `Shutdown` drain, or the channel-close drop-path drain.
     /// Attempt-time.
@@ -646,6 +655,7 @@ pub struct IngestMetricsSnapshot {
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
     pub flushes_by_age_adaptive: u64,
+    pub flushes_by_age_floor: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -748,6 +758,7 @@ impl IngestMetrics {
             FlushTrigger::Size => &self.flushes_by_size,
             FlushTrigger::Age => &self.flushes_by_age,
             FlushTrigger::AgeAdaptive => &self.flushes_by_age_adaptive,
+            FlushTrigger::AgeFloor => &self.flushes_by_age_floor,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -1034,6 +1045,7 @@ impl IngestMetrics {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
             flushes_by_age_adaptive: self.flushes_by_age_adaptive.load(Ordering::Relaxed),
+            flushes_by_age_floor: self.flushes_by_age_floor.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
@@ -1135,6 +1147,21 @@ mod tests {
         let snap = metrics.snapshot();
         assert_eq!(snap.flushes_by_age, 1);
         assert_eq!(snap.flushes_by_age_adaptive, 2);
+    }
+
+    #[test]
+    fn age_floor_trigger_counts_separately_from_both_age_counters() {
+        let metrics = IngestMetrics::default();
+        metrics.record_flush(FlushTrigger::Age);
+        metrics.record_flush(FlushTrigger::AgeAdaptive);
+        metrics.record_flush(FlushTrigger::AgeFloor);
+        metrics.record_flush(FlushTrigger::AgeFloor);
+        metrics.record_flush(FlushTrigger::AgeFloor);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_by_age_adaptive, 1);
+        assert_eq!(snap.flushes_by_age_floor, 3);
     }
 
     #[test]

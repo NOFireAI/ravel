@@ -47,12 +47,7 @@ Buffered mode (opt-in per request, named "buffered"):
   flush is triggered, not when it completes: the flush task then waits for a
   `max_inflight_flushes` permit on its shard (ADR-1642) and runs its PUTs, so
   a shard whose permits are held by a stalled flush widens the window until
-  the stall clears. For a buffer with no strict waiter the trigger is the
-  idle clock (40 s by default), and on the metrics pipeline a buffer below
-  `idle_flush_floor_bytes` is held until it reaches that floor or up to
-  `max_flush_lifetime - max_flush_delay_idle` (3,560 s by default), so a
-  near-idle buffered-mode tenant's window, and the time before its
-  acknowledged rows are visible, can reach that long.
+  the stall clears.
 - The `max_flush_lifetime` abandonment budget is measured from the moment the
   flush's permit is granted, not from flush-open, so time spent queued behind
   a stalled prefix does not count against it: a flush that waited behind a
@@ -88,9 +83,7 @@ rejected point counts and reasons.
   PUT. The flush delay is a configurable operator budget
   (`--max-flush-delay`), default 2 s in strict mode (ADR-0076 decision 4);
   the p99 visibility target under target load tracks that budget, not a fixed
-  sub-second constant. A buffered-mode write in a low-volume buffer with no
-  strict waiter waits for the idle trigger instead (see "Buffered mode"
-  above). The permit wait is zero unless the shard already has
+  sub-second constant. The permit wait is zero unless the shard already has
   `max_inflight_flushes` flushes running (ADR-1642), which is where a stalled
   tenant's throttled prefix shows up in a co-resident tenant's visibility.
 - There is no cross-shard ordering guarantee. A query snapshot may include

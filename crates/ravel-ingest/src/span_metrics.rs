@@ -41,6 +41,10 @@ pub struct SpanIngestMetrics {
     /// Flushes opened because the tenant buffer aged past `max_flush_delay`.
     /// Attempt-time, same as `flushes_by_size`.
     flushes_by_age: AtomicU64,
+    /// Flushes opened because a tenant buffer below a non-zero
+    /// `idle_flush_byte_floor` aged past `max_flush_lifetime`
+    /// ([`FlushTrigger::AgeFloor`], ADR-1737 decision 6). Attempt-time.
+    flushes_by_age_floor: AtomicU64,
     /// Flushes opened by any [`FlushTrigger::Manual`] path: an explicit flush
     /// request, the shutdown drain, and the channel-close drop-path drain.
     flushes_manual: AtomicU64,
@@ -165,6 +169,7 @@ pub struct SpanIngestMetrics {
 pub struct SpanIngestMetricsSnapshot {
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
+    pub flushes_by_age_floor: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -317,6 +322,7 @@ impl SpanIngestMetrics {
             // this arm exists only so the shared `FlushTrigger` enum stays
             // exhaustive here, and is never reached from this actor.
             FlushTrigger::Age | FlushTrigger::AgeAdaptive => &self.flushes_by_age,
+            FlushTrigger::AgeFloor => &self.flushes_by_age_floor,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -486,6 +492,7 @@ impl SpanIngestMetrics {
         SpanIngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
+            flushes_by_age_floor: self.flushes_by_age_floor.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
@@ -717,5 +724,17 @@ mod tests {
         assert_eq!(snap.flushes_by_age, 2);
         assert_eq!(snap.buffered_bytes_total, 15);
         assert_eq!(snap.buffered_spans_total, 3);
+    }
+
+    #[test]
+    fn age_floor_trigger_counts_separately_from_age() {
+        let metrics = SpanIngestMetrics::default();
+        metrics.record_flush(FlushTrigger::Age);
+        metrics.record_flush(FlushTrigger::AgeFloor);
+        metrics.record_flush(FlushTrigger::AgeFloor);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_by_age_floor, 2);
     }
 }

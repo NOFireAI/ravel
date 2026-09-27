@@ -49,8 +49,8 @@ use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
-    SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, memory_backstop_crossed,
-    size_trigger_fires,
+    SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, idle_age_threshold,
+    memory_backstop_crossed, size_trigger_fires,
 };
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
@@ -1196,9 +1196,9 @@ impl ShardActor {
     /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast age clock; anything else is idle
     /// and waits for the slower `max_flush_delay_idle` instead (ADR-0051
-    /// section 7), or, below `idle_flush_floor_bytes`, for the hold bound
-    /// derived from `max_flush_lifetime` (issue #1737). "Worth a PUT" is a
-    /// claim about the object, so this reads the
+    /// section 7), or, below a non-zero `idle_flush_byte_floor`, for
+    /// `max_flush_lifetime` (ADR-1737, [`idle_age_threshold`]). "Worth a PUT"
+    /// is a claim about the object, so this reads the
     /// object-bytes estimate, not the buffered-memory charge (issue #1305).
     /// Strict-mode ack latency is unaffected: a strict
     /// write always leaves `waiters` non-empty for its whole flush window.
@@ -1216,25 +1216,7 @@ impl ShardActor {
         let has_priority =
             !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if !has_priority {
-            let idle_ns = self.config.max_flush_delay_idle.as_nanos() as i64;
-            if buf.flush_est_bytes >= self.config.idle_flush_floor_bytes {
-                return (idle_ns, FlushTrigger::Age);
-            }
-            // Issue #1737: below `idle_flush_floor_bytes` an idle-clock flush
-            // would pay two PUTs for almost nothing, so hold the buffer until
-            // one idle window short of `max_flush_lifetime`. The window keeps
-            // the span from routing to flush-open, plus one late tick and one
-            // flush lifetime, inside two lifetimes, the
-            // `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` budget, and never lets a
-            // buffer sit in memory past `max_flush_lifetime` before its flush
-            // opens. The seal margin is unaffected, since the
-            // ingest hour is pinned when the flush opens. Nothing here is
-            // acknowledged differently: a buffered write was acked on
-            // admission and a strict write has a waiter, which never reaches
-            // this branch.
-            let lifetime_ns = self.config.max_flush_lifetime.as_nanos() as i64;
-            let hold_ns = lifetime_ns.saturating_sub(idle_ns).max(idle_ns);
-            return (hold_ns, FlushTrigger::Age);
+            return idle_age_threshold(buf.flush_est_bytes, &self.config);
         }
         let floor_ns = self.config.max_flush_delay.as_nanos() as i64;
         if !self.config.adaptive_flush_delay {
@@ -2487,20 +2469,33 @@ mod tests {
             flush.record.ingest_hour_bucket
         );
 
-        // The two terms the constant is actually derived from, restated from
-        // the config. They fit; the deferral is the term that does not, and it
-        // is absent here because no configured value bounds it.
+        // The terms the constant is actually derived from, restated from the
+        // config with the idle flush byte floor on, since the constant must
+        // hold for every legal floor (ADR-1737 decision 3). They fit; the
+        // deferral is the term that does not, and it is absent here because no
+        // configured value bounds it.
         let shipped = IngestConfig::default();
-        let bound_ns = routing_to_pin_bound_ns(&shipped);
+        let lifetime_ns = shipped.max_flush_lifetime.as_nanos() as i64;
+        let hold_ns = sub_floor_hold_ns(&shipped);
         assert!(
-            bound_ns <= i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR,
-            "the longer of {:?} idle and the sub-floor hold ({:?} lifetime \
-             less idle), plus one {:?} tick = {bound_ns}ns, must fit inside \
-             FLUSH_BOUND_SLACK_HOURS ({}ns)",
+            hold_ns <= lifetime_ns,
+            "the sub-floor hold ({hold_ns}ns) must not exceed max_flush_lifetime \
+             ({lifetime_ns}ns): FLUSH_BOUND_SLACK_HOURS was derived with the \
+             lifetime as the worst buffer age at flush open"
+        );
+        let bound_ns = routing_to_pin_bound_ns(&shipped) + lifetime_ns;
+        // Whole seconds, as the ADR-1737 derivation is stated: at the defaults
+        // the sum is exactly two hours plus one sub-second `flush_tick`.
+        let bound_s = bound_ns / 1_000_000_000;
+        let slack_s = i64::from(FLUSH_BOUND_SLACK_HOURS) * 3600;
+        assert!(
+            bound_s <= slack_s,
+            "the worst buffer age at flush open ({:?} idle or {hold_ns}ns \
+             sub-floor hold), plus one {:?} tick, plus one {:?} flush lifetime \
+             = {bound_s}s, must fit inside FLUSH_BOUND_SLACK_HOURS ({slack_s}s)",
             shipped.max_flush_delay_idle,
-            shipped.max_flush_lifetime,
             shipped.flush_tick,
-            i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
+            shipped.max_flush_lifetime,
         );
     }
 
@@ -2556,9 +2551,9 @@ mod tests {
     /// an ingest hour, recomputed from `config`, as
     /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` was derived.
     /// - the oldest a buffer with no strict waiter gets before its age trigger
-    ///   fires: `max_flush_delay_idle`, or the sub-floor hold
-    ///   (`max_flush_lifetime - max_flush_delay_idle`, issue #1737) when that
-    ///   is longer. `ravel-server` refuses an idle ceiling below
+    ///   fires: `max_flush_delay_idle`, or, with a non-zero
+    ///   `idle_flush_byte_floor`, the sub-floor hold (ADR-1737), whichever is
+    ///   longer. `ravel-server` refuses an idle ceiling below
     ///   `max_flush_delay`, so this is the validated worst case.
     /// - one `flush_tick`: the trigger is evaluated on a tick, not at the
     ///   instant the threshold is crossed.
@@ -2568,7 +2563,19 @@ mod tests {
     /// `a_deferred_flush_can_overrun_the_flush_bound_slack` measures it.
     fn routing_to_pin_bound_ns(config: &IngestConfig) -> i64 {
         let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
-        let hold_ns = (config.max_flush_lifetime.as_nanos() as i64).saturating_sub(idle_ns);
-        idle_ns.max(hold_ns) + config.flush_tick.as_nanos() as i64
+        idle_ns.max(sub_floor_hold_ns(config)) + config.flush_tick.as_nanos() as i64
+    }
+
+    /// The age threshold the shard actor applies to an empty-waiter buffer
+    /// below a non-zero `idle_flush_byte_floor`, read from the predicate
+    /// itself rather than restated, so a change to the hold moves this too.
+    fn sub_floor_hold_ns(config: &IngestConfig) -> i64 {
+        let floored = IngestConfig {
+            idle_flush_byte_floor: 1,
+            ..*config
+        };
+        let (hold_ns, trigger) = idle_age_threshold(0, &floored);
+        assert_eq!(trigger, FlushTrigger::AgeFloor);
+        hold_ns
     }
 }
