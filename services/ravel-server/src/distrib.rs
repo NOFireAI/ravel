@@ -886,9 +886,11 @@ impl FragmentService {
     /// coordinator's pins name them directly. A record that is missing, fails
     /// verification, or disagrees with the identity fails the slice as
     /// `Unsupported`, and the coordinator runs the query locally; a retryable
-    /// store error on the record GET fails it as `Unavailable`, and the
-    /// coordinator re-dispatches that slice. Record GETs draw from this
-    /// process's GET limiter.
+    /// store error on the record GET fails an inbound fetch as `Unavailable`,
+    /// and the coordinator re-dispatches that slice, or fails the
+    /// coordinator's own local attempt as `SnapshotInvalidated`, which is one
+    /// re-resolve and retry (see [`FragmentService::run_local`]). Record GETs
+    /// draw from this process's GET limiter.
     ///
     /// Returns `None` for a tenant hash we cannot decode or a signal other than
     /// metrics. The delegate service rejects both with the same typed status
@@ -990,7 +992,16 @@ impl FragmentService {
     /// Resolve the request's snapshot and run the slice through the in-crate
     /// [`SeriesFetchService`], collecting its frames. Shared by the gRPC handler
     /// (after auth and admission) and the coordinator's no-hop local path.
-    async fn resolve_and_run(&self, request: pb::FetchRequest) -> Vec<pb::FetchResponse> {
+    ///
+    /// `local_attempt` says which of those two callers this is. It is set only
+    /// by [`run_local`](Self::run_local), and only changes the status a
+    /// retryable record GET fails with (see
+    /// [`SeriesFetchService::with_local_attempt`]).
+    async fn resolve_and_run(
+        &self,
+        request: pb::FetchRequest,
+        local_attempt: bool,
+    ) -> Vec<pb::FetchResponse> {
         // A cross-cluster resolve scope is rewritten to a pinned scope over this
         // cluster's own snapshot, and keeps the snapshot resolver that rewrite
         // built. An intra-cluster pinned scope reads each pinned segment's own
@@ -999,16 +1010,20 @@ impl FragmentService {
         match &request.scope {
             Some(pb::fetch_request::Scope::Resolve(_)) => {
                 let (request, resolver) = self.resolve_scope(request).await;
-                self.run_slice(request, resolver, true).await
+                self.run_slice(request, resolver, true, local_attempt).await
             }
             _ => match self.build_resolver(&request) {
-                Some(resolver) => self.run_slice(request, resolver, false).await,
+                Some(resolver) => {
+                    self.run_slice(request, resolver, false, local_attempt)
+                        .await
+                }
                 // The delegate refuses an undecodable tenant hash or a
                 // non-metrics signal with a typed status before any resolver
                 // call, so this stand-in is never consulted.
                 None => {
                     let resolver = Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
-                    self.run_slice(request, resolver, false).await
+                    self.run_slice(request, resolver, false, local_attempt)
+                        .await
                 }
             },
         }
@@ -1021,6 +1036,7 @@ impl FragmentService {
         request: pb::FetchRequest,
         resolver: Arc<R>,
         federated: bool,
+        local_attempt: bool,
     ) -> Vec<pb::FetchResponse> {
         let mut fetcher = SegmentFetcher::new(self.inner.store.clone())
             .with_get_limiter(self.inner.get_limiter.clone());
@@ -1041,6 +1057,9 @@ impl FragmentService {
             .with_record_get_observer(self.inner.metrics.clone());
         if federated {
             service = service.with_resolve_scope();
+        }
+        if local_attempt {
+            service = service.with_local_attempt();
         }
         match service.fetch(tonic::Request::new(request)).await {
             Ok(response) => {
@@ -1073,8 +1092,15 @@ impl FragmentService {
     /// [`SliceResponse`] a remote fetch would. Skips token auth and fragment
     /// admission: this is the coordinator's own work under its client-query
     /// permit, not an inbound request from another coordinator.
+    ///
+    /// This is the only caller that runs the slice as a local attempt, so a
+    /// retryable record GET here fails `SnapshotInvalidated` (one re-resolve
+    /// and retry) rather than `Unavailable` (terminal, since there is no
+    /// worker left to re-dispatch to). Both of `dispatch`'s local arms reach
+    /// it: the self-mapped or unroutable slice, and the fallback after the
+    /// remote ladder is exhausted.
     async fn run_local(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
-        let frames = self.resolve_and_run(request).await;
+        let frames = self.resolve_and_run(request, true).await;
         decode_slice_frames(frames)
     }
 }
@@ -1141,7 +1167,10 @@ impl SeriesFetch for FragmentService {
             return Err(tonic::Status::unavailable("fragment admission unavailable"));
         };
         self.inner.metrics.record_fragment_request();
-        let frames = self.resolve_and_run(inner).await;
+        // An inbound request, not a local attempt: this coordinator can still
+        // re-dispatch the slice elsewhere, so a retryable record GET stays
+        // `Unavailable`.
+        let frames = self.resolve_and_run(inner, false).await;
         // The permit (and its in-flight gauge decrement) is held across the
         // eager fetch above, the whole admission window, then released here
         // before the already-built frames replay as a stream.
@@ -4476,11 +4505,15 @@ mod tests {
         );
     }
 
-    /// A transient store error on the commit-record GET answers `Unavailable`,
-    /// the status the coordinator answers by re-dispatching this one slice,
-    /// not `Unsupported` and a whole-query local run.
+    /// A transient store error on the commit-record GET is retryable, and
+    /// which retry the slice gets depends on who is running it. An INBOUND
+    /// fragment answers `Unavailable`, the status the coordinator answers by
+    /// re-dispatching this one slice to another worker, not `Unsupported` and
+    /// a whole-query local run. The coordinator's OWN attempt has no other
+    /// worker to be re-dispatched to and `Unavailable` is terminal there, so
+    /// it answers `SnapshotInvalidated`: one re-resolve and retry.
     #[tokio::test]
-    async fn pinned_l0_with_transient_record_get_error_is_unavailable() {
+    async fn a_transient_record_get_error_is_unavailable_inbound_and_retryable_locally() {
         use ravel_object_store::fault::{
             FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
         };
@@ -4494,24 +4527,39 @@ mod tests {
             ),
         ));
         let service = pinned_service(fault.clone(), 4 * HOUR_NS);
-        let response = service
-            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
-            .await
-            .expect("local run");
+        let request = pinned_over_window(tenant_hash, &seg, envelope(&seg));
+
+        let inbound = decode_slice_frames(service.resolve_and_run(request.clone(), false).await)
+            .expect("inbound run");
         assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 1);
         assert_eq!(
-            response.status,
+            inbound.status,
             pb::status::Code::Unavailable,
             "{}",
-            response.status_message
+            inbound.status_message
         );
         assert!(
-            response.status_message.contains(&commit_key),
+            inbound.status_message.contains(&commit_key),
             "{}",
-            response.status_message
+            inbound.status_message
         );
-        assert_eq!(response.series_returned, 0, "no rows");
-        assert!(response.scalar.is_empty(), "no frames");
+        assert_eq!(inbound.series_returned, 0, "no rows");
+        assert!(inbound.scalar.is_empty(), "no frames");
+
+        let local = service.run_local(request).await.expect("local run");
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 2);
+        assert_eq!(
+            local.status,
+            pb::status::Code::SnapshotInvalidated,
+            "{}",
+            local.status_message
+        );
+        assert_eq!(
+            local.status_message, inbound.status_message,
+            "only the status moves; the reason is reported unchanged"
+        );
+        assert_eq!(local.series_returned, 0, "no rows");
+        assert!(local.scalar.is_empty(), "no frames");
     }
 
     /// A commit record whose bytes do not decode fails the fragment locally.

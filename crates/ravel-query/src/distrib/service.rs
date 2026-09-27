@@ -68,9 +68,13 @@
 //! fails verification, or disagrees with the identity fails the slice with
 //! `UNSUPPORTED`, which makes the coordinator run the whole query locally
 //! through its own catalog resolve. A record GET that fails with a retryable
-//! store error is [`ResolveIdentityError::RecordUnavailable`] and fails the
-//! slice with `UNAVAILABLE`, which makes the coordinator re-dispatch that one
-//! slice. None of them ever reads another object instead.
+//! store error is [`ResolveIdentityError::RecordUnavailable`] and fails an
+//! inbound slice with `UNAVAILABLE`, which makes the coordinator re-dispatch
+//! that one slice; on the coordinator's own local attempt, where there is no
+//! worker left to re-dispatch to, it fails with `SNAPSHOT_INVALIDATED`
+//! instead, which is one re-resolve and retry (see
+//! [`SeriesFetchService::with_local_attempt`]). None of them ever reads
+//! another object instead.
 //!
 //! Cross-cluster federation is the exception, and stays one: a resolve-scope
 //! request is authoritative on the remote cluster, which resolves its OWN
@@ -721,6 +725,11 @@ pub struct SeriesFetchService<R: SegmentResolver + 'static> {
     /// (the default) drops the totals, which is what a caller with no counters
     /// of its own wants; the server wires its fragment-metrics family here.
     record_get_observer: Option<Arc<dyn RecordGetObserver>>,
+    /// Whether this service is running the coordinator's OWN slice in process
+    /// rather than serving an inbound request, set via
+    /// [`with_local_attempt`](Self::with_local_attempt). It changes exactly one
+    /// status: see that builder.
+    local_attempt: bool,
 }
 
 impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
@@ -733,7 +742,33 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             engine: EngineConfig::default(),
             resolve_scope: false,
             record_get_observer: None,
+            local_attempt: false,
         }
+    }
+
+    /// Marks this service as running the coordinator's own slice in process,
+    /// with no network hop before it and no worker left to hand it to.
+    ///
+    /// That changes exactly one status. A retryable record GET failure is
+    /// [`ResolveIdentityError::RecordUnavailable`], which is `UNAVAILABLE`,
+    /// which the coordinator reads as "every attempt, local included, was
+    /// unavailable" and fails the query on. That reading is right for a slice
+    /// that walked the remote ladder and wrong for one dispatched straight to
+    /// local execution: a self-mapped or unroutable slice makes no remote
+    /// attempt at all, so a single store blip on one record would fail the
+    /// whole query with no retry. On this path it becomes
+    /// `SNAPSHOT_INVALIDATED`, which the coordinator answers with one
+    /// re-resolve and retry, the same recovery the catalog re-resolve this
+    /// path replaced had.
+    ///
+    /// Only the resolve phase's retryable failure moves. A fetch-phase
+    /// `UNAVAILABLE` still means the segment reads themselves are failing and
+    /// stays terminal, so the remote-then-fallback ladder still ends where it
+    /// did.
+    #[must_use]
+    pub fn with_local_attempt(mut self) -> Self {
+        self.local_attempt = true;
+        self
     }
 
     /// Wires where this worker reports the record GETs its pinned resolves
@@ -1034,7 +1069,18 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                 spent.s3_bytes(AccountedOp::Get),
             );
         }
-        resolved.map_err(|err| SliceFailure::from((err.status_code(), err.to_string())))
+        resolved.map_err(|err| SliceFailure::from((self.resolve_status(&err), err.to_string())))
+    }
+
+    /// The status a resolve refusal fails this slice with. Every variant takes
+    /// [`ResolveIdentityError::status_code`], except a retryable record GET on
+    /// the coordinator's own local attempt: see
+    /// [`with_local_attempt`](Self::with_local_attempt).
+    fn resolve_status(&self, err: &ResolveIdentityError) -> pb::status::Code {
+        if self.local_attempt && matches!(err, ResolveIdentityError::RecordUnavailable { .. }) {
+            return pb::status::Code::SnapshotInvalidated;
+        }
+        err.status_code()
     }
 
     /// The Metrics slice path: resolve the pinned scope to refs, fetch each
@@ -2777,6 +2823,84 @@ mod reconstruct_tests {
         assert_eq!(calls, 1);
         assert_eq!(requests, 1, "the missing record was still GET once");
         assert_eq!(bytes, 0, "a miss transfers no bytes");
+    }
+
+    /// Resolve `identities` through a service, optionally marked as the
+    /// coordinator's own local attempt, and return the slice failure.
+    async fn refused_slice(
+        store: Arc<dyn ObjectStoreBackend>,
+        identity: &pb::SegmentIdentity,
+        local_attempt: bool,
+    ) -> SliceFailure {
+        let mut service = SeriesFetchService::new(
+            SegmentFetcher::new(Arc::clone(&store)),
+            Arc::new(resolver(store)),
+        );
+        if local_attempt {
+            service = service.with_local_attempt();
+        }
+        service
+            .resolve_pinned(std::slice::from_ref(identity))
+            .await
+            .err()
+            .expect("the resolve must refuse")
+    }
+
+    /// A store fault that makes every record GET fail retryably.
+    async fn store_with_throttled_l0() -> Arc<dyn ObjectStoreBackend> {
+        Arc::new(FaultStore::new(
+            store_with_l0().await,
+            FaultPlan::empty().with_rule(Rule::new(
+                Op::Get,
+                ScriptedFault::Throttled { retry_after_ms: 5 },
+            )),
+        ))
+    }
+
+    /// A retryable record GET is `UNAVAILABLE` on an inbound slice, which the
+    /// coordinator answers by re-dispatching that slice to another worker. On
+    /// the coordinator's OWN local attempt there is no other worker: that
+    /// status is terminal there, so the slice fails `SNAPSHOT_INVALIDATED`
+    /// instead and the coordinator re-resolves and retries once.
+    #[tokio::test]
+    async fn a_local_attempt_maps_a_retryable_record_get_to_snapshot_invalidated() {
+        let inbound = refused_slice(store_with_throttled_l0().await, &l0_identity(), false).await;
+        assert_eq!(
+            inbound.code,
+            pb::status::Code::Unavailable,
+            "{}",
+            inbound.message
+        );
+        let local = refused_slice(store_with_throttled_l0().await, &l0_identity(), true).await;
+        assert_eq!(
+            local.code,
+            pb::status::Code::SnapshotInvalidated,
+            "{}",
+            local.message
+        );
+        assert_eq!(
+            local.message, inbound.message,
+            "only the status moves; the reason is reported unchanged"
+        );
+    }
+
+    /// Exactly one status moves on a local attempt. A record that is simply
+    /// absent is not retryable at any worker, so it stays `UNSUPPORTED` and
+    /// the coordinator runs the whole query locally rather than re-resolving
+    /// a snapshot that was never the problem.
+    #[tokio::test]
+    async fn a_local_attempt_leaves_every_other_resolve_failure_alone() {
+        let missing = refused_slice(store_with(Vec::new()).await, &l0_identity(), true).await;
+        assert_eq!(
+            missing.code,
+            pb::status::Code::Unsupported,
+            "{}",
+            missing.message
+        );
+        let mut malformed = l0_identity();
+        malformed.level = 9;
+        let bad = refused_slice(store_with_l0().await, &malformed, true).await;
+        assert_eq!(bad.code, pb::status::Code::BadData, "{}", bad.message);
     }
 
     /// A snapshot resolver miss is retryable, not terminal: the coordinator

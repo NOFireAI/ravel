@@ -1640,8 +1640,10 @@ objects were all still readable.
    through its own catalog resolve. A record GET that fails with a retryable
    store error (throttled, timed out, or transient) fails the slice
    `Unavailable` instead, so only that slice is re-dispatched, as for a lost
-   worker. A structurally malformed identity is `BadData`. None of these reads
-   another object in place of the one pinned.
+   worker. (True of an INBOUND slice; a slice the coordinator runs itself has
+   no worker left to re-dispatch to, and the local-attempt amendment below
+   decides what it does instead.) A structurally malformed identity is
+   `BadData`. None of these reads another object in place of the one pinned.
 
 4. **Request count.** A worker issues one record GET per pinned L0 segment,
    one per pinned L1 part, and two for an L1 part only a rewrite record
@@ -1727,3 +1729,59 @@ tenant, looks identical at the `/metrics` surface to one paying none.
   counter by `ravel_distrib_fragment_requests_total` gives the mean pinned
   segments per slice, against which a rewrite-record fallback shows up as a
   rise.
+
+## Amendment (2026-09-27): a retryable record GET on the coordinator's own attempt
+
+<!-- amendment-applies: sections="Amendment (2026-09-26): a worker resolves each pinned segment from its own record" pointer="local-attempt amendment" -->
+
+Status: Accepted. Issue #1721.
+
+### Context
+
+Decision 3 above reads "fails the slice `Unavailable` instead, so only that
+slice is re-dispatched, as for a lost worker." That holds for a slice a
+coordinator dispatched to a worker. It does not hold for a slice the
+coordinator runs itself, and two of the three paths through
+`RoutingSliceFetcher::dispatch` are exactly that:
+
+- A self-mapped or unroutable slice is handed straight to local execution,
+  with no remote attempt before it and no fallback after it.
+- The final fallback, after a remote worker and its one re-dispatch have both
+  failed, is also local execution.
+
+The coordinator treats an `Unavailable` summary as terminal, because on the
+remote path it means every attempt including the local one was already spent.
+So on the self-mapped path a single throttled record GET failed the whole
+query with no retry at all, where the catalog re-resolve this design replaced
+answered the same blip with one re-resolve and retry. That is a regression
+this ADR's own invariant forbids: a query that succeeds locally must not fail
+because it was distributed.
+
+### Decision
+
+1. **A retryable record GET on a LOCAL attempt fails the slice
+   `SnapshotInvalidated`, not `Unavailable`.** The coordinator answers that
+   status with one re-resolve and one retry, which is the recovery the catalog
+   re-resolve had. Both local arms take it: the self-mapped or unroutable
+   slice, and the fallback after the remote ladder is exhausted. An inbound
+   fragment served for another coordinator is unchanged and still fails
+   `Unavailable`, because that coordinator really can re-dispatch it.
+
+2. **Only the resolve phase moves.** A fetch-phase `Unavailable`, which says
+   the segment reads themselves are failing, stays terminal on every path. A
+   record that is missing, unreadable, fails verification, or disagrees with
+   the identity stays `Unsupported` on every path, and a malformed identity
+   stays `BadData`: neither is retryable at any worker, so re-resolving a
+   snapshot that was never the problem would only spend a round.
+
+3. **Which caller this is, is known where the decision is made.** The worker
+   service is told it is executing a local attempt, rather than the
+   coordinator inferring the phase from a status message it cannot parse
+   reliably. Nothing on the wire changes, and `PROTOCOL_VERSION` is unchanged.
+
+### Consequences
+
+- A store blip on one record costs a re-resolve and retry on a single-process
+  or self-mapped deployment, instead of failing the query.
+- The remote failure ladder is unchanged end to end: primary, exactly one
+  re-dispatch, local, and a typed failure only if local fails too.

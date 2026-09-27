@@ -2540,3 +2540,194 @@ async fn compaction_between_resolve_and_fetch_returns_local_rows() {
 
     server_a.shutdown().await.expect("the worker shuts down");
 }
+
+/// A retryable record-GET failure on a SELF-MAPPED slice must still answer the
+/// query.
+///
+/// `RoutingSliceFetcher::dispatch` runs a self-mapped or unroutable slice
+/// through `run_local` directly: no remote attempt precedes it and no local
+/// fallback follows it. The coordinator, meanwhile, treats an `Unavailable`
+/// summary as terminal, because on the remote path it means every attempt --
+/// primary, one re-dispatch, and local -- was already spent. A worker-side
+/// `Unavailable` raised by the RESOLVE phase on the self-mapped path therefore
+/// had nowhere to go and failed the whole query on a single store blip, where
+/// the catalog re-resolve it replaced cost one re-resolve and retry.
+///
+/// The blip is injected on the fragment service's OWN store only: a
+/// `FaultStore` wrapping the shared backing store, so the coordinator's
+/// catalog resolve and the local oracle read unfaulted objects and only the
+/// pinned resolve's record GET faults. `Occurrence::Nth(1)` fires it once, so
+/// the retry the fix produces reads the record successfully.
+///
+/// NON-VACUITY: the fault counter must read exactly 1, so the blip really
+/// fired and was really survived; and the rows are pinned to the exact grid
+/// the published samples produce, not merely compared against an oracle that
+/// could be empty on both sides.
+#[tokio::test]
+async fn a_retryable_record_get_on_a_self_mapped_slice_still_answers_the_query() {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_query::distrib::codec;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_server::distrib::{
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+    let backing: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    let tenant_hash = tenant.hash();
+    let now = now_ns();
+    // Minute-aligned and two hours back, so every grid step lands exactly on a
+    // sample offset and the whole window is in the past.
+    let anchor = (now - 2 * NS_PER_HOUR) / NS_PER_MIN * NS_PER_MIN;
+    publish_segment(backing.as_ref(), &tenant, anchor).await;
+
+    // Only the worker's own record GET faults: commit records end `.cmt`, and
+    // the data objects this same store serves end `.rseg`.
+    let worker_store = Arc::new(FaultStore::new(
+        Arc::clone(&backing),
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("record GET throttled".to_string()),
+            )
+            .with_key_contains(".cmt")
+            .with_occurrence(Occurrence::Nth(1)),
+        ),
+    ));
+    let worker_backend: Arc<dyn ObjectStoreBackend> = worker_store.clone();
+
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
+    let local_catalog = ravel_server::query::build_catalog(
+        Arc::clone(&backing),
+        1,
+        false,
+        CACHE_BYTES,
+        None,
+        None,
+        None,
+        Duration::from_secs(2),
+    )
+    .expect("catalog");
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let local_service = FragmentService::new(
+        Arc::new(vec![FRAGMENT_KEY]),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            HashMap::new(),
+        )),
+        admission,
+        local_catalog,
+        worker_backend,
+        None,
+        clock,
+        metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+    );
+
+    // The only live worker IS this coordinator, so the slice's rendezvous owner
+    // is `Owner::SelfLocal` and `dispatch` takes the run-local arm.
+    let self_id = uuid::Uuid::from_u128(0x5E1F);
+    let self_cell = Arc::new(OnceLock::new());
+    self_cell.set(self_id).expect("set self id");
+    let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+        process_id: self_id.to_string(),
+        // Never dialed: a self-mapped slice makes no network hop.
+        fragment_endpoint: "127.0.0.1:1".to_string(),
+        flight_sql_endpoint: "127.0.0.1:1".to_string(),
+        protocol_version: codec::PROTOCOL_VERSION,
+        started_unix_ns: 0,
+    }])));
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        Arc::new(vec![FRAGMENT_KEY]),
+        local_service,
+        metrics.clone(),
+    ));
+    let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+        fetcher,
+        always_distribute_settings().thresholds,
+    ));
+    let coordinator_catalog = ravel_server::query::build_catalog(
+        Arc::clone(&backing),
+        1,
+        false,
+        CACHE_BYTES,
+        None,
+        None,
+        None,
+        Duration::from_secs(2),
+    )
+    .expect("catalog");
+    let coordinator = QueryEngine::new(
+        coordinator_catalog,
+        Arc::clone(&backing),
+        EngineConfig::default(),
+    )
+    .with_distributed(distributed);
+
+    let (start_ms, end_ms, step_ms) = (
+        anchor / NS_PER_SEC * 1000,
+        (anchor + 10 * NS_PER_MIN) / NS_PER_SEC * 1000,
+        60_000,
+    );
+    let (value, _) = coordinator
+        .range_with_stats(
+            tenant_hash,
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a single retryable record-GET blip must not fail the query");
+
+    assert_eq!(
+        worker_store.fault_count(Op::Get, FaultKind::Transient),
+        1,
+        "the record GET blip must have fired exactly once"
+    );
+    let series = match &value {
+        ravel_promql::Value::Matrix(matrix) => matrix,
+        other => panic!("a range query returns a matrix, got {}", other.type_name()),
+    };
+    assert_eq!(series.len(), 1, "the published segment carries one series");
+    let points: Vec<(i64, u64)> = series[0]
+        .1
+        .iter()
+        .map(|sample| ((sample.ts_ns - anchor) / NS_PER_MIN, sample.value.to_bits()))
+        .collect();
+    // The 5-minute lookback carries the sample at +0 across steps 0..2 and the
+    // sample at +3 across steps 3..7; step 8 is five minutes past it and empty.
+    let expected: Vec<(i64, u64)> = [0, 1, 2]
+        .into_iter()
+        .map(|m| (m, 1.0f64.to_bits()))
+        .chain([3, 4, 5, 6, 7].into_iter().map(|m| (m, 2.5f64.to_bits())))
+        .collect();
+    assert_eq!(
+        points, expected,
+        "the retried query returns the exact grid the published samples produce"
+    );
+    assert_eq!(
+        metrics.slices_remote_total(),
+        0,
+        "the slice is self-mapped: no remote dispatch is made"
+    );
+    assert_eq!(
+        metrics.slices_fallback_total(),
+        0,
+        "a self-mapped slice never enters the remote-then-fallback ladder"
+    );
+}

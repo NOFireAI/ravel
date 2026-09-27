@@ -37,9 +37,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   beside the other `ravel_distrib_fragment_*` series, carrying only the
   `mode` label. A record that is missing, unreadable, fails verification,
   or disagrees with the identity fails the fragment with `UNSUPPORTED`, and the
-  coordinator runs the query locally; a throttled, timed-out or transient
-  error on the record GET fails it with `UNAVAILABLE`, and the coordinator
-  re-dispatches that slice; a malformed identity is `BAD_DATA`.
+  coordinator runs the query locally; a malformed identity is `BAD_DATA`. A
+  throttled, timed-out or transient error on the record GET fails an inbound
+  fragment with `UNAVAILABLE`, and the coordinator re-dispatches that slice to
+  another worker. On a slice the coordinator runs itself there is no other
+  worker to re-dispatch to and `UNAVAILABLE` would be terminal, so that same
+  failure fails the slice `SNAPSHOT_INVALIDATED` instead and the coordinator
+  re-resolves and retries once, keeping the recovery the catalog re-resolve
+  had. That covers both local arms: a self-mapped or unroutable slice, which
+  is dispatched straight to local execution with no remote attempt at all, and
+  the fallback after a remote worker and its one re-dispatch both failed. Only
+  the resolve phase moves; a fetch-phase `UNAVAILABLE` still means the segment
+  reads themselves are failing and stays terminal.
   Records and the objects they name are immutable, so the pinned read is
   unaffected by whatever the catalog says by then. The queryfrag wire and
   `PROTOCOL_VERSION` are unchanged, and cross-cluster federation is unchanged:
