@@ -593,10 +593,13 @@ pub struct ServerConfig {
     pub query_concurrency_limit: ravel_query::QueryConcurrencyLimit,
     /// The per-query S3 request budget (ADR-0073 decision 3, ADR-0075),
     /// resolved from `--max-s3-requests`. `main` fills it via
-    /// [`crate::config::Cli::resolve_max_s3_requests`]: an explicit flag is
-    /// used verbatim, otherwise the budget is derived from `--shards` and the
-    /// ingest flush cadence so the worst legitimate open hour fits at the
-    /// configured shard count while a runaway query stays bounded. [`start`]
+    /// [`crate::config::Cli::resolve_max_s3_requests_with`] at
+    /// [`crate::query::server_seal_margin`]: an explicit flag is used verbatim,
+    /// otherwise the budget is derived from `--shards`, the ingest flush
+    /// cadence and the catalog's own seal margin, so a cold query over the
+    /// longest healthy unsealed tail plus the fold-stall alert window fits at
+    /// the configured shard count while a runaway query stays bounded (ADR-1306
+    /// decisions 1 to 3). [`start`]
     /// threads this into the one process-wide `EngineConfig` both query
     /// surfaces (PromQL/HTTP and SQL/HTTP) share, so the resolved budget is the
     /// enforced budget. Distinct from the flat default an
