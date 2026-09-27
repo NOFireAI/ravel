@@ -17,7 +17,7 @@
 use datafusion::error::DataFusionError;
 use datafusion::error::Result as DFResult;
 use ravel_logseg::LogRecord;
-use ravel_query::erasure::ErasurePredicate;
+use ravel_query::erasure::{self, ErasurePredicate};
 use ravel_types::logstream::AttrValue;
 
 use crate::error::SqlError;
@@ -28,16 +28,12 @@ use crate::error::SqlError;
 /// promote well-known keys into typed columns (alerts' `alert_id`/`rule_id`/
 /// `state`/`generation`) read them out of this same merged view with
 /// [`find_attr`], so a promoted column and the `attrs` map never disagree.
+///
+/// The merge itself is [`ravel_query::erasure::merged_log_attrs`], shared with
+/// every non-SQL reader of log records (`ravel-cli export`), so the view a
+/// query sees and the view erasure matches on cannot drift apart.
 pub(crate) fn merged_attrs(r: &LogRecord) -> DFResult<Vec<(String, AttrValue)>> {
-    let mut merged = decode_stream_attrs(&r.stream_attrs)?;
-    for (k, v) in &r.attrs {
-        if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == k) {
-            slot.1 = v.clone();
-        } else {
-            merged.push((k.clone(), v.clone()));
-        }
-    }
-    Ok(merged)
+    erasure::merged_log_attrs(r).map_err(|e| corrupt(&e.to_string()))
 }
 
 /// Scan-layer selective-erasure exclusion for the RLOG-backed tables
@@ -47,15 +43,15 @@ pub(crate) fn merged_attrs(r: &LogRecord) -> DFResult<Vec<(String, AttrValue)>> 
 /// column exposes to the query surface. That is the authoritative exclusion: a
 /// subject named only in a resource or scope attribute (`user_id`, `host.name`,
 /// `service.instance.id`) is queryable through `attrs` yet invisible to a
-/// record-attribute-only filter, so it must be matched here. This
-/// mirrors [`ravel_query::erasure::is_erased_span`] but over the
-/// [`AttrValue`]-typed merged map.
+/// record-attribute-only filter, so it must be matched here.
+///
+/// The rule is [`ravel_query::erasure::retain_unerased_log_records`]; this
+/// wrapper only maps its decode error into the SQL error class.
 ///
 /// A no-op when `erasure` is empty. Fallible because the decode is fallible: a
 /// corrupt `stream_attrs` blob must still error the query, exactly as
 /// [`merged_attrs`] does inside `build_batch`, never silently drop or leak the
-/// row. A `Vec::retain` closure cannot propagate an error, so the survivor set
-/// is built explicitly.
+/// row.
 pub(crate) fn retain_unerased(
     records: &mut Vec<LogRecord>,
     erasure: &[ErasurePredicate],
@@ -74,22 +70,8 @@ pub(crate) fn retain_unerased_by<T>(
     erasure: &[ErasurePredicate],
     record: impl Fn(&T) -> &LogRecord,
 ) -> DFResult<()> {
-    if erasure.is_empty() {
-        return Ok(());
-    }
-    let mut survivors = Vec::with_capacity(items.len());
-    for item in std::mem::take(items) {
-        let r = record(&item);
-        let merged = merged_attrs(r)?;
-        let erased = erasure
-            .iter()
-            .any(|p| p.matches_log_attrs(&merged) && (!p.has_window() || p.ts_in_window(r.ts_ns)));
-        if !erased {
-            survivors.push(item);
-        }
-    }
-    *items = survivors;
-    Ok(())
+    erasure::retain_unerased_log_records_by(items, erasure, record)
+        .map_err(|e| corrupt(&e.to_string()))
 }
 
 /// Look up one key in a [`merged_attrs`] result, for tables that promote a
@@ -116,7 +98,9 @@ pub(crate) use ravel_logseg::record::attr_value_to_string;
 /// fields, not key-value entries, so they never become synthetic
 /// `scope.name`/`scope.version` keys. Delegates the actual decode to
 /// [`ravel_logseg::record::decode_stream_attrs`], the structured, full-fidelity
-/// decoder shared with the reader.
+/// decoder shared with the reader, through
+/// [`ravel_query::erasure::stream_identity_attrs`], the same function the
+/// shared merged view uses.
 ///
 /// A top-level entry whose value is itself a `Map` or `List` is decoded (so
 /// the underlying walk stays in frame) but **omitted** from the returned
@@ -126,14 +110,7 @@ pub(crate) use ravel_logseg::record::attr_value_to_string;
 /// -- they are merged in verbatim by [`merged_attrs`] and rendered by
 /// [`attr_value_to_string`].
 pub(crate) fn decode_stream_attrs(blob: &[u8]) -> DFResult<Vec<(String, AttrValue)>> {
-    let attrs =
-        ravel_logseg::record::decode_stream_attrs(blob).map_err(|e| corrupt(&e.to_string()))?;
-    Ok(attrs
-        .resource
-        .into_iter()
-        .chain(attrs.scope_attrs)
-        .filter(|(_, v)| !matches!(v, AttrValue::Map(_) | AttrValue::List(_)))
-        .collect())
+    erasure::stream_identity_attrs(blob).map_err(|e| corrupt(&e.to_string()))
 }
 
 fn corrupt(what: &str) -> DataFusionError {

@@ -237,7 +237,7 @@ pub enum TsUnit {
 }
 
 impl TsUnit {
-    fn factor(self) -> i64 {
+    pub(crate) fn factor(self) -> i64 {
         match self {
             TsUnit::Seconds => 1_000_000_000,
             TsUnit::Millis => 1_000_000,
@@ -321,6 +321,13 @@ pub struct Mapping {
     /// stream identity.
     #[serde(default, rename = "attribute")]
     pub attributes: Vec<AttrMap>,
+    /// Opt-in output column for `ravel-cli export` (ADR-1751 decision 4): every
+    /// record attribute not named by `attributes` above is written into this
+    /// one `Map<Utf8, Utf8>` column, stringified the same way `attrs['<key>']`
+    /// stringifies a value for SQL. Write side only: `ravel-cli load` does not
+    /// read this column back. A mapping that never sets it is unaffected.
+    #[serde(default)]
+    pub attrs_map_column: Option<String>,
 }
 
 /// Parse a `--mapping` TOML document.
@@ -3859,6 +3866,7 @@ mod tests {
             span_id_column: None,
             resource_attributes: Vec::new(),
             attributes: Vec::new(),
+            attrs_map_column: None,
         }
     }
 
