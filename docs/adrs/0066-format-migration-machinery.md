@@ -492,7 +492,8 @@ Scope: RSEG (metrics) only. RLOG and RSPAN objects carry their own trailers and
 their own windows in `ravel-logseg` and `ravel-rspan`; probing them with the
 RSEG gate would classify every one of them as corrupt, which is exactly the
 collapse decision 2 forbids. Those two signals keep the unnarrowed sweep until
-their readers grow the same probe.
+their readers grow the same probe. (Since widened to RLOG and RSPAN: see the
+2026-09-27 amendment below.)
 
 Decision 1's window also changed shape in the same change, without changing
 which versions it admits. The trailer gate and the structural validator each
@@ -507,3 +508,18 @@ rule set the compiler then demands.
 
 Still open from #530, not addressed here: one migration exercised end to end
 through `maintain migrate` across a real bump, and a documented rollback stance.
+
+## Amendment (2026-09-27, #530): the retention version hold covers logs and spans
+
+<!-- amendment-applies: sections="Amendment (2026-09-13, #530): retention ages out only what this build can read" pointer="2026-09-27 amendment" -->
+
+The 2026-09-13 amendment scoped retention's version hold to RSEG (metrics)
+and left RLOG and RSPAN on the unnarrowed sweep until their readers grew the
+same probe. They did not need a new probe: `ravel_logseg::open_from_suffix`
+and `ravel_rspan::open_from_suffix` check magic and then the version window
+before any footer byte, and return the typed `UnsupportedVersion` decision 2
+requires. The hold now runs each bucket's data objects through the gate of
+its own format over the same 16-byte suffix GET, so force 1's narrowing
+("retention ages out an object only when this build can read its version")
+holds for all three bulk data-object formats. The rollback consequence is
+recorded in ADR-0531's 2026-09-27 amendment.
