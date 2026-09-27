@@ -893,6 +893,10 @@ pub async fn sweep(
         superseded_records_deleted,
         superseded_data_deleted,
         unreferenced_parts_deleted,
+        // Byte totals for the reclaimed-bytes metric (issue #1729); this CLI
+        // reports counts, not bytes, so they are not printed here.
+        quarantine_reaped_bytes: _,
+        unreferenced_parts_bytes: _,
         orphan_breaker_tripped,
         orphans_withheld,
         orphan_breaker_overridden,

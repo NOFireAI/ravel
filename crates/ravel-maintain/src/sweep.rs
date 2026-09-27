@@ -203,6 +203,16 @@ pub struct SweepReport {
     pub superseded_data_deleted: usize,
     /// Rule 3: unreferenced `l1/` part objects deleted.
     pub unreferenced_parts_deleted: usize,
+    /// Bytes of the objects [`Self::quarantine_reaped`] deleted this pass, from
+    /// each reaped object's listed [`ObjectMeta::size`]. Known without an extra
+    /// request because the reaper already listed the quarantine prefix; feeds
+    /// `ravel_maintain_bytes_reclaimed_total`.
+    pub quarantine_reaped_bytes: u64,
+    /// Bytes of the objects [`Self::unreferenced_parts_deleted`] deleted this
+    /// pass, from each part's listed [`ObjectMeta::size`]. Known without an
+    /// extra request because rule 3 already listed the `l1/` prefix; feeds
+    /// `ravel_maintain_bytes_reclaimed_total`.
+    pub unreferenced_parts_bytes: u64,
     /// Rule 1's mass-orphan circuit breaker tripped this pass (ADR-0048
     /// decision 4): `orphans_deleted` is `0` and `orphans_withheld` carries
     /// what would have been deleted. Rules 2 and 3 above are unaffected and
@@ -279,8 +289,9 @@ pub async fn sweep_shard_with_holds(
     log_superseded_holds(tenant, signal, shard, &superseded);
     let mut superseded_holds = SupersededHolds::default();
     superseded_holds.absorb(&superseded);
-    let unreferenced_parts_deleted =
-        sweep_unreferenced_parts(store, clock, config, lease, tenant, signal, shard).await?;
+    let (unreferenced_parts_deleted, unreferenced_parts_bytes) =
+        sweep_unreferenced_parts_impl(store, clock, config, lease, tenant, signal, shard, None)
+            .await?;
     let (
         orphans_deleted,
         orphans_refused,
@@ -322,6 +333,8 @@ pub async fn sweep_shard_with_holds(
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
             unreferenced_parts_deleted,
+            quarantine_reaped_bytes: quarantine.reaped_bytes,
+            unreferenced_parts_bytes,
             orphan_breaker_tripped,
             orphans_withheld,
             orphan_breaker_overridden,
@@ -457,7 +470,7 @@ pub async fn sweep_shard_zoned_with_holds(
     log_superseded_holds(tenant, signal, shard, &superseded);
     let mut superseded_holds = SupersededHolds::default();
     superseded_holds.absorb(&superseded);
-    let unreferenced_parts_deleted = sweep_unreferenced_parts_impl(
+    let (unreferenced_parts_deleted, unreferenced_parts_bytes) = sweep_unreferenced_parts_impl(
         store,
         clock,
         config,
@@ -517,6 +530,8 @@ pub async fn sweep_shard_zoned_with_holds(
             superseded_records_deleted: superseded.records_deleted,
             superseded_data_deleted: superseded.data_deleted,
             unreferenced_parts_deleted,
+            quarantine_reaped_bytes: quarantine.reaped_bytes,
+            unreferenced_parts_bytes,
             orphan_breaker_tripped,
             orphans_withheld,
             orphan_breaker_overridden,
@@ -867,6 +882,10 @@ pub struct QuarantineSweepOutcome {
     /// Objects physically deleted from `quarantine/` this pass, past the second
     /// horizon.
     pub reaped: usize,
+    /// Bytes of the [`Self::reaped`] objects, summed from each object's listed
+    /// [`ObjectMeta::size`] as the pass deletes it. No extra request: the size
+    /// comes from the LIST the reaper already issues.
+    pub reaped_bytes: u64,
     /// Objects left in quarantine this pass, still inside the second horizon
     /// (or with an unparseable timestamp, or held: a hold on the recovered
     /// original key binds to its quarantine copy).
@@ -901,6 +920,7 @@ pub async fn sweep_quarantine(
     let objects = list_all(store, &prefix).await?;
 
     let mut reaped = 0usize;
+    let mut reaped_bytes = 0u64;
     let mut retained = 0usize;
     for meta in objects {
         let Some(quarantined_at_ns) = parse_quarantine_timestamp(&meta.key) else {
@@ -921,6 +941,7 @@ pub async fn sweep_quarantine(
             store.delete(&meta.key).await?;
         }
         reaped += 1;
+        reaped_bytes = reaped_bytes.saturating_add(meta.size);
     }
 
     if reaped > 0 {
@@ -935,7 +956,11 @@ pub async fn sweep_quarantine(
         );
     }
 
-    Ok(QuarantineSweepOutcome { reaped, retained })
+    Ok(QuarantineSweepOutcome {
+        reaped,
+        reaped_bytes,
+        retained,
+    })
 }
 
 // --- Rule 2: superseded-input sweep (ADR-0018) -----------------------------
@@ -2057,7 +2082,9 @@ pub async fn sweep_unreferenced_parts(
     signal: Signal,
     shard: u32,
 ) -> Result<usize> {
-    sweep_unreferenced_parts_impl(store, clock, config, lease, tenant, signal, shard, None).await
+    Ok(sweep_unreferenced_parts_impl(store, clock, config, lease, tenant, signal, shard, None)
+        .await?
+        .0)
 }
 
 /// Shared implementation behind [`sweep_unreferenced_parts`] (whole-shard,
@@ -2065,6 +2092,10 @@ pub async fn sweep_unreferenced_parts(
 /// When scoped, both the commit-prefix listing that builds the reference map
 /// and the `l1/` listing are restricted to `hours`: an interior bucket this
 /// tick's zone recomputation skipped is never listed by either.
+///
+/// Returns the count of deleted parts and their total bytes, summed from each
+/// part's listed [`ObjectMeta::size`] (no extra request; the size comes from the
+/// `l1/` LIST this pass already issues).
 #[allow(clippy::too_many_arguments)]
 async fn sweep_unreferenced_parts_impl(
     store: &dyn ObjectStoreBackend,
@@ -2075,7 +2106,7 @@ async fn sweep_unreferenced_parts_impl(
     signal: Signal,
     shard: u32,
     hours: Option<&[u32]>,
-) -> Result<usize> {
+) -> Result<(usize, u64)> {
     let now = clock.now_ns();
     let gate = config.unreferenced_part_age_gate_ns();
     let (referenced, tombstoned) =
@@ -2083,6 +2114,7 @@ async fn sweep_unreferenced_parts_impl(
 
     let objects = list_l1_scoped(store, tenant, signal, shard, hours).await?;
     let mut deleted = 0usize;
+    let mut deleted_bytes = 0u64;
     for meta in objects {
         let parsed = keys::parse_l1_part_key(&meta.key)?;
         let bucket = parsed.ingest_hour_bucket;
@@ -2111,8 +2143,9 @@ async fn sweep_unreferenced_parts_impl(
             store.delete(&meta.key).await?;
         }
         deleted += 1;
+        deleted_bytes = deleted_bytes.saturating_add(meta.size);
     }
-    Ok(deleted)
+    Ok((deleted, deleted_bytes))
 }
 
 /// Why an `l1/` object is a rule-3 deletion candidate. The pre-delete
@@ -3712,6 +3745,61 @@ mod tests {
             recovered,
             BTreeSet::from([key_b]),
             "exactly B remains quarantined; A is physically gone"
+        );
+    }
+
+    /// The reaper reports the exact bytes it reclaimed, summed from each reaped
+    /// object's listed size, and counts only objects it actually deletes: an
+    /// object still inside the horizon adds neither a count nor a byte (issue
+    /// #1729). Flip-line proof: dropping `reaped_bytes += meta.size` leaves the
+    /// byte total at `0` while the count still reads `1`.
+    #[tokio::test]
+    async fn reaper_reports_exact_reclaimed_bytes() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 7;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+
+        // Seed one orphan with a known nonzero payload and quarantine it.
+        const PAYLOAD_LEN: usize = 24;
+        let writer_id = Uuid::from_u128(1);
+        let content_hash = [7u8; 32];
+        let key = keys::data_key(&tenant, signal, shard, writer_id, 1, 0, &content_hash)
+            .expect("valid data key");
+        store
+            .put(
+                &key,
+                Bytes::from(vec![0u8; PAYLOAD_LEN]),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed orphan payload");
+        let t1 = config.orphan_age_gate_ns() + 1;
+        let clock = FixedClock::new(t1);
+        let quarantined = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine");
+        assert_eq!(quarantined.deleted, 1);
+
+        // Seed a second orphan that will remain inside the horizon at reap time.
+        put_orphan(&store, &tenant, signal, shard, 1).await;
+        let t2 = t1 + config.quarantine_horizon_ns;
+        clock.set(t2);
+        sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("quarantine second");
+
+        // Reap just past the first object's horizon: only the 24-byte object.
+        clock.set(t2 + 1);
+        let reaped = sweep_quarantine(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("reap");
+        assert_eq!(reaped.reaped, 1, "only the object past the horizon");
+        assert_eq!(reaped.retained, 1, "the second object is still inside it");
+        assert_eq!(
+            reaped.reaped_bytes, PAYLOAD_LEN as u64,
+            "reaped_bytes is the reaped object's listed size, and excludes the retained one",
         );
     }
 

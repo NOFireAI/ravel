@@ -131,6 +131,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     repeat notifications per interval to every sink where it used to send
     one. Raise `repeat_interval`, or set it to `0s`, on rules that match many
     series.
+
 ### Added
 
 - **`ravel-server` builds a read and a write CPU gate and reports their
@@ -245,6 +246,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   messages in `span_router.rs` and records on-actor and off-actor time in
   `span_shard.rs`, matching the metrics and log pipelines, so all six series
   carry live figures on all three signals.
+
+- **`ravel_maintain_bytes_reclaimed_total` and
+  `ravel_maintain_retention_lag_seconds` render on `/metrics`** (issue #1729).
+  The first is a per-signal counter of bytes freed by the sweep, summed from the
+  listed object size of the two deletions that already carry one, the quarantine
+  reaper and the unreferenced-part delete; superseded and retention deletions
+  are excluded because they delete by key without a size, so the counter is a
+  lower bound and its HELP text says so. The second is a per-signal gauge of how
+  far past its retention deadline the oldest still-present expired bucket is, as
+  observed by this process's most recent completed maintenance cycle, from the
+  injected clock; it is a per-cycle maximum over the process's units and is 0
+  when no expired bucket is still present. Both sit next to the existing
+  `ravel_maintain_*` families under the same maintain-mode gate and carry only
+  the `mode` and `signal` labels. The troubleshooting and observability guides
+  gain alert suggestions for a retention lag that keeps climbing.
 
 ### Changed
 
