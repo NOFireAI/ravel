@@ -70,6 +70,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A full-object GET now verifies the body against the checksum the store
+  recorded at upload** (ADR-1696, issue #1696). A commit record is a bare
+  protobuf with no checksum of its own, so a flipped bit inside a stored record
+  decoded as a valid record: a flip in `max_event_ts_ns` moved the segment out
+  of a query's range and the answer came back short and error-free. The record
+  layout is unchanged; the check moved to the transport that stores the bytes.
+  The S3 adapter asks S3 for the stored checksum with `x-amz-checksum-mode:
+  ENABLED` and recomputes `x-amz-checksum-crc64nvme` or `-crc32c` over the body
+  that arrived, failing a mismatch with the `Corrupted` error the contract
+  already reserves for one, so no reader needed a new error arm. Because the
+  request header must be signed and the HTTP connector that reads the response
+  header runs after signing, the header rides on the client's default headers
+  and is therefore attached to every request, where it is ignored. `MemoryStore`
+  keeps a CRC-32C beside each object and checks it the same way, so the
+  semantics oracle matches. A read with no verifiable checksum is served and
+  counted on the new `ravel_store_get_unverified_total`, never refused: that
+  covers an endpoint that returns no `x-amz-checksum-*` header, a digest this
+  adapter cannot recompute (SHA-256, or a composite multipart digest), and a
+  whole-object read of an object large enough to be split into bounded ranged
+  requests. Caller-issued ranged reads are outside the check entirely, since S3
+  returns the whole-object checksum and a slice cannot be compared against it;
+  they keep the format's own crc32c hierarchy as their check. Write-side upload
+  integrity still defaults to off and is unchanged here.
 - **`ravel-cli export --signal logs` writes a tenant's stored logs back out to
   a Parquet file `ravel-cli load` reads in** (ADR-1751, issue #1712). The
   command takes the store and tenancy flags the other read commands take, plus

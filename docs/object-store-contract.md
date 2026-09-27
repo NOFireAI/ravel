@@ -442,6 +442,71 @@ backstop regardless: the footer/section/page crc32c hierarchy
 (docs/segment-format.md) verifies data on every read of format-bearing bytes,
 independent of whether a wire-level upload checksum existed.
 
+### Read-side checksum verification
+
+A full-object `get` verifies the bytes it received against the checksum the
+store recorded when the object was written, before they reach the caller
+(ADR-1696 decisions 2 to 5). A mismatch is `Corrupted`, the variant this
+document already reserves for a checksum mismatch, so no reader gains an error
+arm. This is the read-time check the commit family otherwise has nowhere to put:
+a commit record is a bare protobuf with no checksum of its own (ADR-1696
+decision 6 keeps it that way), so a flipped bit inside a stored record decodes
+as a valid record and a flip in `max_event_ts_ns` moves the segment out of a
+query's range with no error anywhere.
+
+**`MemoryStore`** records a CRC-32C beside each object on write and recomputes
+it on a full-object get. It is the oracle for this rule, and
+`MemoryStore::corrupt_stored_byte` is the only thing that can make an object's
+stored bytes and stored checksum disagree: it flips one bit of the stored object
+and leaves the checksum alone, which is bit rot, not a rewrite. The contract
+suite pins the rule with `full_object_get_of_a_corrupted_stored_object_is_refused`
+(the `FaultStore` `CorruptRange` counter proves the wrapper was in the path, and
+the refusal still comes from the backend underneath it) and its ranged
+counterpart below.
+
+**`S3Store`** asks S3 for the stored checksum with `x-amz-checksum-mode:
+ENABLED` and recomputes `x-amz-checksum-crc64nvme` or `-crc32c` over the body
+that arrived. Three properties of `object_store` 0.14 shape how:
+
+- The response headers are invisible above the HTTP layer (`GetResult` carries
+  `payload`, `meta`, `range`, `attributes`, and nothing else), so the checksum
+  is read in the counting HTTP connector the adapter already installs below the
+  retry loop and handed back to the adapter per request.
+- That connector runs *after* SigV4 signing, and S3 requires every `x-amz-*`
+  header to be signed, so the request header cannot be added there. It rides on
+  `ClientOptions`' default headers instead, which `object_store` applies before
+  signing. That hook is whole-client, so the header is attached to every request
+  rather than only to GETs; it is meaningless and ignored on the others.
+- A `GetRange::Full` read of an object above `max_request_body_bytes` is served
+  as several bounded ranged requests (see "HTTP client timeouts"), and no one of
+  them carries the whole object a whole-object checksum covers. Such a read is
+  counted unverified rather than verified. Every commit-family record is orders
+  of magnitude below that bound, so a record read is always one request and
+  always verifiable.
+
+**A read with no verifiable checksum is served and counted, never refused**
+(decision 3), on `ravel_store_get_unverified_total`
+(`StoreMetricsSnapshot::get_unverified`, `S3Store::get_unverified`). Three
+things land there: a response with no `x-amz-checksum-*` header (an endpoint
+that stores no checksum, or one that ignored checksum mode), a response carrying
+a digest this adapter cannot recompute (SHA-256, which has no implementation in
+this workspace, or a composite multipart digest, which digests part digests
+rather than the body), and the split whole-object read above. The counter moves
+once per logical full-object `get`, not once per HTTP request. Failing closed
+instead would make an upgrade an outage: every object written before upload
+integrity was enabled carries no stored checksum, and read-time integrity for
+data objects is the format crc hierarchy regardless. A non-zero and growing
+counter against an endpoint that is supposed to store checksums is the signal
+that it is dropping them, which is the one thing the PUT side cannot detect.
+
+**Ranged reads are not verified** (decision 4). S3 returns the whole-object
+checksum, which a slice cannot be compared against, so a caller-issued
+`GetRange::Range` or `GetRange::Suffix` is outside the check by construction: it
+is neither verified nor counted. Suffix and range reads of data objects keep the
+format's own crc32c hierarchy as their check, which is what they have today.
+`MemoryStore` matches this, so the oracle and the adapter agree about which
+reads are covered.
+
 There is no per-part or whole-object upload checksum for a multipart upload:
 `object_store`'s `UploadPart` takes no checksum-algorithm value and `complete`
 takes no digest, so a multipart part keeps only the local CRC32C pre-flight (see

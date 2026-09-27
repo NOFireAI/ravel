@@ -1374,6 +1374,89 @@ async fn upload_checksum_store_rejects_corrupt_in_flight() {
     );
 }
 
+/// ADR-1696 decision 5, the read-side mirror of
+/// [`upload_checksum_store_rejects_corrupt_in_flight`]: a store that keeps a
+/// checksum beside an object must refuse a full-object get whose stored bytes
+/// no longer match it, rather than handing the caller a record that decodes
+/// cleanly with a wrong field in it.
+///
+/// The corruption is at rest --- `MemoryStore::corrupt_stored_byte` flips one
+/// bit of the stored object and leaves the checksum recorded at write time
+/// alone, which is bit rot, not a rewrite --- and the read goes through a
+/// `FaultStore` scripted to corrupt the *returned* bytes on top. That ordering
+/// is the point: the wrapper calls the backend first, so the backend's own
+/// verification refuses the read before the wrapper's flip can reach the
+/// caller. The fault counter proves the wrapper really was in the path (a plan
+/// that never matched would make this a plain `MemoryStore` test), and the
+/// error is the backend's, not the wrapper's.
+///
+/// Reverting the `GetRange::Full` check in `MemoryStore::get` makes the get
+/// return `Ok` with bit-flipped bytes, failing the first assertion.
+#[tokio::test]
+async fn full_object_get_of_a_corrupted_stored_object_is_refused() {
+    let inner = MemoryStore::new();
+    let key = "corrupt/at-rest";
+    let payload = Bytes::from_static(b"a stored record whose bytes rot in place");
+    inner
+        .put(key, payload.clone(), PutOptions::create_if_absent())
+        .await
+        .expect("seed the object");
+    inner
+        .corrupt_stored_byte(key, 3, 6)
+        .expect("flip one bit of the stored object");
+
+    let plan = FaultPlan::empty().with_rule(Rule::new(Op::Get, ScriptedFault::CorruptRange));
+    let store = FaultStore::new(inner, plan);
+
+    let err = store
+        .get(key, GetRange::Full)
+        .await
+        .expect_err("a full-object get of corrupted stored bytes must be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+    assert_eq!(
+        store.fault_count(Op::Get, FaultKind::CorruptRange),
+        1,
+        "the corruption fault must have fired exactly once"
+    );
+}
+
+/// The other half of ADR-1696 decision 4, stated as its own case so the two
+/// cannot drift: a *ranged* read of the same corrupted object is served. The
+/// stored checksum covers the whole object and a slice cannot be compared
+/// against it, so refusing here would fail every suffix read of every segment;
+/// those keep the format's own crc hierarchy as their check.
+#[tokio::test]
+async fn a_ranged_get_of_a_corrupted_stored_object_is_still_served() {
+    let store = MemoryStore::new();
+    let key = "corrupt/ranged";
+    store
+        .put(
+            key,
+            Bytes::from_static(b"0123456789abcdef"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed the object");
+    store
+        .corrupt_stored_byte(key, 0, 0)
+        .expect("flip one bit of the stored object");
+
+    let got = store
+        .get(key, GetRange::Range(8, 16))
+        .await
+        .expect("a ranged read is outside the whole-object check");
+    assert_eq!(
+        &got.data[..],
+        b"89abcdef",
+        "the ranged bytes must be served unchanged"
+    );
+    let err = store
+        .get(key, GetRange::Full)
+        .await
+        .expect_err("the same object read whole must still be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+}
+
 /// The startup gate `--mode maintain` applies, asserted against the real
 /// `S3Store` without an endpoint: `required_capabilities(Mode::
 /// Maintain)` is `mandatory()` with `multipart: true`, and this is the

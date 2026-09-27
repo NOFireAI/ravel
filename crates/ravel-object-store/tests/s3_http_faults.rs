@@ -52,6 +52,8 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use ravel_object_store::s3::{
@@ -139,6 +141,31 @@ enum Fault {
     /// inconclusive-probe case the create-conflict disambiguation must surface
     /// as retryable rather than as a terminal `AlreadyExists` (#1302).
     InconclusiveHead,
+    /// `get` only: a 200/206 whose body has one byte flipped, served with the
+    /// `x-amz-checksum-crc64nvme` of the *stored* object. Models a bit flipped
+    /// at rest or on the wire below a checksum S3 still reports honestly, which
+    /// is exactly what ADR-1696's read-side verification must catch: the
+    /// adapter recomputes the digest over what arrived and must refuse with
+    /// `Corrupted` instead of handing the bytes to a decoder.
+    CorruptGetBody,
+    /// `get` only: the body is served correctly but no `x-amz-checksum-*`
+    /// header comes back, as from an endpoint that stores no checksum or
+    /// ignores `x-amz-checksum-mode`. ADR-1696 decision 3 serves it and counts
+    /// it, so this is the fault that moves `ravel_store_get_unverified_total`.
+    NoGetChecksum,
+}
+
+/// How a GET is served once faults have been resolved: the two ADR-1696 read
+/// paths a test needs to script are variations of a *successful* response, not
+/// error statuses, so they ride here rather than short-circuiting in `handle`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GetBehavior {
+    /// Correct body, with the stored object's CRC-64/NVME attached.
+    Normal,
+    /// Correct checksum header, one byte of the body flipped.
+    CorruptBody,
+    /// Correct body, no checksum header at all.
+    NoChecksum,
 }
 
 /// One request as the server saw it: which operation, which key, when, which
@@ -161,6 +188,9 @@ struct Seen {
     /// deliberately not what this captures: the value header is what carries the
     /// digest S3 verifies.
     checksum_header: Option<(String, String)>,
+    /// The `x-amz-checksum-mode` request header's value, if the client asked S3
+    /// to return the checksum it stored at upload (ADR-1696 decision 2).
+    checksum_mode: Option<String>,
 }
 
 impl Seen {
@@ -210,6 +240,7 @@ impl FakeState {
         fault: Option<Fault>,
         range: Option<(u64, u64)>,
         checksum_header: Option<(String, String)>,
+        checksum_mode: Option<String>,
     ) {
         self.log.lock().push(Seen {
             op,
@@ -218,6 +249,7 @@ impl FakeState {
             fault,
             range,
             checksum_header,
+            checksum_mode,
         });
     }
 }
@@ -402,6 +434,37 @@ fn etag_of(data: &[u8]) -> String {
     format!("\"{:08x}\"", crc32c::crc32c(data))
 }
 
+/// CRC-64/NVME, the digest behind `x-amz-checksum-crc64nvme`, written here as
+/// the plain bitwise loop: reflected polynomial `0x9a6c9329ac4bc9b5` (the bit
+/// reverse of the catalogue's `0xad93d23594c93659`), all-ones init and final
+/// xor.
+///
+/// Deliberately a second, independent implementation rather than a call into
+/// the adapter's table-driven one. The fake endpoint is the other side of the
+/// wire, and a test that computed the digest with the same code under test
+/// would agree with it even if both were a different CRC than S3's. The
+/// catalogue `check` vector is asserted below so this side is pinned too.
+fn crc64_nvme(data: &[u8]) -> u64 {
+    const POLY: u64 = 0x9a6c_9329_ac4b_c9b5;
+    let mut crc = !0u64;
+    for &byte in data {
+        crc ^= u64::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (POLY & mask);
+        }
+    }
+    !crc
+}
+
+/// The catalogue `check` value for CRC-64/NVME. Without this the fake could
+/// serve a self-consistent wrong digest and every verification test would still
+/// pass.
+#[test]
+fn the_fake_endpoints_crc64_matches_the_catalogue_check_vector() {
+    assert_eq!(crc64_nvme(b"123456789"), 0xae8b_1486_0a79_9888);
+}
+
 fn s3_error_body(code: &str, message: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -479,12 +542,17 @@ fn requested_range(headers: &HeaderMap) -> Option<(u64, u64)> {
 
 /// The upload-checksum value header the client attached, if any (#863):
 /// `x-amz-checksum-crc64nvme` / `-sha256` / etc., returned as `(name, value)`.
-/// The `-algorithm` header is skipped: it names the algorithm, it does not
-/// carry the digest S3 verifies.
+/// Two `x-amz-checksum-*` headers are skipped because neither carries a digest:
+/// `-algorithm` names an algorithm, and `-mode` is the read-side
+/// `ENABLED` request flag the adapter sends on every request (ADR-1696
+/// decision 2), which would otherwise read as an upload checksum here.
 fn checksum_header(headers: &HeaderMap) -> Option<(String, String)> {
     headers.iter().find_map(|(name, value)| {
         let name = name.as_str();
-        if name.starts_with("x-amz-checksum-") && name != "x-amz-checksum-algorithm" {
+        if name.starts_with("x-amz-checksum-")
+            && name != "x-amz-checksum-algorithm"
+            && name != "x-amz-checksum-mode"
+        {
             Some((name.to_string(), value.to_str().ok()?.to_string()))
         } else {
             None
@@ -554,6 +622,10 @@ async fn handle(
         fault,
         requested_range(&headers),
         checksum_header(&headers),
+        headers
+            .get("x-amz-checksum-mode")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
     );
 
     match fault {
@@ -603,7 +675,33 @@ async fn handle(
             ],
             Body::empty(),
         ),
-        Some(Fault::Pass) | None => serve(&state, op, &key, &query, &headers, data),
+        Some(Fault::CorruptGetBody) => serve(
+            &state,
+            op,
+            &key,
+            &query,
+            &headers,
+            data,
+            GetBehavior::CorruptBody,
+        ),
+        Some(Fault::NoGetChecksum) => serve(
+            &state,
+            op,
+            &key,
+            &query,
+            &headers,
+            data,
+            GetBehavior::NoChecksum,
+        ),
+        Some(Fault::Pass) | None => serve(
+            &state,
+            op,
+            &key,
+            &query,
+            &headers,
+            data,
+            GetBehavior::Normal,
+        ),
     }
 }
 
@@ -614,6 +712,7 @@ fn serve(
     query: &HashMap<String, String>,
     headers: &HeaderMap,
     data: Bytes,
+    get_behavior: GetBehavior,
 ) -> Response {
     match op {
         Op::Put => {
@@ -648,6 +747,27 @@ fn serve(
                 (header::ETAG, etag),
                 (header::LAST_MODIFIED, LAST_MODIFIED.to_string()),
             ];
+            // The stored whole-object checksum, which a real endpoint returns
+            // for the object rather than for the slice a ranged request asked
+            // for. Computed over `object`, never over `body`, so a corrupted
+            // body is served under an honest checksum.
+            if get_behavior != GetBehavior::NoChecksum {
+                response_headers.push((
+                    header::HeaderName::from_static("x-amz-checksum-crc64nvme"),
+                    STANDARD.encode(crc64_nvme(&object).to_be_bytes()),
+                ));
+            }
+            let body = match get_behavior {
+                GetBehavior::CorruptBody => {
+                    let mut flipped = body.to_vec();
+                    let first = flipped
+                        .first_mut()
+                        .expect("a corrupt-body fault needs a non-empty body to corrupt");
+                    *first ^= 0x01;
+                    Bytes::from(flipped)
+                }
+                GetBehavior::Normal | GetBehavior::NoChecksum => body,
+            };
             let status = match &content_range {
                 Some(value) => {
                     response_headers.push((header::CONTENT_RANGE, value.clone()));
@@ -978,6 +1098,102 @@ async fn put_attaches_server_verified_checksum_only_when_configured() {
             "the checksum header must carry a base64 digest value"
         );
     }
+}
+
+/// ADR-1696 decision 2, on the wire: a full-object GET whose body comes back
+/// with one byte flipped, under the `x-amz-checksum-crc64nvme` of the object as
+/// stored, must fail with `Corrupted` rather than hand the bytes to the caller.
+/// This is the whole mechanism end to end --- the signed request header, the
+/// connector reading the response header below `object_store`'s retry loop, and
+/// the digest recomputed over the body received --- observed from the far side
+/// of a socket.
+///
+/// The three assertions are separable on purpose. The error pins the outcome;
+/// the request-header assertion pins that the adapter actually *asked* for the
+/// stored checksum (an endpoint only returns one under checksum mode, so
+/// dropping the header would make this test pass for the wrong reason against
+/// this fake and fail against real S3); and the unverified counter staying at 0
+/// pins that this was a genuine mismatch, not a read that fell through to the
+/// serve-and-count path.
+///
+/// Removing the `stored.verify(...)` call in `S3Store::verify_full_read` makes
+/// the get return `Ok` with a flipped byte, failing the first assertion.
+#[tokio::test]
+async fn a_flipped_byte_in_a_get_body_is_corrupted() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("verify/flipped", b"a commit record's worth of bytes");
+    fake.always(Op::Get, Fault::CorruptGetBody);
+
+    let error = store
+        .get("verify/flipped", GetRange::Full)
+        .await
+        .expect_err("a body that fails its stored checksum must not be served");
+    assert!(
+        matches!(error, StoreError::Corrupted(_)),
+        "a checksum mismatch must be Corrupted, got {error:?}"
+    );
+
+    let gets = fake.requests(Op::Get);
+    assert_eq!(gets.len(), 1, "a Corrupted read must not be retried");
+    assert_eq!(
+        gets[0].checksum_mode.as_deref(),
+        Some("ENABLED"),
+        "the adapter must ask S3 for the checksum it stored at upload"
+    );
+    assert_eq!(
+        store.get_unverified(),
+        0,
+        "a read that was verified and failed is not an unverified read"
+    );
+}
+
+/// ADR-1696 decision 3: an endpoint that returns no `x-amz-checksum-*` header
+/// (it stores no checksum, or ignored checksum mode) is served, not refused,
+/// and the read is counted on `ravel_store_get_unverified_total`. Failing
+/// closed here would make an upgrade an outage for every object written before
+/// upload integrity was on, which is every object in every existing bucket.
+///
+/// The counter assertion is `by exactly 1`, measured across the call, because
+/// "greater than zero" would not distinguish one logical read from one per HTTP
+/// request --- and the adapter splits a large whole-object read into several.
+/// The verified read at the end is the control: it proves the counter moves for
+/// the missing header rather than for every get.
+#[tokio::test]
+async fn a_get_with_no_checksum_header_is_served_and_counted_unverified() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    let payload = b"served without a stored checksum";
+    fake.seed("verify/unchecksummed", payload);
+    fake.script(Op::Get, [Fault::NoGetChecksum]);
+
+    let before = store.get_unverified();
+    let got = store
+        .get("verify/unchecksummed", GetRange::Full)
+        .await
+        .expect("a response with no checksum header must still be served");
+    assert_eq!(
+        &got.data[..],
+        &payload[..],
+        "the bytes must be served unchanged"
+    );
+    assert_eq!(
+        store.get_unverified(),
+        before + 1,
+        "one full-object read with no stored checksum is exactly one unverified read"
+    );
+
+    // Control: the scripted fault is spent, so this read comes back with the
+    // checksum header and must not move the counter.
+    store
+        .get("verify/unchecksummed", GetRange::Full)
+        .await
+        .expect("the verified read must succeed");
+    assert_eq!(
+        store.get_unverified(),
+        before + 1,
+        "a read the adapter verified must not count as unverified"
+    );
 }
 
 /// `AccessDenied` is permanent per the contract, and the proof is that the
