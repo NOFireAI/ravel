@@ -138,12 +138,29 @@ async fn handle(
     Ok(response)
 }
 
-/// Bind `addr` and serve `/healthz`, `/readyz`, and `/metrics` until the
-/// process exits. Runs for the process lifetime; a per-connection error is
-/// logged and the listener keeps accepting (one bad connection must not take
-/// down the probe surface).
-pub async fn serve(addr: SocketAddr, state: Arc<HealthState>) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+/// The health listener could not bind its address. A startup error: without
+/// the listener the kubelet's probes fail and the pod restarts with no clear
+/// cause, so `main` exits non-zero naming the address and the flag instead.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot bind the health listener on {addr} (set with --listen-health): {source}")]
+pub struct BindError {
+    pub addr: SocketAddr,
+    #[source]
+    pub source: std::io::Error,
+}
+
+/// Bind the listener [`serve`] accepts on. Called before the controller is
+/// spawned (ADR-1731 decision 2) so a bind failure stops startup.
+pub async fn bind(addr: SocketAddr) -> Result<TcpListener, BindError> {
+    TcpListener::bind(addr)
+        .await
+        .map_err(|source| BindError { addr, source })
+}
+
+/// Serve `/healthz`, `/readyz`, and `/metrics` on `listener` until the
+/// process exits. A per-connection or accept error is logged and the listener
+/// keeps accepting (one bad connection must not take down the probe surface).
+pub async fn serve(listener: TcpListener, state: Arc<HealthState>) {
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -177,8 +194,7 @@ mod tests {
     // `hyper::body::Incoming` cannot be constructed outside hyper's own
     // server internals, so `handle` is exercised through the state machine
     // it reads (`is_alive`/`is_ready`) rather than with a built `Request`;
-    // the accept-loop wiring itself is covered by the integration test named
-    // in ADR-1731's follow-up.
+    // `tests/health_listener.rs` covers the accept loop over real HTTP.
     #[tokio::test]
     async fn healthz_is_ok_until_marked_stopped() {
         let state = state();
@@ -193,5 +209,28 @@ mod tests {
         assert!(!state.is_ready());
         state.mark_ready();
         assert!(state.is_ready());
+    }
+
+    #[tokio::test]
+    async fn bind_on_an_occupied_port_names_the_address_and_the_flag() {
+        let held = bind("127.0.0.1:0".parse().expect("valid address"))
+            .await
+            .expect("an ephemeral port binds");
+        let addr = held.local_addr().expect("bound listener has an address");
+
+        let error = bind(addr)
+            .await
+            .expect_err("a second bind on an occupied port fails");
+        assert_eq!(error.addr, addr);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::AddrInUse);
+        let message = error.to_string();
+        assert!(
+            message.contains(&addr.to_string()),
+            "message names the address: {message}"
+        );
+        assert!(
+            message.contains("--listen-health"),
+            "message names the flag: {message}"
+        );
     }
 }
