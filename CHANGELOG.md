@@ -97,9 +97,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--catalog-cache-max-bytes <BYTES>` flag explicitly. A deployment that
   relied on `--cache-max-bytes` to grow the catalog byte cache above its
   default now also needs `--catalog-cache-max-bytes` set explicitly to get
-  the same catalog cache size. Startup still refuses to start when the two
-  caches' resolved ceilings together exceed the process memory budget,
-  exempting `--disable-cache` as before.
+  the same catalog cache size. The reverse also changes: a deployment that
+  set `--cache-max-bytes` low to constrain memory used to get a catalog
+  byte cache that small too, and now gets the catalog's own 5% share (about
+  1.5 GB on a 30 GiB host) unless `--catalog-cache-max-bytes` is also set.
+  Startup still refuses to start when the two caches' resolved ceilings
+  together exceed the process memory budget, exempting `--disable-cache` as
+  before.
 - **`ravel-server` derives a larger fetcher-cache share on a loopback S3
   store** (ADR-2023, issue #2023). Unset, `--cache-max-bytes` used to
   always derive 25% of the process memory budget; now, a `--store s3`
