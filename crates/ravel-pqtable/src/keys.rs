@@ -87,7 +87,7 @@ fn is_lower_hex(s: &str) -> bool {
 }
 
 /// Split `t/<tenant_hash>/pq/<rest>` into the tenant and `<rest>`.
-fn split_tenant_pq<'k>(key: &'k str) -> Result<(TenantHash, &'k str), KeyError> {
+fn split_tenant_pq(key: &str) -> Result<(TenantHash, &str), KeyError> {
     let Some(after_root) = key.strip_prefix("t/") else {
         return Err(malformed(key, "expected the key to start with \"t/\""));
     };

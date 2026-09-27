@@ -82,8 +82,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Parquet table manifest format and object layer** (ADR-2040, issue #2050):
-  the new `ravel-pqtable` crate and `proto/ravel/parquet_table.proto`. No
+- **Parquet table location grants and in-place manifest format** (ADR-2040,
+  issue #2050): the new `ravel-pqtable` crate and
+  `proto/ravel/parquet_table.proto`. A per-tenant grants record at
+  `t/<tenant_hash>/pq/grants` holds the locations an operator admitted, each
+  with the credential profile to read it under, and resolves a `LOCATION` URL
+  to exactly one grant. A table manifest version pins the tenant's own
+  Parquet files in place, by bucket and raw object key with the ETag and store
+  version read at the time, rather than copying them into Ravel's bucket. No
   shipping binary calls it yet.
 - **`ravel-server` builds a read and a write CPU gate and reports their
   queueing on `/metrics`** (ADR-1702, issue #1702). A new crate,

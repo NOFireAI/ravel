@@ -929,6 +929,7 @@ mod tests {
         let clock = clock();
         let key = grants_key(&TENANT_A);
         let gate = store.hold(Op::Put, Some(key.clone()), Occurrence::Always);
+        let timeout = std::time::Duration::from_secs(10);
 
         let a = tokio::spawn({
             let (store, clock) = (store.clone(), clock.clone());
@@ -940,20 +941,25 @@ mod tests {
         });
 
         // Both readers saw no record, so both are about to write a record
-        // holding only their own grant.
-        gate.wait_until_held(2).await;
+        // holding only their own grant. Every wait on the gate is bounded: a
+        // writer that overwrote instead of retrying never arrives at it, and
+        // an unbounded wait would hang rather than fail.
+        tokio::time::timeout(timeout, gate.wait_until_held(2))
+            .await
+            .expect("both puts reach the gate");
         let held = gate.held();
         assert_eq!(held.len(), 2);
         gate.release(held[0]);
         // The second put now fails its CreateIfAbsent and retries against the
         // record the first one wrote.
         gate.release(held[1]);
-        gate.wait_until_held(1).await;
+        tokio::time::timeout(timeout, gate.wait_until_held(1))
+            .await
+            .expect("the loser retries its put");
         let retry = gate.held();
         assert_eq!(retry.len(), 1);
         gate.release(retry[0]);
 
-        let timeout = std::time::Duration::from_secs(10);
         tokio::time::timeout(timeout, a)
             .await
             .expect("join a")
