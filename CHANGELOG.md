@@ -14,7 +14,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   alert, whose labels are the series labels without `__name__` overlaid by
   the rule labels, and whose identity hashes those labels. The Alertmanager
   sink's `alertname` stays the rule id, or the rule's own `alertname` label
-  when it sets one; a series label named `alertname` never replaces it. A
+  when it sets one; a series label named `alertname` never replaces it and,
+  when the rule sets no `alertname`, is sent as `exported_alertname` (with
+  Prometheus' `exported_exported_` rule on a further conflict) so series
+  differing only in that label stay distinct Alertmanager alerts. A
   series that stops matching resolves only its own alert, and
   `repeat_interval` applies to each alert on its own. A rule matching more
   than 1000 series fails the tick with `TooManyAlerts`, and two series

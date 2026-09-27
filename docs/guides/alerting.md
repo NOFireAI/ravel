@@ -115,9 +115,15 @@ pending, firing, and resolved on its own.
   `alertname` to the `rule_id`, or to the rule's own `alertname` label when the
   rule sets one. A series label named `alertname` (a recording rule's output,
   say) stays in the alert's identity and in the webhook payload, but never
-  replaces the Alertmanager `alertname`. A query that returns a scalar has no
-  series labels, so its one alert carries the rule labels alone. A SQL rule
-  has no series either: it raises one alert with the rule labels.
+  replaces the Alertmanager `alertname`: when the rule sets no `alertname`,
+  the Alertmanager payload carries the series value as `exported_alertname`
+  (or `exported_exported_alertname` when the series already has an
+  `exported_alertname`, following Prometheus' conflict rule), so two series
+  that differ only in that label stay two alerts in Alertmanager. A rule's
+  own `alertname` label replaces the series one outright and nothing is
+  exported. A query that returns a scalar has no series labels, so its one
+  alert carries the rule labels alone. A SQL rule has no series either: it
+  raises one alert with the rule labels.
 - **Two series with one identity.** If two matched series produce the same
   label set, for example two metric names that differ only in the dropped
   `__name__`, the rule fails that tick with `DuplicateAlertIdentity` rather than

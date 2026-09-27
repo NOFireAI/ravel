@@ -222,6 +222,10 @@ pub struct AlertNotification {
     /// `record.labels`, where a series label of that name is indistinguishable
     /// from a rule label.
     pub alertname: String,
+    /// Whether `alertname` came from a rule label. When it did not, an
+    /// `alertname` in `record.labels` is a series label and is exported under
+    /// an `exported_` name rather than dropped (see [`alertmanager_payload`]).
+    pub alertname_from_rule: bool,
 }
 
 impl AlertNotification {
@@ -238,15 +242,18 @@ impl AlertNotification {
             Some(p) if matches!(p.state, AlertState::Pending | AlertState::Firing) => p.ts_ns,
             _ => record.ts_ns,
         };
-        let alertname = rule_labels
+        let rule_alertname = rule_labels
             .iter()
             .find(|(name, _)| name == "alertname")
-            .map_or_else(|| record.rule_id.clone(), |(_, value)| value.clone());
+            .map(|(_, value)| value.clone());
+        let alertname_from_rule = rule_alertname.is_some();
+        let alertname = rule_alertname.unwrap_or_else(|| record.rule_id.clone());
         AlertNotification {
             record,
             previous_state,
             started_at_ns,
             alertname,
+            alertname_from_rule,
         }
     }
 }
@@ -337,7 +344,11 @@ pub fn webhook_payload(notification: &AlertNotification) -> Json {
 ///   the rule id unless the rule itself carries an `alertname` label, which
 ///   deliberately wins, matching Prometheus' override order. A series label
 ///   named `alertname` never replaces it, so routing and silences keyed on
-///   the rule id keep matching. Ravel-specific fields are not injected,
+///   the rule id keep matching; when the rule sets no `alertname`, the series
+///   value moves to `exported_alertname` (or, if that name is taken, the
+///   first free `exported_exported_...` name, Prometheus' conflict rule), so
+///   two series differing only in that label stay two Alertmanager alerts.
+///   Ravel-specific fields are not injected,
 ///   because in Alertmanager the label set *is* the alert's identity and
 ///   extra labels would fragment grouping and silences.
 /// - A firing alert sends `startsAt` and no `endsAt`, letting Alertmanager
@@ -357,6 +368,15 @@ pub fn alertmanager_payload(notification: &AlertNotification) -> Option<Json> {
     let mut labels = JsonMap::new();
     for (k, v) in &record.labels {
         labels.insert(k.clone(), Json::String(v.clone()));
+    }
+    if !notification.alertname_from_rule
+        && let Some(series_alertname) = labels.remove("alertname")
+    {
+        let mut exported = "exported_alertname".to_string();
+        while labels.contains_key(&exported) {
+            exported.insert_str(0, "exported_");
+        }
+        labels.insert(exported, series_alertname);
     }
     labels.insert(
         "alertname".to_string(),
@@ -586,8 +606,109 @@ mod tests {
             .expect("payload");
         let labels = &body.as_array().expect("array")[0]["labels"];
         assert_eq!(labels["alertname"], Json::String("high-cpu".to_string()));
+        assert_eq!(labels["exported_alertname"], Json::String("x".to_string()));
         assert_eq!(labels["severity"], Json::String("page".to_string()));
-        assert_eq!(labels.as_object().expect("object").len(), 2);
+        assert_eq!(labels.as_object().expect("object").len(), 3);
+    }
+
+    fn alertmanager_labels(rec: AlertRecord, rule_labels: &[(String, String)]) -> Json {
+        let body =
+            alertmanager_payload(&AlertNotification::new(rec, None, rule_labels)).expect("payload");
+        let alerts = body.as_array().expect("array");
+        assert_eq!(alerts.len(), 1);
+        alerts[0]["labels"].clone()
+    }
+
+    fn json_labels(kv: &[(&str, &str)]) -> Json {
+        let mut map = JsonMap::new();
+        for (k, v) in kv {
+            map.insert((*k).to_string(), Json::String((*v).to_string()));
+        }
+        Json::Object(map)
+    }
+
+    #[test]
+    fn two_series_differing_only_in_alertname_stay_distinct_in_alertmanager() {
+        // {__name__="up", alertname="x"} and {__name__="up", alertname="y"}
+        // under rule labels {severity: page}: two alert identities, which
+        // must stay two alerts once Alertmanager keys them by label set.
+        let rule_labels = pairs(&[("severity", "page")]);
+        let payloads: Vec<Json> = ["x", "y"]
+            .iter()
+            .map(|series_alertname| {
+                let mut rec = record(AlertState::Firing, SEC);
+                rec.labels = pairs(&[("alertname", series_alertname), ("severity", "page")]);
+                alertmanager_labels(rec, &rule_labels)
+            })
+            .collect();
+        assert_eq!(
+            payloads[0],
+            json_labels(&[
+                ("alertname", "high-cpu"),
+                ("exported_alertname", "x"),
+                ("severity", "page"),
+            ])
+        );
+        assert_eq!(
+            payloads[1],
+            json_labels(&[
+                ("alertname", "high-cpu"),
+                ("exported_alertname", "y"),
+                ("severity", "page"),
+            ])
+        );
+        assert_ne!(payloads[0], payloads[1]);
+    }
+
+    #[test]
+    fn an_existing_exported_alertname_pushes_the_series_value_one_level_further() {
+        // Prometheus' conflict rule: the series value takes the first
+        // `exported_`-prefixed name that is still free.
+        let rule_labels = pairs(&[("severity", "page")]);
+        let mut rec = record(AlertState::Firing, SEC);
+        rec.labels = pairs(&[
+            ("alertname", "x"),
+            ("exported_alertname", "w"),
+            ("severity", "page"),
+        ]);
+        assert_eq!(
+            alertmanager_labels(rec, &rule_labels),
+            json_labels(&[
+                ("alertname", "high-cpu"),
+                ("exported_alertname", "w"),
+                ("exported_exported_alertname", "x"),
+                ("severity", "page"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_rule_label_alertname_wins_and_exports_nothing() {
+        // The merge already overlaid the rule's alertname on the series one.
+        let rule_labels = pairs(&[("alertname", "z"), ("severity", "page")]);
+        let mut rec = record(AlertState::Firing, SEC);
+        rec.labels = pairs(&[("alertname", "z"), ("severity", "page")]);
+        assert_eq!(
+            alertmanager_labels(rec, &rule_labels),
+            json_labels(&[("alertname", "z"), ("severity", "page")])
+        );
+    }
+
+    #[test]
+    fn a_series_alertname_equal_to_the_rule_id_is_still_exported() {
+        // Without the export this collides with the same series minus its
+        // alertname label.
+        let rule_labels = pairs(&[("severity", "page")]);
+        let mut rec = record(AlertState::Firing, SEC);
+        rec.labels = pairs(&[("alertname", "high-cpu"), ("severity", "page")]);
+        assert_eq!(
+            alertmanager_labels(rec, &rule_labels),
+            json_labels(&[
+                ("alertname", "high-cpu"),
+                ("exported_alertname", "high-cpu"),
+                ("severity", "page"),
+            ])
+        );
     }
 
     #[test]
