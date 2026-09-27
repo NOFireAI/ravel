@@ -837,6 +837,58 @@ mod tests {
         assert_eq!(bg_m.put.calls, 0, "no background put");
     }
 
+    /// A pinned read spends a permit of its class and is counted in that
+    /// class's `get` block, bytes included: it is one GET on the wire and the
+    /// per-class request budget must see it as one.
+    #[tokio::test]
+    async fn get_pinned_is_scheduled_and_counted_as_a_get_of_its_class() {
+        let inner = Arc::new(MemoryStore::new());
+        inner
+            .put("a", Bytes::from_static(b"0123"), PutOptions::default())
+            .await
+            .expect("put");
+        let meta = inner.head("a").await.expect("head");
+        let pin = crate::Pin::etag(meta.etag.0.clone());
+
+        let cs = ClassedStore::scheduled(
+            Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
+            SchedulerConfig::new(4, 4, 1),
+        );
+        let fg = cs.foreground();
+        let bg = cs.background();
+
+        let got = fg
+            .get_pinned("a", GetRange::Range(0, 3), &pin)
+            .await
+            .expect("a matching pin is served through the handle");
+        assert_eq!(&got.data[..], b"012");
+        let err = bg
+            .get_pinned("a", GetRange::Range(0, 3), &crate::Pin::etag("\"0\""))
+            .await
+            .expect_err("a wrong pin is refused through the handle");
+        assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+
+        let fg_m = cs
+            .metrics(RequestClass::Foreground)
+            .expect("scheduled has metrics")
+            .snapshot();
+        let bg_m = cs
+            .metrics(RequestClass::Background)
+            .expect("scheduled has metrics")
+            .snapshot();
+        assert_eq!(fg_m.get.calls, 1, "the pinned read is a foreground get");
+        assert_eq!(fg_m.get.ok, 1);
+        assert_eq!(fg_m.get.bytes, 3, "only the served range is charged");
+        assert_eq!(bg_m.get.calls, 1, "the refused read is a background get");
+        assert_eq!(bg_m.get.ok, 0);
+        assert_eq!(bg_m.get.bytes, 0);
+        assert_eq!(
+            scheduler(&cs).fg_waiters.load(Ordering::SeqCst),
+            0,
+            "both permits released"
+        );
+    }
+
     /// Weighted admission, foreground cap: with `fg_permits` foreground ops in
     /// flight, the `fg_permits + 1`-th foreground op waits until one releases.
     #[tokio::test]

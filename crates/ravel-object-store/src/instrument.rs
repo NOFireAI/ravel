@@ -706,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn every_store_error_variant_has_its_own_class() {
+    fn every_error_class_is_reachable_and_the_shared_variants_are_pinned() {
         let errors = [
             (StoreError::NotFound, StoreErrorClass::NotFound),
             (StoreError::AlreadyExists, StoreErrorClass::AlreadyExists),
@@ -747,6 +747,26 @@ mod tests {
         );
         for (err, expected) in &errors {
             assert_eq!(StoreErrorClass::of(err), *expected, "misclassified {err:?}");
+        }
+
+        // The two variants that share a class rather than owning one. They are
+        // both caller-side facts about the backend's shape, not about the
+        // request, so they read as permanent and widening the class enum would
+        // renumber every exported metrics array.
+        for err in [
+            StoreError::Unsupported {
+                operation: "conditional get".into(),
+            },
+            StoreError::ReadOnly {
+                operation: "put".into(),
+                store: "external".into(),
+            },
+        ] {
+            assert_eq!(
+                StoreErrorClass::of(&err),
+                StoreErrorClass::Permanent,
+                "misclassified {err:?}"
+            );
         }
     }
 
@@ -818,6 +838,53 @@ mod tests {
         // never drifts on a backend that issues no HTTP (e.g. MemoryStore).
         assert_eq!(snap.put.attempts, 0);
         assert_eq!(snap.head.attempts, 0);
+    }
+
+    /// A pinned read is a GET on the wire and is billed as one: it lands in the
+    /// same `StoreOp::Get` block as an unpinned read, with its bytes, and a
+    /// refusal lands in that block's `PreconditionFailed` class. Anything else
+    /// would make the cost of a pinned read invisible to the per-phase
+    /// accounting every read path reports.
+    #[tokio::test]
+    async fn get_pinned_is_billed_as_a_get_with_its_bytes_and_its_refusals() {
+        use crate::memory::MemoryStore;
+        use crate::{GetRange, ObjectStoreBackend, Pin, PutOptions};
+        use bytes::Bytes;
+
+        let store = InstrumentedStore::new(MemoryStore::new());
+        store
+            .put(
+                "pinned/k",
+                Bytes::from_static(b"0123456789"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        let meta = store.head("pinned/k").await.expect("head");
+        let pin = Pin::etag(meta.etag.0.clone());
+
+        let got = store
+            .get_pinned("pinned/k", GetRange::Range(0, 4), &pin)
+            .await
+            .expect("a matching pin is served");
+        assert_eq!(&got.data[..], b"0123");
+
+        let err = store
+            .get_pinned("pinned/k", GetRange::Range(0, 4), &Pin::etag("\"0\""))
+            .await
+            .expect_err("a wrong pin is refused");
+        assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+
+        let snap = store.metrics().snapshot();
+        assert_eq!(snap.get.calls, 2, "both pinned reads are GET calls");
+        assert_eq!(snap.get.ok, 1);
+        assert_eq!(snap.get.bytes, 4, "only the served range is charged");
+        assert_eq!(
+            snap.get.error_count(StoreErrorClass::PreconditionFailed),
+            1
+        );
+        assert_eq!(snap.head.calls, 1, "the head is billed separately");
+        assert_eq!(snap.put.calls, 1);
     }
 
     #[test]

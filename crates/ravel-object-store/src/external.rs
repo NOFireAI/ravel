@@ -691,3 +691,333 @@ impl ObjectStoreBackend for ExternalStore {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A distinctive string planted in every place a profile could leak one:
+    /// the environment variable's name, the secret file's path, and the file's
+    /// contents.
+    const MARKER: &str = "TOPSECRET-MARKER";
+
+    fn secret_file(dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join(format!("{MARKER}.key"));
+        std::fs::write(&path, format!("{MARKER}-contents\n")).expect("write the secret file");
+        path
+    }
+
+    fn s3_profile(path: &std::path::Path) -> ExternalProfile {
+        ExternalProfile {
+            name: "lake".to_string(),
+            kind: ExternalKind::S3 {
+                region: "us-east-1".to_string(),
+                endpoint: Some("http://127.0.0.1:1".to_string()),
+                force_path_style: true,
+                allow_http: true,
+                credentials: S3ProfileCredentials::Static {
+                    access_key_id: SecretSource::File {
+                        path: path.to_path_buf(),
+                    },
+                    secret_access_key: SecretSource::File {
+                        path: path.to_path_buf(),
+                    },
+                    session_token: None,
+                },
+            },
+        }
+    }
+
+    fn assert_read_only(err: &StoreError, expect_in_operation: &str) {
+        match err {
+            StoreError::ReadOnly { operation, store } => {
+                assert!(
+                    operation.contains(expect_in_operation),
+                    "operation {operation:?} does not name {expect_in_operation:?}"
+                );
+                assert!(
+                    store.contains("lake"),
+                    "store {store:?} does not name the profile"
+                );
+            }
+            other => panic!("expected a read-only refusal, got {other:?}"),
+        }
+        assert!(
+            !err.is_retryable(),
+            "a read-only refusal must never be retried"
+        );
+    }
+
+    /// Every mutating method refuses, and refuses locally: the endpoint these
+    /// profiles name is a closed port, so a call that reached the network would
+    /// surface as a transport error instead.
+    #[tokio::test]
+    async fn every_mutating_call_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = secret_file(&dir);
+        let store = ExternalStore::open(&s3_profile(&path), "customer-lake").expect("open");
+
+        let err = store
+            .put("a/b", Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect_err("put must be refused");
+        assert_read_only(&err, "put of a/b");
+
+        let err = store
+            .put("a/b", Bytes::from_static(b"x"), PutOptions::create_if_absent())
+            .await
+            .expect_err("a conditional put must be refused too");
+        assert_read_only(&err, "put of a/b");
+
+        let err = store
+            .put_multipart("a/b")
+            .await
+            .err()
+            .expect("multipart must be refused");
+        assert_read_only(&err, "multipart upload of a/b");
+
+        let err = store.delete("a/b").await.expect_err("delete must be refused");
+        assert_read_only(&err, "delete of a/b");
+    }
+
+    #[tokio::test]
+    async fn the_capability_set_advertises_no_write_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = secret_file(&dir);
+        let store = ExternalStore::open(&s3_profile(&path), "customer-lake").expect("open");
+        let caps = store.capabilities();
+        assert!(!caps.create_if_absent);
+        assert!(!caps.cas_version);
+        assert!(!caps.upload_checksum);
+        assert!(!caps.multipart);
+        assert!(caps.consistent_read && caps.prefix_list && caps.suffix_range);
+    }
+
+    #[test]
+    fn profiles_parse_for_every_kind() {
+        let json = r#"[
+            {
+              "name": "lake",
+              "kind": "s3",
+              "region": "eu-west-1",
+              "endpoint": "https://minio.example:9000",
+              "force_path_style": true,
+              "allow_http": false,
+              "credentials": {
+                "mode": "static",
+                "access_key_id": { "from": "env", "name": "LAKE_KEY_ID" },
+                "secret_access_key": { "from": "file", "path": "/run/secrets/lake" }
+              }
+            },
+            {
+              "name": "warehouse",
+              "kind": "gcs",
+              "credentials": { "mode": "service_account", "path": "/run/secrets/sa.json" }
+            },
+            {
+              "name": "archive",
+              "kind": "azure",
+              "account": "contoso",
+              "credentials": {
+                "mode": "sas_token",
+                "token": { "from": "env", "name": "ARCHIVE_SAS" }
+              }
+            }
+        ]"#;
+        let profiles = load_profiles(json).expect("three well-formed profiles");
+        assert_eq!(profiles.len(), 3);
+        assert_eq!(
+            profiles.iter().map(|p| p.kind.name()).collect::<Vec<_>>(),
+            vec!["s3", "gcs", "azure"]
+        );
+        match &profiles[0].kind {
+            ExternalKind::S3 {
+                region,
+                endpoint,
+                force_path_style,
+                allow_http,
+                ..
+            } => {
+                assert_eq!(region, "eu-west-1");
+                assert_eq!(endpoint.as_deref(), Some("https://minio.example:9000"));
+                assert!(force_path_style);
+                assert!(!allow_http);
+            }
+            other => panic!("expected an s3 profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_duplicate_profile_name_is_rejected() {
+        let json = r#"[
+            { "name": "lake", "kind": "gcs", "credentials": { "mode": "application_default" } },
+            { "name": "lake", "kind": "gcs", "credentials": { "mode": "application_default" } }
+        ]"#;
+        match load_profiles(json) {
+            Err(ProfileError::DuplicateName { name }) => assert_eq!(name, "lake"),
+            other => panic!("expected a duplicate-name refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_profile_name_is_rejected() {
+        let json =
+            r#"[{ "name": "", "kind": "gcs", "credentials": { "mode": "application_default" } }]"#;
+        assert!(matches!(load_profiles(json), Err(ProfileError::EmptyName)));
+    }
+
+    /// A profile never renders a secret, the name of the variable holding one,
+    /// or the path of the file holding one, in `Debug` or in any error it
+    /// produces. Asserted on the formatted string rather than by inspection,
+    /// because `Debug` is what a `tracing` field and a panic message call.
+    #[test]
+    fn debug_renders_no_secret_and_no_secret_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = secret_file(&dir);
+        let profiles = [
+            s3_profile(&path),
+            ExternalProfile {
+                name: "env-keyed".to_string(),
+                kind: ExternalKind::S3 {
+                    region: "us-east-1".to_string(),
+                    endpoint: None,
+                    force_path_style: false,
+                    allow_http: false,
+                    credentials: S3ProfileCredentials::Static {
+                        access_key_id: SecretSource::Env {
+                            name: format!("{MARKER}_ID"),
+                        },
+                        secret_access_key: SecretSource::Env {
+                            name: format!("{MARKER}_SECRET"),
+                        },
+                        session_token: Some(SecretSource::Env {
+                            name: format!("{MARKER}_TOKEN"),
+                        }),
+                    },
+                },
+            },
+            ExternalProfile {
+                name: "warehouse".to_string(),
+                kind: ExternalKind::Gcs {
+                    credentials: GcsProfileCredentials::ServiceAccount {
+                        path: path.clone(),
+                    },
+                },
+            },
+            ExternalProfile {
+                name: "archive".to_string(),
+                kind: ExternalKind::Azure {
+                    account: "contoso".to_string(),
+                    credentials: AzureProfileCredentials::SasToken {
+                        token: SecretSource::File { path: path.clone() },
+                    },
+                },
+            },
+            ExternalProfile {
+                name: "archive-key".to_string(),
+                kind: ExternalKind::Azure {
+                    account: "contoso".to_string(),
+                    credentials: AzureProfileCredentials::AccessKey {
+                        key: SecretSource::Env {
+                            name: format!("{MARKER}_AZURE"),
+                        },
+                    },
+                },
+            },
+        ];
+
+        for profile in &profiles {
+            let rendered = format!("{profile:?}");
+            assert!(
+                !rendered.contains(MARKER),
+                "{} rendered a secret location: {rendered}",
+                profile.name
+            );
+            assert!(
+                rendered.contains("redacted"),
+                "{} must say that something was redacted: {rendered}",
+                profile.name
+            );
+            // The account name and the profile name are not secrets, and an
+            // operator needs them to identify what was redacted.
+            assert!(rendered.contains(&profile.name));
+        }
+
+        // `GcsProfileCredentials::ServiceAccount` carries a path and no
+        // `SecretSource`, so its own `Debug` is the only thing between that
+        // path and a log line.
+        let gcs = GcsProfileCredentials::ServiceAccount { path: path.clone() };
+        assert_eq!(format!("{gcs:?}"), "GcsCredentials(service_account, redacted)");
+    }
+
+    /// Resolving a missing secret fails, and the error names the kind of source
+    /// and nothing more: the message itself travels into logs.
+    #[test]
+    fn an_unreadable_secret_fails_without_naming_its_location() {
+        let source = SecretSource::File {
+            path: PathBuf::from(format!("/nonexistent/{MARKER}")),
+        };
+        let err = source.resolve().err().expect("the file does not exist");
+        assert!(matches!(
+            err,
+            ProfileError::SecretUnavailable { kind: "file" }
+        ));
+        let rendered = format!("{err} / {err:?}");
+        assert!(!rendered.contains(MARKER), "leaked the path: {rendered}");
+    }
+
+    #[test]
+    fn a_file_secret_is_read_with_its_trailing_newline_trimmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("key");
+        std::fs::write(&path, "abc123\n").expect("write");
+        let source = SecretSource::File { path };
+        assert_eq!(source.resolve().expect("resolve"), "abc123");
+    }
+
+    /// The ETag reaches [`ObjectMeta`] byte for byte, quotes included: it is
+    /// the value a later `get_pinned` sends back as `If-Match`, and any
+    /// normalization here would make that read compare a string the store never
+    /// issued.
+    #[test]
+    fn external_metadata_passes_the_etag_through_verbatim() {
+        let meta = map_external_meta(object_store::ObjectMeta {
+            location: object_store::path::Path::from("a/b.parquet"),
+            last_modified: Default::default(),
+            size: 17,
+            e_tag: Some("\"9a0364b9e99bb480dd25e1f0284c8555\"".to_string()),
+            version: Some("gen-42".to_string()),
+        })
+        .expect("an object with an ETag maps");
+        assert_eq!(meta.etag.0, "\"9a0364b9e99bb480dd25e1f0284c8555\"");
+        assert_eq!(meta.version.0, "gen-42");
+        assert_eq!(meta.size, 17);
+        assert_eq!(meta.key, "a/b.parquet");
+
+        // No version reported: the pin's version half falls back to the ETag,
+        // so a pinned read still has both halves to send.
+        let meta = map_external_meta(object_store::ObjectMeta {
+            location: object_store::path::Path::from("a/b.parquet"),
+            last_modified: Default::default(),
+            size: 17,
+            e_tag: Some("\"abc\"".to_string()),
+            version: None,
+        })
+        .expect("an unversioned object maps");
+        assert_eq!(meta.version.0, "\"abc\"");
+
+        // No ETag at all: there is no pin to record, so this is an error rather
+        // than a silently unpinnable object.
+        let err = map_external_meta(object_store::ObjectMeta {
+            location: object_store::path::Path::from("a/b.parquet"),
+            last_modified: Default::default(),
+            size: 17,
+            e_tag: None,
+            version: None,
+        })
+        .err()
+        .expect("an object with no ETag cannot be pinned");
+        assert!(matches!(err, StoreError::Permanent(_)), "got {err:?}");
+    }
+}

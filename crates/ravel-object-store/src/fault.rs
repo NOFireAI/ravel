@@ -1724,4 +1724,84 @@ mod tests {
         held.await.expect("join").expect("second get after release");
         assert_eq!(gate.held_count(), 0);
     }
+
+    /// With no rule armed, `get_pinned` reaches the wrapped store with the pin
+    /// intact: the wrapped `MemoryStore` serves the matching pin and refuses
+    /// the stale one, and the decorator counts no fault for either.
+    #[tokio::test]
+    async fn get_pinned_passes_through_an_empty_plan_with_the_pin_intact() {
+        let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        store
+            .put("k", Bytes::from_static(b"v1"), PutOptions::default())
+            .await
+            .expect("put");
+        let stale = crate::Pin::etag(store.head("k").await.expect("head").etag.0);
+
+        let got = store
+            .get_pinned("k", GetRange::Full, &stale)
+            .await
+            .expect("the matching pin is served");
+        assert_eq!(&got.data[..], b"v1");
+
+        store
+            .put("k", Bytes::from_static(b"v2"), PutOptions::default())
+            .await
+            .expect("overwrite");
+        let err = store
+            .get_pinned("k", GetRange::Full, &stale)
+            .await
+            .expect_err("the stale pin is refused by the wrapped store");
+        assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+        assert_eq!(
+            store.counters_snapshot().len(),
+            0,
+            "an empty plan injects nothing, so neither read is a counted fault"
+        );
+    }
+
+    /// The scripted precondition failure fires on `get_pinned`, is counted
+    /// under `Op::Get`, and applies exactly once, so the retry after it reaches
+    /// the wrapped store.
+    #[tokio::test]
+    async fn scripted_failed_precondition_fires_once_on_get_pinned_and_is_counted() {
+        let plan = FaultPlan::empty().with_rule(Rule::new(
+            Op::Get,
+            ScriptedFault::FailedPrecondition,
+        ));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store
+            .put("k", Bytes::from_static(b"v1"), PutOptions::default())
+            .await
+            .expect("put");
+        let pin = crate::Pin::etag(store.head("k").await.expect("head").etag.0);
+
+        let err = store
+            .get_pinned("k", GetRange::Full, &pin)
+            .await
+            .expect_err("the scripted fault must surface");
+        assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::FailedPrecondition),
+            1,
+            "the fault must be counted, not just returned"
+        );
+    }
+
+    /// `FailedPrecondition` is scriptable but never randomly generated: it is
+    /// meaningless on any op but a pinned read, and random mode would spend its
+    /// budget on a fault nothing observes.
+    #[test]
+    fn failed_precondition_is_never_a_randomly_generated_kind() {
+        for op in [Op::Put, Op::Get, Op::Head, Op::List, Op::Delete] {
+            assert!(
+                !applicable_kinds(op).contains(&FaultKind::FailedPrecondition),
+                "{op:?} would emit FailedPrecondition in random mode"
+            );
+        }
+        assert_eq!(
+            ScriptedFault::FailedPrecondition.kind(),
+            FaultKind::FailedPrecondition,
+            "it must still be scriptable and countable"
+        );
+    }
 }

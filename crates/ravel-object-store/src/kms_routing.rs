@@ -396,6 +396,21 @@ mod tests {
             })
         }
 
+        async fn get_pinned(
+            &self,
+            key: &str,
+            _range: GetRange,
+            pin: &crate::Pin,
+        ) -> Result<GetOutcome, StoreError> {
+            self.record("get_pinned", key);
+            Ok(GetOutcome {
+                data: Bytes::new(),
+                etag: crate::Etag(pin.etag.clone()),
+                version: crate::Version("fake".into()),
+                total_size: 0,
+            })
+        }
+
         async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
             self.record("head", key);
             Err(StoreError::NotFound)
@@ -627,6 +642,15 @@ mod tests {
         let prefix = format!("t/{TENANT_A}/");
 
         rig.store.get(&key, GetRange::Full).await.expect("get");
+        let outcome = rig
+            .store
+            .get_pinned(&key, GetRange::Full, &crate::Pin::etag("\"abc\""))
+            .await
+            .expect("get_pinned");
+        assert_eq!(
+            outcome.etag.0, "\"abc\"",
+            "the pin must reach the delegate, not be swallowed by the decorator"
+        );
         let _ = rig.store.head(&key).await;
         rig.store.list(&prefix, None).await.expect("list");
         rig.store
@@ -639,7 +663,14 @@ mod tests {
             events_for(&rig, "default").iter().map(|e| e.op).collect();
         assert_eq!(
             default_ops,
-            vec!["get", "head", "list", "list_delimited", "delete"],
+            vec![
+                "get",
+                "get_pinned",
+                "head",
+                "list",
+                "list_delimited",
+                "delete"
+            ],
         );
         // No per-tenant store was ever built: no write happened.
         assert_eq!(rig.builds.load(Ordering::SeqCst), 0);
