@@ -8,6 +8,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ravel-server` resolves `cost-based` logs fetching on every deployment
+  again, including a `--store s3` deployment against a loopback
+  `--s3-endpoint`** (ADR-2023 decision 1, issue #2023). 0.18.0's loopback
+  `byte-minimal` default (ADR-2014) is withdrawn: under ten concurrent
+  queries on the ClickBench reference machine it cut throughput to about a
+  third of `cost-based`'s (0.123 vs 0.400 queries per second, one variable
+  changed per arm). `--logs-fetch-policy byte-minimal` remains available as
+  an explicit opt-in; only the unset default changes.
 - **`ravel-server`'s catalog byte cache is sized independently of
   `--cache-max-bytes`** (ADR-2023, issue #2023). `--cache-max-bytes` now
   bounds the query fetcher cache only; the catalog byte cache derives its

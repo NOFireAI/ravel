@@ -9880,24 +9880,25 @@ mod tests {
     /// answer forward, so a wrong derivation here is a wrong derivation
     /// everywhere it is consumed.
     ///
-    /// Prove-the-test (a): reintroduce ADR-2014's withdrawn derivation, an
-    /// `if self.store_is_loopback() { return (LogsFetchPolicyArg::ByteMinimal,
-    /// "derived-loopback-endpoint"); }` branch ahead of the `match
-    /// self.logs_fetch_policy` in `resolve_logs_fetch_policy`. Case 1 (loopback
-    /// + no flag) then reads `byte-minimal`/`derived-loopback-endpoint`
-    /// against the expected `cost-based`/`default`. Measured: reintroducing
-    /// that branch fails
+    /// Prove-the-test (a): add a `None if self.store_is_loopback() =>
+    /// (LogsFetchPolicyArg::ByteMinimal, "derived-loopback-endpoint")` arm
+    /// ahead of the plain `None` arm in `resolve_logs_fetch_policy`,
+    /// reintroducing ADR-2014's withdrawn derivation. Measured: this fails
     /// `resolve_logs_fetch_policy_resolves_cost_based_by_default_even_on_a_loopback_endpoint`
-    /// on exactly that assertion.
+    /// at its case-1 assertion (the `left: (ByteMinimal,
+    /// "derived-loopback-endpoint")` / `right: (CostBased, "default")`
+    /// mismatch on the plain loopback-IPv4 case, before the hostname,
+    /// no-endpoint or explicit-flag cases are even reached).
     ///
-    /// Prove-the-test (b): change `match self.logs_fetch_policy { Some(policy)
-    /// => ... }` to ignore the flag on a loopback store, e.g. `Some(policy) if
-    /// !self.store_is_loopback() => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG)`
-    /// falling through to the `cost-based`/`default` arm otherwise. Case 5 (an
-    /// explicit `cost-based` on a loopback endpoint) and case 6 (explicit
-    /// `byte-minimal` on the same endpoint) then both read
-    /// `cost-based`/`default` against their expected `.../flag`. Measured:
-    /// that change fails the same test on both of those assertions.
+    /// Prove-the-test (b): change the `match self.logs_fetch_policy { Some(policy)
+    /// => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG), None => ... }` to `match
+    /// self.logs_fetch_policy { Some(policy) if !self.store_is_loopback() =>
+    /// (policy, LOGS_FETCH_POLICY_SOURCE_FLAG), _ => ... }`, so an explicit
+    /// flag on a loopback store falls through to the default arm instead of
+    /// winning. Measured: this fails the same test at case 5 (explicit
+    /// `cost-based` on a loopback endpoint), `left: (CostBased, "default")` /
+    /// `right: (CostBased, "flag")`; case 6 (explicit `byte-minimal` on the
+    /// same endpoint) would fail identically but the test never reaches it.
     #[test]
     fn resolve_logs_fetch_policy_resolves_cost_based_by_default_even_on_a_loopback_endpoint() {
         // 1. loopback + no flag -> cost-based, default. An IPv4 literal and
@@ -9913,7 +9914,10 @@ mod tests {
         );
         let loopback_stamp = stamp_from(&loopback);
         assert_eq!(loopback_stamp.policy, "cost-based");
-        assert_eq!(loopback_stamp.policy_source, LOGS_FETCH_POLICY_SOURCE_DEFAULT);
+        assert_eq!(
+            loopback_stamp.policy_source,
+            LOGS_FETCH_POLICY_SOURCE_DEFAULT
+        );
 
         let loopback_hostname = cli(&["--store", "s3", "--s3-endpoint", "http://localhost:9000"]);
         assert_eq!(
@@ -10068,8 +10072,10 @@ mod tests {
             "policy_source must appear exactly once on the resolved-policy line, lines: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("policy=\"cost-based\"")
-                && l.contains("policy_source=\"default\"")),
+            lines
+                .iter()
+                .any(|l| l.contains("policy=\"cost-based\"")
+                    && l.contains("policy_source=\"default\"")),
             "the resolved policy and its source must appear together on the same line, lines: {lines:?}"
         );
     }
