@@ -46,8 +46,8 @@
 //! this module's job is detection and alarming (the metrics wiring lands in the
 //! follow-up task), exactly as ADR-0059's consequences state.
 
-use ravel_catalog::{PostingsLimits, decode_postings, fetch_segment_names};
-use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_catalog::{PostingsBuildError, PostingsLimits, decode_postings, fetch_segment_names};
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::catalog::v1::SnapshotEntry;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{FooterOutcome, ReaderLimits};
@@ -88,11 +88,13 @@ pub struct CoveringPostings<'a> {
     pub max_postings_bytes: u64,
 }
 
-/// The outcome of scrubbing one object. Anomalies (structural corruption,
-/// checksum mismatch, postings disagreement) are distinguished from a
-/// [`ScrubResult::ReadError`], which is a transient store or decode failure and
-/// is deliberately *not* a corruption finding: a throttle or a timeout must not
-/// be counted as bit rot.
+/// The outcome of scrubbing one object. Corruption findings (structural
+/// corruption, checksum mismatch, postings disagreement) are distinguished
+/// from an object the store refuses to return ([`ScrubResult::Unreadable`]),
+/// whose bytes were never read, and from a [`ScrubResult::ReadError`], which
+/// is a retryable store error, a missing object, or an input/decode
+/// inconsistency. Neither of the last two is a corruption finding: a
+/// throttle, a timeout or an access denial must not be counted as bit rot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScrubResult {
     /// Every requested check passed.
@@ -121,13 +123,94 @@ pub enum ScrubResult {
         /// This object's ordinal in the covered-entry list.
         ordinal: u64,
     },
-    /// A transient store error or an input/decode inconsistency prevented the
-    /// scrub. Not a corruption finding; the cursor should retry it on a later
-    /// tick rather than alarm.
+    /// A store error retrying can clear, a missing object, or an input/decode
+    /// inconsistency prevented the scrub. Not a corruption finding.
     ReadError {
         /// What went wrong, rendered for reporting.
         detail: String,
+        /// The error was a retryable store error
+        /// ([`StoreError::is_retryable`]: throttled, timeout, transient) on a
+        /// GET of this object, so the cursor should hold its place and retry
+        /// the object on a later tick. `false` for `NotFound` (retention
+        /// deleted the object after it was listed) and for every input or
+        /// decode inconsistency, which a retry would only hit again.
+        retryable: bool,
     },
+    /// A GET of the object itself (the footer probe, the footer range chase,
+    /// or the whole-object read) failed with a store error retrying cannot
+    /// clear: anything but `NotFound` and the retryable kinds, such as
+    /// `Permanent`, `AccessDenied` or `Corrupted`. The object's bytes were
+    /// never read, so this is not a checksum mismatch: an access denial can be
+    /// a key policy or a credential fault rather than damage at rest.
+    Unreadable {
+        /// The failed GET and its error, rendered for reporting.
+        detail: String,
+        /// Which kind of non-retryable error it was.
+        reason: UnreadableReason,
+    },
+}
+
+/// Why an object or record could not be read at all, the `reason` label of
+/// `ravel_scrub_unreadable_total`. [`scrub_one_object`] only ever reports
+/// [`AccessDenied`](Self::AccessDenied) or [`Permanent`](Self::Permanent);
+/// [`RetryExhausted`](Self::RetryExhausted) is the scheduled cursor's own
+/// verdict on a unit it stopped retrying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreadableReason {
+    /// The store refused the GET as `AccessDenied` (a bucket or key policy,
+    /// or a credential fault).
+    AccessDenied,
+    /// Any other error retrying cannot clear, or bytes that were read and do
+    /// not decode.
+    Permanent,
+    /// Retryable errors that kept recurring until the cursor gave up holding
+    /// its marker on the unit.
+    RetryExhausted,
+}
+
+impl UnreadableReason {
+    /// Every reason, in label order.
+    pub const ALL: [UnreadableReason; 3] = [
+        UnreadableReason::AccessDenied,
+        UnreadableReason::Permanent,
+        UnreadableReason::RetryExhausted,
+    ];
+
+    /// The label value this reason renders as on `/metrics`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnreadableReason::AccessDenied => "access_denied",
+            UnreadableReason::Permanent => "permanent",
+            UnreadableReason::RetryExhausted => "retry_exhausted",
+        }
+    }
+
+    /// The reason for a GET that failed with `err`, an error retrying cannot
+    /// clear.
+    pub fn of(err: &StoreError) -> Self {
+        match err {
+            StoreError::AccessDenied(_) => UnreadableReason::AccessDenied,
+            _ => UnreadableReason::Permanent,
+        }
+    }
+}
+
+/// Classify a failed GET of the object under scrub: a retryable error or
+/// `NotFound` is a [`ScrubResult::ReadError`], anything else is
+/// [`ScrubResult::Unreadable`].
+fn get_failure(what: &str, err: StoreError) -> ScrubResult {
+    let detail = format!("{what} GET failed: {err}");
+    if err.is_retryable() || matches!(err, StoreError::NotFound) {
+        ScrubResult::ReadError {
+            detail,
+            retryable: err.is_retryable(),
+        }
+    } else {
+        ScrubResult::Unreadable {
+            reason: UnreadableReason::of(&err),
+            detail,
+        }
+    }
 }
 
 /// Scrub one object identified by its commit record (ADR-0059 decision 4's
@@ -136,7 +219,10 @@ pub enum ScrubResult {
 /// found or [`ScrubResult::Clean`].
 ///
 /// `clock` stamps the detection time on the operational log emitted for each
-/// anomaly; it carries no scheduling state and does not influence the verdict.
+/// corruption anomaly; it carries no scheduling state and does not influence
+/// the verdict. A [`ScrubResult::Unreadable`] or [`ScrubResult::ReadError`] is
+/// left to the caller to log: only the caller knows whether the object will
+/// be retried, and so whether a log line now would repeat on every retry.
 pub async fn scrub_one_object(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -148,16 +234,17 @@ pub async fn scrub_one_object(
         Err(_) => {
             return ScrubResult::ReadError {
                 detail: format!("commit record carries unknown signal {}", record.signal),
+                retryable: false,
             };
         }
     };
     let key = record.object_key.as_str();
 
-    // Tier 1: structural. A store error is a ReadError; a reader error is real
-    // corruption.
+    // Tier 1: structural. A store error is classified by `get_failure`; a
+    // reader error is real corruption.
     match verify_structure(store, key, signal).await {
         Ok(()) => {}
-        Err(StructuralOutcome::Read(detail)) => return ScrubResult::ReadError { detail },
+        Err(StructuralOutcome::Read(result)) => return result,
         Err(StructuralOutcome::Corrupt(detail)) => {
             tracing::warn!(
                 object_key = key,
@@ -178,16 +265,13 @@ pub async fn scrub_one_object(
                     "commit record content_hash is {} bytes, expected 32",
                     record.content_hash.len()
                 ),
+                retryable: false,
             };
         }
     };
     let full = match store.get(key, GetRange::Full).await {
         Ok(got) => got,
-        Err(err) => {
-            return ScrubResult::ReadError {
-                detail: format!("full-object GET failed: {err}"),
-            };
-        }
+        Err(err) => return get_failure("full-object", err),
     };
     let actual = *blake3::hash(full.data.as_ref()).as_bytes();
     if actual != expected {
@@ -213,17 +297,17 @@ pub async fn scrub_one_object(
                 );
                 return ScrubResult::PostingsDisagreement { name, ordinal };
             }
-            Err(detail) => return ScrubResult::ReadError { detail },
+            Err(result) => return result,
         }
     }
 
     ScrubResult::Clean
 }
 
-/// Structural-tier outcome: a store/read failure to retry, or genuine
-/// corruption to alarm.
+/// Structural-tier outcome: a failed GET, already classified by
+/// [`get_failure`], or genuine corruption to alarm.
 enum StructuralOutcome {
-    Read(String),
+    Read(ScrubResult),
     Corrupt(String),
 }
 
@@ -241,7 +325,7 @@ async fn verify_structure(
     let probe = store
         .get(key, GetRange::Suffix(FOOTER_PROBE_BYTES))
         .await
-        .map_err(|err| StructuralOutcome::Read(format!("footer suffix GET failed: {err}")))?;
+        .map_err(|err| StructuralOutcome::Read(get_failure("footer suffix", err)))?;
     let total = probe.total_size;
 
     match signal {
@@ -265,9 +349,7 @@ async fn verify_structure_rseg(
             let tail = store
                 .get(key, GetRange::Range(offset, offset + len))
                 .await
-                .map_err(|err| {
-                    StructuralOutcome::Read(format!("footer range GET failed: {err}"))
-                })?;
+                .map_err(|err| StructuralOutcome::Read(get_failure("footer range", err)))?;
             match ravel_segment::open_from_suffix(&tail.data, total, limits)
                 .map_err(|err| StructuralOutcome::Corrupt(format!("RSEG footer: {err}")))?
             {
@@ -294,9 +376,7 @@ async fn verify_structure_rlog(
             let tail = store
                 .get(key, GetRange::Range(offset, offset + len))
                 .await
-                .map_err(|err| {
-                    StructuralOutcome::Read(format!("footer range GET failed: {err}"))
-                })?;
+                .map_err(|err| StructuralOutcome::Read(get_failure("footer range", err)))?;
             match ravel_logseg::open_from_suffix(&tail.data, total)
                 .map_err(|err| StructuralOutcome::Corrupt(format!("RLOG footer: {err}")))?
             {
@@ -311,37 +391,43 @@ async fn verify_structure_rlog(
 
 /// Run the postings tier. Returns `Ok(None)` when the postings' claims agree
 /// with this object's true name set, `Ok(Some((name, ordinal)))` on the first
-/// false negative, or `Err(detail)` on a read/decode inconsistency (classified
-/// by the caller as a [`ScrubResult::ReadError`], never a corruption finding).
+/// false negative, or `Err` with a [`ScrubResult::ReadError`] on a read or
+/// decode failure, never a corruption finding: the content tier has already
+/// verified the object's bytes by then. The error is retryable only when the
+/// re-derivation's own store read failed retryably.
 async fn check_postings(
     store: &dyn ObjectStoreBackend,
     record: &CommitRecord,
     signal: Signal,
     covering: &CoveringPostings<'_>,
-) -> Result<Option<(String, u64)>, String> {
+) -> Result<Option<(String, u64)>, ScrubResult> {
+    let inconsistent = |detail: String| ScrubResult::ReadError {
+        detail,
+        retryable: false,
+    };
     let limits = PostingsLimits {
         max_postings_bytes: covering.max_postings_bytes,
     };
     let decoded = decode_postings(covering.bytes, &limits, covering.part_blake3)
-        .map_err(|err| format!("covering postings failed to decode: {err}"))?;
+        .map_err(|err| inconsistent(format!("covering postings failed to decode: {err}")))?;
 
     // Locate this object's ordinal in the concatenated covered-entry list.
     let ordinal = match self_ordinal(covering.covered_entries, record) {
         Some(index) => index as u64,
         None => {
-            return Err(
+            return Err(inconsistent(
                 "this object's entry was not found among the covering postings' covered entries"
                     .to_string(),
-            );
+            ));
         }
     };
     let entry = &covering.covered_entries[ordinal as usize];
 
     let tenant_hash: [u8; 16] = record.tenant_hash.as_slice().try_into().map_err(|_| {
-        format!(
+        inconsistent(format!(
             "commit record tenant_hash is {} bytes, expected 16",
             record.tenant_hash.len()
-        )
+        ))
     })?;
     let tenant = TenantHash(tenant_hash);
 
@@ -349,7 +435,10 @@ async fn check_postings(
     // wrote the postings did (shared function, ADR-0059 decision 3).
     let mut true_names: Vec<String> = fetch_segment_names(store, &tenant, signal, entry)
         .await
-        .map_err(|err| format!("re-deriving segment names failed: {err}"))?
+        .map_err(|err| ScrubResult::ReadError {
+            retryable: matches!(&err, PostingsBuildError::Store(store) if store.is_retryable()),
+            detail: format!("re-deriving segment names failed: {err}"),
+        })?
         .into_iter()
         .collect();
     // Deterministic order so the reported disagreement is stable.
@@ -431,28 +520,86 @@ pub struct ScrubTarget {
     pub object_size: u64,
 }
 
-/// The bounded amount of work one content-tier tick may do. Every tick scrubs
-/// at least one object even when a single object exceeds the byte budget, so
-/// the cursor always makes progress and can never wedge on an oversized object.
+/// Worst-case store requests verifying one object issues: the footer suffix
+/// probe, the ranged footer chase the probe grows to when it missed, the
+/// whole-object read of the content tier, and the postings tier's one
+/// re-derivation read. Charged per object so a unit naming an unusual number
+/// of parts fills the request budget instead of running unbounded.
+pub const SCRUB_REQUESTS_PER_OBJECT: u64 = 4;
+
+/// Request allowance per listing entry a tick is budgeted. An ordinary commit
+/// record costs one record GET plus one object, so the request cap leaves
+/// headroom above that and binds only on a unit that names several objects.
+pub const SCRUB_REQUESTS_PER_ENTRY: u64 = SCRUB_REQUESTS_PER_OBJECT + 4;
+
+/// How far above the sustained rate a tick may go to catch a rotation up with
+/// its deadline. Above this the rotation cannot finish in time and the scrub
+/// reports it instead of doing one unbounded tick.
+pub const SCRUB_MAX_CATCHUP: u64 = 4;
+
+/// The bounded amount of work one content-tier tick may do (ADR-1686 decision
+/// 2, amended). A tick consumes listing entries in key order until either cap
+/// is reached, and always consumes at least one unit, so the cursor makes
+/// progress even when one unit alone exceeds the budget.
+///
+/// Both caps are counted, not estimated: every listing entry the walk consumes
+/// counts against `max_entries`, and every store request the tick issues
+/// counts against `max_requests` whether or not it succeeded. A byte cap
+/// cannot do that job, because a failing GET moves no bytes, and a tick that
+/// stops on bytes alone walks and GETs the rest of the prefix during a store
+/// outage while its marker skips all of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScrubBudget {
-    /// At most this many objects per tick.
-    MaxObjects(u64),
-    /// At most this many bytes per tick.
-    MaxBytes(u64),
+pub struct ScrubBudget {
+    /// Listing entries this tick may consume.
+    pub max_entries: u64,
+    /// Store requests this tick may issue: listing pages, record GETs, and
+    /// [`SCRUB_REQUESTS_PER_OBJECT`] for each object it verifies.
+    pub max_requests: u64,
 }
 
-/// The rotating content-tier cursor (ADR-0059 decision 1). A small plain-data
-/// record the follow-up task persists to object storage the same way the fold
-/// watermark is; this task implements only the pure advancement logic, so the
-/// struct carries no I/O and every field is public.
+impl ScrubBudget {
+    /// Whether a tick that has consumed `entries` listing entries and issued
+    /// `requests` store requests has filled this budget. An empty slice never
+    /// has, so every tick consumes at least one unit.
+    pub fn is_filled(self, entries: u64, requests: u64) -> bool {
+        if entries == 0 {
+            return false;
+        }
+        entries >= self.max_entries || requests >= self.max_requests
+    }
+}
+
+/// One tick's budget together with the rotation numbers it was derived from,
+/// so the caller can report a rotation that cannot finish in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TickPlan {
+    /// The caps this tick runs under.
+    pub budget: ScrubBudget,
+    /// The rotation's allotted length in seconds: the scrub period `P`, or
+    /// half the operator's retention window when that is shorter. An object
+    /// deleted before the rotation reaches it is never verified at all, and a
+    /// rotation as long as the retention window reaches its oldest objects at
+    /// about the age they expire.
+    pub rotation_secs: u64,
+    /// Entries this tick would have had to consume for the rotation to reach
+    /// the end of the listing by its deadline.
+    pub needed_entries: u64,
+    /// `needed_entries` exceeded the catch-up ceiling, so this rotation will
+    /// not finish within `rotation_secs`: the scrub cannot keep up at the
+    /// configured period.
+    pub behind: bool,
+}
+
+/// The rotating content-tier cursor (ADR-0059 decision 1, ADR-1686). Plain
+/// data with no I/O; the scheduled wrapper persists it to object storage.
 ///
-/// `last_object_key` is the position within the current rotation: the next tick
-/// resumes at the first object whose key sorts strictly after it. `None` means
-/// "start of a rotation" (either the very first tick or a just-completed
-/// rotation that wrapped). `rotation_started_unix_ns` anchors the current
-/// rotation's start for the `ravel_scrub_cursor_position` gauge the follow-up
-/// exposes.
+/// The position is a start-after marker over the commit shard prefix: the
+/// next tick lists strictly after `last_commit_key`, so the store's listing
+/// order is the rotation order and no corpus is ever materialised. `None`
+/// means "start of a rotation". The entry totals size each tick's budget
+/// ([`ScrubCursor::plan_tick`]) and feed the position gauge; the byte totals
+/// report the rotation's read bandwidth (ADR-0059 decision 1) and no longer
+/// bound a tick, since bytes cannot bound one whose GETs fail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrubCursor {
     /// Tenant this cursor rotates over.
@@ -461,11 +608,98 @@ pub struct ScrubCursor {
     pub signal: Signal,
     /// Shard this cursor rotates over.
     pub shard: u32,
-    /// Position within the current rotation: resume after this key. `None` at a
+    /// The last commit-shard-prefix key this rotation consumed. `None` at a
     /// rotation boundary.
-    pub last_object_key: Option<String>,
+    pub last_commit_key: Option<String>,
     /// Unix-ns anchor for the current rotation's start.
     pub rotation_started_unix_ns: i64,
+    /// Sum of `object_size` over the objects this rotation has consumed.
+    pub rotation_bytes_seen: u64,
+    /// `rotation_bytes_seen` at the end of the previous completed rotation;
+    /// `None` until one completes.
+    pub last_rotation_bytes: Option<u64>,
+    /// Listing entries the LIST-only count at this rotation's start found;
+    /// `None` until this rotation has been counted.
+    pub rotation_total_entries: Option<u64>,
+    /// Listing entries this rotation has consumed so far.
+    pub rotation_entries_visited: u64,
+    /// Listing entries appended since this rotation began, counted by a
+    /// LIST-only pass over the tail window each tick
+    /// ([`observe_tail`](Self::observe_tail)). Added to
+    /// `rotation_total_entries` so the budget is sized from what the walk has
+    /// actually observed rather than from a total that went stale the moment
+    /// the rotation opened.
+    pub rotation_appended_entries: u64,
+    /// The directory (ingest hour) the tail window starts at: the
+    /// second-greatest hour directory the last count saw, or the only one.
+    /// `None` means the prefix was empty then, so the next count covers the
+    /// whole prefix.
+    pub rotation_tail_dir: Option<String>,
+    /// Entries in and after `rotation_tail_dir` when the last count ran.
+    pub rotation_tail_entries: u64,
+    /// Consecutive ticks that held the marker behind the unit starting at
+    /// `held_unit_key` because one of its GETs failed retryably. Zero when no
+    /// unit is held.
+    pub held_ticks: u32,
+    /// The first listing entry of the unit `held_ticks` counts for. A unit
+    /// that lands between the marker and this one, and is consumed, leaves
+    /// the count alone; one that is held itself starts a fresh count.
+    pub held_unit_key: Option<String>,
+}
+
+/// The running tally of one LIST-only count pass over the commit shard prefix
+/// (ADR-1686 decision 3, amended): how many entries it saw, and how many of
+/// them fell in each of the two greatest directories (ingest hours) it met.
+///
+/// Every writer commits into the current hour, and a commit key is
+/// `<hour>/<writer_id>.<epoch>.<seq>.cmt`, so a new commit from a writer whose
+/// id sorts low lands below keys already listed in that hour. A count that only
+/// looks past the greatest key seen misses it. Counting the whole window from
+/// the start of its first directory, and comparing with the same window's
+/// count last time, catches every append into those hours whatever its writer.
+/// The window keeps the hour before the greatest one as well, so a commit that
+/// lands late in the previous hour after the next hour has begun is counted
+/// too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TailTally {
+    /// Entries the pass saw.
+    pub entries: u64,
+    last_dir: Option<String>,
+    last_dir_entries: u64,
+    prev_dir: Option<String>,
+    prev_dir_entries: u64,
+}
+
+impl TailTally {
+    /// Count one listed key. Keys must arrive in listing order.
+    pub fn observe(&mut self, key: &str) {
+        self.entries = self.entries.saturating_add(1);
+        let dir = match key.rfind('/') {
+            Some(slash) => &key[..=slash],
+            None => key,
+        };
+        if self.last_dir.as_deref() == Some(dir) {
+            self.last_dir_entries = self.last_dir_entries.saturating_add(1);
+        } else {
+            self.prev_dir = self.last_dir.replace(dir.to_string());
+            self.prev_dir_entries = self.last_dir_entries;
+            self.last_dir_entries = 1;
+        }
+    }
+
+    /// Where the next count starts and how many entries lie in and after it:
+    /// the second-greatest directory this pass met with both directories'
+    /// entries, or the only directory it met. `None` when it saw nothing.
+    pub fn window(&self) -> Option<(String, u64)> {
+        match (&self.prev_dir, &self.last_dir) {
+            (Some(prev), Some(_)) => Some((
+                prev.clone(),
+                self.prev_dir_entries.saturating_add(self.last_dir_entries),
+            )),
+            (None, Some(last)) => Some((last.clone(), self.last_dir_entries)),
+            _ => None,
+        }
+    }
 }
 
 impl ScrubCursor {
@@ -475,124 +709,186 @@ impl ScrubCursor {
             tenant_hash,
             signal,
             shard,
-            last_object_key: None,
+            last_commit_key: None,
             rotation_started_unix_ns: now_ns,
+            rotation_bytes_seen: 0,
+            last_rotation_bytes: None,
+            rotation_total_entries: None,
+            rotation_entries_visited: 0,
+            rotation_appended_entries: 0,
+            rotation_tail_dir: None,
+            rotation_tail_entries: 0,
+            held_ticks: 0,
+            held_unit_key: None,
         }
     }
-}
 
-/// One tick's plan: the objects to scrub now and the cursor to persist after.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScrubSlice {
-    /// Object keys to scrub this tick, in corpus order.
-    pub scrub_keys: Vec<String>,
-    /// The cursor to persist once this slice's objects have been scrubbed.
-    pub next_cursor: ScrubCursor,
-    /// `true` when this slice reached the corpus tail: the rotation is complete
-    /// and `next_cursor` has wrapped to the start with a fresh
-    /// `rotation_started_unix_ns`.
-    pub rotation_complete: bool,
-}
-
-/// Compute the next content-tier slice given the current cursor, the corpus to
-/// rotate over (in key order, as a strongly consistent LIST returns it), a
-/// per-tick budget, and the current wall-clock ns for stamping a new rotation.
-///
-/// Pure and I/O-free: the scheduled wrapper LISTs the corpus, calls this,
-/// scrubs `scrub_keys` via [`scrub_one_object`], then persists `next_cursor`.
-/// Deletions and insertions between ticks are tolerated because the resume
-/// point is a key comparison, not an index: the cursor simply resumes at the
-/// first surviving key after `last_object_key`.
-pub fn advance_cursor(
-    cursor: &ScrubCursor,
-    corpus: &[ScrubTarget],
-    budget: ScrubBudget,
-    now_ns: i64,
-) -> ScrubSlice {
-    if corpus.is_empty() {
-        // Nothing to rotate over: the rotation is trivially complete.
-        return ScrubSlice {
-            scrub_keys: Vec::new(),
-            next_cursor: ScrubCursor {
-                last_object_key: None,
-                rotation_started_unix_ns: now_ns,
-                ..cursor.clone()
-            },
-            rotation_complete: true,
-        };
+    /// Whether this rotation still needs its LIST-only entry count.
+    pub fn needs_entry_count(&self) -> bool {
+        self.rotation_total_entries.is_none()
     }
 
-    let mut rotation_started = cursor.rotation_started_unix_ns;
-    let mut start = match &cursor.last_object_key {
-        None => 0,
-        // First index whose key sorts strictly after the resume point.
-        Some(last) => corpus.partition_point(|target| &target.object_key <= last),
-    };
-    if start >= corpus.len() {
-        // The resume point sits past the current tail (every trailing object
-        // was swept since the last tick): wrap into a fresh rotation.
-        start = 0;
-        rotation_started = now_ns;
+    /// Open a rotation from the start of the prefix with the tally of the
+    /// LIST-only pass over the whole prefix. Keeps `last_rotation_bytes`,
+    /// which reports the previous rotation's bandwidth.
+    pub fn start_rotation(&mut self, tally: &TailTally, now_ns: i64) {
+        self.last_commit_key = None;
+        self.rotation_started_unix_ns = now_ns;
+        self.rotation_bytes_seen = 0;
+        self.rotation_total_entries = Some(tally.entries);
+        self.rotation_entries_visited = 0;
+        self.rotation_appended_entries = 0;
+        let (dir, entries) = tally.window().map_or((None, 0), |(d, n)| (Some(d), n));
+        self.rotation_tail_dir = dir;
+        self.rotation_tail_entries = entries;
+        self.clear_hold();
     }
 
-    let mut scrub_keys = Vec::new();
-    let mut bytes = 0u64;
-    let mut index = start;
-    while index < corpus.len() {
-        let target = &corpus[index];
-        if !scrub_keys.is_empty() {
-            let over_budget = match budget {
-                ScrubBudget::MaxObjects(max) => scrub_keys.len() as u64 >= max,
-                ScrubBudget::MaxBytes(max) => bytes.saturating_add(target.object_size) > max,
-            };
-            if over_budget {
-                break;
+    /// The start-after key of this tick's LIST-only tail count: the tail
+    /// window's directory, which sorts before every key inside it. `None`
+    /// counts the whole prefix.
+    pub fn tail_count_start(&self) -> Option<&str> {
+        self.rotation_tail_dir.as_deref()
+    }
+
+    /// Record this tick's tail count, a tally of every entry listed after
+    /// [`tail_count_start`](Self::tail_count_start). Its growth over the
+    /// window's count last time is what was appended since, and the window
+    /// moves to the directories this pass saw last. The growth is net of
+    /// deletions in the window (retention or a sweep): a deletion cancels an
+    /// append counted in the same pass, and a window that shrank counts none.
+    /// When the deleted entries were still ahead of the marker the walk will
+    /// not meet them either, so a cancelled append leaves the estimate right
+    /// and a deletion with no append to cancel leaves it high. When the walk
+    /// had already consumed them, the appends they cancel are real entries
+    /// still ahead, and the estimate understates what is left to walk.
+    pub fn observe_tail(&mut self, tally: &TailTally) {
+        let appended = tally.entries.saturating_sub(self.rotation_tail_entries);
+        self.rotation_appended_entries = self.rotation_appended_entries.saturating_add(appended);
+        match tally.window() {
+            Some((dir, entries)) => {
+                self.rotation_tail_dir = Some(dir);
+                self.rotation_tail_entries = entries;
             }
+            None => self.rotation_tail_entries = 0,
         }
-        scrub_keys.push(target.object_key.clone());
-        bytes = bytes.saturating_add(target.object_size);
-        index += 1;
     }
 
-    let rotation_complete = index >= corpus.len();
-    let next_cursor = if rotation_complete {
-        ScrubCursor {
-            last_object_key: None,
-            rotation_started_unix_ns: now_ns,
-            ..cursor.clone()
-        }
-    } else {
-        ScrubCursor {
-            last_object_key: Some(corpus[index - 1].object_key.clone()),
-            rotation_started_unix_ns: rotation_started,
-            ..cursor.clone()
-        }
-    };
-
-    ScrubSlice {
-        scrub_keys,
-        next_cursor,
-        rotation_complete,
+    /// Entries this rotation is expected to cover: the count its opening
+    /// LIST-only pass found plus everything appended since.
+    pub fn estimated_rotation_entries(&self) -> u64 {
+        self.rotation_total_entries
+            .unwrap_or(0)
+            .saturating_add(self.rotation_appended_entries)
     }
-}
 
-/// Size one content-tier tick's byte budget so a full rotation over
-/// `total_corpus_bytes` completes in about the scrub period `P`: sustained read
-/// bandwidth is `total_corpus_bytes / P`, so one tick of length `tick_secs`
-/// reads `total_corpus_bytes * tick_secs / P` (rounded up, and at least one
-/// byte so a tiny corpus still advances). This is the explicit, operator-sized
-/// budget ADR-0059 decision 1 calls for.
-pub fn per_tick_byte_budget(
-    total_corpus_bytes: u64,
-    period_secs: u64,
-    tick_secs: u64,
-) -> ScrubBudget {
-    let period = period_secs.max(1);
-    let per_tick = total_corpus_bytes
-        .saturating_mul(tick_secs)
-        .div_ceil(period)
-        .max(1);
-    ScrubBudget::MaxBytes(per_tick)
+    /// This tick's plan (ADR-1686 decision 3, amended). The rotation is
+    /// allotted `min(period_secs, retention_secs / 2)`, since an object
+    /// deleted by retention before the walk reaches it is never verified at
+    /// all, and the oldest-first walk would reach each object at about its
+    /// expiry age if it were allotted the whole retention window. What is
+    /// left to cover is divided by the ticks left before that deadline, so a
+    /// rotation that has fallen behind speeds up instead of running forever:
+    /// on the last tick before the deadline the whole remainder is budgeted.
+    ///
+    /// The estimate is recomputed every tick from
+    /// [`estimated_rotation_entries`](Self::estimated_rotation_entries), which
+    /// tracks appends, so a shard that keeps committing cannot outrun the
+    /// walk. [`SCRUB_MAX_CATCHUP`] caps how far above the sustained rate one
+    /// tick may go; past that cap the returned plan is `behind` and the
+    /// caller reports that the scrub cannot keep up.
+    pub fn plan_tick(
+        &self,
+        period_secs: u64,
+        tick_secs: u64,
+        retention_secs: Option<u64>,
+        now_ns: i64,
+    ) -> TickPlan {
+        let tick_secs = tick_secs.max(1);
+        let rotation_secs = match retention_secs {
+            Some(retention) => period_secs.max(1).min((retention / 2).max(1)),
+            None => period_secs.max(1),
+        };
+        let deadline_ticks = rotation_secs.div_ceil(tick_secs).max(1);
+        let elapsed_ns = now_ns.saturating_sub(self.rotation_started_unix_ns).max(0) as u64;
+        let ticks_elapsed = elapsed_ns / tick_secs.saturating_mul(1_000_000_000).max(1);
+        let ticks_remaining = deadline_ticks.saturating_sub(ticks_elapsed).max(1);
+
+        let estimated = self.estimated_rotation_entries();
+        let remaining = estimated.saturating_sub(self.rotation_entries_visited);
+        let needed_entries = remaining.div_ceil(ticks_remaining).max(1);
+        let sustained = estimated
+            .saturating_mul(tick_secs)
+            .div_ceil(rotation_secs)
+            .max(1);
+        let ceiling = sustained.saturating_mul(SCRUB_MAX_CATCHUP);
+        let max_entries = needed_entries.max(sustained).min(ceiling).max(1);
+        TickPlan {
+            budget: ScrubBudget {
+                max_entries,
+                max_requests: max_entries.saturating_mul(SCRUB_REQUESTS_PER_ENTRY),
+            },
+            rotation_secs,
+            needed_entries,
+            behind: needed_entries > ceiling,
+        }
+    }
+
+    /// Advance the marker past `entries` consumed listing entries ending at
+    /// `last_key`, whose objects total `bytes`. The hold ends once the marker
+    /// reaches or passes the held unit's first entry, whether that unit was
+    /// consumed or deleted after it was listed.
+    pub fn consume(&mut self, last_key: String, entries: u64, bytes: u64) {
+        if self
+            .held_unit_key
+            .as_deref()
+            .is_some_and(|held| last_key.as_str() >= held)
+        {
+            self.clear_hold();
+        }
+        self.last_commit_key = Some(last_key);
+        self.rotation_entries_visited = self.rotation_entries_visited.saturating_add(entries);
+        self.rotation_bytes_seen = self.rotation_bytes_seen.saturating_add(bytes);
+    }
+
+    /// Whether the unit whose first listing entry is `first_key` is the one
+    /// `held_ticks` counts for.
+    pub fn is_held_unit(&self, first_key: &str) -> bool {
+        self.held_unit_key.as_deref() == Some(first_key)
+    }
+
+    /// This tick held the marker behind the unit whose first listing entry is
+    /// `first_key`, because one of its GETs failed retryably. Counts one more
+    /// held tick when that unit is the one already held, and starts a fresh
+    /// count at one for any other unit.
+    pub fn hold(&mut self, first_key: &str) {
+        if self.is_held_unit(first_key) {
+            self.held_ticks = self.held_ticks.saturating_add(1);
+        } else {
+            self.held_ticks = 1;
+            self.held_unit_key = Some(first_key.to_string());
+        }
+    }
+
+    fn clear_hold(&mut self) {
+        self.held_ticks = 0;
+        self.held_unit_key = None;
+    }
+
+    /// The listing ended: roll the byte total over and return to the start of
+    /// the prefix. The next tick counts the new rotation's entries.
+    pub fn complete_rotation(&mut self, now_ns: i64) {
+        self.last_commit_key = None;
+        self.rotation_started_unix_ns = now_ns;
+        self.last_rotation_bytes = Some(self.rotation_bytes_seen);
+        self.rotation_bytes_seen = 0;
+        self.rotation_total_entries = None;
+        self.rotation_entries_visited = 0;
+        self.rotation_appended_entries = 0;
+        self.rotation_tail_dir = None;
+        self.rotation_tail_entries = 0;
+        self.clear_hold();
+    }
 }
 
 #[cfg(test)]
@@ -794,6 +1090,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_object_get_failure_is_classified_by_whether_a_retry_can_clear_it() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let memory = std::sync::Arc::new(MemoryStore::new());
+        let clock = FixedClock::new(0);
+        let record = publish_metric_segment(&memory, Uuid::new_v4(), 1, &["cpu"]).await;
+        let faulted = |fault: ScriptedFault| {
+            FaultStore::new(
+                memory.clone(),
+                FaultPlan::empty()
+                    .with_rule(Rule::new(Op::Get, fault).with_key_contains(&record.object_key)),
+            )
+        };
+
+        let transient = faulted(ScriptedFault::Transient("injected".to_string()));
+        let result = scrub_one_object(&transient, &clock, &record, None).await;
+        assert!(
+            matches!(
+                result,
+                ScrubResult::ReadError {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "a transient GET error is retried, got {result:?}"
+        );
+        assert_eq!(transient.fault_count(Op::Get, FaultKind::Transient), 1);
+
+        let throttled = faulted(ScriptedFault::Throttled { retry_after_ms: 5 });
+        let result = scrub_one_object(&throttled, &clock, &record, None).await;
+        assert!(
+            matches!(
+                result,
+                ScrubResult::ReadError {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "a throttled GET is retried, got {result:?}"
+        );
+        assert_eq!(throttled.fault_count(Op::Get, FaultKind::Throttled), 1);
+
+        let permanent = faulted(ScriptedFault::Permanent("injected".to_string()));
+        let result = scrub_one_object(&permanent, &clock, &record, None).await;
+        assert!(
+            matches!(
+                result,
+                ScrubResult::Unreadable {
+                    reason: UnreadableReason::Permanent,
+                    ..
+                }
+            ),
+            "a permanent GET error makes the object unreadable, got {result:?}"
+        );
+        assert_eq!(permanent.fault_count(Op::Get, FaultKind::Permanent), 1);
+
+        memory
+            .delete(&record.object_key)
+            .await
+            .expect("delete object");
+        let result = scrub_one_object(&memory, &clock, &record, None).await;
+        assert!(
+            matches!(
+                result,
+                ScrubResult::ReadError {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "a missing object is neither retried nor a finding, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn accurate_postings_scrub_clean() {
         let store = MemoryStore::new();
         let clock = FixedClock::new(0);
@@ -884,130 +1256,412 @@ mod tests {
         );
     }
 
-    fn corpus(n: usize) -> Vec<ScrubTarget> {
-        // Keys are zero-padded so lexical order matches numeric order.
-        (0..n)
-            .map(|i| ScrubTarget {
-                object_key: format!("obj-{i:04}"),
-                object_size: 1,
-            })
-            .collect()
+    /// One tick of the marker walk over `keys` (every entry naming one object
+    /// of `size` bytes), driven only through the cursor's own methods the way
+    /// the scheduled wrapper drives them. Returns the keys consumed.
+    fn walk_tick(
+        cursor: &mut ScrubCursor,
+        keys: &[String],
+        size: u64,
+        period_secs: u64,
+        tick_secs: u64,
+        now_ns: i64,
+    ) -> Vec<String> {
+        walk_tick_with_retention(cursor, keys, size, period_secs, tick_secs, None, now_ns)
     }
 
-    #[test]
-    fn cursor_covers_the_whole_corpus_in_ceil_n_over_budget_ticks() {
-        let corpus = corpus(10);
-        let budget = ScrubBudget::MaxObjects(3);
-        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+    /// [`walk_tick`] with an operator retention window, which shortens the
+    /// rotation's deadline.
+    fn walk_tick_with_retention(
+        cursor: &mut ScrubCursor,
+        keys: &[String],
+        size: u64,
+        period_secs: u64,
+        tick_secs: u64,
+        retention_secs: Option<u64>,
+        now_ns: i64,
+    ) -> Vec<String> {
+        walk_tick_planned(
+            cursor,
+            keys,
+            size,
+            period_secs,
+            tick_secs,
+            retention_secs,
+            now_ns,
+        )
+        .0
+    }
 
-        let mut scrubbed: Vec<String> = Vec::new();
-        let mut ticks = 0;
-        let mut completed = false;
-        for _ in 0..100 {
-            let slice = advance_cursor(&cursor, &corpus, budget, 1_000 + ticks as i64);
-            scrubbed.extend(slice.scrub_keys.iter().cloned());
-            cursor = slice.next_cursor.clone();
-            ticks += 1;
-            if slice.rotation_complete {
-                completed = true;
-                break;
-            }
+    /// [`walk_tick_with_retention`], also returning the tick's plan.
+    fn walk_tick_planned(
+        cursor: &mut ScrubCursor,
+        keys: &[String],
+        size: u64,
+        period_secs: u64,
+        tick_secs: u64,
+        retention_secs: Option<u64>,
+        now_ns: i64,
+    ) -> (Vec<String>, TickPlan) {
+        if cursor.needs_entry_count() {
+            cursor.start_rotation(&tally(keys), now_ns);
+        } else {
+            // The LIST-only tail count the scheduled wrapper runs each tick:
+            // every entry listed after the tail window's start.
+            let start = match cursor.tail_count_start() {
+                Some(dir) => keys.partition_point(|key| key.as_str() <= dir),
+                None => 0,
+            };
+            cursor.observe_tail(&tally(&keys[start..]));
         }
+        let plan = cursor.plan_tick(period_secs, tick_secs, retention_secs, now_ns);
+        let start = match &cursor.last_commit_key {
+            Some(last) => keys.partition_point(|key| key <= last),
+            None => 0,
+        };
+        let mut consumed = Vec::new();
+        let mut requests = 0u64;
+        let mut index = start;
+        while index < keys.len() && !plan.budget.is_filled(consumed.len() as u64, requests) {
+            cursor.consume(keys[index].clone(), 1, size);
+            consumed.push(keys[index].clone());
+            // One record GET plus one object's verification, the cost of an
+            // ordinary commit-record entry.
+            requests += 1 + SCRUB_REQUESTS_PER_OBJECT;
+            index += 1;
+        }
+        if index >= keys.len() {
+            cursor.complete_rotation(now_ns);
+        }
+        (consumed, plan)
+    }
 
-        // ceil(10 / 3) == 4 ticks.
-        assert_eq!(ticks, 4);
-        assert!(completed);
-        // Every object visited exactly once, in order.
-        let expected: Vec<String> = corpus.iter().map(|t| t.object_key.clone()).collect();
-        assert_eq!(scrubbed, expected);
-        // The completed rotation wraps to the start.
-        assert_eq!(cursor.last_object_key, None);
+    /// The tally a LIST-only pass over `keys` produces.
+    fn tally(keys: &[String]) -> TailTally {
+        let mut tally = TailTally::default();
+        for key in keys {
+            tally.observe(key);
+        }
+        tally
+    }
+
+    fn entry_keys(n: usize) -> Vec<String> {
+        // Zero-padded so lexical order matches numeric order.
+        (0..n).map(|i| format!("c/0000/{i:04}.cmt")).collect()
     }
 
     #[test]
-    fn cursor_always_advances_even_when_one_object_exceeds_the_byte_budget() {
-        // Budget is 1 byte but every object is 100 bytes: each tick must still
-        // scrub exactly one object rather than wedging.
-        let corpus: Vec<ScrubTarget> = (0..3)
-            .map(|i| ScrubTarget {
-                object_key: format!("big-{i:02}"),
-                object_size: 100,
-            })
+    fn a_first_rotation_covers_every_entry_once_in_ceil_n_over_budget_ticks() {
+        // ceil(10 * 1 / 4) = 3 entries per tick, so ceil(10 / 3) = 4 ticks.
+        let keys = entry_keys(10);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let mut visited: Vec<String> = Vec::new();
+        let mut per_tick: Vec<usize> = Vec::new();
+        for tick in 0..4 {
+            let consumed = walk_tick(&mut cursor, &keys, 5, 4, 1, 1_000 + tick);
+            per_tick.push(consumed.len());
+            visited.extend(consumed);
+        }
+        assert_eq!(per_tick, vec![3, 3, 3, 1]);
+        assert_eq!(visited, keys, "every entry consumed exactly once, in order");
+        assert_eq!(cursor.last_commit_key, None, "the rotation wrapped");
+        assert_eq!(cursor.last_rotation_bytes, Some(50));
+        assert_eq!(cursor.rotation_bytes_seen, 0);
+        assert_eq!(cursor.rotation_total_entries, None);
+        assert_eq!(cursor.rotation_entries_visited, 0);
+        assert_eq!(cursor.rotation_started_unix_ns, 1_003);
+    }
+
+    #[test]
+    fn a_completed_rotation_reports_its_bytes_and_sizes_the_next_by_entries() {
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        cursor.start_rotation(&tally(&entry_keys(4)), 1);
+        // ceil(4 * 1 / 2) = 2 entries, the sustained rate over the count.
+        assert_eq!(cursor.plan_tick(2, 1, None, 1).budget.max_entries, 2);
+        cursor.consume("c/0000/a.cmt".to_string(), 3, 700);
+        assert_eq!(cursor.rotation_entries_visited, 3);
+        assert_eq!(cursor.rotation_bytes_seen, 700);
+        cursor.complete_rotation(9);
+        assert!(cursor.needs_entry_count());
+        cursor.start_rotation(&tally(&entry_keys(4)), 10);
+        // The next rotation is sized by entries, not by the 700 bytes the
+        // previous one read: those are reported, never a budget.
+        assert_eq!(cursor.plan_tick(2, 1, None, 10).budget.max_entries, 2);
+        assert_eq!(cursor.last_rotation_bytes, Some(700));
+        assert_eq!(cursor.rotation_bytes_seen, 0);
+        assert_eq!(cursor.rotation_total_entries, Some(4));
+    }
+
+    #[test]
+    fn every_tick_consumes_at_least_one_entry_even_past_a_tiny_budget() {
+        let tiny = ScrubBudget {
+            max_entries: 1,
+            max_requests: 1,
+        };
+        assert!(!tiny.is_filled(0, 0));
+        assert!(tiny.is_filled(1, 0));
+        // The request cap fills a tick whose entries alone have not.
+        let wide = ScrubBudget {
+            max_entries: 100,
+            max_requests: 8,
+        };
+        assert!(!wide.is_filled(1, 7));
+        assert!(wide.is_filled(1, 8));
+        let keys = entry_keys(3);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let per_tick: Vec<usize> = (0..3)
+            .map(|tick| walk_tick(&mut cursor, &keys, 100, 1_000, 1, tick).len())
             .collect();
-        let budget = ScrubBudget::MaxBytes(1);
-        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-
-        let mut ticks = 0;
-        loop {
-            let slice = advance_cursor(&cursor, &corpus, budget, 5);
-            assert_eq!(
-                slice.scrub_keys.len(),
-                1,
-                "one object per tick under a tiny byte budget"
-            );
-            cursor = slice.next_cursor.clone();
-            ticks += 1;
-            if slice.rotation_complete {
-                break;
-            }
-            assert!(ticks < 10, "cursor failed to converge");
-        }
-        assert_eq!(ticks, 3);
+        assert_eq!(per_tick, vec![1, 1, 1]);
+        assert_eq!(cursor.last_rotation_bytes, Some(300));
     }
 
     #[test]
     fn period_sized_budget_completes_one_rotation_in_about_p_over_tick_ticks() {
-        // 100 one-byte objects, P = 7 days, tick = 1 hour. per-tick byte budget
-        // = ceil(100 * 3600 / 604800) = ceil(0.595) = 1 byte, so a full rotation
-        // takes ~100 ticks; assert it completes within P/tick + a small slack
-        // and covers everything exactly once.
-        let corpus = corpus(100);
-        let total_bytes: u64 = corpus.iter().map(|t| t.object_size).sum();
+        // 100 entries, P = 7 days, tick = 1 hour. Each rotation's entry budget
+        // is ceil(100 * 3600 / 604800) = 1 entry, so it takes 100 ticks, which
+        // fits in P / tick = 168.
+        let keys = entry_keys(100);
         let period_secs = 7 * 86_400;
         let tick_secs = 3_600;
-        let budget = per_tick_byte_budget(total_bytes, period_secs, tick_secs);
-        let ticks_per_period = period_secs / tick_secs; // 168
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        for rotation in 0..2 {
+            let mut visited: Vec<String> = Vec::new();
+            let mut ticks = 0u64;
+            while ticks < period_secs / tick_secs {
+                visited.extend(walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, 42));
+                ticks += 1;
+                if cursor.last_commit_key.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(ticks, 100, "rotation {rotation}");
+            assert_eq!(visited, keys, "rotation {rotation}: every entry once");
+        }
+        assert_eq!(cursor.last_rotation_bytes, Some(100));
+    }
+
+    /// Appends per tick in the property below: equal to the rotation's
+    /// sustained rate when it opens, `ceil(100 * 3600 / 604800)` = 1.
+    const APPENDS_PER_TICK: usize = 1;
+
+    #[test]
+    fn a_rotation_completes_while_the_shard_keeps_committing_at_the_sustained_rate() {
+        // P = 7 days, tick = 1 hour, so a rotation is allotted 168 ticks. The
+        // shard holds 100 entries when the rotation opens and appends
+        // `APPENDS_PER_TICK` more every tick, the sustained rate at the start.
+        // The walk takes at least the sustained rate every tick, and that rate
+        // rises as the appends raise the estimate, so the rotation must still
+        // reach the end of the listing inside its 168 ticks.
+        let period_secs = 7 * 86_400;
+        let tick_secs = 3_600;
+        let deadline_ticks = period_secs / tick_secs;
+        let mut keys = entry_keys(100);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let mut ticks = 0u64;
+        while ticks < deadline_ticks {
+            let now_ns = ticks as i64 * tick_secs as i64 * 1_000_000_000;
+            walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, now_ns);
+            ticks += 1;
+            if cursor.last_commit_key.is_none() {
+                break;
+            }
+            for append in 0..APPENDS_PER_TICK {
+                keys.push(format!(
+                    "c/0000/{:04}.cmt",
+                    100 + ticks as usize * APPENDS_PER_TICK + append
+                ));
+            }
+        }
+        assert!(
+            cursor.last_commit_key.is_none(),
+            "rotation did not complete in {deadline_ticks} ticks: marker still at {:?} with \
+             {} entries listed",
+            cursor.last_commit_key,
+            keys.len()
+        );
+        assert!(ticks <= deadline_ticks, "took {ticks} ticks");
+    }
+
+    /// A commit key in the real layout's shape, `<hour>/<writer>.<epoch>.<seq>`.
+    fn writer_key(hour: u64, writer: &str, seq: u64) -> String {
+        format!("c/0000/{hour:06}/{writer}.1.{seq:08}.cmt")
+    }
+
+    #[test]
+    fn appends_from_writers_on_both_sides_of_the_tail_key_are_all_counted() {
+        // Two writers share the shard: `0a` sorts below `zz` inside every
+        // hour. Ticks fall mid-hour, so between two ticks each writer commits
+        // three records into the hour the last tick saw and three into the
+        // next hour. The `0a` records landing in the hour the last tick saw
+        // sort below that tick's greatest key, and a count that only looks
+        // above that key misses them. Counted exactly, the rotation finishes
+        // inside its 168 ticks without ever reporting behind.
+        let period_secs = 7 * 86_400;
+        let tick_secs = 3_600;
+        let deadline_ticks = period_secs / tick_secs;
+        let writers = ["0a", "zz"];
+        let mut seq = [0u64; 2];
+        let mut keys: Vec<String> = Vec::new();
+        let mut commit = |keys: &mut Vec<String>, hour: u64, count: u64| {
+            for (index, writer) in writers.iter().enumerate() {
+                for _ in 0..count {
+                    keys.push(writer_key(hour, writer, seq[index]));
+                    seq[index] += 1;
+                }
+            }
+            keys.sort();
+        };
+        // The rotation opens on 1,006 entries (five per writer in each of
+        // hours 0 to 99, three per writer in hour 100) and twelve are appended
+        // a tick. The walk keeps pace only while every tick's recount raises
+        // the budget by all twelve, from both writers.
+        for hour in 0..100 {
+            commit(&mut keys, hour, 5);
+        }
+        let mut hour = 100;
+        commit(&mut keys, hour, 3);
 
         let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
-        let mut scrubbed: Vec<String> = Vec::new();
         let mut ticks = 0u64;
+        let mut behind = 0u64;
         let mut completed = false;
-        while ticks < ticks_per_period + 5 {
-            let slice = advance_cursor(&cursor, &corpus, budget, 42);
-            scrubbed.extend(slice.scrub_keys.iter().cloned());
-            cursor = slice.next_cursor.clone();
+        while ticks < deadline_ticks {
+            let now_ns = ticks as i64 * tick_secs as i64 * 1_000_000_000;
+            let (_, plan) =
+                walk_tick_planned(&mut cursor, &keys, 1, period_secs, tick_secs, None, now_ns);
             ticks += 1;
-            if slice.rotation_complete {
+            if plan.behind {
+                behind += 1;
+            }
+            if cursor.last_commit_key.is_none() {
                 completed = true;
                 break;
             }
+            commit(&mut keys, hour, 3);
+            hour += 1;
+            commit(&mut keys, hour, 3);
         }
-
-        assert!(completed, "rotation did not complete within one period");
         assert!(
-            ticks <= ticks_per_period,
-            "rotation took {ticks} ticks, expected <= {ticks_per_period}"
+            completed,
+            "after {ticks} ticks the rotation did not finish: marker at {:?}, {} entries \
+             listed, estimate {}",
+            cursor.last_commit_key,
+            keys.len(),
+            cursor.estimated_rotation_entries()
         );
-        let expected: Vec<String> = corpus.iter().map(|t| t.object_key.clone()).collect();
-        assert_eq!(
-            scrubbed, expected,
-            "every object scrubbed exactly once, in order"
+        assert_eq!(behind, 0, "an exact count keeps the rotation on schedule");
+    }
+
+    #[test]
+    fn the_budget_follows_entries_appended_after_the_rotation_began() {
+        // 10 entries when the rotation opens, P = 20 ticks: the sustained rate
+        // is ceil(10 / 20) = 1 entry per tick. Appending 20 more entries on the
+        // first tick must raise the budget within this same rotation rather
+        // than waiting for the next one to be sized from it.
+        let period_secs = 20;
+        let tick_secs = 1;
+        let mut keys = entry_keys(10);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let first = walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, 0).len();
+        assert_eq!(first, 1, "sustained rate over the entries counted at start");
+        keys.extend((10..30).map(|i| format!("c/0000/{i:04}.cmt")));
+        let second = walk_tick(&mut cursor, &keys, 1, period_secs, tick_secs, 1_000_000_000).len();
+        assert!(
+            second > first,
+            "the budget ignored the 20 entries appended after the rotation began: \
+             tick 1 consumed {first}, tick 2 consumed {second}"
         );
     }
 
     #[test]
-    fn cursor_resumes_after_a_swept_tail() {
-        // The resume key points past the current tail (its object was swept):
-        // the cursor must wrap into a fresh rotation rather than stall.
-        let corpus = corpus(3);
-        let cursor = ScrubCursor {
-            last_object_key: Some("obj-9999".to_string()),
-            rotation_started_unix_ns: 1,
-            ..ScrubCursor::new(tenant(), Signal::Metrics, 0, 1)
+    fn a_rotation_finishes_inside_half_the_configured_retention() {
+        // P = 7 days but retention is 24 hours: an object older than 24 hours
+        // is deleted, so a rotation that takes longer than that leaves objects
+        // unscrubbed for their whole life. A rotation allotted the whole
+        // retention window reaches the oldest objects at about the age they
+        // expire, so it is allotted half: `retention / 2 / tick` = 12 ticks.
+        let period_secs = 7 * 86_400;
+        let tick_secs = 3_600;
+        let retention_secs = 24 * 3_600;
+        let deadline_ticks = retention_secs / 2 / tick_secs;
+        let keys = entry_keys(100);
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let mut ticks = 0u64;
+        while ticks < deadline_ticks {
+            let now_ns = ticks as i64 * tick_secs as i64 * 1_000_000_000;
+            walk_tick_with_retention(
+                &mut cursor,
+                &keys,
+                1,
+                period_secs,
+                tick_secs,
+                Some(retention_secs),
+                now_ns,
+            );
+            ticks += 1;
+            if cursor.last_commit_key.is_none() {
+                break;
+            }
+        }
+        assert!(
+            cursor.last_commit_key.is_none(),
+            "the rotation did not finish inside half the {retention_secs}s retention \
+             window ({deadline_ticks} ticks)"
+        );
+        assert_eq!(
+            ticks, 12,
+            "100 entries at ceil(100 * 3600 / 43200) = 9 a tick"
+        );
+    }
+
+    #[test]
+    fn the_rotation_window_is_the_period_capped_at_half_the_retention() {
+        let cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        let day = 86_400;
+        let window = |period: u64, retention: Option<u64>| {
+            cursor.plan_tick(period, 3_600, retention, 0).rotation_secs
         };
-        let slice = advance_cursor(&cursor, &corpus, ScrubBudget::MaxObjects(10), 500);
-        assert!(slice.rotation_complete);
-        assert_eq!(slice.scrub_keys.len(), 3);
-        assert_eq!(slice.next_cursor.rotation_started_unix_ns, 500);
+        assert_eq!(window(7 * day, None), 7 * day, "no retention caps nothing");
+        assert_eq!(window(7 * day, Some(30 * day)), 7 * day);
+        assert_eq!(window(7 * day, Some(14 * day)), 7 * day);
+        assert_eq!(window(7 * day, Some(10 * day)), 5 * day);
+        assert_eq!(
+            window(7 * day, Some(7 * day)),
+            7 * day / 2,
+            "a period equal to retention would reach each object as it expires"
+        );
+        assert_eq!(window(7 * day, Some(day)), day / 2);
+        assert_eq!(window(7 * day, Some(1)), 1, "never below one second");
+    }
+
+    #[test]
+    fn a_rotation_that_cannot_finish_by_its_deadline_reports_behind() {
+        // 100 entries, retention 24 hours (a 12-hour rotation window), tick 1
+        // hour, and the walk has consumed nothing 23 hours in: past the
+        // deadline one tick is left and it would have to take all 100
+        // entries, well past the catch-up ceiling of
+        // 4 * ceil(100 * 3600 / 43200) = 36.
+        let period_secs = 7 * 86_400;
+        let tick_secs = 3_600;
+        let retention_secs = 24 * 3_600;
+        let mut cursor = ScrubCursor::new(tenant(), Signal::Metrics, 0, 0);
+        cursor.start_rotation(&tally(&entry_keys(100)), 0);
+        let plan = cursor.plan_tick(
+            period_secs,
+            tick_secs,
+            Some(retention_secs),
+            23 * tick_secs as i64 * 1_000_000_000,
+        );
+        assert_eq!(plan.rotation_secs, retention_secs / 2);
+        assert_eq!(plan.needed_entries, 100);
+        assert_eq!(plan.budget.max_entries, 36);
+        assert!(plan.behind);
+
+        // The same rotation at its start is on schedule and not behind.
+        let on_schedule = cursor.plan_tick(period_secs, tick_secs, Some(retention_secs), 0);
+        assert_eq!(on_schedule.needed_entries, 9);
+        assert_eq!(on_schedule.budget.max_entries, 9);
+        assert!(!on_schedule.behind);
     }
 }

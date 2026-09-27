@@ -274,8 +274,53 @@ generation's, not an overlap loser's, and none in a tombstoned bucket): a
 section checksum re-check plus a whole-object rehash against the recorded
 content hash. The [observability guide](../observability.md) records the
 lineage filter and the `level` label a mismatch is counted under. A
-persisted per-shard cursor advances the slice each tick, so a full rotation over
-the corpus completes in about the configured period.
+persisted per-shard cursor in object storage holds a start-after marker: each
+tick lists the shard's commit records strictly after it and stops once the tick's
+budget is filled, so apart from the count that opens a rotation, a tick's LIST
+and GET count follows its budget, not the corpus size. When the listing runs out
+past the marker, the rotation rolls over and the next tick starts again from the
+head, so every object is visited once per rotation.
+
+The budget is recomputed every tick (hourly, or every `P` when `P` is shorter)
+from what the rotation has observed:
+
+- Every rotation opens with one LIST-only pass that counts the shard's listing
+  entries. This pass lists the whole commit prefix, once per rotation.
+- Every later tick recounts the rotation's tail window, the last two ingest
+  hours the previous count met plus anything after them, with another
+  LIST-only pass, and adds the window's growth to the rotation's estimate. A
+  shard that keeps committing raises its own budget; a commit from any writer
+  in those hours is counted, and one that lands behind the marker is counted
+  too although it waits for the next rotation, so the estimate errs high.
+- The rotation is allotted `min(P, retention / 2)` (see below). A tick may
+  consume the entries still to cover divided by the ticks left before that
+  deadline, never fewer than the sustained rate `ceil(estimate * tick /
+  window)` and never more than four times it, and it may issue eight store
+  requests per allowed entry. Every listing page the walk draws (an hour
+  re-list included), every record GET attempt whether it succeeded or not, and
+  four requests per object verified count against the request cap; the
+  LIST-only count passes do not. A tick always attempts at least one unit, even
+  one that alone exceeds the budget.
+- When the entries a tick would need exceed four times the sustained rate, the
+  rotation cannot finish inside its window: the tick logs both numbers with
+  the window and `--scrub-period`, and increments `ravel_scrub_behind_total`.
+
+A GET that fails with a retryable error (throttled, timeout, transient), of a
+commit record or of an object it names, stops the tick with the marker behind
+that unit, and the next tick retries all of it. The hold is capped: after six
+consecutive held ticks on one unit (six hours of tick cadence at the
+default one-hour tick, less when a short `--scrub-period` shrinks the tick),
+the next tick moves past the unit and counts each of its records and objects
+that still fails on `ravel_scrub_unreadable_total{reason="retry_exhausted"}`.
+`ravel_scrub_marker_held_ticks` reads the current count for the signal's worst
+shard. Any other GET error except
+not-found, and a record whose bytes do not decode, is counted once on
+`ravel_scrub_unreadable_total` (at the level of the object or record that
+failed, `reason="access_denied"` or `reason="permanent"`) and the marker moves
+past it, so one unreadable record cannot pin the rotation. These are not
+counted on `ravel_scrub_checksum_mismatch_total`, which counts only bytes that
+were read and did not match. A record or object deleted after it was listed is
+logged and skipped.
 
 It detects and never repairs. An anomaly is reported; there is no redundant copy
 to repair a corrupt segment from.
@@ -294,12 +339,35 @@ A larger corpus or a shorter `P` costs proportionally more read bandwidth, and
 The default is `7d`. A zero or unparseable duration fails startup rather than
 rotating in a tight loop.
 
+A tenant with a retention window gets a shorter rotation when half that window
+is shorter than `P`: the rotation is allotted `min(P, retention / 2)`. The walk
+goes oldest hour first, so a rotation as long as the retention window would
+reach each object at about the age retention deletes it; half the window
+reaches every object by about half its retained life, while the rotation keeps
+pace. A 7-day
+retention with the default `P` therefore rotates every 3.5 days, at twice the
+read bandwidth the formula above gives for `P`. A retention window shorter than
+a tick (more precisely, one whose half fits in a single tick) gives every tick
+the budget of a whole rotation, so every tick normally walks a full rotation,
+including the LIST-only count of the whole commit prefix that opens it, and
+that count's cost is not charged against the tick's budget.
+
 This is the one scheduled task whose cost scales with data volume rather than
 metadata volume, so size `P` against the corpus you actually have, and watch
-`ravel_scrub_cursor_position` to confirm rotations keep pace. That gauge and the
-three scrubber anomaly counters are catalogued in
+`ravel_scrub_cursor_position` to confirm rotations keep pace. That gauge, the
+held-ticks gauge, and the five scrubber counters are catalogued in
 [the observability guide](../observability.md); the alarms that matter are in
 [troubleshooting](troubleshooting.md).
+
+### Cursor compatibility across builds
+
+A cursor written by an earlier release (0.18.0 or before) loads with defaults
+for every field it lacks, and its progress restarts: the next tick opens a
+fresh rotation from the head of the shard. During a mixed-version rolling upgrade, each version's cursor
+write drops the fields only the other version knows, so the rotation restarts
+each time a shard's ownership flips between versions. Nothing is corrupted, the
+cursor stays in object storage throughout, and once every maintain process runs
+one version the rotation proceeds normally.
 
 ### It needs no policy change
 

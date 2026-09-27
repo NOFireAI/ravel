@@ -1927,7 +1927,7 @@
       "id": 35,
       "type": "timeseries",
       "title": "Scrub and tenancy integrity",
-      "description": "The background scrub's three disagreement counters, its cursor, and the two provisioning and tenancy counters that say a process adopted state it should not have. Every series here is expected to stay flat at zero except the cursor.",
+      "description": "The background scrub's three disagreement counters, its unreadable-object counter, its cursor, and the two provisioning and tenancy counters that say a process adopted state it should not have. Every series here is expected to stay flat at zero except the cursor.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -2028,6 +2028,15 @@
           },
           "legendFormat": "unkeyed v1 adoptions",
           "expr": "sum(rate(ravel_tenancy_v1_unkeyed_adoptions_total[$__rate_interval]))"
+        },
+        {
+          "refId": "H",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "legendFormat": "scrub unreadable",
+          "expr": "sum(rate(ravel_scrub_unreadable_total[$__rate_interval]))"
         }
       ]
     },

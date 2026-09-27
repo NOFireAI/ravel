@@ -80,6 +80,9 @@ approved decision is the cheaper form: resume the listing itself.
    fill it, plus at most one partial page. A record whose GET or decode fails
    is skipped and logged exactly as today (`scrub.rs:599-604`), and the marker
    still advances past it, so one bad record cannot pin the rotation.
+   (See the 2026-09-26 amendment below: the budget is no longer a byte
+   budget, and whether the marker advances now depends on which of the two
+   failures happened.)
 
 3. **The budget's corpus total comes from the previous rotation, and a
    rotation starts with one LIST-only count.** `per_tick_byte_budget` needs
@@ -96,6 +99,8 @@ approved decision is the cheaper form: resume the listing itself.
    GETs, once per rotation, which is what the position gauge needs anyway
    (point 5). Every later rotation has a byte total and uses the byte budget
    ADR-0059 specifies.
+   The byte budget is withdrawn and every rotation now opens with the
+   LIST-only count: see the 2026-09-26 amendment below.
 
 4. **A rotation ends when the listing ends, and the next one starts from the
    beginning.** `list_after` returning an empty final page past the marker
@@ -108,6 +113,9 @@ approved decision is the cheaper form: resume the listing itself.
    Records deleted ahead of the marker (a swept L0 input) simply do not appear,
    exactly as `advance_cursor`'s key-comparison resume tolerates today
    (`crates/ravel-maintain/src/scrub.rs:470-472`).
+   Only an entry that sorts before the marker waits for the next rotation, and
+   a late compaction record that sorts after it is judged against its whole
+   hour: see the 2026-09-26 amendment below.
 
 5. **The position gauge counts entries.** `ravel_scrub_cursor_position`
    (ADR-0059 decision 3) becomes `entries_visited_this_rotation /
@@ -196,14 +204,19 @@ flowchart TD
   plus one LIST-only count pass per rotation. The 7-day rotation completes in
   7 days on the corpus size it was sized for, which is what ADR-0059 promised
   and what the operator guide's sizing formula
-  (`docs/guides/operations/maintenance.md:279-297`) already states.
+  (`docs/guides/operations/maintenance.md:279-297`) already states. A tick
+  also pays a LIST-only tail count and a rotation can be capped below
+  `--scrub-period` by half the tenant's retention window: see the
+  2026-09-26 amendment below.
 - The rotation order changes from data-object key order to commit key order,
   which is ingest-hour order. Corruption is still found within one period;
   which slice finds it changes.
 - The first rotation after upgrade starts from the beginning of every shard's
   prefix and runs on an entry-count budget until it completes, then switches
-  to the byte budget. An operator sees `ravel_scrub_cursor_position` drop to
-  zero once at upgrade. The troubleshooting row for a cursor "stuck near 0"
+  to the byte budget (every rotation now runs on the entry-count budget: see
+  the 2026-09-26 amendment below). An operator sees
+  `ravel_scrub_cursor_position` drop to zero once at upgrade. The
+  troubleshooting row for a cursor "stuck near 0"
   (`docs/guides/operations/troubleshooting.md:281`) stays valid: a position
   that does not climb across ticks still means the budget is too small for the
   corpus.
@@ -229,3 +242,160 @@ flowchart TD
      and `docs/guides/observability.md` in the same change.
   3. The corpus widening to compaction and rewrite parts, with level labels
      on the scrub counters, lands as its own task and plugs into point 6.
+
+## Amendment (2026-09-26): the tick is sized by entries and requests against a retention-capped deadline
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="2026-09-26 amendment" -->
+<!-- amendment-supersedes: phrase="the marker still advances past it" pointer="2026-09-26 amendment" -->
+
+Implementing decisions 2, 3 and 4 showed three ways a rotation could fail to
+finish, or could verify something it must not. Each is corrected here; the
+marker walk of decision 1 and the gauge of decision 5 are unchanged.
+
+**The budget is a pair of caps, recomputed every tick from what the walk has
+observed.** Decision 3's byte budget is withdrawn: a byte total cannot bound
+a tick whose GETs fail, since a failing GET moves no bytes and still costs a
+request. `per_tick_byte_budget` and `ScrubBudget::MaxObjects` are gone.
+`ScrubBudget` is now `{ max_entries, max_requests }` and
+`ScrubCursor::plan_tick` returns it with the numbers it came from. Every
+rotation opens with the LIST-only entry count decision 3 reserved for a first
+rotation, and every later tick recounts the rotation's tail window with a
+LIST-only pass and adds the window's growth since the previous count. The
+window is the last two ingest-hour directories the previous count met
+(`rotation_tail_dir`, with their entry count in `rotation_tail_entries`) and
+everything after them. It is whole hours, not the keys past the greatest key
+seen, because a commit key is `<hour>/<writer_id>.<epoch>.<seq>.cmt`: with
+several writers on a shard, a commit from a writer whose id sorts low lands
+below keys already listed in the current hour, and a count that only looks
+past the greatest key misses it. The second hour catches a commit that lands
+late in the previous hour after the next one began. The rotation's expected
+size is therefore the opening count plus every append into the window since,
+not a total that went stale the moment the rotation opened, and a shard that
+keeps committing raises its own budget. An append behind the marker is
+counted too, although the walk will not reach it until the next rotation, so
+the estimate errs high. What the window does not see is an entry landing
+ahead of the marker in an hour older than the window, such as a compaction
+record for an hour sealed well before; the walk still verifies it, it is
+only missing from the estimate. Growth is the window's tally minus its
+previous tally, so a deletion inside the two-hour window cancels an append in
+the same tick: under a retention short enough to reach the window, or a sweep
+deleting there, the appends a tick adds to the estimate are net of those
+deletions and the estimate errs low. A retention tombstone (`retire.tmb`)
+written after the rotation opened lands in an old hour outside the window,
+so when it sorts ahead of the marker the walk consumes it as an entry the
+estimate never counted.
+
+**A rotation is sized by a deadline, and the deadline is the shorter of the
+period and half the tenant's retention window.** An object retention deletes
+before the walk reaches it is never verified at all, so a rotation must not
+outlive the data it verifies. Capping it at the whole retention window is not
+enough: the walk goes oldest hour first, so a rotation as long as the window
+reaches each object at about the age retention deletes it, and most of a
+retention-capped tenant would expire unverified. The rotation window is
+`min(--scrub-period, RetentionConfig::window_for(tenant) / 2)`, so a
+rotation that keeps pace reaches every object by about half its retained
+life, and `None` (unlimited retention) caps nothing. Within that window a
+tick takes `ceil(remaining entries / ticks remaining)`, floored at the
+sustained rate `ceil(estimated * tick / rotation)` so an early tick never
+coasts, and capped at `SCRUB_MAX_CATCHUP`
+(4) times that sustained rate so one late tick cannot ask for the whole
+corpus at once. Termination: every tick that does not hold its marker (see
+below) consumes at least the sustained rate, and the sustained rate is
+computed from the current estimate, so a shard appending fewer entries per
+tick than the sustained rate strictly closes the gap on every such tick and
+the rotation reaches the end of the listing inside its window. A tick that
+holds consumes less, possibly nothing, but a hold is capped: after
+`MAX_HELD_TICKS` (6) consecutive held ticks on one marker position the next
+tick consumes the unit whatever its GETs return, so no unit costs the walk
+more than seven ticks, and the ticks left before the deadline divide the
+remainder between them, up to the catch-up ceiling. The cap is what makes
+this argument hold for a unit whose error the store keeps reporting as
+retryable though it never clears, which would otherwise pin the shard for
+good, with unlimited retention as much as with any other. A shard appending
+faster than the sustained rate cannot be caught, and neither can a rotation
+that loses more ticks to holds than the ceiling can make up; both are
+reported rather than hidden: when the needed rate exceeds the catch-up
+ceiling the tick logs both numbers with the rotation window and the
+configured period, and increments `ravel_scrub_behind_total{signal}`. That
+counter does not report a hold as it happens, since a hold near the end of
+the listing or early in a rotation leaves the needed rate under the ceiling;
+`ravel_scrub_marker_held_ticks{signal}` does.
+
+**Requests are bounded, not just entries.** Every listing page the walk
+draws, every context page an hour re-list costs, and every record GET
+attempt, successful or not, is charged against `max_requests`, as is
+`SCRUB_REQUESTS_PER_OBJECT` for each object handed to `scrub_one_object`.
+The walk stops when either cap is filled. A unit whose record GET fails with
+a retryable error (`StoreError::is_retryable`: `Throttled`, `Timeout`,
+`Transient`) does not advance the marker: the unit is retried on the next
+tick rather than left unverified for a whole rotation. This is the split
+decision 2 did not make. Every other failure advances the marker, so one
+permanently bad record cannot pin the rotation. A record GET that fails with
+an error retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`, and
+every other kind except `NotFound`), and a record whose bytes do not decode,
+make the record unreadable: it is logged at error and counted once on
+`ravel_scrub_unreadable_total{signal, level, reason}` at the record's own
+level, with `reason="access_denied"` for `AccessDenied` and
+`reason="permanent"` for everything else. It is not counted on
+`ravel_scrub_checksum_mismatch_total`, which counts only bytes that were read
+and did not match: an access denial is as likely a key policy or a credential
+fault as damage at rest. A record that is `NotFound` is skipped and not
+counted, since retention deleting a listed record is not a fault. The GETs of
+the objects a unit names (the footer probe, the footer range chase, and the
+whole-object read) follow the same rule: a retryable error holds the marker
+behind the unit, `NotFound` is skipped, and any other error is counted on
+`ravel_scrub_unreadable_total` at the object's level. A held unit counts
+nothing it found, since the next tick verifies all of it again.
+
+**A hold is capped.** The cursor persists `held_ticks`, the consecutive
+ticks that held the marker behind one unit, together with `held_unit_key`,
+that unit's first listing entry, and `ravel_scrub_marker_held_ticks{signal}`
+reads the largest value any shard of the signal reported in the last cycle.
+The count belongs to the unit, not to the marker position: a commit from a
+writer whose id sorts low can land between the marker and the held unit, and
+when it reads clean the walk consumes it and leaves the count alone, while a
+unit that is held itself starts a fresh count at one. The hold ends when the
+marker reaches or passes the held key. Once the count reaches
+`MAX_HELD_TICKS`, the next tick that reaches the unit starting at the held
+key consumes it: it tries each of the
+unit's objects once, counts every record or object that still fails
+retryably once on `ravel_scrub_unreadable_total{reason="retry_exhausted"}`
+at its own level with an error log naming the unit, counts everything else
+it found as it would for any consumed unit, and moves on. `MAX_HELD_TICKS`
+is `6 h / DEFAULT_SCRUB_TICK` = 6. No tick is longer than
+`DEFAULT_SCRUB_TICK` (one hour), so a hold ends within six tick intervals of
+its first held tick: six hours of cadence, at most 6.6 with the up to 10%
+jitter the loop adds to every sleep, plus the time the cycles themselves
+take, and less when a short `--scrub-period` shrinks the tick.
+
+**A late record is judged against its whole hour.** Decision 4 sent every
+record that lands behind the marker to the next rotation. That is true only
+of a record whose key sorts before the marker. A compaction record can land
+in an hour the marker has already passed and still sort after it, since
+compaction, rewrite and tombstone records all sort after the hour's commit
+records. Consuming such a record alone would run overlap and supersession
+selection without its rivals, which makes it authoritative by default and
+scrubs the parts of a record the read path never serves. So when the tick's
+start-after marker lies inside an hour's own lineage set, the hour is listed
+again from its start and the whole set becomes the unit's selection context,
+while only the entries past the marker are consumed. The common case, a
+marker on a commit record or outside the hour, costs no extra LIST.
+
+**A cursor that cannot be read skips the tick.** Only `NotFound` means there
+is no cursor. Any other GET failure leaves the stored cursor untouched and
+the shard's tick is skipped, because starting a fresh rotation there would
+rewind the marker to the head of the listing and drop the rotation's progress
+on a transient throttle.
+
+**What the seven-tick bound counts.** The termination argument above says no
+unit costs the walk more than seven ticks, after six consecutive held ticks
+"on one marker position". The count is per held unit, as the paragraph on
+the hold cap describes, and it counts held ticks only. A tick whose walk
+LIST fails ends with the slice consumed so far and holds nothing, so a
+listing error on the first page neither moves the marker nor adds to the
+count: a listing error that persists stalls the walk at the marker with no
+cap, reported by a warning each tick and, once the lost ticks push the
+needed rate past the ceiling, by `ravel_scrub_behind_total`. A tick skipped
+because the cursor GET or the rotation's opening count failed is outside the
+bound the same way, and so is a tick that fills its budget on entries that
+landed ahead of the held unit before it reaches that unit.
