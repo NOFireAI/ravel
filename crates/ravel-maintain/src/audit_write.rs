@@ -92,7 +92,9 @@ fn jittered_backoff(base_ms: u64, rng: &dyn RngSource) -> Duration {
 fn retry_delay(error: &StoreError, base_ms: u64, rng: &dyn RngSource) -> Duration {
     let jittered = jittered_backoff(base_ms, rng);
     match error {
-        StoreError::Throttled { retry_after_ms } => jittered.max(Duration::from_millis(*retry_after_ms)),
+        StoreError::Throttled { retry_after_ms } => {
+            jittered.max(Duration::from_millis(*retry_after_ms))
+        }
         _ => jittered,
     }
 }
@@ -529,12 +531,31 @@ pub(crate) async fn write_audit_batch_with_rng(
 mod tests {
     use super::*;
 
+    use ravel_commit::SeededRng;
     use ravel_commit::keys;
     use ravel_commit::record;
     use ravel_logseg::{LogRecord, Predicate, RlogReader, stream_attrs_bytes};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, list_all};
     use ravel_types::logstream::log_stream_id;
+
+    /// A stub `RngSource` returning a fixed jitter draw every time, so
+    /// [`jittered_backoff`]'s formula can be pinned exactly without relying
+    /// on a seeded PRNG's actual sequence.
+    struct FixedRng(u64);
+
+    impl RngSource for FixedRng {
+        fn jitter_ms(&self, _max_ms: u64) -> u64 {
+            self.0
+        }
+
+        fn new_uuid(&self) -> Uuid {
+            Uuid::new_v4()
+        }
+    }
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
     const AUDIT_SHARD: u32 = 1;
@@ -677,5 +698,165 @@ mod tests {
                 tenant.to_hex()
             );
         }
+    }
+
+    #[test]
+    fn jittered_backoff_pins_the_low_and_high_ends_of_its_range() {
+        // `jitter_ms` returning 0 is the low end: `base_ms * 3 / 4` exactly.
+        let low = jittered_backoff(200, &FixedRng(0));
+        assert_eq!(low, Duration::from_millis(150));
+
+        // `jitter_ms` returning `range_ms` (`base_ms / 2`) is the high end:
+        // `base_ms * 3 / 4 + base_ms / 2 == base_ms * 1.25`.
+        let high = jittered_backoff(200, &FixedRng(100));
+        assert_eq!(high, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn retry_delay_honors_a_throttle_hint_longer_than_jittered_backoff() {
+        let error = StoreError::Throttled {
+            retry_after_ms: 1_000,
+        };
+        // Jitter's own high end for this base is well under the hint.
+        let delay = retry_delay(&error, 50, &FixedRng(0));
+        assert_eq!(delay, Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn retry_delay_keeps_jittered_backoff_when_it_already_exceeds_the_hint() {
+        let error = StoreError::Throttled { retry_after_ms: 10 };
+        let delay = retry_delay(&error, 200, &FixedRng(0));
+        assert_eq!(
+            delay,
+            Duration::from_millis(150),
+            "jitter's low end, 150ms, beats the 10ms hint"
+        );
+    }
+
+    /// ADR-0062 amendment (2026-09-27): a PUT that never returns at all (no
+    /// error, no success) must still fail the batch closed once
+    /// `AUDIT_WRITE_BUDGET` runs out, not hang forever. `FaultStore::hold`
+    /// blocks the matching PUT indefinitely; the handle is never released.
+    #[tokio::test(start_paused = true)]
+    async fn a_put_that_never_returns_fails_closed_within_the_write_budget() {
+        let mem = MemoryStore::new();
+        let store = FaultStore::new(mem, FaultPlan::empty());
+        let _held = store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
+        let tenant = TenantHash([61u8; 16]);
+
+        let started = tokio::time::Instant::now();
+        let err = write_audit_batch_with_rng(
+            &store,
+            AUDIT_SHARD,
+            Uuid::new_v4(),
+            vec![test_record(tenant, 9 * NS_PER_HOUR, 1)],
+            None,
+            &SeededRng::new(1),
+        )
+        .await
+        .expect_err("a data PUT that never returns must fail the batch closed");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            AUDIT_WRITE_BUDGET,
+            "the paused clock advances exactly to the budget deadline, no further"
+        );
+        match &err {
+            MaintainError::AuditFlush(msg) => {
+                assert!(msg.contains("attempt 1"), "message was: {msg}");
+                assert!(msg.contains("data"), "message was: {msg}");
+            }
+            other => panic!("expected AuditFlush, got {other:?}"),
+        }
+    }
+
+    /// Finding 6: a `Throttled` hint longer than jitter's own backoff is
+    /// honored, as long as it still fits the total write budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttle_hint_within_budget_is_honored_and_the_batch_succeeds() {
+        let mem = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Throttled {
+                    retry_after_ms: 1_000,
+                },
+            )
+            .with_key_contains("/l0/")
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(mem, plan);
+        let tenant = TenantHash([62u8; 16]);
+        let put_retries = AtomicU64::new(0);
+
+        let started = tokio::time::Instant::now();
+        write_audit_batch_with_rng(
+            &store,
+            AUDIT_SHARD,
+            Uuid::new_v4(),
+            vec![test_record(tenant, 10 * NS_PER_HOUR, 1)],
+            Some(&put_retries),
+            &SeededRng::new(1),
+        )
+        .await
+        .expect("the retry after the throttle hint must succeed");
+
+        assert!(
+            tokio::time::Instant::now().duration_since(started) >= Duration::from_millis(1_000),
+            "the retry waited at least the throttle hint, not just jitter's shorter backoff"
+        );
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Throttled),
+            1,
+            "the injected throttle fired exactly once"
+        );
+        assert_eq!(put_retries.load(Ordering::Relaxed), 1);
+    }
+
+    /// Finding 6, other half: a `Throttled` hint that does not fit inside the
+    /// remaining write budget stops retrying immediately rather than sleeping
+    /// past the deadline, and the throttle error itself is what the batch
+    /// fails closed with.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttle_hint_that_does_not_fit_the_budget_fails_closed_without_retrying() {
+        let mem = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Throttled {
+                    retry_after_ms: 60_000,
+                },
+            )
+            .with_key_contains("/l0/")
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(mem, plan);
+        let tenant = TenantHash([63u8; 16]);
+
+        let err = write_audit_batch_with_rng(
+            &store,
+            AUDIT_SHARD,
+            Uuid::new_v4(),
+            vec![test_record(tenant, 11 * NS_PER_HOUR, 1)],
+            None,
+            &SeededRng::new(1),
+        )
+        .await
+        .expect_err("a hint twice the whole budget must not be waited out");
+
+        assert!(
+            matches!(
+                err,
+                MaintainError::Store(StoreError::Throttled {
+                    retry_after_ms: 60_000
+                })
+            ),
+            "expected the throttle error itself surfaced, got {err:?}"
+        );
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Throttled),
+            1,
+            "no retry was attempted, so the fault fired exactly once"
+        );
     }
 }
