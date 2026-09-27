@@ -1306,6 +1306,7 @@ alert rules below quiet there.
 | `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record, so it advances this and then the delivery counter, never `ravel_alert_records_written_total`. |
 | `ravel_alert_notifications_delivered_total` | Notifications delivered to every configured sink, including ones carried over from an earlier tick's failure. |
 | `ravel_alert_notifications_failed_total` | Notifications still undelivered after a tick's attempt, counted once per tick per notification, so one stuck notification keeps advancing it while it is retried. |
+| `ravel_alert_undelivered_notifications` | Gauge. Notifications not yet accepted by every configured sink, summed over this process's evaluators, at most one per alert identity. While a sink keeps failing it grows by one for every identity that transitions, without bound. |
 | `ravel_alert_ticks_total` | Evaluation ticks by `outcome`. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Gauge. Unix time the alert loop last completed a tick in this process, `0` if none has completed since it started. Its age is the alert-loop liveness signal. |
 

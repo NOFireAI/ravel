@@ -471,6 +471,10 @@ pub struct AlertMetrics {
     repeats_queued: AtomicU64,
     notifications_delivered: AtomicU64,
     notifications_failed: AtomicU64,
+    /// The sum of every live evaluator's undelivered map size. A gauge, kept
+    /// by each evaluator adding the change in its own size after every tick
+    /// and taking its share back out when it is dropped.
+    undelivered_notifications: AtomicU64,
     ticks_evaluated: AtomicU64,
     ticks_lease_not_held: AtomicU64,
     ticks_lease_unavailable: AtomicU64,
@@ -545,6 +549,22 @@ impl AlertMetrics {
         self.notifications_failed.load(Ordering::Relaxed)
     }
 
+    /// Replace one evaluator's share of the undelivered gauge, `previous`,
+    /// with its current map size.
+    fn move_undelivered(&self, previous: u64, current: u64) {
+        if current >= previous {
+            self.undelivered_notifications
+                .fetch_add(current - previous, Ordering::Relaxed);
+        } else {
+            self.undelivered_notifications
+                .fetch_sub(previous - current, Ordering::Relaxed);
+        }
+    }
+
+    pub fn undelivered_notifications(&self) -> u64 {
+        self.undelivered_notifications.load(Ordering::Relaxed)
+    }
+
     pub fn ticks(&self, outcome: AlertTickOutcome) -> u64 {
         self.tick_counter(outcome).load(Ordering::Relaxed)
     }
@@ -600,10 +620,16 @@ pub struct AlertEvaluator {
     next_seq: u64,
     /// Transitions written but not yet accepted by every sink, keyed by
     /// `alert_id` so a newer transition supersedes an older undelivered one.
-    /// Bounded by the folded alert identities: at most
-    /// [`ravel_alerting::MAX_ALERTS_PER_RULE`] live ones per rule, plus
-    /// resolutions of identities that stopped matching.
+    /// An entry, a full [`AlertRecord`] clone, leaves only when every sink
+    /// accepted it, so the map holds the live firing identities plus every
+    /// identity whose latest transition some sink has not yet accepted. While
+    /// a sink keeps failing that is unbounded: a rule over a churning series
+    /// label adds an entry per series that ever fired and resolved (issue
+    /// #1438). Its size is the `ravel_alert_undelivered_notifications` gauge.
     undelivered: HashMap<AlertId, AlertNotification>,
+    /// This evaluator's share of the `ravel_alert_undelivered_notifications`
+    /// gauge: `undelivered.len()` as of the last tick, taken back out on drop.
+    undelivered_reported: u64,
     /// Per-alert duplicate suppressor for the repeat pass (ADR-0043 "repeat
     /// notifications while firing" amendment, decision 2): the
     /// `(anchor_ts_ns, window)` of the last repeat window a notification was
@@ -661,6 +687,7 @@ impl AlertEvaluator {
             writer_id: Uuid::new_v4(),
             next_seq: 1,
             undelivered: HashMap::new(),
+            undelivered_reported: 0,
             repeat_marks: HashMap::new(),
             bootstrapped: false,
             // Constructing an evaluator is what marks this process as one that
@@ -718,6 +745,10 @@ impl AlertEvaluator {
         let now_ns = self.clock.now_ns();
         let report = self.evaluate_tick(now_ns).await;
         self.metrics.record_tick(&report, now_ns);
+        let current = self.undelivered.len() as u64;
+        self.metrics
+            .move_undelivered(self.undelivered_reported, current);
+        self.undelivered_reported = current;
         report
     }
 
@@ -1011,12 +1042,20 @@ impl AlertEvaluator {
     /// has no prior record to pair the seeded one with, only the latest),
     /// the same approximation `AlertNotification::new` already documents for
     /// a pending-then-firing episode longer than one transition.
+    ///
+    /// A record whose rule is no longer configured has no rule labels to read
+    /// an `alertname` from, so its notification names the rule id.
     fn bootstrap_undelivered(&mut self, latest: &HashMap<AlertId, AlertRecord>) {
         for (alert_id, record) in latest {
             if matches!(record.state, AlertState::Pending | AlertState::Firing) {
+                let rule_labels = self
+                    .rules
+                    .iter()
+                    .find(|rule| rule.rule_id == record.rule_id)
+                    .map_or(&[][..], |rule| rule.labels.as_slice());
                 self.undelivered
                     .entry(*alert_id)
-                    .or_insert_with(|| AlertNotification::new(record.clone(), None));
+                    .or_insert_with(|| AlertNotification::new(record.clone(), None, rule_labels));
             }
         }
     }
@@ -1080,7 +1119,14 @@ impl AlertEvaluator {
             .max(1);
         for (alert_id, record) in latest {
             if record.rule_id == rule.rule_id && record.state == AlertState::Firing {
-                self.queue_repeat_for_alert(*alert_id, record, interval_ns, now_ns, report);
+                self.queue_repeat_for_alert(
+                    *alert_id,
+                    record,
+                    &rule.labels,
+                    interval_ns,
+                    now_ns,
+                    report,
+                );
             }
         }
     }
@@ -1090,6 +1136,7 @@ impl AlertEvaluator {
         &mut self,
         alert_id: AlertId,
         record: &AlertRecord,
+        rule_labels: &[(String, String)],
         interval_ns: i64,
         now_ns: i64,
         report: &mut AlertEvalReport,
@@ -1118,7 +1165,7 @@ impl AlertEvaluator {
         // `AlertNotification::new` already documents.
         self.undelivered
             .entry(alert_id)
-            .or_insert_with(|| AlertNotification::new(record.clone(), None));
+            .or_insert_with(|| AlertNotification::new(record.clone(), None, rule_labels));
         self.repeat_marks.insert(alert_id, (record.ts_ns, window));
         report.repeats_queued += 1;
     }
@@ -1279,7 +1326,7 @@ impl AlertEvaluator {
         // The record is durable from here on; everything below is notification.
         self.undelivered.insert(
             written.alert_id,
-            AlertNotification::new(written.clone(), prior.as_ref()),
+            AlertNotification::new(written.clone(), prior.as_ref(), &rule.labels),
         );
         latest.insert(written.alert_id, written);
         Ok(true)
@@ -1595,6 +1642,14 @@ impl AlertEvaluator {
                 report.notifications_failed += 1;
             }
         }
+    }
+}
+
+impl Drop for AlertEvaluator {
+    /// A dropped evaluator's undelivered map is gone, so its share of the
+    /// process-wide gauge goes with it.
+    fn drop(&mut self) {
+        self.metrics.move_undelivered(self.undelivered_reported, 0);
     }
 }
 
@@ -2298,7 +2353,7 @@ mod tests {
         let rule = &rules_for(PROMQL_RULE, "acme")[0];
         let pending = ravel_alerting::build_transition_record(rule, AlertState::Pending, 0, 100);
         let firing = ravel_alerting::build_transition_record(rule, AlertState::Firing, 0, 400);
-        let notification = AlertNotification::new(firing, Some(&pending));
+        let notification = AlertNotification::new(firing, Some(&pending), &[]);
         assert_eq!(notification.started_at_ns, 100);
         assert_eq!(notification.previous_state, Some(AlertState::Pending));
     }
@@ -2790,6 +2845,91 @@ mod tick_tests {
         assert_eq!(report.rules_failed, 1);
         assert_eq!(report.records_written, 0);
         assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 0);
+    }
+
+    /// A store holding one hot series whose labels include `alertname="x"`,
+    /// as a recording rule's output or an alerts-on-alerts query would.
+    async fn store_with_an_alertname_series() -> Arc<dyn ObjectStoreBackend> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let labels = LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: METRIC.to_string(),
+            },
+            Label {
+                name: "alertname".to_string(),
+                value: "x".to_string(),
+            },
+            Label {
+                name: "instance".to_string(),
+                value: "host-a".to_string(),
+            },
+        ])
+        .expect("valid labels");
+        publish_series(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            vec![(labels, vec![(NOW_NS - 30 * NS_PER_SEC, 1.0)])],
+        )
+        .await;
+        store
+    }
+
+    /// The Alertmanager `alertname` of the one notification `rule` queues
+    /// over [`store_with_an_alertname_series`], with the record it names. The
+    /// sink is unreachable so the notification stays queued to be read.
+    async fn alertmanager_alertname_for(rule: Rule) -> (String, AlertRecord) {
+        let store = store_with_an_alertname_series().await;
+        let mut ev = evaluator_for_rules(
+            store,
+            TestClock::at(NOW_NS),
+            vec![AlertSink::alertmanager(dead_sink_url().await)],
+            Arc::new(AlertMetrics::default()),
+            vec![rule],
+        );
+        let report = ev.run_tick().await;
+        assert_eq!(report.records_written, 1, "the one hot series fires");
+        assert_eq!(ev.undelivered.len(), 1);
+        let notification = ev.undelivered.values().next().expect("one queued");
+        let body = crate::alert_sink::alertmanager_payload(notification).expect("firing notifies");
+        let alertname = body[0]["labels"]["alertname"]
+            .as_str()
+            .expect("alertname is a string")
+            .to_string();
+        (alertname, notification.record.clone())
+    }
+
+    /// A series label named `alertname` does not replace the rule id as the
+    /// Alertmanager `alertname`, so routing and silences keyed on the rule id
+    /// keep matching. The alert's identity still hashes the series label.
+    #[tokio::test]
+    async fn a_series_alertname_label_does_not_override_the_rule_id() {
+        let (alertname, record) = alertmanager_alertname_for(threshold_rule()).await;
+        assert_eq!(alertname, "high-cpu");
+        let labels = vec![
+            ("alertname".to_string(), "x".to_string()),
+            ("instance".to_string(), "host-a".to_string()),
+            ("severity".to_string(), "page".to_string()),
+        ];
+        assert_eq!(record.labels, labels, "the record keeps the series label");
+        assert_eq!(record.alert_id, compute_alert_id("high-cpu", &labels));
+    }
+
+    /// A rule label named `alertname` still wins over the rule id, and over a
+    /// series label of the same name.
+    #[tokio::test]
+    async fn a_rule_alertname_label_overrides_the_rule_id() {
+        let mut rule = threshold_rule();
+        rule.labels.push(("alertname".to_string(), "y".to_string()));
+        let (alertname, record) = alertmanager_alertname_for(rule).await;
+        assert_eq!(alertname, "y");
+        let labels = vec![
+            ("alertname".to_string(), "y".to_string()),
+            ("instance".to_string(), "host-a".to_string()),
+            ("severity".to_string(), "page".to_string()),
+        ];
+        assert_eq!(record.labels, labels);
+        assert_eq!(record.alert_id, compute_alert_id("high-cpu", &labels));
     }
 
     /// A tick over three hot series that leaves three Firing records, returned
@@ -4941,6 +5081,41 @@ mod tick_tests {
             NOW_NS + 60 * NS_PER_SEC,
             "the second tick re-stamps the gauge"
         );
+    }
+
+    /// The undelivered gauge is the size of the evaluator's undelivered map,
+    /// not a count of attempts: three identities behind one failing sink hold
+    /// it at 3 across ticks, and dropping the evaluator takes its share back
+    /// out of the process sum.
+    #[tokio::test]
+    async fn undelivered_gauge_counts_each_identity_behind_a_failing_sink() {
+        let store = store_with_hot_instances(3).await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator_with(
+            store,
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(dead_sink_url().await)],
+            Arc::clone(&metrics),
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, 3);
+        assert_eq!(first.notifications_failed, 3);
+        assert_eq!(metrics.undelivered_notifications(), 3);
+
+        clock.set(NOW_NS + 10 * NS_PER_SEC);
+        let second = ev.run_tick().await;
+        assert_eq!(second.records_written, 0);
+        assert_eq!(second.notifications_failed, 3);
+        assert_eq!(
+            metrics.undelivered_notifications(),
+            3,
+            "a gauge of the map, not a counter of failed attempts"
+        );
+
+        drop(ev);
+        assert_eq!(metrics.undelivered_notifications(), 0);
     }
 
     /// The liveness gauge is the only figure that separates a dead loop from a

@@ -217,20 +217,36 @@ pub struct AlertNotification {
     /// one transition (pending then firing reports the firing time), which is
     /// all a single-step fold can know without replaying the whole history.
     pub started_at_ns: i64,
+    /// The Alertmanager `alertname`: the rule's own `alertname` label when it
+    /// has one, else the rule id. Decided from the rule rather than from
+    /// `record.labels`, where a series label of that name is indistinguishable
+    /// from a rule label.
+    pub alertname: String,
 }
 
 impl AlertNotification {
     /// Pairs a freshly written record with the record it superseded.
-    pub fn new(record: AlertRecord, prior: Option<&AlertRecord>) -> AlertNotification {
+    /// `rule_labels` are the labels of the rule that wrote `record`, empty
+    /// when that rule is no longer configured.
+    pub fn new(
+        record: AlertRecord,
+        prior: Option<&AlertRecord>,
+        rule_labels: &[(String, String)],
+    ) -> AlertNotification {
         let previous_state = prior.map(|p| p.state);
         let started_at_ns = match prior {
             Some(p) if matches!(p.state, AlertState::Pending | AlertState::Firing) => p.ts_ns,
             _ => record.ts_ns,
         };
+        let alertname = rule_labels
+            .iter()
+            .find(|(name, _)| name == "alertname")
+            .map_or_else(|| record.rule_id.clone(), |(_, value)| value.clone());
         AlertNotification {
             record,
             previous_state,
             started_at_ns,
+            alertname,
         }
     }
 }
@@ -316,11 +332,14 @@ pub fn webhook_payload(notification: &AlertNotification) -> Json {
 ///
 /// Faithful to how Prometheus itself talks to Alertmanager:
 ///
-/// - Labels are `alertname` (the rule id) plus the rule's own labels, and a
-///   rule label named `alertname` deliberately wins, matching Prometheus'
-///   override order. Ravel-specific fields are not injected, because in
-///   Alertmanager the label set *is* the alert's identity and extra labels
-///   would fragment grouping and silences.
+/// - Labels are the alert's merged label set (the series labels without
+///   `__name__`, overlaid by the rule's labels) plus `alertname`, which is
+///   the rule id unless the rule itself carries an `alertname` label, which
+///   deliberately wins, matching Prometheus' override order. A series label
+///   named `alertname` never replaces it, so routing and silences keyed on
+///   the rule id keep matching. Ravel-specific fields are not injected,
+///   because in Alertmanager the label set *is* the alert's identity and
+///   extra labels would fragment grouping and silences.
 /// - A firing alert sends `startsAt` and no `endsAt`, letting Alertmanager
 ///   apply its own resolve timeout. A resolved or suppressed alert sends
 ///   `endsAt` at the transition, which is how Alertmanager is told an alert is
@@ -336,13 +355,13 @@ pub fn alertmanager_payload(notification: &AlertNotification) -> Option<Json> {
     }
 
     let mut labels = JsonMap::new();
-    labels.insert(
-        "alertname".to_string(),
-        Json::String(record.rule_id.clone()),
-    );
     for (k, v) in &record.labels {
         labels.insert(k.clone(), Json::String(v.clone()));
     }
+    labels.insert(
+        "alertname".to_string(),
+        Json::String(notification.alertname.clone()),
+    );
 
     let mut alert = JsonMap::new();
     alert.insert("labels".to_string(), Json::Object(labels));
@@ -438,7 +457,7 @@ mod tests {
     fn webhook_payload_carries_every_record_field() {
         let firing = record(AlertState::Firing, 1_700_000_000 * SEC);
         let prior = record(AlertState::Pending, 1_699_999_940 * SEC);
-        let notification = AlertNotification::new(firing.clone(), Some(&prior));
+        let notification = AlertNotification::new(firing.clone(), Some(&prior), &[]);
         let body = webhook_payload(&notification);
 
         assert_eq!(body["alert_id"], Json::String(firing.alert_id.to_hex()));
@@ -468,14 +487,14 @@ mod tests {
 
     #[test]
     fn webhook_payload_previous_state_is_null_for_a_new_alert() {
-        let notification = AlertNotification::new(record(AlertState::Firing, SEC), None);
+        let notification = AlertNotification::new(record(AlertState::Firing, SEC), None, &[]);
         assert_eq!(webhook_payload(&notification)["previous_state"], Json::Null);
     }
 
     #[test]
     fn alertmanager_firing_payload_matches_the_api_v2_shape() {
         let firing = record(AlertState::Firing, 1_700_000_000 * SEC);
-        let notification = AlertNotification::new(firing, None);
+        let notification = AlertNotification::new(firing, None, &[]);
         let body = alertmanager_payload(&notification).expect("firing notifies alertmanager");
 
         let alerts = body.as_array().expect("api/v2/alerts takes an array");
@@ -512,7 +531,7 @@ mod tests {
     fn alertmanager_resolved_payload_sets_ends_at() {
         let resolved = record(AlertState::Resolved, 1_700_000_060 * SEC);
         let prior = record(AlertState::Firing, 1_700_000_000 * SEC);
-        let notification = AlertNotification::new(resolved, Some(&prior));
+        let notification = AlertNotification::new(resolved, Some(&prior), &[]);
         let body = alertmanager_payload(&notification).expect("resolved notifies alertmanager");
         let alert = &body.as_array().expect("array")[0];
 
@@ -530,7 +549,7 @@ mod tests {
 
     #[test]
     fn alertmanager_skips_pending_but_the_webhook_does_not() {
-        let notification = AlertNotification::new(record(AlertState::Pending, SEC), None);
+        let notification = AlertNotification::new(record(AlertState::Pending, SEC), None, &[]);
         assert!(
             alertmanager_payload(&notification).is_none(),
             "Prometheus does not notify Alertmanager before an alert fires"
@@ -545,15 +564,30 @@ mod tests {
 
     #[test]
     fn a_rule_label_named_alertname_overrides_the_rule_id() {
-        // Matching Prometheus' own override order: alertname is inserted
-        // first, so an explicit rule label wins.
+        // Matching Prometheus' own override order: an explicit rule label wins.
+        let rule_labels = pairs(&[("alertname", "y"), ("severity", "page")]);
         let mut rec = record(AlertState::Firing, SEC);
-        rec.labels = pairs(&[("alertname", "explicit")]);
-        let body = alertmanager_payload(&AlertNotification::new(rec, None)).expect("payload");
+        rec.labels = pairs(&[("alertname", "y"), ("severity", "page")]);
+        let body = alertmanager_payload(&AlertNotification::new(rec, None, &rule_labels))
+            .expect("payload");
         assert_eq!(
             body.as_array().expect("array")[0]["labels"]["alertname"],
-            Json::String("explicit".to_string())
+            Json::String("y".to_string())
         );
+    }
+
+    #[test]
+    fn a_series_label_named_alertname_does_not_override_the_rule_id() {
+        // The merged set carries a series `alertname`; the rule has none.
+        let rule_labels = pairs(&[("severity", "page")]);
+        let mut rec = record(AlertState::Firing, SEC);
+        rec.labels = pairs(&[("alertname", "x"), ("severity", "page")]);
+        let body = alertmanager_payload(&AlertNotification::new(rec, None, &rule_labels))
+            .expect("payload");
+        let labels = &body.as_array().expect("array")[0]["labels"];
+        assert_eq!(labels["alertname"], Json::String("high-cpu".to_string()));
+        assert_eq!(labels["severity"], Json::String("page".to_string()));
+        assert_eq!(labels.as_object().expect("object").len(), 2);
     }
 
     #[test]
