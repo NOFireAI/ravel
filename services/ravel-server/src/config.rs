@@ -1505,9 +1505,9 @@ pub struct Cli {
     /// reserve): 7,516,192,768. On a `--store s3` deployment whose
     /// `--s3-endpoint` is a loopback address, the fetcher cache instead takes
     /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`: a miss
-    /// there is served from the same local disk the store reads from, and
-    /// under concurrent queries the ranged read plan's block cache needs its
-    /// working set resident to keep those misses off that disk (ADR-2023).
+    /// there is served from the same local disk the store reads from, and a
+    /// share that holds the corpus's whole objects serves repeated statements
+    /// without going back to that disk (ADR-2023).
     /// Fallback when MemTotal is unknown: [`DEFAULT_CACHE_MAX_BYTES`]
     /// (256 MiB). Startup refuses (does not clamp) a value that, together
     /// with the resolved `--catalog-cache-max-bytes`, exceeds
