@@ -6,6 +6,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The chaos lane reads labeled metrics by label and passes multi-shard
+  commit tokens one per parameter** (issue #534). The `scripts/chaos/`
+  parser now scans a sample's label set quote-aware, reads the value before
+  any timestamp, and takes `label=value` selectors, and the mid-flush trigger
+  selects `signal="metrics"`. A comma-joined `x-ravel-commit-token` header is
+  split into its opaque tokens, and the header name is matched without the
+  gawk-only `IGNORECASE`. Scenario 2 exits 3 on a setup error, so exit 2
+  stays the release-blocking verdict. `scripts/chaos/lib.test.sh` covers the
+  helpers on every pull request, and the nightly job annotates each
+  scenario's exit code.
+
 ### Changed
 
 - **The scheduled catalog fold now runs only in `--mode maintain` and
