@@ -21,6 +21,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# MemoryStore::corrupt_stored_byte for the ADR-1696 acceptance tests in
+# src/publish.rs.
+ravel-object-store = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }

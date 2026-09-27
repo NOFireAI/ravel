@@ -52,6 +52,8 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use ravel_object_store::s3::{
@@ -94,6 +96,9 @@ enum Op {
     UploadPart,
     CompleteMultipart,
     AbortMultipart,
+    /// `ListObjectsV2`, served as an empty listing: no test here asserts on
+    /// listing contents, only on how the request was signed.
+    List,
 }
 
 /// One scripted misbehavior. Each maps to a response a real S3-compatible
@@ -139,6 +144,32 @@ enum Fault {
     /// inconclusive-probe case the create-conflict disambiguation must surface
     /// as retryable rather than as a terminal `AlreadyExists` (#1302).
     InconclusiveHead,
+    /// `get` only: a 200/206 whose body has one byte flipped, served with the
+    /// `x-amz-checksum-crc64nvme` of the *stored* object. Models a bit flipped
+    /// at rest or on the wire below a checksum S3 still reports honestly, which
+    /// is exactly what ADR-1696's read-side verification must catch: the
+    /// adapter recomputes the digest over what arrived and must refuse with
+    /// `Corrupted` instead of handing the bytes to a decoder.
+    CorruptGetBody,
+    /// `get` only: the body is served correctly but no `x-amz-checksum-*`
+    /// header comes back, as from an endpoint that stores no checksum or
+    /// ignores `x-amz-checksum-mode`. ADR-1696 decision 3 serves it and counts
+    /// it, so this is the fault that moves `ravel_store_get_unverified_total`.
+    NoGetChecksum,
+}
+
+/// How a GET is served once faults have been resolved: the two ADR-1696 read
+/// paths a test needs to script are variations of a *successful* response, not
+/// error statuses, so they ride here rather than short-circuiting in `handle`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GetBehavior {
+    /// Correct body, with the stored object's CRC-64/NVME attached when the
+    /// request is one a MinIO-style endpoint answers with a checksum.
+    Normal,
+    /// Correct checksum header, one byte of the body flipped.
+    CorruptBody,
+    /// Correct body, no checksum header at all.
+    NoChecksum,
 }
 
 /// One request as the server saw it: which operation, which key, when, which
@@ -161,6 +192,12 @@ struct Seen {
     /// deliberately not what this captures: the value header is what carries the
     /// digest S3 verifies.
     checksum_header: Option<(String, String)>,
+    /// The `x-amz-checksum-mode` request header's value, if the client asked S3
+    /// to return the checksum it stored at upload (ADR-1696 decision 2).
+    checksum_mode: Option<String>,
+    /// The request carried an `x-amz-*` header missing from its SigV4
+    /// `SignedHeaders`, and was refused 403 for it.
+    unsigned_amz_header: bool,
 }
 
 impl Seen {
@@ -203,21 +240,20 @@ impl FakeState {
         self.always.lock().get(&op).copied()
     }
 
-    fn record(
-        &self,
-        op: Op,
-        key: &str,
-        fault: Option<Fault>,
-        range: Option<(u64, u64)>,
-        checksum_header: Option<(String, String)>,
-    ) {
+    /// Log one request as the server saw it, stamped with the time it arrived.
+    fn record(&self, op: Op, key: &str, fault: Option<Fault>, headers: &HeaderMap) {
         self.log.lock().push(Seen {
             op,
             key: key.to_string(),
             at: Instant::now(),
             fault,
-            range,
-            checksum_header,
+            range: requested_range(headers),
+            checksum_header: checksum_header(headers),
+            checksum_mode: headers
+                .get("x-amz-checksum-mode")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            unsigned_amz_header: has_unsigned_amz_header(headers),
         });
     }
 }
@@ -391,6 +427,7 @@ fn classify(method: &Method, query: &HashMap<String, String>) -> Option<Op> {
         Method::PUT if has_upload_id => Some(Op::UploadPart),
         Method::DELETE if has_upload_id => Some(Op::AbortMultipart),
         Method::PUT => Some(Op::Put),
+        Method::GET if query.contains_key("list-type") => Some(Op::List),
         Method::GET => Some(Op::Get),
         Method::HEAD => Some(Op::Head),
         Method::DELETE => Some(Op::Delete),
@@ -400,6 +437,37 @@ fn classify(method: &Method, query: &HashMap<String, String>) -> Option<Op> {
 
 fn etag_of(data: &[u8]) -> String {
     format!("\"{:08x}\"", crc32c::crc32c(data))
+}
+
+/// CRC-64/NVME, the digest behind `x-amz-checksum-crc64nvme`, written here as
+/// the plain bitwise loop: reflected polynomial `0x9a6c9329ac4bc9b5` (the bit
+/// reverse of the catalogue's `0xad93d23594c93659`), all-ones init and final
+/// xor.
+///
+/// Deliberately a second, independent implementation rather than a call into
+/// the adapter's table-driven one. The fake endpoint is the other side of the
+/// wire, and a test that computed the digest with the same code under test
+/// would agree with it even if both were a different CRC than S3's. The
+/// catalogue `check` vector is asserted below so this side is pinned too.
+fn crc64_nvme(data: &[u8]) -> u64 {
+    const POLY: u64 = 0x9a6c_9329_ac4b_c9b5;
+    let mut crc = !0u64;
+    for &byte in data {
+        crc ^= u64::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (POLY & mask);
+        }
+    }
+    !crc
+}
+
+/// The catalogue `check` value for CRC-64/NVME. Without this the fake could
+/// serve a self-consistent wrong digest and every verification test would still
+/// pass.
+#[test]
+fn the_fake_endpoints_crc64_matches_the_catalogue_check_vector() {
+    assert_eq!(crc64_nvme(b"123456789"), 0xae8b_1486_0a79_9888);
 }
 
 fn s3_error_body(code: &str, message: &str) -> String {
@@ -479,12 +547,17 @@ fn requested_range(headers: &HeaderMap) -> Option<(u64, u64)> {
 
 /// The upload-checksum value header the client attached, if any (#863):
 /// `x-amz-checksum-crc64nvme` / `-sha256` / etc., returned as `(name, value)`.
-/// The `-algorithm` header is skipped: it names the algorithm, it does not
-/// carry the digest S3 verifies.
+/// Two `x-amz-checksum-*` headers are skipped because neither carries a digest:
+/// `-algorithm` names an algorithm, and `-mode` is the read-side
+/// `ENABLED` request flag the adapter sends on every request (ADR-1696
+/// decision 2), which would otherwise read as an upload checksum here.
 fn checksum_header(headers: &HeaderMap) -> Option<(String, String)> {
     headers.iter().find_map(|(name, value)| {
         let name = name.as_str();
-        if name.starts_with("x-amz-checksum-") && name != "x-amz-checksum-algorithm" {
+        if name.starts_with("x-amz-checksum-")
+            && name != "x-amz-checksum-algorithm"
+            && name != "x-amz-checksum-mode"
+        {
             Some((name.to_string(), value.to_str().ok()?.to_string()))
         } else {
             None
@@ -548,13 +621,14 @@ async fn handle(
         .unwrap_or_default();
 
     let fault = state.take_fault(op);
-    state.record(
-        op,
-        &key,
-        fault,
-        requested_range(&headers),
-        checksum_header(&headers),
-    );
+    state.record(op, &key, fault, &headers);
+    if has_unsigned_amz_header(&headers) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "There were headers present in the request which were not signed",
+        );
+    }
 
     match fault {
         Some(Fault::ServiceUnavailable) => error_response(
@@ -603,7 +677,33 @@ async fn handle(
             ],
             Body::empty(),
         ),
-        Some(Fault::Pass) | None => serve(&state, op, &key, &query, &headers, data),
+        Some(Fault::CorruptGetBody) => serve(
+            &state,
+            op,
+            &key,
+            &query,
+            &headers,
+            data,
+            GetBehavior::CorruptBody,
+        ),
+        Some(Fault::NoGetChecksum) => serve(
+            &state,
+            op,
+            &key,
+            &query,
+            &headers,
+            data,
+            GetBehavior::NoChecksum,
+        ),
+        Some(Fault::Pass) | None => serve(
+            &state,
+            op,
+            &key,
+            &query,
+            &headers,
+            data,
+            GetBehavior::Normal,
+        ),
     }
 }
 
@@ -614,6 +714,7 @@ fn serve(
     query: &HashMap<String, String>,
     headers: &HeaderMap,
     data: Bytes,
+    get_behavior: GetBehavior,
 ) -> Response {
     match op {
         Op::Put => {
@@ -648,6 +749,33 @@ fn serve(
                 (header::ETAG, etag),
                 (header::LAST_MODIFIED, LAST_MODIFIED.to_string()),
             ];
+            // The stored whole-object checksum, returned the way MinIO (and the
+            // MinIO-derived RustFS) returns it: only when the request asked with
+            // `x-amz-checksum-mode: ENABLED` and carried no `Range` header. A
+            // ranged GET gets no checksum at all, whatever it covers. Computed
+            // over `object`, never over `body`, so a corrupted body is served
+            // under an honest checksum.
+            let checksum_mode_enabled = headers
+                .get("x-amz-checksum-mode")
+                .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"ENABLED"));
+            let unranged = headers.get(header::RANGE).is_none();
+            if get_behavior != GetBehavior::NoChecksum && checksum_mode_enabled && unranged {
+                response_headers.push((
+                    header::HeaderName::from_static("x-amz-checksum-crc64nvme"),
+                    STANDARD.encode(crc64_nvme(&object).to_be_bytes()),
+                ));
+            }
+            let body = match get_behavior {
+                GetBehavior::CorruptBody => {
+                    let mut flipped = body.to_vec();
+                    let first = flipped
+                        .first_mut()
+                        .expect("a corrupt-body fault needs a non-empty body to corrupt");
+                    *first ^= 0x01;
+                    Bytes::from(flipped)
+                }
+                GetBehavior::Normal | GetBehavior::NoChecksum => body,
+            };
             let status = match &content_range {
                 Some(value) => {
                     response_headers.push((header::CONTENT_RANGE, value.clone()));
@@ -753,7 +881,36 @@ fn serve(
             state.uploads.lock().remove(&upload_id);
             build(StatusCode::NO_CONTENT, vec![], Body::empty())
         }
+        Op::List => build(
+            StatusCode::OK,
+            vec![(header::CONTENT_TYPE, "application/xml".to_string())],
+            Body::from(format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Name>{BUCKET}</Name><Prefix></Prefix><KeyCount>0</KeyCount>\
+                 <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+                 </ListBucketResult>"
+            )),
+        ),
     }
+}
+
+/// Whether the request carries an `x-amz-*` header its SigV4 `Authorization`
+/// does not list in `SignedHeaders`. S3 and RustFS refuse such a request with
+/// 403 `AccessDenied` ("There were headers present in the request which were
+/// not signed"), and so does this fake.
+fn has_unsigned_amz_header(headers: &HeaderMap) -> bool {
+    let signed: Vec<&str> = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|auth| auth.split("SignedHeaders=").nth(1))
+        .and_then(|rest| rest.split(',').next())
+        .map(|list| list.split(';').collect())
+        .unwrap_or_default();
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        name.starts_with("x-amz-") && !signed.contains(&name)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -978,6 +1135,255 @@ async fn put_attaches_server_verified_checksum_only_when_configured() {
             "the checksum header must carry a base64 digest value"
         );
     }
+}
+
+/// ADR-1696 decision 2, on the wire: a full-object GET whose body comes back
+/// with one byte flipped, under the `x-amz-checksum-crc64nvme` of the object as
+/// stored, must fail with `Corrupted` rather than hand the bytes to the caller.
+/// This is the whole mechanism end to end --- the signed request header, the
+/// connector reading the response header below `object_store`'s retry loop, and
+/// the digest recomputed over the body received --- observed from the far side
+/// of a socket.
+///
+/// The three assertions are separable on purpose. The error pins the outcome;
+/// the request-header assertion pins that the adapter actually *asked* for the
+/// stored checksum (an endpoint only returns one under checksum mode, so
+/// dropping the header would make this test pass for the wrong reason against
+/// this fake and fail against real S3); and the unverified counter staying at 0
+/// pins that this was a genuine mismatch, not a read that fell through to the
+/// serve-and-count path.
+///
+/// The fake returns the checksum header only on an unranged GET, as MinIO and
+/// RustFS do, so this also pins that the first request of a full-object read
+/// is unranged. Against an adapter whose first request was
+/// `Range: bytes=0-(chunk-1)`, the response carries no checksum, the read is
+/// served, and the `expect_err` below fails with the flipped bytes in its
+/// message. Removing the `stored.verify(...)` call in
+/// `S3Store::verify_full_read` fails the same line.
+#[tokio::test]
+async fn a_flipped_byte_in_a_get_body_is_corrupted() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("verify/flipped", b"a commit record's worth of bytes");
+    fake.always(Op::Get, Fault::CorruptGetBody);
+
+    let error = store
+        .get("verify/flipped", GetRange::Full)
+        .await
+        .expect_err("a body that fails its stored checksum must not be served");
+    assert!(
+        matches!(error, StoreError::Corrupted(_)),
+        "a checksum mismatch must be Corrupted, got {error:?}"
+    );
+
+    let gets = fake.requests(Op::Get);
+    assert_eq!(gets.len(), 1, "a Corrupted read must not be retried");
+    assert_eq!(gets[0].range, None, "the verified request is unranged");
+    assert_eq!(
+        gets[0].checksum_mode.as_deref(),
+        Some("ENABLED"),
+        "the adapter must ask S3 for the checksum it stored at upload"
+    );
+    assert_eq!(
+        store.get_unverified(),
+        0,
+        "a read that was verified and failed is not an unverified read"
+    );
+}
+
+/// ADR-1696 decision 3: an endpoint that returns no `x-amz-checksum-*` header
+/// (it stores no checksum, or ignored checksum mode) is served, not refused,
+/// and the read is counted on `ravel_store_get_unverified_total`. Failing
+/// closed here would make an upgrade an outage for every object written before
+/// upload integrity was on, which is every object in every existing bucket.
+///
+/// The counter assertion is `by exactly 1`, measured across the call, because
+/// "greater than zero" would not distinguish one logical read from one per HTTP
+/// request --- and the adapter splits a large whole-object read into several.
+/// The verified read at the end is the control: it proves the counter moves for
+/// the missing header rather than for every get.
+#[tokio::test]
+async fn a_get_with_no_checksum_header_is_served_and_counted_unverified() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    let payload = b"served without a stored checksum";
+    fake.seed("verify/unchecksummed", payload);
+    fake.script(Op::Get, [Fault::NoGetChecksum]);
+
+    let before = store.get_unverified();
+    let got = store
+        .get("verify/unchecksummed", GetRange::Full)
+        .await
+        .expect("a response with no checksum header must still be served");
+    assert_eq!(
+        &got.data[..],
+        &payload[..],
+        "the bytes must be served unchanged"
+    );
+    assert_eq!(
+        store.get_unverified(),
+        before + 1,
+        "one full-object read with no stored checksum is exactly one unverified read"
+    );
+
+    // Control: the scripted fault is spent, so this read comes back with the
+    // checksum header and must not move the counter.
+    store
+        .get("verify/unchecksummed", GetRange::Full)
+        .await
+        .expect("the verified read must succeed");
+    assert_eq!(
+        store.get_unverified(),
+        before + 1,
+        "a read the adapter verified must not count as unverified"
+    );
+
+    // Decision 4, on the wire: a ranged read the caller asked for is outside
+    // the check by construction, so it is neither verified nor counted. An
+    // endpoint returns no checksum on a ranged response, and a slice could not
+    // be compared against the whole-object one anyway, so counting one here
+    // would make every suffix read of every segment look like a gap in
+    // coverage.
+    let ranged = store
+        .get("verify/unchecksummed", GetRange::Range(0, 6))
+        .await
+        .expect("a ranged read must succeed");
+    assert_eq!(&ranged.data[..], b"served", "the ranged bytes come back");
+    assert_eq!(
+        store.get_unverified(),
+        before + 1,
+        "a caller-issued ranged read is outside the check, not an unverified read"
+    );
+}
+
+/// A commit-record-sized full-object read is exactly one store request: one
+/// unranged GET, no HEAD before it, verified against the checksum it carried.
+/// The per-query request budget counts requests, so a HEAD to learn the size
+/// first would double the cost of every record read.
+#[tokio::test]
+async fn a_commit_record_sized_full_read_is_one_unranged_verified_request() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    let record = patterned(200);
+    fake.seed("verify/record", &record);
+
+    let outcome = store
+        .get("verify/record", GetRange::Full)
+        .await
+        .expect("a small full-object read must be served");
+    assert_eq!(&outcome.data[..], &record[..]);
+
+    let gets = fake.requests(Op::Get);
+    assert_eq!(gets.len(), 1, "exactly one GET, saw {gets:?}");
+    assert_eq!(gets[0].range, None, "the GET is unranged");
+    assert_eq!(fake.count(Op::Head), 0, "no HEAD precedes the read");
+    assert_eq!(store.get_unverified(), 0, "the read was verified");
+}
+
+/// `x-amz-checksum-mode` is never sent unsigned. `object_store` signs
+/// `ClientOptions`' default headers onto PUT, GET and HEAD itself, but
+/// not onto LIST, and a reqwest client built from the same options adds them
+/// after signing; S3 and RustFS refuse any request with an unsigned `x-amz-*`
+/// header, so that would fail every LIST with a 403. The fake refuses the same
+/// way. Without the default headers stripped in the S3 connector, the `list`
+/// below fails with that 403.
+#[tokio::test]
+async fn no_request_carries_an_unsigned_checksum_mode_header() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    store
+        .put(
+            "signed/k",
+            Bytes::from_static(b"v"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put");
+    store.head("signed/k").await.expect("head");
+    store.get("signed/k", GetRange::Full).await.expect("get");
+    let page = store
+        .list("signed/", None)
+        .await
+        .expect("a LIST must not carry an unsigned header");
+    assert!(page.objects.is_empty(), "the fake serves an empty listing");
+
+    let log = fake.state.log.lock().clone();
+    for op in [Op::Put, Op::Head, Op::Get, Op::List] {
+        assert_eq!(
+            log.iter().filter(|seen| seen.op == op).count(),
+            1,
+            "exactly one {op:?} request, saw {log:?}"
+        );
+    }
+    for seen in &log {
+        assert!(
+            !seen.unsigned_amz_header,
+            "a request carried an unsigned x-amz-* header: {seen:?}"
+        );
+    }
+    let get = log.iter().find(|seen| seen.op == Op::Get).expect("the GET");
+    assert_eq!(
+        get.checksum_mode.as_deref(),
+        Some("ENABLED"),
+        "the GET still asks for the stored checksum, signed"
+    );
+}
+
+/// `S3HttpConfig::request_stored_checksum = false` sends no
+/// `x-amz-checksum-mode` header on any request. An endpoint then returns no
+/// stored checksum, so a full-object read is served and counted unverified,
+/// exactly once, where the default configuration verifies the same object.
+#[tokio::test]
+async fn disabling_checksum_mode_sends_no_header_and_counts_reads_unverified() {
+    let fake = FakeS3::start().await;
+    let payload = b"read without asking for the stored checksum";
+    fake.seed("verify/mode-off", payload);
+
+    let store = fake.store_with_http(S3HttpConfig {
+        request_stored_checksum: false,
+        ..Default::default()
+    });
+    store
+        .put(
+            "verify/mode-off-put",
+            Bytes::from_static(b"x"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("a put under the disabled mode must succeed");
+    let outcome = store
+        .get("verify/mode-off", GetRange::Full)
+        .await
+        .expect("an unverified read is served, not refused");
+    assert_eq!(&outcome.data[..], payload);
+    assert_eq!(
+        store.get_unverified(),
+        1,
+        "the one full-object read is one unverified read"
+    );
+    for op in [Op::Put, Op::Get] {
+        for seen in fake.requests(op) {
+            assert_eq!(
+                seen.checksum_mode, None,
+                "no request may carry x-amz-checksum-mode when disabled, saw {seen:?}"
+            );
+        }
+    }
+
+    // The default sends it, and the same object is verified.
+    let default_store = fake.store();
+    default_store
+        .get("verify/mode-off", GetRange::Full)
+        .await
+        .expect("the default read is served");
+    assert_eq!(default_store.get_unverified(), 0);
+    assert_eq!(
+        fake.requests(Op::Get)
+            .last()
+            .and_then(|seen| seen.checksum_mode.clone())
+            .as_deref(),
+        Some("ENABLED")
+    );
 }
 
 /// `AccessDenied` is permanent per the contract, and the proof is that the
@@ -1419,12 +1825,15 @@ fn patterned(len: usize) -> Vec<u8> {
 /// rate, *including* a whole-object read, whose size the data chooses rather
 /// than this crate.
 ///
-/// Before this was fixed, `GetRange::Full` mapped straight to an unranged GET,
-/// so a 256 MiB L1 compaction part went out as one request against a 20 s
-/// ceiling it needs ~410 s to satisfy at that floor rate: it could only time
-/// out, and then spend the retry budget re-issuing a request that never fits.
-/// The assertion is on what the *server* saw, so a client that still sent one
-/// unranged GET cannot pass it.
+/// An unranged GET read to its end would carry a 256 MiB L1 compaction part as
+/// one request against a 20 s ceiling it needs ~410 s to satisfy at that floor
+/// rate: it could only time out, and then spend the retry budget re-issuing a
+/// request that never fits. The first request is unranged (the only form an
+/// endpoint answers with a stored checksum), so the bound is kept by reading
+/// `bound` bytes of it and ranging the rest. The assertion is on what the
+/// *server* saw: a client that read the unranged body to its end would issue
+/// no ranged requests after it, and one that ranged its first request would
+/// fail the unranged-first assertion.
 #[tokio::test]
 async fn whole_object_read_is_split_into_requests_the_timeout_can_carry() {
     let fake = FakeS3::start().await;
@@ -1463,28 +1872,41 @@ async fn whole_object_read_is_split_into_requests_the_timeout_can_carry() {
         size.div_ceil(bound),
         "the read must be issued as ceil(size / bound) requests, saw {gets:?}"
     );
-    for seen in &gets {
+    // The first request is unranged, so an endpoint that returns a stored
+    // checksum only without a `Range` header can return it; the adapter reads
+    // `bound` bytes of that body and drops the rest.
+    assert_eq!(
+        gets[0].range, None,
+        "the first request of a whole-object read is unranged, saw {gets:?}"
+    );
+    for seen in &gets[1..] {
         let len = seen
             .range_len()
-            .expect("every request of a bounded read carries a Range header");
+            .expect("every request after the first carries a Range header");
         assert!(
             len <= bound as u64,
             "a request asked for {len} bytes, above the {bound}-byte bound the \
              request timeout is sized for"
         );
     }
-    // The ranges partition the object exactly: no gap, no overlap, so wire
-    // bytes are the object's size and not more.
+    // The ranges pick up exactly where the truncated first body stopped and
+    // partition the rest of the object: no gap, no overlap.
     let mut covered: Vec<(u64, u64)> = gets.iter().filter_map(|seen| seen.range).collect();
     covered.sort_unstable();
-    let mut next = 0u64;
+    let mut next = bound as u64;
     for (start, end) in covered {
-        assert_eq!(start, next, "ranges must be contiguous from 0");
+        assert_eq!(start, next, "ranges must be contiguous from the bound");
         next = end + 1;
     }
     assert_eq!(
         next, size as u64,
-        "the ranges together must cover exactly the object"
+        "the first body and the ranges together must cover exactly the object"
+    );
+    // No single response carried the whole object, so nothing was verified.
+    assert_eq!(
+        store.get_unverified(),
+        1,
+        "a whole-object read split across responses is one unverified read"
     );
 }
 
@@ -1513,14 +1935,19 @@ async fn whole_object_read_below_the_bound_stays_one_request() {
         1,
         "an object at or below the bound costs exactly one request"
     );
+    assert_eq!(
+        store.get_unverified(),
+        0,
+        "an object that fits one unranged response is verified"
+    );
 }
 
-/// A zero-byte object has no satisfiable range, so the bounded form cannot
-/// express it and a real endpoint answers 416. The read must still succeed and
-/// return an empty object, at the cost of one extra unranged request -- the one
-/// case where the split path issues more requests than bytes require.
+/// A zero-byte object has no satisfiable range, and a ranged request for one is
+/// a 416. The unranged first request needs no fallback for it: the empty body
+/// is a legal 200, so the read is one request, and the stored checksum of the
+/// empty object comes back with it and is verified.
 #[tokio::test]
-async fn whole_object_read_of_an_empty_object_falls_back_to_unranged() {
+async fn whole_object_read_of_an_empty_object_is_one_unranged_request() {
     let fake = FakeS3::start().await;
     let store = fake.store_with_http(small_chunk_http());
     fake.seed("fault/empty", b"");
@@ -1533,11 +1960,9 @@ async fn whole_object_read_of_an_empty_object_falls_back_to_unranged() {
     assert_eq!(outcome.total_size, 0);
 
     let gets = fake.requests(Op::Get);
-    assert_eq!(gets.len(), 2, "one refused ranged probe, then one unranged");
-    assert!(
-        gets[0].range.is_some() && gets[1].range.is_none(),
-        "the fallback must be the unranged form, saw {gets:?}"
-    );
+    assert_eq!(gets.len(), 1, "one unranged request, saw {gets:?}");
+    assert_eq!(gets[0].range, None, "the request must be unranged");
+    assert_eq!(store.get_unverified(), 0, "the empty object was verified");
 }
 
 /// A caller-supplied range is passed through untouched, however large. The
