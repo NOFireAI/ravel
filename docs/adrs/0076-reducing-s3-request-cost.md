@@ -176,7 +176,8 @@ the fast tier at 6.8 s regardless.
 
 ADR-1737 adds an opt-in third tier below `min_flush_bytes`: a buffer under
 `idle_flush_byte_floor` waits `max_flush_lifetime`; the shipped default of 0
-leaves this tier off.
+leaves this tier off. (The shipped hold is one `flush_tick` shorter; see the
+ADR-1737 hold amendment below.)
 
 `docs/consistency-model.md:33-34` states a p99 visibility target under one second
 in strict mode. That target is amended to a **configurable visibility budget**
@@ -336,3 +337,16 @@ ceiling is capped by the hard-coded one-second budget.
 The five terms of the cost equation, which lever acts on each, which cost
 latency, and the gap between a 4.7 KiB flush and an 8 MiB size trigger that
 explains why the trigger never fires.
+
+## Amendment (2026-09-27, #1737): the ADR-1737 hold is one tick short of the lifetime
+
+<!-- amendment-applies: sections="Decision" pointer="ADR-1737 hold amendment" -->
+
+The Decision section describes ADR-1737's opt-in tier as waiting
+`max_flush_lifetime`. ADR-1737's own 2026-09-27 amendment shortened that hold
+by one `flush_tick`, because the age check runs on a tick and a buffer opens its
+flush up to one tick after its threshold: a hold of the full lifetime would put
+the worst buffer age at flush open one tick past the figure
+`FLUSH_BOUND_SLACK_HOURS` is derived from. The tier's behaviour is otherwise as
+stated, and the default of 0 still leaves it off.
+
