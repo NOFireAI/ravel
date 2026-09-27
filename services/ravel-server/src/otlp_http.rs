@@ -490,9 +490,10 @@ pub struct GatewayState {
     pub budget: Arc<IngestByteBudget>,
     /// The process-wide in-flight ingest-request ceiling, shared
     /// with every OTLP HTTP/gRPC service and Remote Write on this listener
-    /// and the mTLS listener. Checked first in every handler below, ahead of
-    /// tenant resolution and the layer-2 byte-rate check, so a shed request
-    /// does none of that work.
+    /// and the mTLS listener. Checked on the request head by
+    /// `crate::ingest_admission`, ahead of the body read, tenant resolution
+    /// and the layer-2 byte-rate check, so a shed request does none of that
+    /// work.
     pub ingest_concurrency: Arc<IngestConcurrencyController>,
 }
 

@@ -76,10 +76,12 @@ impl IngestConcurrencyController {
     }
 
     /// Admits the caller immediately or sheds it: this never queues. Call
-    /// this as the first thing an ingest handler does, before tenant
+    /// this on the request head, before the body is read and before tenant
     /// resolution or any per-signal admission check, so a shed request does
     /// none of that work and reaches neither a shard channel nor a commit
-    /// token.
+    /// token. The transport layers in `crate::ingest_admission` do this for
+    /// every ingest route; a handler takes a permit itself only when no
+    /// layer did.
     pub fn try_admit(&self) -> Result<IngestPermit, IngestShed> {
         let Some(semaphore) = &self.semaphore else {
             return Ok(IngestPermit { _permit: None });

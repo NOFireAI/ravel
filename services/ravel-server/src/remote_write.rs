@@ -719,6 +719,13 @@ mod tests {
     }
 
     fn state_with_clock(tenant: &TenantId, clock: Arc<dyn Clock>) -> Arc<RemoteWriteState> {
+        state_with_resolver(Arc::new(FixedTenantResolver(tenant.clone())), clock)
+    }
+
+    fn state_with_resolver(
+        tenant_resolver: Arc<dyn TenantResolver>,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<RemoteWriteState> {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router = Arc::new(IngestRouter::new(
             IngestConfig::default(),
@@ -727,7 +734,7 @@ mod tests {
             Arc::new(SystemClock),
         ));
         Arc::new(RemoteWriteState {
-            tenant_resolver: Arc::new(FixedTenantResolver(tenant.clone())),
+            tenant_resolver,
             router,
             limits: IngestLimits::default(),
             ack_deadline: Duration::from_secs(5),
@@ -745,6 +752,37 @@ mod tests {
             metadata_sink: None,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
         })
+    }
+
+    /// An unauthorized Remote Write is refused 401 by the admission middleware
+    /// on the request head, and still counts in `requests_rejected` through
+    /// `on_unauthorized`, as it did when the handler refused it.
+    ///
+    /// Non-vacuity: empty `on_unauthorized` and the counter stays at 0.
+    #[tokio::test]
+    async fn unauthorized_write_is_counted_as_rejected() {
+        use tower::ServiceExt;
+
+        let state = state_with_resolver(
+            Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+                std::collections::HashMap::new(),
+            )),
+            Arc::new(FixedClock(FIXTURE_NOW_NS)),
+        );
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/write")
+            .header("authorization", "Bearer not-a-token")
+            .body(axum::body::Body::from("unread"))
+            .expect("request builds");
+
+        let response = router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("infallible router");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.metrics.snapshot().requests_rejected, 1);
     }
 
     /// A Remote Write request whose
