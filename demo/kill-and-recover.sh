@@ -268,7 +268,9 @@ log "$SERVICE is dead (exit $SIGKILL_EXIT_CODE, killed by SIGKILL)"
 
 log "removing the dead container (discards its filesystem) and starting a fresh one"
 compose rm --force --stop "$SERVICE"
-compose up --detach "$SERVICE"
+# --no-deps: the rest of the stack is already up, and converging it from
+# $COMPOSE_FILE alone would recreate any service a CI override reconfigured.
+compose up --detach --no-deps "$SERVICE"
 
 container_after=$(compose ps --quiet "$SERVICE" || true)
 if [[ -z "$container_after" ]]; then

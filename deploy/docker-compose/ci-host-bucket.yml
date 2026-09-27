@@ -1,0 +1,17 @@
+# CI-only override for ravel.yml, used by ci.yml's `quickstart` job. Not part of
+# the documented quickstart: README.md's `docker compose -f
+# deploy/docker-compose/ravel.yml up -d` never reads this file.
+#
+# ravel.yml's createbucket one-shot pulls the AWS CLI image from ECR Public,
+# which caps anonymous pulls per source IP (issue #2036). The CI job instead
+# starts rustfs alone, creates the `ravel-dev` bucket from the runner with its
+# own aws CLI (scripts/ci-create-bucket.sh), then brings up the rest. Here
+# createbucket keeps its place in the dependency chain (qualify still waits for
+# it) but runs the image the job built locally and exits 0, so nothing is
+# pulled for it. qualify fails if the bucket is missing, so a skipped host step
+# cannot pass unnoticed.
+services:
+  createbucket:
+    image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the locally built ravel-server image}
+    pull_policy: never
+    entrypoint: ["/usr/local/bin/ravel-cli", "--help"]

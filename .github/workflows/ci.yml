@@ -169,7 +169,7 @@ jobs:
           if echo "$changed" | grep -qE '^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-query/'; then
             promql_area=true
           fi
-          if echo "$changed" | grep -qE '^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/'; then
+          if echo "$changed" | grep -qE '^crates/ravel-object-store/|^crates/ravel-bench/|^crates/ravel-commit/|^crates/ravel-catalog/|^crates/ravel-ingest/|^scripts/ci-create-bucket\.sh$'; then
             object_store_area=true
           fi
           # Catch-all: the four lists above are conservative allowlists, not a
@@ -1280,28 +1280,18 @@ jobs:
           docker logs rustfs || true
           exit 1
       - name: Create the contract-suite bucket
+        env:
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+          AWS_DEFAULT_REGION: us-east-1
         run: |
-          # ECR Public throttles unauthenticated pulls per source IP, and a
-          # throttled pull fails `docker run` with exit 125 ("toomanyrequests: Rate
-          # exceeded"). Retry that code alone, with backoff; any other exit is the
-          # create-bucket call itself and fails the step. The image's entrypoint is
-          # the `aws` binary, so this passes the subcommand directly.
-          for attempt in 1 2 3 4 5; do
-            rc=0
-            docker run --rm --network host \
-              -e AWS_ACCESS_KEY_ID=rustfsadmin \
-              -e AWS_SECRET_ACCESS_KEY=rustfsadmin \
-              -e AWS_DEFAULT_REGION=us-east-1 \
-              -e AWS_EC2_METADATA_DISABLED=true \
-              public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
-              --endpoint-url http://localhost:9000 s3api create-bucket --bucket ravel-object-store-test || rc=$?
-            if [ "$rc" -ne 125 ]; then exit "$rc"; fi
-            echo "AWS CLI container exited 125 on attempt $attempt"
-            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 15)); fi
-          done
-          exit 125
+          # The runner image's own aws CLI, not the AWS CLI container: ECR
+          # Public caps anonymous pulls per source IP (issue #2036). The script
+          # retries the create-bucket call's own transient failures.
+          aws --version
+          scripts/ci-create-bucket.sh http://localhost:9000 ravel-object-store-test
       # The contract suite's S3 case is gated on RAVEL_RUSTFS_URL; set it (and
-      # the credentials/bucket the docker run above provisioned) so the gated
+      # the credentials/bucket the step above provisioned) so the gated
       # test executes instead of skipping.
       - name: Run object-store contract suite against RustFS
         env:
@@ -1469,29 +1459,19 @@ jobs:
           docker logs rustfs || true
           exit 1
       - name: Create the bench-smoke bucket
+        env:
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+          AWS_DEFAULT_REGION: us-east-1
         run: |
-          # ECR Public throttles unauthenticated pulls per source IP, and a
-          # throttled pull fails `docker run` with exit 125 ("toomanyrequests: Rate
-          # exceeded"). Retry that code alone, with backoff; any other exit is the
-          # create-bucket call itself and fails the step. The image's entrypoint is
-          # the `aws` binary, so this passes the subcommand directly.
-          for attempt in 1 2 3 4 5; do
-            rc=0
-            docker run --rm --network host \
-              -e AWS_ACCESS_KEY_ID=rustfsadmin \
-              -e AWS_SECRET_ACCESS_KEY=rustfsadmin \
-              -e AWS_DEFAULT_REGION=us-east-1 \
-              -e AWS_EC2_METADATA_DISABLED=true \
-              public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed \
-              --endpoint-url http://localhost:9000 s3api create-bucket --bucket ravel-object-store-test || rc=$?
-            if [ "$rc" -ne 125 ]; then exit "$rc"; fi
-            echo "AWS CLI container exited 125 on attempt $attempt"
-            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 15)); fi
-          done
-          exit 125
+          # The runner image's own aws CLI, not the AWS CLI container: ECR
+          # Public caps anonymous pulls per source IP (issue #2036). The script
+          # retries the create-bucket call's own transient failures.
+          aws --version
+          scripts/ci-create-bucket.sh http://localhost:9000 ravel-object-store-test
       # rustfs_ingest_read_smoke is gated on RAVEL_RUSTFS_URL, same convention
       # as the contract suite's rustfs_contract; set it (and the
-      # credentials/bucket the docker run above provisioned) so the gated
+      # credentials/bucket the step above provisioned) so the gated
       # test executes instead of skipping.
       - name: Run end-to-end ingest+query smoke test against RustFS
         env:
@@ -2112,6 +2092,10 @@ jobs:
       # The tag the assemble step writes and compose consumes via RAVEL_IMAGE.
       RAVEL_IMAGE: ravel-server:quickstart-ci
       COMPOSE_FILE: deploy/docker-compose/ravel.yml
+      # CI-only override: createbucket runs the locally built image as a no-op
+      # and the bucket is created from the host instead, so the job pulls
+      # nothing from ECR Public (issue #2036). See the file's header.
+      COMPOSE_CI_OVERRIDE: deploy/docker-compose/ci-host-bucket.yml
       # The readiness query has NO default in check-readme-commands.sh and hard
       # errors when empty. `gen` is the series telemetrygen emits, which this job
       # runs deterministically alongside the collector (ADR-0081 D5); no host
@@ -2143,7 +2127,7 @@ jobs:
           fi
           merge_base=$(git merge-base "$base" "${{ github.sha }}")
           changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
-          filter='^README\.md$|^deploy/docker-compose/|^deploy/otel/|^deploy/grafana/|^demo/|^scripts/check-readme-commands\.sh$|^scripts/check_readme_commands\.py$|^scripts/check-collector-delivery\.sh$|^Dockerfile\.prebuilt$|^services/ravel-server/'
+          filter='^README\.md$|^deploy/docker-compose/|^deploy/otel/|^deploy/grafana/|^demo/|^scripts/check-readme-commands\.sh$|^scripts/check_readme_commands\.py$|^scripts/check-collector-delivery\.sh$|^scripts/ci-create-bucket\.sh$|^Dockerfile\.prebuilt$|^services/ravel-server/'
           if echo "$changed" | grep -qE "$filter"; then
             echo "::notice::quickstart-relevant path changed, running the job"
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -2187,13 +2171,13 @@ jobs:
       - name: Pull the compose stack's registry images
         if: steps.filter.outputs.run == 'true'
         run: |
-          # ECR Public throttles unauthenticated pulls per source IP (see
-          # deploy/README.md), so the registry images are pulled here with
-          # backoff rather than left to `up`, where a throttled pull reads as
-          # a bring-up failure. qualify and ravel-server are omitted: they run
-          # the image the previous step built locally.
+          # Registry pulls are throttled per source IP (see deploy/README.md),
+          # so the registry images are pulled here with backoff rather than
+          # left to `up`, where a throttled pull reads as a bring-up failure.
+          # createbucket, qualify and ravel-server are omitted: under the CI
+          # override all three run the image the previous step built locally.
           for attempt in 1 2 3 4 5; do
-            if docker compose -f "$COMPOSE_FILE" pull rustfs createbucket otel-collector grafana; then
+            if docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_CI_OVERRIDE" pull rustfs otel-collector grafana; then
               exit 0
             fi
             if [ "$attempt" -lt 5 ]; then
@@ -2202,9 +2186,37 @@ jobs:
             fi
           done
           exit 1
+      # The bucket must exist before qualify runs, so RustFS comes up alone
+      # first. Its S3 port is published on loopback; the credentials are
+      # ravel.yml's fixed development pair.
+      - name: Start RustFS alone
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_CI_OVERRIDE" up -d rustfs
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9000/health; then
+              echo "RustFS is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::RustFS did not become healthy in time"
+          docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_CI_OVERRIDE" logs --no-color rustfs || true
+          exit 1
+      - name: Create the quickstart bucket from the host
+        if: steps.filter.outputs.run == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ravel
+          AWS_SECRET_ACCESS_KEY: ravel-dev-secret
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --version
+          scripts/ci-create-bucket.sh http://127.0.0.1:9000 ravel-dev
+      # Everything README.md's `up -d` starts; createbucket completes at once
+      # under the override and qualify then writes into the bucket above.
       - name: Bring up the compose stack
         if: steps.filter.outputs.run == 'true'
-        run: docker compose -f "$COMPOSE_FILE" up -d
+        run: docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_CI_OVERRIDE" up -d
       - name: Wait for ravel-server readiness
         if: steps.filter.outputs.run == 'true'
         run: |
@@ -2216,7 +2228,7 @@ jobs:
             sleep 3
           done
           echo "::error::ravel-server did not become ready in time"
-          docker compose -f "$COMPOSE_FILE" logs --no-color || true
+          docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_CI_OVERRIDE" logs --no-color || true
           exit 1
       # First of two telemetrygen steps: this one injects the deterministic
       # metric series (`gen`), alongside the collector's host metrics; the logs
@@ -2300,7 +2312,7 @@ jobs:
       # that gets disabled (ADR-0081 D6).
       - name: Dump compose logs on failure
         if: failure() && steps.filter.outputs.run == 'true'
-        run: docker compose -f "$COMPOSE_FILE" logs --no-color || true
+        run: docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_CI_OVERRIDE" logs --no-color || true
       - name: Tear down the compose stack
         if: always() && steps.filter.outputs.run == 'true'
-        run: docker compose -f "$COMPOSE_FILE" down -v || true
+        run: docker compose -f "$COMPOSE_FILE" -f "$COMPOSE_CI_OVERRIDE" down -v || true
