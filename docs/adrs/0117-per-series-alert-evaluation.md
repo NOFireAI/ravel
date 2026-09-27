@@ -217,3 +217,9 @@ before, now fails at startup. The changelog entry and the alerting guide
 carry this as an upgrade note. Nothing else in the decision changes: the
 identity preimage, the cap, and the storage format are as written above, and
 records already written stay readable.
+
+Two code citations above have moved: the startup duplicate check cited in
+Consequences now lives in `parse_rules` in
+`services/ravel-server/src/alerting.rs`, and the `RowCount` summary cited in
+decision 5 is the `QueryResultSummary::RowCount` variant in
+`crates/ravel-alerting/src/condition.rs`.
