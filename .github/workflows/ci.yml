@@ -292,6 +292,10 @@ jobs:
         run: bash scripts/guards/check-claim-single-source.test.sh
       - name: Store-probe zero claim has one home (issue #1982)
         run: scripts/guards/check-claim-single-source.sh
+      # A green run only takes the clean-create path, so the retry
+      # classification is covered by these cases or not at all (issue #2036).
+      - name: CI bucket-create cases (issue #2036)
+        run: bash scripts/ci-create-bucket.test.sh
 
       # An ADR amendment sometimes claims it updated other places in the same
       # document to point back at it; review kept finding the edit only

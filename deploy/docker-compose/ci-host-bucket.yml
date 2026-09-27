@@ -10,6 +10,10 @@
 # it) but runs the image the job built locally and exits 0, so nothing is
 # pulled for it. qualify fails if the bucket is missing, so a skipped host step
 # cannot pass unnoticed.
+#
+# Because the CI quickstart always applies this file, no per-PR job runs
+# ravel.yml's own createbucket block any more; the scheduled
+# quickstart-published workflow is the lane that still does.
 services:
   createbucket:
     image: ${RAVEL_IMAGE:?set RAVEL_IMAGE to the locally built ravel-server image}

@@ -110,13 +110,18 @@ rationale.
 
 ECR Public does throttle unauthenticated pulls per source IP on its own
 terms, answering a burst with `toomanyrequests: Rate exceeded`, which
-`docker run` reports as exit 125. CI therefore does not pull the AWS CLI
-image at all: its jobs create their bucket with the aws CLI the GitHub
-runner image ships (`scripts/ci-create-bucket.sh`), and the CI quickstart
+`docker run` reports as exit 125. The CI jobs that create a RustFS bucket
+(ci.yml's `object-store-contract`, `bench-smoke` and
+`quickstart`, and metricsbench-nightly's `metricsbench-rustfs`) no longer
+pull the AWS CLI image: they create their bucket with the aws CLI the
+GitHub runner image ships (`scripts/ci-create-bucket.sh`), and the CI quickstart
 applies `docker-compose/ci-host-bucket.yml`, a CI-only override that turns
 `createbucket` into a no-op on the locally built server image after the job
 creates `ravel-dev` from the host (issue #2036). The documented quickstart
-still runs `createbucket` from ECR Public, as do `docker-compose/rustfs.yml`,
+still runs `createbucket` from ECR Public; since the CI quickstart always
+applies the override, the scheduled `quickstart-published` workflow is now
+the only lane that runs that block, and it does not gate a merge. The same
+image is also pulled by `docker-compose/rustfs.yml`,
 `deploy/k8s`, `scripts/demo.sh`, `scripts/dr`, `scripts/chaos`, the
 MetricsBench compose file, and the interop-nightly Flight SQL test.
 
