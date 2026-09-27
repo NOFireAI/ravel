@@ -8513,13 +8513,15 @@ mod tests {
     /// content hash changing with `value`. The object keys are namespaced by
     /// tenant hex and signal prefix so distinct `(tenant, signal)` installs
     /// never collide in one store.
+    /// Returns the installed object's declared `body_uncompressed_len`, the
+    /// figure `fetch_stats_object` reserves before decoding it.
     async fn install_stats(
         store: &MemoryStore,
         tenant: TenantHash,
         signal: Signal,
         part_hash: [u8; 32],
         value: i64,
-    ) {
+    ) -> u64 {
         let signal_num = signal::to_proto(signal) as u32;
         let prefix = signal.key_prefix();
 
@@ -8604,12 +8606,18 @@ mod tests {
             )
             .await
             .expect("put head");
+
+        crate::snapshot_format::decode_column_stats_header(&stats_bytes)
+            .expect("the object this helper just wrote has a readable header")
+            .header
+            .body_uncompressed_len
     }
 
     /// [`install_stats`] for the default [`tenant`] on `Signal::Logs`, the
-    /// fixture the issue #888 reuse tests were written against.
-    async fn install_logs_stats(store: &MemoryStore, part_hash: [u8; 32], value: i64) {
-        install_stats(store, tenant(), Signal::Logs, part_hash, value).await;
+    /// fixture the issue #888 reuse tests were written against. Returns the
+    /// installed object's declared `body_uncompressed_len`.
+    async fn install_logs_stats(store: &MemoryStore, part_hash: [u8; 32], value: i64) -> u64 {
+        install_stats(store, tenant(), Signal::Logs, part_hash, value).await
     }
 
     /// The exact I64 `status` value carried by the one segment of a loaded
@@ -10827,6 +10835,87 @@ mod tests {
         );
     }
 
+    /// ADR-0050 §2 against ADR-1702 decision 6: a snapshot part whose own
+    /// header names another tenant is an isolation breach, and it stays one
+    /// under a budget with no room to decode that part. `load_one_part` reads
+    /// the tenant off the peeked header BEFORE it reserves, the same order
+    /// `load_snapshot_postings` uses, so a memory refusal can never stand in
+    /// for the breach and leave it (and `isolation_breaches()`) unreported.
+    ///
+    /// FLIP: move the tenant check back below the `reserve_decoded` call in
+    /// `load_one_part` (snapshot_resolve.rs) and this resolve fails with
+    /// `CatalogError::MemoryExhausted` instead, so the match below panics with
+    /// "expected a tenant_hash FieldMismatch, got MemoryExhausted(...)" and
+    /// `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn a_foreign_tenant_part_is_a_breach_even_under_a_budget_too_small_to_decode_it() {
+        let (store, range, now_ns, declared) = folded_one_part_fixture().await;
+        let head_key = crate::fold::head_object_key(&tenant(), Signal::Metrics);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+        let mut head = crate::snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
+        let part_key = head.parts[0].key.clone();
+        let part_bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        let part = crate::snapshot_format::decode_part(
+            &part_bytes,
+            &crate::snapshot_format::PartLimits::default(),
+        )
+        .expect("the fixture part decodes");
+
+        // The same entries under a foreign tenant_hash, re-pointed from the
+        // HEAD so the blake3 gate that runs before the header check passes and
+        // the header check is what the part reaches.
+        let foreign = crate::snapshot_format::encode_part_ranged(
+            [0xff; 16],
+            part.header.signal,
+            part.header.shard_count,
+            part.header.min_hour,
+            part.header.watermark_hour,
+            &part.entries,
+        )
+        .expect("re-encode the fixture part for a foreign tenant");
+        head.parts[0].blake3 = blake3::hash(&foreign).as_bytes().to_vec();
+        head.parts[0].size = foreign.len() as u64;
+        store
+            .put(&part_key, Bytes::from(foreign), PutOptions::default())
+            .await
+            .expect("put the foreign part");
+        let rewritten = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(&head_key, Bytes::from(rewritten), PutOptions::default())
+            .await
+            .expect("put the re-pointed HEAD");
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let err = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("a part naming a foreign tenant must hard-fail the resolve");
+        match err {
+            CatalogError::FieldMismatch { field, key, .. } => {
+                assert_eq!(field, "tenant_hash");
+                assert_eq!(key, part_key);
+            }
+            other => panic!("expected a tenant_hash FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            catalog.isolation_breaches(),
+            1,
+            "the breach is counted, not swallowed by the budget refusal"
+        );
+        assert_eq!(budget.reserved(), 0, "nothing was reserved for the part");
+    }
+
     /// A successful resolve charges exactly the part's declared length while
     /// the decoded part is alive (the part cache holds it, and a second resolve
     /// served from that cache charges nothing more), and returns the budget to
@@ -10966,6 +11055,11 @@ mod tests {
         }
     }
 
+    /// The declared `body_uncompressed_len` of the one-segment, one-column v3
+    /// object [`install_stats`] writes: length-delimited protobuf, so a fixed
+    /// figure for a fixed fixture.
+    const COLUMN_STATS_DECLARED_BODY_LEN: u64 = 75;
+
     /// A column-statistics object is charged its declared uncompressed body
     /// before decoding: a budget with no room for it fails the load with the
     /// typed budget error rather than decoding uncharged.
@@ -10975,7 +11069,8 @@ mod tests {
     #[tokio::test]
     async fn column_stats_decode_reserves_its_output() {
         let store = Arc::new(MemoryStore::new());
-        install_logs_stats(&store, *blake3::hash(b"part-reserve").as_bytes(), 1).await;
+        let declared =
+            install_logs_stats(&store, *blake3::hash(b"part-reserve").as_bytes(), 1).await;
         let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
         let catalog = Catalog::new(store.clone(), config(8))
             .expect("catalog")
@@ -10994,7 +11089,11 @@ mod tests {
             .expect_err("a stats object that does not fit the budget fails the load");
         match err {
             column_stats_resolve::LoadColumnStatsError::MemoryExhausted(exhausted) => {
-                assert!(exhausted.requested > 0, "the object's declared body");
+                assert_eq!(
+                    exhausted.requested, declared,
+                    "exactly the object's declared uncompressed body"
+                );
+                assert_eq!(declared, COLUMN_STATS_DECLARED_BODY_LEN);
                 assert_eq!(exhausted.limit, 0);
             }
             other => panic!("expected LoadColumnStatsError::MemoryExhausted, got {other:?}"),

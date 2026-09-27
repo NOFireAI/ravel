@@ -239,9 +239,15 @@ pub enum MetricsMetaError {
         "metadata record {key:?} could not be decompressed (corrupt or truncated body): {message}"
     )]
     Decompress { key: String, message: String },
+    /// `cap` is the bound the body was admitted under, which is not always
+    /// this build's reader ceiling: the serve reader passes the frame's own
+    /// declared content size, the figure it reserved against the memory
+    /// budget (ADR-1702 decision 6), so a body that inflates past what it
+    /// declared is refused here even well under the ceiling.
     #[error(
-        "metadata record {key:?} decompresses to more than the {cap}-byte ceiling this build \
-         accepts: refusing rather than allocate an unbounded body"
+        "metadata record {key:?} decompresses to more than the {cap}-byte bound it was admitted \
+         under (the zstd frame's own declared content size, or this build's reader ceiling when \
+         the frame declares none): refusing rather than allocate an unbounded body"
     )]
     DecompressedTooLarge { key: String, cap: usize },
     /// The process memory budget refused the reservation for the record's

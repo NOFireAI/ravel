@@ -1318,7 +1318,21 @@ pinning are unchanged:
    the decoder's ceiling) against the catalog's `MemoryBudget`
    (`Catalog::with_memory_budget`, unlimited by default; ADR-1702
    decision 6), and the reservation lives with the decoded value, in the
-   decoded-part and postings caches included, until it is dropped.
+   decoded-part and postings caches included, until it is dropped. Both
+   tenant_hash checks read the object's peeked header and run BEFORE that
+   reservation: an isolation breach must be reported as one even when the
+   budget has no room for the object it is in, rather than being reported
+   as a memory refusal with the breach and its counter lost. The
+   column-statistics load reserves each object's declared body the same
+   way and fails with `LoadColumnStatsError::MemoryExhausted`, which a SQL
+   client sees as the transient 503, never as corrupt data; that
+   reservation is released when `load_column_stats` returns, since
+   `LoadedColumnStats` has no slot to carry it.
+   The catalog's budget defaults to unlimited and the server does not yet
+   pass it the process budget, so these reservations account without
+   refusing today. The PromQL fetch path's own decode reservations
+   (docs/query-engine.md) are already wired to the process budget and do
+   refuse.
 2. On any other failure in step 1 (HEAD absent, corrupt, part missing or
    hash-mismatched, postings content-hash or entry-count mismatch): log,
    fall back to full listing for the whole window. Queries never

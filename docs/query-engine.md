@@ -756,12 +756,36 @@ to the same budget before it runs. `SegmentFetcher::decode_selected` (and
 SERIES_IDS, SERIES_META, SERIES_IDX, SERIES_META_CHUNKS), each clamped to the
 reader's section ceiling, and the guard travels with the decoded entries rather
 than with the fetched regions. A refusal is the same typed
-`FetchMemoryExhausted`. On a chunked object the SERIES_META_CHUNKS descriptor
-records the stored frames' length, not what they inflate to; the decoder
-inflates one frame at a time. The catalog resolve charges its own decodes the
-same way (`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), and so does
-the `/api/v1/metadata` cache (`MetadataCache::with_memory_budget`). These guards
-come from the same RAII `reserve` API, so they read under `component="fetch"`.
+`FetchMemoryExhausted`.
+
+SERIES_META_CHUNKS is the one section whose footer figure is not what it
+decodes to. It carries no section-level compression, so its `uncompressed_len`
+is the STORED zstd frames' length, while `decode_catalog_v5_chunked` inflates
+every frame and keeps an entry for every series. The reservation therefore uses
+the SERIES_IDX chunk directory's summed `frame_uncompressed_len` for that
+section (the directory is already fetched before the decode on every chunked
+path), falling back to the footer figure only when that directory is not
+readable. On the 4096-series fixture the two differ by an order of magnitude:
+8,599 stored bytes against 90,356 inflated.
+
+Once the matchers have run, `decode_selected` exchanges the whole-catalog
+reservation for one sized to the entries that survived, measured over their
+structs, label strings and runs. A selective query on a large object therefore
+holds a few hundred bytes through its page fetches rather than the whole
+catalog's charge. The exchange only ever shrinks: on an object small enough
+that the decoded entries measure more than the sections they came from, the
+original reservation stands rather than growing into a new refusal point.
+
+**Where these are live.** The PromQL fetch path already receives the process
+budget (`QueryEngine::with_memory_budget`, wired in `ravel-server`), so these
+catalog-decode reservations are enforced in a running server today and a query
+whose decode does not fit is refused with the 503 `FetchMemoryExhausted` maps
+to. The catalog resolve charges its own decodes the same way
+(`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), as does the
+`/api/v1/metadata` cache (`MetadataCache::with_memory_budget`), but both still
+default to an unlimited budget and the server does not yet pass them the real
+one, so those reservations account without refusing. These guards come from the
+same RAII `reserve` API, so they read under `component="fetch"`.
 
 ## Endpoints (Prometheus compatibility subset)
 

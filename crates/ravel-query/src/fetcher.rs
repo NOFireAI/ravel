@@ -31,6 +31,11 @@ const SECTION_SERIES_META: u32 = 6;
 const SECTION_SERIES_IDX: u32 = 8;
 const SECTION_SERIES_META_CHUNKS: u32 = 9;
 
+/// `Compression.COMPRESSION_NONE` from proto/ravel/segment.proto, the same way
+/// the section kinds above are spelled here: `ravel-segment` keeps its own
+/// copy private.
+const COMPRESSION_NONE: i32 = 0;
+
 /// Store-sourced GET cost, either of a single `guarded_get` call or accumulated
 /// across the coalesced GETs of one `ensure_ranges` call. It scopes ADR-0044
 /// decision 5's per-span `s3_requests`/`s3_bytes` to bytes that actually
@@ -63,10 +68,20 @@ struct GetCost {
 /// What a catalog decode is charged before it runs (ADR-1702 decision 6): the
 /// footer-declared `uncompressed_len` of every catalog section the object
 /// carries, each clamped to the reader's section ceiling, since the decoder
-/// refuses a larger section before allocating it. On a chunked object the
-/// SERIES_META_CHUNKS descriptor records the stored frames' length, not what
-/// they inflate to; the decoder inflates and drops them one frame at a time.
-fn catalog_decode_len(footer: &Footer, limits: ReaderLimits) -> u64 {
+/// refuses a larger section before allocating it.
+///
+/// SERIES_META_CHUNKS is the exception, and `meta_chunks_inflated` is what
+/// replaces its footer figure when the chunk directory is readable. That
+/// section carries no section-level compression, so its `uncompressed_len` is
+/// the STORED (zstd) frames' length, while `decode_catalog_v5_chunked`
+/// inflates every frame and keeps an entry for every series in it. Charging
+/// the footer figure there charges the compressed size for an output several
+/// times larger.
+fn catalog_decode_len(
+    footer: &Footer,
+    limits: ReaderLimits,
+    meta_chunks_inflated: Option<u64>,
+) -> u64 {
     footer
         .sections
         .iter()
@@ -80,10 +95,85 @@ fn catalog_decode_len(footer: &Footer, limits: ReaderLimits) -> u64 {
                     | SECTION_SERIES_META_CHUNKS
             )
         })
-        .map(|s| {
-            s.uncompressed_len
-                .min(limits.max_section_uncompressed_bytes)
+        .map(|s| match (s.kind, meta_chunks_inflated) {
+            (SECTION_SERIES_META_CHUNKS, Some(inflated)) => inflated,
+            _ => s
+                .uncompressed_len
+                .min(limits.max_section_uncompressed_bytes),
         })
+        .fold(0, u64::saturating_add)
+}
+
+/// The bytes SERIES_META_CHUNKS inflates to: the sum of its chunk directory's
+/// `frame_uncompressed_len` (docs/segment-format.md "SERIES_IDX"), each
+/// clamped to the reader's section ceiling, since
+/// `decode_catalog_v5_chunked` refuses a larger frame before allocating it.
+/// The directory lives in SERIES_IDX, which every chunked path has already
+/// fetched into `regions` before the decode.
+///
+/// `None` means the footer figure is the only reading available: the object
+/// carries no SERIES_IDX (it is not chunked), its bytes are not in `regions`,
+/// the section is stored compressed (this parse reads stored bytes, and the
+/// writer always stores it uncompressed), or the directory does not parse, in
+/// which case the decode that follows fails on the same bytes.
+fn meta_chunks_inflated_len(
+    footer: &Footer,
+    regions: &FetchedRegions,
+    limits: ReaderLimits,
+) -> Option<u64> {
+    let idx = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SECTION_SERIES_IDX)
+        .filter(|s| s.comp == COMPRESSION_NONE)?;
+    let bytes = regions.slice(idx.offset, idx.len)?;
+    let index = ravel_segment::parse_series_idx(&bytes).ok()?;
+    let mut total = 0u64;
+    for series_index in 0..u64::from(index.series_count()) {
+        // The directory is dense and `chunk_for` reports the row's offset
+        // within its frame, so `row_in_chunk == 0` walks each frame exactly
+        // once through the public lookup.
+        match index.chunk_for(series_index) {
+            Some(chunk) if chunk.row_in_chunk == 0 => {
+                total = total.saturating_add(
+                    chunk
+                        .frame_uncompressed_len
+                        .min(limits.max_section_uncompressed_bytes),
+                );
+            }
+            _ => {}
+        }
+    }
+    Some(total)
+}
+
+/// Heap bytes one decoded catalog entry holds once the fetched section bytes
+/// are gone: the entry itself, its label set's `Label` vector with every name
+/// and value string's bytes, its run vector, and its per-sample provenance.
+fn catalog_entry_len(entry: &SeriesEntryV4) -> u64 {
+    let labels = entry.entry.labels.iter().fold(0u64, |acc, label| {
+        acc.saturating_add(std::mem::size_of::<ravel_types::Label>() as u64)
+            .saturating_add(label.name.len() as u64)
+            .saturating_add(label.value.len() as u64)
+    });
+    let runs = (entry.runs.len() as u64).saturating_mul(std::mem::size_of::<RunEntry>() as u64);
+    let provenance = entry.per_sample_provenance.iter().fold(0u64, |acc, slot| {
+        acc.saturating_add(std::mem::size_of::<Option<Vec<SampleProvenance>>>() as u64)
+            .saturating_add(slot.as_ref().map_or(0, |v| {
+                (v.len() as u64).saturating_mul(std::mem::size_of::<SampleProvenance>() as u64)
+            }))
+    });
+    (std::mem::size_of::<SeriesEntryV4>() as u64)
+        .saturating_add(labels)
+        .saturating_add(runs)
+        .saturating_add(provenance)
+}
+
+/// [`catalog_entry_len`] summed over the entries a decode retained.
+fn retained_catalog_len(entries: &[SeriesEntryV4]) -> u64 {
+    entries
+        .iter()
+        .map(catalog_entry_len)
         .fold(0, u64::saturating_add)
 }
 
@@ -945,11 +1035,50 @@ impl SegmentFetcher {
     /// (ADR-1702 decision 6), refusing with the same typed
     /// [`FetchError::FetchMemoryExhausted`] a fetch reservation does. The guard
     /// travels with the decoded entries in a [`DecodedCatalog`].
+    ///
+    /// `regions` supplies the already-fetched SERIES_IDX bytes a chunked
+    /// object's real decode size is read from ([`meta_chunks_inflated_len`]).
     fn reserve_catalog_decode(
         &self,
         footer: &Footer,
+        regions: &FetchedRegions,
     ) -> Result<ravel_memory::Reservation, FetchError> {
-        self.reserve_fetch(catalog_decode_len(footer, self.limits))
+        let inflated = meta_chunks_inflated_len(footer, regions, self.limits);
+        self.reserve_fetch(catalog_decode_len(footer, self.limits, inflated))
+    }
+
+    /// Exchanges a decode's whole-catalog reservation for one sized to the
+    /// entries the matchers retained (ADR-1702 decision 6). The pre-decode
+    /// reservation covers every catalog section the object carries; after a
+    /// selective matcher the caller holds a handful of entries through the
+    /// page fetches that follow, and charging the whole catalog for all of
+    /// them overstates the query's memory for the rest of its life.
+    ///
+    /// The full reservation is released before the retained one is taken,
+    /// which is the order that matches what is alive: the filter's `collect`
+    /// has already finished and dropped the decoded vector by the time this
+    /// runs, so only the retained entries exist. Releasing first also keeps
+    /// this query from being refused against headroom it is itself about to
+    /// give back; only another reserver landing in between can refuse a
+    /// shrink, and that refusal is the ordinary typed one.
+    ///
+    /// A retained figure at or above what is held keeps the existing
+    /// reservation untouched, so this only ever shrinks: the pre-decode figure
+    /// is an estimate over section bytes and the retained figure measures
+    /// structs, and exchanging upward would turn a filter that retained
+    /// everything into a new refusal point.
+    fn shrink_to_retained(&self, decoded: DecodedCatalog) -> Result<DecodedCatalog, FetchError> {
+        let retained = retained_catalog_len(&decoded.entries);
+        if retained >= decoded.reservation.size() {
+            return Ok(decoded);
+        }
+        let (entries, held) = decoded.into_parts();
+        drop(held);
+        let reservation = self.reserve_fetch(retained)?;
+        Ok(DecodedCatalog {
+            entries,
+            reservation,
+        })
     }
 
     /// One store GET, bounded by the shared in-flight limiter. The permit
@@ -1558,7 +1687,7 @@ impl SegmentFetcher {
                 // label-set materialization of every non-matching series
                 // (issue #1076); otherwise materialize the whole catalog and
                 // filter it.
-                let reservation = self.reserve_catalog_decode(footer)?;
+                let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let entries = if let Some(equals) = ordinal_equals(matchers) {
                     let matched = decode_catalog_matching_v4(
                         footer,
@@ -1619,7 +1748,7 @@ impl SegmentFetcher {
                 let object = regions
                     .slice(0, total_size)
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-                let reservation = self.reserve_catalog_decode(footer)?;
+                let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let entries = decode_catalog_v5(footer, &object, self.limits)
                     .map_err(|source| corrupt(key, source))?;
                 self.record_materialized(entries.len());
@@ -1637,7 +1766,10 @@ impl SegmentFetcher {
             // page bytes (ADR-0044 decision 5: "record decompressed_bytes if
             // applicable, or series_matched"). Recorded from this call's own count.
             span.record("series_matched", matched.len() as u64);
-            Ok(matched)
+            // The decode was charged for the whole catalog; from here only the
+            // matched entries are held, through the page fetches the caller
+            // runs next.
+            self.shrink_to_retained(matched)
         }
         .instrument(span.clone())
         .await
@@ -1735,7 +1867,7 @@ impl SegmentFetcher {
         let chunks = regions
             .slice(ranges.meta_chunks.0, ranges.meta_chunks.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-        let reservation = self.reserve_catalog_decode(footer)?;
+        let reservation = self.reserve_catalog_decode(footer, regions)?;
         let entries = decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, self.limits)
             .map_err(|source| corrupt(key, source))?;
         Ok(DecodedCatalog {
@@ -4197,13 +4329,24 @@ mod tests {
         );
     }
 
-    /// `decode_sparse_catalog` charges the chunked catalog's declared
-    /// uncompressed length before decoding it, and that reservation rides with
-    /// the decoded entries after the fetched regions are gone.
+    /// `decode_sparse_catalog` charges the bytes the chunked catalog actually
+    /// inflates to, not the stored frames' length its footer descriptor
+    /// records, and that reservation rides with the decoded entries after the
+    /// fetched regions are gone.
     ///
-    /// FLIP: drop the `reserve_catalog_decode` call in
-    /// `decode_sparse_catalog` and the budget reads 0 once the regions drop,
-    /// failing the first assertion below.
+    /// SERIES_META_CHUNKS carries no section-level compression, so its footer
+    /// `uncompressed_len` IS the stored (zstd) frame bytes, while the decoder
+    /// inflates every frame and materializes all 4096 entries. The exact
+    /// figures below are the fixture's, and they are what makes the
+    /// distinction visible: the compressed-size reservation is a small
+    /// fraction of the real one. `frame_uncompressed_len` comes from the
+    /// writer's chunk-frame encoding, not from zstd, so it does not move with
+    /// the compressor.
+    ///
+    /// FLIP: ignore `meta_chunks_inflated` in `catalog_decode_len` (take the
+    /// `_ =>` arm for SERIES_META_CHUNKS too, which is the pre-fix code) and
+    /// the reserved figure drops to `SPARSE_STORED_CATALOG_LEN`, failing the
+    /// first assertion with `left: 151466, right: 233223`.
     #[tokio::test]
     async fn sparse_catalog_decode_reserves_its_output() {
         let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
@@ -4219,12 +4362,110 @@ mod tests {
             .open_segment(tenant_hash, &seg_ref, &accounting)
             .await
             .expect("open segment");
-        assert!(
-            fetcher
-                .sparse_probe_qualifies(&footer, total, &matchers)
-                .is_some(),
-            "the fixture takes the sparse catalog-probe path"
+        let sparse = fetcher
+            .sparse_probe_qualifies(&footer, total, &matchers)
+            .expect("the fixture takes the sparse catalog-probe path");
+
+        // `decode_sparse_catalog` rather than `decode_selected`: this is the
+        // reservation as taken, before the matcher filter shrinks it
+        // (`shrink_to_retained`, pinned by
+        // `sparse_catalog_reservation_shrinks_to_the_retained_entries`).
+        let decoded = fetcher
+            .decode_sparse_catalog(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                &etag,
+                &mut regions,
+                &sparse,
+                &accounting,
+            )
+            .await
+            .expect("decode sparse catalog");
+        assert_eq!(decoded.len(), 4096, "every series in the chunked catalog");
+        assert_eq!(
+            declared_catalog_len(&footer),
+            SPARSE_STORED_CATALOG_LEN,
+            "the footer figure the pre-fix reservation used"
         );
+
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            SPARSE_INFLATED_CATALOG_LEN,
+            "the inflated chunk frames stay charged with the entries"
+        );
+        // The other three catalog sections are stored uncompressed, so the
+        // whole gap between the two totals is SERIES_META_CHUNKS alone.
+        let chunks_stored = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == SECTION_SERIES_META_CHUNKS)
+            .expect("the fixture is chunked")
+            .uncompressed_len;
+        assert_eq!(chunks_stored, SPARSE_STORED_META_CHUNKS_LEN);
+        let chunks_inflated =
+            SPARSE_INFLATED_CATALOG_LEN - (SPARSE_STORED_CATALOG_LEN - chunks_stored);
+        assert_eq!(
+            chunks_inflated, SPARSE_INFLATED_META_CHUNKS_LEN,
+            "the whole difference is the chunk frames"
+        );
+        assert!(
+            chunks_inflated > chunks_stored * 10,
+            "the stored frames understate what they inflate to ten times over: \
+             {chunks_inflated} against {chunks_stored}"
+        );
+        drop(decoded);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Sum of the fixture's catalog-section `uncompressed_len` as the footer
+    /// records them, with SERIES_META_CHUNKS counted at its STORED frame
+    /// length. This is what the pre-fix `catalog_decode_len` reserved.
+    const SPARSE_STORED_CATALOG_LEN: u64 = 151_466;
+
+    /// The same sum with SERIES_META_CHUNKS counted at the chunk directory's
+    /// summed `frame_uncompressed_len`: what `decode_catalog_v5_chunked`
+    /// really inflates and materializes.
+    const SPARSE_INFLATED_CATALOG_LEN: u64 = 233_223;
+
+    /// SERIES_META_CHUNKS alone, as its footer descriptor records it: the
+    /// stored zstd frames.
+    const SPARSE_STORED_META_CHUNKS_LEN: u64 = 8_599;
+
+    /// SERIES_META_CHUNKS alone, inflated: the chunk directory's summed
+    /// `frame_uncompressed_len`.
+    const SPARSE_INFLATED_META_CHUNKS_LEN: u64 = 90_356;
+
+    /// After the matchers have run, the catalog reservation is exchanged for
+    /// one sized to the entries that survived, so a single-series query does
+    /// not hold the whole 4096-series catalog's charge through its page
+    /// fetches.
+    ///
+    /// The retained figure is spelled out from the fixture rather than read
+    /// back from `retained_catalog_len`: one entry, one `__name__` label whose
+    /// name is 8 bytes and whose value `sparse_metric_2000` is 18, and one run
+    /// (an L0 write).
+    ///
+    /// FLIP: drop the `shrink_to_retained` call at the end of
+    /// `decode_selected` and the reserved figure stays at
+    /// `SPARSE_INFLATED_CATALOG_LEN`, failing the assertion below with
+    /// `left: 233223, right: 330`.
+    #[tokio::test]
+    async fn sparse_catalog_reservation_shrinks_to_the_retained_entries() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let fetcher = fetcher
+            .with_whole_object_threshold(0)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
         let decoded = fetcher
             .decode_selected(
                 &seg_ref,
@@ -4240,13 +4481,20 @@ mod tests {
             .expect("decode sparse catalog");
         assert_eq!(decoded.len(), 1, "exactly the matched series");
 
-        let declared = declared_catalog_len(&footer);
-        assert!(declared > 0);
+        let one_entry = std::mem::size_of::<SeriesEntryV4>() as u64
+            + std::mem::size_of::<ravel_types::Label>() as u64
+            + "__name__".len() as u64
+            + "sparse_metric_2000".len() as u64
+            + std::mem::size_of::<RunEntry>() as u64;
         drop(regions);
         assert_eq!(
             budget.reserved(),
-            declared,
-            "the chunked catalog's declared length stays charged with the entries"
+            one_entry,
+            "only the retained entry stays charged once the filter has run"
+        );
+        assert!(
+            one_entry < SPARSE_INFLATED_CATALOG_LEN / 100,
+            "the shrink is the point: {one_entry} against {SPARSE_INFLATED_CATALOG_LEN}"
         );
         drop(decoded);
         assert_eq!(budget.reserved(), 0);
@@ -4457,6 +4705,24 @@ mod tests {
             .await
             .expect("decode catalog");
         assert_eq!(decoded.len(), 2, "both fixture series decode");
+        // An empty matcher retains both series, and on a fixture this small
+        // the two `SeriesEntryV4` structs measure MORE than the catalog
+        // sections they decoded from, so `shrink_to_retained` keeps the
+        // reservation it was given rather than exchanging it upward: the
+        // exchange only ever shrinks.
+        let retained = 2
+            * (std::mem::size_of::<SeriesEntryV4>() as u64
+                + std::mem::size_of::<ravel_types::Label>() as u64
+                + "__name__".len() as u64
+                + std::mem::size_of::<RunEntry>() as u64)
+            + "smooth_metric".len() as u64
+            + "chaotic_metric".len() as u64;
+        assert!(
+            retained > declared_catalog_len(&footer),
+            "the two entries measure more than the sections they decoded from: \
+             {retained} against {}",
+            declared_catalog_len(&footer)
+        );
         // The fixture is small enough that `open_segment` reads it whole, so
         // the catalog sections need no further GET and the only new charge is
         // the decode's.

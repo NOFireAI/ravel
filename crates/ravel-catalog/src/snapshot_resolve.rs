@@ -828,17 +828,41 @@ impl Catalog {
         let limits = PartLimits {
             max_snapshot_part_bytes: self.config().max_snapshot_part_bytes,
         };
-        let declared = match snapshot_format::decode_part_header(&data) {
-            Ok(header) => header.entries_uncompressed_len,
+        let header = match snapshot_format::decode_part_header(&data) {
+            Ok(header) => header,
             Err(err) => {
                 tracing::warn!(error = %err, key = %part_ref.key, "snapshot part header unreadable, falling back to listing");
                 return OnePartOutcome::Unusable;
             }
         };
+        // ADR-0050 §2: a part whose own header names a different tenant is an
+        // isolation breach, hard-fail, never cached or served. The HEAD's
+        // per-part blake3 was already verified above, but a HEAD that passes
+        // that check can still reference a part object belonging to another
+        // tenant; the part header's tenant_hash is the independent binding to
+        // the requester.
+        //
+        // Read off the peeked header, before the reservation below, the same
+        // way `load_snapshot_postings` does it: a budget with no room for this
+        // part would otherwise refuse first, reporting a memory exhaustion
+        // where a cross-tenant part was sitting and leaving the breach and its
+        // counter unreported.
+        if header.tenant_hash.as_slice() != tenant.0.as_slice() {
+            self.record_isolation_breach();
+            return OnePartOutcome::IsolationBreach(CatalogError::FieldMismatch {
+                key: part_ref.key.clone(),
+                field: "tenant_hash",
+                expected: tenant.to_hex(),
+                actual: hex::encode(&header.tenant_hash),
+            });
+        }
         // ADR-1702 decision 6: charge the decoded entry body before decoding
         // it; the reservation rides with the decoded part, in the part cache
         // included, until the last `Arc` to it drops.
-        let reservation = match self.reserve_decoded(declared, limits.max_snapshot_part_bytes) {
+        let reservation = match self.reserve_decoded(
+            header.entries_uncompressed_len,
+            limits.max_snapshot_part_bytes,
+        ) {
             Ok(reservation) => reservation,
             Err(err) => return OnePartOutcome::MemoryExhausted(err),
         };
@@ -849,21 +873,6 @@ impl Catalog {
                 return OnePartOutcome::Unusable;
             }
         };
-        // ADR-0050 §2: a part whose own header names a different tenant is an
-        // isolation breach, hard-fail, never cached or served. The HEAD's
-        // per-part blake3 was already verified above, but a HEAD that passes
-        // that check can still reference a part object belonging to another
-        // tenant; the part header's tenant_hash is the independent binding to
-        // the requester.
-        if decoded.header.tenant_hash.as_slice() != tenant.0.as_slice() {
-            self.record_isolation_breach();
-            return OnePartOutcome::IsolationBreach(CatalogError::FieldMismatch {
-                key: part_ref.key.clone(),
-                field: "tenant_hash",
-                expected: tenant.to_hex(),
-                actual: hex::encode(&decoded.header.tenant_hash),
-            });
-        }
         self.part_cache().insert(
             *tenant,
             part_ref.key.clone(),
