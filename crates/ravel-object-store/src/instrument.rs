@@ -615,13 +615,38 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         key: &str,
         range: GetRange,
         pin: &crate::Pin,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<crate::PinnedRead, StoreError> {
         let start = self.clock.now_nanos();
         let result = self.inner.get_pinned(key, range, pin).await;
         let bytes = result
             .as_ref()
-            .map_or(0, |outcome| outcome.data.len() as u64);
+            .map_or(0, |read| read.outcome.data.len() as u64);
         self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// Counted as a [`StoreOp::Get`] for the same reason as
+    /// [`Self::get_pinned`]: it is the same GET, with the object's version
+    /// reported alongside the bytes.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let start = self.clock.now_nanos();
+        let result = self.inner.get_with_pin(key, range).await;
+        let bytes = result
+            .as_ref()
+            .map_or(0, |read| read.outcome.data.len() as u64);
+        self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// One HEAD on the wire, counted as [`StoreOp::Head`] like [`Self::head`].
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        let start = self.clock.now_nanos();
+        let result = self.inner.pin_of(key).await;
+        self.record(StoreOp::Head, start, 0, &result);
         result
     }
 

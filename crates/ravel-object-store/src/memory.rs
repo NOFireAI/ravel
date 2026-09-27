@@ -262,35 +262,76 @@ impl ObjectStoreBackend for MemoryStore {
         })
     }
 
-    /// Evaluates the precondition under the same lock that serves the bytes,
-    /// so an overwrite cannot land between the check and the read.
+    /// Evaluates the pin under the same lock that serves the bytes, so an
+    /// overwrite cannot land between the check and the read.
     ///
-    /// Absence is decided first: a missing key is `NotFound` whatever the pin
-    /// says. Then the ETag, then the version when the pin carries one, so a
-    /// store whose two identities move together (this one: `put` bumps both
-    /// from one counter) still refuses on either.
+    /// The order is the contract's, and the two halves answer differently
+    /// (docs/object-store-contract.md, "Conditional reads"; the ADR-2040
+    /// pinning amendment):
+    ///
+    /// - A missing key is `NotFound` whatever the pin says.
+    /// - `pin.version` is a *selector*. This store keeps only the current
+    ///   object, so any version but the current one has been replaced and is
+    ///   gone: the answer is `NotFound`, the same answer a versioned store
+    ///   gives for a version that has been deleted. It is never
+    ///   `PreconditionFailed`, which would say the object is there and
+    ///   different.
+    /// - `pin.etag` is a *precondition*, evaluated on the object the selector
+    ///   chose. A mismatch is `PreconditionFailed`, which for a pin with no
+    ///   version is the overwrite case the pinning model rests on.
     async fn get_pinned(
         &self,
         key: &str,
         range: GetRange,
         pin: &crate::Pin,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<crate::PinnedRead, StoreError> {
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
-        if entry.etag.0 != pin.etag {
-            return Err(StoreError::PreconditionFailed);
-        }
         if let Some(version) = pin.version.as_deref()
             && entry.version.0 != version
         {
+            return Err(StoreError::NotFound);
+        }
+        if entry.etag.0 != pin.etag {
             return Err(StoreError::PreconditionFailed);
         }
-        Ok(GetOutcome {
-            data: Self::slice(&entry.data, range)?,
-            etag: entry.etag.clone(),
-            version: entry.version.clone(),
-            total_size: entry.data.len() as u64,
+        Ok(crate::PinnedRead {
+            outcome: GetOutcome {
+                data: Self::slice(&entry.data, range)?,
+                etag: entry.etag.clone(),
+                version: entry.version.clone(),
+                total_size: entry.data.len() as u64,
+            },
+            pin: crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone())),
         })
+    }
+
+    /// This store models a versioned one: its `version` is a distinct value per
+    /// `put`, not the ETag again, so the pin it reports carries a selector and
+    /// the selector case above is reachable from the conformance suite.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        Ok(crate::PinnedRead {
+            outcome: GetOutcome {
+                data: Self::slice(&entry.data, range)?,
+                etag: entry.etag.clone(),
+                version: entry.version.clone(),
+                total_size: entry.data.len() as u64,
+            },
+            pin: crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone())),
+        })
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        let pin = crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone()));
+        Ok((entry.meta(key), pin))
     }
 
     async fn put_multipart<'a>(

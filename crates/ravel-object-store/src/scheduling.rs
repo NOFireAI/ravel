@@ -556,14 +556,40 @@ impl ObjectStoreBackend for ScheduledHandle {
         key: &str,
         range: GetRange,
         pin: &crate::Pin,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<crate::PinnedRead, StoreError> {
         let _permit = self.scheduler.acquire(self.class).await;
         let start = self.clock.now_nanos();
         let result = self.inner.get_pinned(key, range, pin).await;
         let bytes = result
             .as_ref()
-            .map_or(0, |outcome| outcome.data.len() as u64);
+            .map_or(0, |read| read.outcome.data.len() as u64);
         self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// One scheduled GET, like [`Self::get_pinned`], with the object's version
+    /// reported alongside the bytes.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        let start = self.clock.now_nanos();
+        let result = self.inner.get_with_pin(key, range).await;
+        let bytes = result
+            .as_ref()
+            .map_or(0, |read| read.outcome.data.len() as u64);
+        self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// One scheduled HEAD, counted like [`Self::head`].
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        let start = self.clock.now_nanos();
+        let result = self.inner.pin_of(key).await;
+        self.record(StoreOp::Head, start, 0, &result);
         result
     }
 

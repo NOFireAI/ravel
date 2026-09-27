@@ -93,8 +93,8 @@ use object_store::{
 
 use crate::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PartSequence, Pin, PutMode, PutOptions, PutOutcome, StoreError,
-    UploadChecksum, Version, multipart_finished, multipart_poisoned,
+    ObjectStoreBackend, PageToken, PartSequence, Pin, PinnedRead, PutMode, PutOptions, PutOutcome,
+    StoreError, UploadChecksum, Version, multipart_finished, multipart_poisoned,
 };
 
 mod credentials;
@@ -1665,7 +1665,7 @@ impl S3Store {
         key: &str,
         range: GetRange,
         pin: Option<&Pin>,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<PinnedRead, StoreError> {
         let os_range = match range {
             // The one request whose size the caller does not choose, so the one
             // that has to be bounded here to stay inside
@@ -1685,12 +1685,7 @@ impl S3Store {
             GetRange::Suffix(n) => Some(OsGetRange::Suffix(n)),
         };
         let chunk = self.get_one(key, os_range, pin).await?;
-        Ok(GetOutcome {
-            data: chunk.data,
-            etag: Etag(chunk.etag.clone()),
-            version: Version(chunk.etag),
-            total_size: chunk.total_size,
-        })
+        Ok(chunk.into_pinned_read())
     }
 
     /// One GET, ranged or not, reduced to the three things this adapter needs
@@ -1729,10 +1724,12 @@ impl S3Store {
         // `Content-Range`, not the length of the slice returned, which is what
         // makes one bounded request enough to learn how many more to issue.
         let total_size = result.meta.size;
+        let version = result.meta.version.clone();
         let data = result.bytes().await.map_err(map_error_common)?;
         Ok(GetChunk {
             data,
             etag,
+            version,
             total_size,
         })
     }
@@ -1771,7 +1768,7 @@ impl S3Store {
         &self,
         key: &str,
         pin: Option<&Pin>,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<PinnedRead, StoreError> {
         let chunk = self.max_get_chunk as u64;
         let first = match self
             .get_one(key, Some(OsGetRange::Bounded(0..chunk)), pin)
@@ -1785,24 +1782,14 @@ impl S3Store {
             // an unsatisfiable range here can only mean an empty object.
             Err(StoreError::InvalidRange(_)) => {
                 let whole = self.get_one(key, None, pin).await?;
-                return Ok(GetOutcome {
-                    data: whole.data,
-                    etag: Etag(whole.etag.clone()),
-                    version: Version(whole.etag),
-                    total_size: whole.total_size,
-                });
+                return Ok(whole.into_pinned_read());
             }
             Err(e) => return Err(e),
         };
 
         let total_size = first.total_size;
         if first.data.len() as u64 >= total_size {
-            return Ok(GetOutcome {
-                data: first.data,
-                etag: Etag(first.etag.clone()),
-                version: Version(first.etag),
-                total_size,
-            });
+            return Ok(first.into_pinned_read());
         }
 
         let mut ranges = Vec::new();
@@ -1825,7 +1812,10 @@ impl S3Store {
         // issue order, so they must be yielded in issue order.
         let continuation = match pin {
             Some(pin) => pin.clone(),
-            None => Pin::etag(first.etag.clone()),
+            // The first response's own identity, version id included when the
+            // bucket has one: later requests then select the same version
+            // rather than only asserting its ETag.
+            None => Pin::from_store(first.etag.clone(), first.version.clone()),
         };
         {
             let mut inflight = futures::stream::iter(ranges.into_iter().map(|range| {
@@ -1856,23 +1846,50 @@ impl S3Store {
                 data.len()
             )));
         }
-        Ok(GetOutcome {
+        Ok(GetChunk {
             data: data.freeze(),
-            etag: Etag(first.etag.clone()),
-            version: Version(first.etag),
+            etag: first.etag,
+            version: first.version,
             total_size,
-        })
+        }
+        .into_pinned_read())
     }
 }
 
 /// One GET response reduced to what [`ObjectStoreBackend::get`] needs:
-/// the bytes it returned, the object's ETag, and the object's *total* size
-/// (from `Content-Range` on a partial response, so it is the whole object's
-/// size even when the body is one chunk of it).
+/// the bytes it returned, the object's ETag, the object's own version id when
+/// the bucket has versioning on, and the object's *total* size (from
+/// `Content-Range` on a partial response, so it is the whole object's size even
+/// when the body is one chunk of it).
 struct GetChunk {
     data: Bytes,
     etag: String,
+    /// `x-amz-version-id` as `object_store` reports it: `None` on an
+    /// unversioned bucket. This is the selector half of a [`Pin`], and the only
+    /// place a read can learn it.
+    version: Option<String>,
     total_size: u64,
+}
+
+impl GetChunk {
+    /// The bytes plus the identity to record for them.
+    ///
+    /// [`GetOutcome::version`] stays the CAS [`Version`], which on S3 is the
+    /// ETag: commit-protocol callers spend it as a CAS token and must keep
+    /// getting one. The object's version id is reported through
+    /// [`PinnedRead::pin`] instead, where a caller recording a grant looks for
+    /// it.
+    fn into_pinned_read(self) -> PinnedRead {
+        PinnedRead {
+            pin: Pin::from_store(self.etag.clone(), self.version),
+            outcome: GetOutcome {
+                data: self.data,
+                etag: Etag(self.etag.clone()),
+                version: Version(self.etag),
+                total_size: self.total_size,
+            },
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1975,12 +1992,15 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        attempts::scope(StoreOp::Get, self.get_inner(key, range, None)).await
+        attempts::scope(StoreOp::Get, self.get_inner(key, range, None))
+            .await
+            .map(|read| read.outcome)
     }
 
     /// The same request as [`Self::get`] with `If-Match` (and `versionId`, when
-    /// the pin carries one) attached, so S3 decides the precondition and a
-    /// replaced object costs one refused request rather than a body.
+    /// the pin carries one) attached, so S3 decides the precondition and
+    /// selects the version: a replaced object costs one refused request rather
+    /// than a body, and a pinned version keeps serving its own bytes.
     ///
     /// Counted under [`StoreOp::Get`], like `get`: it is one GET on the wire.
     async fn get_pinned(
@@ -1988,8 +2008,15 @@ impl ObjectStoreBackend for S3Store {
         key: &str,
         range: GetRange,
         pin: &Pin,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<PinnedRead, StoreError> {
         attempts::scope(StoreOp::Get, self.get_inner(key, range, Some(pin))).await
+    }
+
+    /// Same request as [`Self::get`], reporting the object's version id
+    /// alongside the bytes so a caller can record a pin for exactly what it
+    /// read.
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        attempts::scope(StoreOp::Get, self.get_inner(key, range, None)).await
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -1997,6 +2024,26 @@ impl ObjectStoreBackend for S3Store {
             let path = path_of(key);
             let meta = self.store.head(&path).await.map_err(map_error_common)?;
             map_meta(meta)
+        })
+        .await
+    }
+
+    /// One HEAD, reporting `x-amz-version-id` as the pin's selector.
+    ///
+    /// [`Self::head`] cannot: [`ObjectMeta::version`] is the CAS token, which
+    /// on S3 is the ETag, so `object_store`'s own `version` is dropped there.
+    /// This is the only path on which an S3 pin can carry a version at all
+    /// (the ADR-2040 pinning amendment, "S3 versions are surfaced"). On a
+    /// bucket without versioning `object_store` reports no version and the pin
+    /// is ETag-only, which is the honest answer: there is nothing to select.
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        attempts::scope(StoreOp::Head, async move {
+            let path = path_of(key);
+            let meta = self.store.head(&path).await.map_err(map_error_common)?;
+            let version = meta.version.clone();
+            let mapped = map_meta(meta)?;
+            let pin = Pin::from_store(mapped.etag.0.clone(), version);
+            Ok((mapped, pin))
         })
         .await
     }

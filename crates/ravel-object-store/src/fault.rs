@@ -937,22 +937,22 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
         key: &str,
         range: GetRange,
         pin: &crate::Pin,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<crate::PinnedRead, StoreError> {
         self.gate_hold(Op::Get, key).await;
         match self.resolve(Op::Get, key) {
             None => self.inner.get_pinned(key, range, pin).await,
             Some(ScriptedFault::FailedPrecondition) => Err(StoreError::PreconditionFailed),
             Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
             Some(ScriptedFault::CorruptRange) => {
-                let mut outcome = self.inner.get_pinned(key, range, pin).await?;
-                let flipped: Vec<u8> = outcome.data.iter().map(|b| b ^ 0xFF).collect();
-                outcome.data = Bytes::from(flipped);
-                Ok(outcome)
+                let mut read = self.inner.get_pinned(key, range, pin).await?;
+                let flipped: Vec<u8> = read.outcome.data.iter().map(|b| b ^ 0xFF).collect();
+                read.outcome.data = Bytes::from(flipped);
+                Ok(read)
             }
             Some(ScriptedFault::EtagChange) => {
-                let mut outcome = self.inner.get_pinned(key, range, pin).await?;
-                outcome.etag = crate::Etag("fault: etag changed between reads".into());
-                Ok(outcome)
+                let mut read = self.inner.get_pinned(key, range, pin).await?;
+                read.outcome.etag = crate::Etag("fault: etag changed between reads".into());
+                Ok(read)
             }
             Some(ScriptedFault::DuplicateDelivery) => {
                 self.inner.get_pinned(key, range, pin).await?;
@@ -969,6 +969,77 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
                 | ScriptedFault::FailedConditionalWrite
                 | ScriptedFault::CorruptBody,
             ) => Err(not_applicable("get_pinned")),
+        }
+    }
+
+    /// The same [`Op::Get`] plan as [`Self::get`], so a scripted GET fault
+    /// fires on this path too, with the wrapped store's pin passed through
+    /// untouched.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        self.gate_hold(Op::Get, key).await;
+        match self.resolve(Op::Get, key) {
+            None => self.inner.get_with_pin(key, range).await,
+            Some(ScriptedFault::CorruptRange) => {
+                let mut read = self.inner.get_with_pin(key, range).await?;
+                let flipped: Vec<u8> = read.outcome.data.iter().map(|b| b ^ 0xFF).collect();
+                read.outcome.data = Bytes::from(flipped);
+                Ok(read)
+            }
+            Some(ScriptedFault::EtagChange) => {
+                let mut read = self.inner.get_with_pin(key, range).await?;
+                read.outcome.etag = crate::Etag("fault: etag changed between reads".into());
+                Ok(read)
+            }
+            Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
+            Some(ScriptedFault::DuplicateDelivery) => {
+                self.inner.get_with_pin(key, range).await?;
+                Err(duplicate_delivery_error())
+            }
+            Some(ScriptedFault::Timeout) => Err(StoreError::Timeout),
+            Some(ScriptedFault::Throttled { retry_after_ms }) => {
+                Err(StoreError::Throttled { retry_after_ms })
+            }
+            Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
+            Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
+            Some(
+                ScriptedFault::PartialWriteThenError
+                | ScriptedFault::FailedConditionalWrite
+                | ScriptedFault::CorruptBody
+                | ScriptedFault::FailedPrecondition,
+            ) => Err(not_applicable("get_with_pin")),
+        }
+    }
+
+    /// One HEAD, on the same [`Op::Head`] plan as [`Self::head`], forwarding
+    /// the wrapped store's pin so a decorated versioned store still reports its
+    /// selector.
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        self.gate_hold(Op::Head, key).await;
+        match self.resolve(Op::Head, key) {
+            None => self.inner.pin_of(key).await,
+            Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
+            Some(ScriptedFault::DuplicateDelivery) => {
+                self.inner.pin_of(key).await?;
+                Err(duplicate_delivery_error())
+            }
+            Some(ScriptedFault::Timeout) => Err(StoreError::Timeout),
+            Some(ScriptedFault::Throttled { retry_after_ms }) => {
+                Err(StoreError::Throttled { retry_after_ms })
+            }
+            Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
+            Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
+            Some(
+                ScriptedFault::PartialWriteThenError
+                | ScriptedFault::FailedConditionalWrite
+                | ScriptedFault::CorruptBody
+                | ScriptedFault::CorruptRange
+                | ScriptedFault::EtagChange
+                | ScriptedFault::FailedPrecondition,
+            ) => Err(not_applicable("pin_of")),
         }
     }
 

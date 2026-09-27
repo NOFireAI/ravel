@@ -247,6 +247,16 @@ pub enum ProfileError {
     /// variable name or the path.
     #[error("the {kind} source for this profile's credential could not be read")]
     SecretUnavailable { kind: &'static str },
+    /// A backend builder rejected this profile's credentials.
+    ///
+    /// The message is fixed per store kind and carries only the kind and the
+    /// profile name. The builder's own error is dropped rather than wrapped,
+    /// because it quotes what it was given: the service-account file path on
+    /// GCS, the SAS token or account key on Azure, the credentials-file path
+    /// on S3. Neither `Display` nor the derived `Debug` can reach it, so the
+    /// error is safe to log and to return to a caller.
+    #[error("{kind} credentials could not be loaded for profile {profile}")]
+    CredentialsRejected { kind: &'static str, profile: String },
     #[error("opening the external store failed: {0}")]
     Backend(#[from] StoreError),
 }
@@ -321,6 +331,7 @@ impl ExternalStore {
                 allow_http,
                 credentials,
             } => Backend::S3(open_s3(
+                &profile.name,
                 bucket,
                 region,
                 endpoint.as_deref(),
@@ -328,11 +339,13 @@ impl ExternalStore {
                 *allow_http,
                 credentials,
             )?),
-            ExternalKind::Gcs { credentials } => Backend::Generic(open_gcs(bucket, credentials)?),
+            ExternalKind::Gcs { credentials } => {
+                Backend::Generic(open_gcs(&profile.name, bucket, credentials)?)
+            }
             ExternalKind::Azure {
                 account,
                 credentials,
-            } => Backend::Generic(open_azure(bucket, account, credentials)?),
+            } => Backend::Generic(open_azure(&profile.name, bucket, account, credentials)?),
         };
         Ok(Arc::new(ExternalStore {
             profile: profile.name.clone(),
@@ -361,6 +374,7 @@ impl ExternalStore {
 }
 
 fn open_s3(
+    profile: &str,
     bucket: &str,
     region: &str,
     endpoint: Option<&str>,
@@ -415,10 +429,14 @@ fn open_s3(
         auth,
         instance_metadata_endpoint: None,
     };
-    Ok(S3Store::new(config)?)
+    S3Store::new(config).map_err(|_| ProfileError::CredentialsRejected {
+        kind: "s3",
+        profile: profile.to_string(),
+    })
 }
 
 fn open_gcs(
+    profile: &str,
     bucket: &str,
     credentials: &GcsProfileCredentials,
 ) -> Result<GenericStore, ProfileError> {
@@ -433,13 +451,17 @@ fn open_gcs(
     };
     let store = builder
         .build()
-        .map_err(|e| ProfileError::Backend(StoreError::Permanent(e.to_string())))?;
+        .map_err(|_| ProfileError::CredentialsRejected {
+            kind: "gcs",
+            profile: profile.to_string(),
+        })?;
     Ok(GenericStore {
         store: Arc::new(store),
     })
 }
 
 fn open_azure(
+    profile: &str,
     container: &str,
     account: &str,
     credentials: &AzureProfileCredentials,
@@ -455,7 +477,10 @@ fn open_azure(
     };
     let store = builder
         .build()
-        .map_err(|e| ProfileError::Backend(StoreError::Permanent(e.to_string())))?;
+        .map_err(|_| ProfileError::CredentialsRejected {
+            kind: "azure",
+            profile: profile.to_string(),
+        })?;
     Ok(GenericStore {
         store: Arc::new(store),
     })
@@ -497,7 +522,7 @@ impl GenericStore {
         key: &str,
         range: GetRange,
         pin: Option<&Pin>,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<crate::PinnedRead, StoreError> {
         let os_range = match range {
             GetRange::Full => None,
             GetRange::Range(start, end) => {
@@ -529,15 +554,33 @@ impl GenericStore {
         let etag = result.meta.e_tag.clone().ok_or_else(|| {
             StoreError::Permanent(format!("the store returned no ETag for {key}"))
         })?;
-        let version = result.meta.version.clone().unwrap_or_else(|| etag.clone());
+        let reported_version = result.meta.version.clone();
+        let version = reported_version.clone().unwrap_or_else(|| etag.clone());
         let total_size = result.meta.size;
         let data = result.bytes().await.map_err(crate::s3::map_error_common)?;
-        Ok(GetOutcome {
-            data,
-            etag: Etag(etag),
-            version: Version(version),
-            total_size,
+        Ok(crate::PinnedRead {
+            pin: Pin::from_store(etag.clone(), reported_version),
+            outcome: GetOutcome {
+                data,
+                etag: Etag(etag),
+                version: Version(version),
+                total_size,
+            },
         })
+    }
+
+    /// The pin for `key`, from a HEAD: the ETag as the precondition and the
+    /// store's own version or generation as the selector when it reports one.
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        let raw = self
+            .store
+            .head(&crate::s3::path_of(key))
+            .await
+            .map_err(crate::s3::map_error_common)?;
+        let reported_version = raw.version.clone();
+        let meta = map_external_meta(raw)?;
+        let pin = Pin::from_store(meta.etag.0.clone(), reported_version);
+        Ok((meta, pin))
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -632,7 +675,7 @@ impl ObjectStoreBackend for ExternalStore {
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         match &self.backend {
             Backend::S3(store) => store.get(key, range).await,
-            Backend::Generic(store) => store.get(key, range, None).await,
+            Backend::Generic(store) => store.get(key, range, None).await.map(|read| read.outcome),
         }
     }
 
@@ -641,10 +684,28 @@ impl ObjectStoreBackend for ExternalStore {
         key: &str,
         range: GetRange,
         pin: &Pin,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<crate::PinnedRead, StoreError> {
         match &self.backend {
             Backend::S3(store) => store.get_pinned(key, range, pin).await,
             Backend::Generic(store) => store.get(key, range, Some(pin)).await,
+        }
+    }
+
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        match &self.backend {
+            Backend::S3(store) => store.get_with_pin(key, range).await,
+            Backend::Generic(store) => store.get(key, range, None).await,
+        }
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        match &self.backend {
+            Backend::S3(store) => store.pin_of(key).await,
+            Backend::Generic(store) => store.pin_of(key).await,
         }
     }
 

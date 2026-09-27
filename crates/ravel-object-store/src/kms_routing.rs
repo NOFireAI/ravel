@@ -295,9 +295,21 @@ impl ObjectStoreBackend for KmsRoutingStore {
         key: &str,
         range: GetRange,
         pin: &crate::Pin,
-    ) -> Result<GetOutcome, StoreError> {
+    ) -> Result<crate::PinnedRead, StoreError> {
         // Same as `get`: the precondition is a read header, not a key choice.
         self.default.get_pinned(key, range, pin).await
+    }
+
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        self.default.get_with_pin(key, range).await
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        self.default.pin_of(key).await
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -401,14 +413,22 @@ mod tests {
             key: &str,
             _range: GetRange,
             pin: &crate::Pin,
-        ) -> Result<GetOutcome, StoreError> {
+        ) -> Result<crate::PinnedRead, StoreError> {
             self.record("get_pinned", key);
-            Ok(GetOutcome {
-                data: Bytes::new(),
-                etag: crate::Etag(pin.etag.clone()),
-                version: crate::Version("fake".into()),
-                total_size: 0,
+            Ok(crate::PinnedRead {
+                outcome: GetOutcome {
+                    data: Bytes::new(),
+                    etag: crate::Etag(pin.etag.clone()),
+                    version: crate::Version("fake".into()),
+                    total_size: 0,
+                },
+                pin: pin.clone(),
             })
+        }
+
+        async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+            self.record("pin_of", key);
+            Err(StoreError::NotFound)
         }
 
         async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -642,15 +662,16 @@ mod tests {
         let prefix = format!("t/{TENANT_A}/");
 
         rig.store.get(&key, GetRange::Full).await.expect("get");
-        let outcome = rig
+        let read = rig
             .store
             .get_pinned(&key, GetRange::Full, &crate::Pin::etag("\"abc\""))
             .await
             .expect("get_pinned");
         assert_eq!(
-            outcome.etag.0, "\"abc\"",
+            read.outcome.etag.0, "\"abc\"",
             "the pin must reach the delegate, not be swallowed by the decorator"
         );
+        let _ = rig.store.pin_of(&key).await;
         let _ = rig.store.head(&key).await;
         rig.store.list(&prefix, None).await.expect("list");
         rig.store
@@ -666,6 +687,7 @@ mod tests {
             vec![
                 "get",
                 "get_pinned",
+                "pin_of",
                 "head",
                 "list",
                 "list_delimited",
