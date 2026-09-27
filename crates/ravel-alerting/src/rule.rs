@@ -175,8 +175,10 @@ pub struct Rule {
     pub query: RuleQuery,
     /// How the query result maps to firing.
     pub condition: RuleCondition,
-    /// Labels attached to every alert this rule produces. Together with
-    /// `rule_id` these form the alert's stable identity.
+    /// Labels attached to every alert this rule produces. For a PromQL vector
+    /// rule they overlay each matching series' labels, and together with
+    /// `rule_id` that per-series label set forms the alert's identity; a
+    /// scalar or SQL rule's identity is `rule_id` plus these labels alone.
     pub labels: Vec<(String, String)>,
     /// Human-facing annotations (summary, runbook, ...) carried on the record
     /// for notification. Not part of alert identity.
@@ -211,7 +213,7 @@ impl Rule {
     ///   PromQL query yields per-series numeric values and takes a
     ///   [`RuleCondition::Threshold`]; a SQL query yields a row set and takes a
     ///   [`RuleCondition::NonEmptyResult`]. The mismatched pairing would return
-    ///   [`AlertError::ResultShapeMismatch`] from [`crate::condition_met`] on
+    ///   [`AlertError::ResultShapeMismatch`] from [`crate::matching_series`] on
     ///   every tick, so it is caught once here.
     ///
     /// This is the in-crate equivalent of the startup check `ravel-server`'s

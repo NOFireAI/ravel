@@ -12,6 +12,7 @@ use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
 use crate::error::AlertError;
 use crate::generation::{compute_generation, guard_generation};
+use crate::instance::AlertInstance;
 use crate::rule::Rule;
 use crate::state::{AlertState, StateTransition};
 
@@ -22,7 +23,7 @@ pub const ATTR_ALERT_ID: &str = "alert_id";
 pub const ATTR_RULE_ID: &str = "rule_id";
 pub const ATTR_STATE: &str = "state";
 pub const ATTR_GENERATION: &str = "generation";
-/// Prefix for one attr entry per rule label: `label.<name>`.
+/// Prefix for one attr entry per alert label: `label.<name>`.
 pub const LABEL_PREFIX: &str = "label.";
 /// Prefix for one attr entry per annotation: `annotation.<name>`.
 pub const ANNOTATION_PREFIX: &str = "annotation.";
@@ -118,7 +119,8 @@ pub struct AlertRecord {
     /// Event time of the transition, in nanoseconds. Pending-duration elapse is
     /// measured from this.
     pub ts_ns: i64,
-    /// The rule's labels, sorted by `(name, value)` on decode.
+    /// The alert's labels: the matched series' labels merged with the rule's
+    /// (ADR-0117 decision 2), sorted by `(name, value)` on decode.
     pub labels: Vec<(String, String)>,
     /// The rule's annotations, sorted by `(name, value)` on decode.
     pub annotations: Vec<(String, String)>,
@@ -253,26 +255,39 @@ fn as_generation(key: &str, value: &AttrValue) -> Result<u32, AlertError> {
     }
 }
 
-/// Builds the [`AlertRecord`] a transition writes: the rule's identity and
-/// labels, the transition's target state, the computed generation, and the
-/// tick's clock reading as the event time.
-///
-/// `rule.labels` is sorted before storing, mirroring [`compute_alert_id`]'s
-/// own canonicalization: `alert_id` already treats labels as an order-
-/// independent set, and a record that stored them in whatever order the rule
-/// happened to list them would silently disagree with that -- two records
-/// for the same `alert_id`, differing only in label insertion order, must
-/// compare equal once decoded.
+/// Builds the [`AlertRecord`] a transition writes for the rule's
+/// rule-labels-only alert: the identity a scalar or SQL result raises. See
+/// [`build_instance_transition_record`] for a per-series alert.
 pub fn build_transition_record(
     rule: &Rule,
     state: AlertState,
     generation: u32,
     now_ns: i64,
 ) -> AlertRecord {
-    let mut labels = rule.labels.clone();
+    let instance = AlertInstance::new(&rule.rule_id, rule.labels.clone());
+    build_instance_transition_record(rule, &instance, state, generation, now_ns)
+}
+
+/// Builds the [`AlertRecord`] a transition of `instance` writes: the
+/// instance's identity and labels, the rule's id and annotations, the
+/// transition's target state, the computed generation, and the tick's clock
+/// reading as the event time.
+///
+/// The labels are stored sorted, mirroring [`compute_alert_id`]'s own
+/// canonicalization: `alert_id` already treats labels as an order-independent
+/// set, and two records for the same `alert_id` differing only in label
+/// insertion order must compare equal once decoded.
+pub fn build_instance_transition_record(
+    rule: &Rule,
+    instance: &AlertInstance,
+    state: AlertState,
+    generation: u32,
+    now_ns: i64,
+) -> AlertRecord {
+    let mut labels = instance.labels.clone();
     labels.sort_unstable();
     AlertRecord {
-        alert_id: compute_alert_id(&rule.rule_id, &rule.labels),
+        alert_id: instance.alert_id,
         rule_id: rule.rule_id.clone(),
         state,
         generation,
@@ -296,8 +311,8 @@ pub fn encode_record_object(
     Ok(writer.finish()?)
 }
 
-/// The full write path: given a rule, the transition decision
-/// for this tick, the most recent prior record for this alert (if any), the
+/// The full write path: given a rule, the alert instance, the transition
+/// decision for this tick, the most recent prior record for this alert (if any), the
 /// generations of any alert records this tick's query consumed as input (only
 /// meaningful when `rule.query.targets_alerts_table()`; pass `&[]` otherwise),
 /// and the RLOG writer parameters, produce the record bytes to PUT.
@@ -314,8 +329,10 @@ pub fn encode_record_object(
 /// record is warranted, the generation is first checked against the rule's
 /// effective cap ([`guard_generation`]); exceeding it is an error, not a
 /// silently dropped record.
+#[allow(clippy::too_many_arguments)]
 pub fn write_alert_record(
     rule: &Rule,
+    instance: &AlertInstance,
     transition: &StateTransition,
     prior: Option<&AlertRecord>,
     input_alert_generations: &[u32],
@@ -332,7 +349,8 @@ pub fn write_alert_record(
         input_alert_generations,
     );
     guard_generation(generation, rule.max_alert_generation)?;
-    let record = build_transition_record(rule, transition.next_state, generation, now_ns);
+    let record =
+        build_instance_transition_record(rule, instance, transition.next_state, generation, now_ns);
     Ok(Some(encode_record_object(&record, cfg, identity)?))
 }
 
@@ -492,6 +510,7 @@ mod tests {
         };
         let out = write_alert_record(
             &rule,
+            &AlertInstance::new(&rule.rule_id, rule.labels.clone()),
             &keep,
             None,
             &[],
@@ -524,6 +543,7 @@ mod tests {
         // 1: an input at generation 2 produces generation 3, over the cap.
         let err = write_alert_record(
             &rule,
+            &AlertInstance::new(&rule.rule_id, rule.labels.clone()),
             &fire,
             None,
             &[2],
@@ -557,6 +577,7 @@ mod tests {
         };
         let bytes = write_alert_record(
             &rule,
+            &AlertInstance::new(&rule.rule_id, rule.labels.clone()),
             &resolve,
             Some(&firing_record),
             &[],
