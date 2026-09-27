@@ -27,11 +27,12 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
-rand = { workspace = true }
 
 [dev-dependencies]
 ravel-segment = { workspace = true }
-tokio = { workspace = true }
+# test-util for `#[tokio::test(start_paused = true)]`: the write-budget
+# deadline tests race a held PUT against a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
 
 [lints]
