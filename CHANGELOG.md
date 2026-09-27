@@ -36,6 +36,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Parquet table manifest format and object layer** (ADR-2040, issue #2050):
+  the new `ravel-pqtable` crate and `proto/ravel/parquet_table.proto`. No
+  shipping binary calls it yet.
+
 - **`ravel-cli export --signal logs` writes a tenant's stored logs back out to
   a Parquet file `ravel-cli load` reads in** (ADR-1751, issue #1712). The
   command takes the store and tenancy flags the other read commands take, plus

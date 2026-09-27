@@ -1,0 +1,57 @@
+// Parquet table manifest versions (ADR-2040 decision D1). Each version of a
+// table is one immutable object at
+// `t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm`, written with
+// CreateIfAbsent. Persistent contract: this is a Class C immutable metadata
+// record (ADR-0066 decision 4). Field numbers are frozen once shipped and only
+// additive changes are allowed; an additive change bumps `format_version`
+// under the readers-before-writers sequence, because version N+1 is built from
+// version N and a reader that dropped an unknown field would write N+1
+// without it.
+syntax = "proto3";
+
+package ravel.parquet_table.v1;
+
+// One version of one Parquet table.
+message ParquetTableManifest {
+  // Reader floor. A reader refuses a value outside its supported read window
+  // rather than decoding it with unknown fields dropped.
+  uint32 format_version = 1;
+  // Table name; must equal the `<table>` segment of the key it is stored at.
+  string table = 2;
+  // Version number, starting at 1; must equal the `<version>` segment of the
+  // key it is stored at.
+  uint64 version = 3;
+  // A dropped version records that the table no longer exists. It carries no
+  // dataset, files or options.
+  bool dropped = 4;
+  // Tenant-relative dataset path the files were listed from.
+  string dataset = 5;
+  // Snapshot of the table's data objects, in the order the writer listed them.
+  repeated ParquetFile files = 6;
+  // Table options and coercions (ADR-2040 decision D5).
+  map<string, string> options = 7;
+  // Principal that wrote this version.
+  string created_by = 8;
+  // Write time of this version, Unix nanoseconds.
+  int64 created_unix_ns = 9;
+  // Statement text that produced this version, as the writer supplies it
+  // (ADR-2040 has the SQL writer render it through `redact`).
+  string statement = 10;
+}
+
+// One content-addressed data object referenced by a manifest.
+message ParquetFile {
+  // Full object key: `t/<tenant_hash>/pq/d/<dataset>/<hash16>.parquet`.
+  string key = 1;
+  // Object size in bytes, nonzero.
+  uint64 size = 2;
+  // BLAKE3 of the object's bytes, 32 bytes. The key's hash16 is the first 16
+  // lowercase hex characters of this digest.
+  bytes blake3 = 3;
+  // Row count from the Parquet footer, as the writer read it. The manifest
+  // codec does not check it against the object.
+  uint64 row_count = 4;
+  // Parquet footer length in bytes, excluding the 8-byte trailer, as the
+  // writer read it. The manifest codec does not check it against the object.
+  uint32 footer_len = 5;
+}
