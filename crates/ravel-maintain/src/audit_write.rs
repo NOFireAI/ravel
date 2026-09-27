@@ -10,17 +10,78 @@
 //! parts (its shard, stream identity, severity, body, and attrs) through
 //! [`AuditWrite`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use bytes::Bytes;
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
-use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError, UploadChecksum};
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum};
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::config::NS_PER_HOUR;
 use crate::error::{MaintainError, Result};
 use crate::rlog::OUTPUT_FORMAT_VERSION;
+
+/// Attempts per PUT before a transient error fails the batch closed (ADR-0062
+/// amendment, 2026-09-27): one attempt plus up to two retries, so a single
+/// transient object-store timeout does not fail every query in the batch
+/// (issue #2035). Only [`StoreError::is_retryable`] errors are retried;
+/// `AlreadyExists`, `AccessDenied`, and other permanent errors are not.
+const MAX_PUT_ATTEMPTS: u32 = 3;
+
+/// Backoff before retry attempts 2 and 3, before jitter. With
+/// [`jittered_backoff`]'s +/-25% jitter, the worst case added wall time for
+/// one PUT that exhausts all attempts is about (50 + 200) * 1.25 = 312.5 ms,
+/// on top of the object-store client's own request timeout for each attempt.
+const RETRY_BACKOFF_BASE_MS: [u64; 2] = [50, 200];
+
+/// Which of a batch's two PUTs an attempt or retry belongs to, for logging.
+#[derive(Clone, Copy, Debug)]
+enum AuditPut {
+    Data,
+    Commit,
+}
+
+impl std::fmt::Display for AuditPut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AuditPut::Data => "data",
+            AuditPut::Commit => "commit",
+        })
+    }
+}
+
+/// `base_ms` scaled by a uniform random factor in `0.75..1.25`, so concurrent
+/// retries after a shared transient failure (a throttled backend, a network
+/// blip affecting several batches at once) do not all retry in lockstep.
+fn jittered_backoff(base_ms: u64) -> Duration {
+    let factor: f64 = rand::random_range(0.75..1.25);
+    Duration::from_millis((base_ms as f64 * factor).round() as u64)
+}
+
+/// Count the retry (if `put_retries` is `Some`, i.e. this write is going
+/// through [`crate::audit_pipeline::AuditPipeline`]) and log it at WARN: a
+/// retry is a real signal that the object store is degraded, even though the
+/// batch itself will likely still succeed.
+fn note_put_retry(
+    put: AuditPut,
+    attempt: u32,
+    error: &StoreError,
+    put_retries: Option<&AtomicU64>,
+) {
+    if let Some(counter) = put_retries {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    tracing::warn!(
+        put = %put,
+        attempt,
+        error = %error,
+        "audit batch PUT hit a transient error, retrying"
+    );
+}
 
 /// One [`Signal::Audit`] record to encode and publish. The caller supplies the
 /// record-specific parts; [`write_audit_object`] owns the object/commit
@@ -119,7 +180,7 @@ pub(crate) async fn write_audit_object(
         body: write.body,
         attrs: write.attrs,
     };
-    write_audit_batch(store, shard, record_id, vec![record]).await
+    write_audit_batch(store, shard, record_id, vec![record], None).await
 }
 
 /// Encode a whole batch of audit records as **one** L0 [`Signal::Audit`] object
@@ -136,9 +197,23 @@ pub(crate) async fn write_audit_object(
 /// events into a batch, mints one `record_id`, and calls this once per flush.
 /// The idempotency and conflict semantics are identical to the single-record
 /// path: `AlreadyExists` on the content-addressed data object is a benign
-/// idempotent republish, while `AlreadyExists` on the commit record is a hard
-/// error because a reused `record_id` would collide two logically distinct
-/// batches onto one commit key.
+/// idempotent republish on every attempt, while `AlreadyExists` on the commit
+/// record's *first* attempt is a hard error because a reused `record_id`
+/// would collide two logically distinct batches onto one commit key.
+/// `AlreadyExists` on a *retry* attempt is different: the previous attempt's
+/// PUT may have landed before its response was lost to the same transient
+/// error that triggered the retry, so that case compares the stored bytes
+/// against the ones this attempt tried to write (ADR-0062 amendment,
+/// 2026-09-27) rather than assuming a collision.
+///
+/// Each of the batch's two PUTs retries up to [`MAX_PUT_ATTEMPTS`] times on a
+/// [`StoreError::is_retryable`] error (a timeout, a throttle, or another
+/// transient classification the store layer already recognizes), with a
+/// short jittered backoff between attempts. A non-retryable error
+/// (`AccessDenied`, an invariant breach, `AlreadyExists` on the commit
+/// record's first attempt) fails immediately, never retried. `put_retries`,
+/// when supplied, counts every retried attempt for callers that expose it as
+/// a metric (see [`crate::audit_pipeline::AuditPipeline`]).
 ///
 /// The tenant is taken from the records themselves, never from a parameter a
 /// caller resolved once at construction time: the object identity, the data
@@ -153,6 +228,7 @@ pub(crate) async fn write_audit_batch(
     shard: u32,
     record_id: Uuid,
     records: Vec<AuditRecord>,
+    put_retries: Option<&AtomicU64>,
 ) -> Result<()> {
     let Some(first) = records.first() else {
         return Err(MaintainError::Invariant(
@@ -237,46 +313,97 @@ pub(crate) async fn write_audit_batch(
         &content_hash,
     )?;
     let data_checksum = UploadChecksum::Crc32c(crc32c::crc32c(&object));
-    match store
-        .put(
-            &data_key,
-            object,
-            PutOptions::create_if_absent().with_checksum(data_checksum),
-        )
-        .await
-    {
-        Ok(_) => {}
-        // A fresh `record_id` collides only if the caller reused one; the
-        // data object is content-addressed by `content_hash` in its key, so
-        // an identical object already present is a genuine no-op, not an
-        // error - the same idempotent-republish convergence every other L0
-        // write in this repo already relies on (ADR-0010 SS7).
-        Err(StoreError::AlreadyExists) => {}
-        Err(e) => return Err(e.into()),
+    let mut attempt = 1u32;
+    loop {
+        match store
+            .put(
+                &data_key,
+                object.clone(),
+                PutOptions::create_if_absent().with_checksum(data_checksum),
+            )
+            .await
+        {
+            Ok(_) => break,
+            // A fresh `record_id` collides only if the caller reused one; the
+            // data object is content-addressed by `content_hash` in its key,
+            // so an identical object already present is a genuine no-op, not
+            // an error - the same idempotent-republish convergence every
+            // other L0 write in this repo already relies on (ADR-0010 SS7).
+            // Benign on every attempt, including a retry: a retry can only
+            // ever republish this same content-addressed object.
+            Err(StoreError::AlreadyExists) => break,
+            Err(e) if attempt < MAX_PUT_ATTEMPTS && e.is_retryable() => {
+                note_put_retry(AuditPut::Data, attempt, &e, put_retries);
+                tokio::time::sleep(jittered_backoff(
+                    RETRY_BACKOFF_BASE_MS[(attempt - 1) as usize],
+                ))
+                .await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
+
     let commit_key = keys::commit_key_for_record(&commit)?;
     let commit_bytes = record::encode(&commit);
     let commit_checksum = UploadChecksum::Crc32c(crc32c::crc32c(&commit_bytes));
-    match store
-        .put(
-            &commit_key,
-            commit_bytes,
-            PutOptions::create_if_absent().with_checksum(commit_checksum),
-        )
-        .await
-    {
-        Ok(_) => {}
-        // The same `record_id` reused for a second, logically distinct audit
-        // record (or batch) would land here as a REAL conflict, since the two
-        // differ in content but share a commit key - surfaced as an error
-        // rather than silently keeping whichever one landed first.
-        Err(StoreError::AlreadyExists) => {
-            return Err(MaintainError::Invariant(format!(
-                "audit commit record {commit_key} already exists with different content \
-                 - record_id {record_id} was reused for a different audit record"
-            )));
+    let mut attempt = 1u32;
+    loop {
+        match store
+            .put(
+                &commit_key,
+                commit_bytes.clone(),
+                PutOptions::create_if_absent().with_checksum(commit_checksum),
+            )
+            .await
+        {
+            Ok(_) => break,
+            // The same `record_id` reused for a second, logically distinct
+            // audit record (or batch) lands here as a REAL conflict on the
+            // *first* attempt, since the two differ in content but share a
+            // commit key - surfaced as an error rather than silently keeping
+            // whichever one landed first.
+            Err(StoreError::AlreadyExists) if attempt == 1 => {
+                return Err(MaintainError::Invariant(format!(
+                    "audit commit record {commit_key} already exists with different content \
+                     - record_id {record_id} was reused for a different audit record"
+                )));
+            }
+            // `AlreadyExists` on a retry is ambiguous: either a genuine
+            // collision, or this same attempt's own earlier PUT landed and
+            // only its response was lost to the transient error that
+            // triggered the retry. Every attempt writes identical bytes
+            // (same `record_id`, same encoded commit), so the stored object
+            // is exactly recoverable: fetch it and compare. Equal bytes mean
+            // the earlier attempt already succeeded; anything else fails
+            // closed rather than assuming it.
+            Err(StoreError::AlreadyExists) => match store.get(&commit_key, GetRange::Full).await {
+                Ok(existing) if existing.data == commit_bytes => break,
+                Ok(_) => {
+                    return Err(MaintainError::Invariant(format!(
+                        "audit commit record {commit_key} already exists with different \
+                             content after a retry - record_id {record_id} collided with an \
+                             unrelated commit record"
+                    )));
+                }
+                Err(get_err) => {
+                    return Err(MaintainError::Invariant(format!(
+                        "audit commit record {commit_key} already exists after a retry, and \
+                             confirming its content failed ({get_err}) - failing closed rather \
+                             than assuming the retry's own write landed"
+                    )));
+                }
+            },
+            Err(e) if attempt < MAX_PUT_ATTEMPTS && e.is_retryable() => {
+                note_put_retry(AuditPut::Commit, attempt, &e, put_retries);
+                tokio::time::sleep(jittered_backoff(
+                    RETRY_BACKOFF_BASE_MS[(attempt - 1) as usize],
+                ))
+                .await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => return Err(e.into()),
     }
     Ok(())
 }
@@ -337,7 +464,7 @@ mod tests {
         let expected_min = base + 100;
         let expected_max = base + 900;
 
-        write_audit_batch(&store, AUDIT_SHARD, Uuid::new_v4(), records)
+        write_audit_batch(&store, AUDIT_SHARD, Uuid::new_v4(), records, None)
             .await
             .expect("batch write");
 
@@ -379,6 +506,7 @@ mod tests {
             AUDIT_SHARD,
             Uuid::new_v4(),
             vec![test_record(tenant, now_ns, 1)],
+            None,
         )
         .await
         .expect("single-record batch");
@@ -397,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn empty_batch_is_rejected() {
         let store = MemoryStore::new();
-        let err = write_audit_batch(&store, AUDIT_SHARD, Uuid::new_v4(), Vec::new())
+        let err = write_audit_batch(&store, AUDIT_SHARD, Uuid::new_v4(), Vec::new(), None)
             .await
             .expect_err("empty batch is an invariant breach");
         assert!(matches!(err, MaintainError::Invariant(_)));
@@ -415,6 +543,7 @@ mod tests {
             AUDIT_SHARD,
             Uuid::new_v4(),
             vec![test_record(one, base, 1), test_record(two, base + 1, 1)],
+            None,
         )
         .await
         .expect_err("a batch spanning two tenants is an invariant breach");

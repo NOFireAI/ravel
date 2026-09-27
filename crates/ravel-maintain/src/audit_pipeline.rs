@@ -151,6 +151,12 @@ pub struct AuditPipeline {
     /// observability and tests: a best-effort failure is otherwise invisible to
     /// the released query.
     flush_failures: Arc<AtomicU64>,
+    /// Count of individual PUT attempts retried after a transient
+    /// object-store error (ADR-0062 amendment, 2026-09-27), across every
+    /// tenant group this pipeline has flushed. A nonzero count means the
+    /// store is degraded even though [`Self::flush_failures`] may still be
+    /// zero: the retries absorbed the errors before they reached a submitter.
+    put_retries: Arc<AtomicU64>,
     /// A copy of `config.audit_mode`, kept alongside the config the flush task
     /// owns so `submit` can honor the configured failure posture on its own
     /// error paths (pipeline stopped, flush task gone), not only on a flush
@@ -170,12 +176,14 @@ impl AuditPipeline {
         let shutdown = Arc::new(Notify::new());
         let stopped = Arc::new(AtomicBool::new(false));
         let flush_failures = Arc::new(AtomicU64::new(0));
+        let put_retries = Arc::new(AtomicU64::new(0));
         let handle = tokio::spawn(run_flush_loop(
             rx,
             store,
             config,
             shutdown.clone(),
             flush_failures.clone(),
+            put_retries.clone(),
         ));
         AuditPipeline {
             tx,
@@ -183,6 +191,7 @@ impl AuditPipeline {
             join: Mutex::new(Some(handle)),
             stopped,
             flush_failures,
+            put_retries,
             audit_mode,
         }
     }
@@ -275,6 +284,13 @@ impl AuditPipeline {
     pub fn flush_failures(&self) -> u64 {
         self.flush_failures.load(Ordering::Relaxed)
     }
+
+    /// Number of individual PUT attempts retried after a transient
+    /// object-store error, across every batch this pipeline has flushed. See
+    /// [`Self::put_retries`] (the field) for what a nonzero count means.
+    pub fn put_retries(&self) -> u64 {
+        self.put_retries.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for AuditPipeline {
@@ -307,6 +323,7 @@ async fn run_flush_loop(
     config: AuditPipelineConfig,
     shutdown: Arc<Notify>,
     flush_failures: Arc<AtomicU64>,
+    put_retries: Arc<AtomicU64>,
 ) {
     loop {
         // Wait for the first submission of a new batch, or a stop signal.
@@ -320,7 +337,7 @@ async fn run_flush_loop(
                     batch.push(submission);
                 }
                 if !batch.is_empty() {
-                    flush_batch(store.as_ref(), &config, &flush_failures, batch).await;
+                    flush_batch(store.as_ref(), &config, &flush_failures, &put_retries, batch).await;
                 }
                 return;
             }
@@ -360,7 +377,14 @@ async fn run_flush_loop(
             }
         }
 
-        flush_batch(store.as_ref(), &config, &flush_failures, batch).await;
+        flush_batch(
+            store.as_ref(),
+            &config,
+            &flush_failures,
+            &put_retries,
+            batch,
+        )
+        .await;
         if stop {
             return;
         }
@@ -379,6 +403,7 @@ async fn flush_batch(
     store: &dyn ObjectStoreBackend,
     config: &AuditPipelineConfig,
     flush_failures: &AtomicU64,
+    put_retries: &AtomicU64,
     batch: Vec<Submission>,
 ) {
     // `BTreeMap` rather than a hash map so a multi-tenant batch flushes in a
@@ -393,7 +418,8 @@ async fn flush_batch(
 
     for (tenant, (records, dones)) in groups {
         let record_id = Uuid::new_v4();
-        let outcome = write_audit_batch(store, config.shard, record_id, records).await;
+        let outcome =
+            write_audit_batch(store, config.shard, record_id, records, Some(put_retries)).await;
 
         match outcome {
             Ok(()) => {
@@ -442,11 +468,17 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
 
+    use bytes::Bytes;
     use ravel_commit::keys;
     use ravel_logseg::{AttrValue, LogStreamId, stream_attrs_bytes};
-    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{ObjectStoreBackend, list_all};
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta,
+        ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, list_all,
+    };
     use ravel_types::Signal;
     use ravel_types::logstream::log_stream_id;
 
@@ -507,6 +539,95 @@ mod tests {
             shard: QUERY_AUDIT_SHARD,
             audit_mode: AuditMode::Required,
             channel_capacity: 1024,
+        }
+    }
+
+    /// A backend whose first `put` matching `key_contains` applies a
+    /// different payload for real (as if an unrelated writer had already
+    /// occupied the key) and reports the caller's own attempt as a
+    /// transient error, then passes every later call straight through.
+    /// `FaultStore`'s scripted faults cannot express this: every one of them
+    /// either leaves the wrapped backend untouched or applies the caller's
+    /// own bytes, never a third party's, so a genuine collision (as opposed
+    /// to a duplicate delivery of the caller's own write) needs this
+    /// purpose-built wrapper instead.
+    struct DivergentRetryStore<S> {
+        inner: S,
+        key_contains: &'static str,
+        fired: AtomicBool,
+    }
+
+    impl<S> DivergentRetryStore<S> {
+        fn new(inner: S, key_contains: &'static str) -> Self {
+            DivergentRetryStore {
+                inner,
+                key_contains,
+                fired: AtomicBool::new(false),
+            }
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for DivergentRetryStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> std::result::Result<PutOutcome, StoreError> {
+            if key.contains(self.key_contains) && !self.fired.swap(true, Ordering::SeqCst) {
+                self.inner
+                    .put(
+                        key,
+                        Bytes::from_static(b"an unrelated commit record from a different writer"),
+                        PutOptions::create_if_absent(),
+                    )
+                    .await?;
+                return Err(StoreError::Transient(
+                    "fault: simulated ack loss after a divergent write landed under the same key"
+                        .into(),
+                ));
+            }
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> std::result::Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> std::result::Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
         }
     }
 
@@ -592,9 +713,10 @@ mod tests {
                 "every submit in a failed batch must observe the flush error in required mode, got {result:?}"
             );
         }
-        assert!(
-            store.fault_count(Op::Put, FaultKind::Timeout) >= 1,
-            "the injected data-object PUT fault must have fired"
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Timeout),
+            3,
+            "every attempt (1 try + 2 retries) hit the always-on fault before failing closed"
         );
         assert_eq!(
             commit_record_count(store.as_ref(), &tenant).await,
@@ -633,9 +755,10 @@ mod tests {
                 .expect("submit task")
                 .expect("best-effort releases the query with Ok despite the failed flush");
         }
-        assert!(
-            store.fault_count(Op::Put, FaultKind::Timeout) >= 1,
-            "the injected data-object PUT fault must have fired"
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Timeout),
+            3,
+            "every attempt (1 try + 2 retries) hit the always-on fault before failing closed"
         );
         assert_eq!(
             pipeline.flush_failures(),
@@ -853,8 +976,9 @@ mod tests {
 
         assert_eq!(
             store.fault_count(Op::Put, FaultKind::Timeout),
-            1,
-            "the injected fault fired exactly once, on the faulted tenant's data PUT"
+            3,
+            "every attempt (1 try + 2 retries) on the faulted tenant's data PUT hit the \
+             always-on fault before failing closed"
         );
         assert_eq!(
             commit_record_count(store.as_ref(), &one).await,
@@ -865,6 +989,242 @@ mod tests {
             commit_record_count(store.as_ref(), &two).await,
             1,
             "the other tenant's record is durable despite the sibling group's failure"
+        );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// ADR-0062 amendment (2026-09-27): a single transient timeout on the
+    /// data-object PUT must not fail the batch, because the object store's
+    /// own client-side retry does not cover a conditional (`create_if_absent`)
+    /// PUT. Only the very first attempt fails, via `Occurrence::Nth(1)`; the
+    /// retry succeeds and the batch completes normally.
+    #[tokio::test]
+    async fn a_transient_timeout_on_the_first_data_put_is_retried_and_the_batch_succeeds() {
+        let mem = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Timeout)
+                .with_key_contains("/l0/")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(mem, plan));
+        let tenant = TenantHash([41u8; 16]);
+        let config = pipeline_config(3, Duration::from_secs(3600));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let pipeline = pipeline.clone();
+            handles.push(tokio::spawn(async move {
+                pipeline.submit(test_event(tenant, 21_000 + i, 7)).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .expect("submit task")
+                .expect("a retried transient timeout must not fail the batch");
+        }
+
+        assert_eq!(
+            commit_record_count(store.as_ref(), &tenant).await,
+            1,
+            "exactly one commit record for the one flushed, retried batch"
+        );
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Timeout),
+            1,
+            "the injected fault fired exactly once (only the first attempt)"
+        );
+        assert_eq!(
+            pipeline.put_retries(),
+            1,
+            "the one retry against the data-object PUT was counted"
+        );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// Same as above, but the transient timeout hits the commit-record PUT
+    /// instead of the data-object PUT.
+    #[tokio::test]
+    async fn a_transient_timeout_on_the_first_commit_put_is_retried_and_the_batch_succeeds() {
+        let mem = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Timeout)
+                .with_key_contains("/u/c/")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(mem, plan));
+        let tenant = TenantHash([42u8; 16]);
+        let config = pipeline_config(3, Duration::from_secs(3600));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let pipeline = pipeline.clone();
+            handles.push(tokio::spawn(async move {
+                pipeline.submit(test_event(tenant, 22_000 + i, 7)).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .expect("submit task")
+                .expect("a retried transient timeout must not fail the batch");
+        }
+
+        assert_eq!(
+            commit_record_count(store.as_ref(), &tenant).await,
+            1,
+            "exactly one commit record for the one flushed, retried batch"
+        );
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Timeout),
+            1,
+            "the injected fault fired exactly once (only the first attempt)"
+        );
+        assert_eq!(
+            pipeline.put_retries(),
+            1,
+            "the one retry against the commit-record PUT was counted"
+        );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// The "landed then timed out" case: the object store applies the
+    /// commit-record PUT for real but the caller never sees the
+    /// acknowledgement (`ScriptedFault::DuplicateDelivery` calls the wrapped
+    /// `put` for real, then reports `Transient` -- exactly what a client
+    /// times out on after the request actually completed server-side). The
+    /// retry's own `create_if_absent` attempt then sees `AlreadyExists` for
+    /// its own earlier write, not a genuine collision: byte-comparing the
+    /// existing object against what it was about to write must recognize
+    /// they match and treat the retry as a success, landing exactly one
+    /// commit record rather than erroring or double-writing.
+    #[tokio::test]
+    async fn a_lost_ack_on_the_commit_put_is_recognized_as_its_own_earlier_write_on_retry() {
+        let mem = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::DuplicateDelivery)
+                .with_key_contains("/u/c/")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(mem, plan));
+        let tenant = TenantHash([43u8; 16]);
+        let config = pipeline_config(3, Duration::from_secs(3600));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let pipeline = pipeline.clone();
+            handles.push(tokio::spawn(async move {
+                pipeline.submit(test_event(tenant, 23_000 + i, 7)).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .expect("submit task")
+                .expect("a retry that finds its own earlier write must succeed, not error");
+        }
+
+        assert_eq!(
+            commit_record_count(store.as_ref(), &tenant).await,
+            1,
+            "the commit record that landed on the first attempt, not a second write"
+        );
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::DuplicateDelivery),
+            1,
+            "the injected lost-ack fault fired exactly once"
+        );
+        assert_eq!(
+            pipeline.put_retries(),
+            1,
+            "the retry that discovered the earlier write's AlreadyExists was counted"
+        );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// A retry that finds a commit object under its key with DIFFERENT
+    /// content is a genuine collision, not its own earlier write landing, and
+    /// must fail closed rather than assume success.
+    #[tokio::test]
+    async fn a_retry_finding_a_different_commit_object_under_the_key_errors() {
+        let backend = Arc::new(DivergentRetryStore::new(MemoryStore::new(), "/u/c/"));
+        let tenant = TenantHash([44u8; 16]);
+        let config = pipeline_config(3, Duration::from_secs(3600));
+        let pipeline = Arc::new(AuditPipeline::spawn(backend.clone(), config));
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let pipeline = pipeline.clone();
+            handles.push(tokio::spawn(async move {
+                pipeline.submit(test_event(tenant, 24_000 + i, 7)).await
+            }));
+        }
+        for handle in handles {
+            let result = handle.await.expect("submit task");
+            match &result {
+                Err(MaintainError::AuditFlush(message)) => {
+                    assert!(
+                        message.contains("after a retry"),
+                        "must fail via the retry-divergence path, got: {message}"
+                    );
+                }
+                other => {
+                    panic!("a genuine collision found on retry must fail closed, got {other:?}")
+                }
+            }
+        }
+        assert!(
+            backend.fired(),
+            "the divergent write must actually have landed before the retry observed it"
+        );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// A non-retryable error (`AccessDenied`-class; `FaultStore` scripts this
+    /// as `Permanent`, which is excluded from `StoreError::is_retryable()`
+    /// the same as `AccessDenied`) must not be retried: exactly one attempt,
+    /// and the batch fails closed.
+    #[tokio::test]
+    async fn a_non_retryable_error_is_not_retried_and_fails_the_batch() {
+        let mem = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("fault: access denied".into()),
+            )
+            .with_key_contains("/l0/"),
+        );
+        let store = Arc::new(FaultStore::new(mem, plan));
+        let tenant = TenantHash([45u8; 16]);
+        let config = pipeline_config(3, Duration::from_secs(3600));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let pipeline = pipeline.clone();
+            handles.push(tokio::spawn(async move {
+                pipeline.submit(test_event(tenant, 25_000 + i, 7)).await
+            }));
+        }
+        for handle in handles {
+            let result = handle.await.expect("submit task");
+            assert!(
+                matches!(result, Err(MaintainError::AuditFlush(_))),
+                "a non-retryable error must still fail the batch, got {result:?}"
+            );
+        }
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Permanent),
+            1,
+            "a non-retryable error must not be retried: exactly one attempt"
+        );
+        assert_eq!(
+            pipeline.put_retries(),
+            0,
+            "no retry was counted for a non-retryable error"
         );
         pipeline.shutdown().await.expect("shutdown");
     }
