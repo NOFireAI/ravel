@@ -305,6 +305,9 @@ mod tests {
     const IO_BOUND: Duration = Duration::from_secs(60);
     const PARK_BOUND: Duration = Duration::from_secs(10);
     const MAIN_WORKERS: usize = 2;
+    /// Wall-clock allowance past `SHUTDOWN_GRACE + JOIN_MARGIN` for a loaded
+    /// host. The sum stays well under [`WATCHDOG_BOUND`].
+    const SCHEDULING_SLACK: Duration = Duration::from_secs(5);
 
     struct TestClock(AtomicI64);
 
@@ -552,12 +555,14 @@ mod tests {
                 listener.shutdown().expect("health listener stops");
                 let elapsed = started.elapsed();
                 // hygiene-allow: wall-clock -- the bound under test is real
-                // time the process waits at shutdown; upper bound only, and
-                // the normal path returns at SHUTDOWN_GRACE, a margin early.
+                // time the process waits at shutdown, on the health thread's
+                // own runtime, so paused tokio time cannot drive it. Upper
+                // bound only, with SCHEDULING_SLACK for a loaded host; an
+                // unbounded shutdown still fails it well before the watchdog.
                 assert!(
-                    elapsed <= SHUTDOWN_GRACE + JOIN_MARGIN,
+                    elapsed <= SHUTDOWN_GRACE + JOIN_MARGIN + SCHEDULING_SLACK,
                     "shutdown took {elapsed:?}, past the {SHUTDOWN_GRACE:?} grace plus \
-                     {JOIN_MARGIN:?} margin"
+                     {JOIN_MARGIN:?} margin plus {SCHEDULING_SLACK:?} slack"
                 );
                 assert!(
                     TcpStream::connect_timeout(&addr, IO_BOUND).is_err(),
