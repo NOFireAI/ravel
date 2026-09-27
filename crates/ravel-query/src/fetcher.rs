@@ -125,6 +125,20 @@ pub const DEFAULT_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 /// semaphore, so this also bounds the total in-flight GETs across every
 /// concurrent segment fetch in a query, not just within one segment.
 pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
+/// Most page-range GETs one fetch of an L0 segment issues. When the coalesced
+/// page runs a query selects outnumber it, the smallest gaps between runs are
+/// bridged until this many remain, trading gap bytes for requests. It gives an
+/// unsealed flush's request cost a ceiling above the whole-object threshold
+/// ([`MAX_GETS_PER_L0_SEGMENT_FETCH`], ADR-1306). L1 parts are left unbounded:
+/// they can be far larger than a flush, so bridging would move far more bytes.
+pub const MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT: usize = 4;
+/// Most GETs one fetch of an L0 segment issues: the first GET (whole object,
+/// footer tail, or suffix), at most one footer chase (a second `NeedRange` is
+/// `Truncated`), one catalog GET (the catalog sections are fetched as one
+/// run), and [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] page-range GETs. Retries
+/// are not counted here.
+pub const MAX_GETS_PER_L0_SEGMENT_FETCH: u64 =
+    1 + 1 + 1 + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64;
 
 /// Object-size floor for taking the sparse catalog-probe path in
 /// [`SegmentFetcher::decode_selected`] instead of the whole-object fallback.
@@ -605,6 +619,36 @@ fn coalesce_ranges(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)>
             continue;
         }
         out.push((start, end));
+    }
+    out
+}
+
+/// Bridges the smallest gaps between `runs` (sorted, non-overlapping, as
+/// [`coalesce_ranges`] returns them) until at most `max_runs` remain. Ties
+/// bridge the earlier gap first. A `max_runs` of zero is read as one.
+fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
+    let max_runs = max_runs.max(1);
+    if runs.len() <= max_runs {
+        return runs;
+    }
+    let mut gaps: Vec<(u64, usize)> = runs
+        .windows(2)
+        .enumerate()
+        .map(|(i, pair)| (pair[1].0.saturating_sub(pair[0].1), i))
+        .collect();
+    gaps.sort_unstable();
+    let mut bridged = vec![false; gaps.len()];
+    for (_, i) in gaps.into_iter().take(runs.len() - max_runs) {
+        bridged[i] = true;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(max_runs);
+    let mut bridge_previous = false;
+    for (run, bridge_next) in runs.into_iter().zip(bridged.into_iter().chain([false])) {
+        match out.last_mut() {
+            Some(last) if bridge_previous => last.1 = last.1.max(run.1),
+            _ => out.push(run),
+        }
+        bridge_previous = bridge_next;
     }
     out
 }
@@ -1131,12 +1175,17 @@ impl SegmentFetcher {
         }
     }
 
+    /// Fetches the parts of `needed` that `regions` does not already hold, in
+    /// at most `max_runs` GETs: the ranges are coalesced within the coalesce
+    /// gap, then [`bound_runs`] bridges the smallest remaining gaps.
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_ranges(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         suffix_etag: &Etag,
         needed: &[(u64, u64)],
+        max_runs: usize,
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
     ) -> Result<GetCost, FetchError> {
@@ -1165,7 +1214,7 @@ impl SegmentFetcher {
         // shared semaphore inside `guarded_get` bounds the actual in-flight
         // GETs; `join_all` preserves input order, so the resulting
         // `regions` insert order is identical to the old sequential loop.
-        let runs = coalesce_ranges(missing, self.coalesce_gap);
+        let runs = bound_runs(coalesce_ranges(missing, self.coalesce_gap), max_runs);
         // Reserve the memory the coalesced runs will materialize before the
         // `join_all` issues a single GET (ADR-1170 decision 2): a refusal
         // fails the whole fetch typed, with zero GETs issued, never a smaller
@@ -1428,6 +1477,7 @@ impl SegmentFetcher {
                         (si_off, si_off + si_len),
                         (sm_off, sm_off + sm_len),
                     ],
+                    1,
                     regions,
                     accounting,
                 )
@@ -1491,6 +1541,7 @@ impl SegmentFetcher {
                     tenant_hash,
                     suffix_etag,
                     &[(0, total_size)],
+                    1,
                     regions,
                     accounting,
                 )
@@ -1592,6 +1643,7 @@ impl SegmentFetcher {
             tenant_hash,
             suffix_etag,
             &needed,
+            1,
             regions,
             accounting,
         )
@@ -1612,33 +1664,56 @@ impl SegmentFetcher {
             .map_err(|source| corrupt(key, source))
     }
 
-    /// Coalesced page ranges for the scalar runs of `selected` (histogram
-    /// runs carry no scalar samples and are skipped), fetched into `regions`.
-    /// Returns the plan for every run of every scalar series.
+    /// Coalesced page ranges for the scalar runs of `scalar` (TS/VAL) and the
+    /// histogram runs of `histogram` (TS/HIST), fetched into `regions` in one
+    /// batch, so an L0 segment's page-range GETs stay within
+    /// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] whichever kinds a query selects.
+    /// `plan_ranges_v4` fills each histogram run's `hist_range` (and leaves
+    /// `val_range` a `(0, 0)` sentinel). Returns the scalar and the histogram
+    /// plans, one entry per run.
     #[allow(clippy::too_many_arguments)]
-    async fn fetch_scalar_pages(
+    async fn fetch_pages(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         footer: &Footer,
         scalar: &[&SeriesEntryV4],
+        histogram: &[&SeriesEntryV4],
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         accounting: &QueryAccounting,
-    ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
+    ) -> Result<
+        (
+            Vec<ravel_segment::PlannedRunRange>,
+            Vec<ravel_segment::PlannedRunRange>,
+        ),
+        FetchError,
+    > {
+        let page_kind = match (scalar.is_empty(), histogram.is_empty()) {
+            (false, true) => "scalar",
+            (true, false) => "histogram",
+            _ => "mixed",
+        };
         // See `open_segment`'s comment: recorded on this handle directly,
         // never through `tracing::Span::current()`.
         let span = tracing::debug_span!(
             "page_fetch",
-            page_kind = "scalar",
-            series_count = scalar.len(),
+            page_kind,
+            series_count = scalar.len() + histogram.len(),
             s3_requests = tracing::field::Empty,
             s3_bytes = tracing::field::Empty,
         );
         async {
             let key = seg_ref.data_object_key.as_str();
-            let planned = plan_ranges_v4(footer, scalar).map_err(|source| corrupt(key, source))?;
-            let page_ranges: Vec<(u64, u64)> = planned
+            let plan = |series: &[&SeriesEntryV4]| {
+                if series.is_empty() {
+                    return Ok(Vec::new());
+                }
+                plan_ranges_v4(footer, series).map_err(|source| corrupt(key, source))
+            };
+            let scalar_planned = plan(scalar)?;
+            let histogram_planned = plan(histogram)?;
+            let page_ranges: Vec<(u64, u64)> = scalar_planned
                 .iter()
                 .flat_map(|p| {
                     [
@@ -1646,72 +1721,24 @@ impl SegmentFetcher {
                         (p.val_range.0, p.val_range.0 + p.val_range.1),
                     ]
                 })
-                .collect();
-            let cost = self
-                .ensure_ranges(
-                    seg_ref,
-                    tenant_hash,
-                    suffix_etag,
-                    &page_ranges,
-                    regions,
-                    accounting,
-                )
-                .await?;
-            // This call's own coalesced page-range GET cost, from the GETs
-            // `ensure_ranges` issued for this invocation, scoped to the span.
-            span.record("s3_requests", cost.requests);
-            span.record("s3_bytes", cost.bytes);
-            Ok(planned)
-        }
-        .instrument(span.clone())
-        .await
-    }
-
-    /// Histogram counterpart to [`fetch_scalar_pages`](Self::fetch_scalar_pages)
-    ///: coalesced TS/HIST page ranges for the histogram runs of
-    /// `histogram`, fetched into `regions`. `plan_ranges_v4` fills each
-    /// histogram run's `hist_range` (and leaves `val_range` a `(0, 0)`
-    /// sentinel), so this fetches the TS and HIST byte ranges the histogram
-    /// decode path reads.
-    #[allow(clippy::too_many_arguments)]
-    async fn fetch_histogram_pages(
-        &self,
-        seg_ref: &SegmentRef,
-        tenant_hash: TenantHash,
-        footer: &Footer,
-        histogram: &[&SeriesEntryV4],
-        suffix_etag: &Etag,
-        regions: &mut FetchedRegions,
-        accounting: &QueryAccounting,
-    ) -> Result<Vec<ravel_segment::PlannedRunRange>, FetchError> {
-        // See `open_segment`'s comment: recorded on this handle directly,
-        // never through `tracing::Span::current()`.
-        let span = tracing::debug_span!(
-            "page_fetch",
-            page_kind = "histogram",
-            series_count = histogram.len(),
-            s3_requests = tracing::field::Empty,
-            s3_bytes = tracing::field::Empty,
-        );
-        async {
-            let key = seg_ref.data_object_key.as_str();
-            let planned =
-                plan_ranges_v4(footer, histogram).map_err(|source| corrupt(key, source))?;
-            let page_ranges: Vec<(u64, u64)> = planned
-                .iter()
-                .flat_map(|p| {
+                .chain(histogram_planned.iter().flat_map(|p| {
                     [
                         (p.ts_range.0, p.ts_range.0 + p.ts_range.1),
                         (p.hist_range.0, p.hist_range.0 + p.hist_range.1),
                     ]
-                })
+                }))
                 .collect();
+            let max_runs = match seg_ref.level {
+                SegmentLevel::L0 => MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+                SegmentLevel::L1 { .. } => usize::MAX,
+            };
             let cost = self
                 .ensure_ranges(
                     seg_ref,
                     tenant_hash,
                     suffix_etag,
                     &page_ranges,
+                    max_runs,
                     regions,
                     accounting,
                 )
@@ -1720,7 +1747,7 @@ impl SegmentFetcher {
             // `ensure_ranges` issued for this invocation, scoped to the span.
             span.record("s3_requests", cost.requests);
             span.record("s3_bytes", cost.bytes);
-            Ok(planned)
+            Ok((scalar_planned, histogram_planned))
         }
         .instrument(span.clone())
         .await
@@ -1874,12 +1901,13 @@ impl SegmentFetcher {
                 },
             ));
         }
-        let planned = self
-            .fetch_scalar_pages(
+        let (planned, _) = self
+            .fetch_pages(
                 seg_ref,
                 tenant_hash,
                 &footer,
                 &scalar,
+                &[],
                 &suffix_etag,
                 &mut regions,
                 accounting.scan(),
@@ -2066,11 +2094,12 @@ impl SegmentFetcher {
         if histogram.is_empty() {
             return Ok(Vec::new());
         }
-        let planned = self
-            .fetch_histogram_pages(
+        let (_, planned) = self
+            .fetch_pages(
                 seg_ref,
                 tenant_hash,
                 &footer,
+                &[],
                 &histogram,
                 &suffix_etag,
                 &mut regions,
@@ -2240,27 +2269,14 @@ impl SegmentFetcher {
             .filter(|e| e.entry.value_kind == ValueKind::Histogram)
             .collect();
 
-        let scalar_planned = if scalar.is_empty() {
-            Vec::new()
+        let (scalar_planned, histogram_planned) = if scalar.is_empty() && histogram.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            self.fetch_scalar_pages(
+            self.fetch_pages(
                 seg_ref,
                 tenant_hash,
                 &footer,
                 &scalar,
-                &suffix_etag,
-                &mut regions,
-                accounting.scan(),
-            )
-            .await?
-        };
-        let histogram_planned = if histogram.is_empty() {
-            Vec::new()
-        } else {
-            self.fetch_histogram_pages(
-                seg_ref,
-                tenant_hash,
-                &footer,
                 &histogram,
                 &suffix_etag,
                 &mut regions,
@@ -4175,6 +4191,7 @@ mod tests {
                 tenant_hash,
                 &suffix_etag,
                 &[(0, RUN)],
+                usize::MAX,
                 &mut regions,
                 &accounting,
             )
@@ -4232,6 +4249,7 @@ mod tests {
                 tenant_hash,
                 &suffix_etag,
                 &[(0, RUN)],
+                usize::MAX,
                 &mut regions,
                 &accounting,
             )
@@ -4294,6 +4312,320 @@ mod tests {
         assert_eq!(out, vec![(0, u64::MAX)]);
         let out = coalesce_ranges(vec![(u64::MAX - 3, u64::MAX)], u64::MAX);
         assert_eq!(out, vec![(u64::MAX - 3, u64::MAX)]);
+    }
+
+    #[test]
+    fn bound_runs_bridges_the_smallest_gaps_first() {
+        // Gaps 5, 80, 2 and 380.
+        let runs = vec![(0, 10), (15, 20), (100, 110), (112, 120), (500, 510)];
+        assert_eq!(bound_runs(runs.clone(), 9), runs);
+        assert_eq!(bound_runs(runs.clone(), 5), runs);
+        assert_eq!(
+            bound_runs(runs.clone(), 4),
+            vec![(0, 10), (15, 20), (100, 120), (500, 510)]
+        );
+        assert_eq!(
+            bound_runs(runs.clone(), 3),
+            vec![(0, 20), (100, 120), (500, 510)]
+        );
+        assert_eq!(bound_runs(runs.clone(), 2), vec![(0, 120), (500, 510)]);
+        assert_eq!(bound_runs(runs.clone(), 1), vec![(0, 510)]);
+        assert_eq!(bound_runs(runs, 0), vec![(0, 510)]);
+        // Equal gaps bridge the earlier one first.
+        assert_eq!(
+            bound_runs(vec![(0, 1), (3, 4), (6, 7)], 2),
+            vec![(0, 4), (6, 7)]
+        );
+        assert_eq!(bound_runs(Vec::new(), 4), Vec::<(u64, u64)>::new());
+    }
+
+    /// An L0 segment of 16 scalar series `s00`..`s15` and 16 histogram series
+    /// `h00`..`h15`, two samples each, with the metric names in page order
+    /// (ascending series id). Selecting every other name leaves an unselected
+    /// page between any two selected ones in the TS, VAL and HIST sections, so
+    /// at a zero coalesce gap each selected page is its own run.
+    fn many_run_segment() -> (Bytes, TenantHash, SegmentRef, Vec<String>) {
+        let tenant_hash = TenantHash([13u8; 16]);
+        let writer_id = Uuid::from_u128(3);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let mut inputs = Vec::new();
+        for i in 0..16 {
+            let v = f64::from(i);
+            inputs.push(scalar_series_v3(
+                &format!("s{i:02}"),
+                &[(1_000 * NS, v), (1_001 * NS, v + 0.5)],
+            ));
+            inputs.push(hist_series(
+                &format!("h{i:02}"),
+                vec![
+                    HistogramSample {
+                        ts_ns: 1_000 * NS,
+                        value: hist_value(3 + i as u64, v),
+                    },
+                    HistogramSample {
+                        ts_ns: 1_001 * NS,
+                        value: hist_value(5 + i as u64, v + 1.0),
+                    },
+                ],
+            ));
+        }
+        let mut order: Vec<([u8; 16], String)> = inputs
+            .iter()
+            .map(|s| {
+                let name = s.labels.get("__name__").expect("metric name").to_string();
+                (s.series_id.0, name)
+            })
+            .collect();
+        order.sort();
+        let written =
+            SegmentWriter::write_histograms(inputs, identity, bounds).expect("write segment");
+        let seg_ref = SegmentRef {
+            data_object_key: "test/many-runs.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 5,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        let order = order.into_iter().map(|(_, name)| name).collect();
+        (written.bytes, tenant_hash, seg_ref, order)
+    }
+
+    /// Fetches `names` from the many-run segment on the ranged path (16-byte
+    /// footer tail, so the footer is chased; zero coalesce gap) and returns the
+    /// GETs issued with the scalar and histogram results. With `whole`, reads
+    /// the object in one GET instead, as the reference result.
+    async fn many_run_fetch(
+        bytes: &Bytes,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        names: &[&String],
+        whole: bool,
+    ) -> (u64, String) {
+        let store = counting_store(bytes.clone(), &seg_ref.data_object_key).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let threshold = if whole { u64::MAX } else { 0 };
+        let pattern = names
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        let matchers = [LabelMatcher::regex("__name__", pattern).expect("regex")];
+        let (mut scalar, _, mut histogram) = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(threshold)
+            .with_suffix_len(16)
+            .with_coalesce_gap(0)
+            .fetch_soa_and_histograms(tenant_hash, seg_ref, &matchers)
+            .await
+            .expect("fetch");
+        scalar.sort_by_key(|s| s.series_id.0);
+        histogram.sort_by_key(|s| s.series_id.0);
+        let scalar: Vec<_> = scalar
+            .iter()
+            .map(|s| {
+                let bits: Vec<u64> = s.values.iter().map(|v| v.to_bits()).collect();
+                (s.series_id, s.timestamps.clone(), bits)
+            })
+            .collect();
+        let histogram: Vec<_> = histogram
+            .iter()
+            .map(|s| (s.series_id, s.timestamps.clone(), format!("{:?}", s.values)))
+            .collect();
+        (
+            store.sequence_progress(0),
+            format!("{scalar:?} {histogram:?}"),
+        )
+    }
+
+    /// An L0 fetch issues at most `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`
+    /// page-range GETs whatever it selects, scalar and histogram pages
+    /// together, so the whole fetch stays within
+    /// `MAX_GETS_PER_L0_SEGMENT_FETCH`, and the bridged reads decode the same
+    /// data as a whole-object read.
+    #[tokio::test]
+    async fn l0_fetch_bounds_page_range_gets_per_segment() {
+        let (bytes, tenant_hash, seg_ref, order) = many_run_segment();
+        assert_eq!(order.len(), 32);
+        // The first GET (16-byte tail), the footer chase and one catalog GET.
+        const OPEN_AND_CATALOG: u64 = 3;
+        let alternate: Vec<&String> = order.iter().step_by(2).collect();
+        let scalar_alternate: Vec<&String> = alternate
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with('s'))
+            .collect();
+        let histogram_alternate: Vec<&String> = alternate
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with('h'))
+            .collect();
+        let one_scalar: Vec<&String> = scalar_alternate.iter().copied().take(1).collect();
+        let two_scalar: Vec<&String> = scalar_alternate.iter().copied().take(2).collect();
+        assert!(scalar_alternate.len() >= 3 && histogram_alternate.len() >= 3);
+
+        // Each selection with the page-range GETs it issues: its runs when
+        // they fit the bound, the bound when they do not.
+        let cases: [(&str, &[&String], u64); 5] = [
+            ("one scalar series: a TS and a VAL run", &one_scalar, 2),
+            ("two scalar series: four runs, at the bound", &two_scalar, 4),
+            ("every other scalar series", &scalar_alternate, 4),
+            ("every other histogram series", &histogram_alternate, 4),
+            ("every other series of both kinds", &alternate, 4),
+        ];
+        for (label, names, page_gets) in cases {
+            let (gets, got) = many_run_fetch(&bytes, tenant_hash, &seg_ref, names, false).await;
+            let (whole_gets, truth) =
+                many_run_fetch(&bytes, tenant_hash, &seg_ref, names, true).await;
+            assert_eq!(whole_gets, 1, "{label}: reference read");
+            assert_eq!(got, truth, "{label}: bridged reads decode the same data");
+            assert_eq!(gets, OPEN_AND_CATALOG + page_gets, "{label}: GETs");
+            assert!(
+                gets <= MAX_GETS_PER_L0_SEGMENT_FETCH,
+                "{label}: {gets} GETs"
+            );
+        }
+        assert_eq!(MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, 4);
+        assert_eq!(MAX_GETS_PER_L0_SEGMENT_FETCH, 7);
+        assert_eq!(
+            OPEN_AND_CATALOG + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+            MAX_GETS_PER_L0_SEGMENT_FETCH
+        );
+    }
+
+    /// A 16-series L1 object, one scalar run per series, with an L1
+    /// `SegmentRef`, and the series names in on-disk (series id) order.
+    fn many_run_l1_segment() -> (Bytes, TenantHash, SegmentRef, Vec<String>) {
+        let tenant_hash = TenantHash([14u8; 16]);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let input_set_hash = [0x44u8; 32];
+        let meta = CompactionMetaV4 {
+            ingest_hour_bucket: 0,
+            input_set_hash,
+            part_index: 0,
+            level: 1,
+        };
+        const NS: i64 = 1_000_000_000;
+        let tenant_id = TenantId::new("t".to_string());
+        let mut series: Vec<SeriesInputV7> = (0..16)
+            .map(|i| {
+                let name = format!("s{i:02}");
+                let label_set = labels(&name);
+                let id = SeriesId::compute(&tenant_id, &name, &label_set).expect("series id");
+                let v = f64::from(i);
+                let samples = SeriesValues::Scalar(vec![
+                    Sample {
+                        ts_ns: 1_000 * NS,
+                        value: v,
+                    },
+                    Sample {
+                        ts_ns: 1_001 * NS,
+                        value: v + 0.5,
+                    },
+                ]);
+                let run = encode_run_v4(&id, 100, 0, 0, &samples).expect("frame run");
+                SeriesInputV7 {
+                    series_id: id,
+                    labels: label_set,
+                    runs: vec![RunInputV7 {
+                        run,
+                        provenance: None,
+                    }],
+                }
+            })
+            .collect();
+        series.sort_by_key(|s| s.series_id.0);
+        let order = series
+            .iter()
+            .map(|s| s.labels.get("__name__").expect("metric name").to_string())
+            .collect();
+        let written =
+            SegmentWriter::write_v7_with_provenance(series, identity, bounds, meta, Vec::new())
+                .expect("write L1");
+        let seg_ref = SegmentRef {
+            data_object_key: "test/many-runs-l1.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 100,
+            level: SegmentLevel::L1 {
+                input_set_hash,
+                part_index: 0,
+            },
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (written.bytes, tenant_hash, seg_ref, order)
+    }
+
+    /// An L1 fetch is exempt from `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`: it
+    /// issues one page-range GET per coalesced run however many there are,
+    /// and bridges no gap.
+    #[tokio::test]
+    async fn l1_fetch_issues_one_page_range_get_per_run() {
+        let (bytes, tenant_hash, seg_ref, order) = many_run_l1_segment();
+        assert_eq!(order.len(), 16);
+        // The first GET (16-byte tail), the footer chase and one catalog GET.
+        const OPEN_AND_CATALOG: u64 = 3;
+        let alternate: Vec<&String> = order.iter().step_by(2).collect();
+        assert_eq!(alternate.len(), 8);
+        let one: Vec<&String> = alternate.iter().copied().take(1).collect();
+        // A selected series' TS and VAL pages are separate runs, and an
+        // unselected series sits between consecutive selected ones, so every
+        // other series is 16 runs, four times the L0 bound.
+        let cases: [(&str, &[&String], u64); 2] = [
+            ("one series: a TS and a VAL run", &one, 2),
+            ("every other series: 16 runs", &alternate, 16),
+        ];
+        for (label, names, page_gets) in cases {
+            let (gets, got) = many_run_fetch(&bytes, tenant_hash, &seg_ref, names, false).await;
+            let (whole_gets, truth) =
+                many_run_fetch(&bytes, tenant_hash, &seg_ref, names, true).await;
+            assert_eq!(whole_gets, 1, "{label}: reference read");
+            assert_eq!(got, truth, "{label}: ranged reads decode the same data");
+            assert_eq!(gets, OPEN_AND_CATALOG + page_gets, "{label}: GETs");
+        }
+        let (gets, _) = many_run_fetch(&bytes, tenant_hash, &seg_ref, &alternate, false).await;
+        assert_eq!(gets, 19);
+        assert!(gets > MAX_GETS_PER_L0_SEGMENT_FETCH);
     }
 
     #[test]
@@ -4531,7 +4863,7 @@ mod tests {
 
     /// Discriminating regression test for the checkpoint-review bug: the
     /// phase functions (`open_segment`, `decode_selected`,
-    /// `fetch_scalar_pages`, `build_scalar_decodes`, ...) used to record their
+    /// `fetch_pages`, `build_scalar_decodes`, ...) used to record their
     /// per-phase `s3_requests`/`s3_bytes`/`series_matched`/
     /// `decompressed_bytes` fields via `tracing::Span::current()`. Every phase
     /// span is `debug`-level; at INFO (the production default) they are
@@ -4806,7 +5138,7 @@ mod tests {
     }
 
     /// `crate::io_shape::depth_for_object` (issue #1214) mirrors the real
-    /// branches `open_segment` -> `decode_selected` -> `fetch_scalar_pages`
+    /// branches `open_segment` -> `decode_selected` -> `fetch_pages`
     /// takes, not just the footer stage. A small object (`object_size` in
     /// `(0, threshold]`) resolves footer, catalog, and pages from one GET:
     /// zero dependent stages, depth 1. Every other case takes the

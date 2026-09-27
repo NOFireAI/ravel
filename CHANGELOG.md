@@ -8,6 +8,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The default query request budget is now derived from the unsealed tail a
+  healthy catalog carries plus the fold-stall alert window** (ADR-1306). At 4
+  shards and a 2 s flush cadence it gives 343,400 requests instead of 15,800,
+  so a wide query is not refused for fold lag before the fold-stall alert
+  pages. Each unsealed flush is budgeted at 8 requests, which covers flushes
+  above the fetcher's 512 KiB whole-object threshold: one fetch of an L0
+  segment now issues at most 4 page-range GETs, bridging the smallest gaps
+  between the page runs a query selects when there are more, so it costs at
+  most 7 GETs plus its commit-record GET. The bridged gap bytes are fetched,
+  reserved against the process fetch memory budget and charged to
+  `max_bytes_scanned`, so a selective query over large L0 flushes can read up
+  to about the object size per segment, the same order as the existing
+  whole-object fallback. The per-flush figure holds per selector: each
+  selector fetches the segment again, so an N-selector query can spend up to
+  `1 + 7N` requests per flush, which the derived budget does not scale for. An
+  explicit `--max-s3-requests` is still used as given.
 - **A distributed-query worker resolves each pinned segment from that segment's
   own commit record instead of re-resolving its catalog** (issue #1721). Every
   fragment request used to re-resolve the worker's catalog to map the

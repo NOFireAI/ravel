@@ -187,7 +187,9 @@ $0.0063 today.
 
 (The table and the cost above assume 1 request per flush. The 2026-09-26
 amendment below gives them at the measured 2: 26,150, 89,600, 174,200 and
-343,400, and $0.0358 for the 4-shard, 2 s query.)
+343,400, and $0.0358 for the 4-shard, 2 s query. The 2026-09-27 amendment
+below supersedes those with the figures at 8 requests per flush: 89,600,
+343,400, 681,800 and 1,358,600, and $0.1374 for the 4-shard, 2 s query.)
 
 What a query can now rely on, at the modelled per-flush cost:
 
@@ -308,7 +310,8 @@ refuses a cold wide query throughout the healthy hour, not from 10:30.)
   configuration, which is what ADR-0073 decision 3 asks for. A runaway query
   is still bounded.
   (At the measured cost the 2026-09-26 amendment below gives 89,600, about
-  5.7x today's figure.)
+  5.7x today's figure. The 2026-09-27 amendment below sizes each flush at 8
+  and gives 343,400, about 21.7x.)
 - The budget and the alert are now coupled. Raising the alert's threshold or
   its `for:` without raising `lag_allowance` breaks the ordering. Follow-up
   task 4 makes that a failing test rather than a review comment. A
@@ -330,7 +333,9 @@ refuses a cold wide query throughout the healthy hour, not from 10:30.)
   doubles in its per-shard term. The 4-shard, 2 s budget would be 89,600.
   That is the honest cost, not headroom.
   (Task 1 did measure 2; the 2026-09-26 amendment below records it, and that
-  the per-flush bound holds only under the whole-object threshold.)
+  the per-flush bound holds only under the whole-object threshold. The
+  2026-09-27 amendment below keeps flush size uncapped and budgets 8 per
+  flush, 343,400 at 4 shards and 2 s, and names the per-selector gap.)
 
 ### Follow-up tasks
 
@@ -364,7 +369,8 @@ Each task names the test that accepts it.
      refused.
    - (The 2026-09-26 amendment below gives the corrected acceptance figures
      for `REQUESTS_PER_UNSEALED_FLUSH` = 2, and the flush-size decision this
-     task must also make.)
+     task must also make. The 2026-09-27 amendment below records that
+     decision and replaces those figures, and corrects task 3's budget.)
    - The existing `open_hour_at_default_shards_fits_the_derived_budget`,
      `budget_follows_flush_cadence` and `budget_scales_with_shard_count` keep
      passing unchanged.
@@ -501,6 +507,8 @@ per hour of tail.
 At $0.40 per million GET-class requests the worst 4-shard, 2 s query now
 costs 89,600 x $0.40 / 1,000,000 = $0.0358, against $0.0063 today, about
 5.7x (89,600 / 15,800).
+(The 2026-09-27 amendment below budgets 8 per flush instead of 2: the table
+becomes 89,600, 343,400, 681,800 and 1,358,600, and the worst query $0.1374.)
 
 ### The proof holds only under the whole-object threshold
 
@@ -529,10 +537,11 @@ never the commit record or the footer read.
 
 Follow-up task 2 must therefore do one of two things: bound unsealed flush
 size at the whole-object threshold, or size the per-flush term for the
-above-threshold case. It should bound the flush size. The above-threshold
-cost grows with the page runs a query selects and has no ceiling of its own,
-so a sized term would be a guess or would need a bound of its own anyway. A
-size bound keeps the measured 2 exact and pinned by task 1's test. It makes a
+above-threshold case. It should bound the flush size. (Superseded: the
+2026-09-27 amendment below keeps flush size uncapped and sizes the term.)
+The above-threshold cost grows with the page runs a query selects and has no
+ceiling of its own, so a sized term would be a guess or would need a bound of
+its own anyway. A size bound keeps the measured 2 exact and pinned by task 1's test. It makes a
 busy tenant flush more often, which is the size-trigger under-count the
 Consequences already name; task 2 should size the record count per
 shard-hour for that case in the same change.
@@ -548,3 +557,158 @@ shard-hour for that case in the same change.
   admits it;
 - asserts a runaway cost of three times the `covered_span` cost,
   3 x 7,050 x 2 x 4 = 169,200, is still refused by 89,600.
+
+(The 2026-09-27 amendment below replaces these acceptance figures with the
+ones at 8 requests per unsealed flush: 89,600, 343,400, 681,800 and 1,358,600.)
+
+## Amendment (2026-09-27): unsealed flush size stays uncapped; the budget covers flushes above the whole-object threshold
+
+<!-- amendment-applies: sections="Decision|Consequences|Follow-up tasks|Amendment (2026-09-26): REQUESTS_PER_UNSEALED_FLUSH is measured at 2" pointer="2026-09-27 amendment" -->
+<!-- amendment-supersedes: phrase="It should bound the flush size." pointer="2026-09-27 amendment" -->
+
+### The decision
+
+On 2026-09-26/27 the project owner decided, on issue #1306, not to cap
+unsealed flush size at the whole-object threshold. A cap would make a busy
+tenant flush several times more often, multiplying commit records and the
+resolve cost of every recent-window query, to protect a per-flush figure that
+only matters for the request budget. Follow-up task 2 instead sizes the
+per-flush term for flushes above the 512 KiB threshold, and gives that term a
+ceiling in the fetcher. This retires the 2026-09-26 amendment's
+recommendation that task 2 bound the flush size, and with it that amendment's
+suggestion to size the size-trigger record count in the same change; the
+size-trigger under-count stays the pre-existing one the Consequences name.
+
+### The measurement
+
+`cold_requests_per_unsealed_flush_above_whole_object_threshold`
+(`crates/ravel-query/tests/unsealed_flush_request_cost.rs`) repeats task 1's
+difference measurement at flushes of 7,700,472 bytes, about 7.7 MB, far above
+the threshold and just under the 8 MiB `target_bytes`. Cold, per unsealed flush
+per shard, split as resolve, plan, probe and scan:
+
+- a narrow query, the flush outside its range: 1 (the commit-record GET);
+- a wide query selecting every series: 4 (commit record, footer tail, one
+  catalog GET, one page run);
+- a query selecting every other series, 48 page runs that coalescing cannot
+  join: 1 + 1 + 1 + 48 = 51 without a bound.
+
+The third figure is the one the 2026-09-26 amendment predicted: the page-range
+cost grows with the runs a query selects and has no ceiling of its own.
+
+### The per-L0-segment page-range bound
+
+`SegmentFetcher::fetch_pages` now bridges the smallest gaps between coalesced
+page runs until at most `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` = 4 remain, on an
+L0 segment only (`bound_runs`, `crates/ravel-query/src/fetcher.rs`). Scalar
+and histogram pages are fetched in one batch, so the bound holds whichever
+page kinds a query selects. The ceilings that follow:
+
+- one L0 segment fetch issues at most `MAX_GETS_PER_L0_SEGMENT_FETCH` =
+  1 + 1 + 1 + 4 = 7 GETs: the first GET (whole object, footer tail or suffix),
+  at most one footer chase, one catalog GET and 4 page-range GETs;
+- one unsealed flush costs at most `MAX_REQUESTS_PER_UNSEALED_FLUSH` =
+  1 + 7 = 8 requests per selector fetch: its commit-record GET plus that fetch.
+
+With the bound, the 48-run query measures 1 + 1 + 1 + 4 = 7 per flush, one
+under the ceiling (its footer fits the 64 KiB tail, so it needs no chase). An
+L1 segment keeps unbounded page runs, since a compacted segment can be far
+larger than one flush; `l1_fetch_issues_one_page_range_get_per_run` pins that
+exemption.
+
+The derived budget sizes each flush at `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`,
+the larger of the measured small-flush 2 and the ceiling 8, so 8. The formulas
+of decisions 1 and 2 stand, with 8 in place of `REQUESTS_PER_UNSEALED_FLUSH`.
+
+### Recomputed figures at 8 per flush
+
+`covered_span` is still 14,100 s, so 7,050 flushes per shard at 2 s and 28,200
+at 500 ms:
+
+| Shards | `max_flush_delay` | Today | This decision, at 8 per flush |
+|---|---|---|---|
+| 1 | 2 s | 7,700 | 7,050 x 8 x 3/2 x 1 + 5,000 = 89,600 |
+| 4 | 2 s | 15,800 | 7,050 x 8 x 3/2 x 4 + 5,000 = 343,400 |
+| 8 | 2 s | 26,600 | 7,050 x 8 x 3/2 x 8 + 5,000 = 681,800 |
+| 4 | 500 ms | 48,200 | 28,200 x 8 x 3/2 x 4 + 5,000 = 1,358,600 |
+
+At $0.40 per million GET-class requests the worst 4-shard, 2 s query costs
+343,400 x $0.40 / 1,000,000 = $0.1374, against $0.0063 today, about 21.7x
+(343,400 / 15,800), and about 3.8x the 2026-09-26 amendment's $0.0358
+(343,400 / 89,600).
+
+The tail at 2 h 20 m, at 4 shards and 2 s, at the ceiling cost:
+
+- it holds 8,400 s / 2 s = 4,200 flushes per shard, costing
+  4,200 x 8 x 4 = 134,400 requests, or 139,400 with the 5,000 fixed overhead;
+- today's 15,800 refuses it;
+- the new 343,400 admits it, and the same tail at the small-flush 2,
+  4,200 x 2 x 4 = 33,600, fits too.
+
+A runaway at three times the `covered_span` cost,
+3 x 7,050 x 8 x 4 = 676,800, is still refused by 343,400.
+
+The refusal point relative to the stall alert is unchanged. The tail's share
+of the budget is 343,400 - 5,000 = 338,400, and a cold wide query at the
+ceiling spends 1,800 x 8 x 4 = 57,600 per hour of tail, so the budget runs out
+at 338,400 / 57,600 = 5.875 h, or 5 h 52 m 30 s, the same as
+84,600 / 14,400 at 2 per flush and 42,300 / 7,200 at 1. Both sides of the
+division scale with the per-flush term. On the gantt chart it is still 14:52,
+2 h 03 m after the alert fires and 1 h 58 m after the page. A query whose
+flushes cost less than the ceiling is refused later still.
+
+### What the bound costs in bytes
+
+Bridging a gap fetches bytes the query did not select. They are fetched like
+any other page bytes: reserved against the process fetch memory budget before
+the GETs are issued (ADR-1170 decision 2), and charged to `max_bytes_scanned`
+and to the scan phase. A selective query over large L0 flushes can therefore
+read up to about the object size per segment. That is the same order as the
+existing whole-object fallback, which reads a segment at or under the threshold,
+or a sparse object that does not qualify for the catalog-probe path, whole. The
+request budget gains a ceiling; the byte budget keeps the one it had.
+
+### The per-flush term is per selector fetch
+
+`prefetch` fetches each segment once per selector (the `estimate_cost` comment
+in `crates/ravel-query/src/engine.rs`), while resolve reads each commit record
+once. So an N-selector query pays up to 1 + 7N requests per unsealed flush
+above the threshold, and up to 1 + N at or under it. The derived budget does
+not account for this: it sizes every flush at 8, which covers one selector at
+any size and up to seven at or under the threshold. This is a known gap, the
+same shape as the two-lane case the Consequences already name. A two-selector
+query over large flushes at the ceiling spends 1 + 14 = 15 per flush, 1,800 x
+15 x 4 = 108,000 per hour of tail at 4 shards and 2 s, and exhausts the tail
+share at 338,400 / 108,000 = 3.13 h, about 3 h 08 m, before the 3 h 55 m page.
+Decision 2's guarantee holds for a query with one selector per signal lane.
+Closing the gap needs either a per-query budget scaled by selector count, which
+would repeat the "scale with the query" alternative's cost-predictability
+problem, or a fetch shared across selectors; neither is decided here.
+
+### Acceptance figures for tasks 3 to 7
+
+- Task 2, `derived_budget_covers_healthy_tail_plus_stall_alert_window`: pins
+  `covered_span` at 14,100 s and the four budgets at 89,600, 343,400, 681,800
+  and 1,358,600; asserts today's 15,800 refuses the 134,400-request tail at
+  2 h 20 m and 343,400 admits it; asserts the 676,800 runaway is refused.
+- Task 3, `fold_stall_alert_fires_before_first_request_budget_refusal`: its
+  fixture's flushes are small, so each costs at most 2, a quarter of the
+  budgeted 8. With the shipped term at the task's scaled cadence (60 s,
+  2 shards, headroom 1) the bare allowance is 235 x 8 x 2 = 3,760 plus the
+  measured overhead, while a last-6-hours query resolves at most about
+  8 h 05 m of flushes, 485 per shard, 360 x 2 + 125 x 1 = 845 per shard or
+  1,690 in all. It would never be refused and the test would fail its own
+  non-vacuity assertion. The test builds its budget from task 2's parts
+  function with the per-shard allowance recomputed at the fixture's measured
+  per-flush cost, `ceil(covered_span / 60 s) x REQUESTS_PER_UNSEALED_FLUSH` =
+  235 x 2 = 470, since decision 2's proof is parametric in that cost. The
+  replay against today's one-hour span uses the same per-flush cost,
+  60 x 2 = 120 per shard.
+- Task 4 quotes no budget figure and is unchanged.
+- Task 5's `consistency_model_defaults.rs` check computes the figure from the
+  derivation, so it follows 343,400 with no restated number.
+- Task 6 quotes no budget figure and is unchanged.
+- Task 7 states 343,400 at 4 shards and 2 s, and 1,358,600 for the
+  `EngineConfig::default` reference pair, in `docs/query-engine.md` and the
+  `--max-s3-requests` help text. The observability guide names the
+  multi-selector gap above as a third case the ordering does not cover.
