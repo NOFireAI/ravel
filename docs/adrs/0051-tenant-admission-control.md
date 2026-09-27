@@ -359,6 +359,8 @@ deliberate flag, not a new auth subsystem.
   lever for tenants that prefer cost over latency. ADR-1737 adds an opt-in
   third tier below `min_flush_bytes`: a buffer under `idle_flush_byte_floor`
   waits `max_flush_lifetime`; the shipped default of 0 leaves this tier off.
+  (The shipped hold is one `flush_tick` shorter; see the ADR-1737 hold
+  amendment below.)
 - **Incremental `max_series`:** the query engine enforces
   `max_series` during `by_id` construction, aborting the loop at the
   bound, so peak memory is bounded by the cap rather than by the match.
@@ -748,3 +750,15 @@ rather than admitting data no query can find. Lowering is always safe.
 - **Docs in the same commit:** the superseded prose list in
   Consequences, plus docs/guides/admission-limits.md gains the clock
   floor and 503 semantics.
+
+## Amendment (2026-09-27, #1737): the ADR-1737 hold is one tick short of the lifetime
+
+<!-- amendment-applies: sections="7. Ingest-time correctness fixes carried with the epic" pointer="ADR-1737 hold amendment" -->
+
+Section 7 describes ADR-1737's opt-in tier as waiting `max_flush_lifetime`.
+ADR-1737's own 2026-09-27 amendment shortened that hold by one `flush_tick`, so
+the worst buffer age at flush open, which includes one tick of age-check
+lateness, equals `max_flush_lifetime` and stays inside the figure
+`FLUSH_BOUND_SLACK_HOURS` is derived from. The default of 0 still leaves the
+tier off.
+
