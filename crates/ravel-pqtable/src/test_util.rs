@@ -56,12 +56,19 @@ pub fn live_manifest(table: &str, version: u64, seeds: &[u8]) -> Manifest {
 /// client that retries after a lost acknowledgement does. With
 /// [`CountingStore::bump_clock_on_list`] set, each LIST advances an injected
 /// clock, which is how a test ages a writer's resolve without a second task.
+/// With `stall_then_land_late` set, the first matching `CreateIfAbsent` put
+/// never returns and the object lands only after the next `get` of its key
+/// has answered: a request the store received and applied after the writer
+/// stopped waiting and checked for it.
 pub struct CountingStore<S> {
     pub inner: S,
     accepted_puts: Mutex<HashMap<String, usize>>,
     listed_prefixes: Mutex<Vec<String>>,
     list_bumps: Mutex<(Option<FixedClock>, VecDeque<i64>)>,
     pub replay_create_if_absent: Option<String>,
+    pub stall_then_land_late: Option<String>,
+    stalled: Mutex<Option<(String, Bytes)>>,
+    stalled_once: Mutex<bool>,
 }
 
 impl<S> CountingStore<S> {
@@ -72,6 +79,9 @@ impl<S> CountingStore<S> {
             listed_prefixes: Mutex::new(Vec::new()),
             list_bumps: Mutex::new((None, VecDeque::new())),
             replay_create_if_absent: None,
+            stall_then_land_late: None,
+            stalled: Mutex::new(None),
+            stalled_once: Mutex::new(false),
         }
     }
 
@@ -133,6 +143,16 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingStore<S> {
                 .replay_create_if_absent
                 .as_deref()
                 .is_some_and(|p| key.contains(p));
+        let stall = opts.mode == PutMode::CreateIfAbsent
+            && self
+                .stall_then_land_late
+                .as_deref()
+                .is_some_and(|p| key.contains(p))
+            && !std::mem::replace(&mut *self.stalled_once.lock().expect("lock"), true);
+        if stall {
+            *self.stalled.lock().expect("lock") = Some((key.to_string(), data));
+            return std::future::pending().await;
+        }
         if replay
             && self
                 .inner
@@ -148,7 +168,21 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingStore<S> {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        self.inner.get(key, range).await
+        let out = self.inner.get(key, range).await;
+        let landing = {
+            let mut stalled = self.stalled.lock().expect("lock");
+            match &*stalled {
+                Some((k, _)) if k == key => stalled.take(),
+                _ => None,
+            }
+        };
+        if let Some((k, data)) = landing {
+            self.inner
+                .put(&k, data, PutOptions::create_if_absent())
+                .await?;
+            self.record_put(&k);
+        }
+        out
     }
 
     async fn put_multipart<'a>(

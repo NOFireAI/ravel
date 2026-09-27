@@ -8,14 +8,17 @@
 //! The grace period is what keeps a query that resolved an older version
 //! readable, so it is measured from when a version stopped being needed: a
 //! manifest version other than its table's newest is deleted once the version
-//! that superseded it (the next one present) is older than the grace. The
-//! newest version of a table, dropped or live, is never deleted, since the
-//! next writer numbers from it.
+//! that superseded it (the next one present) is older than the grace plus
+//! [`SKEW_MS`]. [`plan`] only ever selects a version that has a successor in
+//! the same listing, so it does not select a table's newest version, dropped
+//! or live, which the next writer numbers from.
 //!
 //! [`plan`] refuses a grace below the deployment's minimum (its
 //! `--gc-max-query-duration`). Ages come from the store's
-//! `last_modified_unix_ms`, which may have 1-second granularity; the
-//! comparison is strict, so a version exactly at the grace is kept.
+//! `last_modified_unix_ms`, which may have 1-second granularity and is
+//! stamped by the store's clock while `now_ms` comes from the sweeper's, so
+//! the margin [`SKEW_MS`] is added to the grace. The comparison is strict: a
+//! version whose successor is exactly `grace_ms + SKEW_MS` old is kept.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,8 +59,13 @@ pub struct SweepReport {
     pub manifests_deleted: Vec<String>,
 }
 
+/// Clock-skew margin added to the grace: a superseded version is deleted only
+/// once `now_ms - successor.last_modified_unix_ms > grace_ms + SKEW_MS`. The
+/// same five minutes the catalog allows for clock skew.
+pub const SKEW_MS: u64 = 300_000;
+
 fn past_grace(now_ms: i64, last_modified_ms: i64, grace_ms: u64) -> bool {
-    i128::from(now_ms) - i128::from(last_modified_ms) > i128::from(grace_ms)
+    i128::from(now_ms) - i128::from(last_modified_ms) > i128::from(grace_ms) + i128::from(SKEW_MS)
 }
 
 fn foreign(key: &str, prefix: &str, reason: impl ToString) -> SweepError {
@@ -241,17 +249,24 @@ mod tests {
         .await
         .expect("tenant b");
 
-        // Just before the superseding versions pass the grace: nothing goes.
+        // At the grace plus the skew margin exactly: nothing goes.
         assert_eq!(
-            plan(&store, &TENANT_A, (1_000 + GRACE) as i64, GRACE, GRACE)
-                .await
-                .expect("plan"),
+            plan(
+                &store,
+                &TENANT_A,
+                (1_000 + GRACE + SKEW_MS) as i64,
+                GRACE,
+                GRACE
+            )
+            .await
+            .expect("plan"),
             SweepPlan::default()
         );
 
         // One millisecond later v1 of both tables is superseded past the
-        // grace. The dropped table keeps its newest (dropped) version.
-        let now = (1_001 + GRACE) as i64;
+        // grace and the margin. The dropped table keeps its newest (dropped)
+        // version.
+        let now = (1_001 + GRACE + SKEW_MS) as i64;
         let mut manifest_deletes = vec![mkey("hits", 1), mkey("gone", 1)];
         manifest_deletes.sort();
         let got = plan(&store, &TENANT_A, now, GRACE, GRACE)
@@ -319,9 +334,15 @@ mod tests {
         }
         let manifest_prefix = tenant_manifest_prefix(&TENANT_A);
         let before = store.list_count();
-        let planned = plan(&store, &TENANT_A, 1 + GRACE as i64, GRACE, GRACE)
-            .await
-            .expect("plan");
+        let planned = plan(
+            &store,
+            &TENANT_A,
+            (1 + GRACE + SKEW_MS) as i64,
+            GRACE,
+            GRACE,
+        )
+        .await
+        .expect("plan");
         assert_eq!(planned.manifest_deletes, vec![mkey("hits", 1)]);
         let listed = store.listed_prefixes();
         assert!(listed.len() > before);
@@ -348,7 +369,7 @@ mod tests {
         store.set_clock_ms(0);
         commit(store, "hits", create(&[1])).await;
         commit(store, "hits", create(&[2])).await;
-        let now = 1 + GRACE as i64;
+        let now = (1 + GRACE + SKEW_MS) as i64;
         let planned = plan(&faults, &TENANT_A, now, GRACE, GRACE)
             .await
             .expect("plan");

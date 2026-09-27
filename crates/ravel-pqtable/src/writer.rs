@@ -16,13 +16,24 @@
 //! Two mechanisms make a refused or failed write decidable. Every call carries
 //! an apply nonce, so two callers that would otherwise encode byte-identical
 //! manifests still produce different bodies and only the caller whose bytes
-//! are there reads the version as its own. And the manifest a writer resolved
-//! ages: `apply` re-resolves rather than putting when more than half of
-//! `min_grace_ms` passed between its resolve and its put, so it never writes
-//! against a view old enough for [`crate::sweep`] to have deleted what it read.
+//! are there reads the version as its own. A re-resolve that finds this call's
+//! nonce on the newest version also reports that version as this call's
+//! commit.
+//!
+//! The manifest a writer resolved ages. Half of `min_grace_ms`, less
+//! [`PUT_SKEW_ALLOWANCE_MS`], is the budget from a resolve to the end of the
+//! put that follows it. `apply` re-resolves rather than putting when that
+//! budget is already spent by the time it would put, and otherwise waits on
+//! the put with `tokio::time::timeout` for what is left of it. A put that
+//! times out is treated as not committed: `apply` reads the key to see
+//! whether its bytes landed and, if not, re-resolves. The timeout bounds how
+//! long `apply` waits, not the request itself: a request the store already
+//! received can still land after it, and the nonce is how a later resolve
+//! recognises that write.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
@@ -34,10 +45,16 @@ use crate::manifest::{APPLY_NONCE_LEN, Manifest, ManifestError, ParquetFile, enc
 use crate::names::{NameError, validate_table};
 use crate::resolve::{self, ResolveError};
 
-/// How many times [`apply`] writes before giving up. A refused write that is
-/// not this writer's own means another writer committed that version first,
-/// so this bounds contention, not failures.
+/// How many resolves [`apply`] makes before giving up. An attempt ends without
+/// a commit when another writer committed that version first, when the
+/// resolve aged past the budget before the put, or when the put timed out
+/// without landing. A non-retryable store error ends the call at once.
 pub const MAX_APPLY_ATTEMPTS: usize = 8;
+
+/// Taken off the resolve-to-put budget (half of `min_grace_ms`) to cover the
+/// difference between this process's clock and the store's, which stamps the
+/// `last_modified` a sweep measures grace from.
+pub const PUT_SKEW_ALLOWANCE_MS: u64 = 30_000;
 
 /// Distinguishes two applies started in the same process in the same clock
 /// tick; the rest of the nonce's input distinguishes processes and callers.
@@ -95,8 +112,15 @@ pub enum WriteError {
     TableNotFound { table: String },
     #[error("table {table:?} cannot be created with no files")]
     EmptyFileList { table: String },
-    #[error("table {table:?}: gave up after {attempts} conflicting writes")]
+    #[error("table {table:?}: gave up after {attempts} attempts without committing")]
     RetriesExhausted { table: String, attempts: usize },
+    /// Half of `min_grace_ms` is no larger than [`PUT_SKEW_ALLOWANCE_MS`], so
+    /// no put could finish inside the resolve-to-put budget.
+    #[error(
+        "min_grace_ms {min_grace_ms} leaves no resolve-to-put budget after the \
+         {PUT_SKEW_ALLOWANCE_MS} ms skew allowance"
+    )]
+    NoPutBudget { min_grace_ms: u64 },
     #[error("table {table:?}: version {version} has no successor")]
     VersionOverflow { table: String, version: u64 },
     /// A store failure on the manifest write. A retryable failure is reported
@@ -251,8 +275,8 @@ async fn holds_own_write(
 /// list are refused before any store call.
 ///
 /// `min_grace_ms` is the deployment's sweep floor ([`crate::sweep`]). Half of
-/// it is the budget between this call's resolve and its put; past that, the
-/// call re-resolves instead of putting.
+/// it, less [`PUT_SKEW_ALLOWANCE_MS`], is the budget from this call's resolve
+/// to the end of its put; see the module docs for what happens past it.
 pub async fn apply(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -279,29 +303,48 @@ pub async fn apply(
         Intent::Drop { created_by, .. } => created_by,
     };
     let nonce = apply_nonce(created_by, clock.now_ns(), table);
-    let budget_ns = i64::try_from(min_grace_ms / 2)
+    let budget_ms = (min_grace_ms / 2).saturating_sub(PUT_SKEW_ALLOWANCE_MS);
+    if budget_ms == 0 {
+        return Err(WriteError::NoPutBudget { min_grace_ms });
+    }
+    let budget_ns = i64::try_from(budget_ms)
         .unwrap_or(i64::MAX)
         .saturating_mul(1_000_000);
     for _ in 0..MAX_APPLY_ATTEMPTS {
         let resolved_at = clock.now_ns();
         let newest = resolve::newest(store, tenant, table).await?;
+        if let Some(m) = &newest
+            && m.apply_nonce == nonce
+        {
+            return Ok(Outcome::Committed { version: m.version });
+        }
         let manifest = match plan_step(table, &intent, newest.as_ref(), clock.now_ns(), &nonce)? {
             Step::Done(outcome) => return Ok(outcome),
             Step::Write(manifest) => manifest,
         };
         let key = manifest_key(tenant, table, manifest.version)?;
         let bytes = encode_manifest(tenant, &manifest)?;
-        if clock.now_ns().saturating_sub(resolved_at) > budget_ns {
+        let remaining_ns = budget_ns.saturating_sub(clock.now_ns().saturating_sub(resolved_at));
+        let Ok(remaining_ns) = u64::try_from(remaining_ns) else {
+            continue;
+        };
+        if remaining_ns == 0 {
             continue;
         }
-        match store
-            .put(
-                &key,
-                Bytes::from(bytes.clone()),
-                PutOptions::create_if_absent(),
-            )
-            .await
-        {
+        let put = store.put(
+            &key,
+            Bytes::from(bytes.clone()),
+            PutOptions::create_if_absent(),
+        );
+        let Ok(result) = tokio::time::timeout(Duration::from_nanos(remaining_ns), put).await else {
+            if holds_own_write(store, &key, &bytes).await? {
+                return Ok(Outcome::Committed {
+                    version: manifest.version,
+                });
+            }
+            continue;
+        };
+        match result {
             Ok(_) => {
                 return Ok(Outcome::Committed {
                     version: manifest.version,
@@ -472,7 +515,7 @@ mod tests {
         race_at(store, contested_version, (first, 100), (second, 200)).await
     }
 
-    fn assert_each_version_written_once(store: &Store) {
+    fn assert_each_version_written_once<S>(store: &CountingStore<S>) {
         for (key, n) in store.accepted_puts() {
             assert_eq!(n, 1, "{key} was written {n} times");
         }
@@ -753,33 +796,133 @@ mod tests {
         let lists_per_apply = baseline.list_count();
         assert!(lists_per_apply > 0);
 
-        let store = CountingStore::new(MemoryStore::new());
-        let clock = FixedClock::new(0);
-        let budget_ns = i64::from(GRACE_MS as u32 / 2) * 1_000_000;
-        // The first resolve's LIST ages the clock past the budget, the second
-        // does not, so the write lands on the second attempt.
-        store.bump_clock_on_list(clock.clone(), [budget_ns + 1, 0]);
+        // The first resolve's LIST ages the clock to `age`, the second does
+        // not, so the write lands on the first attempt when `age` leaves some
+        // budget and on the second otherwise.
+        for (age, attempts) in [
+            (budget_ns() - 1_000_000, 1),
+            (budget_ns(), 2),
+            (budget_ns() + 1, 2),
+        ] {
+            let store = CountingStore::new(MemoryStore::new());
+            let clock = FixedClock::new(0);
+            store.bump_clock_on_list(clock.clone(), [age, 0]);
+            assert_eq!(
+                apply(
+                    &store,
+                    &TENANT_A,
+                    "hits",
+                    create(false, &[1], "a"),
+                    &clock,
+                    GRACE_MS,
+                )
+                .await
+                .expect("create"),
+                Outcome::Committed { version: 1 }
+            );
+            assert_eq!(
+                store.list_count(),
+                attempts * lists_per_apply,
+                "age {age} ns"
+            );
+            assert!(
+                store
+                    .listed_prefixes()
+                    .iter()
+                    .all(|p| p.contains("/pq/t/hits/v/")),
+                "{:?}",
+                store.listed_prefixes()
+            );
+        }
+    }
+
+    /// Half the grace floor less the skew allowance, in nanoseconds.
+    fn budget_ns() -> i64 {
+        i64::try_from((GRACE_MS / 2 - PUT_SKEW_ALLOWANCE_MS) * 1_000_000).expect("fits")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_put_that_outlives_the_budget_times_out_and_re_resolves() {
+        let store = new_store(FaultPlan::empty());
+        let first = manifest_key(&TENANT_A, "hits", 1).expect("key");
+        let gate = store.inner.hold(Op::Put, Some(first), Occurrence::Nth(1));
+        let started = tokio::time::Instant::now();
+        // Without the timeout the held put never returns; the outer bound
+        // turns that hang into a failure.
+        let got = tokio::time::timeout(
+            Duration::from_secs(3_600),
+            apply_at(&*store, "hits", create(false, &[1], "a"), 1),
+        )
+        .await
+        .expect("apply returned");
+        assert_eq!(got.expect("create"), Outcome::Committed { version: 1 });
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_nanos(u64::try_from(budget_ns()).expect("positive"))
+        );
+        assert_eq!(gate.held().len(), 1, "the first put was held");
+        assert_eq!(
+            resolve::versions(&*store, &TENANT_A, "hits")
+                .await
+                .expect("versions"),
+            vec![1]
+        );
+        assert_each_version_written_once(&store);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_put_found_by_the_own_write_check_is_this_writers_commit() {
+        let mut store = CountingStore::new(MemoryStore::new());
+        store.stall_then_land_late = Some("/pq/t/".into());
+        let got = tokio::time::timeout(
+            Duration::from_secs(3_600),
+            apply_at(&store, "hits", create(false, &[1], "a"), 1),
+        )
+        .await
+        .expect("apply returned");
+        // The own-write GET read nothing, then the stalled request landed;
+        // the re-resolve finds this call's nonce on version 1. Without that
+        // check the CREATE would see its own table and report TableExists.
+        assert_eq!(got.expect("create"), Outcome::Committed { version: 1 });
+        assert_eq!(
+            resolve::versions(&store, &TENANT_A, "hits")
+                .await
+                .expect("versions"),
+            vec![1]
+        );
+        assert_each_version_written_once(&store);
+    }
+
+    #[tokio::test]
+    async fn a_grace_floor_with_no_room_past_the_skew_allowance_is_refused() {
+        let store = MemoryStore::new();
+        for grace in [0, 2 * PUT_SKEW_ALLOWANCE_MS] {
+            let got = apply(
+                &store,
+                &TENANT_A,
+                "hits",
+                create(false, &[1], "a"),
+                &FixedClock::new(0),
+                grace,
+            )
+            .await;
+            assert!(
+                matches!(got, Err(WriteError::NoPutBudget { min_grace_ms }) if min_grace_ms == grace),
+                "{got:?}"
+            );
+        }
         assert_eq!(
             apply(
                 &store,
                 &TENANT_A,
                 "hits",
                 create(false, &[1], "a"),
-                &clock,
-                GRACE_MS,
+                &FixedClock::new(0),
+                2 * PUT_SKEW_ALLOWANCE_MS + 2,
             )
             .await
-            .expect("create"),
+            .expect("one ms of budget"),
             Outcome::Committed { version: 1 }
-        );
-        assert_eq!(store.list_count(), 2 * lists_per_apply);
-        assert!(
-            store
-                .listed_prefixes()
-                .iter()
-                .all(|p| p.contains("/pq/t/hits/v/")),
-            "{:?}",
-            store.listed_prefixes()
         );
     }
 }
