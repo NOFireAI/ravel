@@ -40,8 +40,12 @@ use crate::sql::SqlState;
 /// Resolves the authoritative tenant and read-your-write tokens for a Flight
 /// SQL request from its gRPC metadata.
 ///
-/// The deployment's [`TenantResolver`] is the only authority. ravel-sql never
-/// sees a credential and never reads a tenant from a ticket.
+/// For every client request the deployment's [`TenantResolver`] is the only
+/// authority, and ravel-sql never sees a credential. A slice `DoGet`
+/// (ADR-1689 decision 2) is the one exception: on any listener that serves
+/// slices, including the combined listener mounted today, a ticket that
+/// verifies under the slice key runs under the tenant it carries, and this
+/// resolver is never consulted for it.
 pub struct ResolverFlightAuth {
     tenant_resolver: Arc<dyn TenantResolver>,
 }
