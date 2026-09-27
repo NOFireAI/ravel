@@ -106,6 +106,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         process_memory_budget_is_fallback: false,
         cache_dir: None,
         catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),
         distrib: None,

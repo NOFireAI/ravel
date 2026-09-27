@@ -11,6 +11,7 @@ pub mod bucket_protection;
 pub mod cache_warm;
 pub mod cli_reference;
 pub mod config;
+pub mod cpu_gates;
 #[cfg(feature = "sql")]
 pub mod declared_columns;
 pub mod distrib;
@@ -650,6 +651,10 @@ pub struct ServerConfig {
     /// separately in any case. [`start`] passes this straight through to
     /// [`query::build_catalog`].
     pub catalog_resolve_concurrency: Option<usize>,
+    /// The resolved permit counts of the ADR-1702 read and write CPU gates,
+    /// from [`config::Cli::resolve_cpu_gate_permits`]. [`start`] builds both
+    /// gates from this in every mode.
+    pub cpu_gate_permits: config::CpuGatePermits,
     /// The process-wide in-flight ingest-request ceiling, from
     /// `--max-inflight-ingest-requests` (default `Bounded(1024)`, `0` maps to
     /// `Unlimited`). [`start`] builds one shared
@@ -2027,6 +2032,10 @@ pub async fn start(
         config.process_memory_budget_bytes,
     ));
 
+    // The ADR-1702 read and write CPU gates, built in every mode: every mode
+    // decodes or encodes something, and `/metrics` renders both regardless.
+    let cpu_gates = cpu_gates::CpuGates::new(config.cpu_gate_permits);
+
     // Liveness/readiness routes are served in every mode, including
     // maintain (whose router is otherwise empty). `readiness` starts false
     // and is latched to true below, once both listeners are bound and the
@@ -2385,6 +2394,7 @@ pub async fn start(
         audit_pipeline: None,
         process_memory_budget: process_memory_budget.clone(),
         process_memory_budget_is_fallback: config.process_memory_budget_is_fallback,
+        cpu_gates,
         // Both fold routes, not just the background task: the on-demand route
         // mounted below runs the same `Catalog::fold` into the same
         // process-global totals, and it is mounted whatever `--disable-fold`

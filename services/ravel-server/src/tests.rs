@@ -224,6 +224,7 @@ fn harness(
         audit_pipeline: None,
         process_memory_budget,
         process_memory_budget_is_fallback: false,
+        cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
     });
@@ -440,6 +441,7 @@ fn promql_harness(
         audit_pipeline: None,
         process_memory_budget,
         process_memory_budget_is_fallback: false,
+        cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
     });

@@ -5153,6 +5153,7 @@ dependencies = [
  "ravel-cache",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-cpu-gate",
  "ravel-fleet",
  "ravel-ingest",
  "ravel-logseg",
