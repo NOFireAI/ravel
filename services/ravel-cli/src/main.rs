@@ -588,11 +588,13 @@ enum Command {
         /// Source tenant id (hashed under the bucket's pinned scheme).
         #[arg(long)]
         tenant: String,
-        /// Inclusive start of the event-time window, RFC 3339
-        /// (`2024-01-01T00:00:00Z`).
+        /// Inclusive start of the event-time window, RFC 3339 with `Z` or a
+        /// numeric offset, which is converted to UTC
+        /// (`2024-01-01T00:00:00Z`, `2024-01-01T02:00:00+02:00`).
         #[arg(long, value_name = "RFC3339", value_parser = ravel_cli::parse_rfc3339_ns)]
         start: i64,
-        /// Exclusive end of the event-time window, RFC 3339. Must be after
+        /// Exclusive end of the event-time window, RFC 3339 with `Z` or a
+        /// numeric offset, which is converted to UTC. Must be after
         /// `--start`.
         #[arg(long, value_name = "RFC3339", value_parser = ravel_cli::parse_rfc3339_ns)]
         end: i64,

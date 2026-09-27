@@ -659,6 +659,7 @@ severity_number_column = "sev_num"   # optional (integer column)
 severity_text_column   = "level"     # optional (string column)
 trace_id_column        = "trace_id"  # optional (16-byte binary or 32-hex string)
 span_id_column         = "span_id"   # optional (8-byte binary or 16-hex string)
+attrs_map_column       = "attrs"     # optional; export only, load never reads it
 
 # Resource attributes: part of stream identity.
 [[resource_attribute]]
@@ -672,6 +673,11 @@ key = "http.status_code"
 column = "status"
 type = "i64"                # str | i64 | f64 | bool | bytes
 ```
+
+`attrs_map_column` is write-side only: `ravel-cli export` writes every record
+attribute no `[[attribute]]` entry covers into that one map column, and
+`ravel-cli load` ignores it (see [What round-trips and what does
+not](#what-round-trips-and-what-does-not)).
 
 **Date columns.** An Arrow `Date32` or `Date64` source column is mapped with
 `type = "i64"`, and its value is stored in its native unit, unchanged: a
@@ -886,7 +892,10 @@ is not an export. The refusal says which missing piece each one waits on.
 ### What the window means
 
 `--start` and `--end` are RFC 3339 instants and the window is **half-open**:
-a record is exported when its event time is at or after `--start` and strictly
+each takes a trailing `Z` or a numeric offset such as `+02:00`, and an offset
+is converted to UTC, so `2024-01-01T02:00:00+02:00` and `2024-01-01T00:00:00Z`
+name the same instant. A timestamp with no offset is refused. A record is
+exported when its event time is at or after `--start` and strictly
 before `--end`. Exporting a day and then the next day with adjoining bounds
 therefore covers both days with no row written twice and none dropped between
 them. `--end` must be after `--start`; an empty window is refused rather than
@@ -945,8 +954,12 @@ visibility rules a query does:
 - Records dropped by retention, and objects superseded by compaction, are
   already absent from the snapshot the export resolves.
 - Subjects with an erasure request in flight are excluded from the decoded
-  records, by the same predicates the query path applies, so a subject erased
-  but not yet rewritten out of its objects is not exported.
+  records, by the same predicates and the same function the SQL log scan
+  applies, so a subject erased but not yet rewritten out of its objects is not
+  exported. The predicates are matched against each record's merged resource,
+  scope and record attributes, as a query sees them, so a subject named only
+  in a resource attribute (a `[[resource_attribute]]` mapping entry, or an
+  OTLP resource attribute) or a scope attribute is excluded too.
 
 A row a query cannot see is a row the export does not write.
 
@@ -959,7 +972,7 @@ null in that column, which a later load reads back as the same absent
 attribute. An attribute stored under a type the mapping does not declare for
 that key is refused by name rather than written as a null.
 
-Three things to know before treating a round trip as lossless:
+Four things to know before treating a round trip as lossless:
 
 - **Only what the mapping names.** A resource or record attribute the mapping
   does not declare is not in the output. Setting `attrs_map_column = "attrs"`
@@ -967,6 +980,12 @@ Three things to know before treating a round trip as lossless:
   column already covers, stringified the way SQL stringifies `attrs['<key>']`.
   That column is for reading the data elsewhere: `load` does not read it back,
   so attributes that reach the file only through it do not survive a reload.
+- **Some stored fields have no mapping key.** A record's observed timestamp
+  (`observed_ts_ns`), its `flags`, its instrumentation scope name and version,
+  and its scope attributes cannot be named by any mapping key, so export drops
+  them. A reload stores the observed timestamp equal to the event time, flags
+  of zero, and an empty scope, which is what `load` writes for any Parquet
+  file.
 - **`ts_unit` truncates.** The timestamp column is written in the unit the
   mapping declares. A mapping with `ts_unit = "millis"` writes millisecond
   values, and a reload of that file gets timestamps truncated to the
