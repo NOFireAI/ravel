@@ -1,14 +1,12 @@
-//! Resolving a table's newest manifest and listing a dataset (ADR-2040 D1,
-//! D2). There is no mutable HEAD: a table's state is the highest version
-//! under its `v/` prefix.
+//! Resolving a table's newest manifest (ADR-2040 D1, D2). There is no mutable
+//! HEAD: a table's state is the highest version under its `v/` prefix. Ravel
+//! stores no data objects of its own for a Parquet table, so resolving a table
+//! never lists anything but that prefix.
 
-use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_types::TenantHash;
 
-use crate::keys::{
-    KeyError, dataset_prefix, manifest_key, manifest_prefix, parse_dataset_object_key,
-    parse_manifest_key,
-};
+use crate::keys::{KeyError, manifest_key, manifest_prefix, parse_manifest_key};
 use crate::manifest::{Manifest, ManifestError, decode_manifest};
 
 /// How many times [`newest`] re-lists when the version it listed is gone by
@@ -24,7 +22,7 @@ pub enum ResolveError {
         source: StoreError,
     },
     /// A key under a Parquet table prefix that is not the key shape that
-    /// prefix holds, or that belongs to another tenant, table or dataset.
+    /// prefix holds, or that belongs to another tenant or table.
     #[error("unexpected object {key:?} under {prefix:?}: {reason}")]
     ForeignKey {
         key: String,
@@ -119,40 +117,6 @@ pub async fn newest(
     })
 }
 
-/// Every data object directly in `dataset`, in key order, from a paginated
-/// LIST of its prefix. Objects of a dataset nested under it (`dataset/sub`)
-/// are not included. A key under the prefix that is not a data object key is
-/// a [`ResolveError::ForeignKey`].
-pub async fn list_dataset(
-    store: &dyn ObjectStoreBackend,
-    tenant: &TenantHash,
-    dataset: &str,
-) -> Result<Vec<ObjectMeta>, ResolveError> {
-    let prefix = dataset_prefix(tenant, dataset)?;
-    let listed = list_all(store, &prefix)
-        .await
-        .map_err(|e| store_error(&prefix, e))?;
-    let mut out = Vec::with_capacity(listed.len());
-    for meta in listed {
-        let parsed = parse_dataset_object_key(&meta.key).map_err(|e| ResolveError::ForeignKey {
-            key: meta.key.clone(),
-            prefix: prefix.clone(),
-            reason: e.to_string(),
-        })?;
-        if parsed.tenant_hash != *tenant {
-            return Err(ResolveError::ForeignKey {
-                key: meta.key,
-                prefix,
-                reason: "belongs to another tenant".into(),
-            });
-        }
-        if parsed.dataset == dataset {
-            out.push(meta);
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -161,14 +125,13 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
 
     use super::*;
-    use crate::keys::dataset_object_key;
     use crate::manifest::encode_manifest;
     use crate::test_util::{TENANT_A, TENANT_B, live_manifest};
 
     async fn put_version(store: &MemoryStore, tenant: &TenantHash, version: u64) {
-        let m = live_manifest(tenant, "hits", version, &[version as u8]);
+        let m = live_manifest("hits", version, &[version as u8]);
         let key = manifest_key(tenant, "hits", version).expect("key");
-        let bytes = encode_manifest(tenant, &m).expect("encode");
+        let bytes = encode_manifest(&m).expect("encode");
         store
             .put(&key, Bytes::from(bytes), PutOptions::create_if_absent())
             .await
@@ -191,7 +154,7 @@ mod tests {
             vec![1, 2, 3, 9, 10, 11, 12]
         );
         let got = newest(&store, &TENANT_A, "hits").await.expect("resolve");
-        assert_eq!(got, Some(live_manifest(&TENANT_A, "hits", 12, &[12])));
+        assert_eq!(got, Some(live_manifest("hits", 12, &[12])));
     }
 
     #[tokio::test]
@@ -210,39 +173,5 @@ mod tests {
             newest(&store, &TENANT_A, "hits").await,
             Err(ResolveError::ForeignKey { key, .. }) if key == junk
         ));
-    }
-
-    #[tokio::test]
-    async fn list_dataset_pages_and_excludes_nested_datasets() {
-        let store = MemoryStore::with_page_size(2);
-        let mut expected = Vec::new();
-        for seed in 0..5u8 {
-            let d = *blake3::hash(&[seed]).as_bytes();
-            let key = dataset_object_key(&TENANT_A, "hits", &d).expect("key");
-            store
-                .put(&key, Bytes::from(vec![seed; 3]), PutOptions::default())
-                .await
-                .expect("put");
-            expected.push(key);
-        }
-        expected.sort();
-        for (tenant, dataset) in [
-            (&TENANT_A, "hits/nested"),
-            (&TENANT_A, "hits2"),
-            (&TENANT_B, "hits"),
-        ] {
-            let key = dataset_object_key(tenant, dataset, &[7; 32]).expect("key");
-            store
-                .put(&key, Bytes::from_static(b"y"), PutOptions::default())
-                .await
-                .expect("put");
-        }
-        let got: Vec<String> = list_dataset(&store, &TENANT_A, "hits")
-            .await
-            .expect("list")
-            .into_iter()
-            .map(|m| m.key)
-            .collect();
-        assert_eq!(got, expected);
     }
 }

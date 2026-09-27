@@ -8,20 +8,25 @@
 //! [`PARQUET_TABLE_MIN_READ_VERSION`]`..=`[`PARQUET_TABLE_MAX_READ_VERSION`]
 //! before looking at the body.
 //!
+//! Ravel does not own the files a manifest lists. Each one is identified by
+//! the tuple (profile, bucket, key) and pinned by its ETag, plus the backend
+//! version or generation where the store reports one. The key is carried as
+//! the raw bytes the listing returned, never as a URL: a URL would have to be
+//! re-parsed to address the object again, and a key may hold bytes no URL
+//! round trips.
+//!
 //! Both directions run [`Manifest::validate`], so a manifest this crate
 //! encodes or decodes has a valid table name, a version of at least 1, a
-//! dataset and file list consistent with `dropped`, and file keys that are
-//! exactly the content-addressed keys of their own BLAKE3 under the manifest's
-//! tenant and dataset.
+//! 16-byte apply nonce, a location, grant and file list consistent with
+//! `dropped`, and files that are individually addressable and distinct.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use prost::Message;
 use ravel_proto::parquet_table::v1 as pb;
-use ravel_types::TenantHash;
 
-use crate::keys::{KeyError, dataset_object_key, parse_manifest_key};
-use crate::names::{NameError, validate_dataset, validate_table};
+use crate::keys::{KeyError, parse_manifest_key};
+use crate::names::{NameError, validate_table};
 
 /// Format floor written into every manifest this build emits.
 pub const PARQUET_TABLE_FORMAT_VERSION: u32 = 1;
@@ -34,12 +39,24 @@ pub const PARQUET_TABLE_MIN_READ_VERSION: u32 = 1;
 /// record has had no additive change.
 pub const PARQUET_TABLE_MAX_READ_VERSION: u32 = PARQUET_TABLE_FORMAT_VERSION;
 
-/// One data object a manifest references.
+/// Bytes in a manifest's per-apply nonce.
+pub const APPLY_NONCE_LEN: usize = 16;
+
+/// One external Parquet file a manifest pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetFile {
-    pub key: String,
+    /// Credential profile the file is read through.
+    pub profile: String,
+    /// Bucket or container holding it.
+    pub bucket: String,
+    /// Object key, the raw bytes the listing returned.
+    pub key: Vec<u8>,
     pub size: u64,
-    pub blake3: [u8; 32],
+    /// ETag the footer read reported.
+    pub etag: String,
+    /// Backend object version or generation, empty when the store reports
+    /// none.
+    pub version: String,
     pub row_count: u64,
     /// Footer length in bytes, excluding the 8-byte trailer.
     pub footer_len: u32,
@@ -53,39 +70,51 @@ pub struct Manifest {
     pub table: String,
     pub version: u64,
     pub dropped: bool,
-    pub dataset: String,
+    /// The LOCATION URL this version was created from, as given.
+    pub location: String,
+    /// The grant that admitted `location`, for audit only.
+    pub grant: String,
     pub files: Vec<ParquetFile>,
     pub options: BTreeMap<String, String>,
     pub created_by: String,
     pub created_unix_ns: i64,
     pub statement: String,
+    /// Per-apply nonce, [`APPLY_NONCE_LEN`] bytes.
+    pub apply_nonce: Vec<u8>,
 }
 
 /// What made a manifest body invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestDefect {
     ZeroVersion,
-    /// A live (not dropped) manifest with no files.
-    NoFiles,
-    /// A dropped manifest that still names a dataset, files or options.
-    DroppedWithContent,
-    /// A `blake3` field that is not 32 bytes.
-    Blake3Len {
-        index: usize,
+    /// An `apply_nonce` that is not [`APPLY_NONCE_LEN`] bytes.
+    NonceLen {
         len: usize,
     },
-    /// A file key that is not the content-addressed key of its own BLAKE3
-    /// under this manifest's tenant and dataset.
-    FileKeyMismatch {
+    /// A live (not dropped) manifest with no files.
+    NoFiles,
+    /// A live manifest with no location or no admitting grant.
+    NoLocation,
+    NoGrant,
+    /// A dropped manifest that still names a location, grant, files or
+    /// options.
+    DroppedWithContent,
+    /// A file with no profile, bucket or key: it names no object.
+    UnaddressableFile {
         index: usize,
-        expected: String,
-        actual: String,
+        field: &'static str,
     },
+    /// A file with no ETag, which nothing could pin a read to.
+    NoEtag {
+        index: usize,
+    },
+    /// Two files with the same (profile, bucket, key).
     DuplicateFile {
-        key: String,
+        index: usize,
     },
+    /// A zero-byte file, which holds no Parquet footer.
     EmptyFile {
-        key: String,
+        index: usize,
     },
 }
 
@@ -128,9 +157,8 @@ pub enum ManifestError {
 }
 
 impl Manifest {
-    /// Check the body against the rules in the module docs, with file keys
-    /// resolved under `tenant`.
-    pub fn validate(&self, tenant: &TenantHash) -> Result<(), ManifestError> {
+    /// Check the body against the rules in the module docs.
+    pub fn validate(&self) -> Result<(), ManifestError> {
         let invalid = |defect| {
             Err(ManifestError::Invalid {
                 table: self.table.clone(),
@@ -142,35 +170,52 @@ impl Manifest {
         if self.version == 0 {
             return invalid(ManifestDefect::ZeroVersion);
         }
+        if self.apply_nonce.len() != APPLY_NONCE_LEN {
+            return invalid(ManifestDefect::NonceLen {
+                len: self.apply_nonce.len(),
+            });
+        }
         if self.dropped {
-            if !self.dataset.is_empty() || !self.files.is_empty() || !self.options.is_empty() {
+            if !self.location.is_empty()
+                || !self.grant.is_empty()
+                || !self.files.is_empty()
+                || !self.options.is_empty()
+            {
                 return invalid(ManifestDefect::DroppedWithContent);
             }
             return Ok(());
         }
-        validate_dataset(&self.dataset)?;
+        if self.location.is_empty() {
+            return invalid(ManifestDefect::NoLocation);
+        }
+        if self.grant.is_empty() {
+            return invalid(ManifestDefect::NoGrant);
+        }
         if self.files.is_empty() {
             return invalid(ManifestDefect::NoFiles);
         }
         let mut seen = BTreeSet::new();
         for (index, file) in self.files.iter().enumerate() {
-            let expected = dataset_object_key(tenant, &self.dataset, &file.blake3)?;
-            if file.key != expected {
-                return invalid(ManifestDefect::FileKeyMismatch {
-                    index,
-                    expected,
-                    actual: file.key.clone(),
-                });
+            let missing = if file.profile.is_empty() {
+                Some("profile")
+            } else if file.bucket.is_empty() {
+                Some("bucket")
+            } else if file.key.is_empty() {
+                Some("key")
+            } else {
+                None
+            };
+            if let Some(field) = missing {
+                return invalid(ManifestDefect::UnaddressableFile { index, field });
+            }
+            if file.etag.is_empty() {
+                return invalid(ManifestDefect::NoEtag { index });
             }
             if file.size == 0 {
-                return invalid(ManifestDefect::EmptyFile {
-                    key: file.key.clone(),
-                });
+                return invalid(ManifestDefect::EmptyFile { index });
             }
-            if !seen.insert(file.key.as_str()) {
-                return invalid(ManifestDefect::DuplicateFile {
-                    key: file.key.clone(),
-                });
+            if !seen.insert((&file.profile, &file.bucket, &file.key)) {
+                return invalid(ManifestDefect::DuplicateFile { index });
             }
         }
         Ok(())
@@ -182,24 +227,27 @@ impl Manifest {
     }
 }
 
-/// Encode `manifest` for storage under `tenant`, stamped with
-/// [`PARQUET_TABLE_FORMAT_VERSION`]. Refuses a manifest that fails
-/// [`Manifest::validate`].
-pub fn encode_manifest(tenant: &TenantHash, manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
-    manifest.validate(tenant)?;
+/// Encode `manifest`, stamped with [`PARQUET_TABLE_FORMAT_VERSION`]. Refuses
+/// a manifest that fails [`Manifest::validate`].
+pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
+    manifest.validate()?;
     let body = pb::ParquetTableManifest {
         format_version: PARQUET_TABLE_FORMAT_VERSION,
         table: manifest.table.clone(),
         version: manifest.version,
         dropped: manifest.dropped,
-        dataset: manifest.dataset.clone(),
+        location: manifest.location.clone(),
+        grant: manifest.grant.clone(),
         files: manifest
             .files
             .iter()
             .map(|f| pb::ParquetFile {
+                profile: f.profile.clone(),
+                bucket: f.bucket.clone(),
                 key: f.key.clone(),
                 size: f.size,
-                blake3: f.blake3.to_vec(),
+                etag: f.etag.clone(),
+                version: f.version.clone(),
                 row_count: f.row_count,
                 footer_len: f.footer_len,
             })
@@ -208,6 +256,7 @@ pub fn encode_manifest(tenant: &TenantHash, manifest: &Manifest) -> Result<Vec<u
         created_by: manifest.created_by.clone(),
         created_unix_ns: manifest.created_unix_ns,
         statement: manifest.statement.clone(),
+        apply_nonce: manifest.apply_nonce.clone(),
     };
     Ok(body.encode_to_vec())
 }
@@ -252,40 +301,33 @@ pub fn decode_manifest(key: &str, bytes: &[u8]) -> Result<Manifest, ManifestErro
             actual: body.version.to_string(),
         });
     }
-    let mut files = Vec::with_capacity(body.files.len());
-    for (index, f) in body.files.into_iter().enumerate() {
-        let blake3: [u8; 32] =
-            f.blake3
-                .as_slice()
-                .try_into()
-                .map_err(|_| ManifestError::Invalid {
-                    table: body.table.clone(),
-                    version: body.version,
-                    defect: ManifestDefect::Blake3Len {
-                        index,
-                        len: f.blake3.len(),
-                    },
-                })?;
-        files.push(ParquetFile {
-            key: f.key,
-            size: f.size,
-            blake3,
-            row_count: f.row_count,
-            footer_len: f.footer_len,
-        });
-    }
     let manifest = Manifest {
         table: body.table,
         version: body.version,
         dropped: body.dropped,
-        dataset: body.dataset,
-        files,
+        location: body.location,
+        grant: body.grant,
+        files: body
+            .files
+            .into_iter()
+            .map(|f| ParquetFile {
+                profile: f.profile,
+                bucket: f.bucket,
+                key: f.key,
+                size: f.size,
+                etag: f.etag,
+                version: f.version,
+                row_count: f.row_count,
+                footer_len: f.footer_len,
+            })
+            .collect(),
         options: body.options,
         created_by: body.created_by,
         created_unix_ns: body.created_unix_ns,
         statement: body.statement,
+        apply_nonce: body.apply_nonce,
     };
-    manifest.validate(&parsed.tenant_hash)?;
+    manifest.validate()?;
     Ok(manifest)
 }
 
@@ -293,18 +335,21 @@ pub fn decode_manifest(key: &str, bytes: &[u8]) -> Result<Manifest, ManifestErro
 #[allow(clippy::expect_used)]
 mod tests {
     use proptest::prelude::*;
+    use ravel_types::TenantHash;
 
     use super::*;
     use crate::keys::manifest_key;
 
     const TENANT: TenantHash = TenantHash([0x5c; 16]);
 
-    fn file(tenant: &TenantHash, dataset: &str, seed: u8) -> ParquetFile {
-        let blake3 = *blake3::hash(&[seed]).as_bytes();
+    fn file(seed: u8) -> ParquetFile {
         ParquetFile {
-            key: dataset_object_key(tenant, dataset, &blake3).expect("key"),
+            profile: "prod".into(),
+            bucket: "customer-bucket".into(),
+            key: format!("data/part-{seed}.parquet").into_bytes(),
             size: 1000 + u64::from(seed),
-            blake3,
+            etag: format!("\"etag-{seed}\""),
+            version: format!("gen-{seed}"),
             row_count: 7,
             footer_len: 321,
         }
@@ -315,17 +360,21 @@ mod tests {
             table: "hits".into(),
             version,
             dropped: false,
-            dataset: "hits".into(),
-            files: vec![file(&TENANT, "hits", 1), file(&TENANT, "hits", 2)],
+            location: "s3://customer-bucket/data/".into(),
+            grant: "s3://customer-bucket/data".into(),
+            files: vec![file(1), file(2)],
             options: BTreeMap::from([("binary_as_string".into(), "true".into())]),
             created_by: "tenant-a".into(),
             created_unix_ns: 1_700_000_000_000_000_000,
-            statement: "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION 'hits'".into(),
+            statement: "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION \
+                        's3://customer-bucket/data/'"
+                .into(),
+            apply_nonce: vec![9; APPLY_NONCE_LEN],
         }
     }
 
     fn raw_with_version(format_version: u32, m: &Manifest) -> Vec<u8> {
-        let bytes = encode_manifest(&TENANT, m).expect("encode");
+        let bytes = encode_manifest(m).expect("encode");
         let mut body = pb::ParquetTableManifest::decode(bytes.as_slice()).expect("decode");
         body.format_version = format_version;
         body.encode_to_vec()
@@ -381,7 +430,7 @@ mod tests {
 
     #[test]
     fn a_body_whose_table_or_version_disagrees_with_its_key_is_refused() {
-        let bytes = encode_manifest(&TENANT, &live(3)).expect("encode");
+        let bytes = encode_manifest(&live(3)).expect("encode");
         let wrong_version = manifest_key(&TENANT, "hits", 4).expect("key");
         assert_eq!(
             decode_manifest(&wrong_version, &bytes),
@@ -407,67 +456,89 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_read_under_another_tenants_key_is_refused() {
-        let bytes = encode_manifest(&TENANT, &live(1)).expect("encode");
-        let other = manifest_key(&TenantHash([0x77; 16]), "hits", 1).expect("key");
-        assert!(matches!(
-            decode_manifest(&other, &bytes),
-            Err(ManifestError::Invalid {
-                defect: ManifestDefect::FileKeyMismatch { index: 0, .. },
-                ..
+    fn a_raw_key_survives_the_round_trip_byte_for_byte() {
+        // Bytes a URL would not round trip: an empty path segment, a percent
+        // escape, a space, and a non-ASCII sequence that is not valid UTF-8.
+        let raw: Vec<Vec<u8>> = vec![
+            b"data//double/slash.parquet".to_vec(),
+            b"data/100%25 done/x.parquet".to_vec(),
+            b"data/a b c.parquet".to_vec(),
+            vec![b'd', b'a', b't', b'a', b'/', 0xff, 0xfe, b'.', b'p'],
+            "data/\u{e9}\u{4e2d}.parquet".as_bytes().to_vec(),
+        ];
+        let mut m = live(1);
+        m.files = raw
+            .iter()
+            .enumerate()
+            .map(|(i, key)| ParquetFile {
+                key: key.clone(),
+                ..file(i as u8)
             })
-        ));
+            .collect();
+        let key = manifest_key(&TENANT, "hits", 1).expect("key");
+        let bytes = encode_manifest(&m).expect("encode");
+        let decoded = decode_manifest(&key, &bytes).expect("decode");
+        let got: Vec<Vec<u8>> = decoded.files.iter().map(|f| f.key.clone()).collect();
+        assert_eq!(got, raw);
+        assert_eq!(decoded, m);
     }
 
     #[test]
     fn invalid_bodies_are_refused_on_encode() {
-        let mut m = live(1);
-        m.files.clear();
+        let cases: [(fn(&mut Manifest), ManifestDefect); 10] = [
+            (|m| m.files.clear(), ManifestDefect::NoFiles),
+            (
+                |m| m.files.push(m.files[0].clone()),
+                ManifestDefect::DuplicateFile { index: 2 },
+            ),
+            (
+                |m| m.files[1].size = 0,
+                ManifestDefect::EmptyFile { index: 1 },
+            ),
+            (
+                |m| m.files[1].profile.clear(),
+                ManifestDefect::UnaddressableFile {
+                    index: 1,
+                    field: "profile",
+                },
+            ),
+            (
+                |m| m.files[0].bucket.clear(),
+                ManifestDefect::UnaddressableFile {
+                    index: 0,
+                    field: "bucket",
+                },
+            ),
+            (
+                |m| m.files[0].key.clear(),
+                ManifestDefect::UnaddressableFile {
+                    index: 0,
+                    field: "key",
+                },
+            ),
+            (
+                |m| m.files[1].etag.clear(),
+                ManifestDefect::NoEtag { index: 1 },
+            ),
+            (|m| m.location.clear(), ManifestDefect::NoLocation),
+            (|m| m.grant.clear(), ManifestDefect::NoGrant),
+            (|m| m.dropped = true, ManifestDefect::DroppedWithContent),
+        ];
+        for (mutate, defect) in cases {
+            let mut m = live(1);
+            mutate(&mut m);
+            assert_eq!(
+                encode_manifest(&m),
+                Err(ManifestError::Invalid {
+                    table: "hits".into(),
+                    version: 1,
+                    defect: defect.clone(),
+                }),
+                "{defect:?}"
+            );
+        }
         assert!(matches!(
-            encode_manifest(&TENANT, &m),
-            Err(ManifestError::Invalid {
-                defect: ManifestDefect::NoFiles,
-                ..
-            })
-        ));
-        let mut m = live(1);
-        m.files.push(m.files[0].clone());
-        assert!(matches!(
-            encode_manifest(&TENANT, &m),
-            Err(ManifestError::Invalid {
-                defect: ManifestDefect::DuplicateFile { .. },
-                ..
-            })
-        ));
-        let mut m = live(1);
-        m.files[1].blake3 = [0; 32];
-        assert!(matches!(
-            encode_manifest(&TENANT, &m),
-            Err(ManifestError::Invalid {
-                defect: ManifestDefect::FileKeyMismatch { index: 1, .. },
-                ..
-            })
-        ));
-        let mut m = live(1);
-        m.files[0].size = 0;
-        assert!(matches!(
-            encode_manifest(&TENANT, &m),
-            Err(ManifestError::Invalid {
-                defect: ManifestDefect::EmptyFile { .. },
-                ..
-            })
-        ));
-        let mut m = live(1);
-        m.dropped = true;
-        assert!(matches!(
-            encode_manifest(&TENANT, &m),
-            Err(ManifestError::Invalid {
-                defect: ManifestDefect::DroppedWithContent,
-                ..
-            })
-        ));
-        assert!(matches!(
-            encode_manifest(&TENANT, &live(0)),
+            encode_manifest(&live(0)),
             Err(ManifestError::Invalid {
                 defect: ManifestDefect::ZeroVersion,
                 ..
@@ -476,15 +547,29 @@ mod tests {
     }
 
     #[test]
-    fn a_short_blake3_is_a_typed_error() {
+    fn a_nonce_of_the_wrong_length_is_refused_in_both_directions() {
+        for len in [0, 15, 17, 32] {
+            let mut m = live(1);
+            m.apply_nonce = vec![1; len];
+            assert!(
+                matches!(
+                    encode_manifest(&m),
+                    Err(ManifestError::Invalid {
+                        defect: ManifestDefect::NonceLen { len: got },
+                        ..
+                    }) if got == len
+                ),
+                "{len}"
+            );
+        }
         let key = manifest_key(&TENANT, "hits", 1).expect("key");
-        let bytes = encode_manifest(&TENANT, &live(1)).expect("encode");
+        let bytes = encode_manifest(&live(1)).expect("encode");
         let mut body = pb::ParquetTableManifest::decode(bytes.as_slice()).expect("decode");
-        body.files[1].blake3.truncate(31);
+        body.apply_nonce.truncate(4);
         assert!(matches!(
             decode_manifest(&key, &body.encode_to_vec()),
             Err(ManifestError::Invalid {
-                defect: ManifestDefect::Blake3Len { index: 1, len: 31 },
+                defect: ManifestDefect::NonceLen { len: 4 },
                 ..
             })
         ));
@@ -493,9 +578,9 @@ mod tests {
     #[test]
     fn truncation_inside_the_last_field_is_a_decode_error() {
         let key = manifest_key(&TENANT, "hits", 1).expect("key");
-        let bytes = encode_manifest(&TENANT, &live(1)).expect("encode");
-        // `statement` (field 10) is encoded last and is longer than one byte,
-        // so dropping the final byte cuts it mid-value.
+        let bytes = encode_manifest(&live(1)).expect("encode");
+        // `apply_nonce` is the highest field number, so it is encoded last and
+        // dropping the final byte cuts it mid-value.
         assert!(matches!(
             decode_manifest(&key, &bytes[..bytes.len() - 1]),
             Err(ManifestError::Decode { .. })
@@ -508,95 +593,90 @@ mod tests {
             table: "hits".into(),
             version: 9,
             dropped: true,
-            dataset: String::new(),
+            location: String::new(),
+            grant: String::new(),
             files: vec![],
             options: BTreeMap::new(),
-            created_by: String::new(),
+            created_by: "operator".into(),
             created_unix_ns: 5,
-            statement: String::new(),
+            statement: "DROP TABLE hits".into(),
+            apply_nonce: vec![3; APPLY_NONCE_LEN],
         };
         let key = manifest_key(&TENANT, "hits", 9).expect("key");
-        let bytes = encode_manifest(&TENANT, &m).expect("encode");
+        let bytes = encode_manifest(&m).expect("encode");
         assert_eq!(decode_manifest(&key, &bytes), Ok(m));
     }
 
-    fn arb_manifest() -> impl Strategy<Value = (TenantHash, Manifest)> {
+    prop_compose! {
+        fn arb_file()(
+            profile in "[a-z]{1,8}",
+            bucket in "[a-z0-9-]{1,12}",
+            key in prop::collection::vec(any::<u8>(), 1..24),
+            size in 1u64..=u64::MAX,
+            etag in "[!-~]{1,10}",
+            version in "[a-z0-9]{0,8}",
+            row_count in any::<u64>(),
+            footer_len in any::<u32>(),
+        ) -> ParquetFile {
+            ParquetFile { profile, bucket, key, size, etag, version, row_count, footer_len }
+        }
+    }
+
+    fn arb_manifest() -> impl Strategy<Value = Manifest> {
         (
-            any::<[u8; 16]>(),
             "[a-z_][a-z0-9_]{0,20}",
             1u64..=u64::MAX,
-            "[a-z0-9_]{1,8}(/[a-z0-9_]{1,8}){0,3}",
-            prop::collection::btree_set(any::<[u8; 32]>(), 1..6),
+            prop::collection::vec(arb_file(), 1..6),
             prop::collection::btree_map("[a-z._]{1,12}", ".{0,12}", 0..4),
             ".{0,16}",
             any::<i64>(),
             ".{0,40}",
-            any::<(u64, u32)>(),
+            any::<[u8; APPLY_NONCE_LEN]>(),
         )
-            .prop_filter("reserved table name", |(_, table, ..)| {
+            .prop_filter("reserved table name", |(table, ..)| {
                 validate_table(table).is_ok()
             })
             .prop_map(
-                |(
-                    tenant,
-                    table,
-                    version,
-                    dataset,
-                    digests,
-                    options,
-                    by,
-                    ns,
-                    stmt,
-                    (rows, footer),
-                )| {
-                    let tenant = TenantHash(tenant);
-                    let files = digests
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, blake3)| ParquetFile {
-                            key: dataset_object_key(&tenant, &dataset, &blake3)
-                                .expect("valid dataset"),
-                            size: 1 + i as u64,
-                            blake3,
-                            row_count: rows,
-                            footer_len: footer,
-                        })
-                        .collect();
-                    (
-                        tenant,
-                        Manifest {
-                            table,
-                            version,
-                            dropped: false,
-                            dataset,
-                            files,
-                            options,
-                            created_by: by,
-                            created_unix_ns: ns,
-                            statement: stmt,
-                        },
-                    )
+                |(table, version, mut files, options, by, ns, stmt, nonce)| {
+                    // Distinct (profile, bucket, key) triples: a duplicate is
+                    // a refused manifest, not a round-trip case.
+                    files.dedup_by(|a, b| {
+                        (&a.profile, &a.bucket, &a.key) == (&b.profile, &b.bucket, &b.key)
+                    });
+                    Manifest {
+                        table,
+                        version,
+                        dropped: false,
+                        location: "s3://b/data/".into(),
+                        grant: "s3://b/data".into(),
+                        files,
+                        options,
+                        created_by: by,
+                        created_unix_ns: ns,
+                        statement: stmt,
+                        apply_nonce: nonce.to_vec(),
+                    }
                 },
             )
     }
 
     proptest! {
         #[test]
-        fn encode_decode_round_trips((tenant, m) in arb_manifest()) {
-            let key = manifest_key(&tenant, &m.table, m.version).expect("key");
-            let bytes = encode_manifest(&tenant, &m).expect("encode");
+        fn encode_decode_round_trips(m in arb_manifest()) {
+            let key = manifest_key(&TENANT, &m.table, m.version).expect("key");
+            let bytes = encode_manifest(&m).expect("encode");
             prop_assert_eq!(decode_manifest(&key, &bytes), Ok(m));
         }
 
         #[test]
         fn mutated_bytes_never_panic_and_never_decode_to_an_invalid_manifest(
-            (tenant, m) in arb_manifest(),
+            m in arb_manifest(),
             cut in any::<prop::sample::Index>(),
             flip_at in any::<prop::sample::Index>(),
             flip in 1u8..=255,
         ) {
-            let key = manifest_key(&tenant, &m.table, m.version).expect("key");
-            let bytes = encode_manifest(&tenant, &m).expect("encode");
+            let key = manifest_key(&TENANT, &m.table, m.version).expect("key");
+            let bytes = encode_manifest(&m).expect("encode");
             let truncated = &bytes[..cut.index(bytes.len())];
             let mut flipped = bytes.clone();
             let at = flip_at.index(flipped.len());
@@ -606,7 +686,7 @@ mod tests {
                     // Anything that decodes still passed every check, so a
                     // mutation can change a free-text field but never yield a
                     // misfiled or structurally invalid manifest.
-                    prop_assert!(decoded.validate(&tenant).is_ok());
+                    prop_assert!(decoded.validate().is_ok());
                     prop_assert_eq!(&decoded.table, &m.table);
                     prop_assert_eq!(decoded.version, m.version);
                 }

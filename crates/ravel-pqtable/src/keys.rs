@@ -1,25 +1,28 @@
 //! Object keys for Parquet tables (ADR-2040 decision D1):
 //!
 //! ```text
-//! t/<tenant_hash>/pq/d/<dataset>/<hash16>.parquet     data object (content-addressed)
+//! t/<tenant_hash>/pq/grants                           location grants record
 //! t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm    table manifest version
 //! ```
 //!
 //! `<tenant_hash>` is rendered as 32 lowercase hex characters, as
-//! ravel-commit's keys render it, and `<hash16>` is the first 16 lowercase hex
-//! characters of the object's BLAKE3. The parsers accept only the exact text
-//! the builders produce.
+//! ravel-commit's keys render it. The parsers accept only the exact text the
+//! builders produce.
+//!
+//! Ravel holds no keys for the Parquet files themselves: they stay in the
+//! tenant's own bucket under the operator-granted locations, and a manifest
+//! records each one as the tuple (profile, bucket, raw key bytes).
 
 use ravel_types::TenantHash;
 
-use crate::names::{NameError, validate_dataset, validate_table};
+use crate::names::{NameError, validate_table};
 
-/// Filename suffix of a data object.
-pub const DATA_SUFFIX: &str = ".parquet";
 /// Filename suffix of a manifest version.
 pub const MANIFEST_SUFFIX: &str = ".pqm";
 /// Digits in a manifest key's zero-padded version, enough for any `u64`.
 pub const VERSION_WIDTH: usize = 20;
+/// Last segment of the grants record key.
+pub const GRANTS_SEGMENT: &str = "grants";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
@@ -29,14 +32,6 @@ pub enum KeyError {
     Name(#[from] NameError),
     #[error("manifest version 0 is not a valid version; versions start at 1")]
     ZeroVersion,
-}
-
-/// A parsed [`dataset_object_key`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedDataObjectKey {
-    pub tenant_hash: TenantHash,
-    pub dataset: String,
-    pub hash16: String,
 }
 
 /// A parsed [`manifest_key`].
@@ -52,40 +47,14 @@ pub fn tenant_pq_prefix(tenant: &TenantHash) -> String {
     format!("t/{}/pq/", tenant.to_hex())
 }
 
-/// `t/<tenant_hash>/pq/d/`: every data object of one tenant.
-pub fn tenant_data_prefix(tenant: &TenantHash) -> String {
-    format!("t/{}/pq/d/", tenant.to_hex())
-}
-
 /// `t/<tenant_hash>/pq/t/`: every manifest version of one tenant.
 pub fn tenant_manifest_prefix(tenant: &TenantHash) -> String {
     format!("t/{}/pq/t/", tenant.to_hex())
 }
 
-/// First 16 lowercase hex characters of a BLAKE3 digest.
-pub fn hash16(blake3: &[u8; 32]) -> String {
-    hex::encode(&blake3[..8])
-}
-
-/// `t/<tenant_hash>/pq/d/<dataset>/<hash16>.parquet`.
-pub fn dataset_object_key(
-    tenant: &TenantHash,
-    dataset: &str,
-    blake3: &[u8; 32],
-) -> Result<String, KeyError> {
-    validate_dataset(dataset)?;
-    Ok(format!(
-        "{}{dataset}/{}{DATA_SUFFIX}",
-        tenant_data_prefix(tenant),
-        hash16(blake3)
-    ))
-}
-
-/// `t/<tenant_hash>/pq/d/<dataset>/`: the objects directly in a dataset, plus
-/// those of any dataset nested under it.
-pub fn dataset_prefix(tenant: &TenantHash, dataset: &str) -> Result<String, KeyError> {
-    validate_dataset(dataset)?;
-    Ok(format!("{}{dataset}/", tenant_data_prefix(tenant)))
+/// `t/<tenant_hash>/pq/grants`: one tenant's location grants record.
+pub fn grants_key(tenant: &TenantHash) -> String {
+    format!("{}{GRANTS_SEGMENT}", tenant_pq_prefix(tenant))
 }
 
 /// `t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm`.
@@ -117,8 +86,8 @@ fn is_lower_hex(s: &str) -> bool {
     s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Split `t/<tenant_hash>/pq/<kind>/<rest>` into the tenant and `<rest>`.
-fn split_pq_key<'k>(key: &'k str, kind: &str) -> Result<(TenantHash, &'k str), KeyError> {
+/// Split `t/<tenant_hash>/pq/<rest>` into the tenant and `<rest>`.
+fn split_tenant_pq<'k>(key: &'k str) -> Result<(TenantHash, &'k str), KeyError> {
     let Some(after_root) = key.strip_prefix("t/") else {
         return Err(malformed(key, "expected the key to start with \"t/\""));
     };
@@ -133,41 +102,30 @@ fn split_pq_key<'k>(key: &'k str, kind: &str) -> Result<(TenantHash, &'k str), K
     }
     let tenant = TenantHash::from_hex(tenant_hex)
         .map_err(|_| malformed(key, "tenant hash is not valid hex"))?;
-    let Some(after_pq) = after_tenant.strip_prefix("pq/") else {
+    let Some(rest) = after_tenant.strip_prefix("pq/") else {
         return Err(malformed(key, "expected a \"pq/\" segment"));
-    };
-    let Some(rest) = after_pq
-        .strip_prefix(kind)
-        .and_then(|r| r.strip_prefix('/'))
-    else {
-        return Err(malformed(key, "unexpected Parquet table key kind"));
     };
     Ok((tenant, rest))
 }
 
-/// Parse a key produced by [`dataset_object_key`].
-pub fn parse_dataset_object_key(key: &str) -> Result<ParsedDataObjectKey, KeyError> {
-    let (tenant_hash, rest) = split_pq_key(key, "d")?;
-    let Some((dataset, filename)) = rest.rsplit_once('/') else {
-        return Err(malformed(key, "expected <dataset>/<hash16>.parquet"));
-    };
-    validate_dataset(dataset)?;
-    let Some(hash16) = filename.strip_suffix(DATA_SUFFIX) else {
-        return Err(malformed(key, "expected a .parquet suffix"));
-    };
-    if hash16.len() != 16 || !is_lower_hex(hash16) {
-        return Err(malformed(key, "hash16 is not 16 lowercase hex characters"));
+/// Parse a key produced by [`grants_key`].
+pub fn parse_grants_key(key: &str) -> Result<TenantHash, KeyError> {
+    let (tenant_hash, rest) = split_tenant_pq(key)?;
+    if rest != GRANTS_SEGMENT {
+        return Err(malformed(
+            key,
+            "expected a \"grants\" segment and nothing after it",
+        ));
     }
-    Ok(ParsedDataObjectKey {
-        tenant_hash,
-        dataset: dataset.to_string(),
-        hash16: hash16.to_string(),
-    })
+    Ok(tenant_hash)
 }
 
 /// Parse a key produced by [`manifest_key`].
 pub fn parse_manifest_key(key: &str) -> Result<ParsedManifestKey, KeyError> {
-    let (tenant_hash, rest) = split_pq_key(key, "t")?;
+    let (tenant_hash, after_pq) = split_tenant_pq(key)?;
+    let Some(rest) = after_pq.strip_prefix("t/") else {
+        return Err(malformed(key, "unexpected Parquet table key kind"));
+    };
     let Some((table, after_table)) = rest.split_once('/') else {
         return Err(malformed(key, "expected <table>/v/<version>.pqm"));
     };
@@ -202,36 +160,13 @@ mod tests {
     const TENANT_A: TenantHash = TenantHash([0xa1; 16]);
     const TENANT_B: TenantHash = TenantHash([0xb2; 16]);
 
-    fn digest(seed: u8) -> [u8; 32] {
-        *blake3::hash(&[seed]).as_bytes()
-    }
-
     #[test]
-    fn data_object_key_has_the_documented_shape_and_round_trips() {
-        let d = digest(1);
-        let key = dataset_object_key(&TENANT_A, "clickbench/hits", &d).expect("key");
-        assert_eq!(
-            key,
-            format!(
-                "t/{}/pq/d/clickbench/hits/{}.parquet",
-                "a1".repeat(16),
-                &hex::encode(d)[..16]
-            )
-        );
-        let parsed = parse_dataset_object_key(&key).expect("parse");
-        assert_eq!(
-            parsed,
-            ParsedDataObjectKey {
-                tenant_hash: TENANT_A,
-                dataset: "clickbench/hits".into(),
-                hash16: hex::encode(d)[..16].to_string(),
-            }
-        );
-        assert_eq!(
-            dataset_prefix(&TENANT_A, "clickbench/hits").expect("prefix"),
-            format!("t/{}/pq/d/clickbench/hits/", "a1".repeat(16))
-        );
-        assert!(key.starts_with(&dataset_prefix(&TENANT_A, "clickbench/hits").expect("prefix")));
+    fn grants_key_has_the_documented_shape_and_round_trips() {
+        let key = grants_key(&TENANT_A);
+        assert_eq!(key, format!("t/{}/pq/grants", "a1".repeat(16)));
+        assert_eq!(parse_grants_key(&key).expect("parse"), TENANT_A);
+        assert_ne!(parse_grants_key(&key).expect("parse"), TENANT_B);
+        assert!(key.starts_with(&tenant_pq_prefix(&TENANT_A)));
     }
 
     #[test]
@@ -261,17 +196,8 @@ mod tests {
 
     #[test]
     fn a_key_for_tenant_a_never_parses_as_tenant_b() {
-        let data = dataset_object_key(&TENANT_A, "hits", &digest(2)).expect("key");
         let manifest = manifest_key(&TENANT_A, "hits", 1).expect("key");
         assert_eq!(
-            parse_dataset_object_key(&data).expect("parse").tenant_hash,
-            TENANT_A
-        );
-        assert_ne!(
-            parse_dataset_object_key(&data).expect("parse").tenant_hash,
-            TENANT_B
-        );
-        assert_eq!(
             parse_manifest_key(&manifest).expect("parse").tenant_hash,
             TENANT_A
         );
@@ -279,20 +205,12 @@ mod tests {
             parse_manifest_key(&manifest).expect("parse").tenant_hash,
             TENANT_B
         );
-        assert!(!data.starts_with(&tenant_pq_prefix(&TENANT_B)));
         assert!(!manifest.starts_with(&tenant_pq_prefix(&TENANT_B)));
+        assert!(!grants_key(&TENANT_A).starts_with(&tenant_pq_prefix(&TENANT_B)));
     }
 
     #[test]
     fn builders_refuse_invalid_names_and_version_zero() {
-        assert!(matches!(
-            dataset_object_key(&TENANT_A, "../x", &digest(1)),
-            Err(KeyError::Name(NameError::InvalidDataset { .. }))
-        ));
-        assert!(matches!(
-            dataset_prefix(&TENANT_A, "a/"),
-            Err(KeyError::Name(NameError::InvalidDataset { .. }))
-        ));
         assert!(matches!(
             manifest_key(&TENANT_A, "logs", 1),
             Err(KeyError::Name(NameError::InvalidTable { .. }))
@@ -311,25 +229,19 @@ mod tests {
     fn parsers_refuse_every_other_shape() {
         let th = "a1".repeat(16);
         let upper = "A1".repeat(16);
-        let h16 = "0123456789abcdef";
-        let data_bad = [
-            format!("x/{th}/pq/d/hits/{h16}.parquet"),
-            format!("t/{upper}/pq/d/hits/{h16}.parquet"),
-            format!("t/{}/pq/d/hits/{h16}.parquet", "a1".repeat(15)),
-            format!("t/{th}/px/d/hits/{h16}.parquet"),
-            format!("t/{th}/pq/t/hits/{h16}.parquet"),
-            format!("t/{th}/pq/d/{h16}.parquet"),
-            format!("t/{th}/pq/d/Hits/{h16}.parquet"),
-            format!("t/{th}/pq/d/a//{h16}.parquet"),
-            format!("t/{th}/pq/d/hits/{h16}.rseg"),
-            format!("t/{th}/pq/d/hits/0123456789ABCDEF.parquet"),
-            format!("t/{th}/pq/d/hits/0123456789abcde.parquet"),
-            format!("t/{th}/pq/d/hits/0123456789abcdef0.parquet"),
-            format!("t/{th}/pq/d/hits/"),
-            format!("t/{th}/pq/dd/hits/{h16}.parquet"),
+        let grants_bad = [
+            format!("x/{th}/pq/grants"),
+            format!("t/{upper}/pq/grants"),
+            format!("t/{}/pq/grants", "a1".repeat(15)),
+            format!("t/{th}/px/grants"),
+            format!("t/{th}/pq/grants/"),
+            format!("t/{th}/pq/grants/extra"),
+            format!("t/{th}/pq/grant"),
+            format!("t/{th}/pq/grantsx"),
+            format!("t/{th}/pq/t/hits/v/00000000000000000001.pqm"),
         ];
-        for key in &data_bad {
-            assert!(parse_dataset_object_key(key).is_err(), "{key:?} parsed");
+        for key in &grants_bad {
+            assert!(parse_grants_key(key).is_err(), "{key:?} parsed");
         }
         let manifest_bad = [
             format!("t/{th}/pq/t/hits/v/0000000000000000001.pqm"),
@@ -345,6 +257,7 @@ mod tests {
             format!("t/{th}/pq/d/hits/v/00000000000000000001.pqm"),
             format!("t/{upper}/pq/t/hits/v/00000000000000000001.pqm"),
             format!("t/{th}/pq/t/hits"),
+            format!("t/{th}/pq/grants"),
         ];
         for key in &manifest_bad {
             assert!(parse_manifest_key(key).is_err(), "{key:?} parsed");
