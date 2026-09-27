@@ -171,9 +171,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   0, which changes nothing: every buffer flushes on the same clocks as before.
   When set to a value below `min_flush_bytes` (`IngestConfig::validate`
   refuses anything else), a metrics, log, or span buffer with no strict-mode
-  waiter that would write fewer object bytes than the floor waits for
-  `max_flush_lifetime` instead of the 40 s idle clock, and each such flush is
-  counted as `flushes_by_age_floor` in the pipeline's metrics snapshot. A
+  waiter that would write fewer object bytes than the floor waits for the
+  sub-floor hold, one `flush_tick` short of `max_flush_lifetime`, instead of
+  the 40 s idle clock, and each such flush is counted as
+  `flushes_by_age_floor` in the pipeline's metrics snapshot. The hold gives up
+  that tick because the age check runs on a tick, so the buffer is at most
+  `max_flush_lifetime` old when its flush opens, which is the figure
+  `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. A
   buffer that reaches the floor goes back to the idle clock, and strict-mode
   writes keep the fast clock. `ravel-server` does not expose the knob yet, so
   no deployment's flush cadence or buffered-mode loss window changes with this

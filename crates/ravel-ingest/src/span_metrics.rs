@@ -42,8 +42,9 @@ pub struct SpanIngestMetrics {
     /// Attempt-time, same as `flushes_by_size`.
     flushes_by_age: AtomicU64,
     /// Flushes opened because a tenant buffer below a non-zero
-    /// `idle_flush_byte_floor` aged past `max_flush_lifetime`
-    /// ([`FlushTrigger::AgeFloor`], ADR-1737 decision 6). Attempt-time.
+    /// `idle_flush_byte_floor` aged past the sub-floor hold,
+    /// `max_flush_lifetime` less one `flush_tick` ([`FlushTrigger::AgeFloor`],
+    /// ADR-1737 decision 6). Attempt-time.
     flushes_by_age_floor: AtomicU64,
     /// Flushes opened by any [`FlushTrigger::Manual`] path: an explicit flush
     /// request, the shutdown drain, and the channel-close drop-path drain.

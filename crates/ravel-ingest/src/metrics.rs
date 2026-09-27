@@ -80,9 +80,9 @@ pub enum FlushTrigger {
     /// adaptive-delay corridor (ADR-0067 decision 3), rather than the fixed
     /// `max_flush_delay` constant.
     AgeAdaptive,
-    /// Buffer below a non-zero `idle_flush_byte_floor` aged past
-    /// `max_flush_lifetime`, the hold tier of ADR-1737. Raised by all three
-    /// shard actors.
+    /// Buffer below a non-zero `idle_flush_byte_floor` aged past the
+    /// sub-floor hold, `max_flush_lifetime` less one `flush_tick`, the hold
+    /// tier of ADR-1737. Raised by all three shard actors.
     AgeFloor,
     Manual,
 }
@@ -107,9 +107,9 @@ pub struct IngestMetrics {
     /// `flushes_by_size`.
     flushes_by_age_adaptive: AtomicU64,
     /// Flushes opened because a tenant buffer below a non-zero
-    /// `idle_flush_byte_floor` aged past `max_flush_lifetime` (ADR-1737
-    /// decision 6). Zero while the floor is 0. Attempt-time, same as
-    /// `flushes_by_size`.
+    /// `idle_flush_byte_floor` aged past the sub-floor hold,
+    /// `max_flush_lifetime` less one `flush_tick` (ADR-1737 decision 6). Zero
+    /// while the floor is 0. Attempt-time, same as `flushes_by_size`.
     flushes_by_age_floor: AtomicU64,
     /// Flushes opened by any `FlushTrigger::Manual` path: an explicit
     /// `FlushNow`, the `Shutdown` drain, or the channel-close drop-path drain.

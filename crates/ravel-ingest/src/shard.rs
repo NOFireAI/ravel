@@ -1196,8 +1196,9 @@ impl ShardActor {
     /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast age clock; anything else is idle
     /// and waits for the slower `max_flush_delay_idle` instead (ADR-0051
-    /// section 7), or, below a non-zero `idle_flush_byte_floor`, for
-    /// `max_flush_lifetime` (ADR-1737, [`idle_age_threshold`]). "Worth a PUT"
+    /// section 7), or, below a non-zero `idle_flush_byte_floor`, for the
+    /// sub-floor hold, `max_flush_lifetime` less one `flush_tick` (ADR-1737,
+    /// [`idle_age_threshold`]). "Worth a PUT"
     /// is a claim about the object, so this reads the
     /// object-bytes estimate, not the buffered-memory charge (issue #1305).
     /// Strict-mode ack latency is unaffected: a strict
@@ -2476,12 +2477,23 @@ mod tests {
         // is absent here because no configured value bounds it.
         let shipped = IngestConfig::default();
         let lifetime_ns = shipped.max_flush_lifetime.as_nanos() as i64;
+        let tick_ns = shipped.flush_tick.as_nanos() as i64;
         let hold_ns = sub_floor_hold_ns(&shipped);
+        let worst_age_ns = hold_ns + tick_ns;
         assert!(
-            hold_ns <= lifetime_ns,
-            "the sub-floor hold ({hold_ns}ns) must not exceed max_flush_lifetime \
-             ({lifetime_ns}ns): FLUSH_BOUND_SLACK_HOURS was derived with the \
-             lifetime as the worst buffer age at flush open"
+            worst_age_ns <= lifetime_ns,
+            "the sub-floor hold ({hold_ns}ns) plus the one {tick_ns}ns flush_tick \
+             the age check may take to notice it is {worst_age_ns}ns, which must \
+             not exceed max_flush_lifetime ({lifetime_ns}ns): \
+             FLUSH_BOUND_SLACK_HOURS was derived with the lifetime as the worst \
+             buffer age at flush open (ADR-1737 decision 3 as amended)"
+        );
+        assert!(
+            worst_age_ns + lifetime_ns <= i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR,
+            "the derivation itself must hold in nanoseconds: worst buffer age at \
+             flush open ({worst_age_ns}ns) + max_flush_lifetime ({lifetime_ns}ns) \
+             must fit inside FLUSH_BOUND_SLACK_HOURS ({}ns)",
+            i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
         );
         let bound_ns = routing_to_pin_bound_ns(&shipped);
         assert!(
