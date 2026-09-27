@@ -50,9 +50,9 @@ from source, run end to end on a fresh bot-style machine (#2023 comment
 
 The two 0.123 figures come from different runs, the long-lived instance above
 and this fresh machine; they agree on throughput and differ on error ratio
-(0.245 against 0.140). A larger cache recovers part of the gap, not most of it. Under concurrency on
-a single local disk, the ranged plan's extra requests cost more than the bytes
-it saves.
+(0.245 against 0.140). A larger cache recovers part of the gap, not most of
+it. Under concurrency on a single local disk, the ranged plan's extra requests
+cost more than the bytes it saves.
 
 Separately, `--cache-max-bytes` sizes both the fetch cache and the catalog
 byte cache at the one value. The 12 GB arm above therefore also committed
@@ -155,9 +155,11 @@ were registered before the runs (#2023 comments 5854876916 and
 | concurrent QPS | 0.403 | 0.372 | 0.493 | at or above 0.40 |
 | concurrent error ratio | 0.955 | 0.043 | 0.060 | at or below 0.058 |
 
-Against the control, the 40% share cut the hot sum by 67%, far past the noise
-floor, and tied on cold sum and QPS (8% apart). The share is credited on hot
-time.
+Cold sums were within 0.4% of each other on every arm, as decision 4
+expects. The first candidate's QPS of 0.403 was measured in the restart
+window described below and is not read. In the rerun, the share beat the
+control by 67% on hot sum and 33% on QPS, both past the noise floor, so the
+share is credited on hot time and throughput.
 
 The first candidate's error ratio was not the share. One object-store PUT
 for an audit record timed out under the concurrent load. Both audit PUTs are
@@ -172,13 +174,12 @@ first version of that change. No retry fired in that run and the server was
 not restarted, so it shows the timeout did not recur rather than that the
 retry prevented it.
 
-In the rerun the share beat the control by 67% on hot sum and 33% on QPS,
-both past the noise floor, and the concurrent throughput is back to the
-v0.17.0 bot's 0.50. The error ratio missed the bar by 0.002. Every one of the
-19 errors was a memory-budget refusal (9 on the tenant limit, 7 on the
-per-query limit, 3 on a full pool with spill off), and 18 would have read
-0.057. That is the cost the Consequences name: the SQL remainder is 4.6 GB
-smaller, and the control, with 21.5 GB of it, refused less (0.043). The bar
-itself came from one v0.17.0 bot run whose run-to-run spread was never
-measured. The owner accepted the miss and kept the 40% share; #2044 tracks
-bringing the refusals under the bar without giving back the hot-time gain.
+The rerun's concurrent throughput is back to the v0.17.0 bot's 0.50. The error
+ratio missed the bar by 0.002. Every one of the 19 errors was a memory-budget
+refusal (9 on the tenant limit, 7 on the per-query limit, 3 on a full pool
+with spill off), and 18 would have read 0.057. That is the cost the
+Consequences name: the SQL remainder is 4.6 GB smaller, and the control, with
+21.5 GB of it, refused less (0.043). The bar itself came from one v0.17.0 bot
+run whose run-to-run spread was never measured. The owner accepted the miss
+and kept the 40% share; #2044 tracks bringing the refusals under the bar
+without giving back the hot-time gain.

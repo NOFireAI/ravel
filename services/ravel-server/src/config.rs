@@ -1510,7 +1510,7 @@ pub struct Cli {
     /// without going back to that disk (ADR-2023).
     /// Fallback when MemTotal is unknown: [`DEFAULT_CACHE_MAX_BYTES`]
     /// (256 MiB). Startup refuses (does not clamp) a value that, together
-    /// with the resolved `--catalog-cache-max-bytes`, exceeds
+    /// with the resolved `--catalog-cache-max-bytes`, reaches or exceeds
     /// `memory_budget_bytes`.
     #[arg(long, value_name = "BYTES")]
     pub cache_max_bytes: Option<u64>,
@@ -1529,7 +1529,7 @@ pub struct Cli {
     /// loopback; reference host: 1,503,238,553. Fallback when MemTotal is
     /// unknown: [`DEFAULT_CACHE_MAX_BYTES`] (256 MiB). Startup refuses (does
     /// not clamp) a value that, together with the resolved
-    /// `--cache-max-bytes`, exceeds `memory_budget_bytes`.
+    /// `--cache-max-bytes`, reaches or exceeds `memory_budget_bytes`.
     #[arg(long, value_name = "BYTES")]
     pub catalog_cache_max_bytes: Option<u64>,
 
@@ -2671,10 +2671,11 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// fetch-cache share to 40% while keeping the ranged plan reached 0.170,
 /// still short of the 0.40 bar the combination was measured against, which
 /// is why decision 1 restores whole-object fetching rather than keeping
-/// `byte-minimal` with a larger share alone. 40 is a starting value:
-/// ADR-2023 decision 4 is the measurement this constant is meant to be
-/// checked against, and it is the number to revisit once a fresh end-to-end
-/// run reports a figure.
+/// `byte-minimal` with a larger share alone. Measured under whole-object
+/// fetching against a 25% control of the same build, 40 cut the ClickBench
+/// hot sum by 67% and raised concurrent throughput by 33%, at the cost of
+/// memory-budget refusals from the smaller SQL remainder (ADR-2023,
+/// Acceptance).
 pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 40;
 
 /// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
