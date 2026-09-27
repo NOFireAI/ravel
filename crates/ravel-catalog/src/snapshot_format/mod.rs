@@ -18,9 +18,10 @@ pub use column_stats::{
 pub use column_stats::{encode_column_stats, encode_column_stats_v2};
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
-pub use part::{DecodedPart, decode_part, encode_part, encode_part_ranged};
+pub use part::{DecodedPart, decode_part, decode_part_header, encode_part, encode_part_ranged};
 pub use postings::{
-    DecodedPostings, NamePostings, decode_postings, encode_postings, postings_declared_tenant_hash,
+    DecodedPostings, NamePostings, decode_postings, decode_postings_header, encode_postings,
+    postings_declared_tenant_hash,
 };
 
 /// Envelope magic, first 4 bytes of every snapshot part object.

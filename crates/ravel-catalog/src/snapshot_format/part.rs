@@ -108,6 +108,35 @@ pub fn encode_part_ranged(
     Ok(out)
 }
 
+/// Reads only a part's header, without checking either crc or touching the
+/// body, so a caller can reserve `entries_uncompressed_len` before
+/// [`decode_part`] decompresses it. The caller must already have verified
+/// `bytes` against the part ref's blake3; every failure is still a typed
+/// error. `decode_part` re-reads and fully validates the same header, so this
+/// never widens what is accepted.
+pub fn decode_part_header(bytes: &[u8]) -> Result<SnapshotPartHeader, SnapshotFormatError> {
+    if bytes.len() < MIN_ENVELOPE_LEN {
+        return Err(SnapshotFormatError::TooSmall { size: bytes.len() });
+    }
+    let mut pos = 0usize;
+    let magic = take_array::<4>(bytes, &mut pos)?;
+    if magic != MAGIC {
+        return Err(SnapshotFormatError::BadMagic);
+    }
+    let version = take_bytes(bytes, &mut pos, 1)?[0];
+    if version != VERSION {
+        return Err(SnapshotFormatError::UnsupportedVersion(version));
+    }
+    let reserved = take_array::<3>(bytes, &mut pos)?;
+    if reserved != RESERVED {
+        return Err(SnapshotFormatError::ReservedNonZero);
+    }
+    let header_len = take_u32_le(bytes, &mut pos)?;
+    let header_bytes = take_bytes(bytes, &mut pos, to_usize(header_len)?)?;
+    SnapshotPartHeader::decode(header_bytes)
+        .map_err(|e| SnapshotFormatError::HeaderDecode(e.to_string()))
+}
+
 /// Decodes and fully validates a snapshot part. Every byte is untrusted;
 /// every failure is a typed error, never a panic.
 pub fn decode_part(bytes: &[u8], limits: &PartLimits) -> Result<DecodedPart, SnapshotFormatError> {

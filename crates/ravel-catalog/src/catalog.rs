@@ -572,6 +572,13 @@ pub struct Catalog {
     /// `None` in every real production run; read through
     /// [`Catalog::column_stats_part_ceiling`].
     column_stats_part_ceiling_override: Option<u64>,
+    /// The budget each resolve-path decode reserves its declared uncompressed
+    /// length against before decoding (ADR-1702 decision 6). The reservation
+    /// travels with the decoded value, including while the part or postings
+    /// cache holds it. [`Catalog::new`] installs
+    /// [`ravel_memory::MemoryBudget::unlimited`], so nothing is refused until a
+    /// caller installs a finite budget with [`Catalog::with_memory_budget`].
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -748,7 +755,32 @@ impl Catalog {
             warned_decode_failures: Mutex::new(HashSet::new()),
             column_stats_decode_refusals: AtomicU64::new(0),
             column_stats_part_ceiling_override: None,
+            memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         })
+    }
+
+    /// Charge this catalog's decoded snapshot parts, postings and
+    /// column-statistics objects to a caller-owned
+    /// [`ravel_memory::MemoryBudget`] (ADR-1702 decision 6), the same `Arc` the
+    /// query engine's fetchers reserve from. A decode whose declared
+    /// uncompressed length does not fit fails its resolve with
+    /// [`CatalogError::MemoryExhausted`] (or
+    /// [`LoadColumnStatsError::MemoryExhausted`]). Call it before the catalog
+    /// serves a read: parts already cached stay charged to the budget they were
+    /// decoded under.
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// [`crate::charged::reserve_decoded`] against this catalog's budget.
+    pub(crate) fn reserve_decoded(
+        &self,
+        declared: u64,
+        ceiling: u64,
+    ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+        crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
     }
 
     /// Enable durable `shard_count` enforcement on the resolve path (ADR-0050
@@ -1419,13 +1451,26 @@ impl Catalog {
         let mut by_content_hash: HashMap<[u8; 32], ravel_proto::catalog::v1::ColumnStatsSegment> =
             HashMap::new();
 
+        // Each decoded object's reservation (ADR-1702 decision 6), held until
+        // the merged result is built. `LoadedColumnStats` has no slot to carry
+        // them past this call; the column-stats cache's own byte budget covers
+        // the merged value from its insert onward.
+        let mut reservations = Vec::new();
         for part in &covered {
             // No field-7 ref at all: the part is simply left uncovered.
             if let Some(resolved) = column_stats_resolve::resolve_part_stats_ref(part) {
-                match column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await? {
-                    column_stats_resolve::FetchOutcome::Loaded(decoded) => {
+                match column_stats_resolve::fetch_stats_object(
+                    &getter,
+                    tenant,
+                    &resolved,
+                    &self.memory_budget,
+                )
+                .await?
+                {
+                    column_stats_resolve::FetchOutcome::Loaded(decoded, reservation) => {
                         segments.extend(decoded.segments);
                         by_content_hash.extend(decoded.by_content_hash);
+                        reservations.push(reservation);
                     }
                     // Store read or stale binding: this part is simply
                     // left uncovered, silently.
