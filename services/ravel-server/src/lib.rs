@@ -2265,28 +2265,15 @@ pub async fn start(
             .map_err(|err| anyhow::anyhow!("invalid store GET concurrency: {err}"))?,
     );
 
-    // The real query engine's deadline is the value `main` validated
-    // against `sys/gc` (ADR-0050 section 4, EC4), not an independent
-    // `EngineConfig::default()`: the deadline validated is the deadline
-    // enforced. The bytes-scanned budget (ADR-0061 decision 1) is resolved
-    // the same way from `--limits-file`'s `[defaults]` table and threaded
-    // here into the one process-wide engine both query surfaces share, so
-    // the configured budget is the enforced budget on the PromQL/HTTP and
-    // SQL/HTTP paths alike (both `build_app_state` and `build_sql_state`
-    // below take this same value). Every other engine limit stays at its
-    // default.
-    // ADR-0088: fold `--fetch-concurrency` / `--max-segments` onto the base
-    // engine config via `QueryBudgets::apply_to_engine` (the single wiring
-    // point start and the reachability tests share). Without it the engine
-    // would keep `EngineConfig::default()`'s compiled-in 8 / 1024.
-    // `fetch_concurrency` is the same knob that sets the SQL scan partition
-    // count and S3 GET concurrency (ADR-0087).
-    // ADR-0996 decision 2: `apply_to_engine` also RESOLVES
-    // `--logs-fetch-policy` against the active store cost profile and the
-    // two ADR-0904 byte flags, so the quantities the fetcher builders read
-    // off this `EngineConfig` are the resolved ones. It is fallible for the
-    // fetch bound's validation (a zero `--logs-max-fetch-run-bytes` is
-    // refused here, not at a division inside the fetch layer).
+    // The one `EngineConfig` both query surfaces share, assembled by
+    // `query::build_engine_config` (its doc comment lists every input and the
+    // running source each is read from: the validated deadline, the
+    // `--limits-file` bytes-scanned budget, the derived S3 request budget, the
+    // ADR-0088 budgets, the resolved ADR-0996 logs fetch quantities, and the
+    // three ADR-1306 fold-lag threshold inputs off `config.fold` and the
+    // catalog just built). `build_app_state` and `build_sql_state` below both
+    // take this same value, so the configured budgets are the enforced ones on
+    // the PromQL/HTTP and SQL/HTTP paths alike.
     //
     // Resolved here, above the distributed scaffolding rather than beside the
     // engine it configures, because the worker-side `FragmentService` clamps
@@ -2295,19 +2282,7 @@ pub async fn start(
     // mounted fragment listeners, and the coordinator's no-hop local path.
     // The `get_limiter` above is resolved from `config.query_budgets` for the
     // same ordering reason.
-    let engine_config = config
-        .query_budgets
-        .apply_to_engine(ravel_query::EngineConfig {
-            deadline: config.query_deadline,
-            max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
-            // The shard-aware S3 request budget (ADR-0075), resolved in `main`
-            // from `--max-s3-requests` (verbatim) or derived from `--shards`
-            // and the flush cadence. Threaded here so the running binary uses
-            // the derived value, not `EngineConfig::default()`'s
-            // no-deployment-context fallback.
-            max_s3_requests: config.max_s3_requests,
-            ..ravel_query::EngineConfig::default()
-        })
+    let engine_config = query::build_engine_config(&config, catalog.config())
         .map_err(|err| anyhow::anyhow!("invalid query engine configuration: {err}"))?;
 
     // --- ADR-0071 distributed read fan-out scaffolding ---
