@@ -483,8 +483,16 @@ RustFS, driving load, or issuing a real kill:
 
 A failure of the second scenario is release-blocking, not a flaky test. On any
 oracle failure that script names the failed assertions and exits 2, distinct
-from 1 for an ordinary failure and from anything above 2 for a setup or usage
-error, so the distinction is legible in a rehearsal record.
+from 1 for an ordinary failure and from 3 or more for a setup or usage error,
+so the distinction is legible in a rehearsal record.
+
+Both scenarios run nightly in the `chaos` job of
+`.github/workflows/k8s-nightly.yml`, against a RustFS the scripts start
+themselves, and that job's error annotation names which exit code each
+scenario returned. The helpers they rest on (the label-aware `/metrics`
+parser, commit-token extraction, and the read-your-write check) are covered
+without a store by `scripts/chaos/lib.test.sh`, which runs on every pull
+request in ci.yml's `doc-scripts` job.
 
 Record each real run here under the same discipline as the table above. A run
 without RustFS can only produce the `--check` result, which is not a rehearsal
