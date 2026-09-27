@@ -7,7 +7,7 @@ rust-version.workspace = true
 description = "DataFusion table provider over Ravel Parquet tables (ADR-2040 D3). Skeleton."
 
 [dependencies]
-ravel-pqtable = { path = "../ravel-pqtable" }
+ravel-pqtable = { path = "../ravel-pqtable", version = "0.18.0" }
 ravel-query = { workspace = true }
 ravel-cache = { workspace = true }
 ravel-object-store = { workspace = true }

@@ -1,17 +1,27 @@
-// Parquet table manifest versions (ADR-2040 decision D1). Each version of a
+// Parquet tables queried in place (ADR-2040 decision D1): the location grants
+// record and the table manifest versions.
+//
+// Two records live here. `ParquetGrants` is one mutable record per tenant at
+// `t/<tenant_hash>/pq/grants`, rewritten whole under CAS. Each version of a
 // table is one immutable object at
 // `t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm`, written with
-// CreateIfAbsent. Persistent contract: this is a Class C immutable metadata
-// record (ADR-0066 decision 4). Field numbers are frozen once shipped and only
-// additive changes are allowed; an additive change bumps `format_version`
-// under the readers-before-writers sequence, because version N+1 is built from
+// CreateIfAbsent.
+//
+// Persistent contract: both are Class C records (ADR-0066 decision 4). Field
+// numbers are frozen from the first release and only additive changes are
+// allowed; an additive change bumps `format_version` under the
+// readers-before-writers sequence, because manifest version N+1 is built from
 // version N and a reader that dropped an unknown field would write N+1
-// without it.
+// without it. Nothing has shipped yet, so the numbering below is still free to
+// move; from the first release it is not.
 syntax = "proto3";
 
 package ravel.parquet_table.v1;
 
-// One version of one Parquet table.
+// One version of one Parquet table: the pinned snapshot of the files it reads.
+// Ravel does not own those files, so a file is identified by the tuple
+// (profile, bucket, key) and pinned by ETag and, where the store reports one,
+// object version or generation.
 message ParquetTableManifest {
   // Reader floor. A reader refuses a value outside its supported read window
   // rather than decoding it with unknown fields dropped.
@@ -22,36 +32,86 @@ message ParquetTableManifest {
   // key it is stored at.
   uint64 version = 3;
   // A dropped version records that the table no longer exists. It carries no
-  // dataset, files or options.
+  // location, grant, files or options, but does carry who dropped it and the
+  // statement that did.
   bool dropped = 4;
-  // Tenant-relative dataset path the files were listed from.
-  string dataset = 5;
-  // Snapshot of the table's data objects, in the order the writer listed them.
-  repeated ParquetFile files = 6;
+  // The LOCATION URL this version was created from, as the statement gave it.
+  string location = 5;
+  // The grant that admitted `location`, rendered as its URL. Audit only: a
+  // read re-checks the grants that exist at read time, never this one.
+  string grant = 6;
+  // Snapshot of the external Parquet files, in the order the writer listed
+  // them.
+  repeated ParquetFile files = 7;
   // Table options and coercions (ADR-2040 decision D5).
-  map<string, string> options = 7;
+  map<string, string> options = 8;
   // Principal that wrote this version.
-  string created_by = 8;
+  string created_by = 9;
   // Write time of this version, Unix nanoseconds.
-  int64 created_unix_ns = 9;
+  int64 created_unix_ns = 10;
   // Statement text that produced this version, as the writer supplies it
   // (ADR-2040 has the SQL writer render it through `redact`).
-  string statement = 10;
+  string statement = 11;
+  // Per-apply nonce, 16 bytes. Distinguishes two writers that would otherwise
+  // encode byte-identical bodies for the same version, so a refused
+  // CreateIfAbsent whose stored bytes differ is another writer's version and
+  // not this writer's own retried write.
+  bytes apply_nonce = 12;
 }
 
-// One content-addressed data object referenced by a manifest.
+// One external Parquet file a manifest pins.
 message ParquetFile {
-  // Full object key: `t/<tenant_hash>/pq/d/<dataset>/<hash16>.parquet`.
-  string key = 1;
+  // Credential profile the file is read through. The profile names the store
+  // kind, endpoint or account, and secrets in server configuration; a URL
+  // alone does not identify a store.
+  string profile = 1;
+  // Bucket or container holding the file.
+  string bucket = 2;
+  // Object key, raw bytes exactly as the listing returned them. Never a URL,
+  // and never re-parsed: a key may hold any byte sequence the store accepts.
+  bytes key = 3;
   // Object size in bytes, nonzero.
-  uint64 size = 2;
-  // BLAKE3 of the object's bytes, 32 bytes. The key's hash16 is the first 16
-  // lowercase hex characters of this digest.
-  bytes blake3 = 3;
+  uint64 size = 4;
+  // ETag the footer read reported, the precondition every later read carries.
+  string etag = 5;
+  // Backend object version or generation, empty when the store reports none
+  // (an unversioned S3 or Azure bucket). GCS always reports a generation.
+  string version = 6;
   // Row count from the Parquet footer, as the writer read it. The manifest
   // codec does not check it against the object.
-  uint64 row_count = 4;
+  uint64 row_count = 7;
   // Parquet footer length in bytes, excluding the 8-byte trailer, as the
   // writer read it. The manifest codec does not check it against the object.
-  uint32 footer_len = 5;
+  uint32 footer_len = 8;
+}
+
+// Every location an operator granted one tenant. One record per tenant,
+// rewritten whole under CAS (ADR-2040 decision D1). Deliberately not a field
+// of the tenant config record, which the ingest and fold paths read.
+message ParquetGrants {
+  // Reader floor, as in ParquetTableManifest.
+  uint32 format_version = 1;
+  // The tenant's grants. Two grants of one tenant whose locations overlap
+  // under different profiles are refused when a grant is added, so a location
+  // resolves to exactly one profile.
+  repeated ParquetGrant grants = 2;
+}
+
+// One granted location: a credential profile plus a location in that
+// profile's store.
+message ParquetGrant {
+  // Credential profile, resolved in server configuration. Never a secret.
+  string profile = 1;
+  // URL scheme: `s3`, `gs` or `az`.
+  string scheme = 2;
+  // Bucket or container.
+  string bucket = 3;
+  // Key prefix inside the bucket, with no leading or trailing `/`. Empty
+  // grants the whole bucket. Containment is segment-wise: `data` admits
+  // `data/x.parquet`, never `data2/x.parquet`.
+  string prefix = 4;
+  // When the grant was added, Unix nanoseconds.
+  int64 created_unix_ns = 5;
+  // Operator principal that added it.
+  string created_by = 6;
 }
