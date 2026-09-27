@@ -77,9 +77,16 @@ Field notes:
   segment opens do not fold into each other's counts.
 - `catalog_decode` records `matcher_count` and `total_size` at open and
   `series_matched` once the decode finds its matching series.
-- `page_fetch` and `decode` carry `page_kind` (`scalar` or `histogram`) and
-  `series_count`. `page_fetch` records the GET cost of pulling pages;
-  `decode` records `decompressed_bytes`, the uncompressed size it produced.
+- `page_fetch` and `decode` carry `page_kind` and `series_count`. On `decode`,
+  `page_kind` is `scalar` or `histogram`. On `page_fetch` it can also be
+  `mixed`: a segment's scalar and histogram pages are fetched in one batch,
+  so when a query selects series of both kinds from the same segment (a
+  PromQL or SQL prefetch that needs both), one `page_fetch` span covers both,
+  its `series_count` is the scalar and histogram series together, and its
+  `s3_requests`/`s3_bytes` are the one batch's GET cost. That fetch is then
+  followed by two `decode` spans, one `scalar` and one `histogram`.
+  `page_fetch` records the GET cost of pulling pages; `decode` records
+  `decompressed_bytes`, the uncompressed size it produced.
 - `evaluate` carries `eval_kind` (`instant` or `range`) and no counts; it is
   pure in-memory evaluation over already-fetched data, so its cost is time,
   not bytes.

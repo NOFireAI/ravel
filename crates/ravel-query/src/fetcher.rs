@@ -1603,8 +1603,9 @@ impl SegmentFetcher {
         })
     }
 
-    /// Fetches the four sparse catalog sections named by `ranges` (coalesced
-    /// into as few GETs as their layout allows) and decodes the chunked catalog
+    /// Fetches the four sparse catalog sections named by `ranges` in one GET
+    /// (bridging the gaps between them, and skipping what `regions` already
+    /// holds, so none when it holds them all) and decodes the chunked catalog
     /// from them, without the page sections. Each section is crc-verified by
     /// [`decode_catalog_v5_chunked`], so a mis-ranged or corrupt fetch is a
     /// typed error, never wrong data.
