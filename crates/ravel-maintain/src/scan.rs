@@ -152,6 +152,43 @@ pub struct MaintainReport {
     /// L0-record count compaction exposes without an extra listing, so it is
     /// the figure `ravel_maintain_l0_records_pending` renders (issue #1729).
     pub l0_records_pending: usize,
+    /// The largest retention lag this pass observed, in nanoseconds: for the
+    /// oldest bucket that is expired (past `bucket_end + retention_window`) yet
+    /// still physically present (tombstoned, swept-partial, or blocked by a
+    /// HEAD snapshot), how far `now` is past that deadline. `0` when the pass
+    /// found no still-present expired bucket. A fully swept-empty bucket
+    /// contributes nothing: its data is gone, so there is no lag to report.
+    ///
+    /// The deadline is the hour's nominal expiry (`(hour + 1) * NS_PER_HOUR +
+    /// retention_window_ns`), the same instant [`classify_zone`] uses to open a
+    /// bucket's tail window, not the bucket's exact maximum-event expiry (which
+    /// needs decoded records). Because a sealed bucket's events fall inside its
+    /// own hour, this nominal deadline is at or after the true expiry, so the
+    /// lag reported here is a slight under-estimate of the true one, never an
+    /// over-estimate. It is the figure `ravel_maintain_retention_lag_seconds`
+    /// renders (issue #1729).
+    pub retention_lag_ns: i64,
+}
+
+/// Retention lag, in nanoseconds, of a bucket that is expired yet still present:
+/// how far `now_ns` is past the hour's nominal retention deadline
+/// (`(hour + 1) * NS_PER_HOUR + retention_window_ns`). `0` when the tenant has
+/// no retention policy, or `now` has not yet reached the deadline (which a
+/// still-present expired bucket has, so this clamps only a benign clock/rounding
+/// edge). Uses saturating arithmetic throughout, matching [`classify_zone`].
+fn expired_bucket_retention_lag_ns(
+    hour: u32,
+    now_ns: i64,
+    retention_window_ns: Option<i64>,
+) -> i64 {
+    let Some(window_ns) = retention_window_ns else {
+        return 0;
+    };
+    let bucket_end_ns = i64::from(hour)
+        .saturating_add(1)
+        .saturating_mul(NS_PER_HOUR);
+    let deadline_ns = bucket_end_ns.saturating_add(window_ns);
+    now_ns.saturating_sub(deadline_ns).max(0)
 }
 
 /// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
@@ -1263,21 +1300,34 @@ pub async fn scan_and_maintain_with_memo(
         )
         .await?;
         match retention_outcome {
-            // The bucket is (being) retired; compaction was skipped by design.
-            RetentionOutcome::Tombstoned
-            | RetentionOutcome::Swept
-            | RetentionOutcome::SweptPartial => {
+            // Fully retired: the bucket's data is gone, so it is not a
+            // still-present expired bucket and contributes no retention lag.
+            RetentionOutcome::Swept => {
                 report.retired += 1;
+            }
+            // Expired but still present (tombstoned within the horizon, or
+            // horizon elapsed with residue left for the next pass); compaction
+            // was skipped by design. Its retention lag is a candidate for this
+            // pass's maximum.
+            RetentionOutcome::Tombstoned | RetentionOutcome::SweptPartial => {
+                report.retired += 1;
+                report.retention_lag_ns = report.retention_lag_ns.max(
+                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns),
+                );
             }
             // The expired bucket's physical sweep was blocked by HEAD
             // reachability (ADR-0020): count by reason and treat as retired
             // work-in-progress (compaction was skipped, same as a tombstone).
+            // The bucket is still present, so it contributes retention lag too.
             RetentionOutcome::BlockedBySnapshot(reason) => {
                 report.retired += 1;
                 match reason {
                     SnapshotBlock::Named => report.blocked_by_snapshot += 1,
                     SnapshotBlock::Unreadable => report.blocked_by_unreadable_head += 1,
                 }
+                report.retention_lag_ns = report.retention_lag_ns.max(
+                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns),
+                );
             }
             // Retention left the bucket live; the compaction outcome classifies
             // it (compaction always ran in these arms; see maintain_bucket).
@@ -2230,6 +2280,88 @@ mod invalidate_tests {
             memo.terminal_state(t, Signal::Spans, SHARD, HOUR),
             None,
             "a published spans rewrite must invalidate the memoized terminal state"
+        );
+    }
+
+    /// The pure lag function (issue #1729): the deadline is the hour's nominal
+    /// end plus the retention window, and the lag is `now` past it, clamped at
+    /// zero, and `0` with no policy.
+    #[test]
+    fn expired_bucket_retention_lag_ns_is_now_past_the_nominal_deadline() {
+        let window = 6 * NS_PER_HOUR;
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        let now = bucket_end + window + 5 * NS_PER_HOUR;
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window)),
+            5 * NS_PER_HOUR,
+            "lag is now minus (bucket_end + window)"
+        );
+        // Not yet at the deadline: clamped to zero, never negative.
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, bucket_end, Some(window)),
+            0
+        );
+        // No retention policy: no deadline, no lag.
+        assert_eq!(expired_bucket_retention_lag_ns(HOUR, now, None), 0);
+    }
+
+    /// End to end through `scan_and_maintain` with an injected clock: a sealed,
+    /// expired, still-present (freshly tombstoned) bucket makes
+    /// `MaintainReport::retention_lag_ns` the exact distance from `now` to the
+    /// bucket's nominal retention deadline (issue #1729). Flip-line proof:
+    /// dropping the `retention_lag_ns` update from the Tombstoned arm leaves this
+    /// at `0`.
+    #[tokio::test]
+    async fn scan_reports_exact_retention_lag_for_a_still_present_expired_bucket() {
+        use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
+
+        let store = MemoryStore::new();
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let config = CompactorConfig::default();
+        // A window at the ADR-0019 floor, so the fixture's near-epoch event is
+        // safely expired, and read the exact window back for the assertion.
+        let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: None,
+                tenants: vec![(TENANT.to_string(), window)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("valid retention config");
+        assert_eq!(retention.window_for(&t), Some(window));
+
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        // Five hours past the deadline, and far enough in the future that the
+        // bucket is sealed.
+        let now = bucket_end + window + 5 * NS_PER_HOUR;
+        let clock = FixedClock::new(now);
+
+        let report = scan_and_maintain(
+            &store,
+            &clock,
+            &config,
+            &retention,
+            &NoLeases,
+            t,
+            Signal::Metrics,
+            SHARD,
+        )
+        .await
+        .expect("scan");
+
+        assert_eq!(report.retired, 1, "the expired bucket was tombstoned");
+        assert_eq!(
+            report.retention_lag_ns,
+            now - (bucket_end + window),
+            "lag is now past the nominal deadline"
+        );
+        assert_eq!(
+            report.retention_lag_ns,
+            5 * NS_PER_HOUR,
+            "the bucket is exactly five hours past its retention deadline"
         );
     }
 }

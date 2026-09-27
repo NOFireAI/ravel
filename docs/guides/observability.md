@@ -1189,7 +1189,7 @@ Labels: `mode`.
 | `ravel_maintain_tenants_maintained` | Gauge. Discovered tenants actually maintained this cycle, after any flag restriction. |
 | `ravel_maintain_tenant_discovery_failures_total` | Maintenance cycles skipped because tenant discovery itself failed. |
 
-### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`, `ravel_maintain_l0_records_pending`, `ravel_maintain_objects_deleted_total`)
+### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`, `ravel_maintain_l0_records_pending`, `ravel_maintain_objects_deleted_total`, `ravel_maintain_bytes_reclaimed_total`, `ravel_maintain_retention_lag_seconds`)
 
 Labels: `mode`, plus `signal` on every series except the legal-hold counter
 (`mode` only) and `ravel_maintain_objects_deleted_total`, which carries `mode`
@@ -1200,6 +1200,8 @@ and `kind` and no `signal`. These carry no `tenant_hash` label.
 | `ravel_maintain_legal_hold_refresh_failures_total` | Legal-hold refresh failures. Each one skips that tenant's whole maintenance tick. |
 | `ravel_maintain_l0_records_pending` | Gauge. L0 commit records sitting below `min_compaction_inputs` in a sealed bucket, by signal, summed over every tenant and shard this process maintains. |
 | `ravel_maintain_objects_deleted_total` | Objects the sweep physically deleted, by `kind`: `superseded_records_deleted`, `superseded_data_deleted`, `unreferenced_parts_deleted`, `quarantine_reaped`. |
+| `ravel_maintain_bytes_reclaimed_total` | Bytes of deleted objects reclaimed by the sweep, by signal. Counts only the quarantine reaper and the unreferenced-part delete, whose object sizes the sweep already listed; superseded and retention deletions are excluded because they delete by key without a listed size, so this is a lower bound. Per process. |
+| `ravel_maintain_retention_lag_seconds` | Gauge. How far past its retention deadline the oldest still-present expired bucket is, by signal, from this process's most recent completed cycle. 0 when none. A per-cycle maximum over the process's units, so it names the single worst bucket. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
 | `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the last completed orphan pass, by signal. |
@@ -1262,6 +1264,29 @@ every cycle publishes the whole pending population rather than only what that
 cycle re-read. The count a skipped bucket contributes is as old as its last
 re-verify, so a bucket that crossed the threshold since then is reflected only
 once its re-verify or its compaction runs.
+
+`ravel_maintain_bytes_reclaimed_total` is the throughput counterpart to those
+pending gauges: bytes physically freed by the sweep. It counts only the two
+deletions whose object size the sweep already listed, the quarantine reaper and
+the unreferenced-part delete, so it is a lower bound on all bytes reclaimed, not
+the whole of it. Superseded and retention deletions delete by object key without
+a listed size, and charging their bytes would cost an extra HEAD per object, so
+they are deliberately excluded; `ravel_maintain_objects_deleted_total{kind=...}`
+still counts those deletions. It is a per-process counter: sum it across maintain
+replicas for a deployment-wide figure.
+
+`ravel_maintain_retention_lag_seconds` reports how far retention's physical sweep
+has fallen behind. For the oldest bucket that is expired (past its hour's
+retention deadline) yet still physically present, it is how far the clock is past
+that deadline; it is `0` when no expired bucket is still present. It is a gauge
+and a per-cycle maximum over the units this process owns, so it names the single
+worst bucket rather than a sum, and a scrape mid-cycle reads the previous
+completed cycle's value. A steadily climbing value means expired data is not
+being deleted fast enough (a HEAD-reachability block from a lagging fold, an
+out-of-window format version, or a legal hold on the bucket); a healthy sweep
+holds it near one protection horizon. With several maintain replicas take the
+maximum across them, not the sum: each owns a disjoint share of the units and the
+lag is a worst-case, not an additive, figure.
 
 ### Maintenance ownership and concurrency (`ravel_maintain_workers_live`, `ravel_maintain_units_*`, `ravel_maintain_memo_warm_start_units_total`, `ravel_maintain_full_sweep_passes_total`)
 
