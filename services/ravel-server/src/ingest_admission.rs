@@ -984,6 +984,8 @@ mod tests {
         let waited = started.elapsed();
 
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
+        // virtual clock, which moves only when a timer fires.
         assert!(
             waited >= INGEST_BODY_READ_TIMEOUT && waited < TEST_DEADLINE,
             "refused at the bound, after {waited:?}"
@@ -1071,6 +1073,8 @@ mod tests {
                 "request body not received within 30s".to_string()
             )
         );
+        // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
+        // virtual clock, which moves only when a timer fires.
         assert!(
             waited >= INGEST_BODY_READ_TIMEOUT && waited < TEST_DEADLINE,
             "refused at the bound, after {waited:?}"
