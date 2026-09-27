@@ -320,6 +320,26 @@ records, compaction records, L0 data, L1 segments, and the tombstone last) once
 `now >= retired_at_ns + protection_horizon`, and only after a verifying listing
 shows the bucket empty but for its tombstone.
 
+Before that first delete the sweep reads the trailer of every data object in
+the bucket, one 16-byte ranged GET per object, and checks its format version
+against the running build's reader window for the bucket's own format: metric
+segments for metrics, log segments for logs, span segments for spans. If any
+object carries a version this build does not read, the sweep deletes nothing in
+that bucket, leaves the tombstone in place, logs a warning naming the versions,
+and counts the objects on `held_out_of_window_objects_total` (an in-process
+counter, not yet on the scrape endpoint; see below). Such an object is usually
+not corrupt: the other side of a rolling upgrade, or the build a rollback
+returns to, reads it. An object at a retired version older than this build's
+window is held the same way, and neither finishing a rollout nor rolling back
+clears that hold, because no current build reads it. This is what makes a binary rollback across a format bump
+lose queryability rather than data, for all three signals: the rolled-back
+build cannot query the newer objects, but it does not delete them, and the
+bucket is retired normally once a build that reads them runs again. A trailer
+with a bad magic, signal, reserved field or footer length is corruption and is
+swept as usual. The check reads the trailer only, not the footer checksum, so
+damage confined to the version field reads as an unreadable version and holds
+the bucket rather than sweeping it.
+
 ### The two timing values
 
 - `grace`, default 24h, is the floor for the orphan and unreferenced-L1 age
