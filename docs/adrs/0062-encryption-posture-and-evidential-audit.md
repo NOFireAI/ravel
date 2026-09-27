@@ -188,3 +188,20 @@ exhausted or non-transient failure fails every awaiting query closed is
 unchanged; this amendment only changes how many attempts happen, and how an
 `AlreadyExists` on a retry is told apart from a real collision, before that
 rule is reached.
+
+The retry ladder is bounded two further ways. First, its jittered backoff is
+drawn from `ravel_commit::RngSource` (`SystemRng` in production), not from a
+direct `rand::random_range` call: ADR-0068 decision 2 restricts direct
+OS-entropy calls on this kind of path, and both PUT loops take the source
+through a `write_audit_batch_with_rng` seam so a test can substitute a seeded
+one. Second, one `AUDIT_WRITE_BUDGET` (30 seconds) covers both PUTs and every
+attempt in a single flush's write, so a store that is hung rather than merely
+slow still fails the batch closed within that ceiling instead of running the
+full three-attempt ladder against a store that never answers; a retry whose
+delay would not fit the remaining budget is not attempted, and the flush
+fails closed with the last observed error. When the transient error is a
+`StoreError::Throttled` hint, the wait before the next attempt is the larger
+of that hint and the jittered backoff, still subject to the same budget
+check. Every attempt the ladder retries is counted on `/metrics` as
+`ravel_audit_put_retries_total`, alongside the existing
+`ravel_audit_write_failures_total`.
