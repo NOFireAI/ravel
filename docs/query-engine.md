@@ -643,9 +643,10 @@ object grows past the target (`IngestConfig::default`, the `max_queued_flushes`
 comment), so a flush can exceed 8 MiB. Above the 512 KiB whole-object
 threshold its page-range GET count used to grow with the page runs a query
 selected: a matcher taking every other series of a 7,700,472-byte flush left
-48 runs that coalescing could not join, and 48 page GETs. `SegmentFetcher::fetch_pages` therefore bridges the smallest
-remaining gaps (`bound_runs`) until at most
-`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4) runs are left, on an L0 segment only.
+48 runs that coalescing could not join, and 48 page GETs.
+`SegmentFetcher::fetch_pages` therefore bridges the smallest remaining gaps
+(`bound_runs`) until at most `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4) runs are
+left, on an L0 segment only.
 Scalar and histogram runs are planned and fetched in one batch, and the
 catalog sections go as one run (three on the dense path, four on the sparse
 catalog-probe path), so the bound holds per segment fetch whichever page
