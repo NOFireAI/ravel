@@ -16,8 +16,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   above the fetcher's 512 KiB whole-object threshold: one fetch of an L0
   segment now issues at most 4 page-range GETs, bridging the smallest gaps
   between the page runs a query selects when there are more, so it costs at
-  most 7 GETs plus its commit-record GET. An explicit `--max-s3-requests` is
-  still used as given.
+  most 7 GETs plus its commit-record GET. The bridged gap bytes are fetched,
+  reserved against the process fetch memory budget and charged to
+  `max_bytes_scanned`, so a selective query over large L0 flushes can read up
+  to about the object size per segment, the same order as the existing
+  whole-object fallback. The per-flush figure holds per selector: each
+  selector fetches the segment again, so an N-selector query can spend up to
+  `1 + 7N` requests per flush, which the derived budget does not scale for. An
+  explicit `--max-s3-requests` is still used as given.
 
 ## [0.18.0] - 2026-09-26
 

@@ -636,20 +636,31 @@ The within-segment GET/byte model is the `selective_read_accounting` bench.
 
 ### The L0 page-range bound (ADR-1306)
 
-An unsealed L0 flush is one ingest buffer, up to ingest's 8 MiB size trigger,
-and above the 512 KiB whole-object threshold its page-range GET count used to
-grow with the page runs a query selected: a matcher taking every other series
-of a 7,700,472-byte flush left 48 runs that coalescing could not join, and
-48 page GETs. `SegmentFetcher::fetch_pages` therefore bridges the smallest
+An unsealed L0 flush is one ingest buffer. Ingest's 8 MiB `target_bytes` size
+trigger does not cap it: a deferred trigger keeps merging into the same buffer,
+and a native-histogram buffer can stay under the memory backstop while its
+object grows past the target (`IngestConfig::default`, the `max_queued_flushes`
+comment), so a flush can exceed 8 MiB. Above the 512 KiB whole-object
+threshold its page-range GET count used to grow with the page runs a query
+selected: a matcher taking every other series of a 7,700,472-byte flush left
+48 runs that coalescing could not join, and 48 page GETs. `SegmentFetcher::fetch_pages` therefore bridges the smallest
 remaining gaps (`bound_runs`) until at most
 `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4) runs are left, on an L0 segment only.
-Scalar and histogram runs are planned and fetched in one batch, and the four
-catalog sections go as one run, so the bound holds per segment whichever page
+Scalar and histogram runs are planned and fetched in one batch, and the
+catalog sections go as one run (three on the dense path, four on the sparse
+catalog-probe path), so the bound holds per segment fetch whichever page
 kinds a query selects. One L0 fetch therefore costs at most
 `MAX_GETS_PER_L0_SEGMENT_FETCH` = 7 GETs: the first GET, one footer chase, one
 catalog GET and 4 page GETs. Bridging moves the bytes in a bridged gap that
 the query did not ask for, which is the trade the bound makes: a bounded,
 predictable request count per flush in exchange for bytes inside one segment.
+The bridged gap bytes are fetched like any other page bytes: they are reserved
+against the process fetch memory budget before the GETs are issued, and they
+are charged to the scan phase and to `max_bytes_scanned`. A selective query over
+large L0 flushes can therefore read up to about the object size per segment,
+the same order as the existing whole-object fallback, which reads a segment at
+or under the threshold, or a sparse object that does not qualify for the
+catalog-probe path, whole.
 An L1 segment keeps unbounded page runs, since a compacted segment can be far
 larger than one flush and bridging its gaps would move far more.
 
@@ -1138,9 +1149,14 @@ sized at `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of
 `REQUESTS_PER_UNSEALED_FLUSH` (2, the measured cold cost of a flush at or under
 the whole-object threshold) and `MAX_REQUESTS_PER_UNSEALED_FLUSH` (8, its
 commit-record GET plus `MAX_GETS_PER_L0_SEGMENT_FETCH`), so the per-flush term
-is an upper bound at any flush size ingest can produce, not only under the
-threshold. At 4 shards and 2 s that is
-`ceil(14,100 / 2) x 8 x 3/2 x 4 + 5,000 = 343,400`.
+is an upper bound per selector fetch at any flush size ingest can produce, not
+only under the threshold. At 4 shards and 2 s that is
+`ceil(14,100 / 2) x 8 x 3/2 x 4 + 5,000 = 343,400`. It is not an upper bound
+per query: `prefetch` fetches each segment once per selector (the
+`estimate_cost` comment in `engine.rs`), while the commit record is read once
+at resolve, so an N-selector query pays up to `1 + 7N` requests per unsealed
+flush against a budget sized at 8. The derived budget does not scale with the
+selector count (ADR-1306, "Amendment (2026-09-27)").
 
 `crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
