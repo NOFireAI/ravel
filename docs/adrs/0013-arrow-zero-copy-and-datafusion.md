@@ -48,7 +48,8 @@ Option 3. Concretely:
 - Two security invariants with the same standing as ADR-0011's
   structural isolation: the SQL surface accepts exactly one read-only
   SELECT statement (DDL, DML, COPY, SET, multi-statement rejected at
-  parse time, no object store registered in the SQL runtime), and every
+  parse time, no object store registered in the SQL runtime; for Parquet
+  tables and their DDL see the ADR-2040 amendment below), and every
   query runs in a fresh single-tenant `SessionContext` with no shared or
   cached runtime state. Relaxing either requires an ADR.
 - Query budgets bridge to DataFusion through a budget-sized per-query
@@ -150,3 +151,27 @@ The code is correct; this amendment makes the ADR match it.
   (`"grow-path memory-ceiling probe; not wired as a gate"`) precisely for
   that reason: it is a recorded violated invariant and a known gap, not a
   demonstration of accepted behavior and not a failing gate.
+
+## Amendment (2026-09-27): Parquet tables and table DDL (ADR-2040)
+
+<!-- amendment-applies: sections="Decision" pointer="ADR-2040 amendment" -->
+
+ADR-2040 replaces the first security invariant with "a SQL caller can name
+tables, never storage". Two parts of it change.
+
+- **DDL.** `CREATE EXTERNAL TABLE ... STORED AS PARQUET`,
+  `CREATE OR REPLACE EXTERNAL TABLE` and `DROP TABLE` are admitted through a
+  separate executor entry point. They require a `ddl` capability on the
+  caller's token, and each is audited. `LOCATION` names a dataset under the
+  caller's own prefix and never a scheme, bucket or credential. Every other
+  statement kind stays refused, and the read path still admits exactly one
+  read-only `SELECT`.
+- **The store registry.** A query over a Parquet table runs in a session
+  whose registry answers exactly one URL, `ravel-pq://<tenant_hash>/`, for
+  the querying tenant. It refuses every other URL and every
+  `register_store`, and the store behind it serves only the data keys listed
+  in the manifests that query resolved. Every other session keeps the empty
+  registry.
+
+The second invariant (a fresh single-tenant `SessionContext` per query) is
+unchanged.
