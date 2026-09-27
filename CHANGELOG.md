@@ -178,9 +178,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   PUT now retries up to two more times with a short jittered backoff when the
   error is one already classified as transient, and only a non-retryable
   error or one that keeps failing across every attempt still fails the batch
-  closed, exactly as before. A single 30 s budget bounds a whole batch's
-  writes, both PUTs and every retry, so a hung store still fails closed
-  rather than stretching out for the full retry ladder; every retried
+  closed, exactly as before. A 30 s budget bounds each tenant group's
+  writes in a flush, both PUTs and every retry, so a hung store still fails
+  closed rather than stretching out for the full retry ladder. A flush
+  writes its tenant groups one after another, so against a hung store a
+  query can wait up to 30 s for each group ahead of its own; every retried
   attempt is now counted on `/metrics` as `ravel_audit_put_retries_total`.
 - **The default query request budget is now derived from the unsealed tail a
   healthy catalog carries plus the fold-stall alert window** (ADR-1306). At 4
