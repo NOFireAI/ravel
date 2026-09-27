@@ -32,6 +32,7 @@ use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_types::{Signal, TenantHash, TenantHashScheme, TenantId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::health::{self, HealthState};
@@ -171,6 +172,12 @@ pub enum Error {
     /// as before the task was spawned).
     #[error("controller task panicked: {0}")]
     ControllerTaskPanicked(#[from] tokio::task::JoinError),
+
+    /// The `/healthz` `/readyz` `/metrics` listener could not bind
+    /// `--listen-health` (ADR-1731 decision 2). Returned by [`run`] before
+    /// the controller starts.
+    #[error(transparent)]
+    HealthListenerBind(#[from] health::BindError),
 }
 
 /// Shared reconcile context.
@@ -2816,12 +2823,12 @@ fn error_policy(_obj: Arc<RavelCluster>, error: &Error, _ctx: Arc<Context>) -> A
 /// and owns the Deployments and Services it creates.
 ///
 /// `listen_addr` is where [`crate::health::serve`] answers `/healthz`,
-/// `/readyz`, and `/metrics` (ADR-1731 decisions 2 and 4). The controller
-/// itself runs as a spawned task, not inline, so this function's own
-/// `.await` below is on that task's `JoinHandle`, letting the health
-/// listener's `/healthz` observe the controller's termination as the
-/// liveness signal.
+/// `/readyz`, and `/metrics` (ADR-1731 decisions 2 and 4). It is bound first,
+/// before any API call, so an occupied or unbindable address fails startup
+/// with [`Error::HealthListenerBind`] instead of leaving a controller running
+/// with no probe surface.
 pub async fn run(listen_addr: SocketAddr) -> Result<(), Error> {
+    let listener = health::bind(listen_addr).await?;
     let client = Client::try_default().await?;
 
     // Read the apiserver version once at startup, not per reconcile: a
@@ -2876,6 +2883,24 @@ pub async fn run(listen_addr: SocketAddr) -> Result<(), Error> {
         }
     };
 
+    run_on(listener, client, kubernetes_version).await
+}
+
+/// The part of [`run`] after the listener is bound and the client and
+/// apiserver version are resolved: serves `listener`, then runs the
+/// controller until its stream ends. Public so an integration test can drive
+/// the same wiring against a fake apiserver.
+///
+/// The controller runs as a spawned task, not inline, so this function's own
+/// `.await` below is on that task's `JoinHandle`, letting the health
+/// listener's `/healthz` observe the controller's termination as the
+/// liveness signal.
+pub async fn run_on(
+    listener: TcpListener,
+    client: Client,
+    kubernetes_version: Option<Info>,
+) -> Result<(), Error> {
+    let listen_addr = listener.local_addr().ok();
     let clusters: Api<RavelCluster> = Api::all(client.clone());
     let deployments: Api<Deployment> = Api::all(client.clone());
     let services: Api<Service> = Api::all(client.clone());
@@ -2904,41 +2929,29 @@ pub async fn run(listen_addr: SocketAddr) -> Result<(), Error> {
     // `Controller::new`, which also drives the primary off `applied_objects`).
     // The reflector store feeds the same owner lookups `.owns()` needs.
     let (reader, writer) = reflector::store();
+    let health_state = Arc::new(HealthState::new(reader.clone(), metrics));
+
+    // Readiness (decision 4) flips on the reflected stream's first `InitDone`,
+    // once the initial list is in the store. Not `Store::wait_until_ready`:
+    // its one-shot keeps a single waker, and the controller waits on the same
+    // store, so a second waiter is never woken.
+    let ready_state = Arc::clone(&health_state);
     let cluster_events = watcher(clusters, watcher::Config::default())
         .default_backoff()
         .reflect(writer)
+        .inspect(move |event| {
+            if matches!(event, Ok(watcher::Event::InitDone)) {
+                ready_state.mark_ready();
+            }
+        })
         .applied_objects()
         .predicate_filter(predicates::generation, Default::default());
 
-    let health_state = Arc::new(HealthState::new(reader.clone(), metrics));
-
-    // Readiness (decision 4): flips once the reflector's initial list has
-    // arrived. `wait_until_ready` resolves `Err` only if the reflector's
-    // writer half is dropped, which happens only once the watch stream
-    // itself has ended; there is nothing useful to do but leave `/readyz`
-    // reporting not-ready forever in that case, so the error is discarded.
-    {
-        let health_state = Arc::clone(&health_state);
-        let ready_reader = reader.clone();
-        tokio::spawn(async move {
-            if ready_reader.wait_until_ready().await.is_ok() {
-                health_state.mark_ready();
-            }
-        });
-    }
-
-    {
-        let health_state = Arc::clone(&health_state);
-        tokio::spawn(async move {
-            if let Err(error) = health::serve(listen_addr, health_state).await {
-                warn!(%error, "health listener stopped");
-            }
-        });
-    }
+    tokio::spawn(health::serve(listener, Arc::clone(&health_state)));
 
     info!(
         minimum_kubernetes_minor_version = MIN_KUBERNETES_MINOR_VERSION,
-        listen_addr = %listen_addr,
+        listen_addr = ?listen_addr,
         "starting ravel-operator controller"
     );
 

@@ -66,17 +66,15 @@ blake3 = { workspace = true }
 # this is the only crate whose Cargo.toml needs to change.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # The operator's own `/healthz` `/readyz` `/metrics` listener (ADR-1731
-# decision 2). `hyper` is the workspace pin; `hyper-util` and
-# `http-body-util` are new direct dependencies (not yet in
-# [workspace.dependencies], since this task's scope excludes the workspace
-# root Cargo.toml), pinned to the versions Cargo.lock already resolves them
-# to via other crates' transitive graphs. Three fixed paths need no router
-# (axum/tower are rejected in the ADR), so only the low-level server pieces
-# are pulled in: `http1` (kubelet and Prometheus scrapers are HTTP/1.1) and
-# `tokio` (for `TokioIo`), not `server`, `client`, or `http2`.
+# decision 2). All three are workspace pins; `hyper-util` and
+# `http-body-util` entered the workspace table at the versions Cargo.lock
+# already resolved. Three fixed paths need no router (axum/tower are rejected
+# in the ADR), so only the low-level server pieces are pulled in: `http1`
+# (kubelet and Prometheus scrapers are HTTP/1.1) and `tokio` (for `TokioIo`),
+# not `client` or `http2`.
 hyper = { workspace = true, features = ["server", "http1"] }
-hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
-http-body-util = { version = "0.1.4", default-features = false }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util = { workspace = true }
 bytes = "1"
 
 [dev-dependencies]
