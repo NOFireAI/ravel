@@ -270,6 +270,7 @@ fn harness_with_sql_deadline(
             None,
             None,
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         ),
         analytics: analytics.clone(),
         exemplars: exemplars.clone(),
@@ -1010,6 +1011,7 @@ async fn promql_routes_record_usage_through_the_wired_sink() {
         None,
         None,
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     );
 
     let request = Request::builder()

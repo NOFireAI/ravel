@@ -6,6 +6,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **PromQL fetches now reserve against the same process-wide memory budget
+  as SQL execution** (issue #1255). `ravel-server` hands the PromQL engine
+  and the startup cache warm pass the one `MemoryBudget` its SQL executor
+  already uses, and with `--distributed-query` on it hands the same budget
+  to the fragment service that runs metrics slices, both for remote workers
+  and for the coordinator's own no-hop local path.
+  An RSEG or RLOG fetch for a PromQL query that needs more than the budget's
+  remainder fails with `FetchMemoryExhausted` (HTTP 503 on the PromQL API)
+  instead of running unbounded, and the next query is admitted as before.
+  The `/metrics` gauges now report real values:
+  `ravel_memory_reserved_bytes{component="fetch"}` is the bytes held by live
+  fetch reservations, `component="sql"` is the rest of the budget's reserved
+  total rather than all of it, and `ravel_memory_handoff_overlap_bytes` is
+  the part of the fetch share whose bytes went through the read cache, hit
+  or miss, whether or not the cache kept them. The SQL path's own RSEG,
+  RLOG and RSPAN fetchers still reserve against private unlimited budgets.
 ### Added
 
 - **`/metrics` now renders a per-shard ingest skew family** (issue #1692).

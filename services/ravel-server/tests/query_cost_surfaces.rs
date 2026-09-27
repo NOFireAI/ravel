@@ -174,6 +174,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         None,
         None,
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     );
     let promql = promql_router(app_state);
 
