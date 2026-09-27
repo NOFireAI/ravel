@@ -754,9 +754,14 @@ impl ScrubCursor {
     /// Record this tick's tail count, a tally of every entry listed after
     /// [`tail_count_start`](Self::tail_count_start). Its growth over the
     /// window's count last time is what was appended since, and the window
-    /// moves to the directories this pass saw last. A window that shrank
-    /// (retention or a sweep deleted entries in it) counts no appends, which
-    /// can only overstate what is left to walk, never understate it.
+    /// moves to the directories this pass saw last. The growth is net of
+    /// deletions in the window (retention or a sweep): a deletion cancels an
+    /// append counted in the same pass, and a window that shrank counts none.
+    /// When the deleted entries were still ahead of the marker the walk will
+    /// not meet them either, so a cancelled append leaves the estimate right
+    /// and a deletion with no append to cancel leaves it high. When the walk
+    /// had already consumed them, the appends they cancel are real entries
+    /// still ahead, and the estimate understates what is left to walk.
     pub fn observe_tail(&mut self, tally: &TailTally) {
         let appended = tally.entries.saturating_sub(self.rotation_tail_entries);
         self.rotation_appended_entries = self.rotation_appended_entries.saturating_add(appended);
