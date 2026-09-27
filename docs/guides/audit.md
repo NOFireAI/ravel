@@ -21,7 +21,12 @@ body or the ticket a client sent, so a tenant can neither forge one nor
 suppress one for a query it ran.
 
 A single group-commit pipeline writes every surface's records; `--audit-mode`
-governs what happens when it cannot. `--audit-mode required` (the default)
+governs what happens when it cannot. Each of the pipeline's two writes (the
+data object, then its commit record) retries a transient object-store error
+(a timeout or a throttle response) a few times with a short backoff before
+giving up, so one slow request does not fail a batch that would otherwise
+have gone through; a non-transient error, or one that keeps failing across
+every attempt, still fails the batch closed. `--audit-mode required` (the default)
 fails the query with a 503 (HTTP) or `Unavailable` (Flight) when its record
 cannot be made durable, so a query never outlives its own trail.
 `--audit-mode best-effort` logs the failure, counts it on
@@ -37,7 +42,8 @@ On shutdown, the server stops every listener first, then drains whatever is
 still buffered: one last group write, after which no query surface can submit
 again. That drain is bounded at `--audit-max-age` plus five seconds. A store
 that is merely slow finishes well inside it, since the write is one object PUT
-plus one commit record under the usual retry ladder. A store that never answers
+plus one commit record, each retried a few times on its own before the
+pipeline gives up. A store that never answers
 does not keep the process alive: the bound elapses, a warning says the still
 buffered records may not be durable, and shutdown completes. Records already
 written are unaffected, and in `required` mode no response was released for
