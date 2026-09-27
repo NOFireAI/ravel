@@ -826,6 +826,36 @@ mod tests {
         assert_eq!(snap.head.attempts, 0);
     }
 
+    /// `ravel_store_get_unverified_total` is store-wide and independent of
+    /// every per-op counter (ADR-1696 decision 3): a read that was served
+    /// without a checksum check is still an ordinary successful `get`, so
+    /// recording one must not touch `calls`, `ok`, `errors` or `attempts`, and
+    /// the two accessors must agree.
+    #[test]
+    fn get_unverified_is_store_wide_and_touches_no_op_counter() {
+        let metrics = StoreMetrics::default();
+        metrics.record(StoreOp::Get, 10_000, 42, None);
+        metrics.record_get_unverified();
+        metrics.record_get_unverified();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.get_unverified, 2, "two unverified full-object reads");
+        assert_eq!(
+            metrics.get_unverified(),
+            snap.get_unverified,
+            "the direct accessor and the snapshot must read one counter"
+        );
+        assert_eq!(snap.get.calls, 1, "the read itself is one ordinary call");
+        assert_eq!(snap.get.ok, 1);
+        assert_eq!(snap.get.attempts, 0);
+        assert_eq!(snap.get.errors_total(), 0);
+        assert_eq!(
+            StoreMetrics::default().snapshot().get_unverified,
+            0,
+            "a store that recorded nothing reads exactly zero"
+        );
+    }
+
     #[test]
     fn snapshot_op_accessor_matches_recorded_op() {
         let metrics = StoreMetrics::default();

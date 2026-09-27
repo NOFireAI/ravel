@@ -1194,6 +1194,22 @@ async fn a_get_with_no_checksum_header_is_served_and_counted_unverified() {
         before + 1,
         "a read the adapter verified must not count as unverified"
     );
+
+    // Decision 4, on the wire: a ranged read the caller asked for is outside
+    // the check by construction, so it is neither verified nor counted. S3
+    // returns the whole-object checksum and a slice cannot be compared against
+    // it, so counting one here would make every suffix read of every segment
+    // look like a gap in coverage.
+    let ranged = store
+        .get("verify/unchecksummed", GetRange::Range(0, 6))
+        .await
+        .expect("a ranged read must succeed");
+    assert_eq!(&ranged.data[..], b"served", "the ranged bytes come back");
+    assert_eq!(
+        store.get_unverified(),
+        before + 1,
+        "a caller-issued ranged read is outside the check, not an unverified read"
+    );
 }
 
 /// `AccessDenied` is permanent per the contract, and the proof is that the
