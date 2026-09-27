@@ -47,12 +47,18 @@ use tracing::Instrument as _;
 
 use rand::Rng as _;
 
+use arrow_flight::sql::Any;
+use tonic::transport::ClientTlsConfig;
+
 use crate::distributed::{DistributedFlightConfig, FlightWorkerSliceClient, WorkerSliceClient};
 use crate::executor::SqlExecutor;
 use crate::flight::request::{sql_request, status_from_sql};
+use crate::flight::slice::{
+    FlightListenerRole, SliceReject, SliceRejectCounters, check_slice_claims, verify_slice,
+};
 use crate::flight::stream::{DoGetStream, audited_stream, fragment_stream, statement_stream};
 use crate::flight::{ClockRef, FlightAuth, FlightClock, FlightSqlConfig, metadata};
-use crate::flight_ticket::{FlightTicket, SegmentPin, TicketKey};
+use crate::flight_ticket::{FlightTicket, SegmentPin, SqlTicketKeys, TicketKey, TicketSurface};
 use crate::validate::validate;
 
 /// The message every prepared-statement method returns. Prepared statements
@@ -70,16 +76,24 @@ pub struct RavelFlightSqlService {
     auth: Arc<dyn FlightAuth>,
     clock: ClockRef,
     config: FlightSqlConfig,
-    /// The in-process secret this service's tickets are signed and verified
-    /// with. Generated once, here, at construction time and
-    /// held only in memory: never logged, never sent to a client, never
-    /// persisted. A process restart mints a fresh key and invalidates every
-    /// ticket the previous process signed, which is safe because a ticket is
-    /// ephemeral by construction (bounded by `deadline_ns`) and never meant
-    /// to outlive the process that minted it. Key persistence/rotation across
-    /// restarts is not implemented; see the module docs if a deployment ever
-    /// needs tickets to survive a restart.
-    ticket_key: TicketKey,
+    /// The keys this service's tickets are signed and verified with, one per
+    /// surface per file key (ADR-1689 decision 2). By default derived from one
+    /// random file key generated at construction and held only in memory:
+    /// never logged, never sent to a client, never persisted. A process
+    /// restart then mints fresh keys and invalidates every ticket the previous
+    /// process signed, which is safe because a ticket is ephemeral by
+    /// construction (bounded by `deadline_ns`). A distributed deployment
+    /// replaces them with shared keys ([`Self::with_ticket_keys`], or
+    /// `DistributedFlightConfig::shared_ticket_key`).
+    ticket_keys: SqlTicketKeys,
+    /// Which surfaces the listener this service is mounted on serves
+    /// (ADR-1689 decision 1). The server supplies it.
+    listener_role: FlightListenerRole,
+    /// The TLS configuration the coordinator dials worker slices with, built
+    /// by the server. `None` dials plaintext.
+    slice_client_tls: Option<ClientTlsConfig>,
+    /// Refused slice capabilities, by closed reason.
+    slice_rejects: SliceRejectCounters,
     /// The evidential audit sink one event per executed statement is submitted
     /// through (ADR-0042 decision 4, ADR-0062 §2a).
     /// Migrated from the raw object-store handle this service previously wrote
@@ -148,14 +162,18 @@ impl RavelFlightSqlService {
         recorder: Arc<dyn QueryCostRecorder>,
         query_admission: Arc<QueryAdmissionController>,
     ) -> Self {
-        let mut ticket_key = TicketKey::default();
-        rand::rng().fill_bytes(&mut ticket_key);
+        let mut file_key = TicketKey::default();
+        rand::rng().fill_bytes(&mut file_key);
+        let ticket_keys = SqlTicketKeys::from_file_key(&file_key);
         RavelFlightSqlService {
             executor,
             auth,
             clock,
             config,
-            ticket_key,
+            ticket_keys,
+            listener_role: FlightListenerRole::default(),
+            slice_client_tls: None,
+            slice_rejects: SliceRejectCounters::default(),
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
             recorder,
             query_admission,
@@ -185,28 +203,114 @@ impl RavelFlightSqlService {
     pub fn with_distributed_scan(mut self, config: DistributedFlightConfig) -> Self {
         // A multi-process cluster keys every ticket MAC off one shared secret so
         // a coordinator's slice ticket verifies on a different worker process
-        // (ADR-0071). When the config carries that derived key,
-        // override the per-process random key minted in `new`. `None` (the
-        // single-process default) keeps this service's own key.
+        // (ADR-0071). When the config carries it, both surface keys derive
+        // from it in place of the per-process random key minted in `new`.
+        // `None` (the single-process default) keeps this service's own keys.
         if let Some(key) = config.shared_ticket_key {
-            self.ticket_key = key;
+            self.ticket_keys = SqlTicketKeys::from_file_key(&key);
         }
         self.distributed = Some(Arc::new(config));
         self
     }
 
-    /// The in-process key this service signs and verifies tickets with.
+    /// Replace this service's ticket keys (ADR-1689 decision 2): the server
+    /// passes the keys it derived from its SQL ticket key file, so every
+    /// process in the cluster mints under the first file key and verifies
+    /// under all of them. Returns `self` so it chains off [`new`](Self::new);
+    /// chain it after [`with_distributed_scan`](Self::with_distributed_scan),
+    /// whose `shared_ticket_key` would otherwise replace these.
+    pub fn with_ticket_keys(mut self, keys: SqlTicketKeys) -> Self {
+        self.ticket_keys = keys;
+        self
+    }
+
+    /// Set the role of the listener this service is mounted on (ADR-1689
+    /// decision 1). The default is [`FlightListenerRole::Combined`].
+    pub fn with_listener_role(mut self, role: FlightListenerRole) -> Self {
+        self.listener_role = role;
+        self
+    }
+
+    /// Dial worker slices over TLS with `tls` (ADR-1689 decision 1), which
+    /// the server builds for its dedicated fragment listener. Without it the
+    /// coordinator dials plaintext.
+    pub fn with_slice_client_tls(mut self, tls: ClientTlsConfig) -> Self {
+        self.slice_client_tls = Some(tls);
+        self
+    }
+
+    /// The key this service signs client whole-set tickets with.
     ///
     /// Exposed so a test can decode a ticket outside the normal `DoGet` path
     /// (for example, to assert what `GetFlightInfo` minted). Never logged or
     /// sent to a client by any code path in this crate.
     pub fn ticket_key(&self) -> &TicketKey {
-        &self.ticket_key
+        self.ticket_keys.mint_key(TicketSurface::Client)
     }
 
-    /// The authoritative tenant for a request. Every method calls this first.
+    /// The key this service signs slice capabilities with. Exposed for the
+    /// same reason as [`ticket_key`](Self::ticket_key).
+    pub fn slice_ticket_key(&self) -> &TicketKey {
+        self.ticket_keys.mint_key(TicketSurface::Slice)
+    }
+
+    /// The per-reason counts of slice capabilities this service refused.
+    pub fn slice_reject_counters(&self) -> SliceRejectCounters {
+        self.slice_rejects.clone()
+    }
+
+    /// The authoritative tenant for a client request. Every client method calls
+    /// this first, which is also where a slice-only listener refuses them.
     fn tenant(&self, metadata: &MetadataMap) -> Result<TenantHash, Status> {
+        if !self.listener_role.serves_clients() {
+            return Err(Status::permission_denied(
+                "this listener serves SQL slice fetches only",
+            ));
+        }
         self.auth.tenant(metadata)
+    }
+
+    /// Count `reason` and return the status the refused slice fetch answers.
+    fn reject_slice(&self, reason: SliceReject) -> Status {
+        self.slice_rejects.record(reason);
+        tracing::debug!(reason = reason.reason(), "slice fetch rejected");
+        reason.status()
+    }
+
+    /// Serve a verified slice capability under the ticket's tenant (ADR-1689
+    /// decision 2): the raw scan fragment over the slice's pinned segments,
+    /// internal schema, `(series_id, ts)`-sorted with provenance retained. No
+    /// statement planning (a slice ticket carries no statement), no
+    /// aggregation, no dedup: those stay at the coordinator
+    /// (crate::distributed). A slice fetch is internal fan-out, not an
+    /// auditable query; the audited unit is the coordinator's statement.
+    async fn slice_do_get(&self, ticket: FlightTicket) -> Result<Response<DoGetStream>, Status> {
+        let tenant = ticket.tenant;
+        // Admission for the scan (ADR-0061 decision 2), after the capability
+        // verified so a refused slice costs no permit.
+        let permit = self.query_admission.try_admit().map_err(|_| {
+            Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
+        })?;
+        let span = tracing::info_span!(
+            "flight_sql_slice_fragment",
+            tenant_hash = %tenant.to_hex(),
+            workload_class = "interactive",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+        );
+        let stream = fragment_stream(
+            &self.executor,
+            Arc::clone(&self.clock),
+            tenant,
+            ticket,
+            &self.config,
+            Arc::clone(&self.recorder),
+            span.clone(),
+            permit,
+        )
+        .instrument(span)
+        .await?;
+        Ok(Response::new(stream))
     }
 
     /// Wrap a single metadata `RecordBatch` as a `DoGet` response.
@@ -253,7 +357,7 @@ impl RavelFlightSqlService {
         tenant: TenantHash,
         ticket: FlightTicket,
     ) -> Result<Ticket, Status> {
-        let handle = ticket.encode(&self.ticket_key).map_err(|err| {
+        let handle = self.ticket_keys.encode(&ticket, TicketSurface::Client).map_err(|err| {
             // The only reachable case is an over-long statement, which is the
             // caller's own input.
             tracing::debug!(tenant = %tenant.to_hex(), error = %err, "flight ticket encode failed");
@@ -423,24 +527,56 @@ impl FlightSqlService for RavelFlightSqlService {
 
     /// Redeem a statement ticket against its pinned snapshot.
     ///
-    /// The tenant comparison below is the security decision enforced
-    /// exists to enforce: the metadata-resolved tenant is authoritative and
-    /// the ticket's embedded tenant is only a value to check it against. A
-    /// mismatch is denied before the pinned snapshot is touched, so a stolen
-    /// or replayed ticket reads nothing under different credentials.
+    /// A slice capability (ADR-1689 decision 2) is recognized first, by its
+    /// MAC under the slice keys, and never touches the request metadata: it
+    /// executes under the ticket's tenant. On a slice-only listener every
+    /// `DoGet` is a slice fetch, so a ticket that is not a valid capability is
+    /// refused with its typed reason; on a listener that serves no slices, a
+    /// valid capability is refused as the wrong surface.
+    ///
+    /// Anything else is a client ticket. The tenant comparison below is the
+    /// security decision this path exists to enforce: the metadata-resolved
+    /// tenant is authoritative and the ticket's embedded tenant is only a
+    /// value to check it against. A mismatch is denied before the pinned
+    /// snapshot is touched, so a stolen or replayed ticket reads nothing under
+    /// different credentials.
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<DoGetStream>, Status> {
+        let handle = &ticket.statement_handle;
+        let slice = if self.listener_role == FlightListenerRole::SliceOnly {
+            Some(verify_slice(&self.ticket_keys, handle, self.clock.now_ns()))
+        } else {
+            match self.ticket_keys.decode(handle, TicketSurface::Slice) {
+                Ok(_) if !self.listener_role.serves_slices() => {
+                    Some(Err(SliceReject::WrongSurface))
+                }
+                Ok(decoded) => Some(check_slice_claims(decoded, self.clock.now_ns())),
+                Err(_) => None,
+            }
+        };
+        if let Some(verified) = slice {
+            let decoded = verified.map_err(|reason| self.reject_slice(reason))?;
+            return self.slice_do_get(decoded).await;
+        }
+
         let tenant = self.tenant(request.metadata())?;
 
-        let decoded = FlightTicket::decode(&ticket.statement_handle, &self.ticket_key).map_err(
-            |err| {
+        let decoded = self
+            .ticket_keys
+            .decode(handle, TicketSurface::Client)
+            .map_err(|err| {
                 tracing::debug!(tenant = %tenant.to_hex(), error = %err, "flight ticket decode failed");
                 Status::invalid_argument("malformed flight ticket")
-            },
-        )?;
+            })?;
+
+        // A client-key ticket never claims a slice: only the slice key mints
+        // one, so this is a ticket for the wrong surface.
+        if decoded.slice_count > 1 {
+            return Err(self.reject_slice(SliceReject::WrongSurface));
+        }
 
         if decoded.tenant != tenant {
             tracing::warn!(
@@ -469,43 +605,6 @@ impl FlightSqlService for RavelFlightSqlService {
         let permit = self.query_admission.try_admit().map_err(|_| {
             Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
         })?;
-
-        // ADR-0071: a slice ticket (`slice_count > 1`) is an
-        // INTERNAL coordinator-to-worker request, never something an external
-        // client holds -- `get_flight_info_statement` only ever mints the
-        // whole-set ticket (`slice_count == 1`). When one arrives, serve the raw
-        // scan fragment over this slice's pinned segments: the internal-schema,
-        // `(series_id, ts)`-sorted rows with provenance retained, scan-only, with
-        // no statement planning (a slice ticket carries `statement: String::new()`,
-        // so there is nothing to `validate`), no aggregation, and no dedup. The
-        // authoritative cross-slice dedup and any aggregate stay at the
-        // coordinator (crate::distributed). A slice fetch is internal fan-out,
-        // not a distinct auditable query, so it is not audit-wrapped; the audited
-        // unit is the client-facing statement the coordinator serves. The tenant
-        // check above still gates it: a slice ticket carries the coordinator's
-        // resolved tenant, and only this deployment's own ticket key MACs it.
-        if decoded.slice_count > 1 {
-            let span = tracing::info_span!(
-                "flight_sql_slice_fragment",
-                tenant_hash = %tenant.to_hex(),
-                workload_class = "interactive",
-                s3_requests = tracing::field::Empty,
-                s3_bytes = tracing::field::Empty,
-            );
-            let stream = fragment_stream(
-                &self.executor,
-                Arc::clone(&self.clock),
-                tenant,
-                decoded,
-                &self.config,
-                Arc::clone(&self.recorder),
-                span.clone(),
-                permit,
-            )
-            .instrument(span)
-            .await?;
-            return Ok(Response::new(stream));
-        }
 
         // The statement now reaches execution against its pinned snapshot for a
         // resolved tenant, so it is auditable (ADR-0042 decision 4, ADR-0062
@@ -542,11 +641,9 @@ impl FlightSqlService for RavelFlightSqlService {
         // gate, a logs-target query, a single-slice snapshot, or no advertised
         // worker all leave this `None`, and the statement runs whole-set on this
         // coordinator, byte-identical to before this seam existed. The client
-        // forwards this request's inbound tenant credential to every worker so a
-        // worker's own `FlightAuth` resolves the same tenant the slice ticket
-        // pins, and signs each slice ticket with this coordinator's ticket key
-        // (the worker verifies it with the key it shares -- the same process
-        // today; cross-process key distribution is the ADR-0071 follow-up).
+        // signs each slice ticket with this coordinator's slice key and sends
+        // nothing else: this request's credential stays here (ADR-1689
+        // decision 2).
         let distributed = self.distributed.as_ref().and_then(|config| {
             let snapshot = decoded.snapshot();
             self.executor
@@ -559,8 +656,8 @@ impl FlightSqlService for RavelFlightSqlService {
                 .map(|slices| {
                     let client: Arc<dyn WorkerSliceClient> =
                         Arc::new(FlightWorkerSliceClient::new(
-                            *self.ticket_key(),
-                            request.metadata().clone(),
+                            *self.slice_ticket_key(),
+                            self.slice_client_tls.clone(),
                             DISTRIB_SLICE_CONNECT_TIMEOUT,
                         ));
                     (slices, client)
@@ -649,6 +746,23 @@ impl FlightSqlService for RavelFlightSqlService {
                 Err(status)
             }
         }
+    }
+
+    /// A `DoGet` whose ticket is no Flight SQL command. On a slice-only
+    /// listener that is a slice fetch with no capability; elsewhere it is the
+    /// protocol's own refusal.
+    async fn do_get_fallback(
+        &self,
+        _request: Request<Ticket>,
+        message: Any,
+    ) -> Result<Response<DoGetStream>, Status> {
+        if self.listener_role == FlightListenerRole::SliceOnly {
+            return Err(self.reject_slice(SliceReject::Missing));
+        }
+        Err(Status::unimplemented(format!(
+            "do_get: The defined request is invalid: {}",
+            message.type_url
+        )))
     }
 
     // -----------------------------------------------------------------

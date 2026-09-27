@@ -107,7 +107,11 @@ arrow-flight = { workspace = true, optional = true }
 #    workspace pin, used the same way `content_hash` fields are hashed
 #    elsewhere in the workspace, just keyed here instead of unkeyed.
 #  - `rand` generates the ticket's in-process MAC key once at construction.
-tonic = { workspace = true, optional = true }
+# `tls-ring` is on so `FlightWorkerSliceClient` can take the
+# `ClientTlsConfig` the server builds for the dedicated fragment listener
+# (ADR-1689 decision 1). ravel-server already enables the same feature, so it
+# adds nothing to the lockfile.
+tonic = { workspace = true, optional = true, features = ["tls-ring"] }
 prost = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }

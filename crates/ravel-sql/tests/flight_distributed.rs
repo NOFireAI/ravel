@@ -43,6 +43,13 @@
 //! - `limit_hint_returns_exactly_limit_rows_over_multiple_slices`: a limited
 //!   distributed scan returns exactly the limit's rows, equal to the first
 //!   `limit` rows of the local scan.
+//! - `worker_do_get_carries_no_authorization_and_resolves_ticket_tenant`
+//!   (ADR-1689): the production client's slice `DoGet` reaches a real worker
+//!   listener with no authorization metadata, is served without `FlightAuth`,
+//!   and executes under the ticket's tenant.
+//! - `worker_do_get_refuses_bad_expired_wrong_surface_and_missing_slice_tickets`:
+//!   each refusal carries its typed reason and moves exactly its own counter
+//!   by one.
 //!
 //! prove-the-test (distributed_scan_equals_local_scan): removing the
 //! `RsegDedupExec` from `distributed_samples_plan` (feeding the merge output
@@ -61,11 +68,14 @@
 mod util;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, TicketStatementQuery};
 use arrow_flight::{FlightDescriptor, Ticket};
@@ -93,14 +103,19 @@ use ravel_query::{
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::distributed::{CoordinatorSliceReader, SliceFallback, SliceFallbackCounters};
 use ravel_sql::{
-    DistributedFlightConfig, FlightAuth, FlightClock, FlightSqlConfig, FlightTicket,
-    FlightTicketError, FlightWorkerSliceClient, RavelFlightSqlService, RavelTableProvider,
-    SegmentPin, SqlConfig, SqlExecutor, StaticWorkerEndpoints, WorkerSlice, WorkerSliceClient,
-    distributed_samples_plan, internal_schema, plan_distributed_slices,
+    DistributedFlightConfig, FlightAuth, FlightClock, FlightListenerRole, FlightSqlConfig,
+    FlightTicket, FlightTicketError, FlightWorkerSliceClient, RavelFlightSqlService,
+    RavelTableProvider, SegmentPin, SliceReject, SqlConfig, SqlExecutor, SqlTicketKeys,
+    StaticWorkerEndpoints, TicketSurface, WorkerSlice, WorkerSliceClient, distributed_samples_plan,
+    internal_schema, plan_distributed_slices,
 };
-use ravel_types::accounting::{NoopQueryCostRecorder, QueryAccounting};
+use ravel_types::accounting::{
+    CostEstimate, NoopQueryCostRecorder, QueryAccounting, QueryAccountingSnapshot,
+    QueryCostRecorder, QueryWorkloadClass,
+};
 use ravel_types::{CommitToken, Label, LabelSet, Sample, SeriesId, TenantHash, TenantId};
-use tonic::metadata::MetadataMap;
+use tokio::sync::Notify;
+use tonic::metadata::{KeyRef, MetadataMap};
 use tonic::{Request, Status};
 use uuid::Uuid;
 
@@ -362,10 +377,9 @@ impl WorkerSliceClient for InProcessWorker {
 // The over-the-wire Flight worker
 // ---------------------------------------------------------------------------
 
-/// A tenant resolver that maps every credential to [`TENANT`]. The wire tests
-/// mint slice tickets under `TENANT` (the identity the fixture segments embed
-/// and their object keys resolve under), so the service's metadata-resolved
-/// tenant must match the ticket's for `do_get_statement` to redeem it.
+/// A tenant resolver that maps every credential to [`TENANT`], for the client
+/// surface of the wire service. A slice `DoGet` never consults it (ADR-1689):
+/// the slice executes under the ticket's own tenant.
 struct FixedAuth;
 
 impl FlightAuth for FixedAuth {
@@ -416,7 +430,6 @@ fn wire_service(store: Arc<dyn ObjectStoreBackend>) -> Arc<RavelFlightSqlService
 /// `do_get_statement` slice path agree on the internal schema and on the bytes.
 struct WireWorker {
     service: Arc<RavelFlightSqlService>,
-    token: String,
 }
 
 impl std::fmt::Debug for WireWorker {
@@ -438,17 +451,15 @@ impl WorkerSliceClient for WireWorker {
         // scan-only fragment branch, which streams the internal, provenance-
         // carrying schema back for the coordinator to merge and dedup.
         let handle = ticket
-            .encode(self.service.ticket_key())
+            .encode(self.service.slice_ticket_key())
             .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         let service = Arc::clone(&self.service);
-        let token = self.token.clone();
         let setup = async move {
             let tsq = TicketStatementQuery {
                 statement_handle: handle.into(),
             };
-            let raw = Ticket::new(tsq.as_any().encode_to_vec());
-            let mut req = Request::new(raw);
-            util::flight_harness::insert(req.metadata_mut(), TOKEN_KEY, &token);
+            // No metadata: the slice ticket is the capability (ADR-1689).
+            let req = Request::new(Ticket::new(tsq.as_any().encode_to_vec()));
             let response = service
                 .do_get_statement(tsq, req)
                 .await
@@ -1119,7 +1130,6 @@ async fn distributed_scan_over_wire_equals_local() {
     let service = wire_service(Arc::clone(&backend));
     let client: Arc<dyn WorkerSliceClient> = Arc::new(WireWorker {
         service: Arc::clone(&service),
-        token: "wire-token".to_string(),
     });
     let distributed = RavelTableProvider::new(
         snapshot.clone(),
@@ -1167,13 +1177,11 @@ async fn fragment_do_get_serves_internal_schema() {
     let ticket = endpoints[0].ticket.clone();
     assert_eq!(ticket.slice_count, 2, "a slice ticket, not the whole set");
 
-    let handle = ticket.encode(service.ticket_key()).expect("encode");
+    let handle = ticket.encode(service.slice_ticket_key()).expect("encode");
     let tsq = TicketStatementQuery {
         statement_handle: handle.into(),
     };
-    let raw = Ticket::new(tsq.as_any().encode_to_vec());
-    let mut req = Request::new(raw);
-    util::flight_harness::insert(req.metadata_mut(), TOKEN_KEY, "wire-token");
+    let req = Request::new(Ticket::new(tsq.as_any().encode_to_vec()));
     let stream = service
         .do_get_statement(tsq, req)
         .await
@@ -1569,7 +1577,7 @@ async fn one_dead_worker_re_dispatches_to_the_other() {
         healthy: InProcessWorker::new(fetcher.clone()),
         flight: FlightWorkerSliceClient::new(
             ravel_sql::derive_ticket_key(b"fallback-cases"),
-            MetadataMap::new(),
+            None,
             Duration::from_secs(1),
         ),
         dead: [dead].into_iter().collect(),
@@ -1628,7 +1636,7 @@ async fn every_worker_dead_reads_on_the_coordinator() {
         healthy: InProcessWorker::new(fetcher.clone()),
         flight: FlightWorkerSliceClient::new(
             ravel_sql::derive_ticket_key(b"fallback-cases"),
-            MetadataMap::new(),
+            None,
             Duration::from_secs(1),
         ),
         dead: locations.iter().cloned().collect(),
@@ -1750,7 +1758,7 @@ async fn the_coordinator_local_read_reserves_against_the_query_pool() {
         healthy: InProcessWorker::new(fetcher.clone()),
         flight: FlightWorkerSliceClient::new(
             ravel_sql::derive_ticket_key(b"fallback-cases"),
-            MetadataMap::new(),
+            None,
             Duration::from_secs(1),
         ),
         dead: locations.iter().cloned().collect(),
@@ -1800,7 +1808,7 @@ async fn a_failing_local_read_fails_typed_and_names_the_cause() {
         healthy: InProcessWorker::new(fetcher.clone()),
         flight: FlightWorkerSliceClient::new(
             ravel_sql::derive_ticket_key(b"fallback-cases"),
-            MetadataMap::new(),
+            None,
             Duration::from_secs(1),
         ),
         dead: [dead].into_iter().collect(),
@@ -2901,4 +2909,496 @@ async fn distributed_spans_plan_merges_without_dedup() {
         !text.to_lowercase().contains("dedup"),
         "spans have no query-time dedup; the merge must not introduce one:\n{text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-1689: the slice ticket is the capability
+// ---------------------------------------------------------------------------
+//
+// These drive the real worker `DoGet` over a real tonic listener: the Flight
+// service mounted as a gRPC server, dialed by the production
+// `FlightWorkerSliceClient` (or, for the refusals, a raw Flight client that
+// presents the exact bytes under test).
+//
+// prove-the-test (worker_do_get_carries_no_authorization_and_resolves_ticket_tenant):
+// reinstating the pre-fix first line of `do_get_statement`,
+// `let tenant = self.tenant(request.metadata())?;`, fails the test on its
+// first role: the slice `DoGet` carries no credential, so `FlightAuth` refuses
+// it and the fetch surfaces `unauthenticated` instead of the slice's rows.
+
+/// A tenant the fixture segments were not written for. A slice minted for it
+/// over those segments fails the scan's segment tenant check.
+const OTHER_TENANT: TenantHash = TenantHash([0x5a; 16]);
+
+/// The file key both the coordinator and the worker derive their SQL ticket
+/// keys from in these tests.
+const SQL_FILE_KEY: &[u8] = b"adr-1689 sql ticket file key";
+
+/// A `FlightAuth` holding no credential at all: every call is counted and
+/// refused. A slice `DoGet` must never reach it.
+#[derive(Default)]
+struct CountingAuth {
+    calls: AtomicUsize,
+}
+
+impl CountingAuth {
+    fn calls(&self) -> usize {
+        self.calls.load(AtomicOrdering::SeqCst)
+    }
+}
+
+impl FlightAuth for CountingAuth {
+    fn tenant(&self, _metadata: &MetadataMap) -> Result<TenantHash, Status> {
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Err(Status::unauthenticated(
+            "invalid or missing tenant credentials",
+        ))
+    }
+
+    fn min_commit_tokens(&self, _metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
+        Ok(Vec::new())
+    }
+}
+
+/// Records the tenant every cost fold is attributed to. The slice fragment
+/// folds its cost when its stream ends, so this names the tenant the slice
+/// executed under.
+#[derive(Default)]
+struct TenantRecorder {
+    tenants: Mutex<Vec<TenantHash>>,
+    folded: Notify,
+}
+
+impl QueryCostRecorder for TenantRecorder {
+    fn record(
+        &self,
+        _accounting: &QueryAccountingSnapshot,
+        _estimate: &CostEstimate,
+        tenant_hash: TenantHash,
+        _workload_class: QueryWorkloadClass,
+    ) {
+        self.tenants.lock().expect("lock").push(tenant_hash);
+        self.folded.notify_one();
+    }
+}
+
+/// A worker Flight service mounted on a real listener, recording the metadata
+/// keys of every request it receives.
+struct SliceWorker {
+    location: String,
+    metadata_keys: Arc<Mutex<Vec<Vec<String>>>>,
+    rejects: ravel_sql::SliceRejectCounters,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SliceWorker {
+    async fn start(
+        store: Arc<dyn ObjectStoreBackend>,
+        auth: Arc<CountingAuth>,
+        recorder: Arc<TenantRecorder>,
+        clock: Arc<TestClock>,
+        role: FlightListenerRole,
+    ) -> Self {
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let executor = Arc::new(SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(Arc::clone(&store)),
+            LogSegmentFetcher::new(Arc::clone(&store)),
+            ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
+            SqlConfig::default(),
+            1 << 30,
+        ));
+        let service = RavelFlightSqlService::new(
+            executor,
+            auth,
+            clock as Arc<dyn FlightClock>,
+            FlightSqlConfig {
+                max_deadline: Duration::from_secs(30),
+                ..FlightSqlConfig::default()
+            },
+            recorder,
+            QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+        )
+        .with_ticket_keys(SqlTicketKeys::from_file_key(SQL_FILE_KEY))
+        .with_listener_role(role);
+        let rejects = service.slice_reject_counters();
+
+        let metadata_keys = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&metadata_keys);
+        let server = FlightServiceServer::with_interceptor(service, move |req: Request<()>| {
+            let keys = req
+                .metadata()
+                .keys()
+                .map(|key| match key {
+                    KeyRef::Ascii(key) => key.as_str().to_string(),
+                    KeyRef::Binary(key) => key.as_str().to_string(),
+                })
+                .collect();
+            log.lock().expect("lock").push(keys);
+            Ok(req)
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(server)
+                .serve_with_incoming_shutdown(
+                    tonic::transport::server::TcpIncoming::from(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await
+                .expect("serve");
+        });
+        SliceWorker {
+            location: format!("http://{addr}"),
+            metadata_keys,
+            rejects,
+            shutdown,
+            task,
+        }
+    }
+
+    /// `DoGet` exactly `ticket`, with no metadata, over a fresh channel.
+    async fn raw_do_get(&self, ticket: Ticket) -> Result<Vec<RecordBatch>, Status> {
+        let channel = tonic::transport::Channel::from_shared(self.location.clone())
+            .expect("valid location")
+            .connect()
+            .await
+            .expect("connect");
+        let response = FlightServiceClient::new(channel).do_get(ticket).await?;
+        let decoded = FlightRecordBatchStream::new_from_flight_data(
+            response
+                .into_inner()
+                .map_err(|status| FlightError::Tonic(Box::new(status))),
+        );
+        decoded.try_collect().await.map_err(|err| match err {
+            FlightError::Tonic(status) => *status,
+            other => Status::internal(other.to_string()),
+        })
+    }
+
+    async fn stop(self) {
+        let _ = self.shutdown.send(());
+        let _ = self.task.await;
+    }
+}
+
+/// Wrap a ticket handle the way the coordinator does.
+fn statement_handle_ticket(handle: Vec<u8>) -> Ticket {
+    Ticket::new(
+        TicketStatementQuery {
+            statement_handle: handle.into(),
+        }
+        .as_any()
+        .encode_to_vec(),
+    )
+}
+
+/// The first slice of the two-shard fixture, minted for [`TENANT`].
+fn first_slice_ticket(snapshot: &Snapshot) -> FlightTicket {
+    let ticket = endpoints_for(snapshot)
+        .into_iter()
+        .next()
+        .expect("the fixture has slices")
+        .ticket;
+    assert_eq!(ticket.slice_count, 2, "a slice ticket, not the whole set");
+    assert_eq!(ticket.tenant, TENANT);
+    ticket
+}
+
+/// Every column of `got` equals the matching column of `want`, and the row
+/// counts agree. Schema-level metadata is not compared, since the Flight wire
+/// may carry some the local plan does not.
+fn assert_same_rows(got: &[RecordBatch], want: &[RecordBatch]) {
+    let schema = internal_schema();
+    let got = datafusion::arrow::compute::concat_batches(&schema, got).expect("concat got");
+    let want = datafusion::arrow::compute::concat_batches(&schema, want).expect("concat want");
+    assert!(want.num_rows() > 0, "the reference slice holds rows");
+    assert_eq!(got.num_rows(), want.num_rows(), "row count");
+    for i in 0..want.num_columns() {
+        assert_eq!(
+            got.column(i).to_data(),
+            want.column(i).to_data(),
+            "column {i} differs"
+        );
+    }
+}
+
+#[tokio::test]
+async fn worker_do_get_carries_no_authorization_and_resolves_ticket_tenant() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let ticket = first_slice_ticket(&snapshot);
+
+    // The reference: the same slice read by the in-process worker fragment.
+    let context = Arc::new(TaskContext::default());
+    let want: Vec<RecordBatch> = InProcessWorker::new(SegmentFetcher::new(Arc::clone(&backend)))
+        .fetch_slice("in-process", &ticket, None, &context)
+        .expect("reference stream")
+        .try_collect()
+        .await
+        .expect("reference rows");
+
+    // `Combined` is the role a process runs in until the server mounts the
+    // dedicated listener; `SliceOnly` is that listener. Both serve the slice.
+    for role in [FlightListenerRole::Combined, FlightListenerRole::SliceOnly] {
+        let auth = Arc::new(CountingAuth::default());
+        let recorder = Arc::new(TenantRecorder::default());
+        let worker = SliceWorker::start(
+            Arc::clone(&backend),
+            Arc::clone(&auth),
+            Arc::clone(&recorder),
+            TestClock::at(NOW_NS),
+            role,
+        )
+        .await;
+
+        // The production coordinator client, keyed like the worker.
+        let keys = SqlTicketKeys::from_file_key(SQL_FILE_KEY);
+        let client = FlightWorkerSliceClient::new(
+            *keys.mint_key(TicketSurface::Slice),
+            None,
+            Duration::from_secs(5),
+        );
+        let got: Vec<RecordBatch> = client
+            .fetch_slice(&worker.location, &ticket, None, &context)
+            .expect("slice stream")
+            .try_collect()
+            .await
+            .unwrap_or_else(|err| panic!("{role:?}: the slice DoGet must succeed: {err}"));
+        assert_same_rows(&got, &want);
+
+        // The request carried no authorization metadata, and the worker never
+        // asked `FlightAuth` for a tenant.
+        let seen = worker.metadata_keys.lock().expect("lock").clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "{role:?}: exactly one request reached the worker"
+        );
+        assert!(
+            !seen[0].iter().any(|key| key == TOKEN_KEY),
+            "{role:?}: a slice DoGet must carry no authorization metadata, saw {:?}",
+            seen[0]
+        );
+        assert_eq!(
+            auth.calls(),
+            0,
+            "{role:?}: FlightAuth::tenant is never called"
+        );
+
+        // The slice executed under the ticket's tenant: its cost is folded
+        // against it, and the same segments minted for another tenant fail the
+        // scan's segment tenant check rather than being served.
+        tokio::time::timeout(Duration::from_secs(5), recorder.folded.notified())
+            .await
+            .expect("the slice folds its cost when its stream ends");
+        assert_eq!(
+            *recorder.tenants.lock().expect("lock"),
+            vec![TENANT],
+            "{role:?}: the slice runs under the ticket's tenant"
+        );
+        let foreign = FlightTicket {
+            tenant: OTHER_TENANT,
+            ..ticket.clone()
+        };
+        let err = client
+            .fetch_slice(&worker.location, &foreign, None, &context)
+            .expect("slice stream")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect_err("segments written for TENANT are not served as OTHER_TENANT");
+        assert!(
+            err.to_string()
+                .contains("stored data failed integrity validation"),
+            "{role:?}: {err}"
+        );
+        assert_eq!(
+            worker.rejects.by_reason(),
+            [
+                ("missing", 0),
+                ("bad_mac", 0),
+                ("expired", 0),
+                ("wrong_surface", 0)
+            ],
+            "{role:?}: a valid slice is not a reject"
+        );
+
+        // Control: the interceptor does see an authorization header when one is
+        // sent, so the absence above is not an artifact of the recording.
+        let mut control = Request::new(statement_handle_ticket(Vec::new()));
+        insert(control.metadata_mut(), TOKEN_KEY, "a-client-token");
+        let channel = tonic::transport::Channel::from_shared(worker.location.clone())
+            .expect("valid location")
+            .connect()
+            .await
+            .expect("connect");
+        let _ = FlightServiceClient::new(channel).do_get(control).await;
+        let seen = worker.metadata_keys.lock().expect("lock").clone();
+        assert!(
+            seen.last()
+                .is_some_and(|keys| keys.iter().any(|key| key == TOKEN_KEY)),
+            "the recording sees authorization metadata when it is sent"
+        );
+
+        worker.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn worker_do_get_refuses_bad_expired_wrong_surface_and_missing_slice_tickets() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let keys = SqlTicketKeys::from_file_key(SQL_FILE_KEY);
+    let slice = first_slice_ticket(&snapshot);
+    let whole_set = FlightTicket {
+        slice_index: 0,
+        slice_count: 1,
+        ..slice.clone()
+    };
+
+    struct Case {
+        name: &'static str,
+        role: FlightListenerRole,
+        handle: Vec<u8>,
+        /// How far past the ticket's deadline to move the injected clock.
+        advance_ns: i64,
+        reason: SliceReject,
+        code: tonic::Code,
+    }
+    let cases = [
+        Case {
+            name: "a slice ticket MAC'd under a key the worker does not hold",
+            role: FlightListenerRole::SliceOnly,
+            handle: SqlTicketKeys::from_file_key(b"another cluster's key")
+                .encode(&slice, TicketSurface::Slice)
+                .expect("encode"),
+            advance_ns: 0,
+            reason: SliceReject::BadMac,
+            code: tonic::Code::Unauthenticated,
+        },
+        Case {
+            name: "a valid slice ticket redeemed after its deadline",
+            role: FlightListenerRole::SliceOnly,
+            handle: keys.encode(&slice, TicketSurface::Slice).expect("encode"),
+            advance_ns: slice.deadline_ns - NOW_NS,
+            reason: SliceReject::Expired,
+            code: tonic::Code::Unauthenticated,
+        },
+        Case {
+            name: "a client whole-set ticket presented as a slice",
+            role: FlightListenerRole::SliceOnly,
+            handle: keys
+                .encode(&whole_set, TicketSurface::Client)
+                .expect("encode"),
+            advance_ns: 0,
+            reason: SliceReject::WrongSurface,
+            code: tonic::Code::PermissionDenied,
+        },
+        Case {
+            name: "a slice DoGet with no ticket",
+            role: FlightListenerRole::SliceOnly,
+            handle: Vec::new(),
+            advance_ns: 0,
+            reason: SliceReject::Missing,
+            code: tonic::Code::Unauthenticated,
+        },
+        Case {
+            name: "a valid slice ticket on a listener that serves no slices",
+            role: FlightListenerRole::ClientOnly,
+            handle: keys.encode(&slice, TicketSurface::Slice).expect("encode"),
+            advance_ns: 0,
+            reason: SliceReject::WrongSurface,
+            code: tonic::Code::PermissionDenied,
+        },
+        Case {
+            name: "an expired slice ticket on the combined listener",
+            role: FlightListenerRole::Combined,
+            handle: keys.encode(&slice, TicketSurface::Slice).expect("encode"),
+            advance_ns: slice.deadline_ns - NOW_NS,
+            reason: SliceReject::Expired,
+            code: tonic::Code::Unauthenticated,
+        },
+    ];
+
+    for case in cases {
+        let auth = Arc::new(CountingAuth::default());
+        let clock = TestClock::at(NOW_NS);
+        let worker = SliceWorker::start(
+            Arc::clone(&backend),
+            Arc::clone(&auth),
+            Arc::new(TenantRecorder::default()),
+            Arc::clone(&clock),
+            case.role,
+        )
+        .await;
+        clock.advance(case.advance_ns);
+
+        let before = worker.rejects.by_reason();
+        let status = worker
+            .raw_do_get(statement_handle_ticket(case.handle))
+            .await
+            .expect_err(case.name);
+        assert_eq!(status.code(), case.code, "{}: {status:?}", case.name);
+        assert_eq!(
+            status.message(),
+            format!("slice fetch rejected: {}", case.reason.reason()),
+            "{}",
+            case.name
+        );
+        let after = worker.rejects.by_reason();
+        for ((label, was), (_, now)) in before.iter().zip(after.iter()) {
+            let want = u64::from(*label == case.reason.reason());
+            assert_eq!(
+                now - was,
+                want,
+                "{}: the {label} counter moved by {} (want {want})",
+                case.name,
+                now - was
+            );
+        }
+        assert_eq!(
+            auth.calls(),
+            0,
+            "{}: FlightAuth is never consulted",
+            case.name
+        );
+        worker.stop().await;
+    }
+
+    // On the combined listener a ticket that verifies under no key is a client
+    // ticket, as before ADR-1689: the credential check answers first, and no
+    // slice reject is counted.
+    let auth = Arc::new(CountingAuth::default());
+    let worker = SliceWorker::start(
+        Arc::clone(&backend),
+        Arc::clone(&auth),
+        Arc::new(TenantRecorder::default()),
+        TestClock::at(NOW_NS),
+        FlightListenerRole::Combined,
+    )
+    .await;
+    let forged = SqlTicketKeys::from_file_key(b"another cluster's key")
+        .encode(&slice, TicketSurface::Slice)
+        .expect("encode");
+    let status = worker
+        .raw_do_get(statement_handle_ticket(forged))
+        .await
+        .expect_err("a forged ticket is refused");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(auth.calls(), 1, "the client path resolved the credential");
+    assert_eq!(
+        worker.rejects.by_reason().map(|(_, count)| count),
+        [0, 0, 0, 0],
+        "an unattributable ticket counts no slice reject"
+    );
+    worker.stop().await;
 }
