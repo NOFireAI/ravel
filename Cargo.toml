@@ -64,6 +64,10 @@ prost = "0.14"
 axum = "0.8"
 tower = "0.5"
 hyper = "1.11"
+# The operator's health listener (ADR-1731 decision 2), pinned at the versions
+# Cargo.lock already resolved through other crates' transitive graphs.
+hyper-util = { version = "0.1.20", default-features = false }
+http-body-util = { version = "0.1.4", default-features = false }
 futures = "0.3"
 async-trait = "0.1"
 # HTTP client. Used by services/ravel-server (alert/webhook sinks) and, for the
