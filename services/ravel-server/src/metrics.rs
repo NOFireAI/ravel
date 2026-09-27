@@ -3023,6 +3023,19 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// value that keeps rising means buckets for this signal are sealing
     /// faster than they cross the compaction threshold.
     pub l0_records_pending: u64,
+    /// Bytes reclaimed for this signal since process start by the two sweep
+    /// deletions whose object size the pass already listed: the quarantine
+    /// reaper and rule 3's unreferenced-part delete (issue #1729). A counter.
+    /// Superseded and retention deletions are excluded; they delete by key
+    /// without a listed size, so counting them would need an extra request.
+    pub bytes_reclaimed: u64,
+    /// Retention lag for this signal, in nanoseconds, from the most recent
+    /// completed maintenance cycle (issue #1729): for the oldest bucket that is
+    /// expired yet still present, how far the clock is past its retention
+    /// deadline. `0` when no still-present expired bucket was observed. A gauge
+    /// and a per-cycle maximum over this process's units, rendered in seconds as
+    /// `ravel_maintain_retention_lag_seconds`.
+    pub retention_lag_ns: i64,
 }
 
 /// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6): the three safety controls that, before this issue, reached
@@ -3081,6 +3094,8 @@ impl MaintenanceSafetySnapshot {
                     orphans_quarantine_refused: metrics.orphans_quarantine_refused(signal),
                     quarantine_reaped: metrics.quarantine_reaped(signal),
                     l0_records_pending: metrics.l0_records_pending(signal),
+                    bytes_reclaimed: metrics.bytes_reclaimed(signal),
+                    retention_lag_ns: metrics.retention_lag_ns(signal),
                 })
                 .collect(),
         }
@@ -3257,6 +3272,48 @@ fn render_maintain_safety_family(
             "ravel_maintain_l0_records_pending",
             &labels(mode, signal.signal),
             signal.l0_records_pending,
+        );
+    }
+
+    // Throughput of the GC work, the counterpart to the pending/backlog gauges
+    // above (issue #1729): bytes reclaimed and how far retention has fallen
+    // behind. Both by signal, both under the same mode gate.
+    write_header(
+        out,
+        "ravel_maintain_bytes_reclaimed_total",
+        "Bytes of deleted objects reclaimed by the GC sweeper, by signal, summed since process \
+         start. Counts only the two deletions whose object size the pass already listed: the \
+         quarantine reaper and rule 3's unreferenced-part delete. Superseded and retention \
+         deletions are excluded because they delete by key without a listed size, so this is a \
+         lower bound on total bytes reclaimed, not the whole of it. Per process: sum across \
+         maintain replicas for the fleet.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_maintain_bytes_reclaimed_total",
+            &labels(mode, signal.signal),
+            signal.bytes_reclaimed,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_retention_lag_seconds",
+        "How far past its retention deadline the oldest still-present expired bucket is, by \
+         signal, as observed by this process's most recent completed maintenance cycle. 0 when no \
+         expired bucket is still present. A gauge and a per-cycle maximum over this process's \
+         units: it names the single worst bucket, not a sum. A value that keeps climbing means \
+         retention's physical sweep is not keeping pace; see the troubleshooting guide.",
+        "gauge",
+    );
+    for signal in &snapshot.signals {
+        write_sample_f64(
+            out,
+            "ravel_maintain_retention_lag_seconds",
+            &labels(mode, signal.signal),
+            signal.retention_lag_ns as f64 / 1e9,
         );
     }
 
@@ -8622,6 +8679,8 @@ mod tests {
                     orphans_quarantine_refused: 5,
                     quarantine_reaped: 6,
                     l0_records_pending: 8,
+                    bytes_reclaimed: 4096,
+                    retention_lag_ns: 90_000_000_000,
                 },
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Logs,
@@ -8633,6 +8692,8 @@ mod tests {
                     orphans_quarantine_refused: 0,
                     quarantine_reaped: 0,
                     l0_records_pending: 0,
+                    bytes_reclaimed: 0,
+                    retention_lag_ns: 0,
                 },
             ],
         };
@@ -8734,6 +8795,40 @@ mod tests {
                 "missing objects_deleted_total sample {sample}:\n{body}"
             );
         }
+        assert!(
+            body.contains("# TYPE ravel_maintain_bytes_reclaimed_total counter"),
+            "bytes_reclaimed_total must carry a counter TYPE header:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"metrics\"} 4096"
+            ),
+            "missing bytes_reclaimed_total sample:\n{body}"
+        );
+        // A zero-valued signal still renders, not omitted.
+        assert!(
+            body.contains(
+                "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_maintain_retention_lag_seconds gauge"),
+            "retention_lag_seconds must carry a gauge TYPE header:\n{body}"
+        );
+        // 90_000_000_000 ns renders as 90 seconds.
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"metrics\"} 90"
+            ),
+            "missing retention_lag_seconds sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
     }
 
     /// The ADR-0071 distributed read fan-out family renders under
@@ -9407,6 +9502,8 @@ mod tests {
                 orphans_quarantine_refused: 1,
                 quarantine_reaped: 1,
                 l0_records_pending: 1,
+                bytes_reclaimed: 1,
+                retention_lag_ns: 1,
             }],
         };
         let body = render(

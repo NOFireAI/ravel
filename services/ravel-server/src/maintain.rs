@@ -187,6 +187,27 @@ pub struct MaintenanceSafetyMetrics {
     objects_deleted_superseded_records_deleted: AtomicU64,
     objects_deleted_superseded_data_deleted: AtomicU64,
     objects_deleted_unreferenced_parts_deleted: AtomicU64,
+    /// Bytes reclaimed by the two sweep deletions whose object size is known
+    /// from the pass's own LIST, by signal, summed over every sweep pass since
+    /// process start: the quarantine reaper and rule 3's unreferenced-part
+    /// delete (issue #1729). Superseded and retention deletions are not
+    /// included; they delete by key without a listed size.
+    bytes_reclaimed: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// The published per-signal retention-lag gauge (issue #1729), paired with
+    /// `retention_lag_ns_accum` exactly as `l0_records_pending` is paired with
+    /// its accumulator: cleared by [`MaintenanceSafetyMetrics::begin_scan_cycle`],
+    /// raised to the per-unit maximum by
+    /// [`MaintenanceSafetyMetrics::record_scan`], and copied here by
+    /// [`MaintenanceSafetyMetrics::publish_scan_cycle`] once the cycle has
+    /// covered every unit this process owns, so a mid-cycle scrape reads the
+    /// previous cycle's complete value rather than a partial one.
+    retention_lag_ns: [AtomicI64; MAINTAINED_SIGNALS.len()],
+    /// The in-progress cycle's retention-lag accumulator. Unlike the summing
+    /// `l0_records_pending_accum`, this takes the MAXIMUM across the cycle's
+    /// units: the gauge reports the single oldest still-present expired bucket
+    /// this process observed, so a later unit with a smaller lag must not lower
+    /// it and units must not add together.
+    retention_lag_ns_accum: [AtomicI64; MAINTAINED_SIGNALS.len()],
 }
 
 impl MaintenanceSafetyMetrics {
@@ -361,6 +382,29 @@ impl MaintenanceSafetyMetrics {
             .load(Ordering::Relaxed)
     }
 
+    /// Bytes reclaimed for `signal` by the size-known sweep deletions (the
+    /// quarantine reaper and rule 3's unreferenced-part delete), summed since
+    /// process start ([`ravel_maintain::SweepReport::quarantine_reaped_bytes`]
+    /// plus [`ravel_maintain::SweepReport::unreferenced_parts_bytes`]). Backs
+    /// `ravel_maintain_bytes_reclaimed_total` (issue #1729).
+    pub fn bytes_reclaimed(&self, signal: Signal) -> u64 {
+        self.bytes_reclaimed[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// The retention lag for `signal` this process's most recent completed
+    /// maintenance cycle observed, in nanoseconds: for the oldest bucket that is
+    /// expired yet still physically present, how far the clock was past its
+    /// nominal retention deadline ([`MaintainReport::retention_lag_ns`]). `0`
+    /// when the cycle found no still-present expired bucket for the signal.
+    ///
+    /// A gauge like [`l0_records_pending`](Self::l0_records_pending), and the
+    /// per-cycle MAXIMUM over this process's units rather than a sum: it names
+    /// the single worst bucket. Backs `ravel_maintain_retention_lag_seconds`
+    /// (issue #1729), rendered in seconds.
+    pub fn retention_lag_ns(&self, signal: Signal) -> i64 {
+        self.retention_lag_ns[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
     pub fn record_legal_hold_refresh_failure(&self) {
         self.legal_hold_refresh_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -431,6 +475,17 @@ impl MaintenanceSafetyMetrics {
             .fetch_add(report.superseded_data_deleted as u64, Ordering::Relaxed);
         self.objects_deleted_unreferenced_parts_deleted
             .fetch_add(report.unreferenced_parts_deleted as u64, Ordering::Relaxed);
+
+        // The per-signal reclaimed-bytes counter (issue #1729): the two sweep
+        // deletions whose object size the pass already listed. Superseded and
+        // retention deletions delete by key without a size, so they contribute
+        // nothing here; the metric's HELP text says so.
+        self.bytes_reclaimed[index].fetch_add(
+            report
+                .quarantine_reaped_bytes
+                .saturating_add(report.unreferenced_parts_bytes),
+            Ordering::Relaxed,
+        );
     }
 
     /// One [`scan_and_maintain_with_memo`] result for `signal`, added to the
@@ -444,8 +499,13 @@ impl MaintenanceSafetyMetrics {
     /// [`begin_scan_cycle`](Self::begin_scan_cycle) cleared the accumulator at
     /// the top of the cycle.
     pub fn record_scan(&self, signal: Signal, report: &MaintainReport) {
-        self.l0_records_pending_accum[signal_index(signal)]
+        let index = signal_index(signal);
+        self.l0_records_pending_accum[index]
             .fetch_add(report.l0_records_pending as u64, Ordering::Relaxed);
+        // Retention lag takes the maximum, not the sum: the gauge names the
+        // single oldest still-present expired bucket, so a later unit with a
+        // smaller lag must not lower it and two units must not add together.
+        self.retention_lag_ns_accum[index].fetch_max(report.retention_lag_ns, Ordering::Relaxed);
     }
 
     /// Clear the L0-pending accumulator at the top of a maintenance cycle.
@@ -454,6 +514,9 @@ impl MaintenanceSafetyMetrics {
     /// still holds the previous cycle's complete total.
     pub fn begin_scan_cycle(&self) {
         for accum in &self.l0_records_pending_accum {
+            accum.store(0, Ordering::Relaxed);
+        }
+        for accum in &self.retention_lag_ns_accum {
             accum.store(0, Ordering::Relaxed);
         }
     }
@@ -473,6 +536,13 @@ impl MaintenanceSafetyMetrics {
             .l0_records_pending
             .iter()
             .zip(self.l0_records_pending_accum.iter())
+        {
+            published.store(accum.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for (published, accum) in self
+            .retention_lag_ns
+            .iter()
+            .zip(self.retention_lag_ns_accum.iter())
         {
             published.store(accum.load(Ordering::Relaxed), Ordering::Relaxed);
         }
@@ -1387,6 +1457,7 @@ pub async fn run_discovery_cycle(
         total.not_sealed += report.not_sealed;
         total.skipped_terminal += report.skipped_terminal;
         total.l0_records_pending += report.l0_records_pending;
+        total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
     }
 
     // Prune stall history to exactly this cycle's owned set (ADR-0065
@@ -1795,6 +1866,7 @@ pub(crate) async fn run_tick_with_clock(
                     total.not_sealed += report.not_sealed;
                     total.skipped_terminal += report.skipped_terminal;
                     total.l0_records_pending += report.l0_records_pending;
+                    total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
                 }
                 Err(MaintainError::ConservationViolation {
                     input_sample_count,
@@ -5838,6 +5910,124 @@ mod tests {
             crate::metrics::MemoryBudgetSnapshot::default(),
             false,
         )
+    }
+
+    /// `bytes_reclaimed` sums the two size-known sweep deletions (quarantine
+    /// reap and unreferenced parts) per signal and accumulates across passes; a
+    /// quiet pass moves nothing and a different signal shares none of it (issue
+    /// #1729). Flip-line proof: drop either term from the `fetch_add` in
+    /// `record_sweep` and the rendered total changes.
+    #[test]
+    fn bytes_reclaimed_accumulates_size_known_deletions_per_signal() {
+        let safety = MaintenanceSafetyMetrics::default();
+        safety.record_sweep(
+            Signal::Metrics,
+            &ravel_maintain::SweepReport {
+                quarantine_reaped_bytes: 100,
+                unreferenced_parts_bytes: 20,
+                ..Default::default()
+            },
+        );
+        safety.record_sweep(
+            Signal::Metrics,
+            &ravel_maintain::SweepReport {
+                quarantine_reaped_bytes: 3,
+                unreferenced_parts_bytes: 4,
+                ..Default::default()
+            },
+        );
+        // A pass that reclaimed nothing must neither move nor drop the total.
+        safety.record_sweep(Signal::Metrics, &ravel_maintain::SweepReport::default());
+
+        assert_eq!(
+            safety.bytes_reclaimed(Signal::Metrics),
+            127,
+            "the sum of quarantine and unreferenced-part bytes over every pass"
+        );
+        assert_eq!(safety.bytes_reclaimed(Signal::Logs), 0);
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"metrics\"} 127"
+            ),
+            "the reclaimed-bytes sample must render the accumulated total:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+    }
+
+    /// `retention_lag_seconds` publishes the per-cycle MAXIMUM across a signal's
+    /// units, in seconds, reads the previous complete value mid-cycle, and is a
+    /// gauge a later shorter cycle lowers (issue #1729). Flip-line proof:
+    /// change the `fetch_max` in `record_scan` to `fetch_add` and cycle 1 sums
+    /// the two units to 240 instead of reporting the worse one, 150.
+    #[test]
+    fn retention_lag_publishes_per_cycle_maximum_in_seconds() {
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // Cycle 1: two metrics units at 90 s and 150 s; the gauge takes the max.
+        safety.begin_scan_cycle();
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 90_000_000_000,
+                ..Default::default()
+            },
+        );
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 150_000_000_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            0,
+            "mid-cycle, before publish, the gauge holds the previous complete value"
+        );
+        safety.publish_scan_cycle();
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            150_000_000_000,
+            "the published value is the cycle maximum, not the sum or the last unit"
+        );
+        assert_eq!(safety.retention_lag_ns(Signal::Logs), 0);
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"metrics\"} 150"
+            ),
+            "150 s of lag must render as 150:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+
+        // Cycle 2: a shorter lag replaces it; the gauge is not sticky.
+        safety.begin_scan_cycle();
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 30_000_000_000,
+                ..Default::default()
+            },
+        );
+        safety.publish_scan_cycle();
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            30_000_000_000,
+            "a later, smaller cycle maximum replaces the old one"
+        );
     }
 
     /// An `OrphanPass::Skip` pass never ran rule 1, so its zero orphan figures
