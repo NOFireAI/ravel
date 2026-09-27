@@ -83,11 +83,14 @@
 //!    `Timeout`, `Transient`) is not consumed: nothing it found is counted,
 //!    the marker stays behind it and the tick ends, so the next tick retries
 //!    the whole unit rather than skipping its objects for a whole rotation.
-//!    The cursor counts consecutive held ticks on one marker position
-//!    (`ravel_scrub_marker_held_ticks`), and once [`MAX_HELD_TICKS`] have held
-//!    the next tick stops retrying: it consumes the unit, tries each of its
-//!    objects once, and counts every record or object that still fails
-//!    retryably on `ravel_scrub_unreadable_total{reason="retry_exhausted"}`.
+//!    The cursor counts consecutive held ticks against the held unit's first
+//!    listing entry (`ravel_scrub_marker_held_ticks`), so a unit that lands
+//!    between the marker and the held one and reads clean leaves the count
+//!    alone, and one that is held itself starts a fresh count. Once
+//!    [`MAX_HELD_TICKS`] have held the unit, the next tick that reaches it
+//!    stops retrying: it consumes the unit, tries each of its objects once,
+//!    and counts every record or object that still fails retryably on
+//!    `ravel_scrub_unreadable_total{reason="retry_exhausted"}`.
 //!    Every other failure moves the marker on. A GET that fails with an error
 //!    retrying cannot clear (`Permanent`, `AccessDenied`, `Corrupted`, and
 //!    every other kind but `NotFound`), and a record whose bytes do not
@@ -199,9 +202,9 @@ const DEFAULT_SCRUB_TICK: Duration = Duration::from_secs(3600);
 /// that retains a day or more.
 const MAX_MARKER_HOLD: Duration = Duration::from_secs(6 * 3600);
 
-/// Consecutive held ticks on one marker position after which the next tick
-/// stops retrying the unit, moves past it, and counts every object in it that
-/// still failed as `reason="retry_exhausted"`. `MAX_MARKER_HOLD /
+/// Consecutive held ticks on one unit after which the next tick that reaches
+/// it stops retrying the unit, moves past it, and counts every object in it
+/// that still failed as `reason="retry_exhausted"`. `MAX_MARKER_HOLD /
 /// DEFAULT_SCRUB_TICK` = 6: no tick is longer than `DEFAULT_SCRUB_TICK`, so a
 /// hold ends within six tick intervals of its first held tick, six hours of
 /// cadence at the default tick (at most 6.6 with the loop's 10% start jitter,
@@ -339,8 +342,8 @@ impl ScrubMetrics {
         self.rotation_behind[signal_index(signal)].load(Ordering::Relaxed)
     }
 
-    /// Consecutive held ticks on one marker position for the worst shard of
-    /// `signal` in the last cycle.
+    /// Consecutive held ticks on one unit for the worst shard of `signal` in
+    /// the last cycle.
     pub fn marker_held_ticks(&self, signal: Signal) -> u64 {
         self.marker_held_ticks[signal_index(signal)].load(Ordering::Relaxed)
     }
@@ -827,15 +830,15 @@ async fn run_shard_tick(
     // cannot clear, and a record that failed to decode, move the marker on, so
     // one bad record cannot pin the rotation; those that were found but could
     // not be read are counted as unreadable. A unit that has already held the
-    // marker for `MAX_HELD_TICKS` consecutive ticks is this tick's first unit,
-    // and it is consumed whatever its GETs return.
-    let give_up = cursor.held_ticks >= MAX_HELD_TICKS;
-    let mut first_unit = true;
+    // marker for `MAX_HELD_TICKS` ticks is consumed whatever its GETs return.
+    // The count belongs to the unit starting at the cursor's held key, not to
+    // whatever unit follows the marker: a commit from a lower-sorting writer
+    // can land between the two.
     let mut listing = MarkerListing::new(store, &prefix, cursor.last_commit_key.clone());
     let mut slice_entries = 0u64;
     let mut requests = 0u64;
     let mut listing_failed = false;
-    let mut unit_held = false;
+    let mut held_unit: Option<String> = None;
     while !plan.budget.is_filled(slice_entries, requests) {
         let pages_before = listing.pages;
         let unit = match next_unit(store, &mut listing).await {
@@ -854,19 +857,17 @@ async fn run_shard_tick(
         requests = requests
             .saturating_add((listing.pages - pages_before) as u64)
             .saturating_add(unit.context_pages);
-        let exhausted = give_up && std::mem::replace(&mut first_unit, false);
+        let unit_key = unit.advance.first().cloned().unwrap_or_default();
+        let hold_starts = !cursor.is_held_unit(&unit_key);
+        let exhausted = !hold_starts && cursor.held_ticks >= MAX_HELD_TICKS;
         let outcome = unit_targets(store, &unit).await;
         requests = requests.saturating_add(outcome.gets);
-        // A hold starts when the marker has not been held on this position
-        // before: it moved this tick, or it has not been held since it last
-        // moved.
-        let hold_starts = cursor.held_ticks == 0;
         if outcome.retry() && !exhausted {
             // Leave the marker where it is: this unit is retried next tick.
             if hold_starts {
                 log_unreadable_in_held_unit(tenant, signal, shard, &outcome.unreadable, &[], &[]);
             }
-            unit_held = true;
+            held_unit = Some(unit_key);
             break;
         }
         requests = requests.saturating_add(
@@ -898,14 +899,14 @@ async fn run_shard_tick(
                         &found,
                     );
                 }
-                unit_held = true;
+                held_unit = Some(unit_key);
                 break;
             }
         };
         if exhausted {
             tracing::error!(
                 tenant = %tenant.to_hex(), signal = ?signal, shard,
-                unit_key = %unit.advance.first().map(String::as_str).unwrap_or_default(),
+                unit_key = %unit_key,
                 held_ticks = cursor.held_ticks,
                 "scrub: unit held the marker for the maximum number of ticks; moving past it, \
                  and what still failed retryably is counted as retry_exhausted"
@@ -940,8 +941,9 @@ async fn run_shard_tick(
         }
         slice_entries = slice_entries.saturating_add(entries);
     }
-    if unit_held {
-        cursor.hold();
+    let unit_held = held_unit.is_some();
+    if let Some(unit_key) = held_unit {
+        cursor.hold(&unit_key);
     }
     let rotation_complete = !listing_failed && !unit_held && listing.ended();
 
@@ -1882,6 +1884,8 @@ struct PersistedCursor {
     rotation_tail_entries: u64,
     #[serde(default)]
     held_ticks: u32,
+    #[serde(default)]
+    held_unit_key: Option<String>,
 }
 
 /// Load this shard's persisted cursor, or a fresh one at the start of a
@@ -1919,6 +1923,7 @@ async fn load_cursor(
                 rotation_tail_dir: persisted.rotation_tail_dir,
                 rotation_tail_entries: persisted.rotation_tail_entries,
                 held_ticks: persisted.held_ticks,
+                held_unit_key: persisted.held_unit_key,
             }),
             Err(err) => {
                 tracing::warn!(
@@ -1963,6 +1968,7 @@ async fn persist_cursor(
         rotation_tail_dir: cursor.rotation_tail_dir.clone(),
         rotation_tail_entries: cursor.rotation_tail_entries,
         held_ticks: cursor.held_ticks,
+        held_unit_key: cursor.held_unit_key.clone(),
     };
     let bytes = match serde_json::to_vec(&persisted) {
         Ok(bytes) => bytes,
@@ -3766,6 +3772,7 @@ mod tests {
         assert_eq!(loaded.rotation_tail_dir, None);
         assert_eq!(loaded.rotation_tail_entries, 0);
         assert_eq!(loaded.held_ticks, 0);
+        assert_eq!(loaded.held_unit_key, None);
 
         let clock = ravel_maintain::FixedClock::new(500_003 * NS_PER_HOUR);
         let metrics = ScrubMetrics::default();
@@ -4752,6 +4759,161 @@ mod tests {
         for part_key in &part_keys {
             assert_eq!(store.calls(part_key), 0, "no GET of part {part_key}");
         }
+    }
+
+    /// The commit key writer 1_002 (the writer of the second listed record in
+    /// [`eight_record_shard`]) gets for `seq`: it sorts after that record and
+    /// before the third.
+    fn late_commit_key(seq: u64) -> String {
+        keys::commit_key(
+            &tenant().hash(),
+            Signal::Metrics,
+            0,
+            500_000,
+            Uuid::from_u128(1_002),
+            1,
+            seq,
+        )
+        .expect("commit key")
+    }
+
+    /// A commit that lands between the marker and a held unit and reads clean
+    /// is consumed without touching the hold: the held unit keeps its count,
+    /// and the tick after the one it reaches `MAX_HELD_TICKS` gives up on it
+    /// and only it.
+    #[tokio::test]
+    async fn a_commit_landing_ahead_of_a_held_unit_keeps_the_units_count() {
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let (listed, data_keys) = eight_record_shard(&memory).await;
+        let held_key = listed[2].key.clone();
+        let failing = data_keys[2].clone();
+        let store = GetFaults::new(memory.clone(), move |key, _| {
+            (key == failing).then_some(StoreError::Timeout)
+        });
+        let metrics = ScrubMetrics::default();
+        let tenant_hash = tenant().hash();
+        for tick in 1..MAX_HELD_TICKS {
+            tick_eight(&store, &metrics).await;
+            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+                .await
+                .expect("cursor loads");
+            assert_eq!(
+                cursor.last_commit_key.as_deref(),
+                Some(listed[1].key.as_str())
+            );
+            assert_eq!(cursor.held_ticks, tick);
+        }
+
+        publish_segment_as(&memory, Uuid::from_u128(1_002), 9, &["cpu"], 500_000).await;
+        let late_key = late_commit_key(9);
+        assert!(listed[1].key < late_key && late_key < held_key);
+
+        tick_eight(&store, &metrics).await;
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(late_key.as_str()),
+            "the late commit is consumed and the held unit holds behind it"
+        );
+        assert_eq!(
+            cursor.held_ticks, MAX_HELD_TICKS,
+            "the held unit keeps its count"
+        );
+        assert_eq!(unreadable_total(&metrics), 0);
+
+        tick_eight(&store, &metrics).await;
+        assert_eq!(store.fired(), u64::from(MAX_HELD_TICKS) + 1);
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(cursor.held_ticks, 0);
+        assert!(
+            cursor.last_commit_key.as_deref() > Some(held_key.as_str()),
+            "the marker moves past the held unit, got {:?}",
+            cursor.last_commit_key
+        );
+        assert_eq!(
+            metrics.unreadable(
+                Signal::Metrics,
+                ScrubLevel::L0,
+                UnreadableReason::RetryExhausted
+            ),
+            1,
+            "only the held unit's object is given up"
+        );
+        assert_eq!(unreadable_total(&metrics), 1);
+        assert_eq!(mismatch_total(&metrics), 0);
+    }
+
+    /// A commit that lands between the marker and a unit that has used up its
+    /// held ticks, and whose own GET then fails retryably once, is held on a
+    /// count of its own: it is not given up on its first failure, and the
+    /// next tick verifies it clean.
+    #[tokio::test]
+    async fn a_commit_landing_ahead_of_an_exhausted_unit_is_held_on_its_own_count() {
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let (listed, data_keys) = eight_record_shard(&memory).await;
+        let failing = data_keys[2].clone();
+        let store = GetFaults::new(memory.clone(), {
+            let failing = failing.clone();
+            move |key, _| (key == failing).then_some(StoreError::Timeout)
+        });
+        let metrics = ScrubMetrics::default();
+        let tenant_hash = tenant().hash();
+        for tick in 1..=MAX_HELD_TICKS {
+            tick_eight(&store, &metrics).await;
+            let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+                .await
+                .expect("cursor loads");
+            assert_eq!(cursor.held_ticks, tick);
+        }
+
+        let late_data =
+            publish_segment_as(&memory, Uuid::from_u128(1_002), 9, &["cpu"], 500_000).await;
+        let late_key = late_commit_key(9);
+        assert!(listed[1].key < late_key && late_key < listed[2].key);
+        let store = GetFaults::new(memory.clone(), move |key, earlier| {
+            if key == failing {
+                Some(StoreError::Timeout)
+            } else if key == late_data && earlier == 0 {
+                Some(StoreError::Timeout)
+            } else {
+                None
+            }
+        });
+
+        tick_eight(&store, &metrics).await;
+        assert_eq!(store.fired(), 1, "the late commit's object failed once");
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(
+            cursor.last_commit_key.as_deref(),
+            Some(listed[1].key.as_str()),
+            "the late commit holds the marker"
+        );
+        assert_eq!(cursor.held_ticks, 1, "a different unit starts a fresh hold");
+        assert_eq!(
+            unreadable_total(&metrics),
+            0,
+            "the late commit is not given up on its first failure"
+        );
+
+        tick_eight(&store, &metrics).await;
+        assert_eq!(
+            store.fired(),
+            2,
+            "the late commit read clean, then the old unit failed"
+        );
+        let cursor = load_cursor(memory.as_ref(), &tenant_hash, Signal::Metrics, 0, 0)
+            .await
+            .expect("cursor loads");
+        assert_eq!(cursor.last_commit_key.as_deref(), Some(late_key.as_str()));
+        assert_eq!(cursor.held_ticks, 1);
+        assert_eq!(unreadable_total(&metrics), 0);
+        assert_eq!(mismatch_total(&metrics), 0);
     }
 
     /// A unit that fails retryably twice and then reads clean holds for two

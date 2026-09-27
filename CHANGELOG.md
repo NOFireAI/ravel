@@ -31,7 +31,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   object GET failed with a retryable error (throttled, timeout, transient) does
   not move the marker past it and counts nothing from it, so the next tick
   retries the whole unit. That hold is capped at six consecutive held ticks on
-  one position, six hours of tick cadence at the default one-hour tick (at most
+  one unit, six hours of tick cadence at the default one-hour tick (at most
   6.6 with the loop's start jitter): the tick after that moves past the unit
   and counts each record or object that still fails retryably on
   `ravel_scrub_unreadable_total{reason="retry_exhausted"}`, and the new gauge

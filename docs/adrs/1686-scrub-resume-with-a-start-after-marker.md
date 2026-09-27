@@ -348,10 +348,16 @@ behind the unit, `NotFound` is skipped, and any other error is counted on
 nothing it found, since the next tick verifies all of it again.
 
 **A hold is capped.** The cursor persists `held_ticks`, the consecutive
-ticks that held the marker on its current position, reset whenever the
-marker moves, and `ravel_scrub_marker_held_ticks{signal}` reads the largest
-value any shard of the signal reported in the last cycle. Once it reaches
-`MAX_HELD_TICKS`, the next tick consumes that unit: it tries each of the
+ticks that held the marker behind one unit, together with `held_unit_key`,
+that unit's first listing entry, and `ravel_scrub_marker_held_ticks{signal}`
+reads the largest value any shard of the signal reported in the last cycle.
+The count belongs to the unit, not to the marker position: a commit from a
+writer whose id sorts low can land between the marker and the held unit, and
+when it reads clean the walk consumes it and leaves the count alone, while a
+unit that is held itself starts a fresh count at one. The hold ends when the
+marker reaches or passes the held key. Once the count reaches
+`MAX_HELD_TICKS`, the next tick that reaches the unit starting at the held
+key consumes it: it tries each of the
 unit's objects once, counts every record or object that still fails
 retryably once on `ravel_scrub_unreadable_total{reason="retry_exhausted"}`
 at its own level with an error log naming the unit, counts everything else

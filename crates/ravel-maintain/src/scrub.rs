@@ -637,10 +637,14 @@ pub struct ScrubCursor {
     pub rotation_tail_dir: Option<String>,
     /// Entries in and after `rotation_tail_dir` when the last count ran.
     pub rotation_tail_entries: u64,
-    /// Consecutive ticks that held the marker on its current position because
-    /// a GET of the next unit failed retryably. Zero whenever the marker has
-    /// moved since the last hold.
+    /// Consecutive ticks that held the marker behind the unit starting at
+    /// `held_unit_key` because one of its GETs failed retryably. Zero when no
+    /// unit is held.
     pub held_ticks: u32,
+    /// The first listing entry of the unit `held_ticks` counts for. A unit
+    /// that lands between the marker and this one, and is consumed, leaves
+    /// the count alone; one that is held itself starts a fresh count.
+    pub held_unit_key: Option<String>,
 }
 
 /// The running tally of one LIST-only count pass over the commit shard prefix
@@ -715,6 +719,7 @@ impl ScrubCursor {
             rotation_tail_dir: None,
             rotation_tail_entries: 0,
             held_ticks: 0,
+            held_unit_key: None,
         }
     }
 
@@ -736,7 +741,7 @@ impl ScrubCursor {
         let (dir, entries) = tally.window().map_or((None, 0), |(d, n)| (Some(d), n));
         self.rotation_tail_dir = dir;
         self.rotation_tail_entries = entries;
-        self.held_ticks = 0;
+        self.clear_hold();
     }
 
     /// The start-after key of this tick's LIST-only tail count: the tail
@@ -825,20 +830,44 @@ impl ScrubCursor {
     }
 
     /// Advance the marker past `entries` consumed listing entries ending at
-    /// `last_key`, whose objects total `bytes`.
+    /// `last_key`, whose objects total `bytes`. The hold ends once the marker
+    /// reaches or passes the held unit's first entry, whether that unit was
+    /// consumed or deleted after it was listed.
     pub fn consume(&mut self, last_key: String, entries: u64, bytes: u64) {
+        if self
+            .held_unit_key
+            .as_deref()
+            .is_some_and(|held| last_key.as_str() >= held)
+        {
+            self.clear_hold();
+        }
         self.last_commit_key = Some(last_key);
         self.rotation_entries_visited = self.rotation_entries_visited.saturating_add(entries);
         self.rotation_bytes_seen = self.rotation_bytes_seen.saturating_add(bytes);
-        self.held_ticks = 0;
     }
 
-    /// This tick held the marker behind a unit whose GET failed retryably.
-    /// Counts one more consecutive held tick on the marker's position; a tick
-    /// that moved the marker before holding has already reset the count, so
-    /// the new position starts at one.
-    pub fn hold(&mut self) {
-        self.held_ticks = self.held_ticks.saturating_add(1);
+    /// Whether the unit whose first listing entry is `first_key` is the one
+    /// `held_ticks` counts for.
+    pub fn is_held_unit(&self, first_key: &str) -> bool {
+        self.held_unit_key.as_deref() == Some(first_key)
+    }
+
+    /// This tick held the marker behind the unit whose first listing entry is
+    /// `first_key`, because one of its GETs failed retryably. Counts one more
+    /// held tick when that unit is the one already held, and starts a fresh
+    /// count at one for any other unit.
+    pub fn hold(&mut self, first_key: &str) {
+        if self.is_held_unit(first_key) {
+            self.held_ticks = self.held_ticks.saturating_add(1);
+        } else {
+            self.held_ticks = 1;
+            self.held_unit_key = Some(first_key.to_string());
+        }
+    }
+
+    fn clear_hold(&mut self) {
+        self.held_ticks = 0;
+        self.held_unit_key = None;
     }
 
     /// The listing ended: roll the byte total over and return to the start of
@@ -853,7 +882,7 @@ impl ScrubCursor {
         self.rotation_appended_entries = 0;
         self.rotation_tail_dir = None;
         self.rotation_tail_entries = 0;
-        self.held_ticks = 0;
+        self.clear_hold();
     }
 }
 
