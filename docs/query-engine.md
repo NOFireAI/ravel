@@ -3515,8 +3515,15 @@ Schema (fixed columns plus one map, `crates/ravel-sql/src/spans_schema.rs`):
   Utf8)})`, nullable (NULL when the span carries no event, never an empty
   list). Built from RSPAN v4's four nested event columns; the event attribute
   map uses the same label map type as `attrs`. The raw protobuf blob remains
-  queryable as `attrs["_events_raw"]`. Span links are not exposed as a column
-  yet and still arrive only in that blob.
+  queryable as `attrs["_events_raw"]`.
+- `links`: `List(Struct{trace_id: FixedSizeBinary(16), span_id:
+  FixedSizeBinary(8), trace_state: Utf8, attrs: Map(Utf8, Utf8)})`, nullable
+  (NULL when the span carries no link, never an empty list). Unlike `events`,
+  built directly from the plain `attrs["_links_raw"]` protobuf blob at scan
+  time, on every RSPAN version: RSPAN is a frozen persistent format, so
+  promoting links into a nested on-disk column the way `events` was (RSPAN v4)
+  needs an ADR and a version bump. The raw blob remains queryable as
+  `attrs["_links_raw"]`.
 - `duration_ns`: `Int64`, non-null, **computed** as `end_ts - start_ts`, never a
   stored column (ADR-0045 decision 5, rejected alternative 3). Both endpoints
   are already stored, so materializing the difference per row would add bytes to
@@ -3574,13 +3581,16 @@ to union, so a `trace_id` disjunction is refused too.
 
 Scan paths and their partition metrics (ADR-0110). `SpansScanExec` runs one of
 two paths per partition: a columnar fast path that builds Arrow arrays straight
-from RSPAN's block view, taken when the projection excludes both `attrs` and
-`events`, no pending erasure predicate applies, and no scanned block carries an
-`attrs_raw` overflow page; and the row path, which rebuilds each `SpanRecord`
-and is what a query touching `attrs` or `events` (`SELECT *` included) runs.
-`events` joins `attrs` in that rule for the same reason: it is reconstructed
-from the nested event columns the fast path exists to skip. Four partition metrics show what
-happened, and `EXPLAIN ANALYZE` prints them:
+from RSPAN's block view, taken when the projection excludes `attrs`, `events`,
+and `links`, no pending erasure predicate applies, and no scanned block carries
+an `attrs_raw` overflow page; and the row path, which rebuilds each
+`SpanRecord` and is what a query touching `attrs`, `events`, or `links`
+(`SELECT *` included) runs. `events` joins `attrs` in that rule because it is
+reconstructed from the nested event columns the fast path exists to skip;
+`links` joins them for a different reason, since it is never promoted into
+nested columns at all, but decoded from the plain `attrs["_links_raw"]` value
+that only the row path's merged `attrs` map carries. Four partition metrics
+show what happened, and `EXPLAIN ANALYZE` prints them:
 
 - `columnar_batches` / `rowpath_batches`: batches emitted by each path. The two
   paths' output is identical by construction, so these are the only external

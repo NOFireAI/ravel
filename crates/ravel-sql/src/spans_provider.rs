@@ -25,8 +25,10 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+#[cfg(feature = "flight-sql")]
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
+#[cfg(feature = "flight-sql")]
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 #[cfg(feature = "flight-sql")]
@@ -43,7 +45,7 @@ use crate::distributed_rlog::{
 };
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_pushdown::{SpansPushdown, extract_spans};
-use crate::spans_scan::{SpansScanExec, columnar_static_eligible};
+use crate::spans_scan::SpansScanExec;
 use crate::spans_schema::spans_schema;
 
 /// The `spans` table provider for one tenant over one pinned `Signal::Spans`
@@ -135,8 +137,9 @@ impl SpansTableProvider {
 
     /// Apply projection pushdown (column selection only) above `plan` on the
     /// distributed path, where the fan-out returns the full public schema and
-    /// DataFusion asked for a subset. The local path applies the same
-    /// `ProjectionExec` inline in [`TableProvider::scan`].
+    /// DataFusion asked for a subset. The local path has no such fan-out: it
+    /// pushes the projection straight into `SpansScanExec`, which emits the
+    /// projected schema directly, so it never needs this wrapper.
     #[cfg(feature = "flight-sql")]
     fn apply_projection(
         &self,
@@ -287,34 +290,17 @@ impl TableProvider for SpansTableProvider {
         let target_partitions = state.config().target_partitions();
         let pushdown = extract_spans(filters);
 
-        // Eligible fast path (ADR-0110 decision 4): the projection excludes the
-        // `attrs` map and the `events` list, and no pending erasure predicate
-        // applies. Push the
-        // projection into the scan, which emits the projected schema directly
-        // and decodes only the pages that schema needs; add NO `ProjectionExec`.
-        if columnar_static_eligible(projection, &self.erasure) {
-            return self.build_scan(target_partitions, &pushdown, projection.cloned());
-        }
-
-        // Ineligible path, unchanged: the scan emits the full twelve-column
-        // schema and, for column selection, this `ProjectionExec` drops the
-        // rest. The fetch reads the whole object regardless (an `attrs` or
-        // `events` projection, or a pending erasure predicate, forces the row
-        // path, which
-        // has no per-column page toggle), matching the logs/metrics providers.
-        let plan = self.build_scan(target_partitions, &pushdown, None)?;
-        match projection {
-            Some(proj) => {
-                let exprs = proj
-                    .iter()
-                    .map(|&i| {
-                        let name = self.schema.field(i).name();
-                        Ok((col(name, &self.schema)?, name.to_string()))
-                    })
-                    .collect::<DFResult<Vec<_>>>()?;
-                Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
-            }
-            None => Ok(plan),
-        }
+        // Push the projection into the scan unconditionally: `SpansScanExec`
+        // computes its own `columnar_eligible` flag from the same
+        // `columnar_static_eligible` check, so passing a real projection is
+        // safe whether or not it includes `attrs`/`events`/`links` or an
+        // erasure predicate is pending. On the columnar fast path (ADR-0110
+        // decision 4) this emits the projected schema directly and decodes
+        // only the pages that schema needs. On the row path, `SpansScanExec`
+        // is equally projection-aware: it only builds the arrow arrays for
+        // the projected column indices, so a projection that excludes
+        // `events`/`links` skips their decode there too, not only on the
+        // columnar path. Either way, no wrapping `ProjectionExec` is needed.
+        self.build_scan(target_partitions, &pushdown, projection.cloned())
     }
 }
