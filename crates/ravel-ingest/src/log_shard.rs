@@ -20,7 +20,9 @@
 //! inside the task. This ports ADR-0067 decisions 1 and 2 from the metrics
 //! [`crate::shard`]; the adaptive flush delay (decision 3) is metrics-only and
 //! deliberately absent here (the age trigger stays the fixed
-//! `max_flush_delay`/`max_flush_delay_idle` in [`LogShardActor::age_threshold_ns`]).
+//! `max_flush_delay`/`max_flush_delay_idle`, plus the opt-in ADR-1737
+//! `max_flush_lifetime` hold shared with the metrics actor, in
+//! [`LogShardActor::age_threshold_ns`]).
 //!
 //! The divergences from the metrics shard actor are otherwise deliberate and
 //! narrow: the buffer holds [`NormalizedLogRecord`]s instead of points, the
@@ -62,8 +64,8 @@ use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES,
-    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket, memory_backstop_crossed,
-    size_trigger_fires,
+    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket, idle_age_threshold,
+    memory_backstop_crossed, size_trigger_fires,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -1296,36 +1298,40 @@ impl LogShardActor {
     /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7). "Worth a PUT" is a claim about the object, so this
+    /// (ADR-0051 section 7), or, below a non-zero `idle_flush_byte_floor`, for
+    /// `max_flush_lifetime` (ADR-1737, [`idle_age_threshold`]). "Worth a PUT"
+    /// is a claim about the object, so this
     /// reads the object-bytes estimate, not the buffered-memory charge (issue
     /// #1305). Strict-mode ack latency is unaffected:
     /// a strict write always leaves `waiters` non-empty for its whole flush
-    /// window.
-    fn age_threshold_ns(&self, buf: &LogTenantBuf) -> i64 {
+    /// window. Returns the trigger to record alongside the threshold.
+    fn age_threshold_ns(&self, buf: &LogTenantBuf) -> (i64, FlushTrigger) {
         let has_priority =
             !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if has_priority {
-            self.config.max_flush_delay.as_nanos() as i64
+            (
+                self.config.max_flush_delay.as_nanos() as i64,
+                FlushTrigger::Age,
+            )
         } else {
-            self.config.max_flush_delay_idle.as_nanos() as i64
+            idle_age_threshold(buf.flush_est_bytes, &self.config)
         }
     }
 
     async fn flush_aged(&mut self) {
         let now = self.clock.now_ns();
-        let due: Vec<TenantId> = self
+        let due: Vec<(TenantId, FlushTrigger)> = self
             .tenants
             .iter()
-            .filter(|(_, buf)| {
-                buf.oldest_arrival_ns
-                    .map(|t| now.saturating_sub(t) >= self.age_threshold_ns(buf))
-                    .unwrap_or(false)
+            .filter_map(|(tenant, buf)| {
+                let oldest = buf.oldest_arrival_ns?;
+                let (threshold_ns, trigger) = self.age_threshold_ns(buf);
+                (now.saturating_sub(oldest) >= threshold_ns).then(|| (tenant.clone(), trigger))
             })
-            .map(|(t, _)| t.clone())
             .collect();
-        for tenant in due {
+        for (tenant, trigger) in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
+                self.flush_tenant(tenant, buf, trigger).await;
             }
         }
     }
