@@ -8,6 +8,9 @@
 //! segment byte is served from a cache. The per-flush figure is read off the
 //! difference between two values of `N`, and the per-sealed-segment figure off
 //! the difference between two values of `K`, so neither is assumed.
+//!
+//! ADR-1306 follow-up task 2 repeats the per-flush measurement with every
+//! unsealed flush written above the fetcher's whole-object threshold.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_arguments)]
 
 use std::sync::{Arc, Mutex};
@@ -29,7 +32,9 @@ use ravel_object_store::{
 };
 use ravel_promql::Value;
 use ravel_query::{
-    DEFAULT_BUDGET_REFERENCE_SHARDS, EngineConfig, QueryEngine, QueryPhase, QueryStats,
+    BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, DEFAULT_BUDGET_REFERENCE_SHARDS,
+    DEFAULT_WHOLE_OBJECT_THRESHOLD, EngineConfig, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+    MAX_REQUESTS_PER_UNSEALED_FLUSH, QueryEngine, QueryPhase, QueryStats,
     REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH,
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
@@ -75,18 +80,6 @@ async fn publish_flush(
     ingest_hour_bucket: u32,
     ts_ns: i64,
 ) {
-    let writer_id = Uuid::new_v4();
-    let identity = SegmentIdentity {
-        tenant_hash: tenant_hash.0,
-        shard,
-        writer_id: writer_id.to_string(),
-        writer_epoch: 1,
-        writer_seq,
-    };
-    let bounds = IngestBounds {
-        min_ingest_ts_ns: 0,
-        max_ingest_ts_ns: 0,
-    };
     let label_set = LabelSet::new(vec![Label {
         name: METRIC_NAME_LABEL.to_string(),
         value: METRIC.to_string(),
@@ -101,7 +94,41 @@ async fn publish_flush(
             value: writer_seq as f64,
         }],
     };
-    let written = SegmentWriter::write(vec![input], identity, bounds).expect("write segment");
+    publish_segment(
+        store,
+        tenant_hash,
+        shard,
+        writer_seq,
+        ingest_hour_bucket,
+        vec![input],
+    )
+    .await;
+}
+
+/// Writes `inputs` as one segment, puts it and publishes its commit record.
+/// Returns the data object's size in bytes.
+async fn publish_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: TenantHash,
+    shard: u32,
+    writer_seq: u64,
+    ingest_hour_bucket: u32,
+    inputs: Vec<SeriesInput>,
+) -> u64 {
+    let writer_id = Uuid::new_v4();
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq,
+    };
+    let bounds = IngestBounds {
+        min_ingest_ts_ns: 0,
+        max_ingest_ts_ns: 0,
+    };
+    let written = SegmentWriter::write(inputs, identity, bounds).expect("write segment");
+    let object_size = written.bytes.len() as u64;
     let rec = record::build(NewCommitRecord {
         tenant_hash,
         signal: Signal::Metrics,
@@ -129,6 +156,7 @@ async fn publish_flush(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish");
+    object_size
 }
 
 fn catalog_config() -> CatalogConfig {
@@ -181,6 +209,134 @@ async fn fixture(sealed: u64, tail_per_shard: u64) -> (Arc<MemoryStore>, TenantH
         }
     }
     (store, th)
+}
+
+/// Series in one large flush, and samples per series. Each series' VAL page
+/// holds `LARGE_SAMPLES` raw f64 values (80,000 bytes, above the fetcher's
+/// 64 KiB coalesce gap), so skipping one series leaves a gap no coalescing
+/// bridges. 96 of them make an object of 7,700,472 bytes, just under ingest's
+/// 8 MiB size trigger.
+const LARGE_SERIES: usize = 96;
+const LARGE_SAMPLES: i64 = 10_000;
+/// Spacing of a large flush's samples: `LARGE_SAMPLES` of them span 100 s.
+const LARGE_SAMPLE_STEP_NS: i64 = 10_000_000;
+
+/// The label value of series `i` of a large flush.
+fn large_key(i: usize) -> String {
+    format!("{i:03}")
+}
+
+/// `LARGE_SERIES` series of `m`, told apart by label `k`, each with
+/// `LARGE_SAMPLES` samples from `start_ns` at `LARGE_SAMPLE_STEP_NS`. Values
+/// are pseudo-random positive finite bit patterns (random exponent and
+/// mantissa below 2.0), which no VAL codec encodes below 8 bytes each, so the
+/// writer stores them as VAL_RAW_F64 and the object size is set by the sample
+/// count.
+fn large_inputs(tenant_id: &TenantId, start_ns: i64, seed: u64) -> Vec<SeriesInput> {
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        f64::from_bits(state >> 2)
+    };
+    (0..LARGE_SERIES)
+        .map(|i| {
+            let labels = LabelSet::new(vec![
+                Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: METRIC.to_string(),
+                },
+                Label {
+                    name: "k".to_string(),
+                    value: large_key(i),
+                },
+            ])
+            .expect("valid labels");
+            let series_id = SeriesId::compute(tenant_id, METRIC, &labels).expect("series id");
+            let samples = (0..LARGE_SAMPLES)
+                .map(|s| Sample {
+                    ts_ns: start_ns + s * LARGE_SAMPLE_STEP_NS,
+                    value: next(),
+                })
+                .collect();
+            SeriesInput {
+                series_id,
+                labels,
+                samples,
+            }
+        })
+        .collect()
+}
+
+/// The fixture of [`fixture`], with every unsealed flush a large one of
+/// [`large_inputs`] instead of a one-sample segment. Returns the size of every
+/// large data object written.
+async fn large_fixture(
+    sealed: u64,
+    tail_per_shard: u64,
+) -> (Arc<MemoryStore>, TenantHash, Vec<u64>) {
+    let store = Arc::new(MemoryStore::new());
+    let tid = TenantId::new("acme".to_string());
+    let th = tid.hash();
+    let mut seq = 0u64;
+    for i in 0..sealed {
+        seq += 1;
+        let shard = (i % u64::from(SHARDS)) as u32;
+        let ts = i64::from(SEALED_HOUR) * NS_PER_HOUR + 10 * NS_PER_MIN + i as i64 * NS_PER_SEC;
+        publish_flush(store.as_ref(), &tid, th, shard, seq, SEALED_HOUR, ts).await;
+    }
+    let folder = Catalog::new(store.clone(), catalog_config()).expect("catalog");
+    folder
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), NOW_NS, &[], None)
+        .await
+        .expect("fold seals SEALED_HOUR");
+    let mut sizes = Vec::new();
+    for shard in 0..SHARDS {
+        // Half a sample step, so no two shards write the same timestamp.
+        let offset = i64::from(shard) * LARGE_SAMPLE_STEP_NS / 2;
+        for j in 0..tail_per_shard {
+            seq += 1;
+            let start =
+                i64::from(TAIL_HOUR) * NS_PER_HOUR + 10 * NS_PER_MIN + j as i64 * 2 * NS_PER_MIN;
+            let inputs = large_inputs(&tid, start + offset, seq);
+            let size = publish_segment(store.as_ref(), th, shard, seq, TAIL_HOUR, inputs).await;
+            sizes.push(size);
+        }
+        for _ in 0..RECENT_PER_SHARD {
+            seq += 1;
+            let start = NOW_NS - 2 * NS_PER_MIN;
+            let inputs = large_inputs(&tid, start + offset, seq);
+            let size = publish_segment(store.as_ref(), th, shard, seq, RECENT_HOUR, inputs).await;
+            sizes.push(size);
+        }
+    }
+    (store, th, sizes)
+}
+
+/// Every other series of a large flush in the order the writer lays their
+/// pages out (ascending series id), so each selected VAL page is separated
+/// from the next by one unselected 80,000-byte page.
+fn alternate_series_keys(tenant_id: &TenantId) -> Vec<String> {
+    let mut by_id: Vec<([u8; 16], String)> = (0..LARGE_SERIES)
+        .map(|i| {
+            let labels = LabelSet::new(vec![
+                Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: METRIC.to_string(),
+                },
+                Label {
+                    name: "k".to_string(),
+                    value: large_key(i),
+                },
+            ])
+            .expect("valid labels");
+            let id = SeriesId::compute(tenant_id, METRIC, &labels).expect("series id");
+            (id.0, large_key(i))
+        })
+        .collect();
+    by_id.sort();
+    by_id.into_iter().step_by(2).map(|(_, k)| k).collect()
 }
 
 /// Requests a query issued, by the kind of object they touched.
@@ -509,4 +665,136 @@ async fn cold_recent_query_requests_per_unsealed_flush_by_phase() {
         "{overhead_at_max_segments} requests outside the tail at max_segments exceed \
          the {REQUEST_BUDGET_FIXED_OVERHEAD} fixed overhead"
     );
+}
+
+/// ADR-1306 follow-up task 2: the same measurement at flushes of 7,700,472
+/// bytes, far above the 512 KiB whole-object threshold and just under ingest's
+/// 8 MiB size trigger. A flush then costs its commit-record GET, a footer-tail
+/// GET, one catalog GET and its page-range GETs. The third query selects every
+/// other series in page order, 48 page runs no coalescing joins, and the
+/// fetcher's page-range bound holds it at 4 page GETs per flush.
+#[tokio::test]
+async fn cold_requests_per_unsealed_flush_above_whole_object_threshold() {
+    const K: u64 = 2;
+    const N_LOW: u64 = 0;
+    const N_HIGH: u64 = 1;
+    let shards = u64::from(SHARDS);
+    let tid = TenantId::new("acme".to_string());
+    let alternate = alternate_series_keys(&tid);
+    assert_eq!(alternate.len(), LARGE_SERIES / 2);
+    assert_eq!(alternate.len(), 48);
+    let many_runs = format!("m{{k=~\"{}\"}}[140m]", alternate.join("|"));
+
+    let (store, th, sizes_low) = large_fixture(K, N_LOW).await;
+    let narrow_low = cold(&store, th, NARROW).await;
+    let wide_low = cold(&store, th, WIDE).await;
+    let many_low = cold(&store, th, &many_runs).await;
+    let (store, th, sizes_high) = large_fixture(K, N_HIGH).await;
+    let narrow_high = cold(&store, th, NARROW).await;
+    let wide_high = cold(&store, th, WIDE).await;
+    let many_high = cold(&store, th, &many_runs).await;
+
+    // Shard 0 objects are 2 bytes shorter: a zero shard is not encoded in the
+    // footer.
+    assert_eq!(sizes_low, [7_700_472, 7_700_474]);
+    assert_eq!(sizes_high, [7_700_472, 7_700_472, 7_700_474, 7_700_474]);
+    for size in sizes_high {
+        assert!(size > DEFAULT_WHOLE_OBJECT_THRESHOLD, "{size} bytes");
+        assert!(size < 8 * 1024 * 1024, "{size} bytes");
+    }
+
+    // Resolve is the fixture of the small-flush test. Plan is one whole-object
+    // GET per sealed segment in range plus one footer-tail GET per large flush
+    // in range; probe one catalog GET per large flush in range; scan one page
+    // run per large flush for a query selecting every series, and 4 for the
+    // alternate-series query.
+    let series_samples = LARGE_SAMPLES as usize;
+    let expected = [
+        (
+            "narrow, N=0",
+            narrow_low,
+            [[5, 3, 0], [2, 0, 0], [2, 0, 0], [2, 0, 0]],
+            objects(2, 6),
+            2 * LARGE_SERIES * series_samples,
+        ),
+        (
+            "wide, N=0",
+            wide_low,
+            [[5, 3, 0], [4, 0, 0], [2, 0, 0], [2, 0, 0]],
+            objects(2, 8),
+            2 * LARGE_SERIES * series_samples + 2,
+        ),
+        (
+            "alternate series, N=0",
+            many_low,
+            [[5, 3, 0], [4, 0, 0], [2, 0, 0], [8, 0, 0]],
+            objects(2, 14),
+            2 * alternate.len() * series_samples,
+        ),
+        (
+            "narrow, N=1",
+            narrow_high,
+            [[7, 3, 0], [2, 0, 0], [2, 0, 0], [2, 0, 0]],
+            objects(4, 6),
+            2 * LARGE_SERIES * series_samples,
+        ),
+        (
+            "wide, N=1",
+            wide_high,
+            [[7, 3, 0], [6, 0, 0], [4, 0, 0], [4, 0, 0]],
+            objects(4, 14),
+            4 * LARGE_SERIES * series_samples + 2,
+        ),
+        (
+            "alternate series, N=1",
+            many_high,
+            [[7, 3, 0], [6, 0, 0], [4, 0, 0], [16, 0, 0]],
+            objects(4, 26),
+            4 * alternate.len() * series_samples,
+        ),
+    ];
+    for (label, cost, phases, by_object, samples) in expected {
+        assert_eq!(cost.phases, phases, "{label}: requests by phase");
+        assert_eq!(cost.objects, by_object, "{label}: requests by object kind");
+        assert_eq!(cost.samples, samples, "{label}: samples returned");
+    }
+
+    // Per large flush per shard, by phase, from the N difference alone.
+    let added_flushes = shards * (N_HIGH - N_LOW);
+    let per_flush = |high: Cost, low: Cost| {
+        let mut out = [0u64; 4];
+        for (phase, slot) in out.iter_mut().enumerate() {
+            let delta: u64 =
+                high.phases[phase].iter().sum::<u64>() - low.phases[phase].iter().sum::<u64>();
+            assert_eq!(delta % added_flushes, 0);
+            *slot = delta / added_flushes;
+        }
+        out
+    };
+    // [resolve, plan, probe, scan].
+    let narrow = per_flush(narrow_high, narrow_low);
+    let wide = per_flush(wide_high, wide_low);
+    let many = per_flush(many_high, many_low);
+    assert_eq!(narrow, [1, 0, 0, 0], "out of range: the commit-record GET");
+    assert_eq!(
+        wide,
+        [1, 1, 1, 1],
+        "record, footer tail, catalog, one page run"
+    );
+    assert_eq!(
+        many,
+        [1, 1, 1, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64],
+        "48 page runs fetched in the bounded number of page-range GETs"
+    );
+    assert_eq!(many, [1, 1, 1, 4]);
+
+    let totals = [narrow, wide, many].map(|p| p.iter().sum::<u64>());
+    assert_eq!(totals, [1, 4, 7]);
+    for total in totals {
+        assert!(total <= MAX_REQUESTS_PER_UNSEALED_FLUSH);
+    }
+    // The worst measured flush leaves one request of the ceiling: the footer
+    // chase, which a footer inside the 64 KiB tail never needs.
+    assert_eq!(MAX_REQUESTS_PER_UNSEALED_FLUSH, 8);
+    assert_eq!(BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, 8);
 }

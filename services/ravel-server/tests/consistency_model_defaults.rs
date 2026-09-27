@@ -317,7 +317,7 @@ fn max_segments_figure_matches_the_derived_constant() {
 /// from the default `--shards` and the default ingest flush cadence. The
 /// figure is computed here from that derivation, never restated, so a default
 /// or a derivation change fails this rather than leaving the doc claiming
-/// 48,200 while a stock server derives 15,800.
+/// one figure while a stock server derives another.
 #[test]
 fn request_budget_figure_matches_the_derived_default() {
     use clap::Parser;

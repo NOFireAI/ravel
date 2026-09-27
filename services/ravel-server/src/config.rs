@@ -7825,8 +7825,8 @@ mod tests {
 
         // Derived path: no --max-s3-requests, default --shards (4). The budget
         // is the shard-aware derivation, and the worst legitimate open hour at
-        // 4 shards (4 x 7,200 = 28,800 GETs) must fit under it. The old flat
-        // 25,000 default rejected exactly this cost.
+        // 4 shards and the default flush cadence, one GET per flush on every
+        // shard, must fit under it.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
             cli.shards, 4,
@@ -7839,8 +7839,8 @@ mod tests {
                 .expect("defaults resolve a bounded budget"),
             RequestLimit::Bounded(expected)
         );
-        let open_hour_cost = 4 * (3_600_000u64 / 2_000);
-        assert_eq!(open_hour_cost, 7_200);
+        let flush_ms = u64::try_from(flush.as_millis()).expect("flush delay fits u64");
+        let open_hour_cost = u64::from(cli.shards) * 3_600_000u64.div_ceil(flush_ms);
         assert!(
             !RequestLimit::Bounded(expected).is_exceeded_by(open_hour_cost),
             "the derived budget {expected} must admit the 4-shard open hour ({open_hour_cost})"
@@ -7849,9 +7849,22 @@ mod tests {
             RequestLimit::Bounded(1_000).is_exceeded_by(open_hour_cost),
             "sanity: an overly tight 1,000 budget rejects the 4-shard open hour"
         );
-        // And the derived cap must still bound a runaway query (three GETs per
-        // recent segment across shards).
-        assert!(RequestLimit::Bounded(expected).is_exceeded_by(open_hour_cost * 3));
+        // And the derived cap must still bound a runaway query. The budget
+        // covers covered_span of flushes at the budgeted per-flush cost plus
+        // headroom, so the runaway is three times that covered-span cost across
+        // every shard.
+        let covered_ms = u64::try_from(
+            ravel_query::covered_span(ravel_query::SealMargin::REFERENCE).as_millis(),
+        )
+        .expect("covered span fits u64");
+        let runaway_cost = 3
+            * covered_ms.div_ceil(flush_ms)
+            * ravel_query::BUDGETED_REQUESTS_PER_UNSEALED_FLUSH
+            * u64::from(cli.shards);
+        assert!(
+            RequestLimit::Bounded(expected).is_exceeded_by(runaway_cost),
+            "the derived budget {expected} must refuse a runaway query ({runaway_cost})"
+        );
 
         // Explicit override: used verbatim, the derivation does not apply.
         let cli = Cli::try_parse_from(["ravel-server", "--max-s3-requests", "999"])
