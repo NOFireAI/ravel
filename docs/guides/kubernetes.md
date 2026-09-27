@@ -262,6 +262,7 @@ A minimal example is in
 | `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
 | `spec.retention.tenants` | map | none | Per-tenant overrides, tenant name to duration. |
+| `spec.probes.dedicatedHealthPort` | boolean | `false` | Probe the dedicated health listener on 4316 instead of the main HTTP port. Requires a server image that has `--listen-health`. See "The dedicated health port" below. |
 
 There is deliberately no way to select the memory store. A non-durable
 per-process store is incoherent across multiple pods, so `storage.s3` is
@@ -531,6 +532,57 @@ at once: four failures down, one success up. See
 [readiness and the store reachability probe](operations/deployment.md#readiness-and-the-store-reachability-probe)
 for the hysteresis and the two `/metrics` samples that make an outage
 visible.
+
+### The dedicated health port
+
+Both probes above share the main HTTP listener with OTLP ingest, SQL, PromQL
+and `/metrics`, so they are served by the same runtime workers that decode
+segments. A node whose workers are all busy in decode for longer than the
+2s probe timeout, three probes running, is killed by the kubelet, its load
+moves to its peers, and the pattern can repeat.
+
+`spec.probes.dedicatedHealthPort: true` moves the probes off that path:
+
+```yaml
+spec:
+  probes:
+    dedicatedHealthPort: true
+```
+
+It changes four things in every gateway, query, and maintain pod, and
+nothing anywhere else:
+
+- The container gains `--listen-health 0.0.0.0:4316`. That listener runs on
+  its own OS thread with its own single-threaded runtime, serves only
+  `/healthz`, `/readyz` and their `/-/` aliases, and is reachable whatever
+  the main runtime is doing.
+- The container gains a port named `health` on 4316, alongside `http` (4318)
+  and, on the gateway, `grpc` (4317).
+- Both probes point at 4316 instead of 4318. The paths, period, timeout, and
+  failure threshold are unchanged, but the answers on 4316 also track a
+  heartbeat from the main runtime: `/healthz` there returns 503 once that
+  heartbeat is older than 60s, and `/readyz` once it is older than 30s, so a
+  wedged main runtime fails its probes instead of passing them.
+- `terminationGracePeriodSeconds` goes from 45 to 51. On SIGTERM the server
+  also stops the health listener, between the drain and the trace flush, which
+  takes up to 6s and raises its shutdown budget from 32.5s to 38.5s. The 10s
+  `preStop` sleep plus 38.5s plus 2.5s of headroom is 51s, so SIGKILL cannot
+  land during that stop or the flush.
+
+The same routes stay on 4318 either way, so Grafana, a `curl` in a shell, and
+anything else already probing the HTTP port keeps working. The
+`ravel-ingest-router` Deployment is unaffected: it runs a different binary,
+with no health listener, and keeps its probes on 8080.
+
+If a network policy restricts which pod ports are reachable, allow the
+kubelet to reach 4316 before setting the field. Otherwise both probes fail
+and the rollout stalls with no pod ever becoming Ready.
+
+The default is `false` in this release, and it will flip to `true` one release
+later. Setting it requires a `ravel-server` image that has `--listen-health`,
+meaning this release or newer: an older server rejects the unknown flag at
+startup, so the pod restart-loops. Check `spec.image` before you set the field,
+and before you take the release whose notes carry the flipped default.
 
 ## Production notes
 

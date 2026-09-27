@@ -395,6 +395,20 @@
                     },
                     "type": "object"
                   },
+                  "probes": {
+                    "default": {
+                      "dedicatedHealthPort": false
+                    },
+                    "description": "Liveness and readiness probe wiring for the rendered `ravel-server`\npods (ADR-1702 decision 10). Omit the block entirely to keep today's\nrender: every field defaults to the pre-ADR-1702 behavior.",
+                    "properties": {
+                      "dedicatedHealthPort": {
+                        "default": false,
+                        "description": "Probe the dedicated health listener instead of the main HTTP port.\n\nWhen true the operator renders `--listen-health 0.0.0.0:4316` on every\n`ravel-server` container, a container port named `health` on 4316, and\npoints both probes at that port. That listener runs on its own thread\nwith its own `current_thread` runtime (ADR-1702 decision 8), so a busy\nmain runtime cannot make the kubelet time a probe out and restart the\npod.\n\nDefaults to false in this release (ADR-1702 decision 10): the flag\nrequires a `ravel-server` image that has `--listen-health`, and an\nolder image rejects the unknown flag and restart-loops the pod. The\ndefault flips to true one release later, with the image requirement in\nits release notes.",
+                        "type": "boolean"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "query": {
                     "default": {
                       "replicas": 1

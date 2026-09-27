@@ -21,6 +21,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--no-deps`, so replacing the server no longer re-runs the stack's one-shot
   services.
 
+- **Retention no longer deletes logs or spans objects whose format version
+  this build cannot read** (issue #530). The physical sweep's version hold
+  covered metrics only, so after a binary rollback across an RLOG or RSPAN
+  format bump, a tombstoned logs or spans bucket holding objects written at
+  the newer version was deleted once its protection horizon elapsed, even
+  though the newer build could still read them. The sweep now reads each
+  data object's trailer through the gate of the bucket's own format (one
+  16-byte ranged GET per object, the cost metrics already paid) and, if any
+  object is outside this build's reader window, deletes nothing in the
+  bucket, logs a warning, and counts the objects on the same in-process
+  held-object counter, exactly as it does for metrics. A corrupt trailer is still swept. ADR-0531 and ADR-0066
+  carry dated amendments recording the wider hold.
+
 ### Added
 
 - **`ravel-cli export --signal logs` writes a tenant's stored logs back out to
@@ -60,6 +73,65 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dependency on `ravel-query`, which is what sharing the query path's
   exclusion rules rather than copying them is worth (ADR-1751 amendment,
   2026-09-26).
+
+- **`ravel-server --listen-health <addr>` serves liveness and readiness from
+  its own thread** (ADR-1702). The listener runs on a dedicated
+  single-threaded runtime and serves only `/healthz`, `/readyz`, `/-/healthy`
+  and `/-/ready`, so a node whose main-runtime workers are all busy still
+  answers its probes. A heartbeat task on the main runtime keeps it honest:
+  `/healthz` there returns 503 once the heartbeat is older than 60 s, and
+  `/readyz` once it is older than 30 s or any existing readiness condition
+  fails. The flag is unset by default, so nothing binds, and the routes on
+  `--listen-http` are unchanged. Startup refuses a `--listen-health` address
+  equal to any other listener's, and shutdown waits at most 5 s for open
+  health connections before dropping them.
+- **The operator can point both probes at a dedicated health port with
+  `spec.probes.dedicatedHealthPort`** (ADR-1702, issue #1702). Set to true,
+  every gateway, query, and maintain container gains
+  `--listen-health 0.0.0.0:4316`, a container port named `health` on 4316,
+  and liveness and readiness probes on that port instead of 4318, with the
+  same paths, period, timeout, and failure threshold as before. The health
+  listener runs on its own thread, so a main runtime busy decoding segments
+  can no longer let a probe time out and have the kubelet restart the pod.
+  The same routes stay on 4318 as well, so anything already probing the HTTP
+  port is unaffected, and the `ravel-ingest-router` Deployment keeps its
+  probes on 8080. The field defaults to false in this release and flips to
+  true one release later; setting it needs a `ravel-server` image from this
+  release or newer, since an older server rejects the unknown flag and
+  restart-loops.
+
+- **`spans.links` decodes span links into a structured, filterable column**
+  (issue #1710). Symmetric to `events`, it is built from the plain
+  `attrs["_links_raw"]` protobuf blob at scan time, on every RSPAN version,
+  since RSPAN is a frozen persistent format and promoting links into a
+  nested on-disk column would need an ADR and a version bump. NULL when a
+  span carries no link, or when its `_links_raw` value is malformed (bad
+  hex, bad framing, a link chunk missing a well-formed `trace_id` or
+  `span_id`, a non-UTF-8 `trace_state`, or a `trace_id`, `span_id` or
+  `trace_state` field that is not a length-delimited value), never an empty
+  list or a fabricated field; one malformed link makes the span's whole
+  `links` value NULL. Selecting `events` or `links` turns off the columnar
+  fast path. On a single node, a query that selects neither never builds
+  those columns; under distributed execution each worker still builds both
+  for every row it returns and the coordinator drops them. A bare single-node
+  `SELECT count(*) FROM spans` with no pending erasure now returns the row
+  count instead of failing with "must either specify a row count or at least
+  one column".
+- **`/metrics` now renders a per-shard ingest skew family** (issue #1692).
+  `ravel_ingest_shard_messages_enqueued_total`,
+  `ravel_ingest_shard_messages_processed_total`,
+  `ravel_ingest_shard_queue_depth`,
+  `ravel_ingest_shard_on_actor_seconds_total`,
+  `ravel_ingest_shard_flush_permit_wait_seconds_total`, and
+  `ravel_ingest_shard_off_actor_seconds_total` render one series per
+  configured shard, labelled `mode`, `signal`, and `shard`, with idle shards
+  reading zero rather than being omitted. Zero-fill covers shards 0 to
+  `--shards - 1`; a tenant resharded above `--shards` renders its extra
+  shards once they record activity. The span pipeline now counts enqueued
+  messages in `span_router.rs` and records on-actor and off-actor time in
+  `span_shard.rs`, matching the metrics and log pipelines, so all six series
+  carry live figures on all three signals.
+
 ### Changed
 
 - **The default query request budget is now derived from the unsealed tail a
@@ -298,66 +370,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keeps the 25% share. The resolved value's source (`budget-carve-loopback`)
   is logged on the `performance default resolved` startup line alongside
   `cache_max_bytes`.
-
-### Added
-
-- **`ravel-server --listen-health <addr>` serves liveness and readiness from
-  its own thread** (ADR-1702). The listener runs on a dedicated
-  single-threaded runtime and serves only `/healthz`, `/readyz`, `/-/healthy`
-  and `/-/ready`, so a node whose main-runtime workers are all busy still
-  answers its probes. A heartbeat task on the main runtime keeps it honest:
-  `/healthz` there returns 503 once the heartbeat is older than 60 s, and
-  `/readyz` once it is older than 30 s or any existing readiness condition
-  fails. The flag is unset by default, so nothing binds, and the routes on
-  `--listen-http` are unchanged. Startup refuses a `--listen-health` address
-  equal to any other listener's, and shutdown waits at most 5 s for open
-  health connections before dropping them.
-- **`spans.links` decodes span links into a structured, filterable column**
-  (issue #1710). Symmetric to `events`, it is built from the plain
-  `attrs["_links_raw"]` protobuf blob at scan time, on every RSPAN version,
-  since RSPAN is a frozen persistent format and promoting links into a
-  nested on-disk column would need an ADR and a version bump. NULL when a
-  span carries no link, or when its `_links_raw` value is malformed (bad
-  hex, bad framing, a link chunk missing a well-formed `trace_id` or
-  `span_id`, a non-UTF-8 `trace_state`, or a `trace_id`, `span_id` or
-  `trace_state` field that is not a length-delimited value), never an empty
-  list or a fabricated field; one malformed link makes the span's whole
-  `links` value NULL. Selecting `events` or `links` turns off the columnar
-  fast path. On a single node, a query that selects neither never builds
-  those columns; under distributed execution each worker still builds both
-  for every row it returns and the coordinator drops them. A bare single-node
-  `SELECT count(*) FROM spans` with no pending erasure now returns the row
-  count instead of failing with "must either specify a row count or at least
-  one column".
-- **`/metrics` now renders a per-shard ingest skew family** (issue #1692).
-  `ravel_ingest_shard_messages_enqueued_total`,
-  `ravel_ingest_shard_messages_processed_total`,
-  `ravel_ingest_shard_queue_depth`,
-  `ravel_ingest_shard_on_actor_seconds_total`,
-  `ravel_ingest_shard_flush_permit_wait_seconds_total`, and
-  `ravel_ingest_shard_off_actor_seconds_total` render one series per
-  configured shard, labelled `mode`, `signal`, and `shard`, with idle shards
-  reading zero rather than being omitted. Zero-fill covers shards 0 to
-  `--shards - 1`; a tenant resharded above `--shards` renders its extra
-  shards once they record activity. The span pipeline now counts enqueued
-  messages in `span_router.rs` and records on-actor and off-actor time in
-  `span_shard.rs`, matching the metrics and log pipelines, so all six series
-  carry live figures on all three signals.
-
-### Fixed
-
-- **Retention no longer deletes logs or spans objects whose format version
-  this build cannot read** (issue #530). The physical sweep's version hold
-  covered metrics only, so after a binary rollback across an RLOG or RSPAN
-  format bump, a tombstoned logs or spans bucket holding objects written at
-  the newer version was deleted once its protection horizon elapsed, even
-  though the newer build could still read them. The sweep now reads each
-  data object's trailer through the gate of the bucket's own format (one
-  16-byte ranged GET per object, the cost metrics already paid) and, if any
-  object is outside this build's reader window, deletes nothing in the
-  bucket, logs a warning, and counts the objects on the same in-process
-  held-object counter, exactly as it does for metrics. A corrupt trailer is still swept. ADR-0531 and ADR-0066
-  carry dated amendments recording the wider hold.
 
 ## [0.18.0] - 2026-09-26
 

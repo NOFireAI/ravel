@@ -108,6 +108,12 @@ pub struct RavelClusterSpec {
     #[serde(default)]
     pub maintain: MaintainSpec,
 
+    /// Liveness and readiness probe wiring for the rendered `ravel-server`
+    /// pods (ADR-1702 decision 10). Omit the block entirely to keep today's
+    /// render: every field defaults to the pre-ADR-1702 behavior.
+    #[serde(default)]
+    pub probes: ProbesSpec,
+
     /// Garbage-collection horizons that must match the bucket's stored `sys/gc`
     /// values. Only the maintain tier validates against `sys/gc`, so these
     /// render onto the maintain Deployment. Omit the whole block, or either
@@ -565,6 +571,31 @@ pub struct FoldSpec {
     /// (`--fold-interval-secs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
+}
+
+/// Probe wiring for the rendered `ravel-server` pods (ADR-1702 decision 10).
+///
+/// The ingest-router Deployment is out of scope here: it runs a different
+/// binary that does no decode, and its probes stay on its own HTTP port.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbesSpec {
+    /// Probe the dedicated health listener instead of the main HTTP port.
+    ///
+    /// When true the operator renders `--listen-health 0.0.0.0:4316` on every
+    /// `ravel-server` container, a container port named `health` on 4316, and
+    /// points both probes at that port. That listener runs on its own thread
+    /// with its own `current_thread` runtime (ADR-1702 decision 8), so a busy
+    /// main runtime cannot make the kubelet time a probe out and restart the
+    /// pod.
+    ///
+    /// Defaults to false in this release (ADR-1702 decision 10): the flag
+    /// requires a `ravel-server` image that has `--listen-health`, and an
+    /// older image rejects the unknown flag and restart-loops the pod. The
+    /// default flips to true one release later, with the image requirement in
+    /// its release notes.
+    #[serde(default)]
+    pub dedicated_health_port: bool,
 }
 
 /// Query tier: replicas and resources.
