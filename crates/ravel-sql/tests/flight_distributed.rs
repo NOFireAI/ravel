@@ -50,6 +50,16 @@
 //! - `worker_do_get_refuses_bad_expired_wrong_surface_and_missing_slice_tickets`:
 //!   each refusal carries its typed reason and moves exactly its own counter
 //!   by one.
+//! - `slice_only_listener_refuses_client_methods`: the dedicated fragment
+//!   listener refuses every client method with `permission_denied`, even
+//!   under a credential that resolves.
+//! - `client_key_ticket_claiming_a_slice_is_wrong_surface`: a client-key
+//!   ticket claiming a slice is refused typed after the credential resolves.
+//! - `slice_only_listener_refuses_a_non_sql_ticket_as_missing`: a `DoGet`
+//!   whose ticket is no Flight SQL command is a missing capability on the
+//!   fragment listener.
+//! - `explicit_ticket_keys_win_over_shared_key_in_either_order`: keys from
+//!   `with_ticket_keys` survive `with_distributed_scan` in both call orders.
 //!
 //! prove-the-test (distributed_scan_equals_local_scan): removing the
 //! `RsegDedupExec` from `distributed_samples_plan` (feeding the merge output
@@ -77,7 +87,9 @@ use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight::sql::server::FlightSqlService;
-use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, TicketStatementQuery};
+use arrow_flight::sql::{
+    CommandGetCatalogs, CommandStatementQuery, ProstMessageExt, TicketStatementQuery,
+};
 use arrow_flight::{FlightDescriptor, Ticket};
 use datafusion::arrow::array::{
     Array, FixedSizeBinaryArray, Float64Array, Int64Array, TimestampNanosecondArray,
@@ -2934,14 +2946,24 @@ const OTHER_TENANT: TenantHash = TenantHash([0x5a; 16]);
 /// keys from in these tests.
 const SQL_FILE_KEY: &[u8] = b"adr-1689 sql ticket file key";
 
-/// A `FlightAuth` holding no credential at all: every call is counted and
-/// refused. A slice `DoGet` must never reach it.
+/// A `FlightAuth` that counts every call. By default it holds no credential
+/// at all and refuses every call, so a slice `DoGet` must never reach it;
+/// [`CountingAuth::accepting`] resolves every call to one tenant instead, for
+/// the client-path refusals that need a valid credential.
 #[derive(Default)]
 struct CountingAuth {
     calls: AtomicUsize,
+    tenant: Option<TenantHash>,
 }
 
 impl CountingAuth {
+    fn accepting(tenant: TenantHash) -> Self {
+        CountingAuth {
+            calls: AtomicUsize::new(0),
+            tenant: Some(tenant),
+        }
+    }
+
     fn calls(&self) -> usize {
         self.calls.load(AtomicOrdering::SeqCst)
     }
@@ -2950,9 +2972,8 @@ impl CountingAuth {
 impl FlightAuth for CountingAuth {
     fn tenant(&self, _metadata: &MetadataMap) -> Result<TenantHash, Status> {
         self.calls.fetch_add(1, AtomicOrdering::SeqCst);
-        Err(Status::unauthenticated(
-            "invalid or missing tenant credentials",
-        ))
+        self.tenant
+            .ok_or_else(|| Status::unauthenticated("invalid or missing tenant credentials"))
     }
 
     fn min_commit_tokens(&self, _metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
@@ -3066,14 +3087,27 @@ impl SliceWorker {
         }
     }
 
-    /// `DoGet` exactly `ticket`, with no metadata, over a fresh channel.
-    async fn raw_do_get(&self, ticket: Ticket) -> Result<Vec<RecordBatch>, Status> {
+    /// A Flight client over a fresh channel to this worker.
+    async fn client(&self) -> FlightServiceClient<tonic::transport::Channel> {
         let channel = tonic::transport::Channel::from_shared(self.location.clone())
             .expect("valid location")
             .connect()
             .await
             .expect("connect");
-        let response = FlightServiceClient::new(channel).do_get(ticket).await?;
+        FlightServiceClient::new(channel)
+    }
+
+    /// `DoGet` exactly `ticket`, with no metadata, over a fresh channel.
+    async fn raw_do_get(&self, ticket: Ticket) -> Result<Vec<RecordBatch>, Status> {
+        self.raw_do_get_request(Request::new(ticket)).await
+    }
+
+    /// `DoGet` exactly `request`, metadata included, over a fresh channel.
+    async fn raw_do_get_request(
+        &self,
+        request: Request<Ticket>,
+    ) -> Result<Vec<RecordBatch>, Status> {
+        let response = self.client().await.do_get(request).await?;
         let decoded = FlightRecordBatchStream::new_from_flight_data(
             response
                 .into_inner()
@@ -3401,4 +3435,278 @@ async fn worker_do_get_refuses_bad_expired_wrong_surface_and_missing_slice_ticke
         "an unattributable ticket counts no slice reject"
     );
     worker.stop().await;
+}
+
+/// Assert `status` is `code` with exactly `message`.
+fn assert_refused(status: &Status, code: tonic::Code, message: &str, what: &str) {
+    assert_eq!(status.code(), code, "{what}: {status:?}");
+    assert_eq!(status.message(), message, "{what}");
+}
+
+// prove-the-test (slice_only_listener_refuses_client_methods): deleting the
+// `if !self.listener_role.serves_clients()` block at the top of
+// `RavelFlightSqlService::tenant` fails this test at its first `expect_err`:
+// the accepting credential then resolves, and the slice listener answers the
+// client `GetFlightInfo` with a FlightInfo carrying a minted client ticket.
+#[tokio::test]
+async fn slice_only_listener_refuses_client_methods() {
+    const REFUSAL: &str = "this listener serves SQL slice fetches only";
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let keys = SqlTicketKeys::from_file_key(SQL_FILE_KEY);
+    let whole_set = FlightTicket {
+        slice_index: 0,
+        slice_count: 1,
+        ..first_slice_ticket(&snapshot)
+    };
+
+    // A credential that resolves: the refusal must come from the listener
+    // role, not from a failed credential.
+    let auth = Arc::new(CountingAuth::accepting(TENANT));
+    let worker = SliceWorker::start(
+        backend,
+        Arc::clone(&auth),
+        Arc::new(TenantRecorder::default()),
+        TestClock::at(NOW_NS),
+        FlightListenerRole::SliceOnly,
+    )
+    .await;
+
+    let sql = "SELECT * FROM samples";
+    let mut request = Request::new(FlightDescriptor::new_cmd(
+        CommandStatementQuery {
+            query: sql.to_string(),
+            transaction_id: None,
+        }
+        .as_any()
+        .encode_to_vec(),
+    ));
+    insert(request.metadata_mut(), TOKEN_KEY, "a-client-token");
+    window_metadata(request.metadata_mut());
+    let status = worker
+        .client()
+        .await
+        .get_flight_info(request)
+        .await
+        .expect_err("a client GetFlightInfo is refused on the slice listener");
+    assert_refused(
+        &status,
+        tonic::Code::PermissionDenied,
+        REFUSAL,
+        "GetFlightInfo(statement)",
+    );
+
+    let mut request = Request::new(FlightDescriptor::new_cmd(
+        CommandGetCatalogs {}.as_any().encode_to_vec(),
+    ));
+    insert(request.metadata_mut(), TOKEN_KEY, "a-client-token");
+    let status = worker
+        .client()
+        .await
+        .get_flight_info(request)
+        .await
+        .expect_err("a client metadata GetFlightInfo is refused on the slice listener");
+    assert_refused(
+        &status,
+        tonic::Code::PermissionDenied,
+        REFUSAL,
+        "GetFlightInfo(catalogs)",
+    );
+
+    let mut request = Request::new(Ticket::new(CommandGetCatalogs {}.as_any().encode_to_vec()));
+    insert(request.metadata_mut(), TOKEN_KEY, "a-client-token");
+    let status = worker
+        .raw_do_get_request(request)
+        .await
+        .expect_err("a client metadata DoGet is refused on the slice listener");
+    assert_refused(
+        &status,
+        tonic::Code::PermissionDenied,
+        REFUSAL,
+        "DoGet(catalogs)",
+    );
+    assert_eq!(
+        auth.calls(),
+        0,
+        "the listener role refuses before the credential is resolved"
+    );
+
+    // A client whole-set statement DoGet with a valid credential never reaches
+    // the client path here: the slice listener verifies every statement ticket
+    // as a capability, and a client-key ticket is the wrong surface.
+    let mut request = Request::new(statement_handle_ticket(
+        keys.encode(&whole_set, TicketSurface::Client)
+            .expect("encode"),
+    ));
+    insert(request.metadata_mut(), TOKEN_KEY, "a-client-token");
+    let status = worker
+        .raw_do_get_request(request)
+        .await
+        .expect_err("a client whole-set DoGet is refused on the slice listener");
+    assert_refused(
+        &status,
+        tonic::Code::PermissionDenied,
+        "slice fetch rejected: wrong_surface",
+        "DoGet(whole-set statement)",
+    );
+    assert_eq!(auth.calls(), 0, "FlightAuth is never consulted");
+    assert_eq!(
+        worker.rejects.by_reason().map(|(_, count)| count),
+        [0, 0, 0, 1],
+        "only the whole-set DoGet counts, as wrong_surface"
+    );
+    worker.stop().await;
+}
+
+// prove-the-test (client_key_ticket_claiming_a_slice_is_wrong_surface):
+// deleting the `if decoded.slice_count > 1` branch in `do_get_statement`
+// fails this test on its first role: the credential resolves to the ticket's
+// own tenant, so the ticket runs as a whole-set statement and answers
+// `invalid_argument` ("the SQL request contains no statement") instead of the
+// typed wrong_surface refusal.
+#[tokio::test]
+async fn client_key_ticket_claiming_a_slice_is_wrong_surface() {
+    let (store, snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let keys = SqlTicketKeys::from_file_key(SQL_FILE_KEY);
+    let slice = first_slice_ticket(&snapshot);
+    let handle = keys.encode(&slice, TicketSurface::Client).expect("encode");
+
+    for role in [FlightListenerRole::Combined, FlightListenerRole::ClientOnly] {
+        let auth = Arc::new(CountingAuth::accepting(TENANT));
+        let worker = SliceWorker::start(
+            Arc::clone(&backend),
+            Arc::clone(&auth),
+            Arc::new(TenantRecorder::default()),
+            TestClock::at(NOW_NS),
+            role,
+        )
+        .await;
+        let mut request = Request::new(statement_handle_ticket(handle.clone()));
+        insert(request.metadata_mut(), TOKEN_KEY, "a-client-token");
+        let status = worker
+            .raw_do_get_request(request)
+            .await
+            .expect_err("a client-key ticket claiming a slice is refused");
+        assert_refused(
+            &status,
+            tonic::Code::PermissionDenied,
+            "slice fetch rejected: wrong_surface",
+            &format!("{role:?}"),
+        );
+        assert_eq!(
+            auth.calls(),
+            1,
+            "{role:?}: the client path resolved the credential first"
+        );
+        assert_eq!(
+            worker.rejects.by_reason().map(|(_, count)| count),
+            [0, 0, 0, 1],
+            "{role:?}: exactly one wrong_surface reject"
+        );
+        worker.stop().await;
+    }
+}
+
+// prove-the-test (slice_only_listener_refuses_a_non_sql_ticket_as_missing):
+// deleting the `SliceOnly` branch of `do_get_fallback` fails this test: the
+// slice listener then answers `unimplemented`, as the combined listener does.
+#[tokio::test]
+async fn slice_only_listener_refuses_a_non_sql_ticket_as_missing() {
+    let (store, _snapshot) = two_shard_snapshot().await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let type_url = "type.googleapis.com/ravel.test.NotAFlightSqlCommand";
+    let ticket = Ticket::new(
+        arrow_flight::sql::Any {
+            type_url: type_url.to_string(),
+            value: Vec::new().into(),
+        }
+        .encode_to_vec(),
+    );
+
+    for (role, code, message, missing) in [
+        (
+            FlightListenerRole::SliceOnly,
+            tonic::Code::Unauthenticated,
+            "slice fetch rejected: missing".to_string(),
+            1,
+        ),
+        (
+            FlightListenerRole::Combined,
+            tonic::Code::Unimplemented,
+            format!("do_get: The defined request is invalid: {type_url}"),
+            0,
+        ),
+    ] {
+        let auth = Arc::new(CountingAuth::default());
+        let worker = SliceWorker::start(
+            Arc::clone(&backend),
+            Arc::clone(&auth),
+            Arc::new(TenantRecorder::default()),
+            TestClock::at(NOW_NS),
+            role,
+        )
+        .await;
+        let status = worker
+            .raw_do_get(ticket.clone())
+            .await
+            .expect_err("a ticket that is no Flight SQL command is refused");
+        assert_refused(&status, code, &message, &format!("{role:?}"));
+        assert_eq!(
+            worker.rejects.by_reason().map(|(_, count)| count),
+            [missing, 0, 0, 0],
+            "{role:?}: the missing counter"
+        );
+        assert_eq!(auth.calls(), 0, "{role:?}: FlightAuth is never consulted");
+        worker.stop().await;
+    }
+}
+
+// prove-the-test (explicit_ticket_keys_win_over_shared_key_in_either_order):
+// making `with_distributed_scan` apply `shared_ticket_key` unconditionally
+// again fails the keys-first order: its client key is the shared one.
+#[tokio::test]
+async fn explicit_ticket_keys_win_over_shared_key_in_either_order() {
+    let explicit = SqlTicketKeys::from_file_key(SQL_FILE_KEY);
+    let shared_key = [0x3c; 32];
+    let shared = SqlTicketKeys::from_file_key(&shared_key);
+    assert_ne!(
+        explicit.mint_key(TicketSurface::Client),
+        shared.mint_key(TicketSurface::Client),
+        "the two key sets differ, so the assertions below can tell them apart"
+    );
+    let config = || DistributedFlightConfig {
+        shared_ticket_key: Some(shared_key),
+        ..two_worker_config()
+    };
+
+    let (service, _, _) = service_over_two_shards().await;
+    let keys_first = service
+        .with_ticket_keys(SqlTicketKeys::from_file_key(SQL_FILE_KEY))
+        .with_distributed_scan(config());
+    let (service, _, _) = service_over_two_shards().await;
+    let scan_first = service
+        .with_distributed_scan(config())
+        .with_ticket_keys(SqlTicketKeys::from_file_key(SQL_FILE_KEY));
+    for (order, service) in [("keys first", &keys_first), ("scan first", &scan_first)] {
+        assert_eq!(
+            service.ticket_key(),
+            explicit.mint_key(TicketSurface::Client),
+            "{order}: the client key is the explicit one"
+        );
+        assert_eq!(
+            service.slice_ticket_key(),
+            explicit.mint_key(TicketSurface::Slice),
+            "{order}: the slice key is the explicit one"
+        );
+    }
+
+    // Control: without explicit keys the shared key is installed.
+    let (service, _, _) = service_over_two_shards().await;
+    let shared_only = service.with_distributed_scan(config());
+    assert_eq!(
+        shared_only.slice_ticket_key(),
+        shared.mint_key(TicketSurface::Slice),
+        "the shared key replaces the per-process keys"
+    );
 }

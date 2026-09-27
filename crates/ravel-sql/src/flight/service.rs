@@ -86,6 +86,10 @@ pub struct RavelFlightSqlService {
     /// replaces them with shared keys ([`Self::with_ticket_keys`], or
     /// `DistributedFlightConfig::shared_ticket_key`).
     ticket_keys: SqlTicketKeys,
+    /// Whether [`Self::with_ticket_keys`] installed `ticket_keys`. Those keys
+    /// win over `DistributedFlightConfig::shared_ticket_key` in either call
+    /// order.
+    explicit_ticket_keys: bool,
     /// Which surfaces the listener this service is mounted on serves
     /// (ADR-1689 decision 1). The server supplies it.
     listener_role: FlightListenerRole,
@@ -171,6 +175,7 @@ impl RavelFlightSqlService {
             clock,
             config,
             ticket_keys,
+            explicit_ticket_keys: false,
             listener_role: FlightListenerRole::default(),
             slice_client_tls: None,
             slice_rejects: SliceRejectCounters::default(),
@@ -205,8 +210,11 @@ impl RavelFlightSqlService {
         // a coordinator's slice ticket verifies on a different worker process
         // (ADR-0071). When the config carries it, both surface keys derive
         // from it in place of the per-process random key minted in `new`.
-        // `None` (the single-process default) keeps this service's own keys.
-        if let Some(key) = config.shared_ticket_key {
+        // `None` (the single-process default) keeps this service's own keys,
+        // and keys installed by `with_ticket_keys` are never replaced.
+        if let Some(key) = config.shared_ticket_key
+            && !self.explicit_ticket_keys
+        {
             self.ticket_keys = SqlTicketKeys::from_file_key(&key);
         }
         self.distributed = Some(Arc::new(config));
@@ -216,11 +224,13 @@ impl RavelFlightSqlService {
     /// Replace this service's ticket keys (ADR-1689 decision 2): the server
     /// passes the keys it derived from its SQL ticket key file, so every
     /// process in the cluster mints under the first file key and verifies
-    /// under all of them. Returns `self` so it chains off [`new`](Self::new);
-    /// chain it after [`with_distributed_scan`](Self::with_distributed_scan),
-    /// whose `shared_ticket_key` would otherwise replace these.
+    /// under all of them. Returns `self` so it chains off [`new`](Self::new).
+    /// These keys take precedence over the `shared_ticket_key` of
+    /// [`with_distributed_scan`](Self::with_distributed_scan) whichever of the
+    /// two is called first.
     pub fn with_ticket_keys(mut self, keys: SqlTicketKeys) -> Self {
         self.ticket_keys = keys;
+        self.explicit_ticket_keys = true;
         self
     }
 
