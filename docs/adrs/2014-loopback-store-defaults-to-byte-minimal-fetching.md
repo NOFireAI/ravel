@@ -1,6 +1,6 @@
 # ADR-2014: Default to byte-minimal fetching when the object store is on loopback
 
-- Status: Proposed
+- Status: Superseded by ADR-2023 (decision 1)
 - Date: 2026-09-26
 - Refs: #2014, #1463, #1196, ADR-1196, ADR-0996, ADR-0904, #1707
 
@@ -122,13 +122,15 @@ machine state at boot. Locality is a stable property; bandwidth is not.
   its block-granular cache did not fit the corpus: see the concurrency
   amendment below.
 
-## Amendment (2026-09-26, ADR-2023): concurrency
+## Amendment (2026-09-27, ADR-2023): concurrency, and the decision superseded
 
 <!-- amendment-applies: sections="Consequences" pointer="concurrency amendment" -->
 
-The Consequences above were measured one query at a time. The ClickBench
-driver's concurrent phase (ten connections, one server) measured 0.123 queries
-per second under this default against 0.400 under `cost-based` on the same
-instance, and 0.320 with a fetch cache that held the corpus (#2014). ADR-2023
-keeps this default and sizes the fetch cache for a loopback store instead, and
-decouples the catalog cache from `--cache-max-bytes`.
+The Consequences above were measured one query at a time. Under the ClickBench
+driver's concurrent phase (ten connections, one server), this default measured
+0.123 queries per second against 0.400 under `cost-based` on the same instance.
+It reached only 0.170 even with a fetch cache sized to hold the corpus, against
+a 0.40 bar, in a fresh end-to-end run (#2014, #2023). ADR-2023 decision 1
+therefore supersedes this decision: a loopback store resolves `cost-based`
+again when `--logs-fetch-policy` is unset, and the ranged plan is an explicit
+opt-in.
