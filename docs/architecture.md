@@ -400,14 +400,14 @@ and recovering a whole deployment from the bucket alone is
 
 ## Crate map
 
-The workspace has 35 members: 31 crates under `crates/` and four binaries
+The workspace has 36 members: 32 crates under `crates/` and four binaries
 under `services/`. Grouped by dependency layer, so a crate depends only on
 crates in its own group or above:
 
 ```text
 foundations       ravel-types, ravel-proto, ravel-codec, ravel-object-store,
                   ravel-cache, ravel-affinity, ravel-analytics,
-                  ravel-tracing-export, ravel-memory
+                  ravel-tracing-export, ravel-memory, ravel-cpu-gate
 formats, identity ravel-segment, ravel-logseg, ravel-rspan,
                   ravel-tenant-resolve, ravel-promql
 commit, members   ravel-commit, ravel-fleet

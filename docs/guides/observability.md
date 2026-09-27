@@ -49,8 +49,8 @@ series colliding.
 
 The renderer can attach only these label keys: `tenant_hash`, `signal`,
 `mode`, `op`, `error_kind`, `workload_class`, `level`, `reason`, `cache`,
-`tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`, and
-`carrier`, seventeen in all. `reason` is shared by two
+`tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`,
+`carrier`, `gate`, `site`, `worker`, and `shard`, twenty-one in all. `reason` is shared by two
 families, the admission-rejection counter and the scrub seal-divergence
 counter. `cache` and `tier` split the read-cache family across its two caches
 and, when a disk tier is configured, its two tiers; the [caching
@@ -61,8 +61,12 @@ splits the fragment in-flight gauge and admission-wait counter into their
 declared-statistics drop tally across its four carrier labels.
 `outcome` splits the alert-tick counter by how one evaluation tick ended, `allocator`
 and `stat` carry the process allocator gauges, and `component` splits the
-memory budget's reserved-bytes gauge by which side reserved it. The `level`
-key is reserved and no family renders it.
+memory budget's reserved-bytes gauge by which side reserved it. `gate` and
+`site` split the CPU gate families by gate and by call site, each from a
+closed set, and `worker` indexes the tokio runtime's per-worker busy counter,
+bounded by the runtime's fixed worker count. `level` splits the scrub
+counters by which part of the commit lineage a target came from (`l0`, `l1`
+or `rewrite`).
 
 The allowlist is closed for two reasons. The first reason is cardinality. An
 unbounded label value multiplies the series count without a ceiling, and the
@@ -74,9 +78,10 @@ the port. A closed enum cannot carry either failure.
 The allowlist is closed at compile time. Attaching a label is possible only
 through a closed enum, so a new label key means a new enum variant and a
 compilation failure at every place the renderer matches on a label; a raw
-string can never reach the label position. A `shard` label is deliberately
-absent, because shard count times tenant count times operation count is
-unbounded in the dimension Ravel controls least.
+string can never reach the label position. `shard` appears only on the
+per-shard ingest skew family, beside `mode` and `signal` and never beside
+`tenant_hash`, because shard count times tenant count times operation count
+is unbounded in the dimension Ravel controls least.
 
 Histogram families carry one further reserved key, `le`, on their `_bucket`
 series. It is the Prometheus-standard bucket bound, not a member of the
@@ -2014,6 +2019,63 @@ A worker-reported `CORRUPT` status is never re-dispatched or masked by
 fallback: it fails the query typed so the corruption is not silently papered
 over.
 
+### CPU gates and the tokio runtime (`ravel_cpu_gate_*`, `ravel_runtime_*`)
+
+Labels: `mode` and `gate` (`read`|`write`) on every CPU gate sample, plus
+`site` on the two per-site counters; `mode` only on the runtime gauges, plus
+`worker` on the per-worker busy counter. Rendered in every mode.
+
+A CPU gate runs codec work on the tokio blocking pool behind a
+fixed number of permits: a job waits for a permit, runs, and releases the
+permit when it returns. The read gate serves query, catalog and maintenance
+decode and is sized by `--cpu-gate-read-permits` (default
+`max(1, cores - 1)`). The write gate serves flush encode and ingest payload
+decode and is sized by `--cpu-gate-write-permits` (default
+`max(1, cores / 2)`). A job below the gate's inline floor, 256 KiB of
+uncompressed bytes or 100,000 samples for a PromQL evaluation, runs on the
+calling thread instead and takes no permit. No call site submits work to the
+gates yet, so the job, inline, wait and run figures stay at 0 until decode
+and encode move onto them.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_cpu_gate_permits` | Gauge. Jobs the gate may run at once. |
+| `ravel_cpu_gate_running` | Gauge. Jobs holding a permit right now, including a job whose caller stopped waiting. |
+| `ravel_cpu_gate_queued` | Gauge. Callers waiting for a permit right now. |
+| `ravel_cpu_gate_wait_seconds_sum`, `ravel_cpu_gate_wait_seconds_count` | Summary with no quantiles. Time callers waited for a permit, and the number of waits, counting only waits that got a permit. |
+| `ravel_cpu_gate_run_seconds_sum`, `ravel_cpu_gate_run_seconds_count` | Summary with no quantiles. Time jobs ran on the blocking pool, and the number of jobs. |
+| `ravel_cpu_gate_abandoned_total` | Counter. Jobs that ran to completion after their caller stopped waiting, so their result was discarded. A started decode cannot be interrupted, so a cancelled query can leave one such job per permit it held. |
+| `ravel_cpu_gate_jobs_total{site}` | Counter. Jobs a call site ran through a permit. |
+| `ravel_cpu_gate_inline_total{site}` | Counter. Jobs a call site ran inline, below the inline floor. |
+| `ravel_runtime_workers` | Gauge. Worker threads of the tokio runtime serving the process. |
+| `ravel_runtime_alive_tasks` | Gauge. Tasks alive on the runtime. |
+| `ravel_runtime_global_queue_depth` | Gauge. Tasks waiting in the runtime's global queue. |
+| `ravel_runtime_worker_busy_seconds_total{worker}` | Counter. Time each worker spent busy. Rendered only on targets with 64-bit atomics, which covers every target Ravel builds for. |
+
+The `site` label takes one value per wrapped call site, from a closed set per
+gate, and every site renders a sample even at 0. On the read gate:
+`catalog_part`, `catalog_postings`, `catalog_column_stats`, `metrics_meta`,
+`segment_section`, `segment_sparse_catalog`, `log_block`, `log_postings`,
+`log_section`, `span_block`, `span_section`, `promql_eval`, `compaction`,
+`fold`, `scrub`, and `reachability`. On the write gate: `metrics_flush`,
+`log_flush`, `span_flush`, `otap_decode`, `otlp_http_gzip`, and
+`remote_write_snappy`.
+
+A node that is CPU-bound on decode shows a rising mean wait with the gate's
+running count at its permit count. The mean wait is
+
+```promql
+rate(ravel_cpu_gate_wait_seconds_sum[5m])
+  / rate(ravel_cpu_gate_wait_seconds_count[5m])
+```
+
+and the gate is full when `ravel_cpu_gate_running` equals
+`ravel_cpu_gate_permits` for the same `gate`. Both together mean the node
+needs more replicas or more permits. Lower the read gate's permits instead on
+a node shared with other CPU-heavy work. A per-worker busy rate near 1, from
+`rate(ravel_runtime_worker_busy_seconds_total[5m])`, on every worker means
+the runtime workers themselves are saturated, which the gates do not cover.
+
 ## Reading estimate against actual
 
 The estimate is an upper envelope, never a prediction. The planner takes the
@@ -2087,4 +2149,4 @@ Distributed read fan-out: ADR-0071. Wire-byte accounting: ADR-0084. The metric
 metadata cache: ADR-0085. Alert evaluation and its at-least-once notification
 contract: ADR-0043. Per-shard ingest skew metrics and the `shard` label:
 ADR-1692. The retiring-generation shard set that family also renders:
-ADR-0052.
+ADR-0052. The CPU gates and the tokio runtime families: ADR-1702.

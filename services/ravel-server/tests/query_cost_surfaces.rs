@@ -225,6 +225,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         audit_pipeline: None,
         process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         process_memory_budget_is_fallback: false,
+        cpu_gates: ravel_server::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
     });
@@ -643,6 +644,7 @@ mod flight {
             audit_pipeline: None,
             process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
             process_memory_budget_is_fallback: false,
+            cpu_gates: ravel_server::cpu_gates::CpuGates::new(Default::default()),
             can_fold: true,
             fold_loop: Default::default(),
         });
