@@ -192,6 +192,7 @@ async fn promql_with_federation(store: Arc<dyn ObjectStoreBackend>, tenant: &Ten
         None,
         Some(federation),
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     );
     promql_router(app_state)
 }
