@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -156,6 +156,14 @@ enum Fault {
     /// ignores `x-amz-checksum-mode`. ADR-1696 decision 3 serves it and counts
     /// it, so this is the fault that moves `ravel_store_get_unverified_total`.
     NoGetChecksum,
+    /// Not a fault either: serve the request normally under this exact `Date`
+    /// header, so a test can pin what the store's clock said (ADR-1685
+    /// decision 1) instead of racing the host clock hyper would otherwise
+    /// stamp. `"not-a-valid-date"` is how a response with no *usable* `Date`
+    /// is scripted: hyper adds one of its own to any response that carries
+    /// none, so an absent header cannot be produced from this side, and an
+    /// unparseable one exercises the same branch of the connector.
+    FixedDate(&'static str),
 }
 
 /// How a GET is served once faults have been resolved: the two ADR-1696 read
@@ -695,6 +703,23 @@ async fn handle(
             data,
             GetBehavior::NoChecksum,
         ),
+        Some(Fault::FixedDate(date)) => {
+            let mut response = serve(
+                &state,
+                op,
+                &key,
+                &query,
+                &headers,
+                data,
+                GetBehavior::Normal,
+            );
+            // hyper only stamps its own `Date` on a response that carries
+            // none, so setting one here is what the client sees.
+            response
+                .headers_mut()
+                .insert(header::DATE, HeaderValue::from_static(date));
+            response
+        }
         Some(Fault::Pass) | None => serve(
             &state,
             op,
@@ -2555,5 +2580,161 @@ async fn attempts_are_attributed_to_the_issuing_operation() {
     assert_eq!(
         snap.get.attempts, 0,
         "a put's retries must not be charged to get"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Observed store time (ADR-1685 decision 1)
+// ---------------------------------------------------------------------------
+
+/// The `Date` the fake stamps on the first GET, and its unix nanoseconds. The
+/// nanoseconds are written out rather than computed from the string, so a
+/// parser that drifted (a month off by one, seconds dropped) fails here instead
+/// of agreeing with itself.
+const STORE_DATE_NOON: &str = "Wed, 16 Sep 2026 12:00:00 GMT";
+const STORE_DATE_NOON_NS: i64 = 1_789_560_000_000_000_000;
+
+/// One hour earlier, for the response that arrives *after* the noon one.
+const STORE_DATE_ELEVEN: &str = "Wed, 16 Sep 2026 11:00:00 GMT";
+const STORE_DATE_ELEVEN_NS: i64 = 1_789_556_400_000_000_000;
+
+/// A store that has issued no request has observed no store clock, so a caller
+/// gets `None` rather than a fabricated reading (ADR-1685 decision 4: no
+/// observation means no check).
+#[tokio::test]
+async fn a_store_that_has_issued_no_request_has_no_observation() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    assert_eq!(store.observed_store_time_ns(), None);
+}
+
+/// One GET against an endpoint whose response carries a known `Date` makes that
+/// date, to the nanosecond, what the store reports.
+#[tokio::test]
+async fn one_response_makes_its_date_the_observed_store_time() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("clock/object", b"payload");
+    fake.script(Op::Get, [Fault::FixedDate(STORE_DATE_NOON)]);
+
+    store
+        .get("clock/object", GetRange::Full)
+        .await
+        .expect("a healthy GET must succeed");
+
+    assert_eq!(fake.count(Op::Get), 1, "a small object is exactly one GET");
+    assert_eq!(
+        store.observed_store_time_ns(),
+        Some(STORE_DATE_NOON_NS),
+        "the observation is the response's Date, in unix nanoseconds"
+    );
+}
+
+/// The latest response wins, in both directions. A second response carrying an
+/// *older* `Date` replaces the first: the observation is not a running maximum,
+/// so one wrong header from a proxy is corrected by the next response rather
+/// than latched for the life of the process (ADR-1685 decision 1).
+///
+/// To watch this fail: make `ObservedStoreTime::observe` keep the larger of the
+/// stored value and `ns` (`crates/ravel-object-store/src/s3/connector.rs`,
+/// `self.ns.store(ns, Ordering::Relaxed)` becomes
+/// `self.ns.fetch_max(ns, Ordering::Relaxed)`). The first two assertions still
+/// pass and the third reports the noon observation where the eleven o'clock one
+/// belongs.
+#[tokio::test]
+async fn a_later_response_with_an_older_date_replaces_the_observation() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("clock/object", b"payload");
+    fake.script(
+        Op::Get,
+        [
+            Fault::FixedDate(STORE_DATE_NOON),
+            Fault::FixedDate(STORE_DATE_ELEVEN),
+        ],
+    );
+
+    store
+        .get("clock/object", GetRange::Full)
+        .await
+        .expect("the first GET must succeed");
+    assert_eq!(
+        store.observed_store_time_ns(),
+        Some(STORE_DATE_NOON_NS),
+        "the first response is observed"
+    );
+
+    store
+        .get("clock/object", GetRange::Full)
+        .await
+        .expect("the second GET must succeed");
+    assert_eq!(
+        store.observed_store_time_ns(),
+        Some(STORE_DATE_ELEVEN_NS),
+        "the latest response wins: an older Date replaces a newer one"
+    );
+}
+
+/// A response whose `Date` cannot be read changes nothing: the previous
+/// observation stands rather than being cleared, which would turn a momentary
+/// bad header into "no observation" and silently skip a caller's check.
+///
+/// The header is unparseable rather than absent because hyper stamps its own
+/// `Date` on any response that carries none, so the fake cannot omit one; the
+/// connector treats both the same way, and the missing-header case is pinned by
+/// `connector.rs`'s own unit tests.
+#[tokio::test]
+async fn an_unreadable_date_leaves_the_previous_observation_standing() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("clock/object", b"payload");
+    fake.script(
+        Op::Get,
+        [
+            Fault::FixedDate(STORE_DATE_NOON),
+            Fault::FixedDate("not-a-valid-date"),
+        ],
+    );
+
+    store
+        .get("clock/object", GetRange::Full)
+        .await
+        .expect("the first GET must succeed");
+    store
+        .get("clock/object", GetRange::Full)
+        .await
+        .expect("the second GET must succeed");
+
+    assert_eq!(fake.count(Op::Get), 2, "both GETs reached the endpoint");
+    assert_eq!(
+        store.observed_store_time_ns(),
+        Some(STORE_DATE_NOON_NS),
+        "an unparseable Date leaves the previous observation alone"
+    );
+}
+
+/// An error response carries the store's clock too, so a request that failed
+/// still seeds the observation. This is what keeps a process that is being
+/// throttled from falling back to "no observation" exactly when its writes are
+/// retrying.
+#[tokio::test]
+async fn an_error_response_is_observed_like_any_other() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.always(Op::Get, Fault::AccessDenied);
+
+    let error = store
+        .get("clock/denied", GetRange::Full)
+        .await
+        .expect_err("403 AccessDenied is permanent");
+    assert!(
+        matches!(error, StoreError::AccessDenied(_)),
+        "a 403 maps to AccessDenied, got {error:?}"
+    );
+    // hyper stamped this response's `Date` itself: the assertion is that *some*
+    // observation exists after a failed request, not which instant it names.
+    assert!(
+        store.observed_store_time_ns().is_some(),
+        "a 403 response still reports the store's clock"
     );
 }

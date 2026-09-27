@@ -154,6 +154,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max_flush_lifetime` old when its flush opens, which is the figure
   `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. A
   buffer that reaches the floor goes back to the idle clock, and strict-mode
+  writes keep the fast clock. `ravel-server` does not expose the knob yet, so
+  no deployment's flush cadence or buffered-mode loss window changes with this
+  release.
+- **The S3 adapter observes the store's own clock from response `Date`
+  headers** (ADR-1685 decision 1, issue #1685). A writer stamps its
+  ingest-hour bucket from its own clock and has had no second time source to
+  check that reading against, so a host lagging the folder's clock publishes
+  acknowledged commit records into an hour the fold has already sealed. Every
+  S3 response carries the store's clock in its `Date` header, and the HTTP
+  connector this adapter installs below `object_store`'s retry loop is the
+  only layer that sees it. `ObjectStoreBackend` gains a defaulted
+  `observed_store_time_ns() -> Option<i64>` returning `None`; `S3Store`
+  returns the latest response's `Date` as unix nanoseconds, or `None` before
+  its first response. Every response counts, an error one included; the latest
+  response wins rather than a running maximum, so one wrong header from a
+  proxy is corrected by the next response instead of latching for the life of
+  the process; and a missing or unparseable `Date` leaves the previous
+  observation standing. For a store whose `Date` is correct the value is a
+  lower bound on the store's current time, never an estimate of it (a leap
+  second is clamped to `:59` to keep it one), and it costs no extra request
+  and no new object. Every decorator in the crate delegates to the store it
+  wraps, as does `ravel-server`'s `--tenant-kms-config` wrapper, and
+  `MemoryStore` reports `None` unless a test sets one through the
+  `test-support` setter. Nothing consults the observation yet: the writer's
+  clock-lag refusal (ADR-1685 decision 2) lands separately, so no flush
+  behavior changes with this release.
   writes keep the fast clock. The `ravel-server` flag that turns it on is the
   next entry.
 - **`ravel-server --idle-flush-byte-floor` exposes that floor, and

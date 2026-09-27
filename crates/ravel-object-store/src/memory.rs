@@ -50,6 +50,13 @@ pub struct MemoryStore {
     clock_ms: AtomicU64,
     /// Page size for listings; tests can shrink it to exercise pagination.
     page_size: usize,
+    /// What [`ObjectStoreBackend::observed_store_time_ns`] reports (ADR-1685
+    /// decision 1). `None` unless a test sets it through
+    /// [`MemoryStore::set_observed_store_time_ns`]: the oracle is in-process
+    /// and receives no responses, so it observes no store clock of its own,
+    /// and inventing one from the host clock would hand callers an unasked-for
+    /// second time source.
+    observed_store_time_ns: RwLock<Option<i64>>,
 }
 
 impl MemoryStore {
@@ -71,6 +78,20 @@ impl MemoryStore {
     /// Advance the fake clock (tests exercising GC grace periods).
     pub fn set_clock_ms(&self, ms: u64) {
         self.clock_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Set what [`ObjectStoreBackend::observed_store_time_ns`] reports, so a
+    /// caller's store-clock check (ADR-1685 decision 2) can be driven against
+    /// the oracle. `None` restores the default of having observed nothing.
+    ///
+    /// The oracle never sets this itself: it serves no HTTP responses, so it
+    /// has no store clock to observe, and a test that wants one says so.
+    ///
+    /// Only compiled with the `test-support` feature, which no production
+    /// build enables.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_observed_store_time_ns(&self, ns: Option<i64>) {
+        *self.observed_store_time_ns.write() = ns;
     }
 
     /// Flip one bit of a stored object *without* touching the checksum recorded
@@ -451,6 +472,11 @@ impl ObjectStoreBackend for MemoryStore {
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.objects.write().remove(key);
         Ok(())
+    }
+
+    /// Whatever a test set (ADR-1685 decision 1), `None` otherwise.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        *self.observed_store_time_ns.read()
     }
 
     fn capabilities(&self) -> Capabilities {
