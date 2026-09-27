@@ -30,9 +30,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per shed batch. Because the permit is now taken before the body arrives,
   the ceiling counts concurrent uploads as well as concurrent decodes, and
   the body wait is bounded: a body that has not fully arrived 30 seconds
-  after admission is refused with 408 on HTTP or `DEADLINE_EXCEEDED` for a
-  unary gRPC export, and its permit is released, so a client trickling its
-  uploads cannot hold every slot. The OTAP stream holds no permit while it
+  after admission is refused with 503 and `Retry-After` on HTTP or
+  `DEADLINE_EXCEEDED` for a unary gRPC export, and its permit is released, so
+  a trickled upload holds its slot for at most 30 seconds. The OTAP stream holds no permit while it
   waits for a frame and is not bounded this way. The gRPC layer claims only
   the ingest services the listener registers, so a process without OTLP
   ingest (for example `--mode query`) still answers `UNIMPLEMENTED` on those

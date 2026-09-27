@@ -512,13 +512,9 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/v1/metrics", post(export_metrics))
         .route("/v1/logs", post(export_logs))
         .route("/v1/traces", post(export_traces))
-        // Issue #1705: the in-flight permit and the tenant credential check
-        // run here, on the request head, rather than as the first statements
-        // of each handler. A handler's `body: Bytes` argument is an
-        // extractor, so by the time the handler's own first line ran the body
-        // had already been buffered for an as-yet unauthenticated caller.
-        // `route_layer` rather than `layer` so a request to an unrouted path
-        // never takes a permit.
+        // Admission and the credential check run on the request head: see
+        // `crate::ingest_admission`. `route_layer` so an unrouted path never
+        // takes a permit.
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::ingest_admission::admit_ingest_request::<GatewayState>,
