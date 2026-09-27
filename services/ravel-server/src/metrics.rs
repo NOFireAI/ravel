@@ -5866,9 +5866,10 @@ pub struct MetricsState {
     /// `None` otherwise leaves the whole family off the exposition.
     pub metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
     /// The process's one query-audit pipeline (ADR-0062 decision 2b), read at
-    /// scrape time for its write-failure counter. `Some` only in a mode that
-    /// installed one (`Mode::All`/`Mode::Query`); `None` otherwise leaves the
-    /// `ravel_audit_write_failures_total` family off the exposition.
+    /// scrape time for its write-failure and put-retry counters. `Some` only
+    /// in a mode that installed one (`Mode::All`/`Mode::Query`); `None`
+    /// otherwise leaves the `ravel_audit_write_failures_total` and
+    /// `ravel_audit_put_retries_total` families off the exposition.
     pub audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>>,
     /// The ADR-1170 decisions 1/3/4 process-wide memory accountant, the SAME
     /// instance installed on the `sql`-featured `SqlExecutor` via
