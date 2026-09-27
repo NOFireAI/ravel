@@ -1,6 +1,6 @@
 # ADR-2040: Parquet tables, defined in SQL and queried in place through DataFusion
 
-- Status: Proposed
+- Status: Accepted (2026-09-27); implementation tracked on epic #2040
 - Date: 2026-09-27
 - Refs: #2040, ADR-0013, ADR-0022, ADR-0027, ADR-0029, ADR-0046, ADR-0064, ADR-0066, ADR-0071, ADR-0089, ADR-0097, ADR-0109, ADR-1374, ADR-2023
 
@@ -102,7 +102,7 @@ Two costs show up, and one of them belongs to Ravel:
 ### D1. Datasets and tables live under the tenant's prefix, as immutable objects
 
 ```
-t/<tenant_hash>/pq/d/<dataset>/<content_hash16>.parquet     data object (immutable, content-addressed)
+t/<tenant_hash>/pq/d/<dataset>/<blake3_hex64>.parquet       data object (immutable, content-addressed)
 t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm            table manifest version (immutable, CreateIfAbsent)
 ```
 
@@ -140,13 +140,17 @@ same number, the store accepts one; the loser sees the conflict, re-reads
 the new version, and re-applies its own intent to it (D2). A table's
 history is therefore a total order with no lost update. There is no
 mutable HEAD: resolving a table is a LIST of `v/` and a GET of the newest
-manifest, both charged to the Resolve phase. `sweep` (D3) deletes old
-versions, so the LIST stays short.
+manifest, both charged to the Resolve phase. `sweep` (see Lifecycle under
+Consequences) deletes old versions, so the LIST stays short.
 
-Data objects are content-addressed. A file that fits in one PUT is written
-with `CreateIfAbsent`, and a conflict there counts as success once a
-`head` confirms the size, since the key already names these bytes. A
-larger file goes through `put_multipart`, which
+Data objects are content-addressed, and the key carries the full 256-bit
+BLAKE3 digest as 64 hex characters. Every other `hash16` key in the layout
+is disambiguated by a writer id, epoch, sequence or watermark; this one has
+nothing else, so a 64-bit truncation would make two different files of the
+same size one object. A file that fits in one PUT is written with
+`CreateIfAbsent`, and a conflict there counts as success once a `head`
+confirms the size, since the key already names these bytes. A larger file
+goes through `put_multipart`, which
 takes no put condition and may overwrite. That is safe because the key is
 the BLAKE3 of the bytes, so an overwrite can only write the same bytes, and
 nothing references the object until a manifest commits. No manifest ever
@@ -291,10 +295,13 @@ instead of rejecting them.
   `validate_query`. New cases:
   - a URL location is refused: `s3://`, `file://`, absolute, `..`, glob;
   - a dataset location is admitted by `validate_ddl`.
-- `sql_endpoint.rs` `rejected_statement_kinds_return_400_over_http` keeps
-  its `s3://` case at 400, and adds:
-  - no capability returns 403;
-  - with the capability, 200 and a manifest under the caller's prefix;
+- `sql_endpoint.rs` `rejected_statement_kinds_return_400_over_http`: the
+  capability is checked before the statement is validated, so a caller
+  without `ddl` learns nothing about validation. Its existing `s3://` case,
+  sent with a token that has no `ddl`, moves to 403. New cases:
+  - the same `s3://` statement from a token holding `ddl` returns 400;
+  - with the capability and a dataset location, 200 and a manifest under
+    the caller's prefix;
   - tenant A's DDL writes nothing under tenant B's prefix.
 - `session.rs` `the_empty_registry_refuses_lookups_and_registrations` stays.
   `SingleStoreRegistry` gains cases for another tenant's URL, `s3://`,
@@ -343,7 +350,16 @@ cost:
 
 - File-scan repartitioning is on, so a single large file is split by byte
   range across `target_partitions` (K5: 203.4 s to 88.1 s hot on one file;
-  K2: 9.1 s on 100 files).
+  K2: 9.1 s on 100 files), but only for a query the ADR-0094
+  classification proves exact-typed: `count`, and `sum`/`min`/`max` over
+  non-float input, with no float group key. Any other query (a float
+  aggregate, or any `avg`) scans as one partition in manifest file order,
+  so its fold is bit-reproducible as it is on the signal tables. A
+  multi-partition scan would merge partial float states in arrival order.
+  The cost of that rule on ClickBench is measured in the first D7 run on
+  the reference machine, and a
+  deterministic ordered merge of partial states is the follow-up if it
+  matters.
 - Parquet filter pushdown (`pushdown_filters`) is on, which evaluates
   predicates inside the reader and decodes the other columns only for
   surviving rows (K6: 57.5 s to 47.1 s hot, 251.7 s to 203.5 s cold).
@@ -370,7 +386,8 @@ they split by what they match:
   aggregate, whatever the scan. It fires on Parquet plans and re-admits
   the vetted TopK shapes that K3 turned off wholesale. Its exactness
   argument (issue #1402) rests on the aggregate's ordering and limit, not
-  on the scan, and T4a pins it with a Parquet-plan test.
+  on the scan, and task T4a of epic #2040 (issue #2053) pins it with a
+  Parquet-plan test.
 
 DataFusion's row-group, page-index and bloom-filter pruning apply to
 Parquet plans. A query may name several Parquet tables. A Parquet table and a
@@ -488,11 +505,18 @@ and the per-query memory cap:
   against the new lock.
 - **Lifecycle.** Parquet tables are outside time retention and outside
   selective erasure (ADR-0064). Their lifecycle is `DROP TABLE` plus
-  `ravel-cli parquet sweep`. `sweep` deletes data objects and manifest
-  versions that the newest version of no table references, once they are
-  older than the grace period. It takes the deployment's
-  `--gc-max-query-duration` (11 minutes when derived) and refuses a grace
-  shorter than that, which covers a query that resolved an older version.
+  `ravel-cli parquet sweep`, which runs only when an operator runs it. It
+  has two age floors:
+  - A manifest version older than its table's newest is deleted once it is
+    older than a grace that must be at least the deployment's
+    `--gc-max-query-duration` (11 minutes when derived), which covers a
+    query that resolved an older version.
+  - A data object that no table's newest manifest references is deleted
+    only once it is older than `--unreferenced-grace`, 7 days by default.
+    Files are uploaded before a table is defined over them, and files added
+    for a later `CREATE OR REPLACE` sit unreferenced until then. So this
+    floor covers upload-to-definition, not only an in-flight query, and
+    `sweep` refuses a value below the query-duration grace.
 - **Distributed execution** (ADR-0071 read fan-out) does not cover Parquet
   tables. A query runs on the node that receives it.
 
@@ -507,7 +531,7 @@ flowchart LR
     L --> M[CreateIfAbsent manifest v N+1]
   end
   subgraph store["Object storage, t/&lt;th&gt;/pq/"]
-    D[(d/hits/&lt;hash16&gt;.parquet)]
+    D[(d/hits/&lt;blake3_hex64&gt;.parquet)]
     MV[(t/hits/v/&lt;version&gt;.pqm)]
   end
   U --> D
