@@ -21,7 +21,7 @@
 //! [`crate::shard`]; the adaptive flush delay (decision 3) is metrics-only and
 //! deliberately absent here (the age trigger stays the fixed
 //! `max_flush_delay`/`max_flush_delay_idle`, plus the opt-in ADR-1737
-//! `max_flush_lifetime` hold shared with the metrics actor, in
+//! sub-floor hold shared with the metrics actor, in
 //! [`LogShardActor::age_threshold_ns`]).
 //!
 //! The divergences from the metrics shard actor are otherwise deliberate and
@@ -1299,7 +1299,8 @@ impl LogShardActor {
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
     /// (ADR-0051 section 7), or, below a non-zero `idle_flush_byte_floor`, for
-    /// `max_flush_lifetime` (ADR-1737, [`idle_age_threshold`]). "Worth a PUT"
+    /// the sub-floor hold, `max_flush_lifetime` less one `flush_tick`
+    /// (ADR-1737, [`idle_age_threshold`]). "Worth a PUT"
     /// is a claim about the object, so this
     /// reads the object-bytes estimate, not the buffered-memory charge (issue
     /// #1305). Strict-mode ack latency is unaffected:

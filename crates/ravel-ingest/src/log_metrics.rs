@@ -51,8 +51,9 @@ pub struct LogIngestMetrics {
     /// Attempt-time, same as `flushes_by_size`.
     flushes_by_age: AtomicU64,
     /// Flushes opened because a tenant buffer below a non-zero
-    /// `idle_flush_byte_floor` aged past `max_flush_lifetime`
-    /// ([`FlushTrigger::AgeFloor`], ADR-1737 decision 6). Attempt-time.
+    /// `idle_flush_byte_floor` aged past the sub-floor hold,
+    /// `max_flush_lifetime` less one `flush_tick` ([`FlushTrigger::AgeFloor`],
+    /// ADR-1737 decision 6). Attempt-time.
     flushes_by_age_floor: AtomicU64,
     /// Flushes opened by any [`FlushTrigger::Manual`] path. Attempt-time.
     flushes_manual: AtomicU64,
@@ -348,7 +349,7 @@ pub struct FlushTriggerMix {
     /// Flushes opened because the tenant buffer aged past `max_flush_delay`
     /// ([`FlushTrigger::Age`], and the metrics-only [`FlushTrigger::AgeAdaptive`]
     /// the log actor never raises) or, below a non-zero `idle_flush_byte_floor`,
-    /// past `max_flush_lifetime` ([`FlushTrigger::AgeFloor`]). The process-wide
+    /// past the sub-floor hold ([`FlushTrigger::AgeFloor`]). The process-wide
     /// counters keep the floor case apart as `flushes_by_age_floor`.
     pub age: u64,
     /// Flushes opened by the final drain at close: a [`FlushTrigger::Manual`]

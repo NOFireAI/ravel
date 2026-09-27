@@ -332,19 +332,30 @@ pub(crate) fn size_trigger_fires(
 /// The age threshold, and the trigger to record, for a buffer with no
 /// strict-mode waiter and under `min_flush_bytes` of object, shared by the
 /// metrics, log, and span shard actors (ADR-1737 decision 2). Below a non-zero
-/// `idle_flush_byte_floor` the buffer waits for `max_flush_lifetime`, the hold
-/// ceiling ADR-0052's `FLUSH_BOUND_SLACK_HOURS` already covers; otherwise it
-/// waits for `max_flush_delay_idle`. `flush_est_bytes` is the same object-bytes
-/// estimate the caller compared against `min_flush_bytes`, so a buffer moves up
-/// a tier as rows arrive and a trickle that reaches the floor flushes on the
-/// idle clock measured from its oldest row.
+/// `idle_flush_byte_floor` the buffer waits for the sub-floor hold, one
+/// `flush_tick` short of `max_flush_lifetime`; otherwise it waits for
+/// `max_flush_delay_idle`. `flush_est_bytes` is the same object-bytes estimate
+/// the caller compared against `min_flush_bytes`, so a buffer moves up a tier
+/// as rows arrive and a trickle that reaches the floor flushes on the idle
+/// clock measured from its oldest row.
+///
+/// The tick is subtracted because the age check runs on a `flush_tick`, not at
+/// the instant the threshold is crossed, so a buffer whose threshold is `T`
+/// opens its flush at an age of up to `T + flush_tick`. Holding the tick back
+/// keeps the worst buffer age at flush open at exactly `max_flush_lifetime`,
+/// which is the figure ADR-0052's
+/// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS = 2` is derived from
+/// (ADR-1737 decision 3 as amended). It saturates at zero, so a `flush_tick`
+/// at or above `max_flush_lifetime` gives a hold of zero rather than wrapping.
 pub(crate) fn idle_age_threshold(
     flush_est_bytes: usize,
     config: &IngestConfig,
 ) -> (i64, FlushTrigger) {
     if config.idle_flush_byte_floor > 0 && flush_est_bytes < config.idle_flush_byte_floor {
+        let lifetime_ns = config.max_flush_lifetime.as_nanos() as i64;
+        let tick_ns = config.flush_tick.as_nanos() as i64;
         (
-            config.max_flush_lifetime.as_nanos() as i64,
+            lifetime_ns.saturating_sub(tick_ns).max(0),
             FlushTrigger::AgeFloor,
         )
     } else {
@@ -397,10 +408,13 @@ pub struct IngestConfig {
     pub min_flush_bytes: usize,
     /// Opt-in third age tier (ADR-1737). When non-zero, a buffer with no
     /// strict-mode waiter whose flush would write fewer than this many object
-    /// bytes waits for `max_flush_lifetime` instead of `max_flush_delay_idle`
-    /// before its age trigger fires, and that flush is counted as
-    /// [`FlushTrigger::AgeFloor`]. Read by the metrics, log, and span actors
-    /// against the same object-bytes estimate as `min_flush_bytes`.
+    /// bytes waits for the sub-floor hold, `max_flush_lifetime` less one
+    /// `flush_tick`, instead of `max_flush_delay_idle` before its age trigger
+    /// fires, and that flush is counted as [`FlushTrigger::AgeFloor`]. Read by
+    /// the metrics, log, and span actors against the same object-bytes
+    /// estimate as `min_flush_bytes`. The tick the hold gives up is the one
+    /// the age check may take to notice the threshold, so the buffer is at
+    /// most `max_flush_lifetime` old when its flush opens.
     ///
     /// 0, the default, disables the tier, and every actor keeps the two-clock
     /// predicate. A non-zero value widens the buffered-mode loss window that
@@ -563,7 +577,7 @@ pub enum IngestConfigError {
     /// A non-zero `idle_flush_byte_floor` at or above `min_flush_bytes`
     /// (ADR-1737 decision 1). Such a floor has no idle tier left between it
     /// and the fast clock, so every buffer below `min_flush_bytes` would wait
-    /// for `max_flush_lifetime`.
+    /// for the sub-floor hold.
     #[error(
         "idle_flush_byte_floor ({floor} bytes) must be below min_flush_bytes \
          ({min_flush_bytes} bytes), or 0 to disable it"
