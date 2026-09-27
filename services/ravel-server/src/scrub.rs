@@ -207,8 +207,8 @@ const MAX_MARKER_HOLD: Duration = Duration::from_secs(6 * 3600);
 /// that still failed as `reason="retry_exhausted"`. `MAX_MARKER_HOLD /
 /// DEFAULT_SCRUB_TICK` = 6: no tick is longer than `DEFAULT_SCRUB_TICK`, so a
 /// hold ends within six tick intervals of its first held tick, six hours of
-/// cadence at the default tick (at most 6.6 with the loop's 10% start jitter,
-/// plus the time the cycles themselves take) and less when a short
+/// cadence at the default tick (at most 6.6 with the up to 10% jitter the loop
+/// adds to every sleep, plus the time the cycles themselves take) and less when a short
 /// `--scrub-period` shrinks the tick.
 pub const MAX_HELD_TICKS: u32 = (MAX_MARKER_HOLD.as_secs() / DEFAULT_SCRUB_TICK.as_secs()) as u32;
 
@@ -548,6 +548,10 @@ pub async fn run_cycle(
 
     let clock = WallClock;
     let mut worst_held = [0u32; MAINTAINED_SIGNALS.len()];
+    // A shard whose cursor could not be read this cycle keeps whatever it last
+    // persisted, which the gauge last reported as at most this.
+    let last_held = MAINTAINED_SIGNALS
+        .map(|signal| u32::try_from(metrics.marker_held_ticks(signal)).unwrap_or(u32::MAX));
     for tenant in &outcome.maintained {
         // A rotation must not outlive the data it verifies: an object retention
         // deletes before the walk reaches it is never verified at all. Half the
@@ -626,8 +630,9 @@ pub async fn run_cycle(
                     metrics,
                 )
                 .await;
-                let worst = &mut worst_held[signal_index(signal)];
-                *worst = (*worst).max(held.unwrap_or(0));
+                let index = signal_index(signal);
+                let worst = &mut worst_held[index];
+                *worst = (*worst).max(held.unwrap_or(last_held[index]));
             }
             // Seal-divergence tier (ADR-0059 decision 2): once per
             // (tenant, signal) per tick, not per shard and not gated behind the
@@ -737,8 +742,9 @@ async fn scan_shards(
 /// tick consumes, plus at most one partial page. Every store error is logged
 /// and the tick is retried next cycle; nothing here mutates durable data.
 ///
-/// Returns the cursor's consecutive held ticks after the tick, or `None` when
-/// the tick was skipped before it could walk.
+/// Returns the cursor's consecutive held ticks after the tick, or before it
+/// when the tick was skipped after loading the cursor; `None` when the cursor
+/// could not be read at all.
 #[allow(clippy::too_many_arguments)]
 async fn run_shard_tick(
     store: &dyn ObjectStoreBackend,
@@ -772,7 +778,7 @@ async fn run_shard_tick(
                     tenant = %tenant.to_hex(), signal = ?signal, shard, error = %err,
                     "scrub: LIST-only entry count failed; rotation not started, retried next tick"
                 );
-                return None;
+                return Some(cursor.held_ticks);
             }
         }
     } else {
@@ -1018,8 +1024,11 @@ async fn verify_slice(
 
 /// Log what a held unit found unreadable, on the tick its hold starts. None of
 /// it is counted until the unit is consumed, and the ticks that retry the unit
-/// log none of it again, so each unreadable record or object is logged once
-/// per hold here and once more, at error, when it is counted.
+/// log none of it again, so each unreadable record or object is logged at most
+/// once per hold here and once more, at error, when it is counted. A hold that
+/// starts on a record GET stops before the unit's objects are read, so an
+/// object a later held tick finds unreadable is logged only when it is
+/// counted.
 fn log_unreadable_in_held_unit(
     tenant: &TenantHash,
     signal: Signal,
@@ -5054,6 +5063,52 @@ mod tests {
             assert_eq!(metrics.marker_held_ticks(Signal::Metrics), cycle);
         }
         assert_eq!(metrics.marker_held_ticks(Signal::Logs), 0);
+    }
+
+    /// A cycle that skips a held shard's tick because its cursor GET failed
+    /// keeps reporting the held count the shard last persisted, not 0.
+    #[tokio::test]
+    async fn the_held_ticks_gauge_keeps_its_value_when_the_cursor_is_unreadable() {
+        let memory = Arc::new(MemoryStore::with_page_size(4));
+        let (_, data_keys) = eight_record_shard(&memory).await;
+        let failing = data_keys[2].clone();
+        let cursor = cursor_key(&tenant().hash(), Signal::Metrics, 0);
+        let cursor_unreadable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = GetFaults::new(memory.clone(), {
+            let cursor_unreadable = cursor_unreadable.clone();
+            move |key, _| {
+                if key == failing {
+                    Some(StoreError::Timeout)
+                } else if key == cursor && cursor_unreadable.load(Ordering::Relaxed) {
+                    Some(StoreError::Transient(
+                        "injected cursor GET fault".to_string(),
+                    ))
+                } else {
+                    None
+                }
+            }
+        });
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+        let live_set = worker.solo_live_set();
+        let cycle = || run_cycle(&store, None, 1, 2, 1, &metrics, &worker, &live_set, None);
+        cycle().await;
+        cycle().await;
+        assert_eq!(metrics.marker_held_ticks(Signal::Metrics), 2);
+
+        cursor_unreadable.store(true, Ordering::Relaxed);
+        let fired = store.fired();
+        cycle().await;
+        assert_eq!(store.fired(), fired + 1, "the cursor GET failed once");
+        assert_eq!(
+            metrics.marker_held_ticks(Signal::Metrics),
+            2,
+            "a skipped tick reports the held count the shard last persisted"
+        );
+
+        cursor_unreadable.store(false, Ordering::Relaxed);
+        cycle().await;
+        assert_eq!(metrics.marker_held_ticks(Signal::Metrics), 3);
     }
 
     /// ADR-1686 amendment, decision 3: a compaction record that lands in an

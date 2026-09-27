@@ -364,9 +364,9 @@ at its own level with an error log naming the unit, counts everything else
 it found as it would for any consumed unit, and moves on. `MAX_HELD_TICKS`
 is `6 h / DEFAULT_SCRUB_TICK` = 6. No tick is longer than
 `DEFAULT_SCRUB_TICK` (one hour), so a hold ends within six tick intervals of
-its first held tick: six hours of cadence, at most 6.6 with the loop's 10%
-start jitter, plus the time the cycles themselves take, and less when a
-short `--scrub-period` shrinks the tick.
+its first held tick: six hours of cadence, at most 6.6 with the up to 10%
+jitter the loop adds to every sleep, plus the time the cycles themselves
+take, and less when a short `--scrub-period` shrinks the tick.
 
 **A late record is judged against its whole hour.** Decision 4 sent every
 record that lands behind the marker to the next rotation. That is true only
@@ -386,3 +386,16 @@ is no cursor. Any other GET failure leaves the stored cursor untouched and
 the shard's tick is skipped, because starting a fresh rotation there would
 rewind the marker to the head of the listing and drop the rotation's progress
 on a transient throttle.
+
+**What the seven-tick bound counts.** The termination argument above says no
+unit costs the walk more than seven ticks, after six consecutive held ticks
+"on one marker position". The count is per held unit, as the paragraph on
+the hold cap describes, and it counts held ticks only. A tick whose walk
+LIST fails ends with the slice consumed so far and holds nothing, so a
+listing error on the first page neither moves the marker nor adds to the
+count: a listing error that persists stalls the walk at the marker with no
+cap, reported by a warning each tick and, once the lost ticks push the
+needed rate past the ceiling, by `ravel_scrub_behind_total`. A tick skipped
+because the cursor GET or the rotation's opening count failed is outside the
+bound the same way, and so is a tick that fills its budget on entries that
+landed ahead of the held unit before it reaches that unit.

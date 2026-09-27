@@ -354,8 +354,8 @@ that count's cost is not charged against the tick's budget.
 
 This is the one scheduled task whose cost scales with data volume rather than
 metadata volume, so size `P` against the corpus you actually have, and watch
-`ravel_scrub_cursor_position` to confirm rotations keep pace. That gauge and the
-three scrubber anomaly counters are catalogued in
+`ravel_scrub_cursor_position` to confirm rotations keep pace. That gauge, the
+held-ticks gauge, and the five scrubber counters are catalogued in
 [the observability guide](../observability.md); the alarms that matter are in
 [troubleshooting](troubleshooting.md).
 

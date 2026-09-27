@@ -1512,9 +1512,10 @@ mod tests {
             }
             keys.sort();
         };
-        // 1,000 entries when the rotation opens, and twelve appended a tick:
-        // below the sustained rate `ceil(estimate / 168)` once the appends are
-        // counted, so an exact count finishes inside the deadline.
+        // The rotation opens on 1,006 entries (five per writer in each of
+        // hours 0 to 99, three per writer in hour 100) and twelve are appended
+        // a tick. The walk keeps pace only while every tick's recount raises
+        // the budget by all twelve, from both writers.
         for hour in 0..100 {
             commit(&mut keys, hour, 5);
         }
