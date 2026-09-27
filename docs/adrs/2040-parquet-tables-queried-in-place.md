@@ -28,8 +28,11 @@ DataFusion's own Parquet scan from running here:
 `context.runtime_env().object_store(url)` at execute time, whatever reader
 factory the scan was given.
 
-This ADR makes Parquet a queryable table kind, and lets SQL define such
-tables with `CREATE EXTERNAL TABLE`. ADR-0029 rejected Parquet as Ravel's
+This ADR makes Parquet a queryable table kind. SQL defines such a table
+with `CREATE EXTERNAL TABLE` over Parquet files where they already are: an
+object or a prefix of many objects in S3, Google Cloud Storage or Azure
+Blob Storage, inside locations an operator granted the tenant. Nothing is
+copied or loaded. ADR-0029 rejected Parquet as Ravel's
 log storage format, because it breaks "one commit is one object" and has no
 place for blooms, postings and stream-sorted records. That stands: RLOG
 stays the log format.
@@ -99,18 +102,67 @@ Two costs show up, and one of them belongs to Ravel:
 
 ## Decision
 
-### D1. Datasets and tables live under the tenant's prefix, as immutable objects
+### D1. A table is a pinned snapshot of Parquet files where they already are
+
+The Parquet files stay where the user put them, in an S3, GCS or Azure
+bucket. Ravel never copies, moves, rewrites or deletes them. What Ravel stores is the
+table definition:
 
 ```
-t/<tenant_hash>/pq/d/<dataset>/<blake3_hex64>.parquet       data object (immutable, content-addressed)
+t/<tenant_hash>/pq/grants                                   location grants (CAS whole-record replace)
 t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm            table manifest version (immutable, CreateIfAbsent)
 ```
 
-A **dataset** is a tenant-relative path matching
-`[a-z0-9_]+(/[a-z0-9_]+)*`. It is a place to put Parquet files. A **table**
-is a name matching `[a-z_][a-z0-9_]{0,62}` that is not a built-in table
-(`samples`, `logs`, `spans`, `alerts`, `audit`) and not a signal name
-(`profiles`). Its state is a sequence of immutable manifest versions.
+A **table** is a name matching `[a-z_][a-z0-9_]{0,62}` that is not a
+built-in table (`samples`, `logs`, `spans`, `alerts`, `audit`) and not a
+signal name (`profiles`). Its state is a sequence of immutable manifest
+versions.
+
+**Location grants.** An operator grants each tenant the blob-storage
+locations its tables may read. A grant is a credential profile plus a
+location in that profile's store:
+
+- `s3://<bucket>/<prefix>` for S3 and S3-compatible stores (RustFS,
+  MinIO);
+- `gs://<bucket>/<prefix>` for Google Cloud Storage;
+- `az://<container>/<prefix>` for Azure Blob Storage.
+
+The prefix may be empty, which grants a whole bucket. A credential profile
+lives in the server's own configuration: the store kind, its endpoint or
+account, and its secrets. A URL alone does not identify a store. An
+`az://` URL carries no account, and an `s3://` bucket name is unique only
+per endpoint. So a location's identity everywhere in this ADR (grant,
+manifest, cache key) is the tuple (profile, bucket, key), never the URL
+string.
+
+Grants live in their own record, `t/<tenant_hash>/pq/grants`, rewritten
+whole under CAS with its own `format_version` (1). They are deliberately
+not a field of the tenant config record: that record is read on the ingest
+and fold paths, and adding a field there would need ADR-0066 R1's
+two-release version bump. No existing binary reads the grants record.
+Neither a grant nor any SQL statement ever carries a secret. A tenant with
+no grant cannot create a Parquet table.
+
+Rules on grants, checked when a grant is added:
+
+- Two grants of one tenant whose locations overlap under different
+  profiles are refused. So a `LOCATION` URL resolves to exactly one
+  profile.
+- A grant must not reach Ravel's own data bucket. A name comparison cannot
+  see an alias, an access point, or the same store under another host
+  name, so the check is also a probe. Ravel writes an object with a fresh
+  random key under `sys/pq-probe/` in its own bucket, tries to read that
+  key from the granted bucket through the grant's profile, and deletes the
+  probe object afterwards. If the read succeeds, the granted bucket is
+  Ravel's own under another name, and the grant is refused. The same probe
+  runs again at `CREATE`.
+- This protects Ravel's internal objects and every tenant's prefix inside
+  Ravel's bucket. It does not police user buckets: granting two tenants
+  overlapping locations in a user's bucket is an operator decision, and
+  Ravel records it without refusing it.
+
+The credentials a profile names must be able to read the granted location
+(a bucket policy or IAM binding, for a bucket in another account).
 
 A manifest (`proto/ravel/parquet_table.proto`, `ParquetTableManifest`)
 carries:
@@ -122,18 +174,51 @@ carries:
   dropped a field while reading N would write N+1 without it, which is the
   loss mechanism in ADR-0066's R1 amendment.
 - the table name, the version, and `dropped`;
-- the dataset it was created from;
-- for each file: its data key, byte size, BLAKE3 content hash, row count,
-  and Parquet footer length;
+- the `LOCATION` it was created from, and the grant that admitted it (for
+  audit only: reads check the grants that exist at read time);
+- for each file: the profile, the bucket, the object key as raw bytes
+  exactly as the listing returned it (never a URL string that would be
+  re-parsed), byte size, ETag, the backend's object version or generation
+  when the store reports one, row count, and Parquet footer length;
 - the options and coercions (D5);
-- who created it, when, and the statement text as `redact` renders it.
+- who created it, when, a per-write nonce, and the statement text as
+  `redact` renders it.
 
-The manifest carries no Arrow schema. The CLI links arrow 59 and the
-reader arrow 58, and a schema encoded by one and decoded by the other
-would be a contract between two arrow majors. Instead, every file in a
-table must have the same Parquet schema, compared on the footer's schema
-elements. The reader infers the Arrow schema from one file's footer at plan
-time, through DataFusion's own Parquet schema inference.
+The manifest carries no Arrow schema. Every file in a table must have the
+same Parquet schema, compared on the footer's schema elements when the
+table is created. The reader infers the Arrow schema from one file's footer
+at plan time, through DataFusion's own Parquet schema inference, so no
+schema is encoded by one arrow major and decoded by another.
+
+**Pinning.** The files are not Ravel's, so their owner can overwrite or
+delete them at any time. Ravel's rule is that a table reads exactly the
+bytes it was created over, or fails:
+
+- Every read carries a precondition: `If-Match` on the recorded ETag, and
+  the recorded version or generation when there is one. The `object_store`
+  crate sends both for S3, GCS and Azure through `GetOptions`. S3 and Azure
+  report a version only on a bucket with versioning on. GCS always reports
+  a generation, so a GCS file is pinned exactly.
+- A file that changed fails the query with a typed error naming it, "file
+  changed since the table was created; run `CREATE OR REPLACE`". A file
+  that is gone fails the same way. Old and new bytes are never mixed in one
+  query.
+- The read cache key's content part is a BLAKE3 over (profile, bucket, key,
+  ETag, version, size), so a changed file can never be served from pages
+  cached for its old bytes. This is a second kind of cache key, and
+  ADR-0046 is amended to say so. Its soundness rests on the ETag or version
+  changing whenever the bytes do, which is weaker than a hash of the bytes.
+  On an unversioned S3 bucket a single-PUT ETag is an MD5, and whoever can
+  write the granted location could in principle forge an MD5 collision. The
+  harm stays inside the tenants granted that location, because the tenant
+  hash is part of the key. A versioned bucket, or GCS, removes this.
+- A store that ignores the precondition would silently serve changed
+  bytes. So the precondition is probed against a real object whenever a
+  grant is added and whenever a table is created: a read with a wrong
+  ETag must be refused with `PreconditionFailed`, and a read with the
+  object's own ETag must succeed. If either fails, the grant or the
+  `CREATE` is refused. RustFS 1.0.0, the store the ClickBench lane uses,
+  passes both (#2040).
 
 Version N+1 is written with `CreateIfAbsent`. When two writers race for the
 same number, the store accepts one; the loser sees the conflict, re-reads
@@ -141,54 +226,55 @@ the new version, and re-applies its own intent to it (D2). A table's
 history is therefore a total order with no lost update. There is no
 mutable HEAD: resolving a table is a LIST of `v/` and a GET of the newest
 manifest, both charged to the Resolve phase. `sweep` (see Lifecycle under
-Consequences) deletes old versions, so the LIST stays short.
+Consequences) deletes superseded versions, so the LIST stays short.
 
-Data objects are content-addressed, and the key carries the full 256-bit
-BLAKE3 digest as 64 hex characters. The other content-addressed keys that
-use `hash16` (L0 data objects, `.csnap` snapshot parts) also carry a writer
-id, epoch, sequence or watermark. This key carries only the dataset, so a
-64-bit truncation would make two different files of the same size one
-object. A file that fits in one PUT is written with
-`CreateIfAbsent`, and a conflict there counts as success once a `head`
-confirms the size, since the key already names these bytes. A larger file
-goes through `put_multipart`, which
-takes no put condition and may overwrite. That is safe because the key is
-the BLAKE3 of the bytes, so an overwrite can only write the same bytes, and
-nothing references the object until a manifest commits. No manifest ever
-references a key whose bytes can change. That makes the content hash usable
-as the read cache's `content_hash` (ADR-0046) exactly as it is for RLOG
-objects.
-
-### D2. SQL defines tables; LOCATION names a dataset, never storage
+### D2. SQL defines tables over granted locations
 
 `POST /api/v1/sql` admits these statements from a caller holding the `ddl`
 capability (D4):
 
 ```sql
-CREATE EXTERNAL TABLE [IF NOT EXISTS] name STORED AS PARQUET LOCATION 'dataset' [OPTIONS (...)];
-CREATE OR REPLACE EXTERNAL TABLE name STORED AS PARQUET LOCATION 'dataset' [OPTIONS (...)];
+CREATE EXTERNAL TABLE [IF NOT EXISTS] name STORED AS PARQUET LOCATION '<url>' [OPTIONS (...)];
+CREATE OR REPLACE EXTERNAL TABLE name STORED AS PARQUET LOCATION '<url>' [OPTIONS (...)];
 DROP TABLE [IF EXISTS] name;
 ```
 
-- `LOCATION` is a dataset path as defined in D1. A scheme, a leading `/`,
-  `..`, a glob, or a percent-escape is refused at validation with a typed
-  error. The statement never carries a bucket, an absolute key, or a
-  credential.
-- `CREATE` lists the dataset once with `list_delimited` at the dataset's
-  prefix, so only the dataset's own files are taken and a nested dataset
-  such as `hits/2024` is not. It requires at least one file, reads each
-  file's footer, and commits a manifest that snapshots the file list.
-  Queries never list the dataset. Files uploaded later are picked up by
-  `CREATE OR REPLACE`.
-- After the manifest commits, `CREATE` checks with a `head` that every
-  object it references still exists at the recorded size, and returns a
-  typed error naming any that do not. A `sweep` that ran between the
-  listing and the commit is the case this covers: sweep ages an
-  unreferenced object from its upload, so a dataset of old files can lose
-  one to a concurrent sweep, and the harmful delete always lands before
-  the commit. The manifest stays, being immutable. The caller re-uploads
-  and issues `CREATE OR REPLACE`. `sweep` also re-resolves every table's
-  newest manifest just before it deletes data, which narrows the window.
+- `LOCATION` is an `s3://`, `gs://` or `az://` URL. It names either a
+  single object or a prefix ending in `/`, and it must lie inside one of
+  the caller's grants (D1). Because grants of one tenant never overlap
+  across profiles, the URL resolves to exactly one profile, and every
+  file of the table is read through it.
+- The `LOCATION` URL is checked once, in canonical form, segment by
+  segment against the grant: `..`, empty segments, globs,
+  percent-escapes, query strings, and a scheme or bucket other than the
+  grant's are refused with a typed error. A grant of `s3://b/data` does not
+  admit `s3://b/data2/`. Keys are case-sensitive and nothing is folded.
+  The statement never carries a credential.
+- A prefix is listed once, recursively. Every object whose key ends in
+  exactly `.parquet` becomes a file of the table.
+  - Hive-style subdirectories such as `year=2024/` are included as plain
+    files; their names do not become columns.
+  - Keys ending in `/` (directory markers) and keys with any other suffix
+    are skipped, and the statement's response counts them.
+  - A listed key that the object-store client cannot address exactly
+    (an empty or `..` segment, for example) refuses the `CREATE` with a
+    typed error naming it, rather than being recorded and becoming
+    unreadable later.
+  - A table holds at most 100,000 files. A prefix with none, or with more
+    than the limit, is refused with a typed error.
+- For each file, `CREATE` reads the footer with `If-Match` on the ETag the
+  listing reported. It then records the ETag, version and size from that
+  read's response, with the footer length and row count. A file changed
+  between the listing and the footer read therefore refuses the `CREATE`
+  instead of producing a manifest whose ETag and footer disagree. A file
+  deleted in between refuses it the same way, naming the file. So does a
+  zero-byte or truncated file. Nothing is skipped silently.
+- `CREATE` requires one Parquet schema across the files and commits a
+  manifest that snapshots the file list. Its footer reads go through the
+  shared `GetLimiter` and run under the SQL deadline. A prefix too large to
+  read within the deadline fails with the deadline error; the file cap
+  bounds the worst case. Queries never list the location. Files added later
+  are picked up by `CREATE OR REPLACE`.
 - `OPTIONS` admits `binary_as_string` and `ravel.cast.<column>` (D5), and
   nothing else.
 - Refused: `TEMPORARY`, `UNBOUNDED`, `PARTITIONED BY`, `WITH ORDER`, a
@@ -213,11 +299,9 @@ functions), each needing a separate refusal. DataFusion's reference
 `TableProviderFactory` also parses `LOCATION` with `ListingTableUrl::parse`,
 which accepts globs and any scheme.
 
-Files reach a dataset through `ravel-cli parquet put --tenant T --dataset
-D FILE...`. It validates each footer and uploads content-addressed objects
-under `t/<th>/pq/d/<D>/`, using multipart above the store's part size. A
-tenant holds no bucket credentials and cannot write there directly. An HTTP
-upload endpoint under the tenant's own token is a later change.
+Grants are written by an operator with `ravel-cli tenant parquet-grant
+add|remove|ls --tenant T --location <url> --profile <name>`, never through
+SQL.
 
 ### D3. The reader: DataFusion's Parquet scan through Ravel's fetch path
 
@@ -231,25 +315,39 @@ untouched.
 
 `ravel-parquet` provides:
 
+- **An external read store per credential profile.** A read-only
+  `ObjectStoreBackend` (`get` with ranges, `head`, `list`) over the
+  `object_store` crate's S3, GCS or Azure client, built at startup from the
+  profile's configuration. `ObjectStoreBackend` gains a conditional get (a
+  `GetRange` plus ETag and version preconditions), implemented here and by
+  `S3Store`, `MemoryStore` and `FaultStore`, so every failure path can be
+  tested without a cloud account. Every Parquet read carries the
+  manifest's ETag and version, and a failed precondition is a typed
+  `FileChanged` error. The workspace's `object_store` gains its `gcp` and
+  `azure` features for this.
 - **A `ParquetFileReaderFactory` and `AsyncFileReader`.** They read through
-  the process-wide `GetLimiter` and `ReadCache` (keyed by tenant hash, the
-  manifest's content hash, offset and length). `get_metadata` is charged to
-  the Probe phase and `get_bytes`/`get_byte_ranges` to the Scan phase.
-  Phases are tagged here, not in an `ObjectStore`, because an object store
-  sees only byte ranges: object_store's default `get_ranges` coalesces
-  ranges within 1 MiB (`object_store-0.13.2/src/util.rs:92`), so a store
-  cannot tell a footer read from a column chunk.
+  the external read store, the process-wide `GetLimiter`, and the
+  `ReadCache` (ADR-0046), keyed by tenant hash, the pinned content key of
+  D1 (a BLAKE3 over profile, bucket, key, ETag, version and size), offset
+  and length. `get_metadata` is charged to the Probe phase and
+  `get_bytes`/`get_byte_ranges` to the Scan phase. Phases are tagged here,
+  not below, because an object store sees only byte ranges: object_store's
+  default `get_ranges` coalesces ranges within 1 MiB (the 0.13 crate
+  DataFusion's reader calls, `object_store-0.13.2/src/util.rs:92`), so a
+  store cannot tell a footer read from a column chunk.
 - **A decoded-metadata cache.** It is owned by Ravel, bounded in bytes, and
-  keyed by tenant hash and content hash. DataFusion's own
+  keyed by tenant hash and the same content key. DataFusion's own
   `FileMetadataCache` lives in the per-query `RuntimeEnv` and dies with the
   session. Without this cache, every statement over 100 files would
   thrift-decode 100 footers. The cache sits outside the session, as the
   byte cache does, so ADR-0013's second invariant is unchanged.
-- **A `TenantParquetStore`** (the `object_store` 0.13 trait). It serves
-  `head` from the manifest's sizes and refuses every path outside the
-  manifest, every write and every list. It exists because `FileScanConfig`
-  needs a registered store even when the reader factory does all the
-  reading.
+- **A `TenantParquetStore`** (the `object_store` 0.13 trait DataFusion 54
+  uses). It names each manifest file
+  `ravel-pq://<tenant_hash>/<table>/<version>/f/<index>`, so two tables in
+  one query never share a path,
+  serves `head` from the manifest's sizes, and refuses every other path,
+  every write and every list. It exists because `FileScanConfig` needs a
+  registered store even when the reader factory does all the reading.
 - **A `ParquetTableProvider`.** It builds a `FileScanConfig` from the
   manifest's file list. Each `PartitionedFile` carries its size and a
   `metadata_size_hint` equal to the footer length plus the 8-byte trailer,
@@ -264,19 +362,36 @@ each Parquet table's newest manifest, and registers the provider with
 `register_table`. There is no async catalog provider doing I/O during
 planning, so store I/O stays at the one resolve site and under its retry
 contract. A table dropped by the time a query resolves it is a
-`TableNotFound` error. A data object deleted under a running query is
-`NotFound`, which re-resolves once, like the logs path.
+`TableNotFound` error.
+
+Resolution also re-checks the grants. Each file's (profile, bucket, key)
+must lie inside a grant that exists now, with the same profile, or the
+query fails with a typed `LocationNotGranted` error. The grant the
+manifest recorded is kept for audit and plays no part in this check. The
+grants record is cached per tenant for at most 60 seconds, so a revoked
+grant stops admitting reads within 60 seconds.
+
+A file changed or deleted under a table fails the
+query with `FileChanged` or `FileMissing`. Re-resolving cannot help,
+because the manifest still names the old bytes, so the error tells the
+caller to run `CREATE OR REPLACE`.
 
 ### D4. ADR-0013's first invariant, replaced for Parquet tables
 
-The replacement invariant: **a SQL caller can name tables, never storage.**
+The replacement invariant: **a SQL caller reads only what an operator
+granted it, and never names a credential.**
 
-- Every object a session reads lies under the caller's own
-  `t/<tenant_hash>/pq/`, and a manifest Ravel wrote chose it.
-- Statement text never carries a scheme, a bucket, a path outside the
-  tenant's dataset namespace, or a credential.
+- Every object a session reads is either Ravel's own (the signal tables),
+  or a file listed in a manifest Ravel wrote for the caller's tenant that
+  lies inside one of that tenant's grants.
+- No grant can reach Ravel's own data bucket, by name or by the probe of
+  D1, so no Parquet table can read Ravel's internal objects or any
+  tenant's prefix inside that bucket.
+- Statement text may carry a location URL. That URL must lie inside a
+  grant, and it never carries a credential.
 - A table-definition statement is admitted only with the `ddl` capability,
-  and it writes only under the caller's own prefix.
+  and it writes only the caller's own manifests under
+  `t/<tenant_hash>/pq/t/`.
 - A query session installs `SingleStoreRegistry` only when it reads a
   Parquet table. That registry answers exactly `ravel-pq://<tenant_hash>/`
   with the `TenantParquetStore` for this query's manifests, errors for
@@ -305,24 +420,38 @@ instead of rejecting them.
 **Tests that pin the invariant:**
 
 - `validate.rs` `create_external_table_is_rejected` stays for
-  `validate_query`. New cases:
-  - a URL location is refused: `s3://`, `file://`, absolute, `..`, glob;
-  - a dataset location is admitted by `validate_ddl`.
+  `validate_query`. New cases for `validate_ddl` and the grant check:
+  - refused: `file://`, `http://`, a relative path, `..`, an empty
+    segment, a glob, a percent-escape, a query string;
+  - refused: a URL outside every grant, a URL whose scheme or bucket
+    differs from the grant's, and a URL sharing only a string prefix with
+    a grant (`s3://b/data2/` against a grant of `s3://b/data/`);
+  - admitted: a single object and a prefix inside a grant.
+- A grant naming Ravel's own data bucket is refused when it is written.
+  So is a grant whose bucket is Ravel's under another name, which a store
+  fixture exposing one bucket under two names proves. A manifest file in
+  Ravel's bucket is refused on read, whatever wrote it.
+- Grants of one tenant that overlap under two profiles are refused.
+- A read after the grant is removed fails with `LocationNotGranted` once
+  the grants cache has refreshed.
 - `sql_endpoint.rs` `rejected_statement_kinds_return_400_over_http`: the
   capability is checked before the statement is validated, so a caller
-  without `ddl` learns nothing about validation. Its existing `s3://` case,
-  sent with a token that has no `ddl`, moves to 403. New cases:
-  - the same `s3://` statement from a token holding `ddl` returns 400;
-  - with the capability and a dataset location, 200 and a manifest under
+  without `ddl` learns nothing about validation. Its existing `s3://evil/x`
+  case, sent with a token that has no `ddl`, moves to 403. New cases:
+  - the same statement from a token holding `ddl` but no grant over
+    `s3://evil/` returns 400;
+  - with the capability and a granted location, 200 and a manifest under
     the caller's prefix;
-  - tenant A's DDL writes nothing under tenant B's prefix.
+  - tenant A cannot create a table over a location granted only to
+    tenant B, and its DDL writes nothing under tenant B's prefix.
 - `session.rs` `the_empty_registry_refuses_lookups_and_registrations` stays.
   `SingleStoreRegistry` gains cases for another tenant's URL, `s3://`,
   `file://`, and `register_store`.
 - `redact.rs` `create_external_table_is_rejected` inverts for the admitted
   form and stays for the refused ones.
-- `SELECT * FROM 'ravel-pq://<own tenant hash>/...'` is refused, so a
-  caller cannot read its own objects around a manifest's coercions.
+- `SELECT * FROM 's3://...'` and `SELECT * FROM 'ravel-pq://...'` are
+  refused, so a caller cannot read a location or a manifest file around
+  the table definition.
 - A `match` over DataFusion's `DdlStatement` with no wildcard arm, so a
   DataFusion upgrade that adds a variant fails to compile rather than
   admitting it.
@@ -424,9 +553,11 @@ it does not know routes to Metrics.
 
 ### D7. Validation and the performance bar
 
-ClickBench is the acceptance workload. The lane runs upstream `create.sql`
-with only `LOCATION` rewritten to the dataset, and the view replaced by
-`ravel.cast.EventDate`. It runs the 43 upstream statements with no rewrite.
+ClickBench is the acceptance workload. The 100 `hits_*.parquet` files sit
+in a bucket on the same loopback RustFS, the tenant is granted that
+bucket's prefix, and the lane runs upstream `create.sql` with `LOCATION`
+pointed at the prefix and the view replaced by `ravel.cast.EventDate`. A
+second arm points `LOCATION` at the single-file `hits.parquet`. It runs the 43 upstream statements with no rewrite.
 Every function they call is already admitted: `EXTRACT` plans as the
 admitted `date_part`.
 
@@ -463,105 +594,133 @@ and the per-query memory cap:
 1. **Parquet as the log storage format.** ADR-0029 rejected it and none of
    its reasons has changed. It would also make the ClickBench number a
    property of a new write path rather than of reading.
-2. **`LOCATION` as an `s3://` URL anywhere.** The server's credentials
-   would read any key the caller names: a confused deputy. Objects Ravel
-   did not write can change under a content-hash cache key, so cached pages
-   and fresh pages of one file could disagree. That is wrong data, not
-   stale data.
-3. **`LOCATION` as an `s3://` URL restricted by an operator allowlist.** It
-   has the same mutability problem. Fixing it needs `If-Match` on every
-   ranged GET, which `ObjectStoreBackend::get(key, GetRange)` cannot
-   express, and credentials passed in `OPTIONS` would land in the audit
-   trail. A later ADR can add ETag-pinned registration of external objects
-   if a user needs it.
-4. **Run DDL through DataFusion (`SessionContext::sql` plus a
+2. **`LOCATION` as any URL the server's credentials can reach.** The
+   server would read any object the caller names, including other tenants'
+   buckets: a confused deputy. It is safe only for a single-tenant
+   deployment, which such a deployment gets anyway by granting its one
+   tenant the locations it needs.
+3. **Copy the files into the tenant's prefix first** (an earlier draft of
+   this ADR). It makes the objects Ravel's own and immutable, but the user
+   pays a second copy of the data and an upload step before the first
+   query. The point of the feature is to query files where they are.
+   Pinning by ETag and version gives the immutability a copy would, at no
+   storage cost.
+4. **Credentials in `OPTIONS`.** They would land in the statement text,
+   the audit trail and the manifest. Credential profiles in server
+   configuration keep secrets out of all three.
+5. **Trust the files not to change, and skip the precondition.** A cached
+   page of the old bytes and a fresh page of the new ones would be mixed in
+   one result: wrong data with no error. The precondition costs nothing
+   extra per request.
+6. **Run DDL through DataFusion (`SessionContext::sql` plus a
    `TableProviderFactory`).** The extension points exist. But this makes
    DataFusion's full DDL dispatch live, and the reference factory's
    location parser accepts globs and any scheme. Intercepting the parsed
    statement keeps the admitted surface to three statement forms written
    in Ravel code.
-5. **An async catalog provider that resolves tables during planning.** It
+7. **An async catalog provider that resolves tables during planning.** It
    moves store I/O into planner callbacks, outside the single resolve site
    and its retry contract.
-6. **Keep `EmptyObjectStoreRegistry` and write Ravel's own
+8. **Keep `EmptyObjectStoreRegistry` and write Ravel's own
    `ParquetScanExec`** over the parquet crate's async reader. This keeps the
    old invariant verbatim but rebuilds what DataFusion already has:
    pruning, page index, row filters, morsel-driven work stealing, and the
    dynamic filters its TopK and joins push into the scan.
-7. **Enable the `datafusion` facade's `parquet` feature in `ravel-sql`.**
+9. **Enable the `datafusion` facade's `parquet` feature in `ravel-sql`.**
    Cargo unifies features, so every binary linking `ravel-sql` would carry
    the Parquet format factory, and `with_default_features` would register
    it.
-8. **Transcode at load time, faster.** That is ADR-0109's path, and the
+10. **Transcode at load time, faster.** That is ADR-0109's path, and the
    RLOG entry is its measurement: 101.7 s hot, against 40.3 s for
    DataFusion on the same files.
 
 ## Consequences
 
 - **New persistent formats**, handled per the format-change procedure:
-  - **Key prefixes.** `t/<tenant_hash>/pq/d/` and `t/<tenant_hash>/pq/t/`
-    are new, which is how the key layout grows. They are added to
-    `docs/catalog-and-mvcc.md` in the same change as the code that writes
-    them.
+  - **Keys.** `t/<tenant_hash>/pq/grants`, `t/<tenant_hash>/pq/t/` and
+    the transient `sys/pq-probe/` are new, which is how the key layout
+    grows. They are added to `docs/catalog-and-mvcc.md` in the same change
+    as the code that writes them.
+  - **Grants record.** A Class C record rewritten whole under CAS, like the
+    tenant config record, with its own reader-floor `format_version`
+    starting at 1. ADR-0066's R1 amendment applies from its first additive
+    change: a later field means a two-release version bump, readers first.
+    It sits beside the tenant config record, not inside it, so this change
+    needs no bump of a record the ingest and fold paths already read.
   - **Manifest.** `ParquetTableManifest` is a Class C immutable metadata
     record (ADR-0066 decision 4). It is additive-only, with frozen field
     numbers, and carries the reader-floor `format_version` with a strict
     gate. The pre-v1.0 single-version regime (ADR-0027) applies. There is
     no dual reader, because there is no second version.
-  - **Data objects.** The Parquet objects are foreign bytes and sit
-    outside classes A to D. Ravel neither writes nor versions their
-    encoding, so there is nothing to converge. Readability across Ravel
-    versions is whatever the linked `parquet` crate reads. An upgrade that
-    drops an encoding surfaces as a typed read error on that table, and
-    re-uploading a re-encoded file is the remedy.
-  - **Inspector.** `ravel-cli parquet ls` prints datasets and every
-    manifest field.
+  - **The Parquet files** are not Ravel's objects. They sit outside
+    classes A to D and outside Ravel's invariants on data objects: Ravel
+    neither writes, versions, nor deletes them. What Ravel guarantees is
+    narrower: a table reads exactly the bytes its manifest pinned, or
+    fails. Readability across Ravel versions is whatever the linked
+    `parquet` crate reads. An upgrade that drops an encoding surfaces as a
+    typed read error on that table.
+  - **Inspector.** `ravel-cli parquet ls` prints every manifest field, and
+    `ravel-cli tenant parquet-grant ls` prints a tenant's grants.
+- **Object storage stays the source of truth.** A table's definition is in
+  Ravel's bucket and its data is in the granted buckets. Nothing depends on
+  local disk.
 - **Checksum coverage is weaker than RLOG's**, and this is stated rather
-  than hidden. Upload verifies that the footer parses and records the size
-  and BLAKE3 hash. Reads check the object size against the manifest. Page
-  bytes are verified only where the file carries Parquet page CRCs, which
-  ClickBench's files do not. Corrupt or truncated bytes produce typed
-  errors, never panics, and property tests over mutated files pin that.
+  than hidden. The precondition proves the object is the one the table was
+  created over. It says nothing about whether those bytes were ever
+  correct. Page bytes are verified only where the file carries Parquet page
+  CRCs, which ClickBench's files do not. Corrupt or truncated bytes produce
+  typed errors, never panics, and property tests over mutated files pin
+  that.
+- **A table breaks when its owner changes a file.** Queries fail with
+  `FileChanged` or `FileMissing` until someone runs `CREATE OR REPLACE`.
+  That is deliberate, since the alternative is a silent wrong answer. An
+  append-only data lake that only adds files never hits it; a new file
+  simply stays invisible until the next `CREATE OR REPLACE`.
+- **The read cache gains a second key kind.** Until now every `CacheKey`
+  named bytes by their BLAKE3, so a mutable object could not be named at
+  all. The pinned key names bytes by (profile, bucket, key, ETag, version,
+  size), and its soundness rests on the precondition. ADR-0046 is amended
+  to name this kind, and `CacheKey` gets a separate constructor for it.
 - **The SQL surface now writes.** The `ddl` capability, the audit record
   and the separate entry point bound it. A deployment that issues no `ddl`
   tokens has the old read-only surface.
 - **New dependencies.** `datafusion-datasource-parquet` 54 and `parquet` 58
   are new lockfile entries. `parquet` 58 sits beside the workspace's 59.
   `object_store` 0.13.2 is already in the lock for DataFusion, beside the
-  workspace's 0.14. `cargo deny` and the quick-xml guards are re-run
-  against the new lock.
+  workspace's 0.14. The workspace's `object_store` 0.14 also gains its
+  `gcp` and `azure` features, and whatever those pull into the lock is
+  new. `cargo deny` and the quick-xml guards are re-run against the new
+  lock.
 - **Lifecycle.** Parquet tables are outside time retention and outside
-  selective erasure (ADR-0064). Their lifecycle is `DROP TABLE` plus
-  `ravel-cli parquet sweep`, which runs only when an operator runs it. It
-  has two age floors:
-  - A manifest version older than its table's newest is deleted once it is
-    older than a grace that must be at least the deployment's
-    `--gc-max-query-duration` (11 minutes when derived), which covers a
-    query that resolved an older version.
-  - A data object that no table's newest manifest references is deleted
-    only once it is older than `--unreferenced-grace`, 7 days by default.
-    Files are uploaded before a table is defined over them, and files added
-    for a later `CREATE OR REPLACE` sit unreferenced until then. So this
-    floor covers upload-to-definition, not only an in-flight query, and
-    `sweep` refuses a value below the query-duration grace.
+  selective erasure (ADR-0064): the data belongs to whoever owns the
+  bucket. `DROP TABLE` removes the table, not the files.
+  `ravel-cli parquet sweep`, run by an operator, deletes manifest versions
+  superseded for longer than a grace. That grace must be at least the
+  deployment's `--gc-max-query-duration` (11 minutes when derived), which
+  covers a query that resolved an older version. Sweep never touches the
+  Parquet files.
 - **Distributed execution** (ADR-0071 read fan-out) does not cover Parquet
   tables. A query runs on the node that receives it.
 
 ```mermaid
 flowchart LR
-  subgraph up["ravel-cli parquet put --dataset hits"]
-    F[local .parquet files] --> V[footer parse, BLAKE3]
-    V --> U[CreateIfAbsent or multipart data objects]
+  subgraph ops["Operator, ravel-cli"]
+    G[tenant parquet-grant add s3://lake/hits/ --profile lake]
   end
   subgraph ddl["POST /api/v1/sql, ddl capability"]
-    C[CREATE EXTERNAL TABLE hits LOCATION 'hits'] --> L[LIST dataset once, read footers]
+    C["CREATE EXTERNAL TABLE hits LOCATION 's3://lake/hits/'"] --> CK[inside a grant?]
+    CK --> L[LIST prefix once, read footers, record ETag + version]
     L --> M[CreateIfAbsent manifest v N+1]
   end
-  subgraph store["Object storage, t/&lt;th&gt;/pq/"]
-    D[(d/hits/&lt;blake3_hex64&gt;.parquet)]
-    MV[(t/hits/v/&lt;version&gt;.pqm)]
+  subgraph ravel["Ravel's bucket"]
+    CFG[(t/&lt;th&gt;/pq/grants)]
+    MV[(t/&lt;th&gt;/pq/t/hits/v/&lt;version&gt;.pqm)]
   end
-  U --> D
+  subgraph lake["User's bucket, S3 / GCS / Azure"]
+    D[(hits/*.parquet)]
+  end
+  G --> CFG
+  CFG --> CK
   D --> L
   M --> MV
   subgraph q["POST /api/v1/sql, SELECT"]
@@ -569,9 +728,10 @@ flowchart LR
     P --> S[DataFusion Parquet scan]
     S --> RF[Ravel reader factory: Probe / Scan]
     RF --> LC[GetLimiter, ReadCache, metadata cache]
+    LC --> X[external read store: GET with If-Match ETag]
   end
   MV --> R
-  LC --> D
+  X --> D
 ```
 
 ```mermaid
@@ -580,12 +740,14 @@ flowchart TB
   kind -->|SELECT| vq[validate_query: one read-only SELECT]
   kind -->|CREATE / DROP| cap{ddl capability?}
   cap -->|no| r403[403, audited]
-  cap -->|yes| vd[validate_ddl: dataset path only, no scheme or bucket]
-  vd --> w[manifest under t/A/pq/ only, audited]
+  cap -->|yes| vd[validate_ddl: URL inside one of A's grants, never Ravel's bucket]
+  vd --> w[manifest under t/A/pq/t/ only, audited]
   vq --> sess[fresh SessionContext for tenant A]
   sess --> reg[SingleStoreRegistry: ravel-pq://A/ only]
-  reg --> tps[TenantParquetStore: keys in A's resolved manifests only]
-  tps --> bucket[(bucket)]
+  reg --> tps[TenantParquetStore: files in A's resolved manifests only]
+  tps --> ext[external read store: grant re-checked, If-Match on every GET]
+  ext --> lake[(granted bucket)]
   sess -. any other URL .-> refuse[error]
-  tps -. key outside manifest .-> refuse
+  tps -. file outside manifest .-> refuse
+  ext -. file changed .-> changed[FileChanged]
 ```
