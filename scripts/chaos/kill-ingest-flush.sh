@@ -97,8 +97,10 @@ SERVER_LOG="$(mktemp)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
 
 cleanup() {
-  # A failure in here must not turn the pending exit status into 3.
+  # A failure in here must not replace the pending exit status, with 3
+  # through the ERR trap or with its own status through set -e.
   trap - ERR
+  set +e
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true

@@ -223,6 +223,10 @@ jobs:
           echo "${GITHUB_WORKSPACE}/target/release/examples" >> "$GITHUB_PATH"
       - name: Chaos-lane structure check
         id: chaos-check
+        # Strict: on this runner every real-run tool must be present, so a
+        # missing one fails here rather than minutes into scenario 1.
+        env:
+          CHAOS_CHECK_STRICT: "1"
         run: |
           scripts/chaos/kill-ingest-flush.sh --check
           scripts/chaos/kill-maintain-worker.sh --check

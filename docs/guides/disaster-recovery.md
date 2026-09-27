@@ -482,9 +482,11 @@ RustFS, driving load, or issuing a real kill:
 | `scripts/chaos/kill-maintain-worker.sh` | Two `maintain` mode workers under leased maintenance, `SIGKILL` one mid-compaction with the sibling running. The kill fires while the victim owns units and has not yet logged its compaction record as published. | The sibling takes over the dead worker's units within the liveness bound plus one maintenance tick; no unit stays orphaned; the interrupted compaction completes under the conservation gate; the dead worker's partial outputs age out with no leak past the horizon; custody and catalog verification clean. |
 
 A failure of the second scenario is release-blocking, not a flaky test. On any
-oracle failure that script names the failed assertions and exits 2, distinct
-from 1 for an ordinary failure and from 3 or more for a setup or usage error,
-so the distinction is legible in a rehearsal record.
+oracle failure that script names the failed assertions and exits 2; its oracle
+path exits only 0 or 2, and 3 or more is a setup or usage error with no oracle
+verdict, so the distinction is legible in a rehearsal record. The first
+scenario exits 1 on an oracle failure and uses the same 3-or-more codes for
+setup and usage errors.
 
 Both scenarios run nightly in the `chaos` job of
 `.github/workflows/k8s-nightly.yml`, against a RustFS the scripts start
