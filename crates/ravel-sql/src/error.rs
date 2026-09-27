@@ -33,7 +33,7 @@
 
 use datafusion::error::DataFusionError;
 use ravel_catalog::{CatalogError, LoadColumnStatsError};
-use ravel_query::{FetchError, LogFetchError};
+use ravel_query::{FetchError, FoldLag, LogFetchError};
 
 use crate::spans_fetcher::SpanFetchError;
 use crate::validate::ValidationError;
@@ -242,9 +242,18 @@ pub enum SqlError {
     /// `ravel_query::QueryError::RequestBudgetExceeded` so both query
     /// languages surface the same trip the same way; `requests` and `max`
     /// are counts an operator needs, no server state, so it is echoed
-    /// verbatim like the other budget errors.
-    #[error("query issued {requests} S3 requests, exceeding the budget of {max}")]
-    RequestBudgetExceeded { requests: u64, max: u64 },
+    /// verbatim like the other budget errors. `fold_lag` is the same
+    /// `ravel_query::FoldLag` the wrapped refusal carried (ADR-1306 decision
+    /// 6): a tail longer than a healthy catalog's renders the tail length and
+    /// the fold-liveness gauge here too, so a SQL caller reads the same cause
+    /// a PromQL caller does. It names no server state either: a duration and a
+    /// metric name.
+    #[error("query issued {requests} S3 requests, exceeding the budget of {max}{fold_lag}")]
+    RequestBudgetExceeded {
+        requests: u64,
+        max: u64,
+        fold_lag: FoldLag,
+    },
 
     /// The per-query or per-tenant byte budget was exhausted. The detail is
     /// the pool's own message (byte counts and limits only).
@@ -710,6 +719,7 @@ mod tests {
         let request_budget = SqlError::RequestBudgetExceeded {
             requests: 30_001,
             max: 30_000,
+            fold_lag: FoldLag::Healthy,
         };
         assert_eq!(request_budget.client_message(), request_budget.to_string());
         assert_eq!(request_budget.class(), ErrorClass::Unsupported);
@@ -721,6 +731,79 @@ mod tests {
         let bad = SqlError::Validation(ValidationError::NotReadOnly { kind: "INSERT" });
         assert_eq!(bad.client_message(), bad.to_string());
         assert_eq!(bad.class(), ErrorClass::BadRequest);
+    }
+
+    /// ADR-1306 decision 6: the fold-lag clause survives the wrap from
+    /// `ravel_query::QueryError` into [`SqlError`], so a SQL caller refused
+    /// during fold lag reads the same cause a PromQL caller does.
+    ///
+    /// The wrap is the exact destructure-and-rebuild `executor.rs`'s
+    /// resolve-boundary check and `scan.rs`'s per-segment check both perform,
+    /// so a field dropped there would show up here as a message that lost its
+    /// clause. The status is unchanged in both directions:
+    /// [`ErrorClass::Unsupported`], which the HTTP endpoint renders as 422 and
+    /// `flight::request::status_from_sql` as `FailedPrecondition`.
+    #[test]
+    fn fold_lag_text_and_status_survive_the_wrap_into_a_sql_error() {
+        use std::time::Duration;
+
+        let lagging = FoldLag::Lagging {
+            unsealed_tail: Duration::from_secs(19_800),
+            healthy_tail_max: Duration::from_secs(8_400),
+        };
+        for fold_lag in [lagging, FoldLag::Healthy] {
+            let query_err = ravel_query::QueryError::RequestBudgetExceeded {
+                requests: 30_001,
+                max: 30_000,
+                fold_lag,
+            };
+            let ravel_query::QueryError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag,
+            } = &query_err
+            else {
+                unreachable!("constructed one line above")
+            };
+            let wrapped = SqlError::RequestBudgetExceeded {
+                requests: *requests,
+                max: *max,
+                fold_lag: *fold_lag,
+            };
+
+            // Same text on both sides of the wrap, so the two crates cannot
+            // drift into two wordings for one refusal.
+            assert_eq!(wrapped.to_string(), query_err.to_string());
+            assert_eq!(wrapped.client_message(), wrapped.to_string());
+            assert_eq!(wrapped.class(), ErrorClass::Unsupported);
+            assert_redacted(&wrapped.client_message());
+        }
+
+        let wrapped = SqlError::RequestBudgetExceeded {
+            requests: 30_001,
+            max: 30_000,
+            fold_lag: lagging,
+        };
+        let message = wrapped.client_message();
+        assert!(
+            message.contains("19800 s"),
+            "the wrapped message must keep the tail's length: {message}"
+        );
+        assert!(
+            message.contains(ravel_query::FOLD_LAST_SUCCESS_GAUGE),
+            "the wrapped message must keep the fold-liveness gauge: {message}"
+        );
+        // Non-vacuity: the healthy refusal is the pre-ADR-1306 text, so the
+        // two assertions above are about the clause and not about the counts.
+        let healthy = SqlError::RequestBudgetExceeded {
+            requests: 30_001,
+            max: 30_000,
+            fold_lag: FoldLag::Healthy,
+        };
+        assert_eq!(
+            healthy.client_message(),
+            "query issued 30001 S3 requests, exceeding the budget of 30000"
+        );
     }
 
     #[test]

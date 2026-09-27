@@ -98,8 +98,9 @@ use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
 use ravel_query::{
-    LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError, RequestBudgets,
-    SegmentAdmission, SegmentFetcher, admit, request_budget_exceeded,
+    LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError, RequestBudget,
+    RequestBudgets, SegmentAdmission, SegmentFetcher, admit, request_budget_exceeded,
+    resolved_fold_lag,
 };
 use ravel_types::accounting::{
     AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
@@ -1907,13 +1908,27 @@ impl SqlExecutor {
         // resolve's own catalog requests alone. Checked once here rather
         // than once per caller, so a fourth resolve entry point cannot be
         // added later without this check automatically covering it too.
-        if let Some(QueryError::RequestBudgetExceeded { requests, max }) = request_budget_exceeded(
+        // The budget carries what this resolve saw of the catalog's unsealed
+        // tail (ADR-1306 decision 6), read off the `origins` it just produced,
+        // so a refusal caused by fold lag names the tail and the fold-liveness
+        // gauge here exactly as it does on the PromQL path.
+        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
+        if let Some(QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag,
+        }) = request_budget_exceeded(
             phase_accounting.resolve().snapshot().total_s3_requests(),
-            self.effective_config(req.budgets.as_ref())
-                .engine
-                .max_s3_requests,
+            RequestBudget::new(
+                engine_config.max_s3_requests,
+                resolved_fold_lag(&snapshot, &origins, req.now_ns, engine_config.seal_margin),
+            ),
         ) {
-            return Err(SqlError::RequestBudgetExceeded { requests, max });
+            return Err(SqlError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag,
+            });
         }
         Ok((snapshot, admission, estimate, unfolded_segments_resolved))
     }
@@ -3893,7 +3908,12 @@ mod tests {
             .execute(tenant_hash, &exec_req)
             .await
             .expect_err("a zero store-request budget must trip even on an empty snapshot");
-        let SqlError::RequestBudgetExceeded { requests, max } = err else {
+        let SqlError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag: _,
+        } = err
+        else {
             panic!("expected SqlError::RequestBudgetExceeded, got {err:?}");
         };
         assert_eq!(
@@ -3921,6 +3941,7 @@ mod tests {
         let SqlError::RequestBudgetExceeded {
             requests: explain_requests,
             max: explain_max,
+            fold_lag: _,
         } = explain_err
         else {
             panic!("expected SqlError::RequestBudgetExceeded, got {explain_err:?}");
@@ -3947,6 +3968,7 @@ mod tests {
         let SqlError::RequestBudgetExceeded {
             requests: snapshot_requests,
             max: snapshot_max,
+            fold_lag: _,
         } = snapshot_err
         else {
             panic!("expected SqlError::RequestBudgetExceeded, got {snapshot_err:?}");

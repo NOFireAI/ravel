@@ -1207,13 +1207,28 @@ at resolve, so an N-selector query pays up to `1 + 7N` requests per unsealed
 flush against a budget sized at 8. The derived budget does not scale with the
 selector count (ADR-1306, "Amendment (2026-09-27)").
 
+A refusal says when the unsealed tail, not the query, is what the budget was
+spent on (ADR-1306 decision 6): each resolve records the tail it listed live
+above the fold watermark, and a refusal whose tail is longer than
+`healthy_tail_max` of the engine's configured seal margin appends that tail's
+length in seconds and names
+`ravel_catalog_fold_last_success_timestamp_seconds`, the fold-liveness gauge
+`RavelCatalogFoldStalled` reads, so an operator goes to the fold rather than to
+the budget; a refusal with a healthy tail keeps its unchanged wording. The tail
+is read off the origins the resolve already produced, never a new store
+request, and it is a lower bound on `now - end(watermark hour)`, so a folding
+catalog is never blamed. Both forms stay HTTP 422 on the PromQL path and
+`ErrorClass::Unsupported` (422, and gRPC `FailedPrecondition` over Flight SQL)
+on the SQL path.
+
 `crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
-`request_budget_exceeded(requests, max_s3_requests)` for the incremental
-budget check. `QueryEngine::resolve_bounded` (`engine.rs`) is the call site
-for PromQL; the SQL executor, the five SQL table providers, and the
-exemplars state moved onto the same seam; no site still runs a
-pre-ADR-0073 per-surface check.
+`request_budget_exceeded(requests, budget)` for the incremental budget check,
+where `budget` is a `RequestBudget` pairing the limit with that resolve's
+fold-lag verdict (a bare `RequestLimit` converts in and blames nothing).
+`QueryEngine::resolve_bounded` (`engine.rs`) is the call site for PromQL; the
+SQL executor, the five SQL table providers, and the exemplars state moved onto
+the same seam; no site still runs a pre-ADR-0073 per-surface check.
 
 An end-to-end test proves this seam through both real HTTP query
 surfaces rather than at the seam's own unit level: a real `IngestRouter`

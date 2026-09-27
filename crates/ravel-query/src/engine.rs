@@ -28,7 +28,7 @@ use ravel_types::{
 
 use crate::config::{ByteLimit, EngineConfig, RequestLimit};
 use crate::erasure::ErasurePredicate;
-use crate::error::QueryError;
+use crate::error::{FoldLag, QueryError};
 use crate::fetcher::{
     FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
     SegmentFetcher,
@@ -39,7 +39,7 @@ use crate::log_fetcher::{DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogS
 use crate::log_series;
 use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
 use crate::request_budgets::RequestBudgets;
-use crate::segment_admission;
+use crate::segment_admission::{self, RequestBudget};
 
 /// Which evaluation shape a prefetch is being computed for: an instant
 /// query has one lookup instant, a range query spans a step grid whose
@@ -385,6 +385,21 @@ impl LiveQueryAccounting {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+}
+
+/// One admitted resolve's outputs, as `resolve_bounded` returns them.
+struct ResolvedBounded {
+    snapshot: Snapshot,
+    /// The shard-generation history THIS resolve computed its scan set from
+    /// (ADR-0103 decision 1(b)).
+    generations: Vec<ShardGeneration>,
+    /// Segments taken from the recent (unfolded) listing path rather than a
+    /// folded snapshot part (issue #1214).
+    unfolded_segments_resolved: u64,
+    /// What this resolve's unsealed tail says about the fold (ADR-1306
+    /// decision 6), carried to every request-budget check downstream of it so
+    /// a refusal caused by fold lag reads as one.
+    fold_lag: FoldLag,
 }
 
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
@@ -1109,7 +1124,8 @@ impl QueryEngine {
         // pushdown), so it ignores the resolve's generation history.
         let attempt = |snapshot: Snapshot,
                        _generations: Vec<ShardGeneration>,
-                       accounting: PhaseAccounting| async move {
+                       accounting: PhaseAccounting,
+                       fold_lag: FoldLag| async move {
             // The bytes-scanned budget (ADR-0061 decision 1) is enforced
             // inside `fetch_all_series`, once per completed segment fetch, so a
             // labels/series query that matches zero series still evaluates the
@@ -1122,7 +1138,7 @@ impl QueryEngine {
                     matchers,
                     &accounting,
                     self.config.max_bytes_scanned,
-                    self.config.max_s3_requests,
+                    RequestBudget::new(self.config.max_s3_requests, fold_lag),
                 )
                 .await?;
             // Cross-cluster federation for the discovery path (ADR-0071): fan the same matchers and window out to every configured
@@ -1143,7 +1159,13 @@ impl QueryEngine {
             // local resolve/plan/probe spend `fetch_all_series` already
             // recorded too.
             let (fed_series, fed_warnings, fed_partial) = self
-                .federate_discovery(tenant_hash, matchers.to_vec(), window, &accounting)
+                .federate_discovery(
+                    tenant_hash,
+                    matchers.to_vec(),
+                    window,
+                    &accounting,
+                    fold_lag,
+                )
                 .await?;
             // Union local + remote identities and enforce `max_series` ONCE
             // over the combined set, mirroring the query path's single
@@ -1211,7 +1233,8 @@ impl QueryEngine {
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
         let attempt = |snapshot: Snapshot,
                        _generations: Vec<ShardGeneration>,
-                       accounting: PhaseAccounting| async move {
+                       accounting: PhaseAccounting,
+                       fold_lag: FoldLag| async move {
             let erasure = snapshot_erasure_predicates(&snapshot);
             let req = log_series::LogSeriesRequest {
                 metric,
@@ -1232,7 +1255,7 @@ impl QueryEngine {
                 &accounting,
             )
             .await
-            .map_err(|err| self.map_log_series_error(err))?;
+            .map_err(|err| self.map_log_series_error(err, fold_lag))?;
 
             // Keyed on the remotes THIS tenant reaches, not on the presence of a
             // federation context: a local tenant with no mapped remote runs a
@@ -1307,6 +1330,7 @@ impl QueryEngine {
         matchers: Vec<LabelMatcher>,
         window: TimeRange,
         accounting: &PhaseAccounting,
+        fold_lag: FoldLag,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool), QueryError> {
         let mut series: Vec<(SeriesId, LabelSet)> = Vec::new();
         let Some(federation) = &self.federation else {
@@ -1348,7 +1372,7 @@ impl QueryEngine {
         // decision 3): a budget trip is never masked by skip_unavailable.
         if let Some(err) = segment_admission::request_budget_exceeded(
             accounting.snapshot().pooled().total_s3_requests(),
-            self.config.max_s3_requests,
+            RequestBudget::new(self.config.max_s3_requests, fold_lag),
         ) {
             return Err(err);
         }
@@ -1436,7 +1460,15 @@ impl QueryEngine {
         // view. Without it a query naming only `ravel_log_lines` (ADR-1103)
         // never registers a handle at all and a cancellation records zero.
         self.install_live_usage(&log_accounting);
-        let (log_snapshot, _log_generations, log_unfolded) = self
+        let ResolvedBounded {
+            snapshot: log_snapshot,
+            unfolded_segments_resolved: log_unfolded,
+            // This lane's own resolve verdict: a log selector resolves a
+            // second tail, and a refusal on this lane names that one
+            // (ADR-1306 decision 6), never the metrics lane's.
+            fold_lag,
+            ..
+        } = self
             .resolve_bounded(
                 tenant_hash,
                 Signal::Logs,
@@ -1468,7 +1500,7 @@ impl QueryEngine {
             .saturating_add(log_accounting.snapshot().pooled().total_s3_requests());
         if let Some(err) = segment_admission::request_budget_exceeded(
             combined_requests_so_far,
-            self.config.max_s3_requests,
+            RequestBudget::new(self.config.max_s3_requests, fold_lag),
         ) {
             return Err(err);
         }
@@ -1559,7 +1591,7 @@ impl QueryEngine {
                 &log_accounting,
             )
             .await
-            .map_err(|err| self.map_log_series_error(err))?;
+            .map_err(|err| self.map_log_series_error(err, fold_lag))?;
             let out_samples: usize = out.series.iter().map(|s| s.samples.len()).sum();
             samples_remaining = samples_remaining.saturating_sub(out_samples);
             series_remaining = series_remaining.saturating_sub(out.series.len());
@@ -1791,7 +1823,8 @@ impl QueryEngine {
         let windows_ref = &windows;
         let attempt = |snapshot: Snapshot,
                        generations: Vec<ShardGeneration>,
-                       accounting: PhaseAccounting| async move {
+                       accounting: PhaseAccounting,
+                       fold_lag: FoldLag| async move {
             // Owned clones, not borrowed slice items: a closure capturing a
             // reference into `plans` through this combinator chain makes
             // rustc infer a fixed (non-higher-ranked) lifetime for the
@@ -1898,7 +1931,7 @@ impl QueryEngine {
                                 &plan.matchers,
                                 accounting,
                                 max_bytes_scanned,
-                                max_s3_requests,
+                                RequestBudget::new(max_s3_requests, fold_lag),
                                 deadline_unix_ns,
                                 partial_req,
                             )
@@ -1993,7 +2026,7 @@ impl QueryEngine {
             // phase breakdown of its own), but its budget re-check needs
             // `pooled()` to see the local resolve/plan/probe spend too.
             let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
-                .federate_scalar(tenant_hash, fed_plans, &accounting)
+                .federate_scalar(tenant_hash, fed_plans, &accounting, fold_lag)
                 .await?;
             all_scalar_runs.extend(fed_runs);
             // Merge every remote's native-histogram runs into the same
@@ -2142,7 +2175,10 @@ impl QueryEngine {
         mut attempt: F,
     ) -> Result<(T, QueryStats), QueryError>
     where
-        F: FnMut(Snapshot, Vec<ShardGeneration>, PhaseAccounting) -> Fut,
+        // The `FoldLag` is this attempt's own resolve verdict (ADR-1306
+        // decision 6): a retry re-resolves, so the second attempt's fetches
+        // are checked against the second resolve's tail, never the first's.
+        F: FnMut(Snapshot, Vec<ShardGeneration>, PhaseAccounting, FoldLag) -> Fut,
         Fut: std::future::Future<Output = Result<(T, FetchStats), QueryError>>,
     {
         // The catalog term (ADR-0044 decision 3) is the same for both
@@ -2172,7 +2208,12 @@ impl QueryEngine {
         // the first catalog LIST must still find this attempt's counters
         // through the live view.
         self.install_live_usage(&first_accounting);
-        let (first, first_generations, first_unfolded) = self
+        let ResolvedBounded {
+            snapshot: first,
+            generations: first_generations,
+            unfolded_segments_resolved: first_unfolded,
+            fold_lag: first_fold_lag,
+        } = self
             .resolve_bounded(
                 tenant_hash,
                 signal,
@@ -2191,7 +2232,7 @@ impl QueryEngine {
         // catalog requests alone.
         if let Some(err) = segment_admission::request_budget_exceeded(
             first_accounting.snapshot().pooled().total_s3_requests(),
-            self.config.max_s3_requests,
+            RequestBudget::new(self.config.max_s3_requests, first_fold_lag),
         ) {
             return Err(err);
         }
@@ -2208,14 +2249,26 @@ impl QueryEngine {
             &first_accounting,
             first_unfolded,
         );
-        match attempt(first, first_generations, first_accounting.clone()).await {
+        match attempt(
+            first,
+            first_generations,
+            first_accounting.clone(),
+            first_fold_lag,
+        )
+        .await
+        {
             Err(QueryError::Fetch(FetchError::Store {
                 source: StoreError::NotFound,
                 ..
             })) => {
                 let second_accounting = PhaseAccounting::new();
                 self.install_live_usage(&second_accounting);
-                let (second, second_generations, second_unfolded) = self
+                let ResolvedBounded {
+                    snapshot: second,
+                    generations: second_generations,
+                    unfolded_segments_resolved: second_unfolded,
+                    fold_lag: second_fold_lag,
+                } = self
                     .resolve_bounded(
                         tenant_hash,
                         signal,
@@ -2228,7 +2281,7 @@ impl QueryEngine {
                     .await?;
                 if let Some(err) = segment_admission::request_budget_exceeded(
                     second_accounting.snapshot().pooled().total_s3_requests(),
-                    self.config.max_s3_requests,
+                    RequestBudget::new(self.config.max_s3_requests, second_fold_lag),
                 ) {
                     return Err(err);
                 }
@@ -2245,7 +2298,14 @@ impl QueryEngine {
                     &second_accounting,
                     second_unfolded,
                 );
-                match attempt(second, second_generations, second_accounting.clone()).await {
+                match attempt(
+                    second,
+                    second_generations,
+                    second_accounting.clone(),
+                    second_fold_lag,
+                )
+                .await
+                {
                     Err(QueryError::Fetch(FetchError::Store {
                         source: StoreError::NotFound,
                         ..
@@ -2295,7 +2355,7 @@ impl QueryEngine {
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<(Snapshot, Vec<ShardGeneration>, u64), QueryError> {
+    ) -> Result<ResolvedBounded, QueryError> {
         // `resolve_pruned_with_generations` returns the shard-generation history
         // THIS resolve computed its scan set from (ADR-0103 decision 1(b)): the
         // pushdown eligibility gate reads exactly this copy, never a separately
@@ -2324,7 +2384,23 @@ impl QueryEngine {
         // downstream fold-benefit decision, so this must be the real count,
         // never an estimate.
         let unfolded_segments_resolved = crate::io_shape::count_unfolded_segments(&origins.origins);
-        Ok((snapshot, generations, unfolded_segments_resolved))
+        // Computed here, from the origins this resolve already produced and
+        // the `now_ns` it resolved at, because this is the last point either
+        // is in hand: a refusal downstream needs the tail to name fold lag
+        // (ADR-1306 decision 6), and re-deriving it there would cost a store
+        // request this seam already paid for.
+        let fold_lag = segment_admission::resolved_fold_lag(
+            &snapshot,
+            &origins,
+            now_ns,
+            self.config.seal_margin,
+        );
+        Ok(ResolvedBounded {
+            snapshot,
+            generations,
+            unfolded_segments_resolved,
+            fold_lag,
+        })
     }
 
     /// Maps a log lane failure onto the same [`QueryError`] variants the
@@ -2337,7 +2413,14 @@ impl QueryEngine {
     /// the client-visible message becomes "unavailable" rather than
     /// "corrupt" for exactly those three cases, a deliberate scope trade-off
     /// flagged in the task report, not a silent behavior change.
-    fn map_log_series_error(&self, err: log_series::LogSeriesError) -> QueryError {
+    fn map_log_series_error(
+        &self,
+        err: log_series::LogSeriesError,
+        // The log lane's own resolve verdict, so a request-budget trip inside
+        // the log fetch names fold lag exactly as the metrics lane's does
+        // (ADR-1306 decision 6). Every other variant ignores it.
+        fold_lag: FoldLag,
+    ) -> QueryError {
         match err {
             log_series::LogSeriesError::SamplesExceeded { count, max } => {
                 QueryError::TooManySamples { count, max }
@@ -2349,7 +2432,11 @@ impl QueryEngine {
                 QueryError::TooManyBytesScanned { scanned, max }
             }
             log_series::LogSeriesError::RequestsExceeded { requests, max } => {
-                QueryError::RequestBudgetExceeded { requests, max }
+                QueryError::RequestBudgetExceeded {
+                    requests,
+                    max,
+                    fold_lag,
+                }
             }
             log_series::LogSeriesError::DeadlineExceeded => QueryError::DeadlineExceeded {
                 deadline: self.config.deadline,
@@ -2418,7 +2505,7 @@ impl QueryEngine {
         matchers: &[LabelMatcher],
         accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
-        max_s3_requests: RequestLimit,
+        max_s3_requests: RequestBudget,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -2513,7 +2600,7 @@ impl QueryEngine {
         matchers: &[LabelMatcher],
         accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
-        max_s3_requests: RequestLimit,
+        max_s3_requests: RequestBudget,
         deadline_unix_ns: i64,
         partial_aggregate: Option<pb::PartialAggregateRequest>,
     ) -> Result<
@@ -2642,6 +2729,7 @@ impl QueryEngine {
         tenant_hash: TenantHash,
         plan_matchers_windows: Vec<(Vec<LabelMatcher>, i64, i64)>,
         accounting: &PhaseAccounting,
+        fold_lag: FoldLag,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -2703,7 +2791,7 @@ impl QueryEngine {
             }
             if let Some(err) = segment_admission::request_budget_exceeded(
                 accounting.snapshot().pooled().total_s3_requests(),
-                self.config.max_s3_requests,
+                RequestBudget::new(self.config.max_s3_requests, fold_lag),
             ) {
                 return Err(err);
             }
@@ -2736,7 +2824,7 @@ impl QueryEngine {
         matchers: &[LabelMatcher],
         accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
-        max_s3_requests: RequestLimit,
+        max_s3_requests: RequestBudget,
     ) -> Result<Vec<Vec<ravel_segment::SeriesEntry>>, QueryError> {
         let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
@@ -5227,7 +5315,12 @@ mod tests {
             )
             .await
             .expect_err("a zero store-request budget must trip even on an empty snapshot");
-        let QueryError::RequestBudgetExceeded { requests, max } = err else {
+        let QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag: _,
+        } = err
+        else {
             panic!("expected QueryError::RequestBudgetExceeded, got {err:?}");
         };
         assert_eq!(
@@ -5311,7 +5404,12 @@ mod tests {
                 "a budget sized for the metrics lane alone must still trip once the log \
                  lane's own resolve is added",
             );
-        let QueryError::RequestBudgetExceeded { requests, max } = err else {
+        let QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag: _,
+        } = err
+        else {
             panic!("expected QueryError::RequestBudgetExceeded, got {err:?}");
         };
         assert_eq!(
