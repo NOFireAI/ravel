@@ -262,6 +262,37 @@ impl ObjectStoreBackend for MemoryStore {
         })
     }
 
+    /// Evaluates the precondition under the same lock that serves the bytes,
+    /// so an overwrite cannot land between the check and the read.
+    ///
+    /// Absence is decided first: a missing key is `NotFound` whatever the pin
+    /// says. Then the ETag, then the version when the pin carries one, so a
+    /// store whose two identities move together (this one: `put` bumps both
+    /// from one counter) still refuses on either.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<GetOutcome, StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        if entry.etag.0 != pin.etag {
+            return Err(StoreError::PreconditionFailed);
+        }
+        if let Some(version) = pin.version.as_deref()
+            && entry.version.0 != version
+        {
+            return Err(StoreError::PreconditionFailed);
+        }
+        Ok(GetOutcome {
+            data: Self::slice(&entry.data, range)?,
+            etag: entry.etag.clone(),
+            version: entry.version.clone(),
+            total_size: entry.data.len() as u64,
+        })
+    }
+
     async fn put_multipart<'a>(
         &'a self,
         key: &str,

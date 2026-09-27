@@ -202,6 +202,15 @@ impl StoreErrorClass {
             StoreError::ListRepeatedToken { .. }
             | StoreError::ListPageCeiling { .. }
             | StoreError::ListOrderViolation { .. } => StoreErrorClass::Permanent,
+            // A capability the backend does not have, and a mutation of a
+            // store opened read-only: both are client-side configuration
+            // failures that no retry and no other argument can fix, so they
+            // class as `Permanent` rather than widening the class enum (and
+            // with it every exported metrics array). Named explicitly, not via
+            // a wildcard, for the same reason as the variants above.
+            StoreError::Unsupported { .. } | StoreError::ReadOnly { .. } => {
+                StoreErrorClass::Permanent
+            }
         }
     }
 
@@ -589,6 +598,26 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         let result = self.inner.get(key, range).await;
         // Bytes actually handed back: a ranged read counts the range, not
         // `total_size`, and a failed read counts nothing.
+        let bytes = result
+            .as_ref()
+            .map_or(0, |outcome| outcome.data.len() as u64);
+        self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// Counted as a [`StoreOp::Get`], identically to [`Self::get`]: a pinned
+    /// read is one GET on the wire and costs the same, so splitting it into
+    /// its own op would make a caller's GET count depend on which read path it
+    /// took. A refused precondition lands in the `PreconditionFailed` error
+    /// class and counts zero bytes.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<GetOutcome, StoreError> {
+        let start = self.clock.now_nanos();
+        let result = self.inner.get_pinned(key, range, pin).await;
         let bytes = result
             .as_ref()
             .map_or(0, |outcome| outcome.data.len() as u64);

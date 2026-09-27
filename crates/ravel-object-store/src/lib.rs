@@ -6,6 +6,7 @@
 //! is the semantics oracle used by tests.
 
 pub mod conformance;
+pub mod external;
 pub mod fault;
 pub mod instrument;
 pub mod kms_routing;
@@ -46,6 +47,41 @@ pub struct Etag(pub String);
 /// etag. Only the backend that issued it can interpret it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version(pub String);
+
+/// Precondition for a read of an object Ravel did not write (ADR-2040
+/// decision 1): the identity the catalog recorded when the object was granted.
+///
+/// A pinned read asserts that identity on the wire (`If-Match` on `etag`, plus
+/// the backend's own `version`/generation selector when `version` is set), so a
+/// file replaced under a stable key fails with
+/// [`StoreError::PreconditionFailed`] instead of returning bytes that do not
+/// match the recorded schema or statistics.
+///
+/// `version` is optional because not every store versions objects. When it is
+/// `None` the ETag alone is the precondition; when it is `Some`, both must hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub etag: String,
+    pub version: Option<String>,
+}
+
+impl Pin {
+    /// Pin on an ETag alone, for a store that does not version objects.
+    pub fn etag(etag: impl Into<String>) -> Self {
+        Pin {
+            etag: etag.into(),
+            version: None,
+        }
+    }
+
+    /// Pin on both the ETag and the backend's version/generation.
+    pub fn etag_and_version(etag: impl Into<String>, version: impl Into<String>) -> Self {
+        Pin {
+            etag: etag.into(),
+            version: Some(version.into()),
+        }
+    }
+}
 
 /// Checksum the caller computed locally and the backend verifies on upload.
 /// Transport-integrity only; blake3 identity lives in commit records.
@@ -405,6 +441,17 @@ pub enum StoreError {
     Transient(String),
     #[error("permanent error: {0}")]
     Permanent(String),
+    /// The backend does not implement this operation at all, so no retry and no
+    /// alternative argument can make it succeed. Distinct from
+    /// [`StoreError::Permanent`], which reports a request the backend
+    /// understood and rejected. Never retryable.
+    #[error("{operation}: unsupported by this backend")]
+    Unsupported { operation: String },
+    /// The store was opened read-only and the call would have mutated it. Every
+    /// [`crate::external::ExternalStore`] refuses `put`, `put_multipart` and
+    /// `delete` this way. Never retryable.
+    #[error("{operation}: {store} is open read-only")]
+    ReadOnly { operation: String, store: String },
     /// A paged listing drain saw the same continuation token twice: the backend
     /// reports "another page" while making no progress. Draining returns this
     /// rather than spinning forever. Never retryable.
@@ -447,6 +494,43 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     -> Result<PutOutcome, StoreError>;
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError>;
+
+    /// Read `range` of `key` only if the object still matches `pin`.
+    ///
+    /// This is the read path for objects Ravel did not write (ADR-2040
+    /// decision 1). The precondition is evaluated by the backend, on the wire,
+    /// not by comparing ETags after the fact: a backend that cannot evaluate it
+    /// must not implement this method, because a local comparison would read
+    /// and pay for the wrong bytes before noticing.
+    ///
+    /// Outcomes, in the order they are decided:
+    ///
+    /// - No object at `key`: [`StoreError::NotFound`], never
+    ///   `PreconditionFailed`. The two are distinct answers and callers act on
+    ///   them differently (a missing grant target versus a changed one).
+    /// - The object exists but its identity differs from `pin`:
+    ///   [`StoreError::PreconditionFailed`], which is not retryable
+    ///   ([`StoreError::is_retryable`]) because a retry reads the same changed
+    ///   object.
+    /// - Otherwise the same [`GetOutcome`] `get` would return, whose `etag` is
+    ///   the pinned one.
+    ///
+    /// The default implementation refuses with [`StoreError::Unsupported`]
+    /// rather than falling back to an unconditional `get`: silently dropping
+    /// the precondition would serve bytes from a replaced file.
+    /// [`crate::external::probe::probe_preconditions`] is how a candidate store
+    /// is qualified for this before any grant relies on it.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<GetOutcome, StoreError> {
+        let _ = (range, pin);
+        Err(StoreError::Unsupported {
+            operation: format!("conditional get of {key}"),
+        })
+    }
 
     /// Begin a multipart upload of `key`. See [`MultipartUpload`] for the part
     /// sequence rules and the visibility guarantee.
@@ -520,9 +604,10 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
 /// `S: ObjectStoreBackend` (for example [`InstrumentedStore`]) wrap an
 /// already-type-erased `Arc<dyn ObjectStoreBackend>`: without this impl the
 /// erased handle is not itself a backend and cannot be a decorator's `S`. Every
-/// method delegates to the pointee, `put_multipart` and `capabilities`
-/// included, so a `multipart: true` backend keeps that capability through the
-/// `Arc` rather than falling back to the refusing default.
+/// method delegates to the pointee, `put_multipart`, `get_pinned` and
+/// `capabilities` included, so a `multipart: true` backend keeps that
+/// capability through the `Arc`, and a backend that evaluates preconditions
+/// keeps that too, rather than falling back to the refusing defaults.
 #[async_trait::async_trait]
 impl<T: ObjectStoreBackend + ?Sized> ObjectStoreBackend for Arc<T> {
     async fn put(
@@ -536,6 +621,15 @@ impl<T: ObjectStoreBackend + ?Sized> ObjectStoreBackend for Arc<T> {
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         (**self).get(key, range).await
+    }
+
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<GetOutcome, StoreError> {
+        (**self).get_pinned(key, range, pin).await
     }
 
     async fn put_multipart<'a>(

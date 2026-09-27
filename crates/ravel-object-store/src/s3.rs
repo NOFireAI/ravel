@@ -93,7 +93,7 @@ use object_store::{
 
 use crate::{
     Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PartSequence, PutMode, PutOptions, PutOutcome, StoreError,
+    ObjectStoreBackend, PageToken, PartSequence, Pin, PutMode, PutOptions, PutOutcome, StoreError,
     UploadChecksum, Version, multipart_finished, multipart_poisoned,
 };
 
@@ -1089,13 +1089,13 @@ impl S3Store {
 /// `key -> Path`. `object_store::path::Path` percent-encodes a small set of
 /// reserved bytes per segment; plain ASCII keys (the only kind this crate's
 /// tests and Ravel's own key scheme produce) round-trip exactly.
-fn path_of(key: &str) -> Path {
+pub(crate) fn path_of(key: &str) -> Path {
     Path::from(key)
 }
 
 /// `prefix -> Option<Path>`, `None` for the empty (whole-bucket) prefix so
 /// `object_store` does not append a stray delimiter.
-fn prefix_of(prefix: &str) -> Option<Path> {
+pub(crate) fn prefix_of(prefix: &str) -> Option<Path> {
     if prefix.is_empty() {
         None
     } else {
@@ -1119,7 +1119,7 @@ fn map_meta(meta: object_store::ObjectMeta) -> Result<ObjectMeta, StoreError> {
 /// Error mapping shared by every non-`put` operation. `put` has its own
 /// mode-aware wrapper (see [`map_put_error`]) because conditional-write
 /// failures must be interpreted differently depending on `PutMode`.
-fn map_error_common(e: object_store::Error) -> StoreError {
+pub(crate) fn map_error_common(e: object_store::Error) -> StoreError {
     use object_store::Error as E;
     match e {
         E::NotFound { .. } => StoreError::NotFound,
@@ -1173,7 +1173,7 @@ fn map_put_error(e: object_store::Error, mode: &PutMode) -> StoreError {
 /// rejected as unsatisfiable (`start >= object length`), which
 /// `object_store` cannot validate client-side without already knowing the
 /// object's size.
-fn map_get_error(e: object_store::Error) -> StoreError {
+pub(crate) fn map_get_error(e: object_store::Error) -> StoreError {
     if let object_store::Error::Generic { source, .. } = &e {
         let msg = source.to_string().to_lowercase();
         if msg.contains("range")
@@ -1565,6 +1565,10 @@ impl S3Store {
                 | StoreError::ListPageCeiling { .. }
                 | StoreError::ListOrderViolation { .. }),
             ) => Err(e),
+            // Likewise impossible from this adapter's own `head`, which
+            // implements the operation and never refuses a write it was not
+            // asked to make. Passed through for the same reason.
+            Err(e @ (StoreError::Unsupported { .. } | StoreError::ReadOnly { .. })) => Err(e),
             Err(
                 StoreError::AccessDenied(_)
                 | StoreError::PreconditionFailed
@@ -1651,15 +1655,57 @@ impl S3Store {
         }
     }
 
+    /// The read path shared by [`ObjectStoreBackend::get`] and
+    /// [`ObjectStoreBackend::get_pinned`]: identical request shaping and range
+    /// validation, differing only in whether a caller-supplied [`Pin`] rides
+    /// along as a precondition. Not wrapped in an [`attempts::scope`]; the two
+    /// callers own that, so one logical call is one scope either way.
+    async fn get_inner(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: Option<&Pin>,
+    ) -> Result<GetOutcome, StoreError> {
+        let os_range = match range {
+            // The one request whose size the caller does not choose, so the one
+            // that has to be bounded here to stay inside
+            // `S3HttpConfig::request_timeout`.
+            GetRange::Full => return self.get_whole_object(key, pin).await,
+            GetRange::Range(start, end) => {
+                if start >= end {
+                    return Err(StoreError::InvalidRange(format!(
+                        "empty or inverted range [{start}, {end})"
+                    )));
+                }
+                Some(OsGetRange::Bounded(start..end))
+            }
+            GetRange::Suffix(0) => {
+                return Err(StoreError::InvalidRange("zero-length suffix".into()));
+            }
+            GetRange::Suffix(n) => Some(OsGetRange::Suffix(n)),
+        };
+        let chunk = self.get_one(key, os_range, pin).await?;
+        Ok(GetOutcome {
+            data: chunk.data,
+            etag: Etag(chunk.etag.clone()),
+            version: Version(chunk.etag),
+            total_size: chunk.total_size,
+        })
+    }
+
     /// One GET, ranged or not, reduced to the three things this adapter needs
-    /// from it. `if_match` rides along as an `If-Match` precondition, used by
+    /// from it. `pin` rides along as an `If-Match` precondition (plus a
+    /// `versionId` selector when it carries one), used by
     /// [`S3Store::get_whole_object`] to pin every request of a split read to
-    /// one version of the object.
+    /// one version of the object and by
+    /// [`ObjectStoreBackend::get_pinned`] to pin a read to the identity the
+    /// catalog recorded. The server evaluates it; nothing here compares ETags
+    /// after the bytes have been paid for.
     async fn get_one(
         &self,
         key: &str,
         range: Option<OsGetRange>,
-        if_match: Option<String>,
+        pin: Option<&Pin>,
     ) -> Result<GetChunk, StoreError> {
         let result = self
             .store
@@ -1667,7 +1713,8 @@ impl S3Store {
                 &path_of(key),
                 OsGetOptions {
                     range,
-                    if_match,
+                    if_match: pin.map(|pin| pin.etag.clone()),
+                    version: pin.and_then(|pin| pin.version.clone()),
                     ..Default::default()
                 },
             )
@@ -1714,10 +1761,20 @@ impl S3Store {
     /// the read instead of splicing two versions into one buffer. Data objects
     /// are immutable, so this is a guard on the mutable-pointer keys, and those
     /// are small enough to take the single-request path anyway.
-    async fn get_whole_object(&self, key: &str) -> Result<GetOutcome, StoreError> {
+    ///
+    /// **Caller-supplied pin.** With `pin` set (the `get_pinned` path) the
+    /// *first* request carries it too, and a refused precondition stays a
+    /// [`StoreError::PreconditionFailed`] rather than being reported as the
+    /// retryable mid-read overwrite above: the caller pinned a specific
+    /// identity, so a fresh read would fail the same way.
+    async fn get_whole_object(
+        &self,
+        key: &str,
+        pin: Option<&Pin>,
+    ) -> Result<GetOutcome, StoreError> {
         let chunk = self.max_get_chunk as u64;
         let first = match self
-            .get_one(key, Some(OsGetRange::Bounded(0..chunk)), None)
+            .get_one(key, Some(OsGetRange::Bounded(0..chunk)), pin)
             .await
         {
             Ok(first) => first,
@@ -1727,7 +1784,7 @@ impl S3Store {
             // body is a legal 200. `GetRange::Full` carries no caller range, so
             // an unsatisfiable range here can only mean an empty object.
             Err(StoreError::InvalidRange(_)) => {
-                let whole = self.get_one(key, None, None).await?;
+                let whole = self.get_one(key, None, pin).await?;
                 return Ok(GetOutcome {
                     data: whole.data,
                     etag: Etag(whole.etag.clone()),
@@ -1766,20 +1823,27 @@ impl S3Store {
 
         // `buffered`, not `buffer_unordered`: the pieces are concatenated in
         // issue order, so they must be yielded in issue order.
-        let etag = first.etag.clone();
+        let continuation = match pin {
+            Some(pin) => pin.clone(),
+            None => Pin::etag(first.etag.clone()),
+        };
         {
             let mut inflight = futures::stream::iter(ranges.into_iter().map(|range| {
-                self.get_one(key, Some(OsGetRange::Bounded(range)), Some(etag.clone()))
+                self.get_one(key, Some(OsGetRange::Bounded(range)), Some(&continuation))
             }))
             .buffered(WHOLE_OBJECT_GET_CONCURRENCY);
             while let Some(piece) = inflight.next().await {
                 let piece = piece.map_err(|e| match e {
                     // The `If-Match` failed: the object was overwritten between
                     // this read's first request and this one. Retryable,
-                    // because a fresh read sees one consistent version.
-                    StoreError::PreconditionFailed => StoreError::Transient(format!(
-                        "get of {key}: object was overwritten during a bounded whole-object read"
-                    )),
+                    // because a fresh read sees one consistent version. A
+                    // caller-supplied pin is different: it names one identity,
+                    // so the refusal is the answer and stays as it is.
+                    StoreError::PreconditionFailed if pin.is_none() => {
+                        StoreError::Transient(format!(
+                            "get of {key}: object was overwritten during a bounded whole-object read"
+                        ))
+                    }
                     other => other,
                 })?;
                 data.extend_from_slice(&piece.data);
@@ -1911,34 +1975,21 @@ impl ObjectStoreBackend for S3Store {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        attempts::scope(StoreOp::Get, async move {
-            let os_range = match range {
-                // The one request whose size the caller does not choose, so the one
-                // that has to be bounded here to stay inside
-                // `S3HttpConfig::request_timeout`.
-                GetRange::Full => return self.get_whole_object(key).await,
-                GetRange::Range(start, end) => {
-                    if start >= end {
-                        return Err(StoreError::InvalidRange(format!(
-                            "empty or inverted range [{start}, {end})"
-                        )));
-                    }
-                    Some(OsGetRange::Bounded(start..end))
-                }
-                GetRange::Suffix(0) => {
-                    return Err(StoreError::InvalidRange("zero-length suffix".into()));
-                }
-                GetRange::Suffix(n) => Some(OsGetRange::Suffix(n)),
-            };
-            let chunk = self.get_one(key, os_range, None).await?;
-            Ok(GetOutcome {
-                data: chunk.data,
-                etag: Etag(chunk.etag.clone()),
-                version: Version(chunk.etag),
-                total_size: chunk.total_size,
-            })
-        })
-        .await
+        attempts::scope(StoreOp::Get, self.get_inner(key, range, None)).await
+    }
+
+    /// The same request as [`Self::get`] with `If-Match` (and `versionId`, when
+    /// the pin carries one) attached, so S3 decides the precondition and a
+    /// replaced object costs one refused request rather than a body.
+    ///
+    /// Counted under [`StoreOp::Get`], like `get`: it is one GET on the wire.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<GetOutcome, StoreError> {
+        attempts::scope(StoreOp::Get, self.get_inner(key, range, Some(pin))).await
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
