@@ -12,8 +12,8 @@
 //!
 //! The second half pins the flush cadence of the three age tiers (ADR-1737)
 //! over one injected-clock hour on each of the metrics, log, and span
-//! pipelines: the idle clock with `idle_flush_byte_floor` off, the
-//! `max_flush_lifetime` hold below a non-zero floor, and the fast clock.
+//! pipelines: the idle clock with `idle_flush_byte_floor` off, the sub-floor
+//! hold below a non-zero floor, and the fast clock.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -22,10 +22,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{TestClock, make_point, span_on_shard, tenant};
+use ravel_commit::record;
 use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, WriteMode};
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, list_all};
+use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_types::logstream::{AttrValue, log_stream_id};
@@ -272,6 +273,12 @@ struct HourResult {
     flushes: FlushCounts,
     data_objects: usize,
     commit_records: usize,
+    /// Rows across every data object written in the hour, read from the
+    /// commit records (`sample_count` is points, log records, or spans
+    /// depending on the pipeline). Object counts alone cannot tell a flush
+    /// that carried the hour's rows from one that carried a prefix and
+    /// dropped the rest.
+    rows: u64,
 }
 
 enum AnyRouter {
@@ -464,12 +471,24 @@ async fn one_hour_at_rate(
     let objects = list_all(store.as_ref(), "t/").await.expect("list");
     let data_objects = objects.iter().filter(|o| o.key.contains("/l0/")).count();
     let commit_records = objects.iter().filter(|o| o.key.contains("/c/")).count();
+    let mut rows = 0u64;
+    for object in objects.iter().filter(|o| o.key.contains("/c/")) {
+        let bytes = store
+            .get(&object.key, GetRange::Full)
+            .await
+            .expect("get commit record")
+            .data;
+        rows += record::decode(&bytes)
+            .expect("decode commit record")
+            .sample_count;
+    }
     router.shutdown().await;
     HourResult {
         pipeline,
         flushes,
         data_objects,
         commit_records,
+        rows,
     }
 }
 
@@ -486,8 +505,9 @@ async fn one_hour_on_every_pipeline(
 }
 
 /// The result every pipeline must produce: `flushes` flushes opened, each
-/// writing one data object and one commit record.
-fn on_every_pipeline(flushes: FlushCounts, objects: usize) -> Vec<HourResult> {
+/// writing one data object and one commit record, carrying `rows` rows
+/// between them.
+fn on_every_pipeline(flushes: FlushCounts, objects: usize, rows: u64) -> Vec<HourResult> {
     PIPELINES
         .iter()
         .map(|&pipeline| HourResult {
@@ -495,8 +515,16 @@ fn on_every_pipeline(flushes: FlushCounts, objects: usize) -> Vec<HourResult> {
             flushes,
             data_objects: objects,
             commit_records: objects,
+            rows,
         })
         .collect()
+}
+
+/// Units `one_hour_at_rate` writes over the hour at this rate: the total every
+/// case's objects must carry between them, since the hour's last tick is also
+/// a flush for every case here.
+fn units_written(units_per_write: u64, write_every_ticks: u64) -> u64 {
+    units_per_write * TICKS_PER_HOUR.div_ceil(write_every_ticks)
 }
 
 /// Near idle, floor off (the default): one unit every 10 s never reaches
@@ -512,13 +540,21 @@ async fn near_idle_with_the_floor_off_flushes_on_the_idle_clock() {
         by_age: 90,
         by_age_floor: 0,
     };
-    assert_eq!(results, on_every_pipeline(expected, 90));
+    assert_eq!(
+        results,
+        on_every_pipeline(expected, 90, units_written(1, 50))
+    );
 }
 
 /// Near idle, floor on: the same trickle stays below the floor all hour, so
-/// every pipeline holds its buffer for `max_flush_lifetime` from the first
-/// unit, which the hour's last tick reaches. One flush, counted on
-/// `flushes_by_age_floor` and not on `flushes_by_age`.
+/// every pipeline holds its buffer for the sub-floor hold from the first unit,
+/// which the hour's second-to-last tick reaches (the hold is one `flush_tick`
+/// short of `max_flush_lifetime`, and the write that would start a second
+/// buffer never comes: writes land every 50th tick and the last is at tick
+/// 17,950). One flush, counted on `flushes_by_age_floor` and not on
+/// `flushes_by_age`, and it carries every row the hour wrote: one object
+/// is the whole hour's data, so an object count alone would pass on a flush
+/// that dropped most of it.
 #[tokio::test]
 async fn near_idle_below_the_floor_holds_for_the_flush_lifetime() {
     let config = IngestConfig {
@@ -527,13 +563,17 @@ async fn near_idle_below_the_floor_holds_for_the_flush_lifetime() {
     };
     assert_eq!(config.validate(), Ok(()));
     assert_eq!(config.max_flush_lifetime, Duration::from_secs(3600));
+    assert_eq!(config.flush_tick, Duration::from_millis(200));
     let results = one_hour_on_every_pipeline(config, 1, 50).await;
     let expected = FlushCounts {
         by_size: 0,
         by_age: 0,
         by_age_floor: 1,
     };
-    assert_eq!(results, on_every_pipeline(expected, 1));
+    assert_eq!(
+        results,
+        on_every_pipeline(expected, 1, units_written(1, 50))
+    );
 }
 
 /// Middle band, floor on: 25 units a second, written once a second, cross a
@@ -552,7 +592,10 @@ async fn middle_band_above_the_floor_keeps_the_idle_clock() {
         by_age: 90,
         by_age_floor: 0,
     };
-    assert_eq!(results, on_every_pipeline(expected, 90));
+    assert_eq!(
+        results,
+        on_every_pipeline(expected, 90, units_written(25, 5))
+    );
 }
 
 /// Fast band, floor on: 160 units a second, written once a second, reach a
@@ -572,7 +615,10 @@ async fn fast_band_keeps_the_fast_clock() {
         by_age: 1800,
         by_age_floor: 0,
     };
-    assert_eq!(results, on_every_pipeline(expected, 1800));
+    assert_eq!(
+        results,
+        on_every_pipeline(expected, 1800, units_written(160, 5))
+    );
 }
 
 /// A strict-mode waiter on a one-unit buffer, far below the floor, still

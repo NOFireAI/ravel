@@ -76,10 +76,12 @@ hold.
    knob.** With the ceiling equal to the lifetime, the worst age of a buffer
    at flush open is one hour and the ADR-0052 derivation reads
    `ceil(max_flush_lifetime + max_flush_lifetime) = 2`, so
-   `FLUSH_BOUND_SLACK_HOURS` stays at 2. The bucket is pinned at flush open,
-   so the distance between routing and the record's ingest hour is at most
-   the hold. A larger ceiling leaves the bounds the slack was derived from,
-   which is why one is not offered.
+   `FLUSH_BOUND_SLACK_HOURS` stays at 2. (The shipped hold is one `flush_tick`
+   short of the lifetime, so that the age check's own tick of lateness fits
+   inside that one hour; see the one-tick hold amendment below.) The bucket
+   is pinned at flush open, so the distance between routing and the record's
+   ingest hour is at most the hold plus that tick. A larger ceiling leaves
+   the bounds the slack was derived from, which is why one is not offered.
 
 4. **Strict mode and the drains are unchanged.** A strict waiter keeps the
    fast clock, so acknowledged-write latency does not move. `FlushNow`,
@@ -183,3 +185,34 @@ flowchart TD
   4. docs: docs/consistency-model.md buffered-mode bullet, docs/ingest.md
      flush-cadence and shutdown-drain text, docs/guides/cost-model.md fourth
      band on top of T7f's three.
+
+## Amendment (2026-09-27, #1737): the hold ceiling is one tick short of the lifetime
+
+<!-- amendment-applies: sections="Decision" pointer="one-tick hold amendment" -->
+
+Decision 3 set the sub-floor hold equal to `max_flush_lifetime` and read the
+ADR-0052 derivation as `ceil(max_flush_lifetime + max_flush_lifetime) = 2`.
+That skipped one term. The age check runs on a `flush_tick` (200 ms by
+default), not at the instant a threshold is crossed, so a buffer whose
+threshold is `T` opens its flush at an age of up to `T + flush_tick`. With
+the hold at the full lifetime the worst buffer age at flush open is 3,600.2 s,
+and the derivation gives `ceil(3,600.2 s + 3,600 s) = 3`, above the 2 the
+shipped `FLUSH_BOUND_SLACK_HOURS` carries. That constant is a frozen
+read-side contract and does not move.
+
+The hold does. It is `max_flush_lifetime` less one `flush_tick`, saturating at
+zero, so the worst buffer age at flush open including the tick is exactly
+`max_flush_lifetime` and `ceil(max_flush_lifetime + max_flush_lifetime) = 2`
+holds as decision 3 claimed. Everything else in decision 3 stands: the hold
+is still not a separate knob, and it is still derived from the one duration
+already inside the slack.
+
+Nothing an operator sees changes. The buffered-mode loss window decision 5
+states is still "up to `max_flush_lifetime` plus flush time" for a buffer
+below the floor, since that is what the tick-inclusive worst case now is, and
+no flush-count band in the Consequences moves: a buffer held for 3,599.8 s
+instead of 3,600 s still flushes 24 times a day.
+`ravel_ingest::shard::tests::a_deferred_flush_can_overrun_the_flush_bound_slack`
+asserts both halves in nanoseconds against the shipped config: the hold plus
+one tick is at most `max_flush_lifetime`, and that sum plus
+`max_flush_lifetime` is at most `FLUSH_BOUND_SLACK_HOURS`.
