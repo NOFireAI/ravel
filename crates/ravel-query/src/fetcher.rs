@@ -626,7 +626,10 @@ fn coalesce_ranges(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)>
 /// Bridges the smallest gaps between `runs` (sorted, non-overlapping, as
 /// [`coalesce_ranges`] returns them) until at most `max_runs` remain. Ties
 /// bridge the earlier gap first. A `max_runs` of zero is read as one.
-fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
+///
+/// `pub(crate)` so `log_fetcher.rs` can reuse it for the RLOG chunk-run cap
+/// (ADR-2066 decision 1) instead of a second copy of the same bridging rule.
+pub(crate) fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
     let max_runs = max_runs.max(1);
     if runs.len() <= max_runs {
         return runs;

@@ -6,6 +6,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A ranged log read's chunk-run GETs against one RLOG object are now bounded
+  at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4)** (ADR-2066 decision 1). A
+  projection whose coalesced candidate runs exceed the cap bridges the
+  smallest remaining gaps between them down to it, the same bound already
+  applied to L0 metrics flushes (ADR-1306); the whole-object coverage
+  crossover is computed against that bridged run set, so bridging can itself
+  push a projection over the 75% threshold and convert it to one whole-object
+  GET. Front-section reads (STREAM_DIR/FIELD_DIR) always land in one combined
+  GET now, including the narrow-projection path that resolves column ids
+  before choosing candidates, and a front section a plan-phase read already
+  cached is served from cache instead of re-fetched into that combined GET.
+  No default or config surface changes; the bound applies unconditionally to
+  the existing ranged log read path.
+
 ## [0.19.0] - 2026-09-27
 
 ### Fixed
