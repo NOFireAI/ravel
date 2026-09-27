@@ -85,7 +85,9 @@ that produce identical bytes share an entry. A re-PUT after a
 `CreateIfAbsent` `AlreadyExists` cannot alias stale bytes. And no mutable
 object is representable as a key at all, because HEAD and the maint
 cursor have no content hash in any `SegmentRef`, so the type system keeps
-them out rather than a rule keeping them out.
+them out rather than a rule keeping them out. (Parquet tables add a second
+key kind for pinned external objects; see the pinned-key amendment
+below.)
 
 `tenant_hash` is in the key even though the content hash alone would be
 unique. It is a defence-in-depth boundary: a hash collision or a
@@ -308,3 +310,25 @@ probe's `max_hour` is computed from `now_ns + clock_skew_allowance_ns`,
 not from the event timestamp, so a late-arriving event filed under an
 hour at or before wall-clock `now` is always within the first probe's
 upper bound.
+
+## Amendment (2026-09-27): a pinned key for external Parquet objects (ADR-2040)
+
+<!-- amendment-applies: sections="2. Keyed by content hash, not by object key" pointer="pinned-key amendment" -->
+
+ADR-2040 reads Parquet files that Ravel did not write, in buckets an
+operator granted a tenant. Their bytes have no BLAKE3 Ravel computed, and
+their owner can overwrite them. They get a second key kind: the
+`content_hash` part is a BLAKE3 over (credential profile, bucket, object
+key, ETag, version or generation, size), built by a constructor separate
+from the one decision 2 describes.
+
+This key is sound only because every read of such an object carries the
+recorded ETag and version as a precondition, and a store that fails the
+precondition probe cannot back a grant. So a cached range under this key
+is always a range of the bytes the precondition admits. It is weaker than
+decision 2's key in one way, stated here rather than hidden: on an
+unversioned S3 bucket a single-PUT ETag is an MD5, and someone who can
+write the granted location could in principle forge an MD5 collision. The
+harm stays inside the tenants granted that location, because `tenant_hash`
+is still part of the key. Decision 2's key is unchanged for every object
+Ravel writes.

@@ -156,8 +156,9 @@ The code is correct; this amendment makes the ADR match it.
 
 <!-- amendment-applies: sections="Decision" pointer="ADR-2040 amendment" -->
 
-ADR-2040 replaces the first security invariant with "a SQL caller can name
-tables, never storage". Each of the two parts below takes effect when its
+ADR-2040 replaces the first security invariant with "a SQL caller reads
+only what an operator granted it, and never names a credential". Each of
+the two parts below takes effect when its
 task in epic #2040 lands: the store registry with the read task (issue
 #2053), DDL with the DDL task (issue #2054). Until then the code enforces
 the invariant exactly as the Decision above states it: `validate` refuses
@@ -166,15 +167,17 @@ all DDL and every session installs the empty registry.
 - **DDL.** `CREATE EXTERNAL TABLE ... STORED AS PARQUET`,
   `CREATE OR REPLACE EXTERNAL TABLE` and `DROP TABLE` are admitted through a
   separate executor entry point. They require a `ddl` capability on the
-  caller's token, and each is audited. `LOCATION` names a dataset under the
-  caller's own prefix and never a scheme, bucket or credential. Every other
-  statement kind stays refused, and the read path still admits exactly one
-  read-only `SELECT`.
+  caller's token, and each is audited. `LOCATION` is an `s3://`, `gs://` or
+  `az://` URL that must lie inside a location an operator granted the
+  caller's tenant, and never inside Ravel's own data bucket. It never
+  carries a credential. Every other statement kind stays refused, and the
+  read path still admits exactly one read-only `SELECT`.
 - **The store registry.** A query over a Parquet table runs in a session
   whose registry answers exactly one URL, `ravel-pq://<tenant_hash>/`, for
   the querying tenant. It refuses every other URL and every
-  `register_store`, and the store behind it serves only the data keys listed
-  in the manifests that query resolved. Every other session keeps the empty
+  `register_store`. The store behind it serves only the files listed in
+  the manifests that query resolved, each read pinned to the ETag and
+  version the manifest recorded. Every other session keeps the empty
   registry.
 
 The second invariant (a fresh single-tenant `SessionContext` per query) is
