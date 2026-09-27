@@ -147,7 +147,9 @@ change, and this ADR follows the same rule.
      and the R1 table row for `ProvisioningRecord` are updated to {1, 2, 3}.
    - Release B, after A is fleet-wide, stamps 3 on every write and fills the
      basis fields on a raise. Until B no floor has a basis, and decisions 2 to
-     5 treat every floor as `Unknown`.
+     5 treat every floor as `Unknown`. (Narrowed: a live record below the
+     floor still makes it `Contradicted`; see the Contradicted-before-basis
+     amendment below.)
 
    No object is migrated; a version-1 or version-2 record stays readable.
    The strip hazard R1 names is why the bump exists: a release-2 binary
@@ -249,3 +251,16 @@ flowchart TD
      audit reports `Contradicted`.
   4. Docs: `docs/adrs/0066` pointer, the maintenance guide, ADR-0531's
      rollback stance paragraph, the flags reference.
+
+## Amendment (2026-09-27, #1746): Contradicted does not need a basis
+
+<!-- amendment-applies: sections="Decision" pointer="Contradicted-before-basis amendment" -->
+
+Decision 6 said that until Release B every floor is `Unknown`, while
+decision 5 and follow-up 1's Release A acceptance test expect a floor with a
+live record below it to classify as `Contradicted` in Release A, where no
+floor carries a basis. The two cannot both hold. `Contradicted` wins: a live
+record below the floor proves the floor false whatever evidence the raise
+recorded, so the classification needs no basis. Only `Current` and `Stale`
+depend on the basis, and until Release B a floor that is not contradicted is
+`Unknown`.

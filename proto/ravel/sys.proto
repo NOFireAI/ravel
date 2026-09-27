@@ -92,9 +92,11 @@ message ProvisioningRecord {
   // reader that only knows a lower version refuses rather than misreading a
   // future layout as v1 (matching TenancyMarker's format_version guard).
   //
-  // Version 2 is current: writers stamp 2 and readers accept the SET {1, 2}.
-  // Version 1 remains fully readable, so a record any earlier build wrote is
-  // still read, and nothing has to be migrated.
+  // Version 2 is current: writers stamp 2 and readers accept the SET {1, 2, 3}.
+  // Version 3 adds the FormatFloor basis fields 5 to 7 (ADR-1746 Release A):
+  // readers accept it one release before any writer stamps it, and the rewrite
+  // paths refuse it. Version 1 remains fully readable, so a record any earlier
+  // build wrote is still read, and nothing has to be migrated.
   //
   // This record is CAS-mutable (append_generation, raise_format_floor rewrite it
   // whole), so per the ADR-0066 R1 amendment its readers accepted version 2
@@ -158,7 +160,8 @@ message ProvisioningRecord {
   // CAS-mutable record: an old WRITER that rewrites a record a newer writer
   // stamped (append_generation, raise_format_floor) would re-encode it without a
   // field it does not model and strip it. The R1 and R2 amendments (ADR-0066,
-  // #1300) close that: readers accept the version SET {1, 2}, the writer now
+  // #1300) close that: readers accept the version SET {1, 2} (widened to
+  // {1, 2, 3} by ADR-1746 Release A for the FormatFloor basis), the writer now
   // stamps 2 so a binary predating those readers fails closed on every current
   // record instead of stripping it, and the rewrite paths refuse a record newer
   // than the writer stamps. Any additive field added after this one still
@@ -203,6 +206,14 @@ message FormatFloor {
   uint32 floor_version = 2;  // no live object of `family` below this version; >= 1
   sfixed64 raised_unix_ns = 3; // when this floor was raised
   string raised_by = 4;      // job identity that raised it; informational
+  // Observation basis of the audit that justified the raise (ADR-1746 decision
+  // 1). All three are zero on a floor raised before ADR-1746 or by a writer
+  // that does not fill them, which reads as "basis unknown". Written only by a
+  // record stamped format_version 3 or later; a version-2 writer refuses to
+  // rewrite such a record rather than strip them.
+  uint64   observed_entries = 5;                // commit-family entries the raising audit enumerated
+  sfixed64 observed_newest_created_unix_ns = 6; // newest created_unix_ns among them
+  uint32   observed_shards = 7;                 // shard range the audit scanned
 }
 
 // The durable, deployment-wide GC configuration at the bucket root `sys/gc`

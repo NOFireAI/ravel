@@ -56,8 +56,10 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // bytes, so a lagging binary cannot strip a sibling's additive field.
         ("AdmissionUsageSnapshot", Immutable(&[1])),
         ("WorkerHeartbeat", Immutable(&[1])),
-        // Read-modify-write under CAS. ProvisioningRecord / TenantConfigRecord /
-        // MetricMetadataRecord accept {1, 2} after ADR-0066 R1; AuthTokenMap
+        // Read-modify-write under CAS. ProvisioningRecord accepts {1, 2, 3}
+        // after ADR-1746 Release A (the FormatFloor basis fields; the writer
+        // still stamps 2). TenantConfigRecord / MetricMetadataRecord accept
+        // {1, 2} after ADR-0066 R1; AuthTokenMap
         // accepts {1, 2} (managed_by, ADR-0072 #897) and KeyEpochRecord {1}, both
         // as a floor-and-ceiling set since ADR-0066 R2. GcConfig and
         // CompactionClaim still carry ceiling-only gates in their own crates
@@ -65,7 +67,7 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // not fixed. Every slice belonging to a ravel-catalog reader is checked
         // against that reader's own constants by
         // `catalog_read_sets_match_their_readers_constants`.
-        ("ProvisioningRecord", CasMutable(&[1, 2])),
+        ("ProvisioningRecord", CasMutable(&[1, 2, 3])),
         ("TenantConfigRecord", CasMutable(&[1, 2])),
         ("MetricMetadataRecord", CasMutable(&[1, 2])),
         ("AuthTokenMap", CasMutable(&[1, 2])),
