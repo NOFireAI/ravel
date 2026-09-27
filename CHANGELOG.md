@@ -255,6 +255,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **This release reads provisioning record format 3 and still writes 2, and
+  `ravel-cli maintain audit-versions` now classifies every recorded format
+  floor** (ADR-1746 Release A, issue #1746). `FormatFloor` gains three basis
+  fields (`observed_entries`, `observed_newest_created_unix_ns`,
+  `observed_shards`, numbers 5 to 7) that a later release fills when
+  `migrate` raises a floor. Readers accept provisioning format versions
+  {1, 2, 3}; writers keep stamping 2, and `append_generation` and
+  `raise_format_floor` refuse a version-3 record with
+  `RefusingToRewriteNewerRecord` instead of rewriting it without the basis.
+  Roll this release out fleet-wide before any release that writes format 3.
+  `audit-versions` prints each floor with its basis and one of `current`,
+  `stale`, `contradicted` or `unknown`, and exits nonzero when a live record
+  sits below a recorded floor (`contradicted`). Every floor raised so far has
+  no basis and reports `unknown` unless it is contradicted.
+
 - **A transient object-store error on an audit-record PUT is retried before the
   batch fails closed** (issue #2035). `write_audit_batch` used to fail an
   entire batch of queries on a single object-store timeout or throttle
