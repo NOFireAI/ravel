@@ -319,6 +319,8 @@ marked):
   (`services/ravel-server/src/query.rs`) reserve against their default
   `MemoryBudget::unlimited()`: `QueryEngine::with_memory_budget` reaches only its
   `fetcher` and `log_fetcher`, and no server task installs a finite budget yet.
+  (See the decision 2 server amendment below: `ravel-server` now installs the
+  process budget on its PromQL, fragment and cache-warm fetchers.)
 - The SQL cross-boundary overlap is untracked by `handoff_overlap`. The
   cache-hit overlap was too, and is now marked at every cache-hit call site,
   and `covering_read`'s own cache-insert branch and RSEG's `ensure_ranges`
@@ -672,6 +674,7 @@ from the breaching tenant's own `grow` overshoot: pooling the two into one
 error-rate figure hides whether a band was blown by one tenant's breach or
 by the cascade it triggered against every other tenant sharing the counter.
 
+(See the decision 2 server amendment below: this paragraph no longer holds.)
 Decision 2 has not landed in the server: `ravel-query`'s fetchers do reserve
 fetch bytes and mark their cache handoffs, but each one carries a private
 `MemoryBudget::unlimited` unless a caller installs a shared instance, and
@@ -699,3 +702,22 @@ decisions 3 and 4 narrows the regression this ADR opened with (the
 analyzes: an infallible-`grow` overshoot is still bounded only by a
 provisional constant, and fetch-layer memory is still uncharged until
 decision 2 lands and a calibration run freezes the reserve against it.
+
+## Amendment 2026-09-26 (issue #1255): decision 2 reaches the server
+
+<!-- amendment-applies: sections="Amendment (2026-09-06, Refs: #1254)|Amendment 2026-09-07 (issue #1255): decisions 3 and 4 landed" pointer="decision 2 server amendment" -->
+
+`ravel-server` now installs the process `MemoryBudget` on the PromQL
+`QueryEngine`, on the distributed `FragmentService` (both the remote-worker
+path and the coordinator's local path) and on the cache warm pass, the same
+`Arc` the SQL executor receives. PromQL-path RSEG and RLOG fetches therefore
+reserve against it: `component="fetch"` and
+`ravel_memory_handoff_overlap_bytes` read real values while a fetch is held,
+and a fetch that needs more than the remaining budget fails with
+`FetchMemoryExhausted`, returned as 503. A refused warm fetch is skipped and
+logged, not a startup failure.
+
+Still unreserved against this budget: the RSPAN fetcher and every fetcher
+`build_sql_state` constructs, which keep their private
+`MemoryBudget::unlimited()`. The M5 reserve calibration (#1256) remains open.
+
