@@ -90,6 +90,9 @@ the query remainder to 6.76 GB.
      each cold try;
    - a hot sum at or below v0.17.0's 274.5 s.
 
+   The error-ratio bar was missed by one query and the miss was accepted;
+   see Acceptance.
+
    That run measures decisions 1 and 3 together, so a pass alone cannot credit
    the share. A control arm runs the same build on a second fresh machine with
    `--cache-max-bytes` pinned at the 25% share, so the share is the only
@@ -157,9 +160,12 @@ were registered before the runs (#2023 comments 5854876916 and
 
 Cold sums were within 0.4% of each other on every arm, as decision 4
 expects. The first candidate's QPS of 0.403 was measured in the restart
-window described below and is not read. In the rerun, the share beat the
-control by 67% on hot sum and 33% on QPS, both past the noise floor, so the
-share is credited on hot time and throughput.
+window described below and is not read. The share is credited on hot time:
+the same-build candidate cut the hot sum 67% against the control, past the
+noise floor, and the rerun repeated it. The rerun's QPS was 33% above the
+control's, but the rerun also carries the first version of #2035, so that
+comparison crosses builds; it is consistent with the share helping
+throughput but does not isolate it.
 
 The first candidate's error ratio was not the share. One object-store PUT
 for an audit record timed out under the concurrent load. Both audit PUTs are

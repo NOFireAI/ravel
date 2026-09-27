@@ -544,9 +544,9 @@ with their own flags: `--cache-max-bytes` bounds the fetcher cache only, and
 derive separately from the process memory budget (see "Per-query budgets"
 below): the fetcher cache at 25% of it, or a larger 40% against a loopback
 `--s3-endpoint`, and the catalog byte cache always at a smaller 5%
-(`7516192768` and `1503238553` on the 30 GB reference host at the 25% share).
+(`7516192768` and `1503238553` on the 30 GiB reference host at the 25% share).
 Startup refuses to start, rather than silently clamping, if the two resolved
-hard caps together exceed the process memory budget. Both ceilings are LRU
+hard caps together reach or exceed the process memory budget. Both ceilings are LRU
 caps, not reservations: neither pre-allocates, each holds only the bytes it
 has admitted, and the sum of the two cache ceilings and the SQL memory pools
 (which derive from raw host memory, not the process memory budget) may

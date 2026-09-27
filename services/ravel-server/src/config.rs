@@ -2673,9 +2673,8 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// is why decision 1 restores whole-object fetching rather than keeping
 /// `byte-minimal` with a larger share alone. Measured under whole-object
 /// fetching against a 25% control of the same build, 40 cut the ClickBench
-/// hot sum by 67% and raised concurrent throughput by 33%, at the cost of
-/// memory-budget refusals from the smaller SQL remainder (ADR-2023,
-/// Acceptance).
+/// hot sum by 67%, at the cost of memory-budget refusals from the smaller
+/// SQL remainder (ADR-2023, Acceptance).
 pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 40;
 
 /// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
@@ -9263,7 +9262,8 @@ mod tests {
     }
 
     /// Startup refuses, never clamps, a flag combination whose two hard cache
-    /// caps together exceed `memory_budget_bytes` (ADR-1170 decision 3). Since
+    /// caps together reach or exceed `memory_budget_bytes` (ADR-1170 decision
+    /// 3). Since
     /// ADR-2023 the two flags bound their own cache independently, so both
     /// must be set explicitly to make their sum exceed half the reference
     /// host's 30,064,771,072-byte budget.
