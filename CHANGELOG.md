@@ -6,6 +6,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **A distributed SQL slice fetch no longer carries the client's credential**
+  (ADR-1689 decision 2, issues #1689 and #1690). The coordinator used to copy
+  the inbound request's gRPC metadata, bearer token included, onto every
+  worker `DoGet`, so the long-lived client token reached every worker that
+  served a slice. The slice ticket is now the whole credential: it is MAC'd
+  under a slice key of its own, derived from each SQL ticket file key beside
+  a separate key for client whole-set tickets, so a ticket minted for one
+  surface fails the MAC on the other. The worker verifies it without
+  consulting the tenant resolver (MAC under any configured key, deadline
+  against the injected clock, `slice_count > 1`, listener role) and runs the
+  slice under the ticket's tenant. Refusals are typed and counted under a
+  closed `reason` label: `missing`, `bad_mac`, `expired`, `wrong_surface`.
+  The slice still travels over the public gRPC listener, in plaintext, and
+  both keys still derive from the first fragment key, until the server
+  mounts the Flight service on the dedicated fragment listener and reads
+  `--sql-ticket-key-file` (ADR-1689 follow-up task 2). During a rolling
+  upgrade an old and a new process do not verify each other's slice
+  tickets, so those slices run on the coordinator through the existing
+  fallback sequence: parallelism drops for the rollout, results do not
+  change.
+
 ## [0.19.0] - 2026-09-27
 
 ### Fixed
