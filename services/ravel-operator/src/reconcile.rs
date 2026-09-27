@@ -197,7 +197,9 @@ pub const PRE_STOP_DRAIN_DELAY_SECONDS: i64 = 10;
 /// check -- which only reads the apiserver version -- cannot see it.
 pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 30;
 
-/// `terminationGracePeriodSeconds` on every ravel-server pod.
+/// `terminationGracePeriodSeconds` on every ravel-server pod, unless
+/// `spec.probes.dedicatedHealthPort` selects
+/// [`POD_TERMINATION_GRACE_PERIOD_WITH_HEALTH_PORT_SECONDS`].
 ///
 /// Kubernetes runs `preStop` inside the grace period and only sends SIGTERM
 /// after it returns, so the grace period must cover the `preStop` sleep plus the
@@ -215,6 +217,19 @@ pub const MIN_KUBERNETES_MINOR_VERSION: u32 = 30;
 /// SIGKILL land mid-drain and lose buffered-mode ingest data, an irreversible
 /// loss, while a longer one only slows a rolling update's pod turnover.
 pub const POD_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 45;
+
+/// `terminationGracePeriodSeconds` on every ravel-server pod when
+/// `spec.probes.dedicatedHealthPort` is true.
+///
+/// That field renders `--listen-health` (ADR-1702 decision 8), and a server
+/// with the health listener bound stops it between the drain and the trace
+/// flush, taking up to 6s (5s shutdown deadline + 1s join margin). The
+/// SIGTERM-to-exit worst case therefore grows from 32.5s to 38.5s.
+///
+/// 10s `preStop` + 38.5s server budget = 48.5s, plus the same 2.5s headroom
+/// as [`POD_TERMINATION_GRACE_PERIOD_SECONDS`] = 51s. At 45s SIGKILL could land
+/// during the health-listener stop or the trace flush.
+pub const POD_TERMINATION_GRACE_PERIOD_WITH_HEALTH_PORT_SECONDS: i64 = 51;
 
 /// Secret key holding the S3 access key id.
 pub(crate) const S3_ACCESS_KEY_ID_KEY: &str = "accessKeyId";
@@ -738,6 +753,16 @@ fn server_probe_port(spec: &RavelClusterSpec) -> i32 {
     }
 }
 
+/// The server tiers' grace period: longer when the dedicated health listener
+/// adds its stop to the server's shutdown budget.
+fn termination_grace_period_seconds(spec: &RavelClusterSpec) -> i64 {
+    if spec.probes.dedicated_health_port {
+        POD_TERMINATION_GRACE_PERIOD_WITH_HEALTH_PORT_SECONDS
+    } else {
+        POD_TERMINATION_GRACE_PERIOD_SECONDS
+    }
+}
+
 /// [`probes`] parameterized by port, so the ravel-native router (which listens
 /// on its own [`ROUTER_HTTP_PORT`], not the ravel-server `HTTP_PORT`) shares the
 /// exact same `/healthz` `/readyz` probe shape.
@@ -944,7 +969,7 @@ fn deployment(
                 spec: Some(PodSpec {
                     containers: vec![container],
                     volumes: volume.map(|v| vec![v]),
-                    termination_grace_period_seconds: Some(POD_TERMINATION_GRACE_PERIOD_SECONDS),
+                    termination_grace_period_seconds: Some(termination_grace_period_seconds(spec)),
                     security_context: Some(pod_security_context()),
                     affinity: Some(pod_anti_affinity(instance, component)),
                     ..Default::default()
@@ -4187,6 +4212,33 @@ mod tests {
                 .as_ref()
                 .expect("httpGet");
             assert_eq!(get.port, IntOrString::Int(ROUTER_HTTP_PORT));
+        }
+    }
+
+    #[test]
+    fn dedicated_health_port_lengthens_every_server_tier_grace_period() {
+        // With `--listen-health` rendered, the server stops the health
+        // listener (up to 6s) between the drain and the trace flush, so its
+        // SIGTERM-to-exit budget grows to 38.5s and the grace period with it
+        // (POD_TERMINATION_GRACE_PERIOD_WITH_HEALTH_PORT_SECONDS). Disabled,
+        // the value stays exactly today's 45.
+        for (dedicated, expected) in [(false, 45), (true, 51)] {
+            let mut spec = base_spec();
+            spec.probes.dedicated_health_port = dedicated;
+            let ctx = ctx();
+            for dep in [
+                desired_gateway_deployment(&spec, "prod", &ctx),
+                desired_query_deployment(&spec, "prod", &ctx),
+                desired_maintain_deployment(&spec, "prod", &ctx)
+                    .expect("no gc render error")
+                    .expect("enabled"),
+            ] {
+                assert_eq!(
+                    pod_spec_of(&dep).termination_grace_period_seconds,
+                    Some(expected),
+                    "dedicatedHealthPort={dedicated}: wrong terminationGracePeriodSeconds"
+                );
+            }
         }
     }
 

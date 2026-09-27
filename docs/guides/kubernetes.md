@@ -549,7 +549,7 @@ spec:
     dedicatedHealthPort: true
 ```
 
-It changes three things in every gateway, query, and maintain pod, and
+It changes four things in every gateway, query, and maintain pod, and
 nothing anywhere else:
 
 - The container gains `--listen-health 0.0.0.0:4316`. That listener runs on
@@ -560,6 +560,11 @@ nothing anywhere else:
   and, on the gateway, `grpc` (4317).
 - Both probes point at 4316 instead of 4318. The paths, period, timeout, and
   failure threshold are unchanged.
+- `terminationGracePeriodSeconds` goes from 45 to 51. On SIGTERM the server
+  also stops the health listener, between the drain and the trace flush, which
+  takes up to 6s and raises its shutdown budget from 32.5s to 38.5s. The 10s
+  `preStop` sleep plus 38.5s plus 2.5s of headroom is 51s, so SIGKILL cannot
+  land during that stop or the flush.
 
 The same routes stay on 4318 either way, so Grafana, a `curl` in a shell, and
 anything else already probing the HTTP port keeps working. The
