@@ -41,12 +41,12 @@ message ParquetTableManifest {
 
 // One content-addressed data object referenced by a manifest.
 message ParquetFile {
-  // Full object key: `t/<tenant_hash>/pq/d/<dataset>/<hash16>.parquet`.
+  // Full object key: `t/<tenant_hash>/pq/d/<dataset>/<blake3_hex64>.parquet`.
   string key = 1;
   // Object size in bytes, nonzero.
   uint64 size = 2;
-  // BLAKE3 of the object's bytes, 32 bytes. The key's hash16 is the first 16
-  // lowercase hex characters of this digest.
+  // BLAKE3 of the object's bytes, 32 bytes. The key's `<blake3_hex64>` is
+  // this digest as 64 lowercase hex characters.
   bytes blake3 = 3;
   // Row count from the Parquet footer, as the writer read it. The manifest
   // codec does not check it against the object.

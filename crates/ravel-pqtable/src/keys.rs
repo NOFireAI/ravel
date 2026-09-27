@@ -1,14 +1,14 @@
 //! Object keys for Parquet tables (ADR-2040 decision D1):
 //!
 //! ```text
-//! t/<tenant_hash>/pq/d/<dataset>/<hash16>.parquet     data object (content-addressed)
-//! t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm    table manifest version
+//! t/<tenant_hash>/pq/d/<dataset>/<blake3_hex64>.parquet    data object (content-addressed)
+//! t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm         table manifest version
 //! ```
 //!
 //! `<tenant_hash>` is rendered as 32 lowercase hex characters, as
-//! ravel-commit's keys render it, and `<hash16>` is the first 16 lowercase hex
-//! characters of the object's BLAKE3. The parsers accept only the exact text
-//! the builders produce.
+//! ravel-commit's keys render it, and `<blake3_hex64>` is the object's full
+//! 256-bit BLAKE3 as 64 lowercase hex characters, so the key names the bytes.
+//! The parsers accept only the exact text the builders produce.
 
 use ravel_types::TenantHash;
 
@@ -36,7 +36,7 @@ pub enum KeyError {
 pub struct ParsedDataObjectKey {
     pub tenant_hash: TenantHash,
     pub dataset: String,
-    pub hash16: String,
+    pub blake3: [u8; 32],
 }
 
 /// A parsed [`manifest_key`].
@@ -62,12 +62,15 @@ pub fn tenant_manifest_prefix(tenant: &TenantHash) -> String {
     format!("t/{}/pq/t/", tenant.to_hex())
 }
 
-/// First 16 lowercase hex characters of a BLAKE3 digest.
-pub fn hash16(blake3: &[u8; 32]) -> String {
-    hex::encode(&blake3[..8])
+/// Digits in a data key's hex digest: the full 256-bit BLAKE3.
+pub const BLAKE3_HEX_LEN: usize = 64;
+
+/// A BLAKE3 digest as 64 lowercase hex characters.
+pub fn blake3_hex(blake3: &[u8; 32]) -> String {
+    hex::encode(blake3)
 }
 
-/// `t/<tenant_hash>/pq/d/<dataset>/<hash16>.parquet`.
+/// `t/<tenant_hash>/pq/d/<dataset>/<blake3_hex64>.parquet`.
 pub fn dataset_object_key(
     tenant: &TenantHash,
     dataset: &str,
@@ -77,12 +80,13 @@ pub fn dataset_object_key(
     Ok(format!(
         "{}{dataset}/{}{DATA_SUFFIX}",
         tenant_data_prefix(tenant),
-        hash16(blake3)
+        blake3_hex(blake3)
     ))
 }
 
-/// `t/<tenant_hash>/pq/d/<dataset>/`: the objects directly in a dataset, plus
-/// those of any dataset nested under it.
+/// `t/<tenant_hash>/pq/d/<dataset>/`. A recursive LIST of it also returns the
+/// objects of every dataset nested under it; a delimited LIST returns only the
+/// dataset's own.
 pub fn dataset_prefix(tenant: &TenantHash, dataset: &str) -> Result<String, KeyError> {
     validate_dataset(dataset)?;
     Ok(format!("{}{dataset}/", tenant_data_prefix(tenant)))
@@ -149,19 +153,22 @@ fn split_pq_key<'k>(key: &'k str, kind: &str) -> Result<(TenantHash, &'k str), K
 pub fn parse_dataset_object_key(key: &str) -> Result<ParsedDataObjectKey, KeyError> {
     let (tenant_hash, rest) = split_pq_key(key, "d")?;
     let Some((dataset, filename)) = rest.rsplit_once('/') else {
-        return Err(malformed(key, "expected <dataset>/<hash16>.parquet"));
+        return Err(malformed(key, "expected <dataset>/<blake3_hex64>.parquet"));
     };
     validate_dataset(dataset)?;
-    let Some(hash16) = filename.strip_suffix(DATA_SUFFIX) else {
+    let Some(digest) = filename.strip_suffix(DATA_SUFFIX) else {
         return Err(malformed(key, "expected a .parquet suffix"));
     };
-    if hash16.len() != 16 || !is_lower_hex(hash16) {
-        return Err(malformed(key, "hash16 is not 16 lowercase hex characters"));
+    if digest.len() != BLAKE3_HEX_LEN || !is_lower_hex(digest) {
+        return Err(malformed(key, "digest is not 64 lowercase hex characters"));
     }
+    let mut blake3 = [0u8; 32];
+    hex::decode_to_slice(digest, &mut blake3)
+        .map_err(|_| malformed(key, "digest is not valid hex"))?;
     Ok(ParsedDataObjectKey {
         tenant_hash,
         dataset: dataset.to_string(),
-        hash16: hash16.to_string(),
+        blake3,
     })
 }
 
@@ -215,16 +222,17 @@ mod tests {
             format!(
                 "t/{}/pq/d/clickbench/hits/{}.parquet",
                 "a1".repeat(16),
-                &hex::encode(d)[..16]
+                hex::encode(d)
             )
         );
+        assert_eq!(key.rsplit('/').next().map(str::len), Some(64 + 8));
         let parsed = parse_dataset_object_key(&key).expect("parse");
         assert_eq!(
             parsed,
             ParsedDataObjectKey {
                 tenant_hash: TENANT_A,
                 dataset: "clickbench/hits".into(),
-                hash16: hex::encode(d)[..16].to_string(),
+                blake3: d,
             }
         );
         assert_eq!(
@@ -308,25 +316,45 @@ mod tests {
     }
 
     #[test]
+    fn a_hash16_length_key_is_refused() {
+        let d = digest(3);
+        let full = dataset_object_key(&TENANT_A, "hits", &d).expect("key");
+        assert_eq!(parse_dataset_object_key(&full).expect("parse").blake3, d);
+        let short = format!(
+            "t/{}/pq/d/hits/{}.parquet",
+            "a1".repeat(16),
+            &hex::encode(d)[..16]
+        );
+        assert_eq!(
+            parse_dataset_object_key(&short),
+            Err(KeyError::Malformed {
+                key: short.clone(),
+                reason: "digest is not 64 lowercase hex characters",
+            })
+        );
+    }
+
+    #[test]
     fn parsers_refuse_every_other_shape() {
         let th = "a1".repeat(16);
         let upper = "A1".repeat(16);
-        let h16 = "0123456789abcdef";
+        let h64 = "0123456789abcdef".repeat(4);
+        assert!(parse_dataset_object_key(&format!("t/{th}/pq/d/hits/{h64}.parquet")).is_ok());
         let data_bad = [
-            format!("x/{th}/pq/d/hits/{h16}.parquet"),
-            format!("t/{upper}/pq/d/hits/{h16}.parquet"),
-            format!("t/{}/pq/d/hits/{h16}.parquet", "a1".repeat(15)),
-            format!("t/{th}/px/d/hits/{h16}.parquet"),
-            format!("t/{th}/pq/t/hits/{h16}.parquet"),
-            format!("t/{th}/pq/d/{h16}.parquet"),
-            format!("t/{th}/pq/d/Hits/{h16}.parquet"),
-            format!("t/{th}/pq/d/a//{h16}.parquet"),
-            format!("t/{th}/pq/d/hits/{h16}.rseg"),
-            format!("t/{th}/pq/d/hits/0123456789ABCDEF.parquet"),
-            format!("t/{th}/pq/d/hits/0123456789abcde.parquet"),
-            format!("t/{th}/pq/d/hits/0123456789abcdef0.parquet"),
+            format!("x/{th}/pq/d/hits/{h64}.parquet"),
+            format!("t/{upper}/pq/d/hits/{h64}.parquet"),
+            format!("t/{}/pq/d/hits/{h64}.parquet", "a1".repeat(15)),
+            format!("t/{th}/px/d/hits/{h64}.parquet"),
+            format!("t/{th}/pq/t/hits/{h64}.parquet"),
+            format!("t/{th}/pq/d/{h64}.parquet"),
+            format!("t/{th}/pq/d/Hits/{h64}.parquet"),
+            format!("t/{th}/pq/d/a//{h64}.parquet"),
+            format!("t/{th}/pq/d/hits/{h64}.rseg"),
+            format!("t/{th}/pq/d/hits/{}.parquet", h64.to_uppercase()),
+            format!("t/{th}/pq/d/hits/{}.parquet", &h64[..63]),
+            format!("t/{th}/pq/d/hits/{h64}0.parquet"),
             format!("t/{th}/pq/d/hits/"),
-            format!("t/{th}/pq/dd/hits/{h16}.parquet"),
+            format!("t/{th}/pq/dd/hits/{h64}.parquet"),
         ];
         for key in &data_bad {
             assert!(parse_dataset_object_key(key).is_err(), "{key:?} parsed");
