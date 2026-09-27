@@ -70,7 +70,9 @@ hold.
    `flush_est_bytes`, the object-bytes estimate, like `min_flush_bytes`
    (issue #1305). A buffer crosses tiers upward as rows arrive, so a trickle
    that reaches the floor flushes 40 seconds after its oldest row rather
-   than an hour after it.
+   than an hour after it. (The shipped hold is one `flush_tick` short of
+   `max_flush_lifetime`, here and in the diagram below; see the one-tick
+   hold amendment below.)
 
 3. **The hold ceiling is `max_flush_lifetime`, and it is not a separate
    knob.** With the ceiling equal to the lifetime, the worst age of a buffer
@@ -115,6 +117,9 @@ flowchart TD
     IDLE --> O
     HOLD -->|count flushes_by_age_floor| O
 ```
+
+The `HOLD` node's figure is one `flush_tick` short in the shipped code; see
+the one-tick hold amendment below.
 
 ## Rejected alternatives
 
