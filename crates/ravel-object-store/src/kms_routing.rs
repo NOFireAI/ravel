@@ -317,6 +317,15 @@ impl ObjectStoreBackend for KmsRoutingStore {
         self.default.delete(key).await
     }
 
+    /// The default store's observation (ADR-1685 decision 1). Every read goes
+    /// through the default store, so it is the one this process talks to on
+    /// every tick; a per-tenant store only sees traffic for its own tenant's
+    /// writes, and the clock being observed is the endpoint's, which they
+    /// share.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.default.observed_store_time_ns()
+    }
+
     fn capabilities(&self) -> Capabilities {
         // The decorator adds no capability and removes none: routed writes go
         // to stores built from the same config, so the default store's
@@ -330,6 +339,7 @@ impl ObjectStoreBackend for KmsRoutingStore {
 mod tests {
     use super::*;
     use crate::UploadChecksum;
+    use crate::memory::MemoryStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// One recorded operation: which store handled it and the key it saw.
@@ -533,6 +543,25 @@ mod tests {
             .filter(|e| e.store == store)
             .cloned()
             .collect()
+    }
+
+    /// The decorator reports the default store's store-clock observation
+    /// (ADR-1685 decision 1) rather than the trait default. Under
+    /// `--tenant-kms-config` this decorator is what a writer holds, so a `None`
+    /// here would disable the clock-lag check for exactly the deployments that
+    /// route per-tenant writes.
+    #[test]
+    fn observed_store_time_delegates_to_the_default_store() {
+        let default = Arc::new(MemoryStore::new());
+        default.set_observed_store_time_ns(Some(1_700_000_000_123_456_789));
+        let builder: TenantStoreBuilder = Box::new(|_config: &S3Config| {
+            Ok(Box::new(MemoryStore::new()) as Box<dyn ObjectStoreBackend>)
+        });
+        let store = KmsRoutingStore::with_builder(default, base_config(), builder);
+        assert_eq!(
+            store.observed_store_time_ns(),
+            Some(1_700_000_000_123_456_789)
+        );
     }
 
     /// The core routing proof (ADR-0062 decision 1a): tenant A has a configured

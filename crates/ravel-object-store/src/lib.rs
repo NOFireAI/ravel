@@ -511,6 +511,31 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     async fn delete(&self, key: &str) -> Result<(), StoreError>;
 
     fn capabilities(&self) -> Capabilities;
+
+    /// The store's own clock, in unix nanoseconds, as this backend last
+    /// observed it, or `None` when it has no observation (ADR-1685 decision 1).
+    ///
+    /// A writer stamps its ingest-hour bucket from its own clock and has no
+    /// second time source to check that reading against. This is that source:
+    /// a backend that talks to a remote store can report what the store said
+    /// the time was, without an extra request or a new object.
+    ///
+    /// **It is a lower bound on the store's current time, never an estimate of
+    /// it.** The store stamped the value before the response left it, and it
+    /// is not advanced by elapsed time, so it only ever under-reports; a
+    /// caller may use it to bound how far *behind* the store its own clock is,
+    /// and must not use it to bound how far ahead. It can be arbitrarily stale
+    /// in a process that has issued no requests, and is not monotonic: the
+    /// latest observation wins, so a store (or a proxy) that answers one
+    /// request with a wrong `Date` moves it backwards until the next response.
+    ///
+    /// The default is `None`, which is the honest answer for a backend with no
+    /// remote store behind it, so a backend need not implement it. Every
+    /// decorator in this crate delegates to the store it wraps; a decorator
+    /// that did not would silently disable the caller's check.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// A shared handle is itself a backend, forwarding every method to the pointee.
@@ -572,6 +597,10 @@ impl<T: ObjectStoreBackend + ?Sized> ObjectStoreBackend for Arc<T> {
 
     fn capabilities(&self) -> Capabilities {
         (**self).capabilities()
+    }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        (**self).observed_store_time_ns()
     }
 }
 
@@ -1114,5 +1143,101 @@ mod list_all_tests {
             3,
             "five keys at page size 2 is exactly three pages"
         );
+    }
+}
+
+/// [`ObjectStoreBackend::observed_store_time_ns`] (ADR-1685 decision 1) at the
+/// trait boundary: the default, the oracle's test-only setter, and the
+/// `Arc<T>` forwarding impl. Each decorator's own delegation is asserted in its
+/// own module, against the decorator's real constructor.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod observed_store_time_tests {
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::memory::MemoryStore;
+
+    /// A backend that implements only the required methods, so
+    /// `observed_store_time_ns` is the trait's default. Nothing calls its
+    /// operations; they exist because the trait requires them.
+    struct NoObservationStore;
+
+    #[async_trait]
+    impl ObjectStoreBackend for NoObservationStore {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            Err(StoreError::Permanent("not used by this test".into()))
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            Err(StoreError::Permanent("not used by this test".into()))
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            Err(StoreError::Permanent("not used by this test".into()))
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            Err(StoreError::Permanent("not used by this test".into()))
+        }
+
+        async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
+            Err(StoreError::Permanent("not used by this test".into()))
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            Err(StoreError::Permanent("not used by this test".into()))
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::mandatory()
+        }
+    }
+
+    /// A backend that does not implement the method observes nothing, which is
+    /// what makes it a defaulted method rather than a contract change for a
+    /// third-party implementation.
+    #[test]
+    fn the_default_is_no_observation() {
+        assert_eq!(NoObservationStore.observed_store_time_ns(), None);
+    }
+
+    /// The oracle serves no responses, so it observes nothing until a test says
+    /// otherwise, and `None` puts it back.
+    #[test]
+    fn the_oracle_reports_only_what_a_test_sets() {
+        let store = MemoryStore::new();
+        assert_eq!(store.observed_store_time_ns(), None);
+        store.set_observed_store_time_ns(Some(1_700_000_000_000_000_000));
+        assert_eq!(
+            store.observed_store_time_ns(),
+            Some(1_700_000_000_000_000_000)
+        );
+        store.set_observed_store_time_ns(None);
+        assert_eq!(store.observed_store_time_ns(), None);
+    }
+
+    /// The `Arc<T>` impl forwards to the pointee, so an already-type-erased
+    /// `Arc<dyn ObjectStoreBackend>` (what every decorator in `ravel-server`'s
+    /// chain wraps) does not drop the observation on the floor.
+    #[test]
+    fn a_shared_handle_forwards_to_the_pointee() {
+        let inner = MemoryStore::new();
+        inner.set_observed_store_time_ns(Some(42));
+        let shared: Arc<dyn ObjectStoreBackend> = Arc::new(inner);
+        assert_eq!(shared.observed_store_time_ns(), Some(42));
+
+        let erased_twice: Arc<dyn ObjectStoreBackend> = Arc::new(Arc::clone(&shared));
+        assert_eq!(erased_twice.observed_store_time_ns(), Some(42));
     }
 }

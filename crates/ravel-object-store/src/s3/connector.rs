@@ -1,7 +1,8 @@
 //! The HTTP connector the S3 adapter installs below `object_store`'s retry
-//! loop, and the two things it observes there: billed requests (issue #928,
-//! ADR-0927 decision 8) and the stored checksum a GET response carries
-//! (ADR-1696 decisions 2 to 4).
+//! loop, and the three things it observes there: billed requests (issue #928,
+//! ADR-0927 decision 8), the stored checksum a GET response carries
+//! (ADR-1696 decisions 2 to 4), and the store's own clock from each response's
+//! `Date` header (ADR-1685 decision 1).
 //!
 //! `object_store` runs its own retry loop *inside* each logical S3 operation
 //! (`RetryConfig`, default `max_retries = 10`), so one `get()` that retried
@@ -51,9 +52,22 @@
 //! to one `get_one` future, so the concurrently-polled ranged GETs of a split
 //! whole-object read each observe their own response rather than sharing one
 //! cell.
+//!
+//! # Observing the store's clock
+//!
+//! A writer stamps its ingest-hour bucket from its own clock and has no second
+//! time source to check it against (ADR-1685 context). Every S3 response
+//! carries a `Date` header, and this connector is the layer that sees it:
+//! `object_store` 0.14's `GetResult`/`PutResult` expose no response headers.
+//! [`S3HttpService`] parses the header of every response it receives and stores
+//! it in an [`ObservedStoreTime`] shared with the [`S3Store`] above it, which
+//! reports it through `ObjectStoreBackend::observed_store_time_ns`.
+//!
+//! [`S3Store`]: crate::s3::S3Store
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
 use object_store::ClientOptions;
@@ -65,6 +79,7 @@ use reqwest::header::HeaderMap;
 
 use crate::instrument::{StoreMetrics, StoreOp};
 use crate::s3::checksum::{self, ObservedChecksum};
+use crate::s3::http_date::parse_imf_fixdate_ns;
 
 tokio::task_local! {
     /// The [`StoreOp`] the S3 adapter is currently executing, read by
@@ -108,20 +123,74 @@ pub(crate) async fn observe_get<F: Future>(fut: F) -> (F::Output, Option<GetObse
     (output, observed)
 }
 
+/// The store's own clock as the last response from it reported, in unix
+/// nanoseconds (ADR-1685 decision 1).
+///
+/// Shared between the connector, which writes it below `object_store`'s retry
+/// loop, and the [`S3Store`](crate::s3::S3Store) that reports it: one instance
+/// per store, so two stores built against different endpoints observe
+/// different clocks and a test's fake endpoint cannot be overwritten by an
+/// unrelated store in the same process.
+///
+/// **The latest response wins, never a running maximum.** A maximum would
+/// latch one bad header from a proxy for the life of the process; the latest
+/// reading is wrong only until the next response arrives.
+#[derive(Debug)]
+pub(crate) struct ObservedStoreTime {
+    /// The most recent parseable `Date`, or [`Self::UNSET`] before the first
+    /// one. `Relaxed` throughout: this is a single standalone value that
+    /// orders no other memory, and a reader that sees the previous
+    /// observation for a moment reads a slightly staler lower bound, which is
+    /// what a lower bound already tolerates.
+    ns: AtomicI64,
+}
+
+impl ObservedStoreTime {
+    /// No response has carried a parseable `Date` yet. A sentinel rather than
+    /// `0`, which is a representable (if implausible) instant, so "unset" and
+    /// "the epoch" stay distinguishable.
+    const UNSET: i64 = i64::MIN;
+
+    /// The latest observation, or `None` before the first response.
+    pub(crate) fn latest(&self) -> Option<i64> {
+        match self.ns.load(Ordering::Relaxed) {
+            Self::UNSET => None,
+            ns => Some(ns),
+        }
+    }
+
+    /// Record what this response's `Date` said. Unconditional: the newest
+    /// reading replaces whatever was there, older or newer.
+    fn observe(&self, ns: i64) {
+        self.ns.store(ns, Ordering::Relaxed);
+    }
+}
+
+impl Default for ObservedStoreTime {
+    fn default() -> Self {
+        ObservedStoreTime {
+            ns: AtomicI64::new(Self::UNSET),
+        }
+    }
+}
+
 /// An [`HttpConnector`] that wraps the default [`ReqwestConnector`], counts
 /// every HTTP request the client it builds issues into a shared
-/// [`StoreMetrics`] via [`StoreMetrics::record_attempt`], and records each GET
-/// response's stored checksum into the [`observe_get`] slot in scope.
+/// [`StoreMetrics`] via [`StoreMetrics::record_attempt`], records each GET
+/// response's stored checksum into the [`observe_get`] slot in scope, and
+/// records every response's `Date` into the shared [`ObservedStoreTime`].
 #[derive(Debug)]
 pub(crate) struct S3HttpConnector {
     metrics: Arc<StoreMetrics>,
+    store_time: Arc<ObservedStoreTime>,
     inner: ReqwestConnector,
 }
 
 impl S3HttpConnector {
-    pub(crate) fn new(metrics: Arc<StoreMetrics>) -> Self {
+    pub(crate) fn new(metrics: Arc<StoreMetrics>, store_time: Arc<ObservedStoreTime>) -> Self {
         S3HttpConnector {
             metrics,
+            store_time,
             inner: ReqwestConnector::default(),
         }
     }
@@ -140,6 +209,7 @@ impl HttpConnector for S3HttpConnector {
         let inner = self.inner.connect(&unsigned_defaults_removed)?;
         Ok(HttpClient::new(S3HttpService {
             metrics: Arc::clone(&self.metrics),
+            store_time: Arc::clone(&self.store_time),
             inner,
         }))
     }
@@ -147,12 +217,13 @@ impl HttpConnector for S3HttpConnector {
 
 /// The [`HttpService`] [`S3HttpConnector`] builds: record one attempt for the
 /// scoped [`StoreOp`], delegate the request unchanged, then record what the
-/// response said about the object's stored checksum. Delegation is
-/// byte-for-byte the default reqwest path, so neither observation adds
-/// behaviour to the request itself.
+/// response said about the object's stored checksum and about the store's
+/// clock. Delegation is byte-for-byte the default reqwest path, so no
+/// observation adds behaviour to the request itself.
 #[derive(Debug)]
 struct S3HttpService {
     metrics: Arc<StoreMetrics>,
+    store_time: Arc<ObservedStoreTime>,
     inner: HttpClient,
 }
 
@@ -166,14 +237,27 @@ impl HttpService for S3HttpService {
             self.metrics.record_attempt(op);
         }
         let response = self.inner.execute(req).await;
-        if let Ok(response) = &response
-            && let Ok(slot) = GET_OBSERVATION.try_with(Arc::clone)
-            && let Some(observation) = observation_of(response)
-        {
-            *slot.lock() = Some(observation);
+        if let Ok(response) = &response {
+            if let Ok(slot) = GET_OBSERVATION.try_with(Arc::clone)
+                && let Some(observation) = observation_of(response)
+            {
+                *slot.lock() = Some(observation);
+            }
+            // Every response, whatever its status: a 503 comes from the store
+            // and its `Date` is as good a reading of the store's clock as a
+            // 200's. A missing or unparseable header changes nothing.
+            if let Some(ns) = response_date_ns(response.headers()) {
+                self.store_time.observe(ns);
+            }
         }
         response
     }
+}
+
+/// Unix nanoseconds from a response's `Date` header, or `None` when there is
+/// no such header or it is not an IMF-fixdate this can read.
+fn response_date_ns(headers: &HeaderMap) -> Option<i64> {
+    parse_imf_fixdate_ns(headers.get("date")?.to_str().ok()?)
 }
 
 /// What a response says about the object's stored checksum, or `None` for a
@@ -240,5 +324,69 @@ mod tests {
     fn an_unknown_total_is_not_whole_object() {
         assert_eq!(content_range_covers_object("bytes 0-99/*"), None);
         assert_eq!(content_range_covers_object("not a range"), None);
+    }
+
+    /// The `Date` of one response, as the connector reads it off the header
+    /// map. `headers` are `(name, value)` pairs.
+    fn date_of(headers: &[(&str, &str)]) -> Option<i64> {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .expect("test header names are valid");
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .expect("test header values are valid");
+            map.insert(name, value);
+        }
+        response_date_ns(&map)
+    }
+
+    #[test]
+    fn a_responses_date_header_is_read_as_unix_nanoseconds() {
+        assert_eq!(
+            date_of(&[("date", "Sun, 06 Nov 1994 08:49:37 GMT")]),
+            Some(784_111_777_000_000_000)
+        );
+    }
+
+    /// Header names are case-insensitive on the wire; S3 sends `Date`.
+    #[test]
+    fn the_date_header_is_matched_case_insensitively() {
+        assert_eq!(
+            date_of(&[("Date", "Sun, 06 Nov 1994 08:49:37 GMT")]),
+            Some(784_111_777_000_000_000)
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_date_yields_no_observation() {
+        assert_eq!(date_of(&[("etag", "\"abc\"")]), None);
+        assert_eq!(date_of(&[("date", "not-a-valid-date")]), None);
+    }
+
+    #[test]
+    fn an_unset_observation_reads_none() {
+        assert_eq!(ObservedStoreTime::default().latest(), None);
+    }
+
+    /// The latest response wins. An older `Date` after a newer one replaces
+    /// it, because a maximum would latch one bad header from a proxy for the
+    /// life of the process (ADR-1685 decision 1).
+    #[test]
+    fn a_later_observation_replaces_an_earlier_one_in_both_directions() {
+        let observed = ObservedStoreTime::default();
+        observed.observe(2_000);
+        assert_eq!(observed.latest(), Some(2_000));
+        observed.observe(1_000);
+        assert_eq!(observed.latest(), Some(1_000));
+        observed.observe(3_000);
+        assert_eq!(observed.latest(), Some(3_000));
+    }
+
+    /// The epoch is a real reading, not the "no observation yet" sentinel.
+    #[test]
+    fn an_observation_of_zero_is_an_observation() {
+        let observed = ObservedStoreTime::default();
+        observed.observe(0);
+        assert_eq!(observed.latest(), Some(0));
     }
 }

@@ -1035,6 +1035,13 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
+
+    /// Passthrough (ADR-1685 decision 1). The fault plan scripts operation
+    /// outcomes, not the store's clock; a test that needs a clock observation
+    /// sets it on the wrapped backend.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
+    }
 }
 
 #[cfg(test)]
@@ -1043,6 +1050,20 @@ mod tests {
     use super::*;
     use crate::UploadChecksum;
     use crate::memory::MemoryStore;
+
+    /// The wrapper reports the wrapped backend's store-clock observation
+    /// (ADR-1685 decision 1), so a failure-path test can drive a caller's
+    /// clock check and its fault plan through one store.
+    #[test]
+    fn observed_store_time_delegates_to_the_inner_store() {
+        let inner = MemoryStore::new();
+        inner.set_observed_store_time_ns(Some(1_700_000_000_123_456_789));
+        let store = FaultStore::new(inner, FaultPlan::empty());
+        assert_eq!(
+            store.observed_store_time_ns(),
+            Some(1_700_000_000_123_456_789)
+        );
+    }
 
     #[tokio::test]
     async fn empty_plan_is_fully_transparent() {

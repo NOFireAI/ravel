@@ -56,6 +56,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writes keep the fast clock. `ravel-server` does not expose the knob yet, so
   no deployment's flush cadence or buffered-mode loss window changes with this
   release.
+- **The S3 adapter observes the store's own clock from response `Date`
+  headers** (ADR-1685 decision 1, issue #1685). A writer stamps its
+  ingest-hour bucket from its own clock and has had no second time source to
+  check that reading against, so a host lagging the folder's clock publishes
+  acknowledged commit records into an hour the fold has already sealed. Every
+  S3 response carries the store's clock in its `Date` header, and the HTTP
+  connector this adapter installs below `object_store`'s retry loop is the
+  only layer that sees it. `ObjectStoreBackend` gains a defaulted
+  `observed_store_time_ns() -> Option<i64>` returning `None`; `S3Store`
+  returns the latest response's `Date` as unix nanoseconds, or `None` before
+  its first response. Every response counts, an error one included; the latest
+  response wins rather than a running maximum, so one wrong header from a
+  proxy is corrected by the next response instead of latching for the life of
+  the process; and a missing or unparseable `Date` leaves the previous
+  observation standing. The value is a lower bound on the store's current
+  time, never an estimate of it, and it costs no extra request and no new
+  object. Every decorator in the crate delegates to the store it wraps, and
+  `MemoryStore` reports `None` unless a test sets one through the
+  `test-support` setter. Nothing consults the observation yet: the writer's
+  clock-lag refusal (ADR-1685 decision 2) lands separately, so no flush
+  behavior changes with this release.
 
 ## [0.19.0] - 2026-09-27
 

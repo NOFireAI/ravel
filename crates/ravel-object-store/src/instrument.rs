@@ -693,12 +693,35 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
+
+    /// Passthrough (ADR-1685 decision 1). Answering `None` here would leave a
+    /// wrapped S3 store's observation invisible to the writer's clock-lag
+    /// check, silently disabling it for every production process, since
+    /// `ravel-server` wraps its backend in this decorator unconditionally.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The decorator reports the wrapped backend's store-clock observation
+    /// rather than the trait default (ADR-1685 decision 1). `ravel-server`
+    /// wraps every backend in this, so a `None` here would disable the
+    /// writer's clock-lag check in every production process.
+    #[test]
+    fn observed_store_time_delegates_to_the_inner_store() {
+        let inner = crate::memory::MemoryStore::new();
+        inner.set_observed_store_time_ns(Some(1_700_000_000_123_456_789));
+        let store = InstrumentedStore::new(inner);
+        assert_eq!(
+            store.observed_store_time_ns(),
+            Some(1_700_000_000_123_456_789)
+        );
+    }
 
     #[test]
     fn op_and_error_class_indices_are_dense_and_stable() {

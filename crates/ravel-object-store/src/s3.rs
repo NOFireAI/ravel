@@ -129,8 +129,10 @@ use instance_role::{DEFAULT_IMDS_ENDPOINT, InstanceRoleCredentialProvider};
 mod checksum;
 use checksum::{CHECKSUM_MODE_ENABLED, CHECKSUM_MODE_HEADER, ObservedChecksum};
 
+mod http_date;
+
 mod connector;
-use connector::{GetObservation, S3HttpConnector};
+use connector::{GetObservation, ObservedStoreTime, S3HttpConnector};
 
 use crate::instrument::{StoreMetrics, StoreOp};
 
@@ -882,6 +884,13 @@ pub struct S3Store {
     /// through [`S3Store::get_unverified`] but shared with nothing, so a
     /// scrape path still sees only what it wired up.
     metrics: Arc<StoreMetrics>,
+    /// The store's own clock as the last response this store received reported
+    /// it (ADR-1685 decision 1), written by the HTTP connector below
+    /// `object_store`'s retry loop and read by
+    /// [`ObjectStoreBackend::observed_store_time_ns`]. Per store rather than
+    /// per process: two stores pointed at different endpoints observe
+    /// different clocks.
+    store_time: Arc<ObservedStoreTime>,
 }
 
 impl S3Store {
@@ -943,8 +952,12 @@ impl S3Store {
         // unchanged, so this changes what is observed, never how a request
         // runs; `retry`/`RetryConfig` stay at `object_store`'s defaults.
         let metrics = attempt_metrics.unwrap_or_default();
+        let store_time: Arc<ObservedStoreTime> = Arc::default();
         let store = builder
-            .with_http_connector(S3HttpConnector::new(Arc::clone(&metrics)))
+            .with_http_connector(S3HttpConnector::new(
+                Arc::clone(&metrics),
+                Arc::clone(&store_time),
+            ))
             .build()
             .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
         Ok(S3Store {
@@ -957,6 +970,7 @@ impl S3Store {
             multipart_uploads_unreaped: AtomicU64::new(0),
             upload_integrity,
             metrics,
+            store_time,
         })
     }
 
@@ -2261,6 +2275,18 @@ impl ObjectStoreBackend for S3Store {
             // maintain` starts against an S3-compatible backend.
             multipart: true,
         }
+    }
+
+    /// The `Date` of the last response this store received, in unix
+    /// nanoseconds, or `None` before the first one (ADR-1685 decision 1).
+    ///
+    /// Every S3 response carries a `Date`, including an error response, so any
+    /// completed request seeds this, not only a successful one. The value is
+    /// whatever the *latest* response said: never a running maximum, so an
+    /// endpoint or proxy that answers one request with a wrong `Date` affects
+    /// only the readings taken before the next response arrives.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.store_time.latest()
     }
 }
 
