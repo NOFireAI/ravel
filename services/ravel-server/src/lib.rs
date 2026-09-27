@@ -763,9 +763,9 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// Whether a catalog fold can run in this process at all, by EITHER route:
-    /// the background fold task ([`fold::spawn`], which [`start`] skips in
-    /// [`Mode::Maintain`] and which returns [`fold::FoldTasks::none`] under
-    /// `--disable-fold`), or the on-demand route
+    /// the background fold task ([`fold::spawn`], which [`start`] spawns only
+    /// in the modes [`Mode::runs_scheduled_fold`] names and which returns
+    /// [`fold::FoldTasks::none`] under `--disable-fold`), or the on-demand route
     /// ([`Mode::mounts_on_demand_fold`], mounted regardless of
     /// `--disable-fold`).
     ///
@@ -777,7 +777,7 @@ impl ServerConfig {
     /// folds through the route: `--mode all --disable-fold` accumulated
     /// coverage while rendering no family at all.
     pub fn folds_in_process(&self) -> bool {
-        let background_task = !matches!(self.mode, Mode::Maintain) && self.fold.enabled;
+        let background_task = self.mode.runs_scheduled_fold() && self.fold.enabled;
         background_task || self.mode.mounts_on_demand_fold()
     }
 }
@@ -2338,6 +2338,12 @@ pub async fn start(
     // others it stays at the zero every counter starts from.
     let reconcile_cycle_metrics = Arc::new(admission_reconcile::ReconcileCycleMetrics::default());
 
+    // Built in every mode for the same reason, and handed to `fold::spawn`
+    // below in the modes that schedule a fold. In the others nothing restarts a
+    // loop that was never spawned, so it stays at the zero every counter starts
+    // from, and the render gate omits it anyway.
+    let fold_loop_metrics = Arc::new(fold::FoldLoopMetrics::default());
+
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
@@ -2387,6 +2393,7 @@ pub async fn start(
         // below read: `fold.enabled` plus the mode for the spawn gate, and
         // `Mode::mounts_on_demand_fold` for the route's mount gate.
         can_fold: config.folds_in_process(),
+        fold_loop: fold_loop_metrics.clone(),
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register
@@ -2897,28 +2904,64 @@ pub async fn start(
     // with nothing above.
     http_router = http_router.merge(metrics::router(metrics_state));
 
-    // Fold optimizes query-resolve cost; a maintain-only process serves no
-    // query surface, so folding would be wasted work. Skip it in maintain mode
-    // and run the maintenance loop instead. The two are independent background
-    // loops over the same tenant list, and no non-maintain mode runs
-    // maintenance.
+    // Fold is scheduled work over the same tenant/signal pairs the maintenance
+    // loop walks, so it runs where those pairs are already partitioned:
+    // `Mode::Maintain` (sharing the membership below) and `Mode::All` (a solo
+    // process that owns everything). A gateway or query process scales on
+    // request load, and an extra replica there used to mean another full copy
+    // of the fold; it keeps only the on-demand route (ADR-1693 decisions 1
+    // to 3).
+    //
     // One `WorkerSet` for the whole maintain-role process (ADR-0065 decision
     // 1): a single membership identity shared by the maintenance supervisor
-    // (which writes the heartbeat on its `H` cadence) and the scrub loop (which
-    // only reads the resulting live set to gate ownership). Constructed
-    // unconditionally (it's cheap: a UUID and config, no I/O), but only ever
-    // wired into a running loop below when Mode::Maintain. Its `process_id` is
-    // what the rendezvous hash resolves ownership against, so the two loops
-    // must share one, never mint separate ones (that would make one process
-    // look like two workers to the fleet).
+    // (which writes the heartbeat on its `H` cadence), the scrub loop, and the
+    // scheduled fold (both of which only read the resulting live set to gate
+    // ownership). Constructed unconditionally (it's cheap: a UUID and config,
+    // no I/O). Its `process_id` is what the rendezvous hash resolves ownership
+    // against, so every loop must share one, never mint separate ones (that
+    // would make one process look like several workers to the fleet).
     let maintain_worker = Arc::new(ravel_maintain::WorkerSet::new(
         <SystemClock as ravel_ingest::Clock>::now_ns(&SystemClock),
         config.maintain.heartbeat_interval,
         ravel_maintain::worker_set::DEFAULT_LIVENESS_FACTOR,
         config.maintain.unit_concurrency,
     ));
+    // The membership view both loops partition against. The maintenance
+    // heartbeat task publishes every freshly computed live set here; the fold
+    // reads the latest value at the top of each tick. It starts as this
+    // process's solo set, which is also the value it keeps for the whole
+    // lifetime of a `Mode::All` process (nothing publishes there), so that
+    // process owns every unit and folds everything (ADR-1693 decision 3).
+    let (live_set_tx, live_set_rx) = tokio::sync::watch::channel(maintain_worker.solo_live_set());
+    let live_set_tx = Arc::new(live_set_tx);
+    // The one blessed wall clock for both loops: the fold reads the same
+    // instance the maintenance context injects rather than a second clock of
+    // its own (ADR-1693 decision 6).
+    let maintain_clock: Arc<dyn ravel_maintain::Clock> = Arc::new(maintain::WallClock);
 
-    let (fold_tasks, maintenance_tasks) = if matches!(config.mode, Mode::Maintain) {
+    let fold_tasks = if config.mode.runs_scheduled_fold() {
+        // Background class (ADR-0070): fold is deferred maintenance traffic.
+        // The fold's retention-frontier reconcile shares the same CLI-derived
+        // RetentionConfig the Maintain-mode sweep uses (ADR-0078), so a tenant
+        // configured only by --retention-default/--retention-tenant still gets
+        // frontier-reconciled even with no durable TenantConfig.retention_ns.
+        let fold_retention = Arc::new(config.maintain.retention.clone());
+        fold::spawn(
+            catalog.clone(),
+            store_background.clone(),
+            &config.fold_tenants,
+            config.fold,
+            fold_retention,
+            maintain_worker.clone(),
+            live_set_rx,
+            maintain_clock.clone(),
+            fold_loop_metrics.clone(),
+        )
+    } else {
+        fold::FoldTasks::none()
+    };
+
+    let maintenance_tasks = if matches!(config.mode, Mode::Maintain) {
         let discovery_metrics = tenant_discovery_metrics
             .clone()
             .unwrap_or_else(|| Arc::new(tenant_discovery::TenantDiscoveryMetrics::default()));
@@ -2936,7 +2979,7 @@ pub async fn start(
         // skew-uncovered horizon fails startup fail-closed, before any listener
         // binds, rather than letting the sweeper delete a pinned reader's
         // snapshot.
-        let maintenance_tasks = maintain::spawn(
+        maintain::spawn(
             // Background class (ADR-0070): compaction, retention sweep, and
             // audit retention all run under the maintenance handle.
             store_background.clone(),
@@ -2947,26 +2990,14 @@ pub async fn start(
             safety_metrics,
             ownership_metrics,
             maintain_worker.clone(),
+            live_set_tx.clone(),
+            maintain_clock.clone(),
         )
         .map_err(|e| {
             anyhow::anyhow!("maintain GC-config skew re-assert failed against sys/gc: {e}")
-        })?;
-        (fold::FoldTasks::none(), maintenance_tasks)
+        })?
     } else {
-        // Background class (ADR-0070): fold is deferred maintenance traffic.
-        // The fold's retention-frontier reconcile shares the same CLI-derived
-        // RetentionConfig the Maintain-mode sweep uses (ADR-0078), so a tenant
-        // configured only by --retention-default/--retention-tenant still gets
-        // frontier-reconciled even with no durable TenantConfig.retention_ns.
-        let fold_retention = Arc::new(config.maintain.retention.clone());
-        let fold_tasks = fold::spawn(
-            catalog,
-            store_background.clone(),
-            &config.fold_tenants,
-            config.fold,
-            fold_retention,
-        );
-        (fold_tasks, maintain::MaintenanceTasks::none())
+        maintain::MaintenanceTasks::none()
     };
 
     let listener = tokio::net::TcpListener::bind(config.listen_http).await?;

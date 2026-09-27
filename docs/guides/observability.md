@@ -307,34 +307,63 @@ an explicit isolation-fault error. [Troubleshooting](operations/troubleshooting.
 
 ### Catalog fold liveness (`ravel_catalog_fold_*`)
 
-Labels: `mode`, `signal`. All three families render in every mode, with one
-series per folded signal (`metrics`, `logs`, `spans`), but only the processes
-that actually fold ever move them. Two things stop the background fold loop:
-the `maintain` mode, which never spawns it, and `--disable-fold`, which
-returns no fold tasks in any mode. The on-demand fold route is mounted only
-in `all` and `query`. A `maintain` process, and any process run with
-`--disable-fold`, therefore reports zeros permanently.
+Labels: `mode`, `signal`. Which of the four a process renders follows from
+the routes by which that mode can fold, with one series per folded signal
+(`metrics`, `logs`, `spans`):
+
+- `maintain` and `all` run the scheduled fold and render all four.
+- `query` renders the two counters and neither the gauge nor the restart
+  counter. It folds only when someone calls the on-demand
+  `POST /api/v1/admin/fold` route it keeps, so an on-demand fold's failures
+  there are visible on `/metrics`, but nothing makes such a fold recur: a
+  liveness gauge would be stale by construction on a healthy process, and
+  there is no scheduled loop there to restart.
+- `gateway` renders none of the four. It mounts no fold route at all and so
+  folds by neither route.
+
+The rule is the mode alone. `--disable-fold` still stops the loop inside a
+folding mode, which returns no fold tasks; such a process renders all four
+families and reports zeros permanently.
 
 The `ravel_catalog_fold_stamped_*` pair shares this prefix and is not part of
 this family. It is stamp coverage, documented under declared-column
-statistics below, and unlike the three liveness families it is omitted rather
-than rendered as zeros on any process that can fold by neither route -- a
-`maintain` process, and a `gateway` process run with `--disable-fold`.
+statistics below, and it follows a different rule: it is omitted rather than
+rendered as zeros on any process that can fold by neither route -- a
+`maintain` or `all` process run with `--disable-fold`, and a `gateway`
+process (which mounts no on-demand route either).
 
 The `signal` label is the family's per-signal keying, not a convenience. The
-fold runs as one independent task per signal, each with its own loop and no
-supervisor, so one signal's fold can stop while the other two keep running.
-Process-global families read as healthy throughout that, because the two
-surviving loops keep the shared figures fresh: the span history stops sealing,
-the unsealed span grows, and nothing moves. One series per signal removes that
-blind spot, and the cardinality is three values per process, the same closed
-set `signal` already carries on the ingest and postings families.
+fold runs as one independent task per signal, each with its own loop, so one
+signal's fold can stop while the other two keep running. Process-global
+families read as healthy throughout that, because the two surviving loops keep
+the shared figures fresh: the span history stops sealing, the unsealed span
+grows, and nothing moves. One series per signal removes that blind spot, and
+the cardinality is three values per process, the same closed set `signal`
+already carries on the ingest and postings families.
+
+Each of those loops runs under a supervisor. A panic in a tick body is caught,
+counted on `ravel_catalog_fold_loop_restarts_total` for that signal, logged at
+error level, and the loop is respawned after a bounded backoff that doubles
+from 1 s to 60 s and resets once an attempt completes a tick. A respawned
+attempt ticks as soon as its backoff ends, not after a further fold interval.
+A single transient panic therefore costs one skipped tick, not the loop. A
+loop that panics every tick keeps restarting and folds nothing, and that state
+is what the restart counter and `RavelCatalogFoldLoopCrashLooping` below exist
+to report. At the defaults such a loop restarts at 0, 1, 3, 7, 15, 31, 63 and
+123 s after its first panic and every 60 s after that: 20 restarts in its
+first 15 minutes and 15 in every 15 minutes after, against the rule's
+threshold of more than 5 in 15m, which it crosses 31 s after the first panic.
+A single transient panic counts 1, and a loop that panics on every other tick
+counts about 3 per 15 minutes, one per fold interval, so neither fires. The liveness gauge cannot report it, because the replica keeps
+heartbeating and so keeps its pairs while its peers hold the fleet-wide
+maximum fresh.
 
 | Metric | Meaning |
 |---|---|
 | `ravel_catalog_fold_cycles_total` | Catalog folds of this signal that completed successfully, no-op folds included. |
 | `ravel_catalog_fold_failures_total` | Catalog folds of this signal that failed. The fold retries on the next tick and never fails a query directly. |
 | `ravel_catalog_fold_last_success_timestamp_seconds` | Gauge. Unix time of the last successful fold of this signal in this process, `0` if none has succeeded since it started. |
+| `ravel_catalog_fold_loop_restarts_total` | This signal's fold loop caught panicking and restarted by its supervisor in this process. Rendered under the same rule as the gauge above: only where the fold runs on a schedule. |
 
 A no-op fold counts as a cycle and advances the gauge. That is deliberate: a
 fold seals an ingest hour only once `max_flush_lifetime +
@@ -379,10 +408,17 @@ page is checked against nothing; the shipped file's own annotations are.
 groups:
   - name: ravel-catalog-fold
     # RavelCatalogFoldStalled fires on any deployment where some signal has
-    # no fresh fold, which includes a fleet that never folds at all: an
-    # intentionally maintain-only fleet, or one running --disable-fold
-    # everywhere. Such a fleet must drop this rule or inhibit it; the state
-    # walkthrough below explains why that opt-out is deliberate.
+    # no fresh fold, which includes a fleet that never folds at all: a fleet
+    # running neither --mode maintain nor --mode all (the two modes that fold
+    # on a timer, ADR-1693), or one running --disable-fold everywhere. Such a
+    # fleet must drop this rule or inhibit it; the state walkthrough below
+    # explains why that opt-out is deliberate. A gateway-only or query-only
+    # fleet is in that class. Neither mode renders
+    # ravel_catalog_fold_last_success_timestamp_seconds, so the `absent()` arm
+    # is what fires there. A query process does render
+    # ravel_catalog_fold_cycles_total and _failures_total, for the on-demand
+    # `POST /api/v1/admin/fold` route it keeps; a gateway process folds by no
+    # route and emits no fold series at all.
     rules:
       - alert: RavelCatalogFoldStalled
         expr: |
@@ -408,6 +444,39 @@ groups:
             ravel_catalog_fold_failures_total for the same signal for a fold
             that is running and failing, and the fold task's logs for the
             underlying store error.
+      - alert: RavelCatalogFoldLoopCrashLooping
+        # The shape RavelCatalogFoldStalled cannot catch since the fold became
+        # partitioned. A replica whose loop for one signal keeps panicking goes
+        # on heartbeating, so it stays in the live set and keeps its pairs,
+        # while its peers' fresh gauges hold max by (signal) under the stalled
+        # threshold. This counter is the only figure that moves.
+        # At the defaults (300 s fold interval, restart backoff 1 s doubling
+        # to 60 s) a restarted attempt ticks as soon as its backoff ends, so
+        # a loop panicking on every tick restarts at 0, 1, 3, 7, 15, 31, 63
+        # and 123 s after its first panic and every 60 s after that: 20
+        # restarts in its first 15m and 15 in every 15m after. A single
+        # transient panic is 1, and a loop panicking on every other tick is
+        # about 3, one per fold interval. More than 5 is crossed 31 s into a
+        # crash loop and stays crossed, so the alert fires about 15.5 minutes
+        # after the loop starts panicking, plus scrape and evaluation delay.
+        # Panics only: a tick hung on a store call that never returns moves
+        # no counter here.
+        expr: |
+          increase(ravel_catalog_fold_loop_restarts_total[15m]) > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel catalog fold loop for {{ $labels.signal }} is panicking and
+            restarting repeatedly
+          description: >-
+            The supervisor is catching a panic and restarting this signal's
+            fold loop faster than the loop is making progress, so the pairs
+            this replica owns are going unfolded while the rest of the fleet
+            looks healthy. Read this process's logs for the panic itself. No
+            aggregation, unlike RavelCatalogFoldStalled: the point is the one
+            replica, and a peer's health must not average it away.
       - alert: RavelCatalogFoldFailing
         expr: |
           sum by (signal) (rate(ravel_catalog_fold_failures_total[15m])) > 0
@@ -426,11 +495,13 @@ groups:
 `max by (signal)`, not a bare `max()` and not a per-instance comparison. The
 grouping and the aggregation answer two different questions.
 
-The aggregation is fleet-wide because the fold loop skips its tick entirely
-when `HEAD` is already fresher than `fold_interval`. A replica whose peers are
-folding on schedule correctly does no folding of its own, and its own gauge is
-correctly stale; the fleet-wide maximum is the figure that answers "is this
-catalog being folded."
+The aggregation is fleet-wide because a replica legitimately folds only part
+of the fleet's work, or none of it. Each `maintain` process owns the
+tenant/signal pairs the rendezvous hash assigns it, so a pair it
+does not own is folded by a peer and never stamps its gauge, and the loop
+also skips its tick entirely when `HEAD` is already fresher than
+`fold_interval`. Either way a replica's own gauge can be correctly stale; the
+fleet-wide maximum is the figure that answers "is this catalog being folded."
 
 The grouping is by `signal` because there is no such thing as "the fold" to be
 alive or dead. There are three independent fold loops per process, one per
@@ -459,53 +530,86 @@ because there is no series to take one from; an alert from it renders an empty
 `{{ $labels.signal }}` and means the whole family stopped arriving, not that
 one signal stalled.
 
-Neither operand filters `mode`. Earlier revisions of this rule carried
-`mode!="maintain"` on both, and it is behaviour-neutral here: `render_catalog_family`
-runs in every mode, so a co-scraped `maintain` process contributes a permanent
-`0` to each signal's group, and `0` can never win a `max()` against any live
-gauge. Where the filter used to matter was a folding fleet that died beside a
-surviving `maintain` node, and the unfiltered form covers that state too, just
-through the other operand: the `0` is the only sample left in each group, so
-`time() - 0` clears any threshold and the staleness operand fires where the
-filtered form needed `absent()` to. Every state below is identical under both
-forms, so the rule carries the simpler expression. The filter also cannot be
-what makes an intentionally non-folding fleet quiet: such a fleet pages under
-both forms, for the reason in the opt-out paragraph below.
+Neither operand filters `mode`, and no `mode` filter would be correct.
+`maintain` is a folding mode: it runs the scheduled fold over the
+tenant/signal pairs the rendezvous hash assigns it, so its gauge is a live
+figure and an earlier `mode!="maintain"` filter would now discard the only
+fresh sample on a maintenance-only fleet. The modes that do not fold on a
+timer, `gateway` and `query`, render no fold series at all, so they cannot
+contribute a `0` that a filter would have to exclude either: the renderer
+does the mode selection, and the expression stays a plain aggregation over
+whatever series exist.
 
 The states, of the observed system rather than of the expression:
 
 | What the fleet is doing | Series at the scrape | Staleness operand | `absent()` operand | Alert |
 |---|---|---|---|---|
 | Nothing scraped at all | none | empty | fires | **fires** |
-| Only `maintain` nodes scraped, intentionally | 3, all `mode="maintain"` at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
-| Healthy folding fleet | 3 per process, all fresh | under threshold for all 3 signals | silent | silent |
-| Folding fleet scraped, every fold loop stalled | 3 per process, all stale | over threshold for all 3 signals | silent | **fires** |
-| Folding fleet dead, co-scraped `maintain` alive | 3, all `mode="maintain"` at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** |
-| One signal's loop dead, other two healthy | 3 per process; 2 fresh, 1 stale | over threshold for that one signal | silent | **fires** for that signal |
-| `--disable-fold` on every non-`maintain` process | 3 per process, all at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
-| Fleet whose tenants write only one signal | 3 per process, all fresh | under threshold for all 3 signals | silent | silent |
+| Only `gateway` and `query` nodes scraped, intentionally | none | empty | fires | **fires** (opt out) |
+| Healthy folding fleet | 3 per `maintain`/`all` process; fresh on every replica that owns pairs | under threshold for all 3 signals | silent | silent |
+| Healthy fleet, one `maintain` replica the hash gives no pairs | 3 on that replica, all at `0`; fresh on its peers | under threshold: the fleet-wide max is a peer's fresh sample | silent | silent |
+| Folding fleet scraped, every fold loop stalled | 3 per folding process, all stale | over threshold for all 3 signals | silent | **fires** |
+| Every `maintain` node dead, `gateway`/`query` nodes alive | none | empty | fires | **fires** |
+| One signal's loop crash-looping on every folding replica | 3 per folding process; 2 fresh, 1 stale | over threshold for that one signal | silent | **fires** for that signal |
+| One signal's loop crash-looping on one replica of several | 3 per folding process; the peers' stay fresh | under threshold: the fleet-wide max is a peer's | silent | silent; `RavelCatalogFoldLoopCrashLooping` is what fires |
+| `--disable-fold` on every folding process | 3 per folding process, all at `0` | `time() - 0` over threshold for all 3 signals | silent | **fires** (opt out) |
+| Fleet whose tenants write only one signal | 3 per folding process, all fresh | under threshold for all 3 signals | silent | silent |
 
-The last row is the one that would be a false page if the gauge tracked
-published snapshots rather than fold cycles. Every loop folds every discovered
-tenant for its own signal every tick; a fold over a signal a tenant never
-writes is a healthy no-op cycle and stamps the gauge like any other. A fleet
-ingesting only logs still has all three gauges fresh.
+The "Healthy fleet, one `maintain` replica the hash gives no pairs" row is
+why "all fresh" is not the healthy shape. A `maintain` replica the rendezvous
+hash gives no `(tenant, signal)` pair for a signal folds nothing for it, never
+stamps that gauge, and reports the `0` sentinel for its whole process life.
+That is correct and it is why the aggregation is fleet-wide; per-instance
+staleness is not a usable condition here.
+
+The "One signal's loop crash-looping on one replica of several" row is the
+blind spot the restart counter fills. One replica's loop can be dead, or
+restarting faster than it folds, while the pairs the hash gives it go
+unsealed, and `max by (signal)` reports a peer's fresh sample throughout. `RavelCatalogFoldLoopCrashLooping` is deliberately unaggregated
+for that reason.
+
+That supervision covers panics only. A tick that hangs, on a store call that
+never returns for example, neither panics nor completes, so the restart
+counter does not move and `RavelCatalogFoldLoopCrashLooping` stays silent.
+What does stop is that replica's own
+`ravel_catalog_fold_last_success_timestamp_seconds` and
+`ravel_catalog_fold_cycles_total` for the signal, while its peers' keep
+moving. No shipped alert catches a hung loop on one replica of several:
+`RavelCatalogFoldStalled` reads `max by (signal)`, so a peer's fresh sample
+holds it under its threshold exactly as in the "One signal's loop
+crash-looping on one replica of several" row, and it fires only once every
+folding replica's loop for that signal is stalled, which includes a
+deployment with one folding process. A per-replica staleness rule
+is not shipped because that gauge standing still is also the healthy reading
+of a replica the hash gives no pairs, and of one that owned pairs and lost them
+to a scale-up; this family exports nothing that tells those apart from a hung
+loop. Detecting it takes a per-instance look at that gauge, read against which
+replicas are expected to own pairs.
+
+The "Fleet whose tenants write only one signal" row is the one that would be
+a false page if the gauge tracked published snapshots rather than fold
+cycles. Every loop folds every discovered tenant it owns for its own signal
+every tick; a fold over a signal a tenant
+never writes is a healthy no-op cycle and stamps the gauge like any other. A
+fleet ingesting only logs still has all three gauges fresh on the replicas
+that own pairs.
 
 Do any two rows produce identical telemetry while meaning different things?
 Yes, two pairs, and both are deliberate:
 
-- "Only `maintain` nodes scraped, intentionally" and "folding fleet dead,
-  co-scraped `maintain` alive" are byte-for-byte identical at the scrape: three
-  `mode="maintain"` series at `0` and nothing else. No arrangement of these
-  operands can tell an intended topology from a fleet-wide death, because the
-  dead processes' series are gone and absence carries no intent.
+- "Only `gateway` and `query` nodes scraped, intentionally" and "every
+  `maintain` node dead" are byte-for-byte identical at the scrape: no fold
+  series at all. No arrangement of these operands can tell an intended
+  topology from a fleet-wide death, because the dead processes' series are
+  gone and absence carries no intent.
 - "`--disable-fold` everywhere" and "every fold loop crashed before its first
   success" are likewise identical: every gauge at its `0` sentinel under a full
-  set of non-`maintain` series.
+  set of folding-mode series.
 
 Both pairs resolve the same way, and the rule fires loud on all four. A fleet
-that never folds -- maintain-only, or `--disable-fold` everywhere -- must opt
-out by dropping `RavelCatalogFoldStalled` or inhibiting it (the group comment
+that never folds -- one running neither `maintain` nor `all`, or
+`--disable-fold` everywhere -- must opt out by dropping
+`RavelCatalogFoldStalled` or inhibiting it (the group comment
 on the rule marks this). `--disable-fold` is documented elsewhere as a pure
 query-cost optimization, so an operator who sets it deliberately should expect
 this rule to page about ten minutes after start and should silence it as part

@@ -2543,6 +2543,12 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "CanonicalTenantResolverMissing".to_string(),
             err.to_string(),
         ),
+        // The retired `spec.gateway.fold` block (ADR-1693). Its own reason,
+        // because the remedy is an edit to the CR and the message already
+        // names the field that replaces it.
+        Error::Render(RenderError::GatewayFoldUnsupported) => {
+            ("GatewayFoldUnsupported".to_string(), err.to_string())
+        }
         // The refusal names `spec.storage.s3.allowHttp` and the remedy in its
         // own Display (issue #1707), so the condition message is the error
         // text: an operator reading `kubectl describe ravelcluster` learns the
@@ -2957,6 +2963,22 @@ mod tests {
             degraded_reason(&Error::Render(RenderError::CanonicalTenantResolverMissing));
         assert_eq!(reason, "CanonicalTenantResolverMissing");
         assert!(!message.is_empty(), "message carries the error text");
+    }
+
+    /// ADR-1693: a cluster still carrying `spec.gateway.fold` learns that the
+    /// field moved from the condition on the RavelCluster, not from the absence
+    /// of a flag on a pod that looks healthy.
+    #[test]
+    fn degraded_reason_names_the_retired_gateway_fold_field() {
+        let (reason, message) =
+            degraded_reason(&Error::Render(RenderError::GatewayFoldUnsupported));
+        assert_eq!(reason, "GatewayFoldUnsupported");
+        for needle in ["spec.gateway.fold", "spec.maintain.fold"] {
+            assert!(
+                message.contains(needle),
+                "the condition message must name {needle}, got: {message}"
+            );
+        }
     }
 
     /// Issue #1707 finding 2: the plaintext-endpoint refusal reaches the
