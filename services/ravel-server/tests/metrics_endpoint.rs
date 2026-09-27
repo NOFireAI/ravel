@@ -283,16 +283,16 @@ async fn metrics_store_probe_last_run_gauge_on_rendered_metrics() {
 ///
 /// The per-carrier drop tally renders in every mode: its four carriers are
 /// read by four different subsystems, and `compaction-part` is observed in
-/// exactly the mode that folds nothing, so gating it on folding would hide a
+/// exactly the mode that compacts, so gating it on folding would hide a
 /// defect signal where it is most likely to appear. The fold stamp-coverage
 /// pair renders where a fold can run AT ALL, by either route
-/// (`ServerConfig::folds_in_process`): the background task, spawned in every
-/// mode but `Mode::Maintain` and only when `--disable-fold` is absent, or the
-/// on-demand `POST /api/v1/admin/fold` route, mounted in `all` and `query`
-/// whatever `--disable-fold` says. So `--mode all --disable-fold` renders the
-/// pair (an operator can still fold it, and that fold moves the totals),
-/// while `--mode gateway --disable-fold` and every `maintain` process omit
-/// it: they can fold by neither route.
+/// (`ServerConfig::folds_in_process`): the scheduled task, spawned in
+/// `Mode::Maintain` and `Mode::All` and only when `--disable-fold` is absent,
+/// or the on-demand `POST /api/v1/admin/fold` route, mounted in `all` and
+/// `query` whatever `--disable-fold` says. So `--mode all --disable-fold`
+/// renders the pair (an operator can still fold it, and that fold moves the
+/// totals), while every `gateway` process and `--mode maintain
+/// --disable-fold` omit it: they can fold by neither route.
 ///
 /// Each family is counted, not merely tested for presence: a family emitted
 /// twice is a duplicate series a scrape rejects, and a duplicate reads the
@@ -303,13 +303,16 @@ async fn metrics_declared_stats_families_render_once_where_the_fold_runs() {
         (Mode::All, "all", true, true),
         // The on-demand route is mounted here, so this process can fold.
         (Mode::All, "all", false, true),
-        (Mode::Gateway, "gateway", true, true),
-        // No query surface, so no on-demand route, and no background task:
-        // the one non-maintain shape that can fold by neither route.
+        // Gateway runs no scheduled fold and mounts no on-demand route, so
+        // `--disable-fold` changes nothing: it can fold by neither route
+        // either way.
+        (Mode::Gateway, "gateway", true, false),
         (Mode::Gateway, "gateway", false, false),
         (Mode::Query, "query", true, true),
         (Mode::Query, "query", false, true),
-        (Mode::Maintain, "maintain", true, false),
+        // Maintain runs the scheduled fold over the units it owns, and has no
+        // on-demand route, so `--disable-fold` is what decides it here.
+        (Mode::Maintain, "maintain", true, true),
         (Mode::Maintain, "maintain", false, false),
     ] {
         let running = start_test_server(mode, u64::MAX, fold_enabled).await;

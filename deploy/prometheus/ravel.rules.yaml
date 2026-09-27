@@ -32,9 +32,16 @@
 groups:
   - name: ravel-catalog-fold
     # RavelCatalogFoldStalled fires on any deployment where some signal has
-    # no fresh fold, which includes a fleet that never folds at all: an
-    # intentionally maintain-only fleet, or one running --disable-fold
-    # everywhere. Such a fleet must drop this rule or inhibit it.
+    # no fresh fold, which includes a fleet that never folds at all: a fleet
+    # running neither --mode maintain nor --mode all (the two modes that fold
+    # on a timer, ADR-1693), or one running --disable-fold everywhere. Such a
+    # fleet must drop this rule or inhibit it. A gateway-only or query-only
+    # fleet is in that class. Neither mode renders
+    # ravel_catalog_fold_last_success_timestamp_seconds, so the `absent()` arm
+    # is what fires there. A query process does render
+    # ravel_catalog_fold_cycles_total and _failures_total, for the on-demand
+    # `POST /api/v1/admin/fold` route it keeps; a gateway process folds by no
+    # route and emits no fold series at all.
     rules:
       - alert: RavelCatalogFoldStalled
         expr: |
@@ -60,6 +67,40 @@ groups:
             ravel_catalog_fold_failures_total for the same signal for a fold
             that is running and failing, and the fold task's logs for the
             underlying store error.
+          runbook: docs/guides/observability.md#the-fold-stalled-alert
+      - alert: RavelCatalogFoldLoopCrashLooping
+        # The shape RavelCatalogFoldStalled cannot catch since the fold became
+        # partitioned. A replica whose loop for one signal keeps panicking goes
+        # on heartbeating, so it stays in the live set and keeps its pairs,
+        # while its peers' fresh gauges hold max by (signal) under the stalled
+        # threshold. This counter is the only figure that moves.
+        # At the defaults (300 s fold interval, restart backoff 1 s doubling
+        # to 60 s) a restarted attempt ticks as soon as its backoff ends, so
+        # a loop panicking on every tick restarts at 0, 1, 3, 7, 15, 31, 63
+        # and 123 s after its first panic and every 60 s after that: 20
+        # restarts in its first 15m and 15 in every 15m after. A single
+        # transient panic is 1, and a loop panicking on every other tick is
+        # about 3, one per fold interval. More than 5 is crossed 31 s into a
+        # crash loop and stays crossed, so the alert fires about 15.5 minutes
+        # after the loop starts panicking, plus scrape and evaluation delay.
+        # Panics only: a tick hung on a store call that never returns moves
+        # no counter here.
+        expr: |
+          increase(ravel_catalog_fold_loop_restarts_total[15m]) > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            A Ravel catalog fold loop for {{ $labels.signal }} is panicking and
+            restarting repeatedly
+          description: >-
+            The supervisor is catching a panic and restarting this signal's
+            fold loop faster than the loop is making progress, so the pairs
+            this replica owns are going unfolded while the rest of the fleet
+            looks healthy. Read this process's logs for the panic itself. No
+            aggregation, unlike RavelCatalogFoldStalled: the point is the one
+            replica, and a peer's health must not average it away.
           runbook: docs/guides/observability.md#the-fold-stalled-alert
       - alert: RavelCatalogFoldFailing
         expr: |

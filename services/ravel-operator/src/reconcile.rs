@@ -78,6 +78,19 @@ pub enum RenderError {
     )]
     CanonicalTenantResolverMissing,
 
+    /// `spec.gateway.fold` is set, which ADR-1693 retired. The scheduled fold
+    /// no longer runs in `--mode gateway` and `ravel-server` refuses both fold
+    /// flags there, so the operator can neither render them nor honor them.
+    /// Dropping the block quietly would turn a `disabled: true` a fleet relies
+    /// on into a setting nothing reads, so the render fails and names the
+    /// field that replaces it.
+    #[error(
+        "spec.gateway.fold is no longer supported: the scheduled catalog fold runs on the \
+         maintain tier (ADR-1693) and ravel-server refuses --disable-fold and \
+         --fold-interval-secs in --mode gateway; move the block to spec.maintain.fold"
+    )]
+    GatewayFoldUnsupported,
+
     /// A `spec.gc` horizon field holds a value that is not a valid humantime
     /// duration (or is empty). Rendering it verbatim would put a flag on the
     /// maintain pod that `ravel-server` rejects at startup, crash-looping the
@@ -905,8 +918,10 @@ fn deployment(
     }
 }
 
-/// The gateway Deployment: `--mode gateway`, HTTP + gRPC listeners, tenant
-/// tokens, and fold tuning. RollingUpdate strategy.
+/// The gateway Deployment: `--mode gateway`, HTTP + gRPC listeners, and tenant
+/// tokens. RollingUpdate strategy. It carries no fold flag: the scheduled fold
+/// runs on the maintain tier (ADR-1693), and `ravel-server` refuses either
+/// fold flag in `--mode gateway`.
 pub fn desired_gateway_deployment(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -922,15 +937,6 @@ pub fn desired_gateway_deployment(
     ];
     args.extend(common_store_args(spec));
     args.extend(tenant_token_args(spec, ctx));
-    if let Some(fold) = &spec.gateway.fold {
-        if fold.disabled {
-            args.push("--disable-fold".to_string());
-        }
-        if let Some(secs) = fold.interval_secs {
-            args.push("--fold-interval-secs".to_string());
-            args.push(secs.to_string());
-        }
-    }
     // Ingest runs only in the gateway tier, so this per-shard flush-isolation
     // bound is pushed here and nowhere else. Unset leaves the argv byte for byte
     // as before, and ravel-server keeps its own default of 1.
@@ -1071,6 +1077,18 @@ pub fn desired_maintain_deployment(
     if let Some(secs) = spec.maintain.interval_secs {
         args.push("--maintain-interval-secs".to_string());
         args.push(secs.to_string());
+    }
+    // Fold flags (ADR-1693): this is the only tier the operator renders that
+    // runs the scheduled fold, and `ravel-server` refuses both flags in the
+    // modes that do not run it.
+    if let Some(fold) = &spec.maintain.fold {
+        if fold.disabled {
+            args.push("--disable-fold".to_string());
+        }
+        if let Some(secs) = fold.interval_secs {
+            args.push("--fold-interval-secs".to_string());
+            args.push(secs.to_string());
+        }
     }
     // GC horizons (#1083): rendered only on this tier, and only when set, since
     // maintain is the only role that validates itself against `sys/gc`. The
@@ -3049,6 +3067,13 @@ pub fn desired_objects(
     // the field name in a status condition instead of in the logs of pods that
     // never become ready.
     s3_allow_http(spec)?;
+    // Refuse a retired fold block for the same reason, before anything renders
+    // (ADR-1693): the gateway tier can no longer carry these flags, so the
+    // choice is a status condition naming `spec.maintain.fold` or a silently
+    // dropped setting.
+    if spec.gateway.fold.is_some() {
+        return Err(RenderError::GatewayFoldUnsupported);
+    }
     // Capture the router render result instead of `?`-propagating it: a router
     // misconfiguration must not abort the gateway/query/maintain tiers below.
     // On error, render none of the router objects (all `None`) and surface the
@@ -3146,10 +3171,7 @@ mod tests {
                 replicas: 3,
                 resources: None,
                 credentials_secret_ref: None,
-                fold: Some(FoldSpec {
-                    disabled: false,
-                    interval_secs: Some(120),
-                }),
+                fold: None,
                 ingest_affinity: None,
                 exposure: None,
                 max_inflight_flushes: None,
@@ -3163,6 +3185,7 @@ mod tests {
                 enabled: true,
                 replicas: 1,
                 interval_secs: Some(600),
+                fold: None,
                 resources: None,
                 credentials_secret_ref: None,
             },
@@ -4281,19 +4304,80 @@ mod tests {
     #[test]
     fn fold_flags_render_only_when_configured() {
         let mut spec = base_spec();
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: true,
+            interval_secs: None,
+        });
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("a maintain fold block renders")
+            .expect("the maintain tier is enabled");
+        let args = args_of(&m);
+        assert!(args.iter().any(|a| a == "--disable-fold"));
+        assert!(arg_value(&args, "--fold-interval-secs").is_none());
+
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: false,
+            interval_secs: Some(900),
+        });
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("a maintain fold block renders")
+            .expect("the maintain tier is enabled");
+        let args = args_of(&m);
+        assert!(!args.iter().any(|a| a == "--disable-fold"));
+        assert_eq!(
+            arg_value(&args, "--fold-interval-secs").as_deref(),
+            Some("900")
+        );
+
+        spec.maintain.fold = None;
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no fold block renders")
+            .expect("the maintain tier is enabled");
+        let args = args_of(&m);
+        assert!(!args.iter().any(|a| a == "--disable-fold"));
+        assert!(arg_value(&args, "--fold-interval-secs").is_none());
+    }
+
+    #[test]
+    fn the_gateway_tier_never_carries_a_fold_flag() {
+        // ADR-1693: the gateway runs no scheduled fold and `ravel-server`
+        // refuses either flag in that mode, so a rendered fold flag is a
+        // crash-looping tier, not an ignored setting.
+        let mut spec = base_spec();
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: true,
+            interval_secs: Some(900),
+        });
+        let args = args_of(&desired_gateway_deployment(&spec, "prod", &ctx()));
+        assert!(!args.iter().any(|a| a == "--disable-fold"));
+        assert!(arg_value(&args, "--fold-interval-secs").is_none());
+    }
+
+    #[test]
+    fn a_gateway_fold_block_is_refused_rather_than_ignored() {
+        // `spec.gateway.fold` used to render onto the tier that no longer
+        // folds. Dropping it silently would turn a `disabled: true` a fleet
+        // relies on into a no-op, so the render fails and the controller
+        // records a Degraded condition naming the replacement field.
+        let mut spec = base_spec();
         spec.gateway.fold = Some(FoldSpec {
             disabled: true,
             interval_secs: None,
         });
-        let g = desired_gateway_deployment(&spec, "prod", &ctx());
-        let args = args_of(&g);
-        assert!(args.iter().any(|a| a == "--disable-fold"));
-        assert!(arg_value(&args, "--fold-interval-secs").is_none());
+        assert_eq!(
+            desired_objects(&spec, "prod", "ravel", &ctx())
+                .expect_err("a gateway fold block must refuse the whole render"),
+            RenderError::GatewayFoldUnsupported
+        );
 
+        // The same block under `spec.maintain` is the supported spelling.
         spec.gateway.fold = None;
-        let g = desired_gateway_deployment(&spec, "prod", &ctx());
-        let args = args_of(&g);
-        assert!(!args.iter().any(|a| a == "--disable-fold"));
+        spec.maintain.fold = Some(FoldSpec {
+            disabled: true,
+            interval_secs: None,
+        });
+        desired_objects(&spec, "prod", "ravel", &ctx())
+            .expect("a maintain fold block is the supported placement");
     }
 
     #[test]

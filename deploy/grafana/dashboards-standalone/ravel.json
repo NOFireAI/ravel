@@ -1000,8 +1000,8 @@
     {
       "id": 16,
       "type": "timeseries",
-      "title": "Fold cycles and failures",
-      "description": "A fold that is running and failing shows here before the age panel to the left crosses its threshold.",
+      "title": "Fold cycles, failures and loop restarts",
+      "description": "A fold that is running and failing shows here before the age panel to the left crosses its threshold. Loop restarts are the supervisor catching a panicking fold loop: under a partitioned fold the panicking replica keeps its pairs while its peers hold the age panel fresh, so this is the only line that moves.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1036,6 +1036,15 @@
           },
           "legendFormat": "failures {{signal}}",
           "expr": "sum by (signal) (rate(ravel_catalog_fold_failures_total[$__rate_interval]))"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "legendFormat": "loop restarts {{signal}}",
+          "expr": "sum by (signal) (rate(ravel_catalog_fold_loop_restarts_total[$__rate_interval]))"
         }
       ]
     },

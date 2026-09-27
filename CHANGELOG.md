@@ -8,6 +8,74 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The scheduled catalog fold now runs only in `--mode maintain` and
+  `--mode all`, and a `maintain` fleet partitions it across its replicas**
+  (ADR-1693, issue #1693). A `maintain` process folds only the
+  `(tenant, signal)` pairs it owns under the rendezvous hash and heartbeat
+  live set that already distribute maintenance units, and it tests ownership
+  before every per-tenant read, the pair's lifecycle `t/<hash>/config` record
+  and its `HEAD` peek alike, so a non-owner issues no object-store request at
+  all for a pair it does not own. The only request a tick makes that no owned
+  pair accounts for is the single delimited listing of `t/` that discovers the
+  tenants. Scaling `maintain` to N replicas therefore divides the fold's
+  request cost N ways instead of running N full copies of it, and a replica
+  leaving the fleet hands its pairs to the survivors within 570 s at the
+  defaults: the 180 s liveness window, plus the survivor's next 60 s heartbeat
+  tick, which is when it re-lists and recomputes the live set, plus its next
+  fold tick, 300 s with up to 10% jitter. That bounds the survivor's first
+  tick over a pair, not always its re-fold: a pair the departed replica
+  folded just before leaving keeps a `HEAD` younger than the 300 s fold
+  interval, a survivor tick before then skips it as fresh, and the next tick
+  is at most 330 s later, so the re-fold lands within 300 + 330 = 630 s of
+  departure. The liveness window alone bounds when the departure becomes
+  visible, not when the pairs are folded again.
+  `--mode all` computes its live set as itself alone and keeps folding
+  everything. `gateway` and `query` processes no longer fold on a timer. A
+  `query` process keeps the on-demand `POST /api/v1/admin/fold` route, which
+  is unchanged; a `gateway` process mounts no fold route at all, as before. A
+  deployment running neither `maintain` nor `all` no longer folds on a timer
+  at all, and must add a `maintain` process. `--disable-fold` and
+  `--fold-interval-secs` are now refused at startup in `--mode gateway` and
+  `--mode query` instead of being accepted and ignored, and the operator
+  renders them on the maintain Deployment: `spec.maintain.fold` replaces
+  `spec.gateway.fold`, which is now refused with a `Degraded` condition
+  (reason `GatewayFoldUnsupported`) naming the field that replaces it.
+  `ravel_catalog_fold_last_success_timestamp_seconds` now renders only in the
+  two modes that fold on a schedule, so no process publishes a permanently
+  stale gauge and `RavelCatalogFoldStalled` fires through its `absent()` arm
+  on a fleet with no scheduled fold; `ravel_catalog_fold_cycles_total` and
+  `ravel_catalog_fold_failures_total` render wherever a fold can run, the
+  `query` mode's on-demand route included, so an on-demand fold's failures
+  stay visible. The fold also reads the injected maintain clock rather than
+  the system clock. Each signal's fold loop now runs under a supervisor: a
+  panic in a tick body is caught, counted on the new
+  `ravel_catalog_fold_loop_restarts_total{signal}` counter, logged at error
+  level, and the loop is respawned after a bounded backoff doubling from 1 s
+  to 60 s and resetting after a completed tick; the respawned loop ticks as
+  soon as its backoff ends, so a loop panicking on every tick restarts 20
+  times in its first 15 minutes and 15 times in every 15 minutes after at the
+  defaults. The supervision is not
+  optional under a partitioned fold: a replica whose loop dies keeps
+  heartbeating, so it stays in the live set, keeps its pairs, and leaves them
+  unfolded while its peers' fresh gauges hold `RavelCatalogFoldStalled`
+  (`max by (signal)`) under its threshold. The new
+  `RavelCatalogFoldLoopCrashLooping` rule in
+  `deploy/prometheus/ravel.rules.yaml` fires on more than 5 restarts in 15m,
+  unaggregated, because the condition is about one replica; a loop panicking
+  on every tick crosses it 31 s after its first panic, while a single
+  transient panic counts one restart. Supervision covers panics only: a tick
+  that hangs on a store call that never returns moves no restart counter, and
+  no shipped alert catches it on one replica of several, since only that
+  replica's own `ravel_catalog_fold_last_success_timestamp_seconds` stops
+  moving and `RavelCatalogFoldStalled` reads the fleet-wide maximum.
+  **On upgrade**, a
+  `RavelCluster` with `spec.gateway.fold` set now fails the render before any
+  tier renders, so the whole cluster stops reconciling until the field moves
+  to `spec.maintain.fold`; a hand-written manifest passing `--disable-fold` or
+  `--fold-interval-secs` to a gateway or query container now fails at startup
+  instead of ignoring the flag; and during a rolling upgrade an old-version
+  maintain pod sits in the live set without folding, so the pairs the hash
+  gives it stay unfolded until the rollout completes.
 - **A distributed-query worker resolves each pinned segment from that segment's
   own commit record instead of re-resolving its catalog** (issue #1721). Every
   fragment request used to re-resolve the worker's catalog to map the
