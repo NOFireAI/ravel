@@ -42,6 +42,10 @@
 #      Scoped to these two files at the time: deploy/k8s's own registry
 #      images were pinned separately by category 6 below (issue #1720's
 #      residual round).
+#      deploy/docker-compose/ci-host-bucket.yml is deliberately out of scope:
+#      its only image is `${RAVEL_IMAGE:?...}` with `pull_policy: never`,
+#      Ravel's own locally built image, not a third-party pull. A
+#      third-party image added there needs this category widened first.
 #   5. every image argument of a `docker run`, `docker pull`, or
 #      `docker create` invocation inside a `run:` block, across every
 #      workflow under .github/workflows and every composite action under

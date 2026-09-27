@@ -12,9 +12,13 @@
 # call is retried with backoff only when it failed transiently: exit 255 (the
 # CLI got no usable response: connection refused, reset or timed out) or a
 # 5xx-class S3 error code. Any other failure (bad credentials, an invalid
-# bucket name) is permanent and fails at once. A retry that finds the bucket
-# already owned by these credentials counts as success, since the earlier
-# attempt may have created it before its response was lost.
+# bucket name) is permanent and fails at once. A bucket already owned by these
+# credentials counts as success on any attempt, the first included: an earlier
+# attempt may have created it before its response was lost, and a rerun
+# against a populated endpoint should not fail. CI_CREATE_BUCKET_BACKOFF_SECONDS
+# (default 5) is the backoff unit; attempt n waits n units before the next.
+#
+# Cases: scripts/ci-create-bucket.test.sh.
 set -uo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -35,6 +39,7 @@ export AWS_EC2_METADATA_DISABLED=true
 export AWS_PAGER=""
 
 attempts=5
+backoff=${CI_CREATE_BUCKET_BACKOFF_SECONDS:-5}
 err=$(mktemp)
 trap 'rm -f "$err"' EXIT
 
@@ -46,8 +51,8 @@ for attempt in $(seq 1 "$attempts"); do
     echo "created bucket $bucket at $endpoint"
     exit 0
   fi
-  if [ "$attempt" -gt 1 ] && grep -q '(BucketAlreadyOwnedByYou)' "$err"; then
-    echo "bucket $bucket already exists from an earlier attempt"
+  if grep -q '(BucketAlreadyOwnedByYou)' "$err"; then
+    echo "bucket $bucket already exists and is owned by these credentials"
     exit 0
   fi
   if [ "$rc" -ne 255 ] &&
@@ -56,7 +61,7 @@ for attempt in $(seq 1 "$attempts"); do
     exit "$rc"
   fi
   echo "create-bucket failed transiently on attempt $attempt (exit $rc)" >&2
-  if [ "$attempt" -lt "$attempts" ]; then sleep $((attempt * 5)); fi
+  if [ "$attempt" -lt "$attempts" ]; then sleep $((attempt * backoff)); fi
 done
 echo "::error::create-bucket still failing after $attempts attempts" >&2
 exit 1
