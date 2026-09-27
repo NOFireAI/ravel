@@ -6,6 +6,38 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A query's fold-lag refusal threshold is now sized from the fold and the
+  catalog the process is actually running** (issue #1306). The threshold that
+  decides whether a request-budget refusal names fold lag is the catalog's seal
+  margin plus the scheduled fold's interval plus the HEAD cache TTL, and
+  `EngineConfig` carried all three, but the server set none of them: every
+  deployment was classified against `ravel-query`'s compiled-in reference
+  durations no matter what its own fold and catalog ran on. The server now
+  builds that `EngineConfig` in one place, reading the seal margin and the HEAD
+  cache TTL off the `CatalogConfig` of the catalog it hands to both resolve and
+  the fold, and the fold interval off the `FoldTaskConfig` it spawns the fold
+  with. The compiled-in values stay what an `EngineConfig` built with no
+  deployment context falls back to, and a test pins `ravel-query`'s hand copy
+  of the fold interval against the server's own default so the two cannot drift
+  apart unnoticed.
+
+### Added
+
+- **An end-to-end proof that a stalled fold pages before it refuses a query**
+  (issue #1306, ADR-1306 follow-up task 3). ADR-1306 decision 2 states the
+  ordering as arithmetic over spans;
+  `fold_stall_alert_fires_before_first_request_budget_refusal` runs it. One
+  simulated timeline writes flushes at a scaled cadence, folds on a schedule,
+  then wedges the fold with a fault on its HEAD PUT, and at every simulated
+  minute evaluates the shipped `RavelCatalogFoldStalled` condition against the
+  rendered `/metrics` gauge and runs a cold last-6-hours query under the
+  derived budget. The alert fires nine minutes before the first
+  `RequestBudgetExceeded`; the same timeline replayed against the one-hour span
+  ADR-1306 replaced is refused at the first minute, before the fold has stalled
+  at all. Time is injected throughout: no step waits on the wall clock.
+
 ## [0.19.0] - 2026-09-27
 
 ### Fixed
