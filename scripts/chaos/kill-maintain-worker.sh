@@ -35,7 +35,10 @@
 # available with no object store; a real run is the orchestrator's job.
 #
 # Gate-shell discipline: see scripts/chaos/lib.sh header.
-set -euo pipefail
+set -eEuo pipefail
+# -E carries the ERR trap below into functions, so a setup command that fails
+# inside a helper exits 3 like one at top level.
+trap 'exit 3' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
@@ -125,6 +128,11 @@ cleanup() {
   rustfs_down
 }
 trap cleanup EXIT
+# A setup step that fails under `set -e` would otherwise exit with its own
+# status, often 1, which the contract above reserves for an oracle failure.
+# The ERR trap set at the top (with -E, so it reaches functions) makes every
+# setup failure exit 3; the oracle calls below carry `|| true` and never reach
+# it.
 
 # Start a maintain-role worker. $1=http $2=grpc $3=logfile; echoes the PID via
 # the named global set by the caller. We set the PID through a nameref so the
@@ -170,7 +178,7 @@ log "bringing up RustFS and qualifying the store"
 rustfs_up
 
 log "generating OTLP fixture"
-cargo run --quiet -p ravel-server --example gen_otlp_fixture > "$FIXTURE_PATH"
+chaos_gen_fixture > "$FIXTURE_PATH"
 
 # Actually drive the generated load: start an ingest server and POST the
 # fixture through it so the bucket carries real, compactable data. A prior
@@ -189,7 +197,7 @@ for _ in $(seq 1 "$EXPORT_COUNT"); do
 done
 if [[ "$SENT" -eq 0 ]]; then
   log "no exports were accepted; the maintain workers would own nothing"
-  exit 1
+  exit 3
 fi
 log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports into the ingest server"
 
@@ -212,6 +220,7 @@ if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$WORKER_A_LOG" 120; 
   log "worker A observed mid-compaction -- issuing SIGKILL"
 else
   log "did not observe worker A mid-compaction within budget; killing anyway"
+  echo "::warning::chaos scenario 2 killed worker A without observing it mid-compaction; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
 fi
 
 # The >= comparison in the two takeover oracles below only discriminates while

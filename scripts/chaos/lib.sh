@@ -420,6 +420,17 @@ ravel_cli() {
   fi
 }
 
+# Write a fresh OTLP metrics fixture to stdout (one `demo_requests_total`
+# gauge point at the current wall clock). Prefers a prebuilt example binary on
+# PATH, as the nightly lane provides, over a per-invocation `cargo run`.
+chaos_gen_fixture() {
+  if chaos_have_command gen_otlp_fixture; then
+    gen_otlp_fixture
+  else
+    cargo run --quiet -p ravel-server --example gen_otlp_fixture
+  fi
+}
+
 ravel_server_cmd() {
   # Emit the argv for launching the server, so callers can background it and
   # capture the PID directly (needed to SIGKILL a specific process).
@@ -453,48 +464,136 @@ sigkill_pid() {
 # parsed from the variable; no pipeline sits between a gate and its exit code.
 # ---------------------------------------------------------------------------
 
-# Read a counter/gauge value from a server's /metrics, summed across every
-# label combination of the family. Prints the sum on stdout, or the empty
-# string if the metric is absent. Returns 1 only when the scrape itself fails
-# (server unreachable).
+# Parse one metric family out of a Prometheus text body. Args: body, name,
+# then zero or more `label=value` selectors. Prints the sum of every sample of
+# `name` whose label set carries each selector exactly, or the empty string
+# when no sample matches. Pure: no I/O, so it is testable against a captured
+# body (scripts/chaos/lib.test.sh).
 #
-# Label-aware: a Prometheus sample renders as `name` or `name{labels} value`,
-# and every metric this lane reads carries at least a `mode`/`signal` label
-# (e.g. `ravel_maintain_units_owned{mode="maintain"} 4`,
-# `ravel_ingest_flushes_by_size_total{mode="all",signal="metrics"} 5`). An
-# exact `$1 == name` match is therefore label-blind and never fires, so a
-# family is matched by `$1 == name` OR `$1` beginning with `name{`. The literal
-# brace is what keeps `ravel_maintain_units_owned` from also matching
-# `ravel_maintain_units_owned_total`. Samples of one family are summed, which
-# for a labeled counter is its total across signals and for a single-series
-# gauge is just its value.
-metric_value() {
-  local base_url="$1"
+# A sample renders as `name value [timestamp]` or `name{labels} value
+# [timestamp]`, and every family this lane reads carries a `mode` label and,
+# for the per-signal families, a `signal` label
+# (`ravel_ingest_flushes_by_size_total{mode="all",signal="metrics"} 5`). The
+# label set is scanned quote-aware, so a label value holding a space, a comma,
+# a brace or an escaped quote cannot shift the value field, and the value is
+# the first field after the label set, never an optional timestamp. The name
+# must be followed by `{` or whitespace, which keeps `ravel_maintain_units_owned`
+# from matching `ravel_maintain_units_owned_total`. With no selector the family
+# is summed across label sets: for a labeled counter that is its total across
+# signals, for a single-series gauge just its value.
+metric_value_from_body() {
+  local body="$1"
   local name="$2"
-  local body
-  body="$(curl --silent --fail --max-time 5 "${base_url}/metrics")" || return 1
-  # $body is data, not a gate; awk sums the family's samples by label-aware name.
-  # The value is $(NF), not $2: a label value holding a space splits the label
-  # set across fields, and $2 would then be part of the label set rather than
-  # the sample. No metric this lane reads carries such a label today.
-  awk -v n="$name" '
-    $1 == n            { sum += $(NF); hit = 1; next }
-    index($1, n "{") == 1 { sum += $(NF); hit = 1 }
+  shift 2
+  local selectors=""
+  if [[ $# -gt 0 ]]; then
+    selectors="$(printf '%s\n' "$@")"
+  fi
+  # Portable awk (mawk is the default on Debian and Ubuntu runners): no gawk
+  # extensions.
+  # The selectors travel through the environment, not -v: BSD awk rejects a
+  # newline inside a -v value, and -v would also expand backslash escapes.
+  CHAOS_METRIC_SELECTORS="$selectors" awk -v n="$name" '
+    BEGIN {
+      sel = ENVIRON["CHAOS_METRIC_SELECTORS"]
+      nsel = 0
+      if (sel != "") {
+        cnt = split(sel, raw, "\n")
+        for (i = 1; i <= cnt; i++) {
+          if (raw[i] == "") continue
+          eq = index(raw[i], "=")
+          if (eq == 0) continue
+          nsel++
+          want_k[nsel] = substr(raw[i], 1, eq - 1)
+          want_v[nsel] = substr(raw[i], eq + 1)
+        }
+      }
+    }
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      if (substr(line, 1, length(n)) != n) next
+      rest = substr(line, length(n) + 1)
+      c = substr(rest, 1, 1)
+      split("", got)
+      if (c == "{") {
+        i = 2
+        len = length(rest)
+        ok = 0
+        while (i <= len) {
+          ch = substr(rest, i, 1)
+          if (ch == " " || ch == "\t" || ch == ",") { i++; continue }
+          if (ch == "}") { ok = 1; i++; break }
+          eq = index(substr(rest, i), "=")
+          if (eq == 0) break
+          key = substr(rest, i, eq - 1)
+          gsub(/[ \t]+$/, "", key)
+          i += eq
+          if (substr(rest, i, 1) != "\"") break
+          i++
+          val = ""
+          closed = 0
+          while (i <= len) {
+            ch = substr(rest, i, 1)
+            if (ch == "\\") {
+              nx = substr(rest, i + 1, 1)
+              if (nx == "n") val = val "\n"; else val = val nx
+              i += 2
+              continue
+            }
+            if (ch == "\"") { closed = 1; i++; break }
+            val = val ch
+            i++
+          }
+          if (!closed) break
+          got[key] = val
+        }
+        if (!ok) next
+        rest = substr(rest, i)
+      } else if (c != " " && c != "\t") {
+        next
+      }
+      sub(/^[ \t]+/, "", rest)
+      split(rest, fields, /[ \t]+/)
+      if (fields[1] == "") next
+      for (s = 1; s <= nsel; s++) {
+        if (!(want_k[s] in got) || got[want_k[s]] != want_v[s]) next
+      }
+      sum += fields[1]
+      hit = 1
+    }
     END { if (hit) print sum; else print "" }' \
     <<<"$body"
 }
 
+# Read a counter/gauge value from a server's /metrics. Args: base_url, name,
+# then optional `label=value` selectors (see metric_value_from_body). Prints
+# the value, or the empty string if no sample matches. Returns 1 only when the
+# scrape itself fails (server unreachable).
+metric_value() {
+  local base_url="$1"
+  local name="$2"
+  shift 2
+  local body
+  body="$(curl --silent --fail --max-time 5 "${base_url}/metrics")" || return 1
+  metric_value_from_body "$body" "$name" "$@"
+}
+
 # Block until a metric reaches at least `threshold`, or a deadline passes.
-# Returns 0 on reaching the threshold, 1 on timeout/unreachable.
+# Args: base_url, name, threshold, deadline_seconds, then optional
+# `label=value` selectors. Returns 0 on reaching the threshold, 1 on
+# timeout/unreachable.
 wait_for_metric_at_least() {
   local base_url="$1"
   local name="$2"
   local threshold="$3"
   local deadline_seconds="$4"
+  shift 4
   local waited=0
   local value
   while [[ "$waited" -lt "$deadline_seconds" ]]; do
-    value="$(metric_value "$base_url" "$name")" || value=""
+    value="$(metric_value "$base_url" "$name" "$@")" || value=""
     if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
       # Integer-compare the truncated value; counters here are whole numbers.
       if [[ "${value%.*}" -ge "$threshold" ]]; then
@@ -515,7 +614,10 @@ wait_for_metric_at_least() {
 # "Attempt-time, same as flushes_by_size"), so an increment means a flush has
 # STARTED but not necessarily completed -- exactly the "mid-flush" window
 # ADR-0077 section 4 names. The kill fires as soon as the counter rises past
-# its pre-load baseline.
+# its pre-load baseline. Only the metrics pipeline's sample counts
+# (`signal="metrics"`): the load is OTLP metrics, and a logs or traces flush
+# in the same process would otherwise fire the kill outside any flush this
+# scenario's writes are in.
 #
 # Scenario 2 keys off the compaction lifecycle: a compaction is observed
 # in-flight when the maintain worker owns units and has begun a run but has
@@ -526,6 +628,7 @@ wait_for_metric_at_least() {
 # ---------------------------------------------------------------------------
 
 CHAOS_FLUSH_METRIC="ravel_ingest_flushes_by_size_total"
+CHAOS_FLUSH_SELECTOR="signal=metrics"
 CHAOS_COMPACTION_PUBLISH_MARKER="compaction record published"
 
 # Wait until the flush counter has risen past `baseline`, i.e. a flush has
@@ -535,7 +638,8 @@ wait_for_flush_started() {
   local baseline="$2"
   local deadline_seconds="$3"
   wait_for_metric_at_least \
-    "$base_url" "$CHAOS_FLUSH_METRIC" "$(( baseline + 1 ))" "$deadline_seconds"
+    "$base_url" "$CHAOS_FLUSH_METRIC" "$(( baseline + 1 ))" "$deadline_seconds" \
+    "$CHAOS_FLUSH_SELECTOR"
 }
 
 # Wait until a compaction has begun for the worker whose log is `log_file`,
@@ -575,9 +679,45 @@ wait_for_compaction_in_flight() {
 # token from each accepted export.
 # ---------------------------------------------------------------------------
 
-# POST one OTLP metrics export and echo its strict-ack commit token on
-# stdout. Returns nonzero if the export was not accepted or carried no token.
-# The caller records the token as an acked-before-kill write.
+# Extract the strict-ack commit tokens from a captured response-header block,
+# one per line on stdout. Returns 1 when there is none. Pure: no I/O.
+#
+# The `x-ravel-commit-token` value is one `CommitToken::encode()` per shard
+# the write flushed through, comma-joined
+# (services/ravel-server/src/otlp_http.rs, `encode_commit_tokens`), and each is
+# an opaque URL-safe base64 string. They are split on the comma and otherwise
+# passed through untouched: `min_commit_token` is repeatable and takes one
+# token per occurrence, so the joined header value is not itself a valid
+# token. The header name is folded by hand because gawk's IGNORECASE is
+# silently ignored by mawk, the default awk on Debian and Ubuntu runners.
+commit_tokens_from_headers() {
+  local headers="$1"
+  local tokens
+  tokens="$(awk '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      colon = index(line, ":")
+      if (colon == 0) next
+      if (tolower(substr(line, 1, colon - 1)) != "x-ravel-commit-token") next
+      value = substr(line, colon + 1)
+      cnt = split(value, parts, ",")
+      for (i = 1; i <= cnt; i++) {
+        t = parts[i]
+        gsub(/^[ \t]+|[ \t]+$/, "", t)
+        if (t != "") print t
+      }
+    }' <<<"$headers")"
+  if [[ -z "$tokens" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$tokens"
+}
+
+# POST one OTLP metrics export and echo its strict-ack commit tokens on
+# stdout, one per line (see commit_tokens_from_headers). Returns nonzero if
+# the export was not accepted or carried no token. The caller records every
+# token as an acked-before-kill write.
 drive_one_export() {
   local http_addr="$1"
   local fixture_path="$2"
@@ -598,13 +738,7 @@ drive_one_export() {
   local header_body
   header_body="$(cat "$header_file")"
   rm -f "$header_file"
-  local token
-  token="$(awk 'BEGIN{IGNORECASE=1} /^x-ravel-commit-token:/ { print $2 }' \
-    <<<"$header_body" | tr -d '\r')"
-  if [[ -z "$token" ]]; then
-    return 1
-  fi
-  echo "$token"
+  commit_tokens_from_headers "$header_body"
 }
 
 # Query one metric back at a given min_commit_token and report whether the
@@ -625,7 +759,18 @@ query_series_visible() {
   if [[ "$rc" -ne 0 ]]; then
     return 1
   fi
-  if [[ "$body" == *'"status":"success"'* && "$body" == *"$series"* ]]; then
+  query_body_shows_series "$body" "$series"
+}
+
+# Report whether a /api/v1/query response body is a success carrying a sample
+# of `series`. Pure: no I/O. The name is matched as the `__name__` label
+# value, so an error message that quotes the series, or a longer series name
+# that contains it, does not read as visible.
+query_body_shows_series() {
+  local body="$1"
+  local series="$2"
+  if [[ "$body" == *'"status":"success"'* \
+      && "$body" == *"\"__name__\":\"${series}\""* ]]; then
     return 0
   fi
   return 1
