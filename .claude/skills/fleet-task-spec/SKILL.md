@@ -51,10 +51,8 @@ DEGRADED-BOX TRIPWIRE, your very first command, before reading anything:
 
 You need both of these before your first commit anyway. Read the elapsed
 time on the FIRST one before running the second: if it took more than 30
-seconds, stop there. Waiting for both doubles the worst case, since the
-box this exists for takes 90 to 120 seconds per command, and two of them
-is three to four minutes rather than the two this paragraph used to
-claim.
+seconds, stop there. A degraded box takes 90 to 120 seconds per command,
+so waiting for both doubles the time lost.
 
 On a breach, STOP: do not read a file, do not start the work. Report
 
@@ -62,15 +60,12 @@ On a breach, STOP: do not read a file, do not start the work. Report
     <the output of `uname -a`>
     <the output of `nproc`>
 
-and end the task. The two extra lines are what make the report
-actionable: one lost task tells the orchestrator the pool has a bad box,
-and the box's identity is what lets it be quarantined instead of
-rediscovered next week by a different task.
+and end the task. The two extra lines identify the box, so the
+orchestrator can quarantine it instead of losing another task to it.
 
 The four-hour ceiling arrives on that box before a first commit does, so
 COMMIT EARLY below cannot save you. Ending in two minutes with a report
-costs a redispatch; carrying on costs the whole task, and 2h50m and
-3h29m have each been lost that way.
+costs a redispatch; carrying on costs the whole task.
 
 COMMIT EARLY: `git commit -s` the first state that compiles, before you
 go on to the rest. Never put any command in the background and never end
@@ -97,101 +92,56 @@ Gates: format and lint IN PLACE before the commit you will gate -- run
 `cargo fmt --all` (not just --check) and, where it applies, scoped
 `cargo clippy --fix -p <crate>` -- then verify with `cargo fmt --all
 --check`; cargo clippy --workspace --all-targets -- -D warnings;
-scripts/affected-tests.sh -p <crate> [-p <crate2>]. Cap cargo's build
-parallelism through the environment, not a flag, because
-`scripts/affected-tests.sh` accepts no `--jobs` and runs cargo at the
-default otherwise: read `nproc` and DERIVE the cap from it rather than
-matching a known machine shape, then prefix every cargo command and every
-script that runs cargo with `CARGO_BUILD_JOBS=<that number>`. Use
-`min(4, max(2, nproc / 4))`, and report the `uname -m`, the `nproc` and the
-value you used. `scripts/gates.sh` also caps jobs by itself, but by MEMORY rather than
-cores (`mem_gb -le 11` gives 2), and its own comment says an explicit
-`CARGO_BUILD_JOBS` in the environment WINS. So the value you export
-overrides that cap for every gate run through it. On the 8-core box this
-paragraph is about, roughly 15 GB, gates.sh would not have capped at all
-and the core-derived 2 is the safer of the two. On a box where memory does
-not track cores at the usual ratio the two rules can disagree the other
-way, so ACT on it rather than reporting it: read the memory you actually
-have (`/proc/meminfo` MemTotal, or `sysctl -n hw.memsize`) and export the
-LOWER of the core-derived value and 2 when that memory is 11 GB or less.
-Reporting a mismatch is too late, because the report is written after the
-gates have already run under the wrong value. Say which of the two bounds
-decided the number you used.
+scripts/affected-tests.sh -p <crate> [-p <crate2>].
 
-Derive it; do not enumerate. This paragraph used to name two shapes,
-x86_64-with-16-cores and aarch64-with-4-cores, and branch on them. At
-least three shapes are in the pool: those two and an 8-core x86_64 with
-about 15 GB of RAM. An executor reading an enumeration that does not
-cover its box has no instruction, and the failure is worse than a missing
-one. On the 8-core box `CARGO_BUILD_JOBS=4` gets `ld` KILLED WITH SIGNAL
-9 during a cold `--all-targets` link, and a SIGKILLed linker reads as a
-compiler error, so the next reader debugs a code problem that is a memory
-problem. That is the same false diagnosis ENOSPC produces when it
-surfaces as `linking with cc failed`. On 2026-09-13 an executor on that
-box read the enumeration, judged it did not apply, and chose 2 on its own
-initiative; the spec earned none of that.
+Build parallelism: prefix every cargo command and every script that runs
+cargo with `CARGO_BUILD_JOBS=<n>`, because `scripts/affected-tests.sh`
+accepts no `--jobs` flag. Compute n on this box, do not assume a machine
+shape: `min(4, max(2, nproc / 4))`, and 2 when total memory
+(`/proc/meminfo` MemTotal, or `sysctl -n hw.memsize`) is 11 GB or less.
+A higher value gets `ld` killed with signal 9 during a cold
+`--all-targets` link, which reads as a compiler error. The value you
+export also overrides the memory-based cap inside `scripts/gates.sh`.
+Report `uname -m`, `nproc`, the memory, the value you used, and which
+bound decided it.
 
-A spec must survive whatever hardware it lands on, because it does not
-choose. `label_selector {"arch":"amd64"}` is a PREFERENCE, not a
-constraint: after a grace period the scheduler falls back to other
-hardware. So do NOT write a stanza that stops the task on an unexpected
-architecture. One that did cost a whole dispatch on 2026-09-22 -- the task
-landed on a healthy Pi, the timing tripwire cleared it at 0.001s, and an
-arch stanza in the same spec killed it 24 seconds in, turning a slow build
-into a lost one and a redispatch.
+Do not run `cargo test --workspace`: full-workspace tests run at merge
+time (verify-dispatch cold gate and PR CI); your job is the blast radius
+of your own change, and affected-tests.sh computes it (the named crates
+plus every crate that depends on them). The commit that gets gated must
+already be formatted; never append a formatting-only fixup commit after
+a failed --check.
 
-Keep the DEGRADED-BOX tripwire, which tests a different proposition: it
-fires on a box where `git config` takes 30 seconds or more, the one that
-burns four hours and produces nothing. A healthy Pi is slow, not broken,
-and that is the distinction the tripwire exists to draw. Do NOT run
-`cargo test --workspace`: full-workspace tests are verified at merge
-time (verify-dispatch cold gate and PR CI); your job is the blast
-radius of your own change, and affected-tests.sh computes it (the
-named crates plus every crate that depends on them). The commit that
-gets gated must already be formatted; never append a formatting-only
-fixup commit after a failed --check. Run every gate command UNPIPED and
-read its own real exit code (`cmd; code=$?`), never `| tail` / `| head` /
-`| grep` to keep the output small -- the pipeline's exit code is the last
-stage's, not the gate's, so a real failure buried in a `tail`-truncated
-tool-result can report a false "affected-tests passed" while a test
-actually failed. If the output is long, redirect it to a file and grep or
-read the file separately; the exit code check and the output-size problem
-are independent, solve them independently.
-Where that file goes is itself a rule, because both wrong answers have
-already cost a task. Run this first, as ONE command, substituting
+Run every gate command unpiped and read its own exit code
+(`cmd; code=$?`), never `| tail` / `| head` / `| grep`: a pipeline
+reports the last stage's exit code, so a failed test can read as passed.
+If the output is long, redirect it to a file and read the file
+separately. Before the first gate, run this as ONE command, substituting
 nothing:
 
     mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 5 && df -h /tmp . "$HOME"
 
-Every step is joined with `&&` so a failure anywhere fails the command:
+The `&&` chain fails the command at the first failing step, and
 `git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
-the directory before a single log is written there. The path is literal
-text rather than built from `$HOME` or the checkout's basename because
+the directory before a log is written there. The path is literal because
 each tool call is its own shell and a variable set in one call is empty
 in the next.
 
 If the guard exits non-zero, say so in your report and stop rather than
 picking another directory: a host without 5 GB for a log has no room for
 the gate either, and the run would die mid-link with a fake compiler
-error. Then redirect every long gate to `.gate-logs/<step>.log`.
+error. Otherwise redirect every long gate to `.gate-logs/<step>.log`.
 
-HOME on the amd64 executor class is a 1 GB tmpfs: pointing the log
-directory there makes the disk-headroom guard report 0 GB free and fail
-before any gate runs, and three tasks died exactly that way on
-2026-09-12. `/tmp` is the harness's own capture filesystem (issue
-#1526): a run that fills it fails every later Bash call, including
-`true` and `df`, while the host's own disk figures still look healthy.
-Inside the checkout is the only volume with room on that class. The
-repository's tracked `.gitignore` lists `.gate-logs/` and `.dd-tools/`
-(the latter for any `cargo install --root "$PWD/.dd-tools"` tree), next
-to the disk-watchdog marker it already ignores for the same reason: the
-harness's commit-on-death `git add -A` must not sweep them into a wip
-commit that the merge script would then fold forward into the PR. Quote
+Keep logs inside the checkout. HOME on the amd64 executor class is a
+1 GB tmpfs, so the headroom guard fails there before any gate runs.
+`/tmp` is the harness's own capture filesystem: filling it fails every
+later Bash call, including `true` and `df`, while the host's disk
+figures still look healthy. Exporting `CLAUDE_CODE_TMPDIR` from inside
+the task changes nothing, because the harness reads it before your first
+Bash call. The tracked `.gitignore` lists `.gate-logs/` and `.dd-tools/`
+(for any `cargo install --root "$PWD/.dd-tools"` tree), so the harness's
+commit-on-death `git add -A` cannot sweep them into a wip commit. Quote
 all three `df` lines (`/tmp`, `.`, and `"$HOME"`) in your report.
-`CLAUDE_CODE_TMPDIR` is NOT the executor's lever: the harness reads it
-when it creates the per-call capture directory, before the task's first
-Bash call, so exporting it from inside a task changes nothing. Setting it
-on the executor image is the real fix and is tracked on #1526.
 Commit with trailer "Refs: #N".
 
 CLAIMS AUDIT, before the commit you gate, reported afterwards: list every
@@ -499,6 +449,16 @@ if it is missing?
   holds both for the full duration. Dispatch the doc task in parallel,
   dependent only on the design decision (the ADR), not on the code
   landing. Merge order handles any cross-references.
+- A spec must survive whatever hardware it lands on.
+  `label_selector {"arch":"amd64"}` is a preference, not a constraint:
+  after a grace period the scheduler falls back to other hardware. Do not
+  add a stanza that stops the task on an unexpected architecture; a
+  healthy Pi is slow, not broken, and such a stanza turns a slow build
+  into a lost one. The DEGRADED-BOX tripwire is the check to keep: it
+  fires only on a box where `git config` takes 30 seconds or more. For the
+  same reason the Gates paragraph derives the job cap from `nproc` and
+  memory instead of listing machine shapes: an executor on a box the list
+  does not cover has no instruction.
 
 fleet-cp rejects any spec whose text contains a dollar-paren command
 substitution (`$(...)`) or a backtick command substitution with `400 bad
