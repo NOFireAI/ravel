@@ -5,205 +5,114 @@ description: Use before merging any fleet-dispatched branch, or to audit one ret
 
 # Verifying a fleet-dispatched branch
 
-An executor's own report that gates passed is not evidence. Real defects
-have shipped behind that exact claim: a cross-crate field rename that
-broke an untouched crate's build, a stale test fixture after a type
-gained a required field, an unguarded array index that panics on a
-corrupt-but-plausible input, a grouped-aggregate UDAF that silently used
-the wrong float ordering, an error-redaction catch-all that swallowed
-real 422s as fake 503s, and a format writer that dropped a sort
-invariant its own reader still required. None of those would have shown
-up if the only check was "did the executor say clippy was clean."
+An executor's report that gates passed is not evidence; `reference.md`
+beside this file lists defects that shipped behind that claim. This skill
+runs two tiers and keeps them separate in the report and in what happens
+next:
 
-This skill runs two tiers. Tier 1 is deterministic and has zero false
-positives: a named command exited nonzero, full stop. Tier 2 is a set of
-narrow, scoped semantic checks that flag things worth five minutes of a
-human's attention; it is not proof, and a tier-2-only finding never
-triggers automatic action on its own. Keep these separate in the report
-and in what happens next.
+- **Tier 1** is deterministic: a named command exited non-zero, full stop.
+- **Tier 2** is narrow semantic checks that flag things worth five minutes
+  of a human's attention. It is not proof, and a tier-2-only finding never
+  triggers automatic action.
 
-## When to use this
-
-- Before merging any fleet task's result branch (this supersedes plain
-  "re-run gates locally" in the merge-fleet-result skill; run this
-  first, then follow merge-fleet-result's merge/push/cleanup steps once
-  tier 1 passes).
-- To retroactively audit a branch, or to check a specific historical
-  commit (useful for validating this skill itself against a known-bad
-  state; see "Validating this skill" below).
+Run it before merging any fleet result (then continue with
+merge-fleet-result), or to audit a branch or historical commit.
 
 ## Inputs
 
-Accepts, in order of preference:
+In order of preference:
 
-1. A fleet task-id: resolve via `git ls-remote origin
-   refs/heads/task/<id>/result`. If that comes back empty, the branch has
-   landed and its task refs were deleted (the merge workflow deletes them
-   once the PR is confirmed merged). `main` is rebase-only, so there is no
-   merge commit: find the landed commits on `main` (for example by the
-   ticket number in their `Fixes:`/`Refs:` trailer, `git log --grep`),
-   verify the newest of them, and diff against the parent of the oldest
-   for the tier-2 hunk scope.
+1. A fleet task id: resolve `git ls-remote origin
+   refs/heads/task/<id>/result`. Empty means it landed and its task refs
+   were deleted. `main` is rebase-only, so there is no merge commit: find
+   the landed commits on `main` (for example `git log --grep` on the
+   ticket number in their `Fixes:`/`Refs:` trailer), verify the newest,
+   and diff against the parent of the oldest for the tier-2 scope.
 2. A merge-commit SHA, for history from before `main` became rebase-only:
-   verify `<merge>^2`, diff against `<merge>^1` (main before the merge) for
-   the tier-2 hunk scope.
-3. Any other ref `git worktree add` accepts (a branch, a tag, a raw SHA).
+   verify `<merge>^2`, diff against `<merge>^1`.
+3. Any other ref `git worktree add` accepts.
 
-Always print the exact SHA resolved before doing anything else: an
-ambiguous or moved ref is a debugging trap later.
+Print the exact SHA resolved before doing anything else.
 
-## Procedure
+## Tier 1: deterministic gates
 
-### Tier 1: deterministic gates
+```sh
+scripts/verify-dispatch-gates.sh --with-gates <ref> <scratchpad-dir>
+```
 
-Run `scripts/verify-dispatch-gates.sh --with-gates <ref> <scratchpad-dir>`,
-where `<scratchpad-dir>` is a path **outside this repo's working tree**
-(the session's scratchpad directory is exactly right for this; never a
-subdirectory of the repo itself: a worktree left behind inside the repo
-shows up as untracked content in every session's `git status` on the
-shared checkout, unless its path happens to be ignored).
+`<scratchpad-dir>` is outside this repo's working tree (the session's
+scratchpad is right): a worktree left behind inside the repo shows up as
+untracked content in every session's `git status` on the shared checkout,
+unless its path happens to be ignored.
 
-The script always:
+The script resolves `<ref>` to a SHA, creates a detached worktree there,
+sets a fresh `CARGO_TARGET_DIR` (the cold cache that defeats incremental
+masking; leave `RUSTC_WRAPPER`/sccache alone, it does not mask errors),
+stops at the first failure with the exact command and exit code, and
+always removes the worktree.
 
-- Resolves `<ref>` to a SHA and creates a detached-HEAD worktree at that
-  exact commit under the scratchpad path (not the ref name: a branch
-  already checked out elsewhere, including `main` in the primary
-  checkout, cannot be checked out a second time by `git worktree add`).
-- Sets a **fresh `CARGO_TARGET_DIR`** for this run only, not the repo's
-  shared target directory. This is what "cold cache" means here: it
-  defeats incremental-compile masking, which is a real, previously
-  observed failure mode (an executor's own claimed-green branch that
-  didn't actually compile once the incremental cache was invalidated).
-  It does **not** mean disabling sccache: sccache is keyed on inputs and
-  doesn't mask a genuine compile error, it just avoids redoing
-  already-correct work, so leave `RUSTC_WRAPPER` alone.
-- Stops at the first failure, printing the exact command and its real
-  exit code, and always removes the worktree on exit (pass or fail).
+- `--with-gates` (or `VERIFY_WITH_GATES=1`) runs the worktree's own
+  `scripts/gates.sh` workspace-wide, including the `sql`, `flight-sql`
+  and `ravel-bench` feature lanes, and on a clean tree writes a
+  gates-pass receipt keyed by tree hash. That receipt lets the merge step
+  run `FLEET_MERGE_SKIP_GATES=1 scripts/fleet-result-merge.sh` instead of
+  repeating the build. Print the `Gates receipt: <path>` line it emits.
+- Without the flag it runs `cargo fmt --all --check`, then `cargo build`
+  and `cargo clippy` with `--workspace --all-targets`, `cargo test
+  --workspace` and `cargo test --doc --workspace`. That skips the feature lanes
+  and writes no receipt, so the merge must not set
+  `FLEET_MERGE_SKIP_GATES=1`. Use it only when `--with-gates` cannot run.
 
-Two modes for what actually runs inside that worktree:
+The script's exit code is authoritative. Non-zero is tier-1 FAIL: capture
+the command, exit code and the last ~40 lines of output, and skip tier 2.
 
-- **`--with-gates`** (or `VERIFY_WITH_GATES=1`): runs the worktree's own
-  `scripts/gates.sh`, unscoped, workspace-wide. This is the default
-  recommendation now: `gates.sh` also covers the `sql` / `flight-sql`
-  feature lanes and the `ravel-bench` feature lanes the plain mode below
-  never builds, and on a clean tree it writes a gates-pass receipt keyed
-  by tree hash. That receipt is exactly what lets the merge step run
-  `FLEET_MERGE_SKIP_GATES=1 scripts/fleet-result-merge.sh` and skip its
-  own second full build instead of redoing the identical workspace-wide
-  gate a few minutes later. Print the `Gates receipt: <path>` line the
-  script emits on success; it is not needed to invoke the merge step
-  (the merge script recomputes the same path from the tree hash) but is
-  useful when a receipt-missing failure needs to be debugged.
-- **Plain mode** (no flag): runs, workspace-wide regardless of which
-  crate the branch touched (a crate-scoped `-p` run is exactly what let a
-  cross-crate rename break an untouched crate's build):
-  `cargo fmt --all --check`, `cargo build --workspace --all-targets`,
-  `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test --workspace`, `cargo test --doc --workspace`. This does
-  **not** build the `sql` / `flight-sql` / `ravel-bench` lanes and does
-  **not** write a gates-pass receipt, so a merge that follows a plain-mode
-  verify run must NOT set `FLEET_MERGE_SKIP_GATES=1` (there is no receipt
-  for it to find, and the script refuses the skip without one). Use this
-  mode only when `--with-gates` itself is unavailable for some reason;
-  otherwise prefer `--with-gates` so the land chain pays for the full
-  gate list exactly once.
+## Tier 2: narrow adversarial review (only on tier-1 PASS)
 
-Treat the script's own exit code as authoritative. If it's nonzero, tier 1
-is FAIL: capture the command, exit code, and the last ~40 lines of its
-output as evidence, and skip tier 2 entirely (there's nothing to review
-if it doesn't build).
+Get the diff scope (`git diff <base>...<ref> --stat`, plus full hunks for
+anything non-trivial). Dispatch one subagent per class below, in parallel
+in a single message, scoped to the changed hunks only. Tell each one: it
+reviews the diff for one narrow pattern, cites file:line for any finding,
+and says plainly when the pattern does not appear rather than reaching
+for something else. Never ask a generic "find bugs in this diff"; its
+clean verdict is worth nothing.
 
-### Tier 2: narrow adversarial review (only on tier-1 PASS)
-
-Get the diff scope first: `git diff <merge-base-or-parent>...<ref>
---stat` and the full hunks for anything non-trivial. Then dispatch one
-subagent per failure class below, in parallel (Agent tool, all
-invocations in a single message), scoped to **only the diff's changed
-hunks**, not the whole codebase, and not "find bugs in this diff"
-generically. A generic adversarial pass produces plausible-sounding
-findings that then have to be individually disproven; a narrow,
-concretely-specified check is what actually catches something.
-
-Give each subagent this framing: it is reviewing a diff for one specific,
-narrow pattern; it must cite file:line for any finding; if the pattern
-does not appear in the diff at all, say so plainly rather than reaching
-for something else to flag.
-
-1. **Grouped/aggregate float correctness.** Any new or modified
-   aggregate, UDAF, or `GROUP BY` accumulator: check that NaN, `-0.0`
-   vs `0.0`, and an all-equal or all-infinite group are handled through a
-   documented *total* order (`f64::total_cmp` or equivalent) rather than
-   `partial_cmp` seeded from `f64::MAX`/`f64::MIN`. (This class is real:
-   DataFusion's own grouped `MIN`/`MAX` shipped exactly this bug. A NaN
-   poisoned later comparisons, `-0.0`/`0.0` compared `Equal` so arrival
-   order decided the winner, and an all-infinite group never displaced
-   the seed.)
-2. **Error redaction.** Any new or modified catch-all / wildcard match
-   arm that maps an internal error type to a generic client-facing status
-   (`Internal`, `Unavailable`, a bare 5xx): check that every variant
-   folded into that arm actually needs redaction (its `Display` text can
-   carry backend-derived content) rather than being swept in only
-   because it wasn't explicitly handled. A real evaluator-level error
-   (a bad regex argument, an ambiguous match) reported back as a fake
-   "storage unavailable" hides the actual, fixable problem from the
-   caller.
-3. **Fail-open validation asymmetry.** Any new decode/reader path for a
-   persistent, versioned format: check that every invariant the format's
-   writer, or a sibling version's reader, already enforces is enforced
-   here too, not silently trusted because "the writer wouldn't produce
-   that." A tampered or buggy object exercises exactly the path that
-   skipped the check.
-4. **Sort/ordering invariant drift.** Any new writer for a format section
-   documented as sorted or otherwise order-dependent (a dictionary, a
-   monotonic index): check the new writer actually sorts, rather than
-   using first-occurrence or insertion order because it's "similar
-   enough." Silent drift here doesn't fail a test; it fails a byte-size
-   or performance gate much later, far from the change that caused it.
-5. **Cross-crate rename/field drift in non-compiled references.** Any
-   renamed or removed public field, function, or type: grep the *whole
-   workspace*, not just the touched crate, for the old name, including
-   doc comments, a bench binary gated behind a feature so it isn't in the
-   default build, or a fixture file. Most of this class is already tier
-   1 (if it's compiled code, `cargo build --workspace --all-targets`
-   already caught it); this subagent only adds value for references
-   tier 1's compiler pass cannot see.
-6. **Unguarded indexing / bounds on adversarial input.** Any new code
-   that indexes a collection (an array, a dictionary, a decoded buffer)
-   using a value that came from parsed or otherwise untrusted input:
-   check there's an explicit bounds check before the index, not just a
-   type-level `usize` cast that only rejects negative values. (The known
-   shape of this bug: a `usize::try_from` guarded negative keys but not
-   out-of-range positive ones, and the panic path only surfaced once a
-   fuzz/property test was added; ordinary unit tests
-   never construct a corrupt key. Tier 1 will **not** catch this class
-   unless a test already exercises the malicious input; that gap is
-   exactly why this check exists.)
-
-7. **Vacuous tests.** Any new or modified test the branch cites as proof
-   of a fix or of coverage: check it can actually detect the defect it
-   names. Concrete tells, all shipped before: a fault-injection test that
-   never asserts the FaultStore occurrence counter fired; a fixture
-   sized below the threshold constant that gates the path under test
-   (a 370-byte segment "testing" the paged-fetch path that only runs
-   above `DEFAULT_WHOLE_OBJECT_THRESHOLD`); one identical literal (a
-   tenant hash, a key) reused across cases that claim to prove
-   cross-tenant separation; a tie-break test on an input so small the
-   unfixed code passes it too. The question to answer per test: which
-   single line of production code flips to make this test fail? If no
-   such line exists, flag it. A vacuous test found after merge costs a
-   full extra dispatch round to replace.
+1. **Grouped/aggregate float correctness.** A new or changed aggregate,
+   UDAF or `GROUP BY` accumulator handles NaN, `-0.0` vs `0.0`, and
+   all-equal or all-infinite groups through a total order
+   (`f64::total_cmp`), not `partial_cmp` seeded from `f64::MAX`/`MIN`.
+2. **Error redaction.** A new or changed catch-all arm that maps internal
+   errors to a generic client status (`Internal`, `Unavailable`, a bare
+   5xx): every variant folded in actually needs redaction, rather than a
+   caller-fixable error (a bad regex argument, an ambiguous match) being
+   reported as "storage unavailable".
+3. **Fail-open validation asymmetry.** A new decode or reader path for a
+   persistent versioned format enforces every invariant the writer or a
+   sibling version's reader enforces, instead of trusting "the writer
+   would not produce that".
+4. **Sort/ordering invariant drift.** A new writer for a section
+   documented as sorted or order-dependent actually sorts, rather than
+   using insertion order.
+5. **Rename drift outside compiled code.** A renamed or removed public
+   field, function or type: grep the whole workspace for the old name in
+   doc comments, feature-gated bench binaries and fixture files. Compiled
+   references are tier 1's job.
+6. **Unguarded indexing on untrusted input.** Indexing a collection with
+   a value from parsed input has an explicit bounds check, not just a
+   `usize` conversion that rejects only negatives. Tier 1 misses this
+   unless a test already feeds the malicious input.
+7. **Vacuous tests.** For each test the branch cites as proof: which
+   single production line flips to make it fail? Flag it if none does.
+   Known shapes: a FaultStore test that never asserts the fault fired, a
+   fixture below the threshold that gates the path under test, one
+   literal reused across cases claiming separation, an input too small to
+   exercise the property.
 8. **Diff scope vs declared scope.** Compare `git diff --name-status
-   <merge-base>..<ref>` against the task's stated crates and docs. Flag
-   every deletion and every touched path outside the declared scope. A
-   result branch can silently delete diagrams and their references from
-   unrelated docs with every CI gate passing; only a scope comparison
-   catches it. Deletions of files the task never mentions are a flag
-   at any confidence level.
+   <base>..<ref>` with the task's stated crates and docs. Flag every
+   deletion and every path outside the declared scope; deletions of files
+   the task never mentions are a flag at any confidence.
 
-Each subagent returns: verdict (clean / flag), confidence (high / medium
-/ low), and file:line evidence if flagged. A "clean" verdict from a
-narrow, well-specified check is worth something; a "clean" verdict from
-"did you find any bugs" is not; don't ask the latter.
+Each subagent returns a verdict (clean / flag), confidence (high /
+medium / low), and file:line evidence when flagged.
 
 ## Report format
 
@@ -215,50 +124,32 @@ TIER 1: PASS | FAIL
   <if FAIL: exact command, exit code, evidence (file:line or output tail)>
 
 TIER 2: <n> findings (only run if tier 1 passed)
-  [class] file:line — one-line claim (confidence: high/medium/low)
+  [class] file:line - one-line claim (confidence: high/medium/low)
   ...
   Tier 2 findings need a human read before acting. They are narrow
   heuristic checks, not proof. Never auto-file or auto-redispatch on a
   tier-2-only result.
 ```
 
-## Wiring into the dispatch flow
+## What happens next
 
-Only a **tier-1 FAIL** drives the auto-retry loop below. A tier-2 finding
-alongside a tier-1 PASS surfaces directly to the user in the same turn;
-it never triggers automatic filing or redispatch, because most of the
-real defects listed above (everything except the cross-crate build
-breakage) needed a dedicated audit or a differential test harness to
-surface, not a generic reviewer, and a subagent's narrow check is a
-lead, not a verdict.
+A tier-2 finding beside a tier-1 PASS goes to the user in the same turn
+and triggers nothing automatically. Only a tier-1 FAIL drives the loop:
 
-On tier-1 FAIL:
+1. `gh issue create` with the full tier-1 report, linked to the
+   originating ticket if there is one.
+2. Re-dispatch a fix task whose spec quotes the exact command and its
+   output, not "gates failed, fix it".
+3. Re-run this skill on the fix's result branch.
+4. Tier-1 PASS: continue with merge-fleet-result, passing
+   `FLEET_MERGE_SKIP_GATES=1` if tier 1 ran with `--with-gates`.
+5. A second consecutive tier-1 FAIL: stop, give the user both reports,
+   and dispatch no third attempt without explicit direction.
 
-1. `gh issue create` with the full tier-1 report (command, exit code,
-   evidence), linked to the originating ticket if one exists.
-2. Re-dispatch a fix task to the fleet. The spec must include the exact
-   failure (not "gates failed, fix it"; include the command and its
-   output), so the executor isn't guessing at what broke.
-3. Re-run this skill against the fix's result branch.
-4. Tier-1 PASS now: proceed to the normal merge flow
-   (`scripts/fleet-result-merge.sh` / the merge-fleet-result skill). If
-   tier 1 ran in gated mode (either `--with-gates` or `VERIFY_WITH_GATES=1`,
-   which select the same mode and write the same receipt), pass
-   `FLEET_MERGE_SKIP_GATES=1` to the merge script so it does not redo the
-   same workspace-wide build.
-5. Tier-1 FAIL again (2nd consecutive failure): stop. Surface both
-   reports to the user directly. Do not dispatch a third attempt without
-   explicit direction.
+## Validating a change to this skill
 
-## Validating this skill
-
-Before trusting a change to this skill or its script, don't just run it
-against branches that already merged clean: a known-good branch passing
-proves nothing (it would pass with a tier-1 gate that never actually ran
-anything, too). Validate against real pre-fix regressions instead: check
-out a commit one step before a known fix (its parent, or the specific
-buggy commit itself) and confirm tier 1 correctly fails with the same
-symptom the fix commit's message describes. The repo's history has
-ready-made cases: search `git log --grep` for `fix(` commits
-with detailed bodies, then verify against `<fix-commit>^` or the specific
-commit the fix's own message names as the root cause.
+A known-good branch passing proves nothing; a tier 1 that ran nothing
+passes too. Check out the parent of a known fix, or the commit its
+message names as the root cause (find `fix(` commits with detailed bodies
+via `git log --grep`), and confirm tier 1 fails with the symptom the fix's
+message describes.

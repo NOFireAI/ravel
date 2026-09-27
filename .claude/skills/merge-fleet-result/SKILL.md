@@ -5,252 +5,132 @@ description: Use when a fleet task finishes - inspect its result branch, open th
 
 # Merging a fleet result branch
 
-Executor gate claims are not the gate. An executor can report fmt/clippy/
-test clean while its branch does not compile from a cold build, because an
-incremental build cache can mask an error (a stale-cache lifetime error is
-the known shape). Acceptance is a cold-cache gate run on the result branch
-(the verify-dispatch skill) plus the PR's required checks, which the merge
-queue runs again on the branch rebased onto current main.
+An executor's "gates green" is not the gate: an incremental build cache
+can mask an error that a cold build shows. Acceptance is a cold-cache gate
+run on the result branch (the verify-dispatch skill) plus the PR's
+required checks, which the merge queue runs again on the branch rebased
+onto current main. `main` is protected (PR required, required checks,
+rebase-merge only), so nothing pushes it directly. `reference.md` beside
+this file has the details of the history clean and the review states.
 
-**Run the verify-dispatch skill on the result branch before merging.** It
-runs the same gates this skill's procedure below runs, but in an isolated
-worktree with a cold `CARGO_TARGET_DIR` (defeating exactly that
-incremental-cache masking) instead of on the primary checkout after the
-merge has already landed there, plus a set of narrow adversarial checks
-for defect classes this repo has shipped before. On a tier-1 FAIL,
-verify-dispatch's own procedure covers filing an issue and re-dispatching
-a fix; don't duplicate that here. Once verify-dispatch reports tier-1
-PASS, continue with the procedure below.
+## 1. Verify and inspect
 
-## main is landed through a PR, never a direct push
-
-`main` has required branch protection: a PR is mandatory, required status
-checks must pass, and history is linear (rebase-merge only). No process,
-`fleet-result-merge.sh` included, pushes `main` directly. The script
-lands a result branch by cleaning its history, pushing that cleaned history
-to a `task/<id>/merge` head branch, and opening a PR against `main`. The
-rebase-merge keeps each commit's own message, so per-commit `Fixes:`/
-`Refs:` trailers still close their issues when they land.
-
-**The PR opens without auto-merge.** The fleet review posts as a review
-comment, not a required status check, so `--auto` would merge before the
-review lands and its findings would go unaddressed. The script asks for the
-review itself: after
-opening the PR it posts one comment whose whole body is
-`@claude-fleet review`, which is the trigger (ADR-1586; anything after
-`review` is parsed as arguments, and an unrecognized word gets a confused
-reaction and no review). Wait for the `claude-fleet[bot]` review, then fix
-or explicitly answer every finding not marked `nit` (each inline comment
-starts with its severity; one with no severity counts as actionable). A
-review whose findings are all nits is clean: the bot reports nits on
-almost every PR, so waiting for a zero-finding review never ends. Do not
-push nit fixes and ask for another round; a push moves the head and needs
-a fresh review. After 3 review rounds on one PR, stop and hand it to a person.
-Merge by hand once the review is clean and CI is green:
-
-```sh
-scripts/pr-review-status.sh <pr-number>   # one-line status; on clean, prints
-                                           # the exact merge command to run
-```
-
-`FLEET_MERGE_AUTO=1` enables `gh pr merge --auto --rebase` for the rare
-case that genuinely does not need to wait for a
-review; do not set it out of impatience. The review still arrives, after
-the merge, so sweep it rather than skipping it.
-
-## Result-branch history is cleaned before the PR is opened
-
-Before it pushes anything, `fleet-result-merge.sh` scans the result
-branch's own commits (everything between its merge base against
-`origin/main` and its tip) and rewrites two classes of commit out so they
-never reach main:
-
-- `wip:` headers. Work-in-progress snapshot commits have reached
-  protected main when the merge path carried a result branch through
-  verbatim.
-- Pure formatting/style fixups. When an executor gates first and formats
-  second, a formatting-only commit rides along on top of the real work
-  and ends up on main as noise.
-
-The rewrite rebuilds the branch linearly with `cherry-pick` onto a
-throwaway `_fleet_rewrite_<id>` branch (a merge commit anywhere in the
-range aborts the whole run with a clear message, because cherry-pick
-cannot replay a merge). Each flagged commit is folded into the previous *retained*
-commit, but its own `Refs:`/`Fixes:`/`Signed-off-by:` trailers are carried
-into that commit's message first (via `git interpret-trailers
---if-exists addIfDifferent`), so a required trailer that lived only on a
-`wip:` snapshot is never dropped. A flagged commit that is the *first*
-retained commit has nothing to fold into, so it is reworded instead: the
-`wip:` prefix is stripped and, if what remains has no Conventional Commits
-type, a `chore:` type is prepended so the subject stays a valid header. The
-formatting-fixup detector is deliberately conservative: it fires only when
-the subject mentions `fmt`/`style fix` AND the diff is empty under
-`git diff -w`, so a commit that reformats and also changes real content is
-left alone. A branch with no flagged commits is left byte-for-byte
-untouched and pushed as-is. The cleaned history is what becomes the PR
-head, so the PR only ever contains clean commits. The fleet-task-spec skill
-stops these commits being created in the first place (specs tell executors
-to format before the gated commit); this step is the backstop for branches
-written before that discipline, or that slip.
-
-## Procedure
-
-`fleet-result-merge.sh` is the path: it enforces the pre-flight guard
-(refuses unless HEAD is a clean `main`/`origin/main`, so a stale HEAD can
-never produce a too-old merge base), does the history clean above, runs the
-local pre-flight gates on the cleaned tree, and only then pushes the PR
-head and opens the PR (without auto-merge; see above).
+Run the verify-dispatch skill on the result branch first. On a tier-1
+FAIL, follow its procedure (issue plus fix dispatch) and stop here.
 
 ```sh
 TASK=<task-id>
-git fetch origin refs/heads/task/$TASK/result
-git log --oneline origin/main..FETCH_HEAD   # exactly the expected commits?
-git diff --stat origin/main...FETCH_HEAD    # scope: only the task's dirs?
-
-# Write the PR message: first line is the PR title, everything after the
-# blank line is the PR body (put Fixes: #<issue> / Refs: #<issue> here).
-scripts/fleet-result-merge.sh $TASK message.txt   # add -p CRATE to scope local gates
+scripts/fleet-result-inspect.sh $TASK   # expected commits? only the task's dirs?
 ```
 
-- Scope creep in the diff (files outside the task's stated dirs): stop and
-  review those hunks before running the script; do not open the PR if they
-  are wrong.
-- The PR's required status checks are the real gate. The script's local
-  pre-flight gate run only catches obvious breakage before a PR is opened;
-  a failure there means fix the branch (or re-dispatch) before retrying,
-  not push anything. Never try to bypass the required checks.
-- When the exact tree being merged already passed the full gates locally
-  (the orchestrator gated the result branch before or after a local fix
-  commit), `FLEET_MERGE_SKIP_GATES=1` skips the script's repeat run and
-  lets the PR checks carry it. Not for conflict resolutions or any tree
-  that differs from what was gated.
-- Commit header not in repo convention: amend on the branch before running
-  the script (the script only rewrites `wip:`/fixup subjects, not arbitrary
-  non-conforming ones).
+Files outside the task's stated dirs: review those hunks before going on,
+and do not open the PR if they are wrong. A commit header outside the
+repo convention: amend it on the branch first (the script rewrites only
+`wip:` and formatting-fixup subjects).
 
-## Recurring mechanical conflicts and gotchas
+## 2. Open the PR
 
-- Run the script from a fresh worktree detached at `origin/main`
-  (`git worktree add --detach <path> origin/main`), not from the primary
-  checkout and not from the worktree you reviewed or fixed the branch in.
-  The script checks out the cleaned branch in its current directory to
-  run the pre-flight gates, so running it in the primary checkout changes
-  that checkout. Its own guard refuses any HEAD other than `main` or
-  `origin/main`.
-- Append-heavy index files (`docs/adrs/README.md` is the usual one)
-  conflict on almost every landing, because `main` moves with unrelated
-  entries. This is not a premise conflict. Mechanical resolve: keep both
-  sides' entries, delete the duplicate of your own entry, keep the file's
-  existing order, re-run the gates.
-- Before running cargo on any hand-combined tree (a rebase, a multi-branch
-  land), do a textual pass first: for every struct whose field list the
-  combined diff changes, `grep -rn '<StructName> {'` across the whole
-  workspace and fix every literal. Otherwise a changed field list surfaces
-  as a long series of `E0063` (missing field) errors, one full cargo cycle
-  at a time; the grep finds the whole class at once.
-- `gh api` sends every `-f` value as a string. A boolean or number field
-  needs `-F` (`-F strict=false`), or the API answers with
-  `"false" is not a boolean`.
-- `gh pr merge --auto --rebase` (only under `FLEET_MERGE_AUTO=1`, or the
-  final by-hand merge once the review is clean) can fail once with a
-  GraphQL error naming a merge method you never requested ("squash merging
-  is not allowed"). That is API flakiness around enabling auto-merge:
-  retry once before investigating repo settings.
-- Disabling auto-merge on a PR that is already mid-merge fails silently:
-  GitHub can complete a merge within seconds of a required check going
-  green, and a `gh pr merge --disable-auto` call that loses that race just
-  finds the PR already merged. This is why the default is to never enable
-  auto-merge in the first place, not to enable-then-disable it.
+From a fresh worktree detached at `origin/main` (`git worktree add
+--detach <path> origin/main`), never the primary checkout or a worktree
+you reviewed or fixed the branch in: the script checks out the cleaned
+branch in its current directory to run pre-flight gates, and its guard
+refuses any HEAD other than a clean `main` or `origin/main`.
 
-## After the PR is open
+Write the PR message file (line 1 is the title; the body after the blank
+line carries `Fixes: #<issue>` or `Refs: #<issue>`), then:
 
-**Under `FLEET_MERGE_AUTO=1`** (auto-merge already enabled): just poll
-`gh pr view <number> --json state,mergedAt` until it reports merged, then
-go straight to cleanup below. Do not run a second, manual `gh pr merge`
-against a PR GitHub is already landing for you.
+```sh
+scripts/fleet-result-merge.sh $TASK message.txt   # -p CRATE scopes the local gates
+```
 
-**Otherwise** (the default): poll `scripts/pr-review-status.sh <number>`
-until CI is green, `mergeStateStatus` is `CLEAN` or `UNSTABLE` (`DIRTY`/
-`DRAFT`/`BEHIND` mean it isn't mergeable regardless of CI or review state
--- resolve those first), and it reports a review against the PR's current
-head commit in state `COMMENTED` or `APPROVED` (`PENDING`, `DISMISSED`, and
-`CHANGES_REQUESTED` are all not clean; the bot itself only ever posts
-`COMMENTED`, so do not read "not approved" as "not clean"). That state, and
-the inline-comment count beside it, cover reviews from ANY author, so a
-maintainer's `CHANGES_REQUESTED` at head blocks even though `protect-main`
-requires no approvals; the presence check that says a review happened at all
-stays scoped to the bot, since a human review is not the agent review the
-gate asks for. When it reports
-no review at head, read WHICH of the five states it names: nobody asked, a
-malformed trigger, a task queued or running, a task that went terminal with
-no review (nothing retries it -- post the trigger again), or a review at an
-older commit. The review's inline-comment count does not drop to zero once
-you fix something -- the REST API never removes a comment just because the
-code it flagged changed -- so "clean" here means every comment has been
-individually read and its finding fixed or explicitly answered (a reply on
-the thread, or a commit message noting why it doesn't apply), never that the
-count reaches zero. A review with zero comments from the start is the one
-case that is actually clean by count. Findings the bot could not place
-inline sit in the review BODY under "Findings outside the diff:" and are
-counted separately on the status line; read those too. Once every finding is
-accounted for, `pr-review-status.sh` prints the exact merge command, pinned
-to the head SHA it just checked via `--match-head-commit` so the merge
-refuses if the branch moved since. Run it as printed:
+It folds `wip:` and formatting-only commits into their neighbours (keeping
+their trailers), rewrites authorship, runs the local pre-flight gates,
+pushes `task/<id>/merge`, opens the PR without auto-merge, and posts
+`@claude-fleet review`.
+
+- A pre-flight gate failure means fix the branch or re-dispatch, then
+  retry. Never bypass the required checks.
+- `FLEET_MERGE_SKIP_GATES=1` skips the repeat local run only when this
+  exact tree already passed the full gates (for example a
+  `verify-dispatch-gates.sh --with-gates` receipt). Not after a conflict
+  resolution or any edit.
+- `FLEET_MERGE_AUTO=1` enables auto-merge for the rare PR that needs no
+  review wait. The review still arrives after the merge; sweep it.
+
+## 3. Answer the review
+
+Poll `scripts/pr-review-status.sh <pr-number>` until CI is green,
+`mergeStateStatus` is `CLEAN` or `UNSTABLE`, and a review exists at the
+current head in state `COMMENTED` or `APPROVED`. `DIRTY`, `DRAFT` and
+`BEHIND` are not mergeable whatever CI or the review says: resolve them
+first. `PENDING`, `DISMISSED` and `CHANGES_REQUESTED` are not clean. The
+bot only ever posts `COMMENTED`; a `CHANGES_REQUESTED` from anyone at
+head blocks. When there
+is no review at head, act on which of the five states the script names;
+a task that went terminal with no review needs the trigger posted again,
+and a push never starts a review by itself.
+
+Fix or explicitly answer (thread reply, or a commit message saying why it
+does not apply) every finding not marked `nit`; an inline comment with no
+severity counts as actionable. Read the "Findings outside the diff:"
+section of the review body too. The inline-comment count never drops, so
+clean means every comment accounted for, not zero. A review whose
+findings are all nits is clean: do not push nit fixes or ask for another
+round. After 3 review rounds on one PR, stop and hand it to a person.
+
+## 4. Merge
+
+Run the merge command `pr-review-status.sh` prints, exactly:
 
 ```sh
 ALLOW_LITERAL_SHA=1 gh pr merge <number> --rebase --match-head-commit <sha>
 ```
 
-The PreToolUse hook refuses a bare 40-character SHA unless the command
-carries `ALLOW_LITERAL_SHA=1`, and this is the case the prefix exists for:
-the pinned SHA is the check. Never swap it for a head resolved at merge time
-(`gh pr view --json headRefOid`), which matches whatever the head is by then
-and merges a push that landed after the review.
+The pinned SHA is the check: a head resolved at merge time
+(`gh pr view --json headRefOid`) would merge a push that landed after the
+review. The command enqueues the PR in the merge queue (`REBASE`,
+`ALLGREEN`, batches up to 5), which tests it on top of current main.
 
-**`protect-main` has a merge queue, so that command enqueues the PR rather
-than merging it on the spot.** GitHub rebases it onto current main, runs full
-CI on the combined result (the `merge_group:` trigger in `ci.yml`), and lands
-it only if that is green. Consequences here:
+- Do not hand-rebase because main moved; it costs a CI cycle and
+  invalidates the review at head. A behind-ness count is not a reason to
+  act; `assert-fresh-merge-base.sh` is for a merge that bypasses the
+  queue.
+- Do not add `--delete-branch`: `gh` refuses it while a queue is enabled,
+  and `delete_branch_on_merge` removes the merge head anyway. "The merge
+  strategy for main is set by the merge queue" is informational.
+- Poll `gh pr view <number> --json state,mergedAt` until it reports
+  merged. A PR still open ten minutes later may have been ejected (a red
+  batch, or a conflict after the rebase): look, do not wait it out. For a
+  failed batch, read which check went red on the `merge_group` run.
+- Under `FLEET_MERGE_AUTO=1`, only poll; never run a second `gh pr merge`.
 
-- **Do not hand-rebase a PR because main moved.** The queue already tests the
-  PR on top of current main. Rebasing anyway costs a CI cycle and invalidates
-  the review at head for no gain.
-- `mergeStateStatus` and the merge-base guard stay worth reading, but a
-  behind-ness count is not a reason to act. The guard covers a merge that
-  bypasses the queue.
-- The PR does not merge the instant the command returns. Poll
-  `gh pr view <number> --json state,mergedAt` as under `FLEET_MERGE_AUTO=1`.
-  A queue entry can also be ejected (its batch went red, or it conflicted after
-  the rebase); an ejected PR sits open with the queue gone, so "still open ten
-  minutes later" is something to look at rather than something to wait out.
-- The queue is `ALLGREEN` and batches up to 5, so one bad PR fails its whole
-  batch and the rest requeue. When a batch fails, read which check went red on
-  the `merge_group` run, not on the PR.
-- **Do not add `--delete-branch` to that command.** `gh` refuses it while a
-  queue is enabled ("Cannot use `-d` or `--delete-branch` when merge queue
-  enabled") and fails before merging anything. It is not needed: the
-  repository sets `delete_branch_on_merge`, so the `task/<id>/merge` head is
-  removed when the merge lands. `gh` also prints "The merge strategy for main
-  is set by the merge queue", which is informational, not an error.
+## 5. Clean up
 
-The script deliberately leaves `task/$TASK/result` and `task/$TASK/start` in
-place regardless of merge mode: opening a PR is not landing, and deleting them
-before the checks (and the review wait) finish would mean a failed
-check or an unresolved finding leaves the PR open with no way to recover
-the original result branch.
-
-Watch the PR (`gh pr view <number> --json state,mergedAt`) until it reports
-merged. Once merged, delete the task refs yourself:
+Only once the PR reports merged:
 
 ```sh
 git push origin --delete task/$TASK/result task/$TASK/start
 ```
 
-If a required check fails instead, the PR stays open with the task refs
-still intact; fix the branch (or re-dispatch) and retry, do not delete
-anything.
+If a required check fails instead, keep the task refs, fix or
+re-dispatch, and retry. Close the issue if no landed trailer did
+(`Fixes:` closes, `Refs:` does not), update the task ledger, and file
+follow-up issues for any deviations or bugs the executor reported.
 
-Close the issue if no landed commit trailer did (`Fixes:` closes it,
-`Refs:` does not). Update the in-flight task ledger. If the agent's report
-listed deviations, ambiguities, or discovered bugs, file follow-up issues
-now, before the context is lost.
+## Gotchas
+
+- Append-heavy index files (`docs/adrs/README.md`) conflict on almost
+  every landing. Not a premise conflict: keep both sides' entries, drop
+  the duplicate of your own, keep the file's order, re-run the gates.
+- Before running cargo on a hand-combined tree (a rebase, a multi-branch
+  land), `grep -rn '<StructName> {'` workspace-wide for every struct whose
+  fields the diff changes and fix every literal; otherwise `E0063` errors
+  surface one cargo cycle at a time.
+- `gh api -f` sends strings; a boolean or number needs `-F`
+  (`-F strict=false`), or the API answers `"false" is not a boolean`.
+- `gh pr merge` can fail once with a GraphQL error naming a merge method
+  you never asked for ("squash merging is not allowed"). Retry once
+  before investigating repo settings.
+- Never enable auto-merge planning to disable it later:
+  `gh pr merge --disable-auto` fails silently when GitHub has already
+  merged the PR seconds after a check went green.
