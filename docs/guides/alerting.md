@@ -82,9 +82,12 @@ Fields on a rule:
 - `for` (optional): a humantime duration (`5m`, `30s`), the pending-before-firing
   delay. Omitted, the rule fires on the first tick its condition holds; set, the
   condition must hold continuously for that long first.
-- `repeat_interval` (optional): a humantime duration for how often a rule that
-  stays firing re-notifies its sinks. Omitted uses a one-minute default; `0s`
-  disables repeats for that rule.
+- `repeat_interval` (optional): a humantime duration for how often an alert
+  that stays firing re-notifies its sinks. Omitted uses a one-minute default;
+  `0s` disables repeats for that rule. The interval applies to each of the
+  rule's alerts separately, each counted from its own firing record, so a rule
+  with 500 firing series sends 500 repeat notifications per interval to every
+  sink.
 - `max_alert_generation` (optional): a per-rule override of the alerts-on-alerts
   generation circuit breaker.
 
@@ -145,7 +148,7 @@ history today.
 ### Upgrading from one alert per rule
 
 Releases before per-series evaluation raised one alert per rule, carrying the
-rule labels only. Three things change for an existing rules file on upgrade:
+rule labels only. Four things change for an existing rules file on upgrade:
 
 - **A notification burst on the first tick.** A PromQL rule whose matching
   series carry labels besides `__name__` that the rule labels do not override
@@ -167,6 +170,11 @@ rule labels only. Three things change for an existing rules file on upgrade:
   `rule_id` stop the process at load with `rule id "<id>" is used by more than
   one rule in tenant "<tenant>"`. Give each rule its own `rule_id` before
   upgrading.
+- **Repeat notifications multiply by the firing series.** `repeat_interval`
+  now applies to each alert, not to the rule, so a rule with 500 firing series
+  sends 500 repeat notifications per interval to every sink where it used to
+  send one. Raise `repeat_interval`, or set it to `0s`, on rules that match
+  many series.
 
 A SQL detection rule reads the same tables the `POST /api/v1/sql` endpoint
 serves (`samples`, `logs`, `spans`, `audit`), under the same
