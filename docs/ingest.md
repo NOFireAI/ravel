@@ -269,9 +269,24 @@ Loop over `select!`:
   at least `min_flush_bytes` (default 256 KiB) of object bytes, on the same
   `flush_est_bytes` estimate the size trigger reads; otherwise the buffer is idle
   and the threshold is `max_flush_delay_idle` (default 40 s) instead
-  (ADR-0051 section 7). Strict-mode ack latency is unaffected, since a
+  (ADR-0051 section 7). On the metrics actor an idle buffer below
+  `idle_flush_floor_bytes` (default 13,107 object bytes, `min_flush_bytes x
+  max_flush_delay / max_flush_delay_idle`) is held longer still, until it
+  reaches the floor or its oldest point is `max_flush_lifetime -
+  max_flush_delay_idle` old (3,560 s at the defaults), so a near-idle buffer
+  flushes about 24 times a day instead of 2,160; log and span
+  actors have no floor. Strict-mode ack latency is unaffected, since a
   strict write always leaves a waiter in the buffer for its whole flush
-  window; only a low-volume buffered-mode tenant's PUT cadence changes.
+  window; only a low-volume buffered-mode tenant's PUT cadence changes, and
+  with it how long that tenant's acknowledged rows wait in memory before
+  they are visible (the buffered crash-loss window, docs/consistency-model.md
+  "Buffered mode"). The hold changes no seal bound, since the ingest hour is
+  pinned when the flush opens. It does lengthen the routing-to-open term of
+  the straggler slack `S` below, from 40 s to 3,560 s, which still fits:
+  3,560 s plus one tick plus a 3,600 s flush lifetime is under the 7,200 s
+  `FLUSH_BOUND_SLACK_HOURS` allows, and for every `max_flush_delay_idle` the
+  `ravel-server` startup check accepts, the longer of the idle clock and the
+  hold plus one lifetime stays within two lifetimes.
   ADR-0076 decision 4 sized this tier against a buffer fill rate stated in
   buffered-memory units, so its worked example reaches `min_flush_bytes`
   sooner than a buffer does today: the knob is unchanged, the unit it counts
@@ -1085,6 +1100,7 @@ carries max token per shard).
 | max_flush_delay | 2 s (`--max-flush-delay`) |
 | max_flush_delay_idle | 40 s (`--max-flush-delay-idle`) |
 | min_flush_bytes (object bytes, not buffered memory) | 256 KiB (`--min-flush-bytes`) |
+| idle_flush_floor_bytes (metrics pipeline only, object bytes) | 13,107 bytes (`IngestConfig` only, no server flag; 0 disables the hold) |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |

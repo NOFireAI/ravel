@@ -8,6 +8,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A near-idle metrics buffer now flushes about 24 times a day instead of
+  2,160** (issue #1737). A metrics buffer with no strict-mode waiter that
+  holds fewer than the new `idle_flush_floor_bytes` (13,107 object bytes by
+  default, `min_flush_bytes x max_flush_delay / max_flush_delay_idle`) is no
+  longer flushed on the 40 s idle clock: it is held until it reaches the floor
+  or its oldest point is `max_flush_lifetime - max_flush_delay_idle` old
+  (3,560 s at the defaults). That cuts such a buffer from 4,320 objects a day
+  to about 48. Strict-mode writes keep the 2 s fast clock, and buffers at or
+  above the floor keep today's cadence. A near-idle buffered-mode tenant's
+  rows now wait up to 3,560 s in memory before they are visible, which is also
+  its crash-loss window. Log and span buffers are unchanged. Setting the floor
+  to 0 restores the previous behavior. See docs/guides/cost-model.md for the
+  band structure and a worked example.
 - **The scheduled catalog fold now runs only in `--mode maintain` and
   `--mode all`, and a `maintain` fleet partitions it across its replicas**
   (ADR-1693, issue #1693). A `maintain` process folds only the

@@ -256,6 +256,9 @@ async fn buffered_flush_queued_behind_a_stall_reaches_the_store_past_lifetime() 
         max_flush_delay,
         max_flush_delay_idle,
         max_flush_lifetime,
+        // Keeps B's one-point buffer on the idle clock rather than the
+        // sub-floor hold toward max_flush_lifetime (issue #1737).
+        idle_flush_floor_bytes: 0,
         flush_tick: Duration::from_millis(50),
         max_inflight_flushes: 1,
         ..IngestConfig::default()

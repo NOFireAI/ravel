@@ -1196,7 +1196,9 @@ impl ShardActor {
     /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast age clock; anything else is idle
     /// and waits for the slower `max_flush_delay_idle` instead (ADR-0051
-    /// section 7). "Worth a PUT" is a claim about the object, so this reads the
+    /// section 7), or, below `idle_flush_floor_bytes`, for the hold bound
+    /// derived from `max_flush_lifetime` (issue #1737). "Worth a PUT" is a
+    /// claim about the object, so this reads the
     /// object-bytes estimate, not the buffered-memory charge (issue #1305).
     /// Strict-mode ack latency is unaffected: a strict
     /// write always leaves `waiters` non-empty for its whole flush window.
@@ -1214,10 +1216,25 @@ impl ShardActor {
         let has_priority =
             !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if !has_priority {
-            return (
-                self.config.max_flush_delay_idle.as_nanos() as i64,
-                FlushTrigger::Age,
-            );
+            let idle_ns = self.config.max_flush_delay_idle.as_nanos() as i64;
+            if buf.flush_est_bytes >= self.config.idle_flush_floor_bytes {
+                return (idle_ns, FlushTrigger::Age);
+            }
+            // Issue #1737: below `idle_flush_floor_bytes` an idle-clock flush
+            // would pay two PUTs for almost nothing, so hold the buffer until
+            // one idle window short of `max_flush_lifetime`. The window keeps
+            // the span from routing to flush-open, plus one late tick and one
+            // flush lifetime, inside two lifetimes, the
+            // `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` budget, and never lets a
+            // buffer sit in memory past `max_flush_lifetime` before its flush
+            // opens. The seal margin is unaffected, since the
+            // ingest hour is pinned when the flush opens. Nothing here is
+            // acknowledged differently: a buffered write was acked on
+            // admission and a strict write has a waiter, which never reaches
+            // this branch.
+            let lifetime_ns = self.config.max_flush_lifetime.as_nanos() as i64;
+            let hold_ns = lifetime_ns.saturating_sub(idle_ns).max(idle_ns);
+            return (hold_ns, FlushTrigger::Age);
         }
         let floor_ns = self.config.max_flush_delay.as_nanos() as i64;
         if !self.config.adaptive_flush_delay {
@@ -2477,9 +2494,11 @@ mod tests {
         let bound_ns = routing_to_pin_bound_ns(&shipped);
         assert!(
             bound_ns <= i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR,
-            "{:?} idle plus one {:?} tick = {bound_ns}ns must fit inside \
+            "the longer of {:?} idle and the sub-floor hold ({:?} lifetime \
+             less idle), plus one {:?} tick = {bound_ns}ns, must fit inside \
              FLUSH_BOUND_SLACK_HOURS ({}ns)",
             shipped.max_flush_delay_idle,
+            shipped.max_flush_lifetime,
             shipped.flush_tick,
             i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
         );
@@ -2536,9 +2555,11 @@ mod tests {
     /// The worst-case span between a record being routed and its flush pinning
     /// an ingest hour, recomputed from `config`, as
     /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` was derived.
-    /// - `max_flush_delay_idle`: the oldest a buffer with no strict waiter
-    ///   gets before its age trigger fires. The validated worst case, since
-    ///   `ravel-server` refuses an idle ceiling below `max_flush_delay`.
+    /// - the oldest a buffer with no strict waiter gets before its age trigger
+    ///   fires: `max_flush_delay_idle`, or the sub-floor hold
+    ///   (`max_flush_lifetime - max_flush_delay_idle`, issue #1737) when that
+    ///   is longer. `ravel-server` refuses an idle ceiling below
+    ///   `max_flush_delay`, so this is the validated worst case.
     /// - one `flush_tick`: the trigger is evaluated on a tick, not at the
     ///   instant the threshold is crossed.
     ///
@@ -2546,6 +2567,8 @@ mod tests {
     /// and no configured value bounds (issue #1916);
     /// `a_deferred_flush_can_overrun_the_flush_bound_slack` measures it.
     fn routing_to_pin_bound_ns(config: &IngestConfig) -> i64 {
-        config.max_flush_delay_idle.as_nanos() as i64 + config.flush_tick.as_nanos() as i64
+        let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
+        let hold_ns = (config.max_flush_lifetime.as_nanos() as i64).saturating_sub(idle_ns);
+        idle_ns.max(hold_ns) + config.flush_tick.as_nanos() as i64
     }
 }

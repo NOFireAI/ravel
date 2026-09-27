@@ -368,6 +368,22 @@ pub struct IngestConfig {
     /// PUT" is a statement about the object, not about the RAM the buffer
     /// occupies while building it.
     pub min_flush_bytes: usize,
+    /// A buffer with no strict-mode waiter whose flush would write fewer than
+    /// this many object bytes is not flushed on `max_flush_delay_idle`
+    /// either: it is held until it reaches this floor or its oldest point is
+    /// one idle window short of `max_flush_lifetime`, whichever comes first
+    /// (issue #1737). Metrics-only; the log and span actors do not read it.
+    /// Same estimator and units as `min_flush_bytes`. 0 turns the hold off.
+    ///
+    /// The default, 13,107 bytes (12.8 KiB), is `min_flush_bytes *
+    /// max_flush_delay / max_flush_delay_idle` at their defaults (256 KiB x
+    /// 2 s / 40 s): the fast clock asks for `min_flush_bytes` before it pays a
+    /// PUT every 2 s, and the idle clock, which pays one 20 times less often,
+    /// asks for one twentieth of it. Below about 328 object bytes a second
+    /// (roughly 20 scalar samples) a buffer stops paying the idle clock, and at
+    /// near-zero volume it flushes once per 3,560 s: about 24 flushes (48
+    /// objects) a day instead of 2,160 flushes (4,320 objects).
+    pub idle_flush_floor_bytes: usize,
     /// Retries after the first attempt for the data-object PUT (total
     /// attempts = this + 1). Also bounds retries of the commit-record PUT.
     /// This matches `ravel_commit::publish::RetryPolicy::max_attempts`'s own
@@ -476,6 +492,8 @@ impl Default for IngestConfig {
             flush_tick: Duration::from_millis(200),
             max_flush_delay_idle: Duration::from_secs(40),
             min_flush_bytes: 256 * 1024,
+            // 256 KiB x 2 s / 40 s, see the field's doc comment.
+            idle_flush_floor_bytes: 13_107,
             put_retry_max_attempts: 4,
             put_retry_base_delay: Duration::from_millis(100),
             put_retry_max_delay: Duration::from_secs(2),
@@ -646,6 +664,14 @@ mod tests {
         assert_eq!(cfg.flush_tick, Duration::from_millis(200));
         assert_eq!(cfg.max_flush_delay_idle, Duration::from_secs(40));
         assert_eq!(cfg.min_flush_bytes, 256 * 1024);
+        assert_eq!(cfg.idle_flush_floor_bytes, 13_107);
+        // Issue #1737: the floor is min_flush_bytes scaled by the fast-to-idle
+        // clock ratio, so it moves if either default does without it.
+        assert_eq!(
+            cfg.idle_flush_floor_bytes as u128,
+            cfg.min_flush_bytes as u128 * cfg.max_flush_delay.as_nanos()
+                / cfg.max_flush_delay_idle.as_nanos()
+        );
         assert_eq!(cfg.put_retry_max_attempts, 4);
         assert_eq!(cfg.put_retry_base_delay, Duration::from_millis(100));
         assert_eq!(cfg.put_retry_max_delay, Duration::from_secs(2));
