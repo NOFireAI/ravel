@@ -117,6 +117,8 @@ INGEST_LOG="$(mktemp)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
 
 cleanup() {
+  # A failure in here must not turn a pending exit 2 into 3.
+  trap - ERR
   local pid
   for pid in "$WORKER_A_PID" "$WORKER_B_PID" "$INGEST_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -129,10 +131,11 @@ cleanup() {
 }
 trap cleanup EXIT
 # A setup step that fails under `set -e` would otherwise exit with its own
-# status, often 1, which the contract above reserves for an oracle failure.
-# The ERR trap set at the top (with -E, so it reaches functions) makes every
-# setup failure exit 3; the oracle calls below carry `|| true` and never reach
-# it.
+# status, which could be the 2 the contract above reserves for a
+# release-blocking oracle failure. The ERR trap set at the top (with -E, so it
+# reaches functions) makes every setup failure exit 3; the oracle calls below
+# carry `|| true` and never reach it. The summary below passes `blocking`, so
+# the oracle path itself exits only 0 or 2.
 
 # Start a maintain-role worker. $1=http $2=grpc $3=logfile; echoes the PID via
 # the named global set by the caller. We set the PID through a nameref so the
