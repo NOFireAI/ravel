@@ -8,6 +8,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A transient object-store error on an audit-record PUT is retried before the
+  batch fails closed** (issue #2035). `write_audit_batch` used to fail an
+  entire batch of queries on a single object-store timeout or throttle
+  response, even though the object store's own client-side retry never covers
+  a conditional PUT (`PutOptions::create_if_absent()`, the mode both the data
+  object and the commit record use, is never marked idempotent by the S3
+  client, so a `Timeout` on it skips the client's retry loop entirely). Each
+  PUT now retries up to two more times with a short jittered backoff when the
+  error is one already classified as transient, and only a non-retryable
+  error or one that keeps failing across every attempt still fails the batch
+  closed, exactly as before.
+
 - **A distributed-query worker resolves each pinned segment from that segment's
   own commit record instead of re-resolving its catalog** (issue #1721). Every
   fragment request used to re-resolve the worker's catalog to map the
