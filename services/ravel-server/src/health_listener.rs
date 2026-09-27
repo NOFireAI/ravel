@@ -47,6 +47,15 @@ pub const LIVENESS_MAX_HEARTBEAT_AGE: Duration = Duration::from_secs(60);
 /// workers, so a busy node stays in the Service while a deadlocked one leaves.
 pub const READINESS_MAX_HEARTBEAT_AGE: Duration = Duration::from_secs(30);
 
+/// How long shutdown waits for open health connections to close before the
+/// health runtime drops them: a probe is one small GET answered in
+/// milliseconds, so only a client holding a request open reaches this.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Slack past [`SHUTDOWN_GRACE`] that [`HealthListener::shutdown`] waits for
+/// the health thread itself to exit before giving up on it.
+pub const JOIN_MARGIN: Duration = Duration::from_secs(1);
+
 /// The time of the main runtime's last heartbeat, read from the server's
 /// injected [`Clock`]. Clones share one atomic.
 #[derive(Clone)]
@@ -109,7 +118,8 @@ pub struct HealthListener {
     local_addr: SocketAddr,
     readiness: Arc<OnceLock<Readiness>>,
     shutdown: Option<oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    done: std::sync::mpsc::Receiver<anyhow::Result<()>>,
 }
 
 impl HealthListener {
@@ -138,9 +148,16 @@ impl HealthListener {
             readiness: readiness.clone(),
         });
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("ravel-health".to_string())
-            .spawn(move || runtime.block_on(serve(listener, app, shutdown_rx)))
+            .spawn(move || {
+                let result = runtime.block_on(serve(listener, local_addr, app, shutdown_rx));
+                // Drops connections still open past the grace period instead
+                // of waiting for them.
+                runtime.shutdown_background();
+                let _ = done_tx.send(result);
+            })
             .context("--listen-health: failed to spawn the health listener thread")?;
 
         Ok(Self {
@@ -148,6 +165,7 @@ impl HealthListener {
             readiness,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            done: done_rx,
         })
     }
 
@@ -162,35 +180,81 @@ impl HealthListener {
         let _ = self.readiness.set(readiness);
     }
 
-    /// Stop accepting, finish in-flight probes, and join the thread. Blocks
-    /// the calling thread; call it from `spawn_blocking` inside a runtime.
+    /// Stop accepting, give open connections [`SHUTDOWN_GRACE`] to finish,
+    /// and join the thread. Blocks the calling thread for at most
+    /// `SHUTDOWN_GRACE + JOIN_MARGIN`; call it from `spawn_blocking` inside a
+    /// runtime. A thread that has not exited by then is logged at warn and
+    /// left behind, so process shutdown is never held up by it.
     pub fn shutdown(mut self) -> anyhow::Result<()> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        match self.thread.take() {
-            Some(thread) => thread
-                .join()
-                .map_err(|_| anyhow::anyhow!("the health listener thread panicked"))?,
-            None => Ok(()),
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        match self.done.recv_timeout(SHUTDOWN_GRACE + JOIN_MARGIN) {
+            Ok(result) => {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the health listener thread panicked"))?;
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    health = %self.local_addr,
+                    wait = ?SHUTDOWN_GRACE + JOIN_MARGIN,
+                    "health listener thread did not exit in time; continuing shutdown without it"
+                );
+                Ok(())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = thread.join();
+                Err(anyhow::anyhow!("the health listener thread panicked"))
+            }
         }
     }
 }
 
 async fn serve(
     listener: std::net::TcpListener,
+    addr: SocketAddr,
     app: Router,
     shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::from_std(listener)
         .context("failed to register the health listener socket")?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            // A dropped sender stops the listener the same as a sent signal.
-            let _ = shutdown.await;
-        })
-        .await
-        .context("health listener failed")
+    let (graceful_tx, graceful_rx) = oneshot::channel::<()>();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async {
+        let _ = graceful_rx.await;
+    });
+    let mut server = std::pin::pin!(server.into_future());
+    tokio::select! {
+        result = &mut server => {
+            let result = result.context("health listener failed");
+            if let Err(err) = &result {
+                tracing::error!(
+                    health = %addr,
+                    error = %format!("{err:#}"),
+                    "health listener stopped serving"
+                );
+            }
+            return result;
+        }
+        // A dropped sender stops the listener the same as a sent signal.
+        _ = shutdown => {}
+    }
+    let _ = graceful_tx.send(());
+    match tokio::time::timeout(SHUTDOWN_GRACE, server).await {
+        Ok(result) => result.context("health listener failed"),
+        Err(_) => {
+            tracing::warn!(
+                health = %addr,
+                grace = ?SHUTDOWN_GRACE,
+                "health listener connections still open after the grace period; dropping them"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn router(state: ListenerState) -> Router {
@@ -457,6 +521,46 @@ mod tests {
                     TcpStream::connect_timeout(&addr, IO_BOUND).is_err(),
                     "the listener socket is closed after shutdown"
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn shutdown_is_bounded_by_a_client_holding_a_partial_request() {
+        run_with_watchdog(
+            WATCHDOG_BOUND,
+            || {
+                "HealthListener::shutdown never returned while a client held a partial \
+                 request head open: the graceful shutdown is unbounded"
+                    .to_string()
+            },
+            || {
+                let heartbeat = Heartbeat::new(TestClock::at(BASE_NS));
+                let listener = HealthListener::bind(loopback(), heartbeat).expect("binds");
+                let addr = listener.local_addr();
+
+                // The partial head goes out on a fresh connection before a
+                // second connection completes a whole request: the listener
+                // accepts in order on one thread, so once that answer arrives
+                // the stalled connection is accepted and being served.
+                let mut client = TcpStream::connect_timeout(&addr, IO_BOUND).expect("connect");
+                write!(client, "GET /healthz HTTP/1.1\r\nHost: {addr}\r\n")
+                    .expect("write partial request head");
+                assert_eq!(get(addr, "/healthz"), (200, "ok".to_string()));
+
+                let started = std::time::Instant::now();
+                listener.shutdown().expect("health listener stops");
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed <= SHUTDOWN_GRACE + JOIN_MARGIN,
+                    "shutdown took {elapsed:?}, past the {SHUTDOWN_GRACE:?} grace plus \
+                     {JOIN_MARGIN:?} margin"
+                );
+                assert!(
+                    TcpStream::connect_timeout(&addr, IO_BOUND).is_err(),
+                    "the listener socket is closed after shutdown"
+                );
+                drop(client);
             },
         );
     }
