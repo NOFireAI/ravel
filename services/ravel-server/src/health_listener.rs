@@ -583,6 +583,104 @@ mod tests {
         );
     }
 
+    /// A clock whose `sleep` completes only when the test advances it, and
+    /// that counts `sleep` calls so the test can tell when the heartbeat task
+    /// has finished a loop iteration and is waiting again.
+    struct SteppedClock {
+        now_ns: tokio::sync::watch::Sender<i64>,
+        sleeps: tokio::sync::watch::Sender<u64>,
+    }
+
+    impl SteppedClock {
+        fn at(now_ns: i64) -> Arc<Self> {
+            Arc::new(Self {
+                now_ns: tokio::sync::watch::Sender::new(now_ns),
+                sleeps: tokio::sync::watch::Sender::new(0),
+            })
+        }
+
+        fn advance(&self, by: Duration) {
+            let by_ns = i64::try_from(by.as_nanos()).expect("step fits i64");
+            self.now_ns.send_modify(|now| *now += by_ns);
+        }
+
+        async fn wait_for_sleeps(&self, count: u64) {
+            self.sleeps
+                .subscribe()
+                .wait_for(|sleeps| *sleeps >= count)
+                .await
+                .expect("the clock owns the sender");
+        }
+    }
+
+    impl Clock for SteppedClock {
+        fn now_ns(&self) -> i64 {
+            *self.now_ns.borrow()
+        }
+
+        fn sleep(
+            &self,
+            dur: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let deadline = self.now_ns() + i64::try_from(dur.as_nanos()).expect("fits i64");
+            let mut now_rx = self.now_ns.subscribe();
+            self.sleeps.send_modify(|sleeps| *sleeps += 1);
+            Box::pin(async move {
+                let _ = now_rx.wait_for(|now| *now >= deadline).await;
+            })
+        }
+    }
+
+    #[test]
+    fn the_spawned_heartbeat_task_beats_every_interval_until_stopped() {
+        const TICKS: u64 = 5;
+        run_with_watchdog(
+            WATCHDOG_BOUND,
+            || "the heartbeat task never re-entered its sleep after a tick".to_string(),
+            || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("runtime builds");
+                rt.block_on(async {
+                    let clock = SteppedClock::at(BASE_NS);
+                    let heartbeat = Heartbeat::new(clock.clone());
+                    let task = heartbeat.spawn();
+                    clock.wait_for_sleeps(1).await;
+                    assert_eq!(heartbeat.age(), Duration::ZERO, "stamped at construction");
+
+                    for tick in 1..=TICKS {
+                        clock.advance(HEARTBEAT_INTERVAL);
+                        assert_eq!(
+                            heartbeat.age(),
+                            HEARTBEAT_INTERVAL,
+                            "tick {tick}: one interval since the last beat, before the task runs"
+                        );
+                        clock.wait_for_sleeps(tick + 1).await;
+                        assert_eq!(
+                            heartbeat.age(),
+                            Duration::ZERO,
+                            "tick {tick}: the task beat before sleeping again"
+                        );
+                    }
+
+                    task.abort();
+                    assert!(
+                        task.await.expect_err("an aborted task").is_cancelled(),
+                        "the heartbeat task stops on abort"
+                    );
+                    for step in 1..=3 {
+                        clock.advance(HEARTBEAT_INTERVAL);
+                        assert_eq!(
+                            heartbeat.age(),
+                            HEARTBEAT_INTERVAL * step,
+                            "the age grows once the task is stopped"
+                        );
+                    }
+                });
+            },
+        );
+    }
+
     #[test]
     fn a_beat_resets_the_age_on_the_injected_clock() {
         let clock = TestClock::at(BASE_NS);
