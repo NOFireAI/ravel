@@ -1219,6 +1219,55 @@ itself (a live per-tenant `S3Store` has no endpoint under test); routing is
 covered by `kms_routing`'s own unit tests instead, including key rotation
 and `put_multipart` routing.
 
+### Observed store time
+
+`ObjectStoreBackend::observed_store_time_ns() -> Option<i64>` reports the
+store's own clock, in unix nanoseconds, as the backend last observed it
+(ADR-1685 decision 1). It is a defaulted method returning `None`, so a backend
+with no remote store behind it implements nothing; adding it is not a contract
+change for a third-party implementation.
+
+The S3 adapter returns the `Date` header of the **latest** response it
+received, parsed as RFC 7231 IMF-fixdate, and `None` before its first response.
+The header is read by the same HTTP connector that counts billed requests and
+observes stored checksums, because `object_store` 0.14 exposes no response
+headers above it. Three properties follow, and callers depend on each:
+
+- **Every response, not only a successful one.** A 503 or a 403 carries the
+  store's clock as honestly as a 200, so a process being throttled keeps a
+  fresh observation.
+- **The latest response wins; it is never a running maximum.** An endpoint or
+  proxy that answers one request with a wrong `Date` moves the value, including
+  backwards, until the next response corrects it. A maximum would latch that
+  one bad header for the life of the process.
+- **A missing or unparseable `Date` changes nothing.** The previous
+  observation stands rather than being cleared, so a momentary bad header does
+  not read as "no observation".
+
+For a store whose `Date` is correct the value is a **lower bound** on the
+store's current time, never an estimate of it: the store stamped it before the
+response left, nothing advances it by elapsed time, and a leap second (`:60`)
+is clamped to `:59` rather than read as the next minute. A wrong `Date` moves
+it in the direction of its error. A caller may use it to bound how far *behind* the store its
+own clock is (ADR-1685 decision 2 refuses a flush whose reading lags it by more
+than the clock-skew allowance), and must not use it to bound how far ahead. It
+is arbitrarily stale in a process that has issued no requests, and it costs no
+extra request and no new object.
+
+`MemoryStore` returns `None` unless a test sets a value through
+`set_observed_store_time_ns`, which is behind the `test-support` feature: the
+oracle serves no responses, so it observes no store clock, and deriving one
+from the host clock would hand a caller the very clock it is trying to check.
+
+Every decorator in `ravel-object-store` delegates to the store it wraps ---
+`InstrumentedStore`, `FaultStore`, `KmsRoutingStore` (to its default store,
+which serves every read), the `ClassedStore` class handles, and the `Arc<T>`
+forwarding impl --- and so does ravel-server's `SharedKmsStore`, which sits
+between `InstrumentedStore` and `KmsRoutingStore` under `--tenant-kms-config`.
+A decorator that answered `None` instead would silently
+disable the caller's check, since production wraps its backend in several of
+them; each delegation is pinned by a test in its own module.
+
 ## Rules for callers
 
 - Never infer visibility from a successful data PUT; only commit records

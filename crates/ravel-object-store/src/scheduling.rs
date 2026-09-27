@@ -612,6 +612,12 @@ impl ObjectStoreBackend for ScheduledHandle {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
+
+    /// Passthrough, unscheduled (ADR-1685 decision 1): reading the inner
+    /// store's last observation issues no request, so it takes no permit.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
+    }
 }
 
 #[cfg(test)]
@@ -633,6 +639,25 @@ mod tests {
             tokio::task::yield_now().await;
         }
         cond()
+    }
+
+    /// Both class handles report the inner store's store-clock observation
+    /// (ADR-1685 decision 1). A scheduled handle is what ravel-server hands to
+    /// its ingest path under ADR-0070, so the observation has to survive this
+    /// wrapper as well as the instrumentation one.
+    #[test]
+    fn observed_store_time_delegates_through_both_class_handles() {
+        let inner = MemoryStore::new();
+        inner.set_observed_store_time_ns(Some(1_700_000_000_123_456_789));
+        let classed = ClassedStore::scheduled(Arc::new(inner), SchedulerConfig::new(2, 2, 1));
+        assert_eq!(
+            classed.foreground().observed_store_time_ns(),
+            Some(1_700_000_000_123_456_789)
+        );
+        assert_eq!(
+            classed.background().observed_store_time_ns(),
+            Some(1_700_000_000_123_456_789)
+        );
     }
 
     /// The scheduler behind a scheduled [`ClassedStore`] (tests reach into the

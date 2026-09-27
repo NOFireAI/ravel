@@ -68,7 +68,8 @@ advanced by elapsed time in a way a test can drive.
 1. **The S3 backend observes the store's clock from response `Date` headers.**
    The `HttpService` that already counts attempts parses the `Date` header of
    every response it receives and stores the result, as unix nanoseconds, in
-   a process-shared atomic. The latest response wins; the value is never a
+   a process-shared atomic (per store, in an HTTP connector: see the
+   store-clock implementation amendment below). The latest response wins; the value is never a
    running maximum, so one bad header from a proxy affects at most the
    flushes before the next response. A response without a parseable `Date`
    changes nothing. `ObjectStoreBackend` gains a default method,
@@ -213,7 +214,8 @@ flowchart LR
 - Follow-up work, as tasks:
   1. ravel-object-store: parse `Date` in the attempt-counting service, add
      the atomic and the default trait method, delegate in the three
-     decorators, add the `MemoryStore` test setter, and update
+     decorators (four, plus one in ravel-server, per the store-clock
+     implementation amendment below), add the `MemoryStore` test setter, and update
      docs/object-store-contract.md under "Implementations".
   2. ravel-ingest: add `FlushClockError::LagRefused`, the two counters, and
      the check in all three shard actors; land the two-clock acceptance test
@@ -225,3 +227,33 @@ flowchart LR
      troubleshooting table.
   4. docs: docs/ingest.md flush-open section and the consistency-model
      paragraph update described above.
+
+## Amendment (2026-09-28): store-clock implementation
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="store-clock implementation amendment" -->
+<!-- amendment-supersedes: phrase="a process-shared atomic" pointer="store-clock implementation amendment" -->
+
+Task 1 landed with three differences from decision 1 as written, none of
+which changes the check decisions 2 to 4 build on it.
+
+- **Per store, not per process.** Each `S3Store` holds its own observation.
+  Two stores pointed at different endpoints observe different clocks, and a
+  process-wide value would let one endpoint's `Date` stand in for another's.
+  `KmsRoutingStore` reports its default store's observation, since the
+  default serves every read and the startup probe.
+- **Read in the HTTP connector, not an `HttpService`.** The attempt counter
+  moved from an `HttpService` in `s3/attempts.rs` to an `HttpConnector` in
+  `s3/connector.rs` before this landed; the `Date` header is read there,
+  still below `object_store`'s retry loop, so every attempt's response is
+  observed.
+- **Every production decorator delegates.** Besides the three named, the
+  `ClassedStore` class handles and the `Arc<T>` forwarding impl delegate in
+  ravel-object-store, and ravel-server's `SharedKmsStore`, which sits
+  between `InstrumentedStore` and `KmsRoutingStore` under
+  `--tenant-kms-config`, delegates too. Without that last one the check would
+  be off for exactly the per-tenant KMS deployments.
+
+The parser also clamps a leap second (`:60`) to `:59`, so a correct `Date`
+still yields a value no later than the instant the store stamped, which is
+what decision 3's lower-bound argument needs. A wrong `Date` can move the
+observation in either direction, as the Consequences already state.

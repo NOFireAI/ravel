@@ -297,6 +297,10 @@ impl ObjectStoreBackend for SharedKmsStore {
     fn capabilities(&self) -> Capabilities {
         self.0.capabilities()
     }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.0.observed_store_time_ns()
+    }
 }
 
 /// The endpoint rules (the plaintext one from issue #1707, the missing-scheme
@@ -1087,6 +1091,50 @@ mod tests {
         );
 
         (store, metrics, mock)
+    }
+
+    /// Under `--tenant-kms-config` the writer's store is
+    /// `InstrumentedStore<SharedKmsStore>`, so the store-clock observation
+    /// (ADR-1685 decision 1) must pass through `SharedKmsStore` too; the
+    /// trait default there would report `None` and switch the clock-lag
+    /// check off for exactly the per-tenant KMS deployments. The mock's HTTP
+    /// server stamps a `Date` on every response, so one write through the
+    /// built store must leave an observation within a day of this host's
+    /// clock (a loose band: it only has to tell a real Date from `None`).
+    /// Removing `SharedKmsStore::observed_store_time_ns` turns this red.
+    #[tokio::test]
+    async fn kms_routed_build_reports_the_store_clock_observation() {
+        let (store, _metrics, _mock) = kms_routed_build("00112233445566778899aabbccddeeff").await;
+        assert_eq!(
+            store.observed_store_time_ns(),
+            None,
+            "precondition: no response observed before any request"
+        );
+
+        store
+            .put(
+                "unrouted/seg/0001",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("unrouted put through the default store");
+
+        let observed = store
+            .observed_store_time_ns()
+            .expect("a response Date must be observed through SharedKmsStore");
+        let now_ns = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos(),
+        )
+        .expect("now fits i64 nanoseconds");
+        const DAY_NS: i64 = 86_400 * 1_000_000_000;
+        assert!(
+            (observed - now_ns).abs() < DAY_NS,
+            "observed {observed} ns is not within a day of now {now_ns} ns"
+        );
     }
 
     /// A KMS-routed write's billed HTTP requests are counted into the SAME
