@@ -39,12 +39,49 @@
 //! # Segment identity resolution
 //!
 //! A worker receives durable [`pb::SegmentIdentity`] values, not object keys or
-//! trusted bytes (ADR-0071 reconstruct-don't-trust). Turning an identity back
-//! into the [`SegmentRef`] to fetch needs the `ravel-commit` key
-//! reconstruction that is not yet implemented. Until that lands, a [`SegmentResolver`]
-//! maps an identity to a ref by its content hash; [`SnapshotSegmentResolver`]
-//! is the interim implementation, resolving against the same pinned snapshot
-//! the coordinator dispatched from.
+//! trusted bytes (ADR-0071 reconstruct-don't-trust). An intra-cluster pinned
+//! slice resolves them with [`ReconstructingSegmentResolver`]. For each
+//! identity it rebuilds the key of the segment's own durable record with
+//! `ravel_commit::keys` (the commit record for L0; the compaction record, or
+//! failing that the erasure rewrite record, for an L1 part), GETs that one
+//! record, and verifies it: the record decodes and validates, its own identity
+//! fields reconstruct the key it was read from, an L0 record's stored
+//! `object_key` passes `verify_object_key`, and the full 32-byte content hash
+//! and the object size (plus, for L1, the full input-set hash and the part
+//! index) equal the identity's. The ref is then built from the verified record
+//! exactly as the catalog builds one, so nothing but the identity's key
+//! components is taken from the wire. The worker lists nothing and resolves no
+//! snapshot, so a compaction committed between the coordinator's resolve and
+//! this fetch cannot change which object is read: records and the objects they
+//! name are immutable.
+//!
+//! Each record GET holds a permit of the same GET limiter the worker's
+//! data-object GETs use. Record GETs are not charged to the slice's
+//! accounting, so they count toward neither `max_bytes_scanned` nor
+//! `max_s3_requests` here or on the coordinator, and are not in the slice's
+//! reported cost. They are still reported: every resolve hands its request
+//! and byte totals to the worker's [`RecordGetObserver`], which the embedding
+//! process backs with its own counters.
+//!
+//! A structurally malformed identity is [`ResolveIdentityError::Invalid`] and
+//! fails the slice with `BAD_DATA`. A record that is missing, unreadable,
+//! fails verification, or disagrees with the identity fails the slice with
+//! `UNSUPPORTED`, which makes the coordinator run the whole query locally
+//! through its own catalog resolve. A record GET that fails with a retryable
+//! store error is [`ResolveIdentityError::RecordUnavailable`] and fails an
+//! inbound slice with `UNAVAILABLE`, which makes the coordinator re-dispatch
+//! that one slice; on the coordinator's own local attempt, where there is no
+//! worker left to re-dispatch to, it fails with `SNAPSHOT_INVALIDATED`
+//! instead, which is one re-resolve and retry (see
+//! [`SeriesFetchService::with_local_attempt`]). None of them ever reads
+//! another object instead.
+//!
+//! Cross-cluster federation is the exception, and stays one: a resolve-scope
+//! request is authoritative on the remote cluster, which resolves its OWN
+//! snapshot and pins it before the fetch runs. [`SnapshotSegmentResolver`]
+//! serves that path, mapping an identity to a ref of that snapshot by content
+//! hash; an identity outside it is [`ResolveIdentityError::Unknown`] and maps
+//! to `SNAPSHOT_INVALIDATED`, which the coordinator retries once.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -52,13 +89,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use ravel_catalog::SegmentRef;
+use ravel_catalog::{DeclaredColumnStats, SegmentLevel, SegmentRef};
+use ravel_commit::keys;
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::{AccountedOp, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{SeriesId, Signal, TenantHash};
 
 use ravel_rspan::SpanQuery;
 
+use crate::GetLimiter;
 use crate::config::{ByteLimit, EngineConfig};
 use crate::distrib::codec;
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
@@ -71,20 +111,495 @@ use crate::fetcher::{
 use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
 use crate::span_fetcher::{SpanFetchError, SpanSegmentFetcher};
 
-/// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
-/// worker fetches. The production resolver reconstructs the
-/// object key from the identity and verifies the footer; see the module docs
-/// for why an interim content-hash resolver stands in for now.
-pub trait SegmentResolver: Send + Sync {
-    /// The ref this identity names, or `None` if it is unknown to this worker
-    /// (the segment vanished under a concurrent GC/compaction, which the
-    /// coordinator maps to a snapshot invalidation).
-    fn resolve(&self, identity: &pb::SegmentIdentity) -> Option<SegmentRef>;
+/// Why a shipped [`pb::SegmentIdentity`] could not be turned into the
+/// [`SegmentRef`] a worker fetches.
+///
+/// Each variant names its recovery through [`Self::status_code`]. None of them
+/// reads a different object in place of the one pinned.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResolveIdentityError {
+    /// The identity is structurally malformed: a field has the wrong length or
+    /// shape, the level is unknown, or no record key can be built from it.
+    /// Terminal (`BAD_DATA`): every worker reproduces it, so re-dispatch would
+    /// only spread it.
+    #[error("segment identity is malformed: {reason}")]
+    Invalid { reason: String },
+    /// The identity is well formed but names a segment outside the snapshot
+    /// this worker resolved for itself. Only the federation resolver raises
+    /// this; the coordinator maps it to a single re-resolve and re-dispatch.
+    #[error("pinned segment not found on worker: {reason}")]
+    Unknown { reason: String },
+    /// No record exists at the key the identity reconstructs.
+    #[error("record {key} for the pinned segment was not found")]
+    RecordMissing { key: String },
+    /// The record GET failed with a retryable store error (throttled, timed
+    /// out, or transient). Another worker, or a later attempt, can read it.
+    #[error("record {key} for the pinned segment is unavailable: {reason}")]
+    RecordUnavailable { key: String, reason: String },
+    /// The record at the reconstructed key could not be read, for a reason a
+    /// retry would not change.
+    #[error("record {key} for the pinned segment could not be read: {reason}")]
+    RecordRead { key: String, reason: String },
+    /// The record read back does not decode, fails its own validation, is not
+    /// the record its key addresses, or names a data key its identity fields do
+    /// not reconstruct.
+    #[error("record {key} for the pinned segment failed verification: {reason}")]
+    RecordInvalid { key: String, reason: String },
+    /// The verified record disagrees with the identity on `field`.
+    #[error("record {key} disagrees with the pinned identity on {field}")]
+    RecordMismatch { key: String, field: &'static str },
 }
 
-/// Interim [`SegmentResolver`] that resolves identities by content hash against
-/// a fixed set of known segments (the pinned snapshot the coordinator
-/// dispatched from). Stands in for the reconstruct-from-identity path.
+impl ResolveIdentityError {
+    fn invalid(reason: impl Into<String>) -> Self {
+        ResolveIdentityError::Invalid {
+            reason: reason.into(),
+        }
+    }
+
+    /// The wire status this failure fails its slice with. A retryable record
+    /// GET error is `UNAVAILABLE`, which makes the coordinator re-dispatch that
+    /// one slice (a slice the coordinator ran locally has no worker left to
+    /// re-dispatch to, so it maps that status to one re-resolve and retry
+    /// instead; see the local-attempt mapping in `RoutingSliceFetcher`). Every
+    /// other record failure is `UNSUPPORTED`, which makes it run the whole
+    /// query locally through its own catalog resolve.
+    ///
+    /// The `Unknown` to `SNAPSHOT_INVALIDATED` arm is reachable only from
+    /// [`SnapshotSegmentResolver`], the cross-cluster federation resolver:
+    /// only a resolver holding a snapshot of its own can find an identity
+    /// outside it. The intra-cluster [`ReconstructingSegmentResolver`] resolves
+    /// no snapshot and never raises it.
+    pub fn status_code(&self) -> pb::status::Code {
+        match self {
+            ResolveIdentityError::Invalid { .. } => pb::status::Code::BadData,
+            ResolveIdentityError::Unknown { .. } => pb::status::Code::SnapshotInvalidated,
+            ResolveIdentityError::RecordUnavailable { .. } => pb::status::Code::Unavailable,
+            ResolveIdentityError::RecordMissing { .. }
+            | ResolveIdentityError::RecordRead { .. }
+            | ResolveIdentityError::RecordInvalid { .. }
+            | ResolveIdentityError::RecordMismatch { .. } => pb::status::Code::Unsupported,
+        }
+    }
+}
+
+/// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
+/// worker fetches. See the module docs for which resolver serves which path.
+#[async_trait::async_trait]
+pub trait SegmentResolver: Send + Sync {
+    /// The ref this identity names, or a typed refusal. A resolver never
+    /// substitutes a different segment for one it cannot resolve. Any store
+    /// request it issues is charged to `accounting`, which the caller picks:
+    /// the slice service passes a handle apart from the slice's own (see
+    /// `SeriesFetchService::resolve_pinned`).
+    async fn resolve(
+        &self,
+        identity: &pb::SegmentIdentity,
+        accounting: &QueryAccounting,
+    ) -> Result<SegmentRef, ResolveIdentityError>;
+}
+
+/// Where a worker reports the record GETs its pinned resolves issue.
+///
+/// Those GETs are deliberately outside the slice's own accounting (ADR-0071
+/// pinned-record amendment decision 5), so nothing on the wire or in the
+/// query's reported cost carries them. That is a reason to keep them off the
+/// budget, not a reason to leave them unreported: every object-store read is
+/// reported under the phase that issued it. The embedding process implements
+/// this over its own counters and wires it with
+/// [`SeriesFetchService::with_record_get_observer`]; a service with no
+/// observer resolves exactly as before.
+pub trait RecordGetObserver: Send + Sync {
+    /// One pinned resolve's totals: the record GETs it issued and the bytes
+    /// they transferred. Called once per resolve, after every identity has
+    /// been resolved or one has refused, so a resolve that failed partway
+    /// still reports what the store served.
+    fn observe_record_gets(&self, requests: u64, bytes: u64);
+}
+
+/// How many pinned identities one slice resolves concurrently. Each costs one
+/// record GET (two for an erasure-rewrite part). Every one of those GETs also
+/// holds a permit of the resolver's GET limiter, so this only bounds how many
+/// wait for one.
+const RESOLVE_CONCURRENCY: usize = 16;
+
+/// Resolve every identity in order, stopping at the first refusal.
+async fn resolve_identities<R: SegmentResolver + ?Sized>(
+    resolver: &R,
+    identities: &[pb::SegmentIdentity],
+    accounting: &QueryAccounting,
+) -> Result<Vec<SegmentRef>, ResolveIdentityError> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    // Collected first so the stream holds concrete futures rather than a
+    // closure over a borrowed identity, which `async fn fetch` cannot prove
+    // general over every lifetime. Futures are lazy, so `buffered` still
+    // bounds how many records are in flight.
+    let pending: Vec<_> = identities
+        .iter()
+        .map(|identity| resolver.resolve(identity, accounting))
+        .collect();
+    futures::stream::iter(pending)
+        .buffered(RESOLVE_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+/// The intra-cluster [`SegmentResolver`] (ADR-0071 reconstruct-don't-trust,
+/// ADR-0010 §7 key discipline). For each identity it reconstructs the key of
+/// the segment's own durable record, GETs that one record, verifies it, and
+/// builds the ref from the verified record exactly as the catalog does. It
+/// lists nothing and resolves no snapshot.
+///
+/// Built for one (tenant, signal) pair, which the fetch request names and the
+/// gRPC handler has already re-derived from the presented credential. Those two
+/// therefore never come from an identity, so a coordinator cannot point a
+/// worker at another tenant's objects by rewriting the pins.
+pub struct ReconstructingSegmentResolver {
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    /// The process-wide GET limiter (ADR-1195) the worker's data-object GETs
+    /// also draw from, so record GETs never add to the per-worker bound.
+    get_limiter: Arc<GetLimiter>,
+}
+
+impl ReconstructingSegmentResolver {
+    pub fn new(
+        store: Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        get_limiter: Arc<GetLimiter>,
+    ) -> Self {
+        ReconstructingSegmentResolver {
+            store,
+            tenant_hash,
+            signal,
+            get_limiter,
+        }
+    }
+
+    /// GET one record in full, charging the request and its bytes to
+    /// `accounting`.
+    /// The GET holds a permit of the same limiter the data-object GETs draw
+    /// from, and only around the store call.
+    async fn get_record(
+        &self,
+        key: &str,
+        accounting: &QueryAccounting,
+    ) -> Result<bytes::Bytes, ResolveIdentityError> {
+        // A closed limiter is process shutdown, not a store condition: it
+        // never reopens, so re-dispatching this slice to another worker on
+        // this process's account would fail the same way. It is
+        // `RecordRead`, which runs the whole query locally, not the
+        // retryable `RecordUnavailable`.
+        let got = match self.get_limiter.acquire().await {
+            Ok(_permit) => {
+                accounting.record_s3_request(AccountedOp::Get);
+                self.store.get(key, GetRange::Full).await
+            }
+            Err(closed) => {
+                return Err(ResolveIdentityError::RecordRead {
+                    key: key.to_string(),
+                    reason: closed.to_string(),
+                });
+            }
+        };
+        match got {
+            Ok(outcome) => {
+                accounting.add_s3_bytes(AccountedOp::Get, outcome.data.len() as u64);
+                Ok(outcome.data)
+            }
+            Err(StoreError::NotFound) => Err(ResolveIdentityError::RecordMissing {
+                key: key.to_string(),
+            }),
+            Err(err) if err.is_retryable() => Err(ResolveIdentityError::RecordUnavailable {
+                key: key.to_string(),
+                reason: err.to_string(),
+            }),
+            Err(err) => Err(ResolveIdentityError::RecordRead {
+                key: key.to_string(),
+                reason: err.to_string(),
+            }),
+        }
+    }
+
+    /// An L0 segment: its commit record, at the key the identity's
+    /// (shard, ingest hour, writer, epoch, seq) reconstruct.
+    async fn resolve_l0(
+        &self,
+        identity: &pb::SegmentIdentity,
+        content_hash: &[u8; 32],
+        accounting: &QueryAccounting,
+    ) -> Result<SegmentRef, ResolveIdentityError> {
+        if !identity.input_set_hash.is_empty() || identity.part_index != 0 {
+            return Err(ResolveIdentityError::invalid(
+                "an L0 identity carries L1 compaction fields (input_set_hash/part_index)",
+            ));
+        }
+        let writer_id = uuid::Uuid::parse_str(&identity.writer_id).map_err(|_| {
+            ResolveIdentityError::invalid(format!(
+                "writer_id {:?} is not a uuid",
+                identity.writer_id
+            ))
+        })?;
+        let key = keys::commit_key(
+            &self.tenant_hash,
+            self.signal,
+            identity.shard,
+            identity.ingest_hour_bucket,
+            writer_id,
+            identity.writer_epoch,
+            identity.writer_seq,
+        )
+        .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        let bytes = self.get_record(&key, accounting).await?;
+        let invalid = |reason: String| ResolveIdentityError::RecordInvalid {
+            key: key.clone(),
+            reason,
+        };
+        let record =
+            ravel_commit::record::decode(&bytes).map_err(|err| invalid(err.to_string()))?;
+        // The body must be the commit its key addresses: this binds the
+        // record's tenant, signal, shard, hour, writer, epoch and seq to the
+        // identity's.
+        let own_key =
+            keys::commit_key_for_record(&record).map_err(|err| invalid(err.to_string()))?;
+        if own_key != key {
+            return Err(invalid(format!("its body addresses {own_key}")));
+        }
+        let data_object_key =
+            keys::verify_object_key(&record).map_err(|err| invalid(err.to_string()))?;
+        let record_hash: [u8; 32] = record
+            .content_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("content_hash is not 32 bytes".to_string()))?;
+        let mismatch = |field| ResolveIdentityError::RecordMismatch {
+            key: key.clone(),
+            field,
+        };
+        if &record_hash != content_hash {
+            return Err(mismatch("content_hash"));
+        }
+        if record.object_size != identity.object_size {
+            return Err(mismatch("object_size"));
+        }
+        Ok(SegmentRef {
+            data_object_key,
+            object_size: record.object_size,
+            min_event_ts_ns: record.min_event_ts_ns,
+            max_event_ts_ns: record.max_event_ts_ns,
+            ingest_hour_bucket: record.ingest_hour_bucket,
+            sample_count: record.sample_count,
+            series_count: record.series_count,
+            shard: record.shard,
+            content_hash: record_hash,
+            writer_id,
+            writer_epoch: record.writer_epoch,
+            writer_seq: record.writer_seq,
+            created_unix_ns: record.created_unix_ns,
+            level: SegmentLevel::L0,
+            segment_format_version: record.segment_format_version,
+            declared_column_stats: DeclaredColumnStats::from_validated(
+                &ravel_commit::declared_stats::read_commit_record(&record),
+            ),
+        })
+    }
+
+    /// An L1 part: its compaction record, or failing that the erasure rewrite
+    /// record, at the key the identity's (shard, ingest hour, input-set hash)
+    /// reconstruct.
+    async fn resolve_l1(
+        &self,
+        identity: &pb::SegmentIdentity,
+        content_hash: &[u8; 32],
+        accounting: &QueryAccounting,
+    ) -> Result<SegmentRef, ResolveIdentityError> {
+        let input_set_hash: [u8; 32] =
+            identity.input_set_hash.as_slice().try_into().map_err(|_| {
+                ResolveIdentityError::invalid(format!(
+                    "L1 input_set_hash is {} bytes, expected 32",
+                    identity.input_set_hash.len()
+                ))
+            })?;
+        let input_set_hash16 = hex::encode(&input_set_hash[..8]);
+        let compaction_key = keys::compaction_record_key(
+            &self.tenant_hash,
+            self.signal,
+            identity.shard,
+            identity.ingest_hour_bucket,
+            &input_set_hash16,
+        )
+        .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        match self.get_record(&compaction_key, accounting).await {
+            Ok(bytes) => {
+                let key = compaction_key;
+                let invalid = |reason: String| ResolveIdentityError::RecordInvalid {
+                    key: key.clone(),
+                    reason,
+                };
+                let record = ravel_commit::record::decode_compaction(&bytes)
+                    .map_err(|err| invalid(err.to_string()))?;
+                keys::verify_compaction_record_key(&record, &key)
+                    .map_err(|err| invalid(err.to_string()))?;
+                let part = verified_part(
+                    &key,
+                    &record.input_set_hash,
+                    &record.parts,
+                    identity,
+                    &input_set_hash,
+                    content_hash,
+                )?;
+                let data_object_key = keys::reconstruct_l1_part_key(&record, part)
+                    .map_err(|err| invalid(err.to_string()))?;
+                Ok(l1_ref(
+                    data_object_key,
+                    part,
+                    record.shard,
+                    record.ingest_hour_bucket,
+                    record.created_unix_ns,
+                    input_set_hash,
+                    DeclaredColumnStats::from_validated(
+                        &ravel_commit::declared_stats::read_compaction_part(part),
+                    ),
+                ))
+            }
+            Err(ResolveIdentityError::RecordMissing { .. }) => {
+                let key = keys::rewrite_record_key(
+                    &self.tenant_hash,
+                    self.signal,
+                    identity.shard,
+                    identity.ingest_hour_bucket,
+                    &input_set_hash16,
+                )
+                .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+                let bytes = self.get_record(&key, accounting).await?;
+                let invalid = |reason: String| ResolveIdentityError::RecordInvalid {
+                    key: key.clone(),
+                    reason,
+                };
+                let record = ravel_commit::erasure::decode_rewrite(&bytes)
+                    .map_err(|err| invalid(err.to_string()))?;
+                keys::verify_rewrite_record_key(&record, &key)
+                    .map_err(|err| invalid(err.to_string()))?;
+                let part = verified_part(
+                    &key,
+                    &record.input_set_hash,
+                    &record.parts,
+                    identity,
+                    &input_set_hash,
+                    content_hash,
+                )?;
+                let data_object_key = keys::reconstruct_rewrite_part_key(&record, part)
+                    .map_err(|err| invalid(err.to_string()))?;
+                // A rewrite output never carries declared statistics, as in
+                // the catalog's own rewrite refs (ADR-0873 decision 3).
+                Ok(l1_ref(
+                    data_object_key,
+                    part,
+                    record.shard,
+                    record.ingest_hour_bucket,
+                    record.created_unix_ns,
+                    input_set_hash,
+                    DeclaredColumnStats::default(),
+                ))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// The part of a verified compaction or rewrite record that `identity` pins,
+/// after checking the record's full input-set hash and the part's full content
+/// hash and object size against the identity.
+fn verified_part<'a>(
+    key: &str,
+    record_input_set_hash: &[u8],
+    parts: &'a [ravel_proto::commit::v1::CompactionPart],
+    identity: &pb::SegmentIdentity,
+    input_set_hash: &[u8; 32],
+    content_hash: &[u8; 32],
+) -> Result<&'a ravel_proto::commit::v1::CompactionPart, ResolveIdentityError> {
+    let mismatch = |field| ResolveIdentityError::RecordMismatch {
+        key: key.to_string(),
+        field,
+    };
+    if record_input_set_hash != input_set_hash.as_slice() {
+        return Err(mismatch("input_set_hash"));
+    }
+    let part = parts
+        .iter()
+        .find(|part| part.part_index == identity.part_index)
+        .ok_or_else(|| mismatch("part_index"))?;
+    if part.content_hash.as_slice() != content_hash.as_slice() {
+        return Err(mismatch("content_hash"));
+    }
+    if part.object_size != identity.object_size {
+        return Err(mismatch("object_size"));
+    }
+    Ok(part)
+}
+
+/// An L1 ref built from a verified record and part, field for field as the
+/// catalog builds one.
+fn l1_ref(
+    data_object_key: String,
+    part: &ravel_proto::commit::v1::CompactionPart,
+    shard: u32,
+    ingest_hour_bucket: u32,
+    created_unix_ns: i64,
+    input_set_hash: [u8; 32],
+    declared_column_stats: DeclaredColumnStats,
+) -> SegmentRef {
+    let mut content_hash = [0u8; 32];
+    content_hash.copy_from_slice(&part.content_hash);
+    SegmentRef {
+        data_object_key,
+        object_size: part.object_size,
+        min_event_ts_ns: part.min_event_ts_ns,
+        max_event_ts_ns: part.max_event_ts_ns,
+        ingest_hour_bucket,
+        sample_count: part.sample_count,
+        series_count: part.series_count,
+        shard,
+        content_hash,
+        // A part has no writer identity of its own; never used for an L1
+        // ref's identity or dedup.
+        writer_id: uuid::Uuid::nil(),
+        writer_epoch: 0,
+        writer_seq: 0,
+        created_unix_ns,
+        level: SegmentLevel::L1 {
+            input_set_hash,
+            part_index: part.part_index,
+        },
+        segment_format_version: part.segment_format_version,
+        declared_column_stats,
+    }
+}
+
+#[async_trait::async_trait]
+impl SegmentResolver for ReconstructingSegmentResolver {
+    async fn resolve(
+        &self,
+        identity: &pb::SegmentIdentity,
+        accounting: &QueryAccounting,
+    ) -> Result<SegmentRef, ResolveIdentityError> {
+        let content_hash = codec::identity_content_hash(identity)
+            .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        match identity.level {
+            0 => self.resolve_l0(identity, &content_hash, accounting).await,
+            1 => self.resolve_l1(identity, &content_hash, accounting).await,
+            other => Err(ResolveIdentityError::invalid(format!(
+                "unknown segment level {other}"
+            ))),
+        }
+    }
+}
+
+/// The federation [`SegmentResolver`]: resolves identities by content hash
+/// against a fixed set of known segments, the snapshot the REMOTE cluster
+/// resolved for itself before pinning the slice (see the module docs).
 pub struct SnapshotSegmentResolver {
     by_content_hash: HashMap<[u8; 32], SegmentRef>,
 }
@@ -102,10 +617,21 @@ impl SnapshotSegmentResolver {
     }
 }
 
+#[async_trait::async_trait]
 impl SegmentResolver for SnapshotSegmentResolver {
-    fn resolve(&self, identity: &pb::SegmentIdentity) -> Option<SegmentRef> {
-        let hash = codec::identity_content_hash(identity).ok()?;
-        self.by_content_hash.get(&hash).cloned()
+    async fn resolve(
+        &self,
+        identity: &pb::SegmentIdentity,
+        _accounting: &QueryAccounting,
+    ) -> Result<SegmentRef, ResolveIdentityError> {
+        let hash = codec::identity_content_hash(identity)
+            .map_err(|err| ResolveIdentityError::invalid(err.to_string()))?;
+        self.by_content_hash
+            .get(&hash)
+            .cloned()
+            .ok_or_else(|| ResolveIdentityError::Unknown {
+                reason: "identity is outside this cluster's resolved snapshot".to_string(),
+            })
     }
 }
 
@@ -194,6 +720,16 @@ pub struct SeriesFetchService<R: SegmentResolver + 'static> {
     /// series and samples slice by slice. This worker therefore enforces its
     /// own `max_series`/`max_samples` over what it is about to return.
     resolve_scope: bool,
+    /// Where this worker's pinned-resolve record GETs are reported, wired via
+    /// [`with_record_get_observer`](Self::with_record_get_observer). `None`
+    /// (the default) drops the totals, which is what a caller with no counters
+    /// of its own wants; the server wires its fragment-metrics family here.
+    record_get_observer: Option<Arc<dyn RecordGetObserver>>,
+    /// Whether this service is running the coordinator's OWN slice in process
+    /// rather than serving an inbound request, set via
+    /// [`with_local_attempt`](Self::with_local_attempt). It changes exactly one
+    /// status: see that builder.
+    local_attempt: bool,
 }
 
 impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
@@ -205,7 +741,44 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             resolver,
             engine: EngineConfig::default(),
             resolve_scope: false,
+            record_get_observer: None,
+            local_attempt: false,
         }
+    }
+
+    /// Marks this service as running the coordinator's own slice in process,
+    /// with no network hop before it and no worker left to hand it to.
+    ///
+    /// That changes exactly one status. A retryable record GET failure is
+    /// [`ResolveIdentityError::RecordUnavailable`], which is `UNAVAILABLE`,
+    /// which the coordinator reads as "every attempt, local included, was
+    /// unavailable" and fails the query on. That reading is right for a slice
+    /// that walked the remote ladder and wrong for one dispatched straight to
+    /// local execution: a self-mapped or unroutable slice makes no remote
+    /// attempt at all, so a single store blip on one record would fail the
+    /// whole query with no retry. On this path it becomes
+    /// `SNAPSHOT_INVALIDATED`, which the coordinator answers with one
+    /// re-resolve and retry, the same recovery the catalog re-resolve this
+    /// path replaced had.
+    ///
+    /// Only the resolve phase's retryable failure moves. A fetch-phase
+    /// `UNAVAILABLE` still means the segment reads themselves are failing and
+    /// stays terminal, so the remote-then-fallback ladder still ends where it
+    /// did.
+    #[must_use]
+    pub fn with_local_attempt(mut self) -> Self {
+        self.local_attempt = true;
+        self
+    }
+
+    /// Wires where this worker reports the record GETs its pinned resolves
+    /// issue (see [`RecordGetObserver`]). A builder for the same reason
+    /// [`with_engine_config`](Self::with_engine_config) is one: the
+    /// out-of-crate callers of `new` stay unchanged.
+    #[must_use]
+    pub fn with_record_get_observer(mut self, observer: Arc<dyn RecordGetObserver>) -> Self {
+        self.record_get_observer = Some(observer);
+        self
     }
 
     /// Wires this worker's own [`EngineConfig`] onto the service, so every
@@ -468,6 +1041,48 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         )])
     }
 
+    /// Resolves a pinned slice's shipped identities to refs. A typed refusal
+    /// carries its own status (see [`ResolveIdentityError::status_code`]).
+    ///
+    /// The record GETs a resolver issues are charged to a handle of their own,
+    /// never to the slice's. The slice's accounting is what this worker and the
+    /// coordinator hold to `max_bytes_scanned` and `max_s3_requests`, and
+    /// local execution never issues these GETs, so charging them would fail a
+    /// query distributed that succeeds locally (ADR-0071 pinned-record
+    /// amendment). The summary carries one pooled snapshot with no phase
+    /// split, so they are not in the slice's reported cost either.
+    ///
+    /// Off the budget is not unreported: the handle's totals go to this
+    /// worker's [`RecordGetObserver`] before the result is returned, whether
+    /// the resolve succeeded or refused partway, so the process exports the
+    /// requests and bytes its resolve phase spent.
+    async fn resolve_pinned(
+        &self,
+        identities: &[pb::SegmentIdentity],
+    ) -> Result<Vec<SegmentRef>, SliceFailure> {
+        let records = QueryAccounting::new();
+        let resolved = resolve_identities(self.resolver.as_ref(), identities, &records).await;
+        if let Some(observer) = &self.record_get_observer {
+            let spent = records.snapshot();
+            observer.observe_record_gets(
+                spent.s3_requests(AccountedOp::Get),
+                spent.s3_bytes(AccountedOp::Get),
+            );
+        }
+        resolved.map_err(|err| SliceFailure::from((self.resolve_status(&err), err.to_string())))
+    }
+
+    /// The status a resolve refusal fails this slice with. Every variant takes
+    /// [`ResolveIdentityError::status_code`], except a retryable record GET on
+    /// the coordinator's own local attempt: see
+    /// [`with_local_attempt`](Self::with_local_attempt).
+    fn resolve_status(&self, err: &ResolveIdentityError) -> pb::status::Code {
+        if self.local_attempt && matches!(err, ResolveIdentityError::RecordUnavailable { .. }) {
+            return pb::status::Code::SnapshotInvalidated;
+        }
+        err.status_code()
+    }
+
     /// The Metrics slice path: resolve the pinned scope to refs, fetch each
     /// segment's scalar and histogram series, enforce the per-slice
     /// bytes-scanned budget, apply erasure, and stream one `SeriesFrame` per
@@ -500,29 +1115,15 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         };
 
-        // Reconstruct each ref from its shipped identity. An unknown identity
-        // means the pinned segment vanished under a concurrent GC/compaction:
-        // the coordinator's single re-resolve/retry handles it.
-        let mut segments = Vec::with_capacity(identities.len());
-        for identity in &identities {
-            match self.resolver.resolve(identity) {
-                Some(seg) => segments.push(seg),
-                None => {
-                    return Err(SliceFailure::from((
-                        pb::status::Code::SnapshotInvalidated,
-                        "pinned segment not found on worker".to_string(),
-                    )));
-                }
-            }
-        }
+        let segments = self.resolve_pinned(&identities).await?;
+        // One fresh accounting handle per slice: the coordinator folds the
+        // returned snapshot into the query's aggregate (ADR-0071).
+        let accounting = QueryAccounting::new();
 
         // Per-slice bytes-scanned budget, enforced per completed segment
         // exactly as the local path does (ADR-0061 decision 1).
         let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
-        // One fresh accounting handle per slice: the coordinator folds the
-        // returned snapshot into the query's aggregate (ADR-0071).
-        let accounting = QueryAccounting::new();
         let mut scalar = Vec::new();
         let mut histograms: Vec<FetchedHistogramSeries> = Vec::new();
         let mut stats = FetchStats::default();
@@ -771,18 +1372,8 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         };
 
-        let mut segments = Vec::with_capacity(identities.len());
-        for identity in &identities {
-            match self.resolver.resolve(identity) {
-                Some(seg) => segments.push(seg),
-                None => {
-                    return Err(SliceFailure::from((
-                        pb::status::Code::SnapshotInvalidated,
-                        "pinned segment not found on worker".to_string(),
-                    )));
-                }
-            }
-        }
+        let segments = self.resolve_pinned(&identities).await?;
+        let accounting = QueryAccounting::new();
 
         let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
@@ -793,7 +1384,6 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // threaded through the same funnel, applied per segment after decode.
         let query = LogQuery::new(window_start_ns, window_end_ns).with_erasure(erasure);
 
-        let accounting = QueryAccounting::new();
         let mut records: Vec<ravel_logseg::LogRecord> = Vec::new();
         // Logs carry no raw-f64 page counters (a metric-path concept), so
         // `FetchStats` stays zero, exactly what a local log read reports.
@@ -910,18 +1500,8 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         };
 
-        let mut segments = Vec::with_capacity(identities.len());
-        for identity in &identities {
-            match self.resolver.resolve(identity) {
-                Some(seg) => segments.push(seg),
-                None => {
-                    return Err(SliceFailure::from((
-                        pb::status::Code::SnapshotInvalidated,
-                        "pinned segment not found on worker".to_string(),
-                    )));
-                }
-            }
-        }
+        let segments = self.resolve_pinned(&identities).await?;
+        let accounting = QueryAccounting::new();
 
         let byte_limit = slice_byte_limit(budgets.as_ref(), self.engine.max_bytes_scanned);
 
@@ -934,7 +1514,6 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // the scan beyond the window.
         let query = SpanQuery::ts_range(window_start_ns, window_end_ns);
 
-        let accounting = QueryAccounting::new();
         let mut spans: Vec<crate::span_fetcher::SpanRow> = Vec::new();
         // Spans carry no raw-f64 page counters (a metric-path concept), so
         // `FetchStats` stays zero, exactly what a local span read reports.
@@ -1313,5 +1892,1025 @@ fn map_span_fetch_error(err: SpanFetchError) -> (pb::status::Code, String) {
         SpanFetchError::FetchMemoryExhausted { .. } => {
             (pb::status::Code::BudgetExceeded, err.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod reconstruct_tests {
+    use super::*;
+    use prost::Message as _;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_proto::commit::v1 as commit_pb;
+
+    const WRITER_ID: &str = "8d9f0b8e-6f2a-4f4a-9a1e-2c3b4d5e6f70";
+    const CONTENT_HASH: [u8; 32] = [0xAB; 32];
+    const INPUT_SET_HASH: [u8; 32] = [0x5C; 32];
+    const PART_HASH: [u8; 32] = [0xCD; 32];
+    const HOUR: u32 = 472_000;
+
+    fn tenant() -> TenantHash {
+        ravel_types::TenantId::new("reconstruct-tenant".to_string()).hash()
+    }
+
+    fn writer() -> uuid::Uuid {
+        uuid::Uuid::parse_str(WRITER_ID).expect("a uuid")
+    }
+
+    fn resolver(store: Arc<dyn ObjectStoreBackend>) -> ReconstructingSegmentResolver {
+        ReconstructingSegmentResolver::new(store, tenant(), Signal::Metrics, limiter(8))
+    }
+
+    fn limiter(permits: usize) -> Arc<GetLimiter> {
+        Arc::new(GetLimiter::new(permits).expect("nonzero permits"))
+    }
+
+    /// A commit record whose every field differs from the identity's non-key
+    /// fields, so a ref field can only equal the record's if it was read from
+    /// the record.
+    fn l0_record() -> commit_pb::CommitRecord {
+        ravel_commit::record::build(ravel_commit::record::NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 7,
+            writer_id: writer(),
+            writer_epoch: 3,
+            writer_seq: 11,
+            object_size: 4096,
+            content_hash: CONTENT_HASH,
+            sample_count: 120,
+            series_count: 4,
+            min_event_ts_ns: 1_699_999_000_000_000_000,
+            max_event_ts_ns: 1_700_000_500_000_000_000,
+            min_ingest_ts_ns: 1_699_999_100_000_000_000,
+            max_ingest_ts_ns: 1_700_000_600_000_000_000,
+            segment_format_version: 4,
+            created_unix_ns: 1_700_000_000_000_000_000,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("valid commit record")
+    }
+
+    fn l0_key() -> String {
+        keys::commit_key(&tenant(), Signal::Metrics, 7, HOUR, writer(), 3, 11).expect("commit key")
+    }
+
+    /// The identity a coordinator ships for [`l0_record`]. Its
+    /// `segment_format_version` is deliberately not the record's: the ref must
+    /// take the record's.
+    fn l0_identity() -> pb::SegmentIdentity {
+        pb::SegmentIdentity {
+            level: 0,
+            shard: 7,
+            ingest_hour_bucket: HOUR,
+            writer_id: WRITER_ID.to_string(),
+            writer_epoch: 3,
+            writer_seq: 11,
+            input_set_hash: Vec::new(),
+            part_index: 0,
+            content_hash: CONTENT_HASH.to_vec(),
+            object_size: 4096,
+            segment_format_version: 99,
+        }
+    }
+
+    fn part(part_index: u32, content_hash: [u8; 32]) -> commit_pb::CompactionPart {
+        commit_pb::CompactionPart {
+            part_index,
+            content_hash: content_hash.to_vec(),
+            object_size: 8192 + u64::from(part_index),
+            sample_count: 300 + u64::from(part_index),
+            series_count: 9,
+            min_event_ts_ns: 1_699_998_000_000_000_000,
+            max_event_ts_ns: 1_700_001_000_000_000_000,
+            segment_format_version: 3,
+            ..Default::default()
+        }
+    }
+
+    fn compaction_record() -> commit_pb::CompactionRecord {
+        commit_pb::CompactionRecord {
+            format_version: ravel_commit::record::COMPACTION_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 7,
+            ingest_hour_bucket: HOUR,
+            level: 1,
+            inputs: Vec::new(),
+            input_set_hash: INPUT_SET_HASH.to_vec(),
+            parts: vec![part(0, [0x11; 32]), part(2, PART_HASH)],
+            created_unix_ns: 1_700_000_900_000_000_000,
+        }
+    }
+
+    fn compaction_key() -> String {
+        keys::compaction_record_key(
+            &tenant(),
+            Signal::Metrics,
+            7,
+            HOUR,
+            &hex::encode(&INPUT_SET_HASH[..8]),
+        )
+        .expect("compaction record key")
+    }
+
+    /// A rewrite record that validates: its `input_set_hash` is the canonical
+    /// hash of its inputs and applied request.
+    fn rewrite_record() -> commit_pb::RewriteRecord {
+        let inputs = vec![commit_pb::CompactionInputIdentity {
+            writer_id: WRITER_ID.to_string(),
+            writer_epoch: 3,
+            writer_seq: 11,
+        }];
+        let request_id = "0b1c2d3e-4f50-4a6b-9c7d-8e9fa0b1c2d3".to_string();
+        let input_set_hash = ravel_commit::erasure::compute_rewrite_input_set_hash(
+            &inputs,
+            None,
+            std::slice::from_ref(&request_id),
+        );
+        commit_pb::RewriteRecord {
+            format_version: ravel_commit::erasure::FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 7,
+            ingest_hour_bucket: HOUR,
+            inputs,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part(1, PART_HASH)],
+            drops: vec![commit_pb::RewriteDrop {
+                request_id,
+                dropped_count: 2,
+            }],
+            created_unix_ns: 1_700_000_950_000_000_000,
+            superseded_record_key: String::new(),
+        }
+    }
+
+    fn rewrite_key(record: &commit_pb::RewriteRecord) -> String {
+        keys::rewrite_record_key_for(record).expect("rewrite record key")
+    }
+
+    fn l1_identity(
+        input_set_hash: &[u8],
+        part_index: u32,
+        object_size: u64,
+    ) -> pb::SegmentIdentity {
+        pb::SegmentIdentity {
+            level: 1,
+            shard: 7,
+            ingest_hour_bucket: HOUR,
+            writer_id: uuid::Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            input_set_hash: input_set_hash.to_vec(),
+            part_index,
+            content_hash: PART_HASH.to_vec(),
+            object_size,
+            segment_format_version: 99,
+        }
+    }
+
+    async fn store_with(objects: Vec<(String, Vec<u8>)>) -> Arc<dyn ObjectStoreBackend> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        for (key, data) in objects {
+            store
+                .put(&key, bytes::Bytes::from(data), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        store
+    }
+
+    async fn store_with_l0() -> Arc<dyn ObjectStoreBackend> {
+        store_with(vec![(l0_key(), l0_record().encode_to_vec())]).await
+    }
+
+    fn gets(accounting: &QueryAccounting) -> u64 {
+        accounting.snapshot().s3_requests(AccountedOp::Get)
+    }
+
+    /// Resolves `identity`, expecting a refusal; returns it with the GET count.
+    async fn refusal(
+        store: Arc<dyn ObjectStoreBackend>,
+        identity: &pb::SegmentIdentity,
+    ) -> (ResolveIdentityError, u64) {
+        let accounting = QueryAccounting::new();
+        let err = resolver(store)
+            .resolve(identity, &accounting)
+            .await
+            .expect_err("the identity must be refused");
+        (err, gets(&accounting))
+    }
+
+    fn assert_mismatch(err: &ResolveIdentityError, key: &str, field: &'static str) {
+        assert_eq!(
+            err,
+            &ResolveIdentityError::RecordMismatch {
+                key: key.to_string(),
+                field,
+            }
+        );
+        assert_eq!(err.status_code(), pb::status::Code::Unsupported);
+    }
+
+    fn assert_record_invalid(err: &ResolveIdentityError, key: &str, needle: &str) {
+        let ResolveIdentityError::RecordInvalid { key: got, reason } = err else {
+            panic!("expected RecordInvalid, got {err:?}");
+        };
+        assert_eq!(got, key);
+        assert!(reason.contains(needle), "{reason:?} lacks {needle:?}");
+        assert_eq!(err.status_code(), pb::status::Code::Unsupported);
+    }
+
+    /// Every ref field is the verified record's, and the one GET is charged.
+    #[tokio::test]
+    async fn l0_ref_is_built_from_the_verified_commit_record() {
+        let record = l0_record();
+        let encoded = record.encode_to_vec();
+        let store = store_with(vec![(l0_key(), encoded.clone())]).await;
+        let accounting = QueryAccounting::new();
+        let seg = resolver(store)
+            .resolve(&l0_identity(), &accounting)
+            .await
+            .expect("L0 resolves");
+        let expected = SegmentRef {
+            data_object_key: record.object_key.clone(),
+            object_size: 4096,
+            min_event_ts_ns: 1_699_999_000_000_000_000,
+            max_event_ts_ns: 1_700_000_500_000_000_000,
+            ingest_hour_bucket: HOUR,
+            sample_count: 120,
+            series_count: 4,
+            shard: 7,
+            content_hash: CONTENT_HASH,
+            writer_id: writer(),
+            writer_epoch: 3,
+            writer_seq: 11,
+            created_unix_ns: 1_700_000_000_000_000_000,
+            level: SegmentLevel::L0,
+            segment_format_version: 4,
+            declared_column_stats: DeclaredColumnStats::default(),
+        };
+        assert_eq!(seg, expected);
+        assert_eq!(
+            seg.data_object_key,
+            keys::data_key(
+                &tenant(),
+                Signal::Metrics,
+                7,
+                writer(),
+                3,
+                11,
+                &CONTENT_HASH
+            )
+            .expect("data key")
+        );
+        let spend = accounting.snapshot();
+        assert_eq!(spend.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(spend.s3_bytes(AccountedOp::Get), encoded.len() as u64);
+    }
+
+    /// The tenant comes from the resolver, never the identity: the same
+    /// identity under another tenant addresses a record that does not exist.
+    #[tokio::test]
+    async fn the_tenant_comes_from_the_resolver_not_the_identity() {
+        let store = store_with_l0().await;
+        let other = ravel_types::TenantId::new("other-tenant".to_string()).hash();
+        let accounting = QueryAccounting::new();
+        let err = ReconstructingSegmentResolver::new(store, other, Signal::Metrics, limiter(8))
+            .resolve(&l0_identity(), &accounting)
+            .await
+            .expect_err("another tenant's record is absent");
+        let other_key =
+            keys::commit_key(&other, Signal::Metrics, 7, HOUR, writer(), 3, 11).expect("key");
+        assert_eq!(err, ResolveIdentityError::RecordMissing { key: other_key });
+    }
+
+    #[tokio::test]
+    async fn a_missing_commit_record_is_record_missing() {
+        let store = store_with(Vec::new()).await;
+        let (err, gets) = refusal(store, &l0_identity()).await;
+        assert_eq!(err, ResolveIdentityError::RecordMissing { key: l0_key() });
+        assert_eq!(err.status_code(), pb::status::Code::Unsupported);
+        assert_eq!(gets, 1, "the failed GET is still charged");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_commit_record_is_record_read() {
+        let inner = store_with_l0().await;
+        let fault = Arc::new(FaultStore::new(
+            inner,
+            FaultPlan::empty().with_rule(Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("record GET fails".into()),
+            )),
+        ));
+        let (err, _) = refusal(fault.clone(), &l0_identity()).await;
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Permanent), 1);
+        let ResolveIdentityError::RecordRead { key, .. } = &err else {
+            panic!("expected RecordRead, got {err:?}");
+        };
+        assert_eq!(key, &l0_key());
+        assert_eq!(err.status_code(), pb::status::Code::Unsupported);
+    }
+
+    /// A retryable store error on the record GET is `UNAVAILABLE`, so the
+    /// coordinator re-dispatches that one slice instead of running the whole
+    /// query locally. Each of the three retryable kinds is checked, and each
+    /// fault is proven to have fired.
+    #[tokio::test]
+    async fn a_retryable_record_get_error_is_unavailable() {
+        let cases = [
+            (
+                ScriptedFault::Transient("blip".into()),
+                FaultKind::Transient,
+            ),
+            (ScriptedFault::Timeout, FaultKind::Timeout),
+            (
+                ScriptedFault::Throttled { retry_after_ms: 5 },
+                FaultKind::Throttled,
+            ),
+        ];
+        for (scripted, kind) in cases {
+            let inner = store_with_l0().await;
+            let fault = Arc::new(FaultStore::new(
+                inner,
+                FaultPlan::empty().with_rule(Rule::new(Op::Get, scripted)),
+            ));
+            let (err, gets) = refusal(fault.clone(), &l0_identity()).await;
+            assert_eq!(fault.fault_count(Op::Get, kind), 1, "{kind:?} fired");
+            assert_eq!(gets, 1, "{kind:?}: one record GET");
+            let ResolveIdentityError::RecordUnavailable { key, .. } = &err else {
+                panic!("{kind:?}: expected RecordUnavailable, got {err:?}");
+            };
+            assert_eq!(key, &l0_key());
+            assert_eq!(
+                err.status_code(),
+                pb::status::Code::Unavailable,
+                "{kind:?}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_commit_record_is_record_invalid() {
+        let store = store_with(vec![(l0_key(), vec![0xff, 0xff, 0xff])]).await;
+        let (err, _) = refusal(store, &l0_identity()).await;
+        assert_record_invalid(&err, &l0_key(), "");
+    }
+
+    /// `record::decode` validates: a record with an inverted event range at the
+    /// right key is refused.
+    #[tokio::test]
+    async fn a_commit_record_failing_validation_is_record_invalid() {
+        let mut record = l0_record();
+        record.min_event_ts_ns = record.max_event_ts_ns + 1;
+        let store = store_with(vec![(l0_key(), record.encode_to_vec())]).await;
+        let (err, _) = refusal(store, &l0_identity()).await;
+        assert_record_invalid(&err, &l0_key(), "event");
+    }
+
+    /// A self-consistent record for seq 12 stored at seq 11's key. Only the
+    /// key check refuses it: its `object_key`, content hash and size all pass.
+    #[tokio::test]
+    async fn a_commit_record_for_another_commit_is_record_invalid() {
+        let mut record = l0_record();
+        record.writer_seq = 12;
+        record.object_key = keys::reconstruct_data_key(&record).expect("data key");
+        let store = store_with(vec![(l0_key(), record.encode_to_vec())]).await;
+        let (err, _) = refusal(store, &l0_identity()).await;
+        assert_record_invalid(&err, &l0_key(), "addresses");
+    }
+
+    #[tokio::test]
+    async fn a_tampered_object_key_is_record_invalid() {
+        let mut record = l0_record();
+        record.object_key = format!("{}.moved", record.object_key);
+        let store = store_with(vec![(l0_key(), record.encode_to_vec())]).await;
+        let (err, _) = refusal(store, &l0_identity()).await;
+        assert_record_invalid(&err, &l0_key(), "object_key mismatch");
+    }
+
+    /// The last byte differs, past the 8 bytes any key embeds.
+    #[tokio::test]
+    async fn an_l0_content_hash_tail_mismatch_is_refused() {
+        let mut identity = l0_identity();
+        identity.content_hash[31] ^= 0x01;
+        let (err, _) = refusal(store_with_l0().await, &identity).await;
+        assert_mismatch(&err, &l0_key(), "content_hash");
+    }
+
+    #[tokio::test]
+    async fn an_l0_object_size_mismatch_is_refused() {
+        let mut identity = l0_identity();
+        identity.object_size = 4097;
+        let (err, _) = refusal(store_with_l0().await, &identity).await;
+        assert_mismatch(&err, &l0_key(), "object_size");
+    }
+
+    /// A malformed identity is refused before any record is read, even though
+    /// a valid record is in the store.
+    async fn assert_invalid(identity: pb::SegmentIdentity, needle: &str) {
+        let store = store_with(vec![
+            (l0_key(), l0_record().encode_to_vec()),
+            (compaction_key(), compaction_record().encode_to_vec()),
+        ])
+        .await;
+        let (err, gets) = refusal(store, &identity).await;
+        let ResolveIdentityError::Invalid { reason } = &err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(reason.contains(needle), "{reason:?} lacks {needle:?}");
+        assert_eq!(err.status_code(), pb::status::Code::BadData);
+        assert_eq!(gets, 0, "no record is read for a malformed identity");
+    }
+
+    #[tokio::test]
+    async fn a_non_uuid_writer_id_is_refused() {
+        let mut identity = l0_identity();
+        identity.writer_id = "not-a-uuid".to_string();
+        assert_invalid(identity, "not a uuid").await;
+    }
+
+    #[tokio::test]
+    async fn a_short_content_hash_is_refused() {
+        let mut identity = l0_identity();
+        identity.content_hash = vec![0xAB; 31];
+        assert_invalid(identity, "31").await;
+    }
+
+    #[tokio::test]
+    async fn an_absent_content_hash_is_refused() {
+        let mut identity = l0_identity();
+        identity.content_hash = Vec::new();
+        assert_invalid(identity, "0").await;
+    }
+
+    /// The key shape formats the shard as four digits, so a shard outside that
+    /// range has no key at all; it must not be truncated into another shard's.
+    #[tokio::test]
+    async fn an_out_of_range_shard_is_refused() {
+        let mut identity = l0_identity();
+        identity.shard = 10_000;
+        assert_invalid(identity, "10000").await;
+    }
+
+    #[tokio::test]
+    async fn an_l0_identity_carrying_an_input_set_hash_is_refused() {
+        let mut identity = l0_identity();
+        identity.input_set_hash = INPUT_SET_HASH.to_vec();
+        assert_invalid(identity, "L1 compaction fields").await;
+    }
+
+    #[tokio::test]
+    async fn an_l0_identity_carrying_a_part_index_is_refused() {
+        let mut identity = l0_identity();
+        identity.part_index = 1;
+        assert_invalid(identity, "L1 compaction fields").await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_level_is_refused() {
+        let mut identity = l0_identity();
+        identity.level = 2;
+        assert_invalid(identity, "unknown segment level 2").await;
+    }
+
+    #[tokio::test]
+    async fn an_l1_identity_without_a_32_byte_input_set_hash_is_refused() {
+        assert_invalid(l1_identity(&INPUT_SET_HASH[..16], 2, 8194), "16 bytes").await;
+    }
+
+    /// Every L1 ref field is the verified compaction record's or its part's.
+    #[tokio::test]
+    async fn l1_ref_is_built_from_the_verified_compaction_record() {
+        let record = compaction_record();
+        let store = store_with(vec![(compaction_key(), record.encode_to_vec())]).await;
+        let accounting = QueryAccounting::new();
+        let seg = resolver(store)
+            .resolve(&l1_identity(&INPUT_SET_HASH, 2, 8194), &accounting)
+            .await
+            .expect("L1 resolves");
+        let expected = SegmentRef {
+            data_object_key: keys::reconstruct_l1_part_key(&record, &record.parts[1])
+                .expect("part key"),
+            object_size: 8194,
+            min_event_ts_ns: 1_699_998_000_000_000_000,
+            max_event_ts_ns: 1_700_001_000_000_000_000,
+            ingest_hour_bucket: HOUR,
+            sample_count: 302,
+            series_count: 9,
+            shard: 7,
+            content_hash: PART_HASH,
+            writer_id: uuid::Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 1_700_000_900_000_000_000,
+            level: SegmentLevel::L1 {
+                input_set_hash: INPUT_SET_HASH,
+                part_index: 2,
+            },
+            segment_format_version: 3,
+            declared_column_stats: DeclaredColumnStats::default(),
+        };
+        assert_eq!(seg, expected);
+        assert_eq!(gets(&accounting), 1);
+    }
+
+    /// With no compaction record, an erasure rewrite record at the same bucket
+    /// and input-set hash serves the part, at the cost of a second GET.
+    #[tokio::test]
+    async fn l1_ref_falls_back_to_the_verified_rewrite_record() {
+        let record = rewrite_record();
+        let store = store_with(vec![(rewrite_key(&record), record.encode_to_vec())]).await;
+        let input_set_hash: [u8; 32] = record
+            .input_set_hash
+            .as_slice()
+            .try_into()
+            .expect("32 bytes");
+        let accounting = QueryAccounting::new();
+        let seg = resolver(store)
+            .resolve(&l1_identity(&input_set_hash, 1, 8193), &accounting)
+            .await
+            .expect("rewrite part resolves");
+        assert_eq!(
+            seg.data_object_key,
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key")
+        );
+        assert_eq!(seg.created_unix_ns, 1_700_000_950_000_000_000);
+        assert_eq!(seg.object_size, 8193);
+        assert_eq!(seg.sample_count, 301);
+        assert_eq!(
+            seg.level,
+            SegmentLevel::L1 {
+                input_set_hash,
+                part_index: 1,
+            }
+        );
+        assert_eq!(gets(&accounting), 2);
+    }
+
+    #[tokio::test]
+    async fn an_l1_part_with_neither_record_is_record_missing() {
+        let identity = l1_identity(&INPUT_SET_HASH, 2, 8194);
+        let (err, gets) = refusal(store_with(Vec::new()).await, &identity).await;
+        let rewrite_key = keys::rewrite_record_key(
+            &tenant(),
+            Signal::Metrics,
+            7,
+            HOUR,
+            &hex::encode(&INPUT_SET_HASH[..8]),
+        )
+        .expect("rewrite key");
+        assert_eq!(
+            err,
+            ResolveIdentityError::RecordMissing { key: rewrite_key }
+        );
+        assert_eq!(err.status_code(), pb::status::Code::Unsupported);
+        assert_eq!(gets, 2);
+    }
+
+    /// A compaction record whose own fields reconstruct another bucket's key
+    /// (here shard 8) is refused where it was read.
+    #[tokio::test]
+    async fn a_compaction_record_for_another_bucket_is_record_invalid() {
+        let mut record = compaction_record();
+        record.shard = 8;
+        let store = store_with(vec![(compaction_key(), record.encode_to_vec())]).await;
+        let (err, _) = refusal(store, &l1_identity(&INPUT_SET_HASH, 2, 8194)).await;
+        assert_record_invalid(&err, &compaction_key(), "mismatch");
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_compaction_record_is_record_invalid() {
+        let store = store_with(vec![(compaction_key(), vec![0xff, 0xff])]).await;
+        let (err, _) = refusal(store, &l1_identity(&INPUT_SET_HASH, 2, 8194)).await;
+        assert_record_invalid(&err, &compaction_key(), "");
+    }
+
+    /// A rewrite record whose `input_set_hash` is not the canonical hash of its
+    /// own contents fails `decode_rewrite`'s validation.
+    #[tokio::test]
+    async fn a_rewrite_record_failing_validation_is_record_invalid() {
+        let mut record = rewrite_record();
+        let key = rewrite_key(&record);
+        let input_set_hash = record.input_set_hash.clone();
+        record.drops[0].dropped_count = 3;
+        record.drops[0].request_id = "1b1c2d3e-4f50-4a6b-9c7d-8e9fa0b1c2d3".to_string();
+        let store = store_with(vec![(key.clone(), record.encode_to_vec())]).await;
+        let (err, _) = refusal(store, &l1_identity(&input_set_hash, 1, 8193)).await;
+        assert_record_invalid(&err, &key, "");
+    }
+
+    /// A valid rewrite record for shard 8 stored at shard 7's rewrite key: its
+    /// input-set hash does not cover the shard, so only the key check refuses
+    /// it.
+    #[tokio::test]
+    async fn a_rewrite_record_for_another_bucket_is_record_invalid() {
+        let mut record = rewrite_record();
+        let key = rewrite_key(&record);
+        record.shard = 8;
+        let input_set_hash = record.input_set_hash.clone();
+        let store = store_with(vec![(key.clone(), record.encode_to_vec())]).await;
+        let (err, _) = refusal(store, &l1_identity(&input_set_hash, 1, 8193)).await;
+        assert_record_invalid(&err, &key, "mismatch");
+    }
+
+    async fn store_with_compaction() -> Arc<dyn ObjectStoreBackend> {
+        store_with(vec![(
+            compaction_key(),
+            compaction_record().encode_to_vec(),
+        )])
+        .await
+    }
+
+    /// The last byte differs, past the 8 bytes the record key embeds, so the
+    /// same record is read and the full comparison refuses it.
+    #[tokio::test]
+    async fn an_input_set_hash_tail_mismatch_is_refused() {
+        let mut input_set_hash = INPUT_SET_HASH;
+        input_set_hash[31] ^= 0x01;
+        let identity = l1_identity(&input_set_hash, 2, 8194);
+        let (err, _) = refusal(store_with_compaction().await, &identity).await;
+        assert_mismatch(&err, &compaction_key(), "input_set_hash");
+    }
+
+    #[tokio::test]
+    async fn a_part_index_absent_from_the_record_is_refused() {
+        let identity = l1_identity(&INPUT_SET_HASH, 1, 8194);
+        let (err, _) = refusal(store_with_compaction().await, &identity).await;
+        assert_mismatch(&err, &compaction_key(), "part_index");
+    }
+
+    #[tokio::test]
+    async fn an_l1_content_hash_tail_mismatch_is_refused() {
+        let mut identity = l1_identity(&INPUT_SET_HASH, 2, 8194);
+        identity.content_hash[31] ^= 0x01;
+        let (err, _) = refusal(store_with_compaction().await, &identity).await;
+        assert_mismatch(&err, &compaction_key(), "content_hash");
+    }
+
+    #[tokio::test]
+    async fn an_l1_object_size_mismatch_is_refused() {
+        let identity = l1_identity(&INPUT_SET_HASH, 2, 8195);
+        let (err, _) = refusal(store_with_compaction().await, &identity).await;
+        assert_mismatch(&err, &compaction_key(), "object_size");
+    }
+
+    /// Refs come back in identity order, and the first refusal fails the set.
+    #[tokio::test]
+    async fn identities_resolve_in_order_and_stop_at_the_first_refusal() {
+        let store = store_with(vec![
+            (l0_key(), l0_record().encode_to_vec()),
+            (compaction_key(), compaction_record().encode_to_vec()),
+        ])
+        .await;
+        let resolver = resolver(store);
+        let accounting = QueryAccounting::new();
+        let identities = vec![l1_identity(&INPUT_SET_HASH, 2, 8194), l0_identity()];
+        let refs = resolve_identities(&resolver, &identities, &accounting)
+            .await
+            .expect("both resolve");
+        assert_eq!(refs.len(), 2);
+        assert!(matches!(refs[0].level, SegmentLevel::L1 { .. }));
+        assert_eq!(refs[1].level, SegmentLevel::L0);
+
+        let mut bad = l0_identity();
+        bad.object_size = 1;
+        let err = resolve_identities(&resolver, &[l0_identity(), bad], &accounting)
+            .await
+            .expect_err("the second identity is refused");
+        assert_mismatch(&err, &l0_key(), "object_size");
+    }
+
+    /// Counts the GETs in flight at its own `get` and keeps the peak. Each GET
+    /// yields before completing, so on a current-thread runtime every GET a
+    /// caller lets start overlaps every other one it lets start.
+    struct PeakGetStore {
+        inner: MemoryStore,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for PeakGetStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.gets.fetch_add(1, SeqCst);
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            let got = self.inner.get(key, range).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            got
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Record GETs draw from the GET limiter the resolver was built with, the
+    /// same process-wide one the data-object GETs use (ADR-1195), so
+    /// `RESOLVE_CONCURRENCY` never lets a slice put more record GETs in flight
+    /// than that limiter's permits. Eight pinned identities resolve under
+    /// limiters of 1 and 3 permits; the store's own peak in-flight count must
+    /// equal the permit count exactly, and every identity costs one GET.
+    #[tokio::test]
+    async fn record_gets_are_bounded_by_the_shared_get_limiter() {
+        for permits in [1usize, 3] {
+            let inner = MemoryStore::new();
+            inner
+                .put(
+                    &l0_key(),
+                    bytes::Bytes::from(l0_record().encode_to_vec()),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+            let store = Arc::new(PeakGetStore {
+                inner,
+                in_flight: Default::default(),
+                peak: Default::default(),
+                gets: Default::default(),
+            });
+            let resolver = ReconstructingSegmentResolver::new(
+                Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+                tenant(),
+                Signal::Metrics,
+                limiter(permits),
+            );
+            let identities = vec![l0_identity(); 8];
+            let accounting = QueryAccounting::new();
+            let refs = resolve_identities(&resolver, &identities, &accounting)
+                .await
+                .expect("every identity resolves");
+            assert_eq!(refs.len(), 8);
+            use std::sync::atomic::Ordering::SeqCst;
+            assert_eq!(store.gets.load(SeqCst), 8, "one record GET per identity");
+            assert_eq!(
+                store.peak.load(SeqCst),
+                permits,
+                "record GETs in flight must be capped at the limiter's {permits} permits"
+            );
+        }
+    }
+
+    /// A [`RecordGetObserver`] that keeps what it was handed, so a test can
+    /// assert the exact totals rather than that something was reported.
+    #[derive(Default)]
+    struct CapturedRecordGets {
+        calls: std::sync::atomic::AtomicU64,
+        requests: std::sync::atomic::AtomicU64,
+        bytes: std::sync::atomic::AtomicU64,
+    }
+
+    impl RecordGetObserver for CapturedRecordGets {
+        fn observe_record_gets(&self, requests: u64, bytes: u64) {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            self.requests.fetch_add(requests, SeqCst);
+            self.bytes.fetch_add(bytes, SeqCst);
+        }
+    }
+
+    impl CapturedRecordGets {
+        fn totals(&self) -> (u64, u64, u64) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (
+                self.calls.load(SeqCst),
+                self.requests.load(SeqCst),
+                self.bytes.load(SeqCst),
+            )
+        }
+    }
+
+    /// Resolve `identities` through a service wired to a fresh observer, and
+    /// return the observer's totals. The fetcher is never reached: a pinned
+    /// resolve happens before any data object is opened.
+    async fn observed_resolve(
+        store: Arc<dyn ObjectStoreBackend>,
+        identities: &[pb::SegmentIdentity],
+    ) -> (Vec<SegmentRef>, (u64, u64, u64)) {
+        let observer = Arc::new(CapturedRecordGets::default());
+        let service = SeriesFetchService::new(
+            SegmentFetcher::new(Arc::clone(&store)),
+            Arc::new(resolver(store)),
+        )
+        .with_record_get_observer(Arc::clone(&observer) as Arc<dyn RecordGetObserver>);
+        let segments = service
+            .resolve_pinned(identities)
+            .await
+            .unwrap_or_else(|failure| panic!("the pins resolve: {}", failure.message));
+        (segments, observer.totals())
+    }
+
+    /// One pinned L0 segment costs exactly one record GET, and the bytes
+    /// reported are exactly that commit record's encoded length: the counters
+    /// the worker exports are the store's real cost, not a per-segment
+    /// estimate.
+    #[tokio::test]
+    async fn an_l0_pin_reports_one_record_get_and_the_records_bytes() {
+        let encoded = l0_record().encode_to_vec();
+        let store = store_with(vec![(l0_key(), encoded.clone())]).await;
+        let (segments, (calls, requests, bytes)) = observed_resolve(store, &[l0_identity()]).await;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(calls, 1, "one resolve reports once");
+        assert_eq!(requests, 1, "an L0 pin GETs exactly its own commit record");
+        assert_eq!(
+            bytes,
+            encoded.len() as u64,
+            "the reported bytes are the commit record's encoded length"
+        );
+    }
+
+    /// An L1 part only a rewrite record describes costs exactly two record
+    /// GETs: the compaction key misses first. The reported bytes are the
+    /// rewrite record's alone, because the missed compaction key transferred
+    /// none, so the byte figure stays the bytes the store actually served
+    /// rather than a count of GETs issued.
+    #[tokio::test]
+    async fn a_rewrite_only_l1_pin_reports_two_record_gets_and_the_bytes_served() {
+        let record = rewrite_record();
+        let encoded = record.encode_to_vec();
+        let store = store_with(vec![(rewrite_key(&record), encoded.clone())]).await;
+        let input_set_hash: [u8; 32] = record
+            .input_set_hash
+            .as_slice()
+            .try_into()
+            .expect("32 bytes");
+        let identity = l1_identity(&input_set_hash, 1, 8193);
+        let (segments, (calls, requests, bytes)) = observed_resolve(store, &[identity]).await;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(calls, 1, "one resolve reports once");
+        assert_eq!(
+            requests, 2,
+            "the compaction key is GET first and misses, then the rewrite key"
+        );
+        assert_eq!(
+            bytes,
+            encoded.len() as u64,
+            "only the rewrite record's bytes crossed the wire"
+        );
+    }
+
+    /// A resolve that refuses partway still reports what the store served, so
+    /// a failing slice's record GETs are not lost from the worker's counters.
+    #[tokio::test]
+    async fn a_refused_resolve_still_reports_its_record_gets() {
+        let observer = Arc::new(CapturedRecordGets::default());
+        let store = store_with(Vec::new()).await;
+        let service = SeriesFetchService::new(
+            SegmentFetcher::new(Arc::clone(&store)),
+            Arc::new(resolver(store)),
+        )
+        .with_record_get_observer(Arc::clone(&observer) as Arc<dyn RecordGetObserver>);
+        let failure = service
+            .resolve_pinned(&[l0_identity()])
+            .await
+            .expect_err("a missing commit record refuses the slice");
+        assert_eq!(failure.code, pb::status::Code::Unsupported);
+        let (calls, requests, bytes) = observer.totals();
+        assert_eq!(calls, 1);
+        assert_eq!(requests, 1, "the missing record was still GET once");
+        assert_eq!(bytes, 0, "a miss transfers no bytes");
+    }
+
+    /// Resolve `identities` through a service, optionally marked as the
+    /// coordinator's own local attempt, and return the slice failure.
+    async fn refused_slice(
+        store: Arc<dyn ObjectStoreBackend>,
+        identity: &pb::SegmentIdentity,
+        local_attempt: bool,
+    ) -> SliceFailure {
+        let mut service = SeriesFetchService::new(
+            SegmentFetcher::new(Arc::clone(&store)),
+            Arc::new(resolver(store)),
+        );
+        if local_attempt {
+            service = service.with_local_attempt();
+        }
+        service
+            .resolve_pinned(std::slice::from_ref(identity))
+            .await
+            .expect_err("the resolve must refuse")
+    }
+
+    /// A store fault that makes every record GET fail retryably.
+    async fn store_with_throttled_l0() -> Arc<dyn ObjectStoreBackend> {
+        Arc::new(FaultStore::new(
+            store_with_l0().await,
+            FaultPlan::empty().with_rule(Rule::new(
+                Op::Get,
+                ScriptedFault::Throttled { retry_after_ms: 5 },
+            )),
+        ))
+    }
+
+    /// A retryable record GET is `UNAVAILABLE` on an inbound slice, which the
+    /// coordinator answers by re-dispatching that slice to another worker. On
+    /// the coordinator's OWN local attempt there is no other worker: that
+    /// status is terminal there, so the slice fails `SNAPSHOT_INVALIDATED`
+    /// instead and the coordinator re-resolves and retries once.
+    #[tokio::test]
+    async fn a_local_attempt_maps_a_retryable_record_get_to_snapshot_invalidated() {
+        let inbound = refused_slice(store_with_throttled_l0().await, &l0_identity(), false).await;
+        assert_eq!(
+            inbound.code,
+            pb::status::Code::Unavailable,
+            "{}",
+            inbound.message
+        );
+        let local = refused_slice(store_with_throttled_l0().await, &l0_identity(), true).await;
+        assert_eq!(
+            local.code,
+            pb::status::Code::SnapshotInvalidated,
+            "{}",
+            local.message
+        );
+        assert_eq!(
+            local.message, inbound.message,
+            "only the status moves; the reason is reported unchanged"
+        );
+    }
+
+    /// Exactly one status moves on a local attempt. A record that is simply
+    /// absent is not retryable at any worker, so it stays `UNSUPPORTED` and
+    /// the coordinator runs the whole query locally rather than re-resolving
+    /// a snapshot that was never the problem.
+    #[tokio::test]
+    async fn a_local_attempt_leaves_every_other_resolve_failure_alone() {
+        let missing = refused_slice(store_with(Vec::new()).await, &l0_identity(), true).await;
+        assert_eq!(
+            missing.code,
+            pb::status::Code::Unsupported,
+            "{}",
+            missing.message
+        );
+        let mut malformed = l0_identity();
+        malformed.level = 9;
+        let bad = refused_slice(store_with_l0().await, &malformed, true).await;
+        assert_eq!(bad.code, pb::status::Code::BadData, "{}", bad.message);
+    }
+
+    /// A snapshot resolver miss is retryable, not terminal: the coordinator
+    /// re-resolves once and re-dispatches.
+    #[tokio::test]
+    async fn a_snapshot_resolver_miss_is_snapshot_invalidated() {
+        let resolver = SnapshotSegmentResolver::new(std::iter::empty());
+        let err = resolver
+            .resolve(&l0_identity(), &QueryAccounting::new())
+            .await
+            .expect_err("an empty snapshot resolves nothing");
+        assert!(matches!(err, ResolveIdentityError::Unknown { .. }));
+        assert_eq!(err.status_code(), pb::status::Code::SnapshotInvalidated);
     }
 }

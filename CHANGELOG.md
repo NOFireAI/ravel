@@ -8,6 +8,51 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A distributed-query worker resolves each pinned segment from that segment's
+  own commit record instead of re-resolving its catalog** (issue #1721). Every
+  fragment request used to re-resolve the worker's catalog to map the
+  coordinator's pins back to segments, so a compaction committed between the
+  coordinator's resolve and the worker's fetch could invalidate the slice and
+  cost a full re-resolve and re-dispatch. The worker now rebuilds the key of
+  the pinned segment's own record from the identity the coordinator shipped
+  with the ADR-0010 key builders: the commit record for an L0 segment, and the
+  compaction record (or, when none exists, the erasure rewrite record) for a
+  compacted L1 segment. It GETs that one record, checks that the record's own
+  fields address the key it was read from, verifies the data-object key with
+  `verify_object_key` (or the L1 object-key reconstruction), and compares the
+  full 32-byte content hash, the object size, and for L1 the full input-set
+  hash and `part_index` against the identity. The segment ref it reads is
+  built from the verified record alone. A worker lists nothing and reads no
+  manifest on the intra-cluster fetch path; it issues one record GET per
+  pinned L0 segment, one per pinned L1 segment, and two for an L1 segment only
+  a rewrite record describes. Each record GET holds a permit of the worker's
+  process-wide GET limiter, the one its data-object GETs use. Record GETs are
+  not charged to the slice's accounting, so they count toward neither
+  `max_bytes_scanned` nor `max_s3_requests` on the worker or the coordinator,
+  and a query that fits its budget locally also fits it distributed; they are
+  also not in the query's reported cost, which the slice summary carries as
+  one pooled figure. Off the budget is not unreported: a worker exports the
+  totals as `ravel_distrib_fragment_record_get_requests_total` and
+  `ravel_distrib_fragment_record_get_bytes_total`, process-wide counters
+  beside the other `ravel_distrib_fragment_*` series, carrying only the
+  `mode` label. A record that is missing, unreadable, fails verification,
+  or disagrees with the identity fails the fragment with `UNSUPPORTED`, and the
+  coordinator runs the query locally; a malformed identity is `BAD_DATA`. A
+  throttled, timed-out or transient error on the record GET fails an inbound
+  fragment with `UNAVAILABLE`, and the coordinator re-dispatches that slice to
+  another worker. On a slice the coordinator runs itself there is no other
+  worker to re-dispatch to and `UNAVAILABLE` would be terminal, so that same
+  failure fails the slice `SNAPSHOT_INVALIDATED` instead and the coordinator
+  re-resolves and retries once, keeping the recovery the catalog re-resolve
+  had. That covers both local arms: a self-mapped or unroutable slice, which
+  is dispatched straight to local execution with no remote attempt at all, and
+  the fallback after a remote worker and its one re-dispatch both failed. Only
+  the resolve phase moves; a fetch-phase `UNAVAILABLE` still means the segment
+  reads themselves are failing and stays terminal.
+  Records and the objects they name are immutable, so the pinned read is
+  unaffected by whatever the catalog says by then. The queryfrag wire and
+  `PROTOCOL_VERSION` are unchanged, and cross-cluster federation is unchanged:
+  a resolve-scope request still resolves the remote cluster's own snapshot.
 - **A scrub tick's request count follows its budget, not the corpus size**
   (issue #1686, ADR-1686). Each content-tier tick used to LIST a shard's whole
   commit prefix and GET every record in it before verifying its slice. It now

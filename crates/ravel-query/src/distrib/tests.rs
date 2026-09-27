@@ -52,8 +52,8 @@ use crate::distrib::federation::{Federation, RemoteCluster};
 use crate::distrib::partition::DistribThresholds;
 use crate::distrib::proto::series_fetch_server::SeriesFetch;
 use crate::distrib::{
-    log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver, span_cmp,
-    span_order_key,
+    log_record_order_key, service::ReconstructingSegmentResolver, service::SeriesFetchService,
+    service::SnapshotSegmentResolver, span_cmp, span_order_key,
 };
 use crate::engine::merge_soa_runs;
 use crate::erasure::ErasurePredicate;
@@ -1336,6 +1336,175 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
         assert!(
             accounting.snapshot().total_s3_bytes() >= 10_000,
             "the folded spend must survive on the live accounting handle"
+        );
+    });
+}
+
+// --- pinned-record GETs and the byte budget (issue #1721) ------------------
+
+/// Moves the object `seg` was written at to the ADR-0010 data key its identity
+/// reconstructs and PUTs its commit record at the commit key, so a
+/// [`ReconstructingSegmentResolver`] can resolve it. Returns the ref at its new
+/// key and the encoded record's length.
+async fn commit_segment(store: &MemoryStore, seg: SegmentRef) -> (SegmentRef, u64) {
+    let record = ravel_commit::record::build(ravel_commit::record::NewCommitRecord {
+        tenant_hash: TENANT,
+        signal: Signal::Metrics,
+        shard: seg.shard,
+        writer_id: seg.writer_id,
+        writer_epoch: seg.writer_epoch,
+        writer_seq: seg.writer_seq,
+        object_size: seg.object_size,
+        content_hash: seg.content_hash,
+        sample_count: seg.sample_count,
+        series_count: seg.series_count,
+        min_event_ts_ns: seg.min_event_ts_ns,
+        max_event_ts_ns: seg.max_event_ts_ns,
+        min_ingest_ts_ns: 0,
+        max_ingest_ts_ns: 0,
+        segment_format_version: seg.segment_format_version,
+        created_unix_ns: seg.created_unix_ns,
+        ingest_hour_bucket: seg.ingest_hour_bucket,
+    })
+    .expect("valid commit record");
+    let object = store
+        .get(&seg.data_object_key, ravel_object_store::GetRange::Full)
+        .await
+        .expect("read segment")
+        .data;
+    store
+        .delete(&seg.data_object_key)
+        .await
+        .expect("delete old key");
+    store
+        .put(&record.object_key, object, PutOptions::default())
+        .await
+        .expect("put segment at its data key");
+    let encoded = prost::Message::encode_to_vec(&record);
+    let record_len = encoded.len() as u64;
+    let commit_key = ravel_commit::keys::commit_key_for_record(&record).expect("commit key");
+    store
+        .put(&commit_key, Bytes::from(encoded), PutOptions::default())
+        .await
+        .expect("put commit record");
+    let seg = SegmentRef {
+        data_object_key: record.object_key.clone(),
+        ..seg
+    };
+    (seg, record_len)
+}
+
+/// Starts a real `tonic` metrics worker whose resolver reads each pinned
+/// segment's own commit record, as the production fragment service does.
+async fn spawn_record_worker(store: Arc<MemoryStore>) -> (RemoteSliceFetcher, JoinHandle<()>) {
+    let store: Arc<dyn ObjectStoreBackend> = store;
+    let limiter = Arc::new(crate::GetLimiter::new(8).expect("nonzero permits"));
+    let resolver = Arc::new(ReconstructingSegmentResolver::new(
+        Arc::clone(&store),
+        TENANT,
+        Signal::Metrics,
+        Arc::clone(&limiter),
+    ));
+    let fetcher = SegmentFetcher::new(store).with_get_limiter(limiter);
+    let service = SeriesFetchService::new(fetcher, resolver).into_server();
+    let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+    let addr = incoming.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .expect("serve");
+    });
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    (RemoteSliceFetcher::new(channel), handle)
+}
+
+/// ADR-0071: distribution changes where bytes are fetched, never what a query
+/// computes, so a query whose data bytes fit `max_bytes_scanned` exactly must
+/// succeed distributed as it does locally, although every pinned segment
+/// costs its worker one commit-record GET the local path never issues. The
+/// budget is set to the local path's exact byte figure over two segments on
+/// two shards; the distributed fetch must succeed, and the query's folded
+/// cost must equal the local cost exactly, so the record GETs are neither
+/// charged to the budget nor counted in the pooled data cost.
+///
+/// Fails before the fix: the worker charged its record GETs to the slice, so
+/// the first completed segment pushed the slice over the exact budget and the
+/// query failed `TooManyBytesScanned`.
+#[test]
+fn record_gets_do_not_count_toward_the_byte_budget() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        let mut record_bytes = 0;
+        for shard in 0..2u32 {
+            let seg = write_segment(
+                &store,
+                u64::from(shard),
+                shard,
+                100,
+                &[SeriesDesc {
+                    metric: format!("m{shard}"),
+                    samples: vec![(NS, 1.0f64.to_bits()), (2 * NS, 2.0f64.to_bits())],
+                }],
+            )
+            .await;
+            let (seg, len) = commit_segment(&store, seg).await;
+            record_bytes += len;
+            segments.push(seg);
+        }
+        let snapshot = Snapshot {
+            segments,
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let (local_runs, local_acct, _stats) = local_scalar(Arc::clone(&store), &snapshot).await;
+        let data_bytes = local_acct.total_s3_bytes();
+        assert!(record_bytes > 0, "the fixture must need record GETs");
+
+        let (fetcher, server) = spawn_record_worker(Arc::clone(&store)).await;
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 2,
+            },
+        );
+        let config = EngineConfig {
+            max_bytes_scanned: crate::config::ByteLimit::Bounded(data_bytes),
+            ..EngineConfig::default()
+        };
+        let accounting = QueryAccounting::new();
+        let result = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &config,
+                i64::MAX,
+                None,
+            )
+            .await;
+        server.abort();
+        let triple = result
+            .expect("a query inside its data budget succeeds distributed")
+            .expect("distributed produced a result (not a fallback)")
+            .0;
+        let local = merge_soa_runs(local_runs, usize::MAX, usize::MAX).expect("local merge");
+        let dist = merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("dist merge");
+        assert_series_bit_identical(&local, &dist);
+        assert_eq!(
+            accounting.snapshot(),
+            local_acct,
+            "the distributed data cost must equal the local cost exactly"
         );
     });
 }

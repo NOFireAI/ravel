@@ -10,12 +10,14 @@
 //!   [`AdmissionClasses`] (`Pinned` or `Resolve`, selected by request scope;
 //!   never the client-query cap), so a federation-heavy peer cluster queuing
 //!   on the `Resolve` class can never delay this cluster's own intra-cluster
-//!   `Pinned` slices. Per request it
-//!   resolves a snapshot for the request's tenant over the request's event-time
-//!   window, builds an interim content-hash
-//!   [`SnapshotSegmentResolver`], and delegates to the in-crate
-//!   [`SeriesFetchService`] so a fragment fetch is byte-identical to what the
-//!   local path would read.
+//!   `Pinned` slices. An intra-cluster pinned slice rebuilds each segment's
+//!   own commit (or compaction) record key from the shipped identity and GETs
+//!   and verifies that one record ([`ReconstructingSegmentResolver`]); it
+//!   lists nothing and reads no manifest;
+//!   only a cross-cluster resolve scope resolves a snapshot here, over which it
+//!   builds a [`SnapshotSegmentResolver`]. Either way it delegates to the
+//!   in-crate [`SeriesFetchService`] so a fragment fetch is byte-identical to
+//!   what the local path would read.
 //! * [`RoutingSliceFetcher`] -- the coordinator side. It implements the
 //!   [`SliceFetcher`] seam the engine dispatches each slice through. It
 //!   rendezvous-maps a slice's `(tenant_hash, signal, shard)` unit onto the live
@@ -77,7 +79,9 @@ use ravel_query::distrib::client::{
 use ravel_query::distrib::codec;
 use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
-use ravel_query::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
+use ravel_query::distrib::service::{
+    ReconstructingSegmentResolver, SegmentResolver, SeriesFetchService, SnapshotSegmentResolver,
+};
 use ravel_query::http::TenantResolver;
 use ravel_types::accounting::QueryAccountingSnapshot;
 use ravel_types::{Signal, TenantHash, TimeRange};
@@ -221,6 +225,17 @@ pub struct FragmentMetrics {
     /// `class` label; a class queuing does not mean it rejected anything (this
     /// admission never rejects), only that a caller waited for a permit.
     fragment_admission_waits_total: [AtomicU64; 2],
+    /// Record GETs this worker's pinned resolves issued (ADR-0071
+    /// pinned-record amendment decision 5, and the record-GET counter
+    /// amendment): one per pinned L0 segment, one per pinned L1 part, two for
+    /// an L1 part only a rewrite record describes. Deliberately outside the
+    /// query's accounting and absent from the slice summary, so this counter
+    /// is the only place the resolve phase's request cost is reported.
+    fragment_record_get_requests_total: AtomicU64,
+    /// Bytes those record GETs transferred. Wire bytes as the store served
+    /// them: a GET that missed transferred none, so a rewrite-only L1 part
+    /// adds two requests and one record's bytes.
+    fragment_record_get_bytes_total: AtomicU64,
     /// Slices this coordinator executed locally (self-mapped, no network hop).
     slices_local_total: AtomicU64,
     /// Slices this coordinator dispatched to a remote worker successfully.
@@ -262,6 +277,8 @@ impl Default for FragmentMetrics {
             fragment_capability_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_inflight: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_admission_waits_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            fragment_record_get_requests_total: AtomicU64::new(0),
+            fragment_record_get_bytes_total: AtomicU64::new(0),
             slices_local_total: AtomicU64::new(0),
             slices_remote_total: AtomicU64::new(0),
             slices_redispatched_total: AtomicU64::new(0),
@@ -272,6 +289,20 @@ impl Default for FragmentMetrics {
             quarantine_readmits_total: AtomicU64::new(0),
             quarantine_current: AtomicU64::new(0),
         }
+    }
+}
+
+/// One pinned resolve's record GETs, reported by the in-crate worker service
+/// (ADR-0071 record-GET counter amendment). The slice summary cannot carry
+/// them without a `queryfrag` field, so this process-global pair is where they
+/// surface; the totals are per process, not per query, and carry no tenant
+/// label, exactly like the fragment counters beside them.
+impl ravel_query::distrib::service::RecordGetObserver for FragmentMetrics {
+    fn observe_record_gets(&self, requests: u64, bytes: u64) {
+        self.fragment_record_get_requests_total
+            .fetch_add(requests, Ordering::Relaxed);
+        self.fragment_record_get_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -398,6 +429,17 @@ impl FragmentMetrics {
     /// per class under the `class` label.
     pub fn fragment_admission_waits_by_class(&self) -> [(AdmissionClass, u64); 2] {
         AdmissionClass::ALL.map(|class| (class, self.fragment_admission_waits_total(class)))
+    }
+
+    /// Record GETs this process's pinned resolves have issued.
+    pub fn fragment_record_get_requests_total(&self) -> u64 {
+        self.fragment_record_get_requests_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// Bytes those record GETs transferred.
+    pub fn fragment_record_get_bytes_total(&self) -> u64 {
+        self.fragment_record_get_bytes_total.load(Ordering::Relaxed)
     }
 
     pub fn slices_local_total(&self) -> u64 {
@@ -856,53 +898,46 @@ impl FragmentService {
             .inspect_err(|_| self.inner.metrics.record_fragment_auth_failure())
     }
 
-    /// Build the interim content-hash resolver for one request by resolving a
-    /// snapshot for the request's tenant and metrics signal over the request's
-    /// event-time window.
+    /// Build the resolver for one intra-cluster pinned request.
     ///
-    /// The coordinator carries the event-time envelope of the slice's pinned
-    /// segments in `window_start_ns`/`window_end_ns` (see
-    /// [`ravel_query::distrib`]'s `slice_event_window`). That envelope contains
-    /// every pinned segment's own event range, so a resolve bounded to it still
-    /// returns every pinned segment (a `Catalog::resolve` over a window returns
-    /// every segment whose events overlap it): the resolved snapshot stays a
-    /// superset of the dispatched pins, and the fetch reads exactly the pinned
-    /// segments (byte-identical to the local path), while no longer paying a
-    /// whole-history catalog resolve on the query critical path. A tenant we
-    /// cannot decode, or a signal other than metrics, yields an empty resolver:
-    /// the delegate service then returns the same typed status
-    /// (`BadData`/`Unsupported`) it would for any such request, which the
-    /// coordinator handles.
-    async fn build_resolver(&self, request: &pb::FetchRequest) -> Arc<SnapshotSegmentResolver> {
-        let Some(tenant_hash) = decode_tenant_hash(&request.tenant_hash) else {
-            return Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
-        };
+    /// ADR-0071 is reconstruct-don't-trust: the coordinator ships each pinned
+    /// segment's durable identity, and the worker rebuilds the key of that
+    /// segment's own commit record (or, for an L1 part, compaction record) from
+    /// the identity with `ravel_commit::keys`, GETs it, verifies it, and builds
+    /// the segment ref from the verified record alone. No listing and no
+    /// manifest is read on this path, so a compaction committed between the
+    /// coordinator's resolve and this fetch cannot change which objects are
+    /// read: records and the objects they name are immutable, and the
+    /// coordinator's pins name them directly. A record that is missing, fails
+    /// verification, or disagrees with the identity fails the slice as
+    /// `Unsupported`, and the coordinator runs the query locally; a retryable
+    /// store error on the record GET fails an inbound fetch as `Unavailable`,
+    /// and the coordinator re-dispatches that slice, or fails the
+    /// coordinator's own local attempt as `SnapshotInvalidated`, which is one
+    /// re-resolve and retry (see [`FragmentService::run_local`]). Record GETs
+    /// draw from this process's GET limiter.
+    ///
+    /// Returns `None` for a tenant hash we cannot decode or a signal other than
+    /// metrics. The delegate service rejects both with the same typed status
+    /// (`BadData`/`Unsupported`) before it ever consults a resolver, so the
+    /// caller's stand-in is never asked to resolve anything.
+    fn build_resolver(
+        &self,
+        request: &pb::FetchRequest,
+    ) -> Option<Arc<ReconstructingSegmentResolver>> {
+        let tenant_hash = decode_tenant_hash(&request.tenant_hash)?;
         // Only metrics are distributed; for any other signal the delegate
-        // returns Unsupported regardless of the resolver, so skip the resolve.
-        if codec::signal_from_u32(request.signal) != Ok(Signal::Metrics) {
-            return Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
+        // returns Unsupported regardless of the resolver.
+        let signal = codec::signal_from_u32(request.signal).ok()?;
+        if signal != Signal::Metrics {
+            return None;
         }
-        let window = TimeRange {
-            start_ns: request.window_start_ns,
-            end_ns: request.window_end_ns,
-        };
-        let now_ns = self.inner.clock.now_ns();
-        match self
-            .inner
-            .catalog
-            .resolve(&tenant_hash, Signal::Metrics, window, &[], now_ns)
-            .await
-        {
-            Ok(snapshot) => Arc::new(SnapshotSegmentResolver::new(snapshot.segments)),
-            // A resolve failure leaves an empty resolver: the delegate maps the
-            // unknown pinned segments to SnapshotInvalidated, and the
-            // coordinator re-resolves and retries once, the same recovery a
-            // genuinely vanished segment takes.
-            Err(err) => {
-                tracing::warn!(error = %err, "fragment snapshot resolve failed; returning empty resolver");
-                Arc::new(SnapshotSegmentResolver::new(std::iter::empty()))
-            }
-        }
+        Some(Arc::new(ReconstructingSegmentResolver::new(
+            self.inner.store.clone(),
+            tenant_hash,
+            signal,
+            self.inner.get_limiter.clone(),
+        )))
     }
 
     /// Rewrite a cross-cluster resolve-scope request into a pinned one over this
@@ -982,18 +1017,52 @@ impl FragmentService {
     /// Resolve the request's snapshot and run the slice through the in-crate
     /// [`SeriesFetchService`], collecting its frames. Shared by the gRPC handler
     /// (after auth and admission) and the coordinator's no-hop local path.
-    async fn resolve_and_run(&self, request: pb::FetchRequest) -> Vec<pb::FetchResponse> {
+    ///
+    /// `local_attempt` says which of those two callers this is. It is set only
+    /// by [`run_local`](Self::run_local), and only changes the status a
+    /// retryable record GET fails with (see
+    /// [`SeriesFetchService::with_local_attempt`]).
+    async fn resolve_and_run(
+        &self,
+        request: pb::FetchRequest,
+        local_attempt: bool,
+    ) -> Vec<pb::FetchResponse> {
         // A cross-cluster resolve scope is rewritten to a pinned scope over this
-        // cluster's own snapshot; a pinned scope (intra-cluster) uses the
-        // full-window content-hash resolver unchanged.
-        let federated = matches!(request.scope, Some(pb::fetch_request::Scope::Resolve(_)));
-        let (request, resolver) = match &request.scope {
-            Some(pb::fetch_request::Scope::Resolve(_)) => self.resolve_scope(request).await,
-            _ => {
-                let resolver = self.build_resolver(&request).await;
-                (request, resolver)
+        // cluster's own snapshot, and keeps the snapshot resolver that rewrite
+        // built. An intra-cluster pinned scope reads each pinned segment's own
+        // record at the key reconstructed from the shipped identity, and lists
+        // nothing.
+        match &request.scope {
+            Some(pb::fetch_request::Scope::Resolve(_)) => {
+                let (request, resolver) = self.resolve_scope(request).await;
+                self.run_slice(request, resolver, true, local_attempt).await
             }
-        };
+            _ => match self.build_resolver(&request) {
+                Some(resolver) => {
+                    self.run_slice(request, resolver, false, local_attempt)
+                        .await
+                }
+                // The delegate refuses an undecodable tenant hash or a
+                // non-metrics signal with a typed status before any resolver
+                // call, so this stand-in is never consulted.
+                None => {
+                    let resolver = Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
+                    self.run_slice(request, resolver, false, local_attempt)
+                        .await
+                }
+            },
+        }
+    }
+
+    /// Run one slice through the in-crate [`SeriesFetchService`] with the
+    /// resolver its scope selected, collecting the response frames.
+    async fn run_slice<R: SegmentResolver + 'static>(
+        &self,
+        request: pb::FetchRequest,
+        resolver: Arc<R>,
+        federated: bool,
+        local_attempt: bool,
+    ) -> Vec<pb::FetchResponse> {
         let mut fetcher = SegmentFetcher::new(self.inner.store.clone())
             .with_get_limiter(self.inner.get_limiter.clone())
             .with_memory_budget(self.memory_budget.clone());
@@ -1006,10 +1075,17 @@ impl FragmentService {
         // its scope into a pinned one over the LOCAL snapshot, so the service
         // can no longer tell where the request came from, and the requesting
         // coordinator folds this cluster's whole answer as one lump.
-        let mut service =
-            SeriesFetchService::new(fetcher, resolver).with_engine_config(self.engine);
+        // The resolve phase's record GETs are off the query's budget and off
+        // the wire, so this process's own counters are where they are
+        // reported (ADR-0071 record-GET counter amendment).
+        let mut service = SeriesFetchService::new(fetcher, resolver)
+            .with_engine_config(self.engine)
+            .with_record_get_observer(self.inner.metrics.clone());
         if federated {
             service = service.with_resolve_scope();
+        }
+        if local_attempt {
+            service = service.with_local_attempt();
         }
         match service.fetch(tonic::Request::new(request)).await {
             Ok(response) => {
@@ -1042,8 +1118,15 @@ impl FragmentService {
     /// [`SliceResponse`] a remote fetch would. Skips token auth and fragment
     /// admission: this is the coordinator's own work under its client-query
     /// permit, not an inbound request from another coordinator.
+    ///
+    /// This is the only caller that runs the slice as a local attempt, so a
+    /// retryable record GET here fails `SnapshotInvalidated` (one re-resolve
+    /// and retry) rather than `Unavailable` (terminal, since there is no
+    /// worker left to re-dispatch to). Both of `dispatch`'s local arms reach
+    /// it: the self-mapped or unroutable slice, and the fallback after the
+    /// remote ladder is exhausted.
     async fn run_local(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
-        let frames = self.resolve_and_run(request).await;
+        let frames = self.resolve_and_run(request, true).await;
         decode_slice_frames(frames)
     }
 }
@@ -1110,7 +1193,10 @@ impl SeriesFetch for FragmentService {
             return Err(tonic::Status::unavailable("fragment admission unavailable"));
         };
         self.inner.metrics.record_fragment_request();
-        let frames = self.resolve_and_run(inner).await;
+        // An inbound request, not a local attempt: this coordinator can still
+        // re-dispatch the slice elsewhere, so a retryable record GET stays
+        // `Unavailable`.
+        let frames = self.resolve_and_run(inner, false).await;
         // The permit (and its in-flight gauge decrement) is held across the
         // eager fetch above, the whole admission window, then released here
         // before the already-built frames replay as a stream.
@@ -3965,9 +4051,8 @@ mod tests {
             .expect("one published segment")
     }
 
-    /// The whole timestamp domain, wider than the event-time window a worker
-    /// resolves over. Used here only as the test oracle
-    /// (a full-window resolve) and to name a disjoint window.
+    /// The whole timestamp domain, used by the test oracle's own catalog
+    /// resolve so it sees every published segment.
     const FULL: TimeRange = TimeRange {
         start_ns: i64::MIN,
         end_ns: i64::MAX,
@@ -3993,15 +4078,21 @@ mod tests {
         }
     }
 
-    /// The worker resolves its content-hash resolver over the request's window,
-    /// not the whole history: a window disjoint from a pinned segment's event
-    /// range bounds the resolve away from it, so the pin no longer resolves and
-    /// the slice reports `SnapshotInvalidated`. A covering window (the segment's
-    /// own event envelope, what the coordinator ships) still finds it. Under the
-    /// old whole-history resolve the disjoint window would have found the segment
-    /// too, so this proves the resolve is bounded to the query window.
+    /// A pinned slice reads what the identity names, whatever the request window
+    /// says. The worker builds each ref from the pinned segment's own verified
+    /// record and resolves no snapshot, so a window entirely disjoint from the pinned
+    /// segment's event range returns the same rows as the segment's own
+    /// envelope. Under the resolve this replaced, the disjoint window bounded
+    /// the catalog resolve away from the pin and the slice reported
+    /// `SnapshotInvalidated` with zero series.
+    ///
+    /// Flip-line proof: make [`FragmentService::build_resolver`] return a
+    /// [`SnapshotSegmentResolver`] over a `catalog.resolve` bounded to
+    /// `request.window_start_ns..request.window_end_ns` again. The disjoint run
+    /// then reports `SnapshotInvalidated` and its `series_returned` is 0, so
+    /// both assertions below fail.
     #[tokio::test]
-    async fn windowed_resolve_is_bounded_to_the_request_window() {
+    async fn pinned_slice_is_independent_of_the_request_window() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = ravel_types::TenantId::new("windowed-tenant".to_string());
         publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
@@ -4009,7 +4100,7 @@ mod tests {
         let seg = only_segment(&store, tenant.hash(), now).await;
         let service = pinned_service(store, now);
 
-        // Covering window = the segment's own event envelope: the pin resolves.
+        // The segment's own event envelope, which is what the coordinator ships.
         let envelope = TimeRange {
             start_ns: seg.min_event_ts_ns,
             end_ns: seg.max_event_ts_ns,
@@ -4021,35 +4112,38 @@ mod tests {
         assert_eq!(covering.status, pb::status::Code::Ok);
         assert_eq!(covering.series_returned, 1);
 
-        // A window entirely after the segment's event range: the resolve is
-        // bounded away from it, so the pin is not found.
+        // A window entirely after the segment's event range.
         let disjoint = TimeRange {
             start_ns: 3 * HOUR_NS,
             end_ns: 4 * HOUR_NS,
         };
-        let missed = service
+        let outside = service
             .run_local(pinned_over_window(tenant.hash(), &seg, disjoint))
             .await
             .expect("local run");
         assert_eq!(
-            missed.status,
-            pb::status::Code::SnapshotInvalidated,
-            "a window disjoint from the pin bounds the resolve away from it"
+            outside.status,
+            pb::status::Code::Ok,
+            "a window disjoint from the pin no longer bounds anything away from it"
+        );
+        assert_eq!(
+            outside.series_returned, covering.series_returned,
+            "the pin names the object, so the window cannot change what is read"
         );
     }
 
-    /// The narrowed windowed resolve loses no pinned segment: a slice over the
-    /// segment's event envelope returns byte-identical rows to the same slice
-    /// resolved over the whole history.
+    /// The window-independence of [`pinned_slice_is_independent_of_the_request_window`]
+    /// down to the rows: the same pin fetched under a window disjoint from the
+    /// segment's events returns byte-identical samples to the same pin fetched
+    /// under the segment's own envelope.
     ///
-    /// Flip-line proof: in [`FragmentService::build_resolver`], narrow the
-    /// `window` passed to `catalog.resolve(..)` so it drops the pin -- e.g.
-    /// change `end_ns: request.window_end_ns` to
-    /// `end_ns: request.window_start_ns.saturating_sub(1)`. The windowed run then
-    /// resolves to `SnapshotInvalidated` with zero rows while the full-window
-    /// oracle still returns the sample, so the row assertions below fail.
+    /// Flip-line proof: make [`FragmentService::build_resolver`] return a
+    /// [`SnapshotSegmentResolver`] over a `catalog.resolve` bounded to
+    /// `request.window_start_ns..request.window_end_ns` again. The disjoint run
+    /// then resolves nothing, reports `SnapshotInvalidated` with an empty
+    /// `scalar`, and every assertion below fails.
     #[tokio::test]
-    async fn windowed_fragment_returns_same_rows_as_full_window() {
+    async fn pinned_fragment_returns_same_rows_under_a_disjoint_window() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = ravel_types::TenantId::new("same-rows-tenant".to_string());
         publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
@@ -4064,24 +4158,688 @@ mod tests {
         let windowed = service
             .run_local(pinned_over_window(tenant.hash(), &seg, envelope))
             .await
-            .expect("windowed local run");
-        let full = service
-            .run_local(pinned_over_window(tenant.hash(), &seg, FULL))
+            .expect("envelope local run");
+        let disjoint = TimeRange {
+            start_ns: 3 * HOUR_NS,
+            end_ns: 4 * HOUR_NS,
+        };
+        let outside = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, disjoint))
             .await
-            .expect("full-window local run");
+            .expect("disjoint-window local run");
 
         assert_eq!(windowed.status, pb::status::Code::Ok);
-        assert_eq!(full.status, pb::status::Code::Ok);
-        assert_eq!(windowed.series_returned, full.series_returned);
-        assert_eq!(windowed.samples_returned, full.samples_returned);
-        assert_eq!(windowed.scalar.len(), full.scalar.len());
-        for (w, f) in windowed.scalar.iter().zip(full.scalar.iter()) {
+        assert_eq!(outside.status, pb::status::Code::Ok);
+        assert_eq!(windowed.series_returned, outside.series_returned);
+        assert_eq!(windowed.samples_returned, outside.samples_returned);
+        assert_eq!(windowed.scalar.len(), outside.scalar.len());
+        assert!(
+            !windowed.scalar.is_empty(),
+            "both runs must return rows for the comparison to mean anything"
+        );
+        for (w, f) in windowed.scalar.iter().zip(outside.scalar.iter()) {
             assert_eq!(w.series_id, f.series_id, "series id differs");
             assert_eq!(w.timestamps, f.timestamps, "timestamps differ");
             let wb: Vec<u64> = w.values.iter().map(|v| v.to_bits()).collect();
             let fb: Vec<u64> = f.values.iter().map(|v| v.to_bits()).collect();
             assert_eq!(wb, fb, "value bit patterns differ");
         }
+    }
+
+    // --- Pinned identity verified against the durable record (ADR-0071) -----
+
+    /// The commit-record key of the one segment [`publish_metric`] writes.
+    fn published_commit_key(tenant_hash: TenantHash) -> String {
+        ravel_commit::keys::commit_key(
+            &tenant_hash,
+            Signal::Metrics,
+            0,
+            0,
+            uuid::Uuid::from_u128(2_000),
+            1,
+            1,
+        )
+        .expect("commit key")
+    }
+
+    async fn read_object(store: &Arc<dyn ObjectStoreBackend>, key: &str) -> bytes::Bytes {
+        store
+            .get(key, ravel_object_store::GetRange::Full)
+            .await
+            .expect("object present")
+            .data
+    }
+
+    async fn overwrite(store: &Arc<dyn ObjectStoreBackend>, key: &str, data: Vec<u8>) {
+        store
+            .put(
+                key,
+                bytes::Bytes::from(data),
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .expect("overwrite object");
+    }
+
+    /// Publish one L0 segment and return the service plus the pinned request for
+    /// it, as the coordinator would ship it.
+    async fn pinned_l0(
+        name: &str,
+    ) -> (
+        Arc<dyn ObjectStoreBackend>,
+        TenantHash,
+        ravel_catalog::SegmentRef,
+        FragmentService,
+    ) {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new(name.to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let service = pinned_service(store.clone(), now);
+        (store, tenant.hash(), seg, service)
+    }
+
+    /// The worker's resolver, fed the identity the coordinator would ship for
+    /// `seg`, returns the catalog's own ref field for field, after exactly one
+    /// record GET.
+    async fn assert_worker_ref_is_the_catalogs(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        seg: &ravel_catalog::SegmentRef,
+    ) {
+        let accounting = ravel_types::accounting::QueryAccounting::new();
+        let resolved = ReconstructingSegmentResolver::new(
+            store.clone(),
+            tenant_hash,
+            Signal::Metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        )
+        .resolve(&codec::encode_segment_identity(seg), &accounting)
+        .await
+        .expect("the pin resolves");
+        assert_eq!(&resolved, seg);
+        assert_eq!(
+            accounting
+                .snapshot()
+                .s3_requests(ravel_types::accounting::AccountedOp::Get),
+            1
+        );
+    }
+
+    fn envelope(seg: &ravel_catalog::SegmentRef) -> TimeRange {
+        TimeRange {
+            start_ns: seg.min_event_ts_ns,
+            end_ns: seg.max_event_ts_ns,
+        }
+    }
+
+    /// Assert a slice failed closed onto the coordinator's local fallback: the
+    /// `Unsupported` status the coordinator answers by running the whole query
+    /// locally, with no rows.
+    fn assert_local_fallback(response: &SliceResponse, why: &str) {
+        assert_eq!(
+            response.status,
+            pb::status::Code::Unsupported,
+            "{why}: {}",
+            response.status_message
+        );
+        assert_eq!(response.series_returned, 0, "{why}: no rows");
+        assert!(response.scalar.is_empty(), "{why}: no frames");
+    }
+
+    /// A [`FragmentService`] over `store` on the pinned path, built with the
+    /// caller's own `metrics` and GET limiter so a test can read either back.
+    fn pinned_service_with(
+        store: Arc<dyn ObjectStoreBackend>,
+        now_ns: i64,
+        metrics: Arc<FragmentMetrics>,
+        get_limiter: Arc<ravel_query::GetLimiter>,
+    ) -> FragmentService {
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        FragmentService::new(
+            test_keys(),
+            empty_resolver(),
+            AdmissionClasses::new(8, 8, metrics.clone()),
+            catalog,
+            store,
+            None,
+            Arc::new(FixedClock(now_ns)),
+            metrics,
+            get_limiter,
+        )
+    }
+
+    /// A pinned L0 slice's one record GET reaches this process's fragment
+    /// counters, with exact values: one request, and the commit record's own
+    /// encoded length in bytes (ADR-0071 record-GET counter amendment). The
+    /// GET is charged to no query, so these counters are the only report of
+    /// it; a resolve that reported nothing leaves both at zero.
+    #[tokio::test]
+    async fn a_pinned_l0_slice_reports_its_record_get_to_the_fragment_counters() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("record-get-counters".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let record_bytes = read_object(&store, &published_commit_key(tenant.hash()))
+            .await
+            .len() as u64;
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = pinned_service_with(
+            store,
+            now,
+            metrics.clone(),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        );
+
+        let response = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "{}",
+            response.status_message
+        );
+        assert_eq!(
+            metrics.fragment_record_get_requests_total(),
+            1,
+            "one pinned L0 segment costs exactly one record GET"
+        );
+        assert_eq!(
+            metrics.fragment_record_get_bytes_total(),
+            record_bytes,
+            "the bytes counter is the commit record's own encoded length"
+        );
+        assert!(
+            record_bytes > 0,
+            "a zero-length record would make the byte assertion vacuous"
+        );
+    }
+
+    /// Records the shared limiter's available permits at the instant a record
+    /// GET is in flight, so a test can prove the resolver drew from it.
+    struct LimiterProbeStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        limiter: Arc<ravel_query::GetLimiter>,
+        available_during_record_get: AtomicU64,
+        record_gets: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for LimiterProbeStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            if key.ends_with(".cmt") {
+                self.record_gets.fetch_add(1, Ordering::SeqCst);
+                self.available_during_record_get
+                    .store(self.limiter.available_permits() as u64, Ordering::SeqCst);
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// `build_resolver` hands the resolver this process's GET limiter, not a
+    /// private one (ADR-1195). The service is built with a single-permit
+    /// limiter, and the probe reads that limiter's available permits from
+    /// inside the record GET: zero, because the in-flight GET is holding the
+    /// only one. A resolver given a limiter of its own leaves the service's
+    /// untouched and the probe reads one.
+    #[tokio::test]
+    async fn record_gets_hold_a_permit_of_the_services_own_get_limiter() {
+        let backing: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("shared-limiter".to_string());
+        publish_metric(backing.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&backing, tenant.hash(), now).await;
+        let limiter = Arc::new(ravel_query::GetLimiter::new(1).expect("nonzero permits"));
+        let probe = Arc::new(LimiterProbeStore {
+            inner: Arc::clone(&backing),
+            limiter: Arc::clone(&limiter),
+            available_during_record_get: AtomicU64::new(u64::MAX),
+            record_gets: AtomicU64::new(0),
+        });
+        let service = pinned_service_with(
+            Arc::clone(&probe) as Arc<dyn ObjectStoreBackend>,
+            now,
+            Arc::new(FragmentMetrics::new()),
+            Arc::clone(&limiter),
+        );
+
+        let response = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "{}",
+            response.status_message
+        );
+        assert_eq!(
+            probe.record_gets.load(Ordering::SeqCst),
+            1,
+            "the pinned L0 segment's commit record is read exactly once"
+        );
+        assert_eq!(
+            probe.available_during_record_get.load(Ordering::SeqCst),
+            0,
+            "the in-flight record GET must hold the service's only permit; a \
+             private limiter would leave it at 1"
+        );
+        assert_eq!(
+            limiter.available_permits(),
+            1,
+            "the permit is released when the record GET completes"
+        );
+    }
+
+    /// The happy path the rejection tests below perturb: an untouched L0 pin
+    /// resolves through its commit record, after exactly one record GET, and
+    /// returns the segment's one series.
+    #[tokio::test]
+    async fn pinned_l0_resolves_through_its_commit_record() {
+        let (store, tenant_hash, seg, service) = pinned_l0("l0-happy").await;
+        assert_worker_ref_is_the_catalogs(&store, tenant_hash, &seg).await;
+        let response = service
+            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "{}",
+            response.status_message
+        );
+        assert_eq!(response.series_returned, 1);
+    }
+
+    /// A pin whose commit record is absent from the store fails the fragment to
+    /// the coordinator's local fallback rather than reading the object the
+    /// identity names.
+    #[tokio::test]
+    async fn pinned_l0_with_missing_commit_record_falls_back_locally() {
+        let (store, tenant_hash, seg, service) = pinned_l0("l0-missing").await;
+        store
+            .delete(&published_commit_key(tenant_hash))
+            .await
+            .expect("delete commit record");
+        let response = service
+            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+        assert_local_fallback(&response, "missing commit record");
+        assert!(
+            response.status_message.contains("not found"),
+            "{}",
+            response.status_message
+        );
+    }
+
+    /// A transient store error on the commit-record GET is retryable, and
+    /// which retry the slice gets depends on who is running it. An INBOUND
+    /// fragment answers `Unavailable`, the status the coordinator answers by
+    /// re-dispatching this one slice to another worker, not `Unsupported` and
+    /// a whole-query local run. The coordinator's OWN attempt has no other
+    /// worker to be re-dispatched to and `Unavailable` is terminal there, so
+    /// it answers `SnapshotInvalidated`: one re-resolve and retry.
+    #[tokio::test]
+    async fn a_transient_record_get_error_is_unavailable_inbound_and_retryable_locally() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+        let (store, tenant_hash, seg, _) = pinned_l0("l0-transient").await;
+        let commit_key = published_commit_key(tenant_hash);
+        let fault = Arc::new(FaultStore::new(
+            store,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Transient("blip".into()))
+                    .with_key_contains(commit_key.clone()),
+            ),
+        ));
+        let service = pinned_service(fault.clone(), 4 * HOUR_NS);
+        let request = pinned_over_window(tenant_hash, &seg, envelope(&seg));
+
+        let inbound = decode_slice_frames(service.resolve_and_run(request.clone(), false).await)
+            .expect("inbound run");
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert_eq!(
+            inbound.status,
+            pb::status::Code::Unavailable,
+            "{}",
+            inbound.status_message
+        );
+        assert!(
+            inbound.status_message.contains(&commit_key),
+            "{}",
+            inbound.status_message
+        );
+        assert_eq!(inbound.series_returned, 0, "no rows");
+        assert!(inbound.scalar.is_empty(), "no frames");
+
+        let local = service.run_local(request).await.expect("local run");
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 2);
+        assert_eq!(
+            local.status,
+            pb::status::Code::SnapshotInvalidated,
+            "{}",
+            local.status_message
+        );
+        assert_eq!(
+            local.status_message, inbound.status_message,
+            "only the status moves; the reason is reported unchanged"
+        );
+        assert_eq!(local.series_returned, 0, "no rows");
+        assert!(local.scalar.is_empty(), "no frames");
+    }
+
+    /// A commit record whose bytes do not decode fails the fragment locally.
+    #[tokio::test]
+    async fn pinned_l0_with_undecodable_commit_record_falls_back_locally() {
+        let (store, tenant_hash, seg, service) = pinned_l0("l0-garbage").await;
+        overwrite(
+            &store,
+            &published_commit_key(tenant_hash),
+            vec![0xff, 0xff, 0xff],
+        )
+        .await;
+        let response = service
+            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+        assert_local_fallback(&response, "undecodable commit record");
+    }
+
+    /// A commit record whose stored `object_key` disagrees with the key its own
+    /// identity fields reconstruct fails `verify_object_key`, and the fragment
+    /// falls back locally.
+    #[tokio::test]
+    async fn pinned_l0_with_tampered_object_key_falls_back_locally() {
+        use prost::Message as _;
+        let (store, tenant_hash, seg, service) = pinned_l0("l0-object-key").await;
+        let key = published_commit_key(tenant_hash);
+        let mut record =
+            ravel_commit::record::decode(&read_object(&store, &key).await).expect("record");
+        record.object_key = format!("{}.moved", record.object_key);
+        overwrite(&store, &key, record.encode_to_vec()).await;
+        let response = service
+            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+        assert_local_fallback(&response, "tampered object_key");
+        assert!(
+            response.status_message.contains("object_key mismatch"),
+            "{}",
+            response.status_message
+        );
+    }
+
+    /// A record stored at this pin's key whose body names a different commit
+    /// (here `writer_seq` 2, with a self-consistent `object_key` and a real data
+    /// object at that key) is refused: the record must be the one its key
+    /// addresses. Without that check the worker would read seq 2's object.
+    #[tokio::test]
+    async fn pinned_l0_with_record_for_another_commit_falls_back_locally() {
+        use prost::Message as _;
+        let (store, tenant_hash, seg, service) = pinned_l0("l0-other-commit").await;
+        let key = published_commit_key(tenant_hash);
+        let mut record =
+            ravel_commit::record::decode(&read_object(&store, &key).await).expect("record");
+        record.writer_seq = 2;
+        record.object_key = ravel_commit::keys::reconstruct_data_key(&record).expect("data key");
+        let data = read_object(&store, &seg.data_object_key).await;
+        overwrite(&store, &record.object_key, data.to_vec()).await;
+        overwrite(&store, &key, record.encode_to_vec()).await;
+        let response = service
+            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+        assert_local_fallback(&response, "record body names another commit");
+        assert!(
+            response.status_message.contains("addresses"),
+            "{}",
+            response.status_message
+        );
+    }
+
+    /// An identity whose content hash differs from the record's only past the
+    /// 8 bytes a key embeds is still refused: the full 32 bytes are compared.
+    #[tokio::test]
+    async fn pinned_l0_with_content_hash_tail_mismatch_falls_back_locally() {
+        let (_store, tenant_hash, seg, service) = pinned_l0("l0-hash-tail").await;
+        let mut request = pinned_over_window(tenant_hash, &seg, envelope(&seg));
+        let Some(pb::fetch_request::Scope::Pinned(pinned)) = request.scope.as_mut() else {
+            panic!("pinned scope");
+        };
+        pinned.segments[0].content_hash[31] ^= 0x01;
+        let response = service.run_local(request).await.expect("local run");
+        assert_local_fallback(&response, "content_hash tail differs");
+        assert!(
+            response.status_message.contains("content_hash"),
+            "{}",
+            response.status_message
+        );
+    }
+
+    /// An identity whose object size disagrees with the record is refused.
+    #[tokio::test]
+    async fn pinned_l0_with_object_size_mismatch_falls_back_locally() {
+        let (_store, tenant_hash, seg, service) = pinned_l0("l0-size").await;
+        let mut request = pinned_over_window(tenant_hash, &seg, envelope(&seg));
+        let Some(pb::fetch_request::Scope::Pinned(pinned)) = request.scope.as_mut() else {
+            panic!("pinned scope");
+        };
+        pinned.segments[0].object_size += 1;
+        let response = service.run_local(request).await.expect("local run");
+        assert_local_fallback(&response, "object_size differs");
+        assert!(
+            response.status_message.contains("object_size"),
+            "{}",
+            response.status_message
+        );
+    }
+
+    /// Publish one L0 segment, compact its bucket into one L1 part, and return
+    /// the service, the L1 ref the catalog resolves, and its compaction record
+    /// key.
+    async fn pinned_l1(
+        name: &str,
+    ) -> (
+        Arc<dyn ObjectStoreBackend>,
+        TenantHash,
+        ravel_catalog::SegmentRef,
+        String,
+        FragmentService,
+    ) {
+        use ravel_maintain::{Bucket, CompactionOutcome, CompactorConfig, compact_bucket};
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new(name.to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let config = CompactorConfig {
+            min_compaction_inputs: 1,
+            compactor_writer_id: uuid::Uuid::from_u128(9_000),
+            ..CompactorConfig::default()
+        };
+        let bucket = Bucket::new(tenant.hash(), Signal::Metrics, 0, 0);
+        let outcome = compact_bucket(
+            store.as_ref(),
+            &ravel_maintain::FixedClock::new(now),
+            &config,
+            &bucket,
+        )
+        .await
+        .expect("compact");
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { parts: 1, .. }),
+            "{outcome:?}"
+        );
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let ravel_catalog::SegmentLevel::L1 { input_set_hash, .. } = &seg.level else {
+            panic!("the compacted bucket resolves to its L1 part, got {seg:?}");
+        };
+        let record_key = ravel_commit::keys::compaction_record_key(
+            &tenant.hash(),
+            Signal::Metrics,
+            0,
+            0,
+            &hex::encode(&input_set_hash[..8]),
+        )
+        .expect("compaction record key");
+        let service = pinned_service(store.clone(), now);
+        (store, tenant.hash(), seg, record_key, service)
+    }
+
+    /// The L1 happy path: a pinned part resolves through its compaction record
+    /// and returns the compacted series.
+    #[tokio::test]
+    async fn pinned_l1_resolves_through_its_compaction_record() {
+        let (store, tenant_hash, seg, _key, service) = pinned_l1("l1-happy").await;
+        assert_worker_ref_is_the_catalogs(&store, tenant_hash, &seg).await;
+        let response = service
+            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+        assert_eq!(
+            response.status,
+            pb::status::Code::Ok,
+            "{}",
+            response.status_message
+        );
+        assert_eq!(response.series_returned, 1);
+    }
+
+    /// A pinned part whose compaction record (and any rewrite record) is absent
+    /// falls back locally.
+    #[tokio::test]
+    async fn pinned_l1_with_missing_compaction_record_falls_back_locally() {
+        let (store, tenant_hash, seg, key, service) = pinned_l1("l1-missing").await;
+        store.delete(&key).await.expect("delete compaction record");
+        let response = service
+            .run_local(pinned_over_window(tenant_hash, &seg, envelope(&seg)))
+            .await
+            .expect("local run");
+        assert_local_fallback(&response, "missing compaction record");
+        assert!(
+            response.status_message.contains("not found"),
+            "{}",
+            response.status_message
+        );
+    }
+
+    /// Rewrite one field of the pinned L1 identity and assert the fragment falls
+    /// back locally with a message naming `field`.
+    async fn assert_l1_identity_refused(
+        name: &str,
+        field: &str,
+        perturb: impl FnOnce(&mut pb::SegmentIdentity),
+    ) {
+        let (_store, tenant_hash, seg, _key, service) = pinned_l1(name).await;
+        let mut request = pinned_over_window(tenant_hash, &seg, envelope(&seg));
+        let Some(pb::fetch_request::Scope::Pinned(pinned)) = request.scope.as_mut() else {
+            panic!("pinned scope");
+        };
+        perturb(&mut pinned.segments[0]);
+        let response = service.run_local(request).await.expect("local run");
+        assert_local_fallback(&response, field);
+        assert!(
+            response.status_message.contains(field),
+            "{field}: {}",
+            response.status_message
+        );
+    }
+
+    /// An `input_set_hash` differing from the record's past the 8 bytes the key
+    /// embeds addresses the same record and is refused on the full comparison.
+    #[tokio::test]
+    async fn pinned_l1_with_input_set_hash_tail_mismatch_falls_back_locally() {
+        assert_l1_identity_refused("l1-input-set", "input_set_hash", |id| {
+            id.input_set_hash[31] ^= 0x01;
+        })
+        .await;
+    }
+
+    /// A part `content_hash` differing from the part's own past the key's 8
+    /// bytes is refused.
+    #[tokio::test]
+    async fn pinned_l1_with_content_hash_tail_mismatch_falls_back_locally() {
+        assert_l1_identity_refused("l1-hash-tail", "content_hash", |id| {
+            id.content_hash[31] ^= 0x01;
+        })
+        .await;
+    }
+
+    /// A part `object_size` disagreeing with the record's part is refused.
+    #[tokio::test]
+    async fn pinned_l1_with_object_size_mismatch_falls_back_locally() {
+        assert_l1_identity_refused("l1-size", "object_size", |id| {
+            id.object_size += 1;
+        })
+        .await;
+    }
+
+    /// A `part_index` the compaction record does not carry is refused.
+    #[tokio::test]
+    async fn pinned_l1_with_unknown_part_index_falls_back_locally() {
+        assert_l1_identity_refused("l1-part", "part_index", |id| {
+            id.part_index = 7;
+        })
+        .await;
     }
 
     // ---- ADR-0071 amendment decision 1: the dedicated TLS fragment listener ----

@@ -58,6 +58,15 @@ impl GetLimiter {
         self.permits
     }
 
+    /// Permits not currently held, sampled now. A test asserting that two
+    /// components draw from the SAME limiter reads this from inside one of
+    /// them: a component given a private limiter leaves this one untouched.
+    /// Nothing in a production path may branch on it, since the value is stale
+    /// the instant it is read.
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
     /// Acquires one owned permit. Owned rather than borrowed so a fetcher can
     /// hold it across an `.await` on the store GET itself without borrowing
     /// this limiter; drop the permit to release it back to the pool. Errors
@@ -79,7 +88,7 @@ impl fmt::Debug for GetLimiter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GetLimiter")
             .field("permits", &self.permits)
-            .field("available_permits", &self.semaphore.available_permits())
+            .field("available_permits", &self.available_permits())
             .finish()
     }
 }
