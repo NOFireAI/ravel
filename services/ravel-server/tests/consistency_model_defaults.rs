@@ -313,11 +313,13 @@ fn max_segments_figure_matches_the_derived_constant() {
 
 /// The per-query S3 request budget `docs/query-engine.md` states as the
 /// derived default is the budget a stock server enforces through
-/// `resolve_max_s3_requests`, which derives it with `derive_max_s3_requests`
-/// from the default `--shards` and the default ingest flush cadence. The
-/// figure is computed here from that derivation, never restated, so a default
-/// or a derivation change fails this rather than leaving the doc claiming
-/// one figure while a stock server derives another.
+/// `resolve_max_s3_requests`, which derives it with
+/// `derive_max_s3_requests_for` from the default `--shards`, the default
+/// ingest flush cadence, and the seal margin of the catalog the server folds
+/// and resolves with (ADR-1306 decision 3). The figure is computed here from
+/// that derivation, never restated, so a default or a derivation change fails
+/// this rather than leaving the doc claiming one figure while a stock server
+/// derives another.
 #[test]
 fn request_budget_figure_matches_the_derived_default() {
     use clap::Parser;
@@ -338,7 +340,11 @@ fn request_budget_figure_matches_the_derived_default() {
         "guards the shard default the documented figure is derived at"
     );
     let flush = ravel_ingest::IngestConfig::default().max_flush_delay;
-    let expected = ravel_query::derive_max_s3_requests(cli.shards, flush);
+    // The seal margin is the one the server's own catalog folds and resolves
+    // with, the third input the derivation takes (ADR-1306 decision 3), not
+    // `ravel_query`'s reference constants.
+    let seal_margin = ravel_server::query::server_seal_margin();
+    let expected = ravel_query::derive_max_s3_requests_for(cli.shards, flush, seal_margin);
 
     // The figure must be exactly what a stock server enforces through the real
     // resolve path, not just what the standalone derivation returns.
@@ -353,7 +359,8 @@ fn request_budget_figure_matches_the_derived_default() {
     assert_eq!(
         *value, expected,
         "docs/query-engine.md states a derived S3 request budget of {value} but \
-         ravel-server derives derive_max_s3_requests({}, {flush:?}) = {expected}. \
+         ravel-server derives derive_max_s3_requests_for({}, {flush:?}, {seal_margin:?}) \
+         = {expected}. \
          An operator sizes a query tier from that figure, so it must track the \
          derivation.",
         cli.shards
