@@ -503,9 +503,6 @@ mod tests {
         );
     }
 
-    /// A candidate that answers every key with the same placeholder bytes is
-    /// inconclusive too: it did not return the probe payload, but it did not
-    /// report the object absent either.
     /// A store that answers every key with the same placeholder bytes, which
     /// some gateways do in place of a 404. Only `get` is reachable from the
     /// probe; the rest of the surface is unused here.
@@ -556,6 +553,9 @@ mod tests {
         }
     }
 
+    /// A candidate that answers every key with the same placeholder bytes is
+    /// inconclusive too: it did not return the probe payload, but it did not
+    /// report the object absent either.
     #[tokio::test]
     async fn a_candidate_that_serves_other_bytes_is_inconclusive() {
         let ravel = MemoryStore::new();
