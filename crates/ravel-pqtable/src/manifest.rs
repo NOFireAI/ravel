@@ -485,7 +485,8 @@ mod tests {
 
     #[test]
     fn invalid_bodies_are_refused_on_encode() {
-        let cases: [(fn(&mut Manifest), ManifestDefect); 10] = [
+        type Case = (fn(&mut Manifest), ManifestDefect);
+        let cases: [Case; 10] = [
             (|m| m.files.clear(), ManifestDefect::NoFiles),
             (
                 |m| m.files.push(m.files[0].clone()),
