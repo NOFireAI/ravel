@@ -1490,6 +1490,50 @@ mod tests {
         );
     }
 
+    /// ADR-1702 decision 6: the serve reader reserves the record's declared
+    /// decompressed size before decoding it. One byte short of it is a typed
+    /// refusal that charges nothing; within budget the returned reservation
+    /// holds exactly that size until dropped.
+    ///
+    /// FLIP: drop the `budget.reserve(bound as u64)?` line in
+    /// `read_metrics_meta_for_serve` (returning a 0-byte guard instead) and
+    /// the refusal becomes a successful read, failing `expect_err`.
+    #[tokio::test]
+    async fn serve_reader_reserves_the_decoded_record() {
+        let store = mem();
+        let entries = vec![entry("a", MetricKind::Counter, "h", "u", 1)];
+        write_metrics_meta(store.as_ref(), &tenant(), &entries, None)
+            .await
+            .expect("seed");
+        let raw_len = build_record(&tenant(), &entries).encode_to_vec().len() as u64;
+
+        let tight = Arc::new(MemoryBudget::new(raw_len - 1));
+        let err = read_metrics_meta_for_serve(store.as_ref(), &tenant(), &tight)
+            .await
+            .expect_err("a record that does not fit the budget is refused");
+        match err {
+            MetricsMetaError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, raw_len);
+                assert_eq!(exhausted.reserved, 0);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(tight.reserved(), 0);
+
+        let budget = Arc::new(MemoryBudget::new(1 << 20));
+        let starting = budget.reserve(7).expect("starting figure");
+        let (served, _version, reservation) =
+            read_metrics_meta_for_serve(store.as_ref(), &tenant(), &budget)
+                .await
+                .expect("read within budget")
+                .expect("present");
+        assert_eq!(served, entries);
+        assert_eq!(budget.reserved(), 7 + raw_len);
+        drop(reservation);
+        assert_eq!(budget.reserved(), 7, "back to exactly the starting figure");
+        drop(starting);
+    }
+
     /// ADR-0066 item 2: the read-only serve reader and the strict rewrite reader
     /// take different paths on a record newer than this build's writer. Both
     /// refuse a version-3 record, but with different typed errors, and that

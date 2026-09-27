@@ -6,6 +6,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Catalog and PromQL decodes reserve their decoded output against the
+  process memory budget before they run** (ADR-1702 decision 6, issue #1702).
+  The catalog resolve reserves each snapshot part's, postings object's and
+  column-statistics object's header-declared uncompressed length, and the
+  reservation stays with the decoded value, in the decoded-part and postings
+  caches included, until it is dropped. The PromQL fetcher reserves the
+  footer-declared length of a segment's catalog sections before
+  `decode_selected` or `decode_sparse_catalog` decodes them, and the
+  `/api/v1/metadata` cache reserves a record's declared decompressed size. A
+  reservation that does not fit fails the read with a typed error
+  (`CatalogError::MemoryExhausted`, `LoadColumnStatsError::MemoryExhausted`,
+  `FetchMemoryExhausted`, `MetricsMetaError::MemoryExhausted`); a catalog
+  refusal never falls back to a listing pass. The catalog and the metadata
+  cache take the budget through the new `Catalog::with_memory_budget` and
+  `MetadataCache::with_memory_budget`, and both default to an unlimited
+  budget, so nothing is refused until the server passes the real one.
+  `read_metrics_meta_for_serve` now takes the budget and returns the
+  reservation alongside the entries.
+
 ## [0.19.0] - 2026-09-27
 
 ### Fixed
