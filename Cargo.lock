@@ -4708,6 +4708,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-cpu-gate"
+version = "0.18.0"
+dependencies = [
+ "ravel-test-support",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "ravel-failure-tests"
 version = "0.18.0"
 dependencies = [
