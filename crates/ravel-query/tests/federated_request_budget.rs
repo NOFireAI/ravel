@@ -126,7 +126,11 @@ async fn federated_series_over_request_budget_trips_typed_error() {
         .await;
 
     match result {
-        Err(QueryError::RequestBudgetExceeded { requests, max }) => {
+        Err(QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag: _,
+        }) => {
             assert!(
                 requests > max,
                 "typed error must name an overage: requests {requests} <= max {max}"

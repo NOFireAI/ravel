@@ -98,8 +98,9 @@ use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
 use ravel_query::{
-    LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError, RequestBudgets,
-    SegmentAdmission, SegmentFetcher, admit, request_budget_exceeded,
+    LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError, RequestBudget,
+    RequestBudgets, SegmentAdmission, SegmentFetcher, admit, request_budget_exceeded,
+    resolved_fold_lag,
 };
 use ravel_types::accounting::{
     AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
@@ -1907,13 +1908,35 @@ impl SqlExecutor {
         // resolve's own catalog requests alone. Checked once here rather
         // than once per caller, so a fourth resolve entry point cannot be
         // added later without this check automatically covering it too.
-        if let Some(QueryError::RequestBudgetExceeded { requests, max }) = request_budget_exceeded(
+        // The budget carries what this resolve saw of the catalog's unsealed
+        // tail (ADR-1306 decision 6), read off the `origins` it just produced,
+        // so a refusal caused by fold lag names the tail and the fold-liveness
+        // gauge here exactly as it does on the PromQL path. This is the only
+        // SQL check with a resolve verdict in hand: the per-segment check in
+        // scan.rs builds its budget from the session config alone, so a
+        // refusal raised mid-scan renders the plain message.
+        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
+        if let Some(QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag,
+        }) = request_budget_exceeded(
             phase_accounting.resolve().snapshot().total_s3_requests(),
-            self.effective_config(req.budgets.as_ref())
-                .engine
-                .max_s3_requests,
+            RequestBudget::new(
+                engine_config.max_s3_requests,
+                resolved_fold_lag(
+                    &snapshot,
+                    &origins,
+                    req.now_ns,
+                    engine_config.fold_lag_threshold(),
+                ),
+            ),
         ) {
-            return Err(SqlError::RequestBudgetExceeded { requests, max });
+            return Err(SqlError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag,
+            });
         }
         Ok((snapshot, admission, estimate, unfolded_segments_resolved))
     }
@@ -3862,6 +3885,247 @@ mod tests {
         )))
     }
 
+    const FOLD_LAG_NS_PER_SEC: i64 = 1_000_000_000;
+    const FOLD_LAG_NS_PER_MIN: i64 = 60 * FOLD_LAG_NS_PER_SEC;
+    const FOLD_LAG_NS_PER_HOUR: i64 = 60 * FOLD_LAG_NS_PER_MIN;
+    /// An arbitrary but fixed ingest hour the fold-lag fixture calls "now",
+    /// large enough that subtracting seven hours stays positive.
+    const FOLD_LAG_NOW_HOUR: u32 = 490_000;
+
+    /// Writes one real RSEG segment carrying a single sample into
+    /// `ingest_hour_bucket` and publishes its commit record.
+    async fn publish_fold_lag_segment(
+        store: &MemoryStore,
+        tenant: &TenantId,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        ts_ns: i64,
+    ) {
+        let writer_id = Uuid::from_u128(u128::from(writer_seq) + 1_306);
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "m".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(tenant, "m", &labels).expect("series id");
+        let written = SegmentWriter::write(
+            vec![SeriesInput {
+                series_id,
+                labels,
+                samples: vec![Sample {
+                    ts_ns,
+                    value: 1.125,
+                }],
+            }],
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: u32::from(ravel_segment::VERSION_V7),
+            created_unix_ns: 0,
+            ingest_hour_bucket,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// The fold-lag fixture: one segment in an hour the fold sealed
+    /// (`FOLD_LAG_NOW_HOUR - 7`) and two in hours it did not
+    /// (`- 5` and `- 0`), folded once at an instant six hours before query
+    /// time and never again. The executor shares the catalog handle the fold
+    /// ran through, so its resolve reads the snapshot that fold wrote.
+    async fn fold_lag_executor() -> (SqlExecutor, TenantHash) {
+        let tenant = TenantId::new("acme-sql-fold-lag".to_string());
+        let tenant_hash = tenant.hash();
+        let memory = MemoryStore::new();
+        for (seq, back) in [7u32, 5, 0].iter().enumerate() {
+            let hour = FOLD_LAG_NOW_HOUR - back;
+            publish_fold_lag_segment(
+                &memory,
+                &tenant,
+                tenant_hash,
+                seq as u64 + 1,
+                hour,
+                // Ten minutes into the hour, inside the window below.
+                i64::from(hour) * FOLD_LAG_NS_PER_HOUR + 10 * FOLD_LAG_NS_PER_MIN,
+            )
+            .await;
+        }
+        let store = Arc::new(InstrumentedStore::new(FaultStore::new(
+            memory,
+            FaultPlan::empty(),
+        )));
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        // 1 h 50 m into FOLD_LAG_NOW_HOUR - 5 the 4,800 s seal margin has
+        // elapsed for `- 6` and not for `- 5`, so this fold seals to `- 6` and
+        // the `- 7` segment sits below the watermark.
+        let fold_now =
+            i64::from(FOLD_LAG_NOW_HOUR - 5) * FOLD_LAG_NS_PER_HOUR + 110 * FOLD_LAG_NS_PER_MIN;
+        let report = catalog
+            .fold(
+                &tenant_hash,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                fold_now,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            report.watermark_hour,
+            Some(FOLD_LAG_NOW_HOUR - 6),
+            "test setup: the one fold that ran sealed through FOLD_LAG_NOW_HOUR - 6"
+        );
+        let executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store),
+            SqlConfig::default(),
+            1 << 30,
+        );
+        (executor, tenant_hash)
+    }
+
+    /// ADR-1306 decision 6 and its 2026-09-27 amendment, on the SQL path, end
+    /// to end: the resolve-boundary check in `resolve_admitted` is where a SQL
+    /// refusal picks up the fold-lag clause, so a statement refused there
+    /// during real fold lag reads the tail and the gauge, not a bare budget
+    /// figure.
+    ///
+    /// The flipped line: `resolve_admitted`'s
+    /// `resolved_fold_lag(&snapshot, &origins, req.now_ns,
+    /// engine_config.fold_lag_threshold())`. Replace it with
+    /// `ravel_query::FoldLag::Healthy` and this test fails with
+    /// `left: Healthy, right: Lagging { unsealed_tail: 19800s,
+    /// fold_lag_threshold: 8730s }`.
+    ///
+    /// Injected time throughout: every instant is derived from
+    /// `FOLD_LAG_NOW_HOUR`, and neither the fold nor the query reads a wall
+    /// clock.
+    #[tokio::test]
+    async fn sql_resolve_boundary_refusal_names_the_unsealed_tail() {
+        let (executor, tenant_hash) = fold_lag_executor().await;
+        let now_ns = i64::from(FOLD_LAG_NOW_HOUR) * FOLD_LAG_NS_PER_HOUR + 30 * FOLD_LAG_NS_PER_MIN;
+        // Back past the sealed segment's event time, so the resolve extracts
+        // it from the snapshot and therefore knows where the watermark is. The
+        // tail is set by the oldest RECENT hour, `- 5`, not by the width.
+        let window = TimeRange {
+            start_ns: i64::from(FOLD_LAG_NOW_HOUR - 7) * FOLD_LAG_NS_PER_HOUR
+                + 5 * FOLD_LAG_NS_PER_MIN,
+            end_ns: now_ns,
+        };
+        let expected_tail = Duration::from_nanos(
+            (now_ns - i64::from(FOLD_LAG_NOW_HOUR - 5) * FOLD_LAG_NS_PER_HOUR)
+                .try_into()
+                .expect("a positive tail"),
+        );
+        assert_eq!(
+            expected_tail,
+            Duration::from_secs(19_800),
+            "test setup: the fixture's tail is 5 h 30 m"
+        );
+
+        let mut req = sql_request("SELECT ts, value FROM samples", window);
+        req.now_ns = now_ns;
+        req.budgets = Some(ravel_query::RequestBudgets {
+            max_store_requests: Some(ravel_query::RequestLimit::Bounded(1)),
+            ..Default::default()
+        });
+        let err = executor
+            .execute(tenant_hash, &req)
+            .await
+            .expect_err("a budget of 1 must refuse this resolve");
+        let SqlError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag,
+        } = &err
+        else {
+            panic!("expected SqlError::RequestBudgetExceeded, got {err:?}");
+        };
+        assert!(
+            requests > max,
+            "the refusal must carry the spend that passed the budget: {requests} vs {max}"
+        );
+        assert_eq!(
+            *fold_lag,
+            ravel_query::FoldLag::Lagging {
+                unsealed_tail: expected_tail,
+                // The literal the PromQL side pins too: 8,400 s of healthy
+                // tail + the 300 s fold interval + the 30 s HEAD cache TTL.
+                fold_lag_threshold: Duration::from_secs(8_730),
+            },
+            "the SQL resolve boundary must carry the tail its own resolve listed"
+        );
+        let message = err.client_message();
+        assert_eq!(message, err.to_string());
+        assert!(
+            message.contains("19800 s"),
+            "the message must name the tail's length: {message}"
+        );
+        assert!(
+            message.contains("8730 s"),
+            "the message must name the threshold it exceeded: {message}"
+        );
+        assert!(
+            message.contains(ravel_query::FOLD_LAST_SUCCESS_GAUGE),
+            "the message must name the fold-liveness gauge: {message}"
+        );
+        // Unchanged status: 422 over HTTP, `FailedPrecondition` over Flight SQL.
+        assert_eq!(err.class(), crate::ErrorClass::Unsupported);
+
+        // Non-vacuity: the identical fixture and window with no lowered budget
+        // runs to a result, so the assertions above are about the budget and
+        // not about a fixture that cannot resolve at all.
+        let (control_executor, control_tenant) = fold_lag_executor().await;
+        let mut control = sql_request("SELECT ts, value FROM samples", window);
+        control.now_ns = now_ns;
+        let outcome = control_executor
+            .execute(control_tenant, &control)
+            .await
+            .expect("the default ceiling must admit the fixture's statement");
+        assert_eq!(
+            ts_values(&outcome.output).len(),
+            3,
+            "the fixture's three segments each carry one sample"
+        );
+    }
+
     /// SQL side of the resolve-time request-budget gap: a statement whose
     /// snapshot resolves to zero segments never reaches the segment-fetch
     /// loop in scan.rs, so the incremental `max_s3_requests` check there
@@ -3893,7 +4157,12 @@ mod tests {
             .execute(tenant_hash, &exec_req)
             .await
             .expect_err("a zero store-request budget must trip even on an empty snapshot");
-        let SqlError::RequestBudgetExceeded { requests, max } = err else {
+        let SqlError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag: _,
+        } = err
+        else {
             panic!("expected SqlError::RequestBudgetExceeded, got {err:?}");
         };
         assert_eq!(
@@ -3921,6 +4190,7 @@ mod tests {
         let SqlError::RequestBudgetExceeded {
             requests: explain_requests,
             max: explain_max,
+            fold_lag: _,
         } = explain_err
         else {
             panic!("expected SqlError::RequestBudgetExceeded, got {explain_err:?}");
@@ -3947,6 +4217,7 @@ mod tests {
         let SqlError::RequestBudgetExceeded {
             requests: snapshot_requests,
             max: snapshot_max,
+            fold_lag: _,
         } = snapshot_err
         else {
             panic!("expected SqlError::RequestBudgetExceeded, got {snapshot_err:?}");

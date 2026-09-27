@@ -153,6 +153,42 @@ pub fn healthy_tail_max(seal_margin: SealMargin) -> Duration {
     seal_margin.total().saturating_add(OPEN_INGEST_HOUR)
 }
 
+/// `services/ravel-server/src/fold.rs`'s `DEFAULT_FOLD_INTERVAL`, 5 minutes:
+/// how long a keeping-up fold waits between cycles, so how long a tail keeps
+/// growing after the fold that last shortened it. Named here rather than
+/// imported: ravel-server depends on ravel-query, not the other way round.
+/// Wiring the running server's `FoldTaskConfig` through to
+/// [`EngineConfig::fold_interval`] is a later ADR-1306 task.
+pub const REFERENCE_FOLD_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// `CatalogConfig::default`'s `head_cache_ttl`
+/// (`ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS`), 30 s: how stale the HEAD a
+/// resolve reads through the TTL cache may be, so how far behind the fold's
+/// real watermark the watermark a resolve resolves against may be.
+pub const REFERENCE_HEAD_CACHE_TTL: Duration =
+    Duration::from_nanos(ravel_catalog::DEFAULT_HEAD_CACHE_TTL_NS.unsigned_abs());
+
+/// The longest unsealed tail a catalog whose fold is keeping up can present to
+/// one resolve, and so the tail at which a request-budget refusal starts naming
+/// fold lag (ADR-1306 decision 6, "Amendment (2026-09-27, #1306)").
+///
+/// Three terms, not one. `healthy_tail_max` bounds the tail a fold leaves at the
+/// instant it runs. The fold then does not run again for `fold_interval`, and
+/// the tail grows one second per second meanwhile. The watermark a resolve sees
+/// is read from a HEAD served through a `head_cache_ttl` cache, so it may be
+/// that much older again. Classifying against `healthy_tail_max` alone blames a
+/// fold that is keeping up for the last `fold_interval + head_cache_ttl` of
+/// every cycle.
+pub fn fold_lag_tail_threshold(
+    seal_margin: SealMargin,
+    fold_interval: Duration,
+    head_cache_ttl: Duration,
+) -> Duration {
+    healthy_tail_max(seal_margin)
+        .saturating_add(fold_interval)
+        .saturating_add(head_cache_ttl)
+}
+
 /// The span the per-shard request allowance is sized from (ADR-1306
 /// decisions 1 and 2): the healthy tail plus the time a stalled fold takes to
 /// page, `healthy_tail_max + seal_margin + FOLD_STALL_ALERT_FOR +
@@ -584,6 +620,30 @@ pub struct EngineConfig {
     /// the derivation at [`DEFAULT_BUDGET_REFERENCE_SHARDS`] shards as a
     /// no-deployment-context fallback.
     pub max_s3_requests: RequestLimit,
+    /// The seal margin the catalog this engine resolves through folds with
+    /// (ADR-1306 decision 3). Not a limit: it is the first of the three terms
+    /// of [`Self::fold_lag_threshold`], the tail at which a request-budget
+    /// refusal starts naming fold lag (ADR-1306 decision 6). Defaults to
+    /// [`SealMargin::REFERENCE`], the catalog's own compiled-in durations;
+    /// wiring the running server's `CatalogConfig` through to here is ADR-1306
+    /// follow-up task 5.
+    pub seal_margin: SealMargin,
+    /// How long the scheduled fold waits between cycles, the second term of
+    /// [`Self::fold_lag_threshold`] (ADR-1306 decision 6, "Amendment
+    /// (2026-09-27, #1306)"): a fold that is keeping up still lets the tail
+    /// grow by this much before its next cycle shortens it again. Defaults to
+    /// [`REFERENCE_FOLD_INTERVAL`], the server's own `DEFAULT_FOLD_INTERVAL`;
+    /// wiring the running server's `FoldTaskConfig` through to here is a later
+    /// ADR-1306 task.
+    pub fold_interval: Duration,
+    /// How long a decoded catalog HEAD may be served from the TTL cache, the
+    /// third term of [`Self::fold_lag_threshold`] (ADR-1306 decision 6,
+    /// "Amendment (2026-09-27, #1306)"): the watermark a resolve resolves
+    /// against may be this much older than the fold's real one. Defaults to
+    /// [`REFERENCE_HEAD_CACHE_TTL`], the catalog's own
+    /// `DEFAULT_HEAD_CACHE_TTL_NS`; wiring the running server's `CatalogConfig`
+    /// through to here is ADR-1306 follow-up task 5.
+    pub head_cache_ttl: Duration,
     pub deadline: Duration,
     pub fetch_concurrency: usize,
     /// Step for a subquery that does not specify its own (`expr[5m:]`).
@@ -653,6 +713,14 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    /// The unsealed tail at which a request-budget refusal from this engine
+    /// starts naming fold lag: [`fold_lag_tail_threshold`] of this config's
+    /// seal margin, fold interval and HEAD cache TTL. 8,730 s at the
+    /// defaults (8,400 + 300 + 30).
+    pub fn fold_lag_threshold(&self) -> Duration {
+        fold_lag_tail_threshold(self.seal_margin, self.fold_interval, self.head_cache_ttl)
+    }
+
     /// The resolved concurrent-GET permit count: the explicit
     /// [`Self::store_get_concurrency`] override if set, else the legacy
     /// [`Self::fetch_concurrency`] (ADR-1195: no default moves).
@@ -708,6 +776,9 @@ impl Default for EngineConfig {
                 DEFAULT_BUDGET_REFERENCE_SHARDS,
                 DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY,
             )),
+            seal_margin: SealMargin::REFERENCE,
+            fold_interval: REFERENCE_FOLD_INTERVAL,
+            head_cache_ttl: REFERENCE_HEAD_CACHE_TTL,
             deadline: DEFAULT_DEADLINE,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             default_evaluation_interval: DEFAULT_EVALUATION_INTERVAL,
