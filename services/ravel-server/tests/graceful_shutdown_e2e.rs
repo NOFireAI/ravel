@@ -138,6 +138,7 @@ async fn start_server_configured(
         max_flush_delay: Duration::from_secs(3600),
         max_flush_delay_idle: Duration::from_secs(3600),
         min_flush_bytes: 1024 * 1024 * 1024,
+        idle_flush_byte_floor: 0,
         mode,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),

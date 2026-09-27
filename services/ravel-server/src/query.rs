@@ -1050,6 +1050,7 @@ mod catalog_cache_tests {
             max_flush_delay: Duration::from_secs(2),
             max_flush_delay_idle: Duration::from_secs(40),
             min_flush_bytes: 256 * 1024,
+            idle_flush_byte_floor: 0,
             tenant_resolver: Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             mtls_listener: None,
             fold_tenants: Vec::new(),

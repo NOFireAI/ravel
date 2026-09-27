@@ -150,6 +150,7 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 |---|---|
 | `ravel_ingest_flushes_by_size_total` | Flushes opened because the tenant buffer reached target_bytes. |
 | `ravel_ingest_flushes_by_age_total` | Flushes opened because the tenant buffer aged past max_flush_delay. |
+| `ravel_ingest_flushes_by_age_floor_total` | Flushes opened because the tenant buffer aged past the sub-floor hold, which a buffer holding fewer object bytes than `--idle-flush-byte-floor` waits for instead of max_flush_delay_idle. Zero unless that flag is set. A rising figure means the floor is holding buffers, which is the point of setting it, and it is also the count of flushes whose rows sat in memory for up to an hour before the flush opened: it is how an operator sizes the buffered-mode loss window they accepted. |
 | `ravel_ingest_flushes_manual_total` | Flushes opened by an explicit, shutdown, or drop-path drain. |
 | `ravel_ingest_put_retries_total` | Retried PUT attempts on the data-object or commit-record path. |
 | `ravel_ingest_abandoned_retry_exhausted_total` | Flushes abandoned by retry-budget or lifetime exhaustion. |
@@ -183,18 +184,21 @@ spans, not zero.
 The `ravel_ingest_flushes_by_age_adaptive_total` family likewise carries only
 the `signal="metrics"` series: the adaptive-delay corridor is a
 metrics-pipeline feature, so that sample is structurally absent for logs and
-spans, not zero. `ravel_ingest_in_flight_flushes`,
+spans, not zero. `ravel_ingest_flushes_by_age_floor_total`,
+`ravel_ingest_in_flight_flushes`,
 `ravel_ingest_flush_permit_wait_seconds_total`,
 `ravel_ingest_queued_flushes`, `ravel_ingest_flush_trigger_deferred_total`,
 and `ravel_ingest_grace_extended_stale_flushes_total` are carried for every
-signal, each for its own reason: the in-flight gauge because all three shard
+signal, each for its own reason: the sub-floor hold counter because all three
+shard actors read the floor, so a logs- or spans-only process renders a real
+sample for it rather than nothing; the in-flight gauge because all three shard
 actors arm an `InFlightFlushGuard`; the permit-wait counter because the
 `max_inflight_flushes` acquire runs off-actor for all three ingest pipelines;
 the queue-depth gauge and its deferral counter because the queued-flush cap is
 wired identically in all three; the grace-extended counter because all three
 snapshots already expose the stale-provisioning counter it pairs with. A logs-
 or spans-only process therefore still renders a real (possibly zero) sample
-for all five. `ravel_ingest_flush_all_residue_tenants_total` is carried for
+for all six. `ravel_ingest_flush_all_residue_tenants_total` is carried for
 all three signals too, for the same reason: `DrainIntent::Teardown` runs
 identically in every shard actor.
 
@@ -2189,4 +2193,5 @@ Distributed read fan-out: ADR-0071. Wire-byte accounting: ADR-0084. The metric
 metadata cache: ADR-0085. Alert evaluation and its at-least-once notification
 contract: ADR-0043. Per-shard ingest skew metrics and the `shard` label:
 ADR-1692. The retiring-generation shard set that family also renders:
-ADR-0052. The CPU gates and the tokio runtime families: ADR-1702.
+ADR-0052. The sub-floor hold counter and the flag that turns it on:
+ADR-1737. The CPU gates and the tokio runtime families: ADR-1702.

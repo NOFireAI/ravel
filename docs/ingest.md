@@ -320,6 +320,25 @@ Loop over `select!`:
   sooner than a buffer does today: the knob is unchanged, the unit it counts
   is not. Reasoning about how long a tenant takes to reach either threshold
   starts from the object-bytes model above.
+  A third tier sits under the idle one and is off unless an operator asks for
+  it (ADR-1737). With `--idle-flush-byte-floor` set to a non-zero byte count,
+  an idle buffer holding fewer than that many object bytes waits for the
+  sub-floor hold, `max_flush_lifetime` less one `flush_tick`, instead of
+  `max_flush_delay_idle`, and the flush that opens is recorded as
+  `FlushTrigger::AgeFloor` and counted in `flushes_by_age_floor` rather than
+  in `flushes_by_age`. The tick is held back so that the age check's own tick
+  of lateness fits inside the hour: the worst buffer age when the flush opens
+  is then exactly `max_flush_lifetime`, which is the figure
+  `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. The floor is read
+  against `flush_est_bytes`, the same object-bytes estimate `min_flush_bytes`
+  uses, and a buffer crosses tiers upward as rows arrive, so a trickle that
+  reaches the floor flushes 40 s after its oldest row rather than an hour
+  after it. The default is 0, which disables the tier and leaves every buffer
+  on the two clocks above. A non-zero floor widens the buffered-mode loss
+  window for a buffer below it from `max_flush_delay_idle` to
+  `max_flush_lifetime` (docs/consistency-model.md), and the floor must be
+  below `min_flush_bytes`: `IngestConfig::validate` refuses anything else and
+  `ravel-server` refuses to start on it.
 - channel closed (router dropped): flush the remaining buffer before
   exiting rather than discarding it; points that still fail to flush are
   counted, never silently lost. The drain (`flush_all`, shared with
@@ -332,6 +351,14 @@ Loop over `select!`:
   (`flush_all_residue_tenants`, a durability defect). On `FlushNow` the actor
   keeps running and the residue stays buffered with its arrival timestamp, so
   the age tick retries it; that case is logged at WARN and not counted.
+  A drain flushes every buffer regardless of size or age, so the sub-floor
+  hold does not change how many PUTs a drain writes: each buffer with data is
+  one flush whether it is 40 seconds or an hour old. What it changes is what
+  the residue holds when the drain runs out of its bound. With
+  `--idle-flush-byte-floor` set, a near-empty tenant's residual buffer can
+  carry up to an hour of its rows instead of 40 seconds' worth, and on
+  `Shutdown` those rows were already acknowledged, so
+  `flush_all_residue_tenants` is counting a proportionally larger loss.
 
 Shard-actor death is observable and recoverable. A shard
 actor dies when its flush task panics (a split-brain commit is one such
@@ -1128,6 +1155,7 @@ carries max token per shard).
 | max_flush_delay | 2 s (`--max-flush-delay`) |
 | max_flush_delay_idle | 40 s (`--max-flush-delay-idle`) |
 | min_flush_bytes (object bytes, not buffered memory) | 256 KiB (`--min-flush-bytes`) |
+| idle_flush_byte_floor (object bytes, all three pipelines) | 0 = disabled (`--idle-flush-byte-floor`, must be below `min_flush_bytes`; a non-zero floor makes a buffer under it wait `max_flush_lifetime` less one `flush_tick` and widens the buffered-mode loss window to match) |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
@@ -1306,15 +1334,19 @@ tenants of the process.
 Counters recorded today:
 
 - `flushes_by_size`, `flushes_by_age`, `flushes_by_age_adaptive`,
-  `flushes_manual`: flush count by trigger. `flushes_by_age_adaptive` is the
+  `flushes_by_age_floor`, `flushes_manual`: flush count by trigger.
+  `flushes_by_age_adaptive` is the
   subset of age-triggered flushes where `adaptive_flush_delay` actually
   stretched the threshold past `max_flush_delay`; it is zero unless that knob
   is enabled, and is disjoint from `flushes_by_age` (a flush counts in exactly
-  one of the two). `flushes_manual` covers explicit `FlushNow`, the `Shutdown`
+  one of the two). `flushes_by_age_floor` is the age-triggered subset that
+  waited for the sub-floor hold instead of `max_flush_delay_idle`, disjoint
+  from the other two the same way, and zero unless `idle_flush_byte_floor` is
+  set. `flushes_manual` covers explicit `FlushNow`, the `Shutdown`
   drain, and the channel-close drop-path drain. These are **attempt-time**:
   incremented when a flush is opened, before the segment build or any PUT, so
   a later-abandoned flush is counted here as well as in an `abandoned_*`
-  counter. Successful flushes = the four trigger counters minus the three
+  counter. Successful flushes = the five trigger counters minus the three
   `abandoned_*` counters.
 - `abandoned_retry_exhausted`: flush abandoned because a PUT exhausted its retry
   budget or `max_flush_lifetime` elapsed while the flush's own store calls were

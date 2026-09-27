@@ -1426,6 +1426,33 @@ pub struct Cli {
     #[arg(long = "min-flush-bytes", value_name = "BYTES")]
     pub min_flush_bytes: Option<u64>,
 
+    /// Opt-in third age tier, shared by all three ingest pipelines (ADR-1737),
+    /// in bytes. `0`, the default, disables it and every buffer keeps today's
+    /// two-clock behavior. A non-zero value makes a tenant's buffer with no
+    /// strict-mode waiter whose flush would write fewer than this many object
+    /// bytes wait for the sub-floor hold, `max_flush_lifetime` less one flush
+    /// tick, instead of `--max-flush-delay-idle`. That cuts the PUT cost of a
+    /// near-empty tenant from 4,320 a day to 48, and it WIDENS THE
+    /// BUFFERED-MODE LOSS WINDOW for such a tenant: an acknowledged
+    /// buffered-mode row in a buffer below the floor may sit in process memory
+    /// for up to one hour (`max_flush_lifetime`)
+    /// before its flush even opens, and a crash in that window loses it.
+    /// Strict mode is unaffected: a strict waiter keeps the fast clock, so
+    /// acknowledged-write latency does not move. The graceful-drain residue a
+    /// `--shutdown-timeout` cuts short can likewise now hold up to an hour of
+    /// a near-empty tenant's rows instead of 40 seconds' worth. Unlike the
+    /// ADR-0076 cadence trio this knob moves on its own, and it must be below
+    /// `--min-flush-bytes`: a floor at or above it leaves no idle tier between
+    /// the two, and startup is refused. Watch
+    /// `ravel_ingest_flushes_by_age_floor_total` to see the floor holding
+    /// buffers.
+    #[arg(
+        long = "idle-flush-byte-floor",
+        value_name = "BYTES",
+        default_value_t = 0
+    )]
+    pub idle_flush_byte_floor: u64,
+
     /// The at-rest scrub period `P` (ADR-0059 decision 1), as a humantime
     /// duration (e.g. `7d`). The content-tier scrubber rotates through the
     /// whole object corpus once per `P`, so sustained scrub read bandwidth is
@@ -11133,6 +11160,30 @@ mod tests {
             err.to_string().contains("target_bytes"),
             "expected a target_bytes error, got: {err}"
         );
+    }
+
+    /// ADR-1737 decision 1: the floor ships disabled, and an operator who sets
+    /// it gets the byte count they typed. The default is asserted against
+    /// `IngestConfig::default().idle_flush_byte_floor` rather than against a
+    /// restated `0`, so the flag and the library default cannot drift apart
+    /// and leave a stock server holding buffers for an hour.
+    #[test]
+    fn idle_flush_byte_floor_defaults_to_the_disabled_library_value() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.idle_flush_byte_floor as usize,
+            ravel_ingest::IngestConfig::default().idle_flush_byte_floor,
+            "--idle-flush-byte-floor must default to IngestConfig's own value"
+        );
+        assert_eq!(
+            cli.idle_flush_byte_floor, 0,
+            "the shipped default must be 0 (the sub-floor hold disabled), since \
+             a non-zero floor widens the buffered-mode loss window"
+        );
+
+        let set = Cli::try_parse_from(["ravel-server", "--idle-flush-byte-floor", "8192"])
+            .expect("an explicit floor parses");
+        assert_eq!(set.idle_flush_byte_floor, 8192);
     }
 
     #[test]

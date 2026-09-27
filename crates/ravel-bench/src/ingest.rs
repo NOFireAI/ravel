@@ -706,6 +706,7 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         * (metrics.flushes_by_size
             + metrics.flushes_by_age
             + metrics.flushes_by_age_adaptive
+            + metrics.flushes_by_age_floor
             + metrics.flushes_manual);
 
     Report {

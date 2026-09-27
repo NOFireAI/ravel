@@ -508,6 +508,11 @@ async fn main() -> anyhow::Result<()> {
         max_flush_delay: flush_cadence.max_flush_delay,
         max_flush_delay_idle: flush_cadence.max_flush_delay_idle,
         min_flush_bytes: flush_cadence.min_flush_bytes,
+        // Not part of the ADR-0076 cadence trio `resolve_flush_cadence`
+        // reconciles: the floor moves on its own, and its one cross-field
+        // constraint is checked against the resolved `min_flush_bytes` by
+        // `IngestConfig::validate` in `start`.
+        idle_flush_byte_floor: cli.idle_flush_byte_floor as usize,
         tenant_resolver: resolver_bundle.resolver,
         mtls_listener,
         fold_tenants,
