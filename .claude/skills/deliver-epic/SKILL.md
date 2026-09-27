@@ -268,12 +268,12 @@ Work in a dedicated worktree of main (`git worktree add`), per CLAUDE.md.
    `scripts/fleet-result-merge.sh <task-id> <message-file> -p <crates>`.
    `main` is protected, so the script never pushes it: it cleans the
    result branch's history, runs local pre-flight gates, and opens a PR.
-   It does NOT enable auto-merge (standing rule, 2026-08-26): the fleet
-   review posts as a comment rather than a required check, so `--auto`
-   used to land before the review arrived. It posts `@claude-fleet
-   review` instead; wait for that review, address every finding, then
-   merge by hand. `FLEET_MERGE_AUTO=1` restores the old behaviour for the
-   rare case that genuinely does not need the wait.
+   It does not enable auto-merge: the fleet review posts as a comment
+   rather than a required check, so `--auto` would land before the
+   review arrived. It posts `@claude-fleet review` instead; wait for that
+   review, address every finding, then merge by hand. `FLEET_MERGE_AUTO=1`
+   enables auto-merge for the rare case that genuinely does not need the
+   wait.
 
    Before merging each PR, confirm CI is green on the head you reviewed:
 

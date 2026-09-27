@@ -32,20 +32,20 @@ to a `task/<id>/merge` head branch, and opening a PR against `main`. The
 rebase-merge keeps each commit's own message, so per-commit `Fixes:`/
 `Refs:` trailers still close their issues when they land.
 
-**The PR opens WITHOUT auto-merge by default (standing rule, 2026-08-26).**
-A bot review posts as a review comment, not a required status check, so
-`--auto` merges before that review lands -- \#749/\#750 landed with 6 real
-findings unaddressed this way. The script asks for the review itself: after
+**The PR opens without auto-merge.** The fleet review posts as a review
+comment, not a required status check, so `--auto` would merge before the
+review lands and its findings would go unaddressed. The script asks for the
+review itself: after
 opening the PR it posts one comment whose whole body is
 `@claude-fleet review`, which is the trigger (ADR-1586; anything after
 `review` is parsed as arguments, and an unrecognized word gets a confused
 reaction and no review). Wait for the `claude-fleet[bot]` review, then fix
 or explicitly answer every finding not marked `nit` (each inline comment
 starts with its severity; one with no severity counts as actionable). A
-review whose findings are all nits is clean: the bot runs Claude Opus 5,
-which reports nits on almost every PR, so waiting for a zero-finding review never ends. Do not push nit
-fixes and ask for another round; a push moves the head and needs a fresh
-review. After 3 review rounds on one PR, stop and hand it to a person.
+review whose findings are all nits is clean: the bot reports nits on
+almost every PR, so waiting for a zero-finding review never ends. Do not
+push nit fixes and ask for another round; a push moves the head and needs
+a fresh review. After 3 review rounds on one PR, stop and hand it to a person.
 Merge by hand once the review is clean and CI is green:
 
 ```sh
@@ -53,8 +53,8 @@ scripts/pr-review-status.sh <pr-number>   # one-line status; on clean, prints
                                            # the exact merge command to run
 ```
 
-`FLEET_MERGE_AUTO=1` restores the old `gh pr merge --auto --rebase`
-behavior for the rare case that genuinely does not need to wait for a
+`FLEET_MERGE_AUTO=1` enables `gh pr merge --auto --rebase` for the rare
+case that genuinely does not need to wait for a
 review; do not set it out of impatience. The review still arrives, after
 the merge, so sweep it rather than skipping it.
 
@@ -207,17 +207,16 @@ the pinned SHA is the check. Never swap it for a head resolved at merge time
 (`gh pr view --json headRefOid`), which matches whatever the head is by then
 and merges a push that landed after the review.
 
-**A merge queue landed on `protect-main` on 2026-09-13, and it changes what
-that command does.** The PR is added to the queue rather than merged on the
-spot: GitHub rebases it onto current main, runs full CI on the combined result
-(`ci.yml` already carries the `merge_group:` trigger), and lands it only if
-that is green. Consequences here:
+**`protect-main` has a merge queue, so that command enqueues the PR rather
+than merging it on the spot.** GitHub rebases it onto current main, runs full
+CI on the combined result (the `merge_group:` trigger in `ci.yml`), and lands
+it only if that is green. Consequences here:
 
-- **Do not hand-rebase a PR because main moved.** That was how CI was got onto
-  main-plus-PR before, and the queue now does it. Rebasing anyway costs a CI
-  cycle and invalidates the review at head for no gain.
+- **Do not hand-rebase a PR because main moved.** The queue already tests the
+  PR on top of current main. Rebasing anyway costs a CI cycle and invalidates
+  the review at head for no gain.
 - `mergeStateStatus` and the merge-base guard stay worth reading, but a
-  behind-ness count is no longer a reason to act. The guard covers a merge that
+  behind-ness count is not a reason to act. The guard covers a merge that
   bypasses the queue.
 - The PR does not merge the instant the command returns. Poll
   `gh pr view <number> --json state,mergedAt` as under `FLEET_MERGE_AUTO=1`.
@@ -227,16 +226,15 @@ that is green. Consequences here:
 - The queue is `ALLGREEN` and batches up to 5, so one bad PR fails its whole
   batch and the rest requeue. When a batch fails, read which check went red on
   the `merge_group` run, not on the PR.
-- **`--delete-branch` is gone from that command and must not come back.** `gh`
-  refuses it once a queue is enabled ("Cannot use `-d` or `--delete-branch`
-  when merge queue enabled") and fails before merging anything. Nothing is
-  lost: the repository sets `delete_branch_on_merge`, so the `task/<id>/merge`
-  head is removed when the merge lands. `gh` also prints "The merge strategy
-  for main is set by the merge queue", which is informational, not an error.
+- **Do not add `--delete-branch` to that command.** `gh` refuses it while a
+  queue is enabled ("Cannot use `-d` or `--delete-branch` when merge queue
+  enabled") and fails before merging anything. It is not needed: the
+  repository sets `delete_branch_on_merge`, so the `task/<id>/merge` head is
+  removed when the merge lands. `gh` also prints "The merge strategy for main
+  is set by the merge queue", which is informational, not an error.
 
-This removes the `task/$TASK/merge` head once it merges. The script
-deliberately leaves `task/$TASK/result` and `task/$TASK/start` in place
-regardless of merge mode: opening a PR is not landing, and deleting them
+The script deliberately leaves `task/$TASK/result` and `task/$TASK/start` in
+place regardless of merge mode: opening a PR is not landing, and deleting them
 before the checks (and the review wait) finish would mean a failed
 check or an unresolved finding leaves the PR open with no way to recover
 the original result branch.
