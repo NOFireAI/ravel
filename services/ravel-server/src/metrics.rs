@@ -6126,13 +6126,14 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
 
     // The query-audit pipeline's failure and retry counters, read at scrape
     // time (atomic loads). `None` in a mode that installed no pipeline.
-    let audit_pipeline_metrics = state
-        .audit_pipeline
-        .as_ref()
-        .map(|pipeline| AuditPipelineMetrics {
-            write_failures: pipeline.flush_failures(),
-            put_retries: pipeline.put_retries(),
-        });
+    let audit_pipeline_metrics =
+        state
+            .audit_pipeline
+            .as_ref()
+            .map(|pipeline| AuditPipelineMetrics {
+                write_failures: pipeline.flush_failures(),
+                put_retries: pipeline.put_retries(),
+            });
     // The ADR-1170 process memory budget readings (atomic loads), like every
     // other family, rather than baking a snapshot in at construction.
     let memory_budget_snapshot = MemoryBudgetSnapshot {
