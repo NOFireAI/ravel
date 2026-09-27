@@ -64,24 +64,37 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `1 + 7N` requests per flush, which the derived budget does not scale for. An
   explicit `--max-s3-requests` is still used as given.
 - **A request-budget refusal now names fold lag when fold lag is what the
-  budget was spent on** (ADR-1306 decision 6, issue #1306). Each resolve
-  records the unsealed tail it listed live above the fold watermark, and a
-  refusal whose tail is longer than `healthy_tail_max` of the catalog's seal
-  margin (2 h 20 m at the reference margin) appends that tail's length in
+  budget was spent on** (ADR-1306 decision 6 and its 2026-09-27
+  refusal-threshold amendment, issue #1306). Each resolve records the unsealed
+  tail it listed live above the fold watermark, and a refusal whose tail is
+  longer than the engine's `fold_lag_threshold` appends that tail's length in
   seconds and names `ravel_catalog_fold_last_success_timestamp_seconds`, the
   gauge the `RavelCatalogFoldStalled` alert reads, so an operator reading the
-  error goes to the fold rather than to the budget. A refusal with a healthy
-  tail keeps its previous message to the byte. The tail comes from the
+  error goes to the fold rather than to the budget. Every other refusal keeps
+  its previous message to the byte. The threshold is `healthy_tail_max` of the
+  catalog's seal margin plus the fold interval plus the HEAD cache TTL
+  (8,400 + 300 + 30 = 8,730 s at the defaults): a fold leaves at most
+  `healthy_tail_max` unsealed at the instant it runs, then lets the tail grow
+  for one interval, and the HEAD a resolve reads may be one TTL older again,
+  so classifying against `healthy_tail_max` alone would blame a fold that is
+  keeping up for about five minutes of every hour. The tail comes from the
   origins the resolve already produced, never an extra object-store request,
-  and it is a lower bound on `now - end(watermark hour)`, so a catalog whose
-  fold is keeping up is never blamed. Both forms keep their statuses: HTTP 422
-  on the PromQL path, and 422 (gRPC `FailedPrecondition` over Flight SQL) on
-  the SQL path. `EngineConfig` gains `seal_margin`, defaulting to the
-  catalog's compiled-in 1 h + 5 m + 15 m; passing a server's own
-  `CatalogConfig` through to it is a follow-up, so a deployment that has
-  changed those three durations is classified against the default bound until
-  then. On the SQL path the clause is attached at the resolve-boundary check;
-  a SQL refusal raised mid-scan still reads as a plain budget refusal.
+  and it is reported only when that resolve read a folded snapshot part: a
+  resolve that found no usable snapshot lists the whole window live, tags
+  every key as recent including hours the fold has already sealed, and so
+  names nothing. A refusal therefore names fold lag only when the resolve
+  behind it read a snapshot part and the tail above that watermark exceeded
+  the threshold; the rule is conservative the other way, so a stall whose
+  window holds no sealed segment goes unnamed. Both forms keep their statuses:
+  HTTP 422 on the PromQL path, and 422 (gRPC `FailedPrecondition` over Flight
+  SQL) on the SQL path. `EngineConfig` gains `seal_margin`, `fold_interval`
+  and `head_cache_ttl`, defaulting to the catalog's and the server's own
+  compiled-in values; passing a running server's `CatalogConfig` and
+  `FoldTaskConfig` through to them is a follow-up, so a deployment that has
+  changed them is classified against the defaults until then. On the SQL path
+  the clause is attached at the resolve-boundary check only; a SQL refusal
+  raised mid-scan, and the exemplars read's own budget check, still read as
+  plain budget refusals.
 - **The scheduled catalog fold now runs only in `--mode maintain` and
   `--mode all`, and a `maintain` fleet partitions it across its replicas**
   (ADR-1693, issue #1693). A `maintain` process folds only the

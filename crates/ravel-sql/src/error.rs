@@ -244,10 +244,13 @@ pub enum SqlError {
     /// are counts an operator needs, no server state, so it is echoed
     /// verbatim like the other budget errors. `fold_lag` is the same
     /// `ravel_query::FoldLag` the wrapped refusal carried (ADR-1306 decision
-    /// 6): a tail longer than a healthy catalog's renders the tail length and
-    /// the fold-liveness gauge here too, so a SQL caller reads the same cause
-    /// a PromQL caller does. It names no server state either: a duration and a
-    /// metric name.
+    /// 6): a tail longer than a fold that is keeping up can leave renders the
+    /// tail length and the fold-liveness gauge here too, so a SQL caller reads
+    /// the same cause a PromQL caller does. It names no server state either: a
+    /// duration and a metric name. Only the resolve-boundary check in
+    /// `executor.rs` resolves a verdict; the per-segment check in `scan.rs`
+    /// builds its budget from the session config alone and always renders the
+    /// plain message.
     #[error("query issued {requests} S3 requests, exceeding the budget of {max}{fold_lag}")]
     RequestBudgetExceeded {
         requests: u64,
@@ -749,7 +752,7 @@ mod tests {
 
         let lagging = FoldLag::Lagging {
             unsealed_tail: Duration::from_secs(19_800),
-            healthy_tail_max: Duration::from_secs(8_400),
+            fold_lag_threshold: Duration::from_secs(8_730),
         };
         for fold_lag in [lagging, FoldLag::Healthy] {
             let query_err = ravel_query::QueryError::RequestBudgetExceeded {

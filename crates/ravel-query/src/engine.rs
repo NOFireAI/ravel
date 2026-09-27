@@ -2393,7 +2393,7 @@ impl QueryEngine {
             &snapshot,
             &origins,
             now_ns,
-            self.config.seal_margin,
+            self.config.fold_lag_threshold(),
         );
         Ok(ResolvedBounded {
             snapshot,

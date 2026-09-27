@@ -166,7 +166,10 @@ Two related facts bound what any fix here can promise:
 
 6. **The refusal names fold lag when fold lag is the cause.** When a query is
    refused for its request budget and the resolved tail exceeds
-   `healthy_tail_max`, the error text says so. It gives the tail's length and
+   `healthy_tail_max`, the error text says so (the threshold is
+   `healthy_tail_max` plus the fold interval plus the HEAD cache TTL, and the
+   verdict needs a resolve that read a snapshot part; see the 2026-09-27
+   refusal-threshold amendment below). It gives the tail's length and
    names `ravel_catalog_fold_last_success_timestamp_seconds`. The status stays
    422 and the result stays refused. This changes what the operator reads, not
    what the query returns.
@@ -712,3 +715,85 @@ problem, or a fetch shared across selectors; neither is decided here.
   `EngineConfig::default` reference pair, in `docs/query-engine.md` and the
   `--max-s3-requests` help text. The observability guide names the
   multi-selector gap above as a third case the ordering does not cover.
+
+## Amendment (2026-09-27, #1306): the fold-lag refusal threshold adds the fold interval and the HEAD cache TTL
+
+<!-- amendment-applies: sections="Decision" pointer="2026-09-27 refusal-threshold amendment" -->
+
+Decision 6 as written classified a refusal's tail against `healthy_tail_max`
+alone. Two defects follow from that, both found in review of follow-up task 6.
+This amendment corrects the threshold and the precondition; it changes nothing
+about decision 1's `covered_span` or any budget figure, which keep
+`healthy_tail_max` as written.
+
+### `healthy_tail_max` is the tail at fold time, not the tail a resolve sees
+
+`sealed_watermark_hour` (`crates/ravel-catalog/src/fold.rs`) leaves
+`margin + ((T - margin) mod 1 h)` unsealed when a fold runs at `T`, which is
+under `healthy_tail_max` (8,400 s at the reference margin). A resolve does not
+observe the catalog at fold time. Two delays sit between:
+
+- the next fold does not run for one `fold_interval` (`DEFAULT_FOLD_INTERVAL`,
+  300 s, `services/ravel-server/src/fold.rs`), and the tail grows one second
+  per second meanwhile;
+- the watermark a resolve resolves against comes from a HEAD served through a
+  `head_cache_ttl` cache (`DEFAULT_HEAD_CACHE_TTL_NS`, 30 s,
+  `crates/ravel-catalog/src/config.rs`), so it may be that much older again.
+
+So a fold that is keeping up can present a tail of up to about 8,730 s, and the
+original threshold blamed it for roughly the last five minutes of every hour.
+The threshold becomes
+
+```
+fold_lag_threshold = healthy_tail_max + fold_interval + head_cache_ttl
+```
+
+8,400 + 300 + 30 = 8,730 s at the reference inputs. `EngineConfig` gains
+`fold_interval` and `head_cache_ttl` alongside `seal_margin`, each defaulting
+to the constant above; wiring the running server's `FoldTaskConfig` and
+`CatalogConfig` through to all three stays a later task, so a deployment that
+has changed them is classified against the defaults until then.
+
+### A resolve that read no snapshot part has no tail to report
+
+When `Catalog::resolve_impl` finds no usable snapshot for the window (an absent
+HEAD, or parts that were corrupt or unreadable) it lists the whole window live
+and tags every key `SegmentOrigin::Recent`, including hours a fold that is
+keeping up has already sealed. The tail those tags imply is then not a lower
+bound on `now - end(watermark hour)` at all, and a healthy catalog reads as
+hours of lag.
+
+`ravel-query` cannot distinguish "no snapshot existed" from "a snapshot existed
+and could not be read" without a change to `ravel-catalog`, which this task's
+scope does not cover. It can tell whether THIS resolve read a snapshot part at
+all, from outputs it already holds and with no extra store request:
+`SegmentOrigins::sealed_count > 0` (only the snapshot-extract step assigns
+`SealedBelowWatermark`; the read-your-write token paths assign
+`TokenResolved`), or `Snapshot::segments_pruned > 0` (postings pruning applies
+to snapshot-sourced segments only). When neither fired, the verdict is
+`Healthy` and the refusal keeps its plain wording.
+
+That is deliberately conservative in one direction. A resolve whose window
+holds no sealed segment under the watermark also reports `Healthy`, so a real
+stall can go unnamed; the failure mode it removes is the opposite one, blaming
+a fold that is fine. A tighter rule needs the catalog to report whether a
+snapshot was used, which is not decided here.
+
+### What the refusal now guarantees
+
+The wording the code and the docs may claim is exactly this: a refusal names
+fold lag only when the resolve behind it read a folded snapshot part and the
+tail above that snapshot's watermark exceeded `fold_lag_threshold`. The
+stronger claim decision 6 shipped with, that a catalog whose fold is keeping up
+is never blamed, was not true of either defect above and is true of the
+corrected rule.
+
+### Coverage on the SQL path is unchanged and now stated
+
+Only the resolve-boundary check in `crates/ravel-sql/src/executor.rs` has a
+resolve verdict in hand, so it is the only SQL refusal that names fold lag. The
+per-segment check in `crates/ravel-sql/src/scan.rs` builds its budget from the
+session config, and the exemplars read
+(`services/ravel-server/src/exemplars.rs`) checks a bare `RequestLimit`; both
+render the plain message. `docs/query-engine.md` states this rather than
+leaving a reader to infer it from a refusal that did not name the gauge.

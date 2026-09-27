@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use ravel_catalog::CatalogError;
 
-use crate::config::{SealMargin, healthy_tail_max};
 use crate::fetcher::FetchError;
 
 /// The per-signal catalog fold-liveness gauge `ravel-server` renders
@@ -21,41 +20,49 @@ pub const FOLD_LAST_SUCCESS_GAUGE: &str = "ravel_catalog_fold_last_success_times
 /// tail, carried into a request-budget refusal (ADR-1306 decision 6).
 ///
 /// The tail is the span from the newest sealed ingest hour to query time. A
-/// healthy fold keeps it under [`healthy_tail_max`] of the catalog's seal
-/// margin; past that the fold is behind, the tail (not the query) is what made
-/// the query expensive, and the refusal says so. A resolve that listed no
-/// unsealed data at all is [`FoldLag::Healthy`]: there is no tail to blame.
+/// fold that is keeping up holds it under
+/// [`crate::config::fold_lag_tail_threshold`]: `healthy_tail_max` of the
+/// catalog's seal margin, plus the fold interval it waits between cycles, plus
+/// the HEAD cache TTL the resolve reads the watermark through. Past that the
+/// fold is behind, the tail (not the query) is what made the query expensive,
+/// and the refusal says so. A resolve that listed no unsealed data above a
+/// watermark it actually read is [`FoldLag::Healthy`]: there is no tail it can
+/// attribute to the fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FoldLag {
-    /// The resolved tail was at or under `healthy_tail_max`, or the resolve
-    /// saw no unsealed data. The refusal keeps its pre-ADR-1306 wording.
+    /// The resolved tail was at or under the fold-lag threshold, or the
+    /// resolve produced no tail it could attribute to the fold. The refusal
+    /// keeps its pre-ADR-1306 wording.
     #[default]
     Healthy,
-    /// The resolved tail was longer than a healthy catalog carries.
+    /// The resolved tail was longer than a fold that is keeping up can leave.
     Lagging {
         unsealed_tail: Duration,
-        healthy_tail_max: Duration,
+        /// The [`crate::config::fold_lag_tail_threshold`] the tail passed.
+        fold_lag_threshold: Duration,
     },
 }
 
 impl FoldLag {
-    /// Classifies a resolve's unsealed tail against [`healthy_tail_max`] of
-    /// the seal margin the engine is configured with. `None` (no unsealed data
-    /// resolved) and a tail inside the healthy bound are both
-    /// [`FoldLag::Healthy`].
+    /// Classifies a resolve's unsealed tail against the engine's
+    /// [`crate::config::fold_lag_tail_threshold`]. `None` (no tail this
+    /// resolve can attribute to the fold) and a tail at or inside the
+    /// threshold are both [`FoldLag::Healthy`].
     #[must_use]
-    pub fn from_resolved_tail(unsealed_tail: Option<Duration>, seal_margin: SealMargin) -> FoldLag {
-        let healthy = healthy_tail_max(seal_margin);
+    pub fn from_resolved_tail(
+        unsealed_tail: Option<Duration>,
+        fold_lag_threshold: Duration,
+    ) -> FoldLag {
         match unsealed_tail {
-            Some(tail) if tail > healthy => FoldLag::Lagging {
+            Some(tail) if tail > fold_lag_threshold => FoldLag::Lagging {
                 unsealed_tail: tail,
-                healthy_tail_max: healthy,
+                fold_lag_threshold,
             },
             _ => FoldLag::Healthy,
         }
     }
 
-    /// True when the resolved tail exceeded `healthy_tail_max`.
+    /// True when the resolved tail exceeded the fold-lag threshold.
     #[must_use]
     pub fn is_lagging(&self) -> bool {
         matches!(self, FoldLag::Lagging { .. })
@@ -72,14 +79,14 @@ impl fmt::Display for FoldLag {
             FoldLag::Healthy => Ok(()),
             FoldLag::Lagging {
                 unsealed_tail,
-                healthy_tail_max,
+                fold_lag_threshold,
             } => write!(
                 f,
-                "; the catalog's unsealed tail is {} s, longer than the {} s a folding catalog \
-                 carries, so the fold is behind and the tail is what the budget was spent on: \
-                 check {FOLD_LAST_SUCCESS_GAUGE} before raising the budget",
+                "; the catalog's unsealed tail is {} s, longer than the {} s a catalog whose \
+                 fold is keeping up can show, so the fold is behind and the tail is what the \
+                 budget was spent on: check {FOLD_LAST_SUCCESS_GAUGE} before raising the budget",
                 unsealed_tail.as_secs(),
-                healthy_tail_max.as_secs()
+                fold_lag_threshold.as_secs()
             ),
         }
     }
@@ -139,10 +146,11 @@ pub enum QueryError {
     TooManySliceBytes { bytes: u64, max: u64 },
     /// The per-query object-store request budget was exhausted. `fold_lag`
     /// carries what the resolve saw of the catalog's unsealed tail (ADR-1306
-    /// decision 6): a tail longer than a healthy catalog's appends the tail
-    /// length and the fold-liveness gauge to the message, so an operator reads
-    /// the refusal as fold lag rather than as a budget that is too small. A
-    /// healthy tail renders nothing and keeps the pre-ADR-1306 message.
+    /// decision 6): a tail longer than a fold that is keeping up can leave
+    /// appends the tail length and the fold-liveness gauge to the message, so
+    /// an operator reads the refusal as fold lag rather than as a budget that
+    /// is too small. Any other verdict renders nothing and keeps the
+    /// pre-ADR-1306 message.
     #[error("query issued {requests} S3 requests, exceeding the budget of {max}{fold_lag}")]
     RequestBudgetExceeded {
         requests: u64,
