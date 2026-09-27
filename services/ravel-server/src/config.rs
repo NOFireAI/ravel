@@ -1590,6 +1590,22 @@ pub struct Cli {
     #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
     pub catalog_resolve_concurrency: Option<usize>,
 
+    /// Jobs the read CPU gate runs at once (ADR-1702 decision 3): query,
+    /// catalog and maintenance decode above the gate's inline floor, each on
+    /// a blocking-pool thread holding one permit. Unset, it is
+    /// `max(1, cores - 1)`. Lower it on a node shared with other CPU-heavy
+    /// work. `0` is rejected at startup, because a zero-permit gate would
+    /// never run a job.
+    #[arg(long = "cpu-gate-read-permits", value_name = "COUNT")]
+    pub cpu_gate_read_permits: Option<usize>,
+
+    /// Jobs the write CPU gate runs at once (ADR-1702 decision 3): flush
+    /// encode and ingest payload decode, kept on a separate gate so a burst
+    /// of wide scans cannot delay the flushes acknowledgements wait on.
+    /// Unset, it is `max(1, cores / 2)`. `0` is rejected at startup.
+    #[arg(long = "cpu-gate-write-permits", value_name = "COUNT")]
+    pub cpu_gate_write_permits: Option<usize>,
+
     /// Disables every ADR-0046 read cache in the process entirely: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
     /// (`query::build_catalog`) both, not just the fetcher cache.
@@ -2604,6 +2620,34 @@ pub fn derive_catalog_resolve_concurrency(q: usize) -> usize {
             ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY,
         )
         .min(INTERIM_CATALOG_RESOLVE_CEILING)
+}
+
+/// The resolved permit counts of the two ADR-1702 CPU gates, from
+/// [`Cli::resolve_cpu_gate_permits`]. `Default` is the one-core derivation,
+/// one permit each, which is what a test that builds a `ServerConfig` by hand
+/// gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuGatePermits {
+    /// `--cpu-gate-read-permits`, or `max(1, cores - 1)`.
+    pub read: usize,
+    /// `--cpu-gate-write-permits`, or `max(1, cores / 2)`.
+    pub write: usize,
+}
+
+impl CpuGatePermits {
+    /// Both gates at their ADR-1702 decision 3 defaults for `cores`.
+    pub fn derive(cores: usize) -> Self {
+        CpuGatePermits {
+            read: ravel_cpu_gate::default_read_permits(cores),
+            write: ravel_cpu_gate::default_write_permits(cores),
+        }
+    }
+}
+
+impl Default for CpuGatePermits {
+    fn default() -> Self {
+        CpuGatePermits::derive(1)
+    }
 }
 
 /// Provisional placeholder for the overhead reserve subtracted from
@@ -4612,6 +4656,17 @@ impl Cli {
         }
     }
 
+    /// Resolve the two CPU gates' permit counts (ADR-1702 decision 3): each
+    /// flag verbatim when set, otherwise the core-count derivation for
+    /// `host`. A `0` is refused by [`Self::validate`], not clamped here.
+    pub fn resolve_cpu_gate_permits(&self, host: HostProfile) -> CpuGatePermits {
+        let derived = CpuGatePermits::derive(host.cores);
+        CpuGatePermits {
+            read: self.cpu_gate_read_permits.unwrap_or(derived.read),
+            write: self.cpu_gate_write_permits.unwrap_or(derived.write),
+        }
+    }
+
     /// Resolve the per-query S3 request budget (ADR-0075). An explicit
     /// `--max-s3-requests` is used verbatim; otherwise the budget is DERIVED
     /// from `--shards` and the ingest pipeline's actually-configured flush
@@ -5250,6 +5305,19 @@ impl Cli {
                  smaller count.",
                 ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY
             );
+        }
+
+        for (flag, permits) in [
+            ("--cpu-gate-read-permits", self.cpu_gate_read_permits),
+            ("--cpu-gate-write-permits", self.cpu_gate_write_permits),
+        ] {
+            if permits == Some(0) {
+                anyhow::bail!(
+                    "{flag} '0' would never run a gated job: a zero-permit gate can never \
+                     be acquired. Omit the flag to derive it from the core count, or set a \
+                     positive count."
+                );
+            }
         }
 
         // ADR-0076 decision 4: parsed and range-checked here so a malformed
@@ -10845,6 +10913,50 @@ mod tests {
             err.to_string().contains("--catalog-resolve-concurrency"),
             "expected the catalog-resolve-concurrency error, got: {err}"
         );
+    }
+
+    /// ADR-1702 decision 3: unset, the read gate takes `max(1, cores - 1)`
+    /// and the write gate `max(1, cores / 2)`; a flag replaces only its own
+    /// gate's derivation.
+    #[test]
+    fn cpu_gate_permits_derive_from_cores_unless_a_flag_is_set() {
+        let host = HostProfile::new(8, None);
+        let unset = Cli::try_parse_from(["ravel-server"]).expect("parses");
+        assert_eq!(
+            unset.resolve_cpu_gate_permits(host),
+            CpuGatePermits { read: 7, write: 4 }
+        );
+        assert_eq!(
+            unset.resolve_cpu_gate_permits(HostProfile::new(1, None)),
+            CpuGatePermits { read: 1, write: 1 }
+        );
+        let read_only =
+            Cli::try_parse_from(["ravel-server", "--cpu-gate-read-permits", "3"]).expect("parses");
+        assert_eq!(
+            read_only.resolve_cpu_gate_permits(host),
+            CpuGatePermits { read: 3, write: 4 }
+        );
+        let write_only =
+            Cli::try_parse_from(["ravel-server", "--cpu-gate-write-permits", "9"]).expect("parses");
+        assert_eq!(
+            write_only.resolve_cpu_gate_permits(host),
+            CpuGatePermits { read: 7, write: 9 }
+        );
+    }
+
+    #[test]
+    fn cpu_gate_permits_zero_is_rejected_at_startup() {
+        for flag in ["--cpu-gate-read-permits", "--cpu-gate-write-permits"] {
+            let cli = Cli::try_parse_from(["ravel-server", flag, "0"])
+                .expect("flag parses at the CLI layer");
+            let err = cli
+                .validate()
+                .expect_err("startup must reject a zero-permit CPU gate");
+            assert!(
+                err.to_string().contains(flag),
+                "expected the {flag} error, got: {err}"
+            );
+        }
     }
 
     /// `--audit-max-batch 0` must be rejected here, at `Cli::validate`, not

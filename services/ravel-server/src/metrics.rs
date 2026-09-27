@@ -11,10 +11,10 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly eighteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, `level`, `reason`, `shard`, `cache`, `tier`,
-//! `kind`, `outcome`, `allocator`, `stat`, `component`, `class`, and `carrier`
-//! (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
+//! renders exactly twenty-one label keys: `tenant_hash`, `signal`, `mode`,
+//! `op`, `error_kind`, `workload_class`, `level`, `reason`, `shard`, `cache`,
+//! `tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`,
+//! `carrier`, `gate`, `site`, and `worker` (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
 //! seal-divergence family, `shard` added by ADR-1692 decision 2 as the ninth
 //! key for the per-shard ingest-skew family, `cache` to split the read-cache
@@ -28,14 +28,18 @@
 //! process memory budget's reserved-bytes gauge by which side reserved it,
 //! `class` added by ADR-0071's admission disjointness deliverable (issue
 //! #1722) to split the fragment in-flight gauge and admission-wait counters
-//! into their `Pinned` and `Resolve` classes, and `carrier` added by
+//! into their `Pinned` and `Resolve` classes, `carrier` added by
 //! ADR-0873 decision 2 to split the declared-statistics drop tally across
-//! its four carriers). The eighteen keys come from twenty-one `Label`
-//! variants, because three pairs share a key: `RejectReason` and
-//! `ScrubReason` both render `reason`, `Level` (log/tracing severity) and
-//! `ScrubLevel` (issue #1686, which part of the commit lineage --
-//! `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`, and
-//! `MergeMemoryKind` and `DeletedObjectKind` both render `kind`.
+//! its four carriers, and `gate`, `site` and `worker` added by ADR-1702
+//! decision 11 for the CPU gate and tokio runtime families). The twenty-one
+//! keys come from twenty-six `Label` variants, because some variants share a
+//! key: `RejectReason`, `ScrubReason` and `ScrubUnreadableReason` all render
+//! `reason`, `Level` (log/tracing severity) and `ScrubLevel` (issue #1686,
+//! which part of the commit lineage -- `l0`/`l1`/`rewrite` -- a scrub target
+//! came from) both render `level`, `MergeMemoryKind` and `DeletedObjectKind`
+//! both render `kind`, and `ReadGateSite` and `WriteGateSite` both render
+//! `site`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
+//! only constructor.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
@@ -325,6 +329,22 @@ pub enum Label {
     /// at" is the question a nonzero drop tally asks and the answer has to
     /// name the carrier the ADR names.
     StatCarrier(ravel_commit::declared_stats::StatCarrier),
+    /// Which ADR-1702 CPU gate a `ravel_cpu_gate_*` sample belongs to:
+    /// `read` or `write`. A closed enum owned by [`ravel_cpu_gate`].
+    CpuGate(ravel_cpu_gate::GateKind),
+    /// Which read-gate call site a `ravel_cpu_gate_jobs_total` or
+    /// `ravel_cpu_gate_inline_total` sample counts. A closed enum owned by
+    /// [`ravel_cpu_gate`]; shares the `site` key with [`Label::WriteGateSite`].
+    ReadGateSite(ravel_cpu_gate::ReadSite),
+    /// Which write-gate call site a per-site CPU gate sample counts. Shares the
+    /// `site` key with [`Label::ReadGateSite`].
+    WriteGateSite(ravel_cpu_gate::WriteSite),
+    /// One tokio runtime worker index of
+    /// `ravel_runtime_worker_busy_seconds_total` (ADR-1702 decision 11). A bare
+    /// `u32` like [`Label::Shard`], bounded the same way: [`Label::runtime_worker`]
+    /// is the only constructor and refuses any index at or above the runtime's
+    /// worker count, which is fixed when the runtime is built.
+    RuntimeWorker(u32),
 }
 
 /// Which high-water mark a `ravel_maintain_rlog_merge_peak_bytes` sample is
@@ -493,6 +513,10 @@ impl Label {
             Label::MemoryComponent(_) => "component",
             Label::AdmissionClass(_) => "class",
             Label::StatCarrier(_) => "carrier",
+            Label::CpuGate(_) => "gate",
+            Label::ReadGateSite(_) => "site",
+            Label::WriteGateSite(_) => "site",
+            Label::RuntimeWorker(_) => "worker",
         }
     }
 
@@ -520,6 +544,10 @@ impl Label {
             Label::MemoryComponent(component) => component.name().to_string(),
             Label::AdmissionClass(class) => admission_class_name(*class).to_string(),
             Label::StatCarrier(carrier) => carrier.label().to_string(),
+            Label::CpuGate(gate) => gate.name().to_string(),
+            Label::ReadGateSite(site) => ravel_cpu_gate::GateSite::name(*site).to_string(),
+            Label::WriteGateSite(site) => ravel_cpu_gate::GateSite::name(*site).to_string(),
+            Label::RuntimeWorker(index) => index.to_string(),
         }
     }
 
@@ -529,6 +557,15 @@ impl Label {
     /// the scrape.
     pub fn shard(index: u32) -> Option<Label> {
         (index < ravel_catalog::MAX_SHARD_COUNT).then_some(Label::Shard(index))
+    }
+
+    /// Bounded constructor for [`Label::RuntimeWorker`]: refuses any index at
+    /// or above `workers`, the runtime's fixed worker count.
+    pub fn runtime_worker(index: usize, workers: usize) -> Option<Label> {
+        if index >= workers {
+            return None;
+        }
+        u32::try_from(index).ok().map(Label::RuntimeWorker)
     }
 }
 
@@ -2473,6 +2510,274 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
         &[Label::Mode(mode)],
         budget.handoff_overlap,
     );
+}
+
+/// Both ADR-1702 CPU gates' counters, read once per scrape.
+#[derive(Debug, Clone)]
+pub struct CpuGatesSnapshot {
+    pub read: ravel_cpu_gate::CpuGateSnapshot<ravel_cpu_gate::ReadSite>,
+    pub write: ravel_cpu_gate::CpuGateSnapshot<ravel_cpu_gate::WriteSite>,
+}
+
+impl CpuGatesSnapshot {
+    pub fn from_gates(gates: &crate::cpu_gates::CpuGates) -> Self {
+        CpuGatesSnapshot {
+            read: gates.read.snapshot(),
+            write: gates.write.snapshot(),
+        }
+    }
+}
+
+/// One gate's whole-gate figures, with its site samples already labelled, so
+/// [`render_cpu_gate_family`] writes each family's header once and then one
+/// sample per gate beneath it.
+struct CpuGateRow {
+    gate: Label,
+    permits: u64,
+    running: u64,
+    queued: u64,
+    wait_nanos_sum: u64,
+    wait_count: u64,
+    run_nanos_sum: u64,
+    run_count: u64,
+    abandoned: u64,
+    sites: Vec<CpuGateSiteRow>,
+}
+
+/// One call site's per-site counters, with its `site` label.
+struct CpuGateSiteRow {
+    site: Label,
+    jobs: u64,
+    inline: u64,
+}
+
+/// Reads one whole-gate figure off a [`CpuGateRow`].
+type GateFigure = fn(&CpuGateRow) -> u64;
+/// Reads one summary's nanosecond sum and count off a [`CpuGateRow`].
+type GateSumCount = fn(&CpuGateRow) -> (u64, u64);
+/// Reads one per-site figure off a [`CpuGateSiteRow`].
+type SiteFigure = fn(&CpuGateSiteRow) -> u64;
+
+impl CpuGateRow {
+    fn new<S: ravel_cpu_gate::GateSite>(
+        snapshot: &ravel_cpu_gate::CpuGateSnapshot<S>,
+        site_label: fn(S) -> Label,
+    ) -> Self {
+        CpuGateRow {
+            gate: Label::CpuGate(snapshot.gate),
+            permits: u64::try_from(snapshot.permits).unwrap_or(u64::MAX),
+            running: snapshot.running,
+            queued: snapshot.queued,
+            wait_nanos_sum: snapshot.wait_nanos_sum,
+            wait_count: snapshot.wait_count,
+            run_nanos_sum: snapshot.run_nanos_sum,
+            run_count: snapshot.run_count,
+            abandoned: snapshot.abandoned,
+            sites: snapshot
+                .sites
+                .iter()
+                .map(|site| CpuGateSiteRow {
+                    site: site_label(site.site),
+                    jobs: site.jobs,
+                    inline: site.inline,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The ADR-1702 decision 11 CPU gate families. Every sample carries `{mode,
+/// gate}`; the two per-site counters add `site`, one sample for every site in
+/// that gate's closed set, zero included. A rising mean wait
+/// (`wait_seconds_sum / wait_seconds_count` over a window) with `running` at
+/// `permits` means the node is CPU-bound on decode.
+///
+/// The wait and run pairs are summaries with no quantiles: `_sum` and
+/// `_count` under one `summary` header, the shape Prometheus reads a mean
+/// from. A wait is counted when it ends with a permit, so a waiter dropped in
+/// the queue adds to neither. `abandoned_total` counts started jobs whose
+/// waiter was gone when they returned.
+fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot) {
+    let rows = [
+        CpuGateRow::new(&gates.read, Label::ReadGateSite),
+        CpuGateRow::new(&gates.write, Label::WriteGateSite),
+    ];
+    let nanos_to_seconds = |nanos: u64| nanos as f64 / 1_000_000_000.0;
+    let gauges: [(&str, &str, GateFigure); 3] = [
+        (
+            "ravel_cpu_gate_permits",
+            "Jobs this CPU gate may run at once (--cpu-gate-read-permits, --cpu-gate-write-permits).",
+            |row| row.permits,
+        ),
+        (
+            "ravel_cpu_gate_running",
+            "Jobs holding a CPU gate permit right now, including a job whose waiter is gone.",
+            |row| row.running,
+        ),
+        (
+            "ravel_cpu_gate_queued",
+            "Callers waiting for a CPU gate permit right now.",
+            |row| row.queued,
+        ),
+    ];
+    for (name, help, value) in gauges {
+        write_header(out, name, help, "gauge");
+        for row in &rows {
+            write_sample(
+                out,
+                name,
+                &[Label::Mode(mode), row.gate.clone()],
+                value(row),
+            );
+        }
+    }
+
+    let summaries: [(&str, &str, GateSumCount); 2] = [
+        (
+            "ravel_cpu_gate_wait_seconds",
+            "Time callers waited for a CPU gate permit, over waits that got one.",
+            |row| (row.wait_nanos_sum, row.wait_count),
+        ),
+        (
+            "ravel_cpu_gate_run_seconds",
+            "Time CPU gate jobs ran on the blocking pool.",
+            |row| (row.run_nanos_sum, row.run_count),
+        ),
+    ];
+    for (name, help, value) in summaries {
+        write_header(out, name, help, "summary");
+        let sum_name = format!("{name}_sum");
+        let count_name = format!("{name}_count");
+        for row in &rows {
+            let (nanos, count) = value(row);
+            let labels = [Label::Mode(mode), row.gate.clone()];
+            write_sample_f64(out, &sum_name, &labels, nanos_to_seconds(nanos));
+            write_sample(out, &count_name, &labels, count);
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_cpu_gate_abandoned_total",
+        "CPU gate jobs that ran to completion after their caller stopped waiting; the result was discarded.",
+        "counter",
+    );
+    for row in &rows {
+        write_sample(
+            out,
+            "ravel_cpu_gate_abandoned_total",
+            &[Label::Mode(mode), row.gate.clone()],
+            row.abandoned,
+        );
+    }
+
+    let per_site: [(&str, &str, SiteFigure); 2] = [
+        (
+            "ravel_cpu_gate_jobs_total",
+            "Jobs a call site ran on the blocking pool through a CPU gate permit.",
+            |site| site.jobs,
+        ),
+        (
+            "ravel_cpu_gate_inline_total",
+            "Jobs a call site ran inline because they were below the CPU gate's inline floor.",
+            |site| site.inline,
+        ),
+    ];
+    for (name, help, value) in per_site {
+        write_header(out, name, help, "counter");
+        for row in &rows {
+            for site in &row.sites {
+                write_sample(
+                    out,
+                    name,
+                    &[Label::Mode(mode), row.gate.clone(), site.site.clone()],
+                    value(site),
+                );
+            }
+        }
+    }
+}
+
+/// The stable tokio `RuntimeMetrics` figures ADR-1702 decision 11 names, read
+/// from the runtime serving the scrape. `worker_busy_nanos` is `None` on a
+/// target without 64-bit atomics, where tokio does not provide it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    pub workers: usize,
+    pub alive_tasks: usize,
+    pub global_queue_depth: usize,
+    pub worker_busy_nanos: Option<Vec<u64>>,
+}
+
+impl RuntimeSnapshot {
+    /// The current runtime's figures, or `None` outside a runtime.
+    pub fn current() -> Option<Self> {
+        let metrics = tokio::runtime::Handle::try_current().ok()?.metrics();
+        let workers = metrics.num_workers();
+        #[cfg(target_has_atomic = "64")]
+        let worker_busy_nanos = Some(
+            (0..workers)
+                .map(|worker| {
+                    u64::try_from(metrics.worker_total_busy_duration(worker).as_nanos())
+                        .unwrap_or(u64::MAX)
+                })
+                .collect(),
+        );
+        #[cfg(not(target_has_atomic = "64"))]
+        let worker_busy_nanos = None;
+        Some(RuntimeSnapshot {
+            workers,
+            alive_tasks: metrics.num_alive_tasks(),
+            global_queue_depth: metrics.global_queue_depth(),
+            worker_busy_nanos,
+        })
+    }
+}
+
+/// The ADR-1702 decision 11 tokio runtime families, all `{mode}` except the
+/// per-worker busy counter, which adds a `worker` index bounded by the
+/// runtime's worker count. Omitted when the scrape runs outside a runtime.
+fn render_runtime_family(out: &mut String, mode: Mode, runtime: &RuntimeSnapshot) {
+    let to_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    for (name, help, value) in [
+        (
+            "ravel_runtime_workers",
+            "Worker threads of the tokio runtime serving this process.",
+            runtime.workers,
+        ),
+        (
+            "ravel_runtime_alive_tasks",
+            "Tasks alive on the tokio runtime right now.",
+            runtime.alive_tasks,
+        ),
+        (
+            "ravel_runtime_global_queue_depth",
+            "Tasks waiting in the tokio runtime's global queue right now.",
+            runtime.global_queue_depth,
+        ),
+    ] {
+        write_header(out, name, help, "gauge");
+        write_sample(out, name, &[Label::Mode(mode)], to_u64(value));
+    }
+
+    if let Some(busy) = &runtime.worker_busy_nanos {
+        write_header(
+            out,
+            "ravel_runtime_worker_busy_seconds_total",
+            "Time each tokio runtime worker spent busy, cumulative.",
+            "counter",
+        );
+        for (index, nanos) in busy.iter().enumerate() {
+            if let Some(worker) = Label::runtime_worker(index, runtime.workers) {
+                write_sample_f64(
+                    out,
+                    "ravel_runtime_worker_busy_seconds_total",
+                    &[Label::Mode(mode), worker],
+                    *nanos as f64 / 1_000_000_000.0,
+                );
+            }
+        }
+    }
 }
 
 /// The logs prune-selectivity family (ADR-0049):
@@ -5886,6 +6191,10 @@ pub struct MetricsState {
     /// rather than the raw near-miss remainder. See
     /// [`exposed_memory_budget_limit`].
     pub process_memory_budget_is_fallback: bool,
+    /// The ADR-1702 read and write CPU gates, the same handles every gated
+    /// call site holds. Always present: `crate::start` builds both in every
+    /// mode, so the `ravel_cpu_gate_*` families render in every mode.
+    pub cpu_gates: crate::cpu_gates::CpuGates,
     /// Whether a catalog fold can run in this process at all, by either
     /// route: the background fold task, or the on-demand
     /// `POST /api/v1/admin/fold` route. Computed by
@@ -6147,7 +6456,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         handoff_overlap: state.process_memory_budget.handoff_overlap(),
     };
 
-    let body = render(
+    let mut body = render(
         state.mode,
         &store_snapshot,
         &pipelines,
@@ -6178,6 +6487,18 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         memory_budget_snapshot,
         state.can_fold,
     );
+    // Appended after `render` rather than threaded through it: the CPU gate
+    // and runtime figures are read here, at scrape time, like every other
+    // family, and `render`'s positional signature is shared by every render
+    // test in this module.
+    render_cpu_gate_family(
+        &mut body,
+        state.mode,
+        &CpuGatesSnapshot::from_gates(&state.cpu_gates),
+    );
+    if let Some(runtime) = RuntimeSnapshot::current() {
+        render_runtime_family(&mut body, state.mode, &runtime);
+    }
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -6342,7 +6663,9 @@ mod tests {
         // in-flight gauge and admission-wait counters into their `Pinned`
         // and `Resolve` classes; `carrier` is the eighteenth, added by
         // ADR-0873 decision 2 to split the declared-statistics drop tally
-        // across its four carriers.
+        // across its four carriers; `gate`, `site` and `worker` are the
+        // nineteenth to twenty-first, added by ADR-1702 decision 11 for the
+        // CPU gate and tokio runtime families.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -6366,6 +6689,10 @@ mod tests {
             Label::MemoryComponent(MemoryComponent::Sql),
             Label::AdmissionClass(crate::distrib::AdmissionClass::Pinned),
             Label::StatCarrier(ravel_commit::declared_stats::StatCarrier::CommitRecord),
+            Label::CpuGate(ravel_cpu_gate::GateKind::Read),
+            Label::ReadGateSite(ravel_cpu_gate::ReadSite::CatalogPart),
+            Label::WriteGateSite(ravel_cpu_gate::WriteSite::MetricsFlush),
+            Label::RuntimeWorker(0),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -6392,6 +6719,10 @@ mod tests {
                 Label::MemoryComponent(_) => "component",
                 Label::AdmissionClass(_) => "class",
                 Label::StatCarrier(_) => "carrier",
+                Label::CpuGate(_) => "gate",
+                Label::ReadGateSite(_) => "site",
+                Label::WriteGateSite(_) => "site",
+                Label::RuntimeWorker(_) => "worker",
             })
             .collect();
         assert_eq!(
@@ -6433,20 +6764,134 @@ mod tests {
                 "component",
                 "class",
                 "carrier",
+                "gate",
+                "site",
+                // WriteGateSite (ADR-1702 decision 11) reuses the `site` key,
+                // so two variants map to it.
+                "site",
+                "worker",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
              for the per-shard ingest skew family, the `cache` label, #97's `tier` \
              label, ADR-0065 decision 4's `kind` (also reused by issue #1729's deleted-objects \
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
-             `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, and \
-             issue #1686's `level` reuse by `ScrubLevel`"
+             `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, \
+             ADR-1702 decision 11's `gate`/`site`/`worker`, and issue #1686's `level` reuse by \
+             `ScrubLevel`"
         );
         assert_eq!(
             one_of_each.len(),
-            22,
-            "exactly 22 label variants, 18 distinct keys"
+            26,
+            "exactly 26 label variants, 21 distinct keys"
         );
+        assert_eq!(
+            keys.iter().collect::<HashSet<_>>().len(),
+            21,
+            "exactly 21 distinct keys"
+        );
+    }
+
+    /// Every ADR-1702 decision 11 family renders exactly one header, and each
+    /// sample carries the figure of the snapshot field it names under exactly
+    /// `{mode, gate}` (plus `site`, or `worker` for the runtime busy counter).
+    #[test]
+    fn cpu_gate_and_runtime_families_render_each_name_once() {
+        let gates =
+            crate::cpu_gates::CpuGates::new(crate::config::CpuGatePermits { read: 7, write: 3 });
+        let mut snapshot = CpuGatesSnapshot::from_gates(&gates);
+        snapshot.read.running = 5;
+        snapshot.read.queued = 2;
+        snapshot.read.wait_nanos_sum = 1_500_000_000;
+        snapshot.read.wait_count = 4;
+        snapshot.read.abandoned = 1;
+        snapshot.read.sites[0].jobs = 9;
+        snapshot.read.sites[0].inline = 6;
+        snapshot.write.run_nanos_sum = 250_000_000;
+        snapshot.write.run_count = 2;
+        snapshot.write.sites[5].jobs = 8;
+        let runtime = RuntimeSnapshot {
+            workers: 2,
+            alive_tasks: 11,
+            global_queue_depth: 4,
+            worker_busy_nanos: Some(vec![500_000_000, 2_000_000_000]),
+        };
+
+        let mut body = String::new();
+        render_cpu_gate_family(&mut body, Mode::All, &snapshot);
+        render_runtime_family(&mut body, Mode::All, &runtime);
+
+        for (family, kind) in [
+            ("ravel_cpu_gate_permits", "gauge"),
+            ("ravel_cpu_gate_running", "gauge"),
+            ("ravel_cpu_gate_queued", "gauge"),
+            ("ravel_cpu_gate_wait_seconds", "summary"),
+            ("ravel_cpu_gate_run_seconds", "summary"),
+            ("ravel_cpu_gate_abandoned_total", "counter"),
+            ("ravel_cpu_gate_jobs_total", "counter"),
+            ("ravel_cpu_gate_inline_total", "counter"),
+            ("ravel_runtime_workers", "gauge"),
+            ("ravel_runtime_alive_tasks", "gauge"),
+            ("ravel_runtime_global_queue_depth", "gauge"),
+            ("ravel_runtime_worker_busy_seconds_total", "counter"),
+        ] {
+            let header = format!("# TYPE {family} {kind}\n");
+            assert_eq!(
+                body.matches(&header).count(),
+                1,
+                "{header:?} must appear exactly once:\n{body}"
+            );
+        }
+
+        for line in [
+            "ravel_cpu_gate_permits{mode=\"all\",gate=\"read\"} 7",
+            "ravel_cpu_gate_permits{mode=\"all\",gate=\"write\"} 3",
+            "ravel_cpu_gate_running{mode=\"all\",gate=\"read\"} 5",
+            "ravel_cpu_gate_running{mode=\"all\",gate=\"write\"} 0",
+            "ravel_cpu_gate_queued{mode=\"all\",gate=\"read\"} 2",
+            "ravel_cpu_gate_wait_seconds_sum{mode=\"all\",gate=\"read\"} 1.5",
+            "ravel_cpu_gate_wait_seconds_count{mode=\"all\",gate=\"read\"} 4",
+            "ravel_cpu_gate_run_seconds_sum{mode=\"all\",gate=\"write\"} 0.25",
+            "ravel_cpu_gate_run_seconds_count{mode=\"all\",gate=\"write\"} 2",
+            "ravel_cpu_gate_abandoned_total{mode=\"all\",gate=\"read\"} 1",
+            "ravel_cpu_gate_abandoned_total{mode=\"all\",gate=\"write\"} 0",
+            "ravel_cpu_gate_jobs_total{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 9",
+            "ravel_cpu_gate_inline_total{mode=\"all\",gate=\"read\",site=\"catalog_part\"} 6",
+            "ravel_cpu_gate_jobs_total{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 8",
+            "ravel_cpu_gate_inline_total{mode=\"all\",gate=\"write\",site=\"remote_write_snappy\"} 0",
+            "ravel_runtime_workers{mode=\"all\"} 2",
+            "ravel_runtime_alive_tasks{mode=\"all\"} 11",
+            "ravel_runtime_global_queue_depth{mode=\"all\"} 4",
+            "ravel_runtime_worker_busy_seconds_total{mode=\"all\",worker=\"0\"} 0.5",
+            "ravel_runtime_worker_busy_seconds_total{mode=\"all\",worker=\"1\"} 2",
+        ] {
+            assert_eq!(
+                body.lines().filter(|rendered| *rendered == line).count(),
+                1,
+                "{line:?} must render exactly once:\n{body}"
+            );
+        }
+
+        use ravel_cpu_gate::GateSite;
+        let sites = ravel_cpu_gate::ReadSite::ALL.len() + ravel_cpu_gate::WriteSite::ALL.len();
+        for family in ["ravel_cpu_gate_jobs_total{", "ravel_cpu_gate_inline_total{"] {
+            assert_eq!(
+                body.lines().filter(|line| line.starts_with(family)).count(),
+                sites,
+                "{family} renders one sample per site of each gate's closed set"
+            );
+        }
+        for family in [
+            "ravel_cpu_gate_permits{",
+            "ravel_cpu_gate_wait_seconds_sum{",
+            "ravel_cpu_gate_run_seconds_count{",
+        ] {
+            assert_eq!(
+                body.lines().filter(|line| line.starts_with(family)).count(),
+                2,
+                "{family} renders one sample per gate"
+            );
+        }
     }
 
     /// The POSTINGS family renders one sample per metric for the

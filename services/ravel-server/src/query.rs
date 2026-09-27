@@ -985,6 +985,7 @@ mod catalog_cache_tests {
             process_memory_budget_is_fallback: false,
             cache_dir: None,
             catalog_resolve_concurrency: None,
+            cpu_gate_permits: Default::default(),
             ingest_concurrency_limit: crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(
                 1024,
             ),
@@ -1022,6 +1023,7 @@ mod catalog_cache_tests {
         );
         let config = crate::ServerConfig {
             catalog_resolve_concurrency: Some(derived),
+            cpu_gate_permits: Default::default(),
             ..server_config()
         };
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

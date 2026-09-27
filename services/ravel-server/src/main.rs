@@ -67,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
         .resolve_performance(host)
         .context("failed to resolve the host-derived performance defaults")?;
     performance.emit(host);
+    // ADR-1702 decision 3: the read and write CPU gates' permits, derived from
+    // the same host profile unless a flag sets them.
+    let cpu_gate_permits = cli.resolve_cpu_gate_permits(host);
+    tracing::info!(
+        read_permits = cpu_gate_permits.read,
+        write_permits = cpu_gate_permits.write,
+        "CPU gate permits resolved"
+    );
 
     // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
     // feature links the arrow decode stack, `--otap` decides whether this
@@ -545,6 +553,7 @@ async fn main() -> anyhow::Result<()> {
             == ravel_server::config::PERF_SOURCE_FALLBACK,
         cache_dir: cli.cache_dir.clone(),
         catalog_resolve_concurrency: Some(performance.catalog_resolve_concurrency),
+        cpu_gate_permits,
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,

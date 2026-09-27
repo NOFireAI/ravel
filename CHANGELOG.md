@@ -82,6 +82,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ravel-server` builds a read and a write CPU gate and reports their
+  queueing on `/metrics`** (ADR-1702, issue #1702). A new crate,
+  `ravel-cpu-gate`, holds the gate: a job at or above its inline floor
+  (256 KiB, or 100,000 samples for a PromQL evaluation) waits for one of a
+  fixed number of permits, then runs on the tokio blocking pool and keeps the
+  permit until it returns; a smaller job runs on the calling thread.
+  `--cpu-gate-read-permits` and `--cpu-gate-write-permits` size the two gates.
+  Unset, they are `max(1, cores - 1)` and `max(1, cores / 2)`, and `0` is
+  refused at startup. `/metrics` renders `ravel_cpu_gate_permits`,
+  `ravel_cpu_gate_running`, `ravel_cpu_gate_queued`, the
+  `ravel_cpu_gate_wait_seconds` and `ravel_cpu_gate_run_seconds` sum and count
+  pairs and `ravel_cpu_gate_abandoned_total` per `gate`, plus
+  `ravel_cpu_gate_jobs_total` and `ravel_cpu_gate_inline_total` per `gate` and
+  `site`, and the tokio runtime's `ravel_runtime_workers`,
+  `ravel_runtime_alive_tasks`, `ravel_runtime_global_queue_depth` and
+  `ravel_runtime_worker_busy_seconds_total`. No decode or encode path submits
+  work to the gates yet; the later ADR-1702 tasks move them.
 - **`ravel-cli export --signal logs` writes a tenant's stored logs back out to
   a Parquet file `ravel-cli load` reads in** (ADR-1751, issue #1712). The
   command takes the store and tenancy flags the other read commands take, plus

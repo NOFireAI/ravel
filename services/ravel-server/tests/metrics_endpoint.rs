@@ -70,6 +70,7 @@ async fn start_test_server(
         process_memory_budget_is_fallback: false,
         cache_dir: None,
         catalog_resolve_concurrency: None,
+        cpu_gate_permits: ravel_server::config::CpuGatePermits { read: 3, write: 2 },
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -417,6 +418,82 @@ async fn metrics_memory_budget_family_reflects_configured_budget() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// ADR-1702 decision 11: a scrape in every mode carries each CPU gate and
+/// tokio runtime family exactly once, with the permit counts the server was
+/// started with (`start_test_server` sets read 3, write 2). Counted rather
+/// than tested with `contains`, so a family rendered twice fails too.
+#[tokio::test]
+async fn metrics_render_cpu_gate_and_runtime_families_once() {
+    for (mode, mode_label) in [
+        (Mode::All, "all"),
+        (Mode::Gateway, "gateway"),
+        (Mode::Query, "query"),
+        (Mode::Maintain, "maintain"),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let body = reqwest::Client::new()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        for (family, kind) in [
+            ("ravel_cpu_gate_permits", "gauge"),
+            ("ravel_cpu_gate_running", "gauge"),
+            ("ravel_cpu_gate_queued", "gauge"),
+            ("ravel_cpu_gate_wait_seconds", "summary"),
+            ("ravel_cpu_gate_run_seconds", "summary"),
+            ("ravel_cpu_gate_abandoned_total", "counter"),
+            ("ravel_cpu_gate_jobs_total", "counter"),
+            ("ravel_cpu_gate_inline_total", "counter"),
+            ("ravel_runtime_workers", "gauge"),
+            ("ravel_runtime_alive_tasks", "gauge"),
+            ("ravel_runtime_global_queue_depth", "gauge"),
+            ("ravel_runtime_worker_busy_seconds_total", "counter"),
+        ] {
+            let header = format!("# TYPE {family} {kind}\n");
+            assert_eq!(
+                body.matches(&header).count(),
+                1,
+                "mode {mode:?}: {header:?} must appear exactly once:\n{body}"
+            );
+        }
+        for (gate, permits) in [("read", 3), ("write", 2)] {
+            let line = format!(
+                "ravel_cpu_gate_permits{{mode=\"{mode_label}\",gate=\"{gate}\"}} {permits}"
+            );
+            assert_eq!(
+                body.lines().filter(|rendered| *rendered == line).count(),
+                1,
+                "mode {mode:?}: {line:?} must render exactly once:\n{body}"
+            );
+        }
+        let workers_line = body
+            .lines()
+            .find(|line| line.starts_with("ravel_runtime_workers{"))
+            .expect("runtime workers sample");
+        let workers: usize = workers_line
+            .rsplit(' ')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .expect("runtime workers value");
+        assert!(workers >= 1, "the scraping runtime has at least one worker");
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with("ravel_runtime_worker_busy_seconds_total{"))
+                .count(),
+            workers,
+            "one busy sample per runtime worker"
+        );
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
 // --- ADR-0051 section 6: the /metrics admission family ---
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -597,6 +674,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
         process_memory_budget_is_fallback: false,
         cache_dir: None,
         catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
@@ -824,6 +902,7 @@ async fn start_attribution_server() -> ravel_server::Running {
         process_memory_budget_is_fallback: false,
         cache_dir: None,
         catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
