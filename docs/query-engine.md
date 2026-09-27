@@ -650,8 +650,8 @@ kinds a query selects. One L0 fetch therefore costs at most
 catalog GET and 4 page GETs. Bridging moves the bytes in a bridged gap that
 the query did not ask for, which is the trade the bound makes: a bounded,
 predictable request count per flush in exchange for bytes inside one segment.
-L1 parts keep unbounded page runs, since a compacted part can be far larger
-than one flush and bridging its gaps would move far more.
+An L1 segment keeps unbounded page runs, since a compacted segment can be far
+larger than one flush and bridging its gaps would move far more.
 
 ## Fetch-layer memory reservations
 
