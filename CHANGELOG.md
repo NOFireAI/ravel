@@ -302,6 +302,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `span_shard.rs`, matching the metrics and log pipelines, so all six series
   carry live figures on all three signals.
 
+### Fixed
+
+- **Retention no longer deletes logs or spans objects whose format version
+  this build cannot read** (issue #530). The physical sweep's version hold
+  covered metrics only, so after a binary rollback across an RLOG or RSPAN
+  format bump, a tombstoned logs or spans bucket holding objects written at
+  the newer version was deleted once its protection horizon elapsed, even
+  though the newer build could still read them. The sweep now reads each
+  data object's trailer through the gate of the bucket's own format (one
+  16-byte ranged GET per object, the cost metrics already paid) and, if any
+  object is outside this build's reader window, deletes nothing in the
+  bucket, logs a warning, and counts the objects on the same in-process
+  held-object counter, exactly as it does for metrics. A corrupt trailer is still swept. ADR-0531 and ADR-0066
+  carry dated amendments recording the wider hold.
+
 ## [0.18.0] - 2026-09-26
 
 ### Changed

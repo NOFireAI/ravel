@@ -30,9 +30,13 @@ Ravel's accepted pre-release posture, not a gap to close later.
 **Upgrade and rollback posture at HEAD.** A trailer-version bump is a
 non-rollbackable, forward-only data-migration event: the reader admits exactly
 one version, so once any object at the new version exists, a build that predates
-the bump cannot read it. The irreversible step is the first write at the new
-version; before it, a rollback to the earlier build is safe. The N/N-1 window
-described below is staged for the v1.0 release and is not a posture any
+the bump cannot read it: it fails closed with a typed `UnsupportedVersion`, and
+retention's version hold declines to delete it but cannot make it readable
+(ADR-0531, 2026-09-27 amendment). A tombstoned bucket holding such an object is
+kept past its retention window rather than swept, and is retired by the first
+pass of a build that reads the version. The irreversible step is the first write
+at the new version; before it, a rollback to the earlier build is safe. The
+N/N-1 window described below is staged for the v1.0 release and is not a posture any
 released build has had: ADR-0531 fixes the format-lifecycle activation
 milestone at v1.0, which is distinct from the software's first public release
 at 0.9.0 and has not shipped. Before v1.0 a trailer-version bump may break

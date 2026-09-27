@@ -152,8 +152,9 @@ in force at HEAD (Reading B, point 2 above):
   (issue #530) declines to delete such an object under a build that cannot read
   it, so the object is not lost, but it is not queryable until a build whose
   window includes its version runs again. **That hold covers metrics only.**
-  `held_out_of_window` returns early for any other signal
-  (`crates/ravel-maintain/src/retention.rs:590`), so logs (RLOG) and spans
+  (No longer true: see the 2026-09-27 amendment below, under which the hold
+  covers logs and spans as well.) `held_out_of_window` returned early for any
+  signal other than metrics at the time, so logs (RLOG) and spans
   (RSPAN) keep the unconditional horizon-gated sweep until the remaining half of
   issue #530 lands. For those two the irreversible step is a data-loss risk and
   not only a queryability one: an object written at the new version and left
@@ -211,3 +212,34 @@ in force at HEAD (Reading B, point 2 above):
   "ready for the first post-release bump" (`crates/ravel-segment/src/format.rs`).
   Under this ADR both mean v1.0. No code behaviour is affected, and no code is
   changed here; the wording is recorded as a follow-up.
+
+## Amendment (2026-09-27, #530): the version hold covers all three signals
+
+<!-- amendment-applies: sections="Rollback stance (issue #530 / #1775, the second unlanded bullet)" pointer="2026-09-27 amendment" -->
+<!-- amendment-supersedes: phrase="That hold covers metrics only." pointer="2026-09-27 amendment" -->
+
+The rollback stance above records that retention's version hold covered
+metrics only, and that for logs and spans the irreversible step was therefore
+a data-loss risk and not only a queryability one. The remaining half of issue
+#530 closes that gap. `held_out_of_window` in
+`crates/ravel-maintain/src/retention.rs` now probes every data object of a
+tombstoned bucket through the trailer gate of the bucket's own format: RSEG
+for metrics, RLOG (`ravel_logseg::open_from_suffix`) for logs, and RSPAN
+(`ravel_rspan::open_from_suffix`) for spans. Each is the gate a full read of
+that format applies, and each checks the version window before any footer
+byte, so a 16-byte suffix GET per data object answers the question for all
+three, the same cost the metrics hold already paid. An out-of-window object
+holds the whole bucket with the same warning and the same
+`held_out_of_window_objects_total` counter; a corrupt one is still swept.
+
+What changes in the stance: for all three signals, an object written at the
+new version and left unreadable by a rolled-back build is retained, not
+deleted, and becomes queryable again once a build whose window includes its
+version runs. The irreversible step is still the first write at the new
+version, and a format bump is still a non-rollbackable data-migration event
+under the current regime, because the rolled-back build cannot query that
+data. It is no longer a data-loss event for logs and spans, and the rollback
+window for those two is no longer bounded by the retention horizon. The cost
+is the one ADR-0066's 2026-09-13 amendment names for metrics: a held bucket is
+kept past its retention window until the upgrade finishes, `maintain migrate`
+converges it, or the build that reads it runs again.
