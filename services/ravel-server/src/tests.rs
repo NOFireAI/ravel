@@ -441,6 +441,7 @@ fn promql_harness(
         process_memory_budget,
         process_memory_budget_is_fallback: false,
         can_fold: true,
+        fold_loop: Default::default(),
     });
 
     (state, promql, metrics)
