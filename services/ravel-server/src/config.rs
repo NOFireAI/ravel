@@ -4621,9 +4621,8 @@ impl Cli {
     /// cadence ([`Self::resolve_flush_cadence`], the value the server's own
     /// ingest pipelines run with -- not `IngestConfig::default()`, so an
     /// operator who raises `--max-flush-delay` gets a budget derived from
-    /// what they configured, not the shipped default). This is the one place
-    /// the derivation is wired into the real startup path: `main.rs` calls it
-    /// to fill [`crate::ServerConfig::max_s3_requests`], which `start` threads
+    /// what they configured, not the shipped default). The resolved value
+    /// fills [`crate::ServerConfig::max_s3_requests`], which `start` threads
     /// into the process-wide `EngineConfig` both query surfaces share. A `0`
     /// override is rejected by [`Self::validate`], not here.
     ///
@@ -4638,13 +4637,42 @@ impl Cli {
     /// `derived_request_budget_uses_the_catalogs_seal_margin`
     /// (`src/query.rs`, where the catalog this derivation must agree with is
     /// built) pins that agreement.
+    ///
+    /// This is that margin applied to [`Self::resolve_max_s3_requests_with`].
+    /// `main.rs` calls the seam directly, with the same margin, because it
+    /// also logs the span that margin covers (ADR-1306 decision 5) and the
+    /// two must be the one value.
     pub fn resolve_max_s3_requests(&self) -> anyhow::Result<ravel_query::RequestLimit> {
+        self.resolve_max_s3_requests_with(crate::query::server_seal_margin())
+    }
+
+    /// [`Self::resolve_max_s3_requests`] with the seal margin as an argument
+    /// rather than read from [`crate::query::server_seal_margin`].
+    ///
+    /// The margin is a real input here, not a constant this function could
+    /// recover on its own, which is what makes the wiring testable: every
+    /// server path pins the catalog's compiled-in margin today and
+    /// `SealMargin::REFERENCE` holds those same three durations, so a
+    /// derivation that quietly fell back to the reference constants would
+    /// return the identical number on every production input.
+    /// `derived_request_budget_uses_the_catalogs_seal_margin`
+    /// (`src/query.rs`) calls this with a margin an hour longer than the
+    /// reference and pins the budget to the derivation at THAT margin, so
+    /// ignoring the argument is a failing test rather than an invisible
+    /// revert.
+    ///
+    /// An explicit `--max-s3-requests` is used verbatim whatever the margin
+    /// is (ADR-1306 decision 5); the margin only sizes the derived default.
+    pub fn resolve_max_s3_requests_with(
+        &self,
+        seal_margin: ravel_query::SealMargin,
+    ) -> anyhow::Result<ravel_query::RequestLimit> {
         Ok(match self.max_s3_requests {
             Some(n) => ravel_query::RequestLimit::Bounded(n),
             None => ravel_query::RequestLimit::Bounded(ravel_query::derive_max_s3_requests_for(
                 self.shards,
                 self.resolve_flush_cadence()?.max_flush_delay,
-                crate::query::server_seal_margin(),
+                seal_margin,
             )),
         })
     }

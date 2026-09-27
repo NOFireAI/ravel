@@ -71,7 +71,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   test: its threshold must be that seal margin and its `for:` the 600 s the
   derivation budgets, so raising either in
   `deploy/prometheus/ravel.rules.yaml` fails a gate rather than silently
-  moving the first refusal ahead of the page.
+  moving the first refusal ahead of the page. `ravel-server` logs the resolved
+  budget once at startup with the span it is measured against
+  (`max_s3_requests`, `source`, `covered_span_secs`, `seal_margin_secs`),
+  derived or explicit alike, so an operator who pins `--max-s3-requests` can
+  see which span their value undercuts.
 - **The scheduled catalog fold now runs only in `--mode maintain` and
   `--mode all`, and a `maintain` fleet partitions it across its replicas**
   (ADR-1693, issue #1693). A `maintain` process folds only the

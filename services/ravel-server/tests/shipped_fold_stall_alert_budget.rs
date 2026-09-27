@@ -274,26 +274,33 @@ fn shipped_fold_stall_rule() -> FoldStallRule {
 /// really covers, taken off `ravel-query`'s own functions rather than
 /// recomputed here from the three terms.
 ///
-/// The three assertions, and what each one is for:
+/// The assertions, in the order they run, and what each one is for:
 ///
-/// * The threshold equals the seal margin of the catalog this server folds
-///   with. Decision 1 rests on that ("the alert's threshold is already the
-///   seal margin, so those two terms are the time from the last successful
-///   fold to the rule's condition holding for its `for:`"). A threshold above
-///   the margin delays the page past what `lag_allowance` budgets for; one
-///   below it pages on a fold that is running normally.
-/// * The `for:` equals `FOLD_STALL_ALERT_FOR`, the term the derivation
-///   budgets for the rule's own hold time. The constant is named for this
-///   file's value; if the file moves and the constant does not, the budget is
-///   sized for a page that arrives later than it assumes.
+/// * `lag_allowance` really is decision 1's lag half. That is arithmetic over
+///   `ravel-query`'s own functions, not a claim about the shipped file, so it
+///   comes first: everything below compares against it.
 /// * Threshold plus `for:` plus `ALERT_DELIVERY_SLACK` is at most
 ///   `lag_allowance`. This is the ordering itself: the whole path from the
 ///   last successful fold to a page in an operator's hand has to fit inside
 ///   the lag the budget covers. It holds with equality today, which is the
-///   tightest it can hold, so any rise in either shipped value fails here.
+///   tightest it can hold, so any rise in either shipped value fails HERE,
+///   before the two equalities below narrow it to a term. It is asserted
+///   before them deliberately: after them it could not fail, since together
+///   they fix both of its inputs.
+/// * The threshold equals the seal margin of the catalog this server folds
+///   with. Decision 1 rests on that ("the alert's threshold is already the
+///   seal margin, so those two terms are the time from the last successful
+///   fold to the rule's condition holding for its `for:`"). This is also the
+///   direction the ordering assertion cannot see: a threshold BELOW the
+///   margin fits the lag allowance comfortably and pages on a fold that is
+///   running normally.
+/// * The `for:` equals `FOLD_STALL_ALERT_FOR`, the term the derivation
+///   budgets for the rule's own hold time. The constant is named for this
+///   file's value; if the file moves and the constant does not, the budget is
+///   sized for a page that arrives later than it assumes.
 ///
 /// RED: raise the `> 4800` in the shipped file, or its `for: 10m`. Either
-/// breaks its own equality, and the ordering assertion with it.
+/// breaks the ordering assertion, and then its own equality.
 #[test]
 fn shipped_fold_stall_alert_fits_the_budget_lag_allowance() {
     let rule = shipped_fold_stall_rule();
@@ -315,6 +322,31 @@ fn shipped_fold_stall_alert_fits_the_budget_lag_allowance() {
     // today. Read off the server's catalog rather than restated, so the alert
     // is compared against the margin a running process really seals on.
     let seal_margin = ravel_server::query::server_seal_margin();
+
+    // The lag half of the span the derivation covers, off ravel-query's own
+    // functions: `covered_span = healthy_tail_max + lag_allowance`.
+    let lag_allowance =
+        ravel_query::covered_span(seal_margin) - ravel_query::healthy_tail_max(seal_margin);
+    assert_eq!(
+        lag_allowance,
+        seal_margin.total() + ravel_query::FOLD_STALL_ALERT_FOR + ravel_query::ALERT_DELIVERY_SLACK,
+        "sanity: `covered_span - healthy_tail_max` must be ADR-1306 decision 1's \
+         `lag_allowance`, or the comparisons below are against the wrong span"
+    );
+
+    // The ordering, asserted before the two equalities that pin its terms: a
+    // shipped value that rises fails here first. After them it could not
+    // fail, since between them they fix both `threshold` and `fires_after`.
+    let to_the_page = threshold + fires_after + ravel_query::ALERT_DELIVERY_SLACK;
+    assert!(
+        to_the_page <= lag_allowance,
+        "the shipped alert takes {to_the_page:?} to reach an operator (threshold \
+         {threshold:?} + for: {fires_after:?} + ALERT_DELIVERY_SLACK {:?}), past the \
+         {lag_allowance:?} of fold lag the derived request budget covers. ADR-1306 \
+         decision 2's ordering is broken: a query would be refused before the page",
+        ravel_query::ALERT_DELIVERY_SLACK
+    );
+
     assert_eq!(
         threshold,
         seal_margin.total(),
@@ -331,27 +363,6 @@ fn shipped_fold_stall_alert_fits_the_budget_lag_allowance() {
         "alert {ALERT} holds its condition for {fires_after:?}, but the derived request \
          budget sizes the page's arrival with FOLD_STALL_ALERT_FOR = {:?}",
         ravel_query::FOLD_STALL_ALERT_FOR
-    );
-
-    // The lag half of the span the derivation covers, off ravel-query's own
-    // functions: `covered_span = healthy_tail_max + lag_allowance`.
-    let lag_allowance =
-        ravel_query::covered_span(seal_margin) - ravel_query::healthy_tail_max(seal_margin);
-    assert_eq!(
-        lag_allowance,
-        seal_margin.total() + ravel_query::FOLD_STALL_ALERT_FOR + ravel_query::ALERT_DELIVERY_SLACK,
-        "sanity: `covered_span - healthy_tail_max` must be ADR-1306 decision 1's \
-         `lag_allowance`, or the comparison below is against the wrong span"
-    );
-
-    let to_the_page = threshold + fires_after + ravel_query::ALERT_DELIVERY_SLACK;
-    assert!(
-        to_the_page <= lag_allowance,
-        "the shipped alert takes {to_the_page:?} to reach an operator (threshold \
-         {threshold:?} + for: {fires_after:?} + ALERT_DELIVERY_SLACK {:?}), past the \
-         {lag_allowance:?} of fold lag the derived request budget covers. ADR-1306 \
-         decision 2's ordering is broken: a query would be refused before the page",
-        ravel_query::ALERT_DELIVERY_SLACK
     );
 }
 

@@ -1208,7 +1208,22 @@ recomputation, and the fold-stall ordering keeps holding at that margin. It is
 `derived_request_budget_uses_the_catalogs_seal_margin`
 (`services/ravel-server/src/query.rs`) is what holds the two together if the
 catalog's margin ever moves. An explicit `--max-s3-requests` is still used
-verbatim and follows no margin. The other side of the same coupling is the
+verbatim and follows no margin.
+
+`ravel-server` logs the resolved budget once at startup, at info level, with
+the span it is measured against (ADR-1306 decision 5):
+
+```text
+per-query S3 request budget resolved max_s3_requests=343400 source="derived" covered_span_secs=14100 seal_margin_secs=4800
+```
+
+`source` is `derived` or `explicit --max-s3-requests`, and `covered_span_secs`
+is reported on both paths. It is the explicit path it exists for: that value
+is used verbatim, so an operator who sets one below what the span costs gets
+queries refused for fold lag before the fold-stall alert reaches them, and
+this line is where they can see which span they undercut.
+
+The other side of the same coupling is the
 shipped alert: its threshold is that seal margin and its `for:` is
 `FOLD_STALL_ALERT_FOR`, held there by
 `shipped_fold_stall_alert_fits_the_budget_lag_allowance`
