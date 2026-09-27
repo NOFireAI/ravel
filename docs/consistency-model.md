@@ -48,6 +48,21 @@ Buffered mode (opt-in per request, named "buffered"):
   `max_inflight_flushes` permit on its shard (ADR-1642) and runs its PUTs, so
   a shard whose permits are held by a stalled flush widens the window until
   the stall clears.
+- Which delay triggers the flush depends on the buffer, and one of the three
+  tiers is opt-in. A buffer with a strict-mode waiter or at least
+  `min_flush_bytes` of estimated object bytes triggers on `max_flush_delay`
+  (2 s); any other buffer triggers on `max_flush_delay_idle` (40 s). With
+  `--idle-flush-byte-floor` set to a non-zero byte count (ADR-1737), a buffer
+  holding fewer estimated object bytes than that floor instead waits for the
+  sub-floor hold, one `flush_tick` short of `max_flush_lifetime`, so an
+  acknowledged buffered row in such a buffer may sit in process memory for up
+  to `max_flush_lifetime` (1 h) before its flush even opens, plus the flush's
+  own time. The flag defaults to 0, which disables the tier: unless an
+  operator sets it, no buffer takes the hold and the buffered window stays
+  bounded by the 40 s idle delay as above. Setting it is a choice to accept
+  the one-hour window for tenants below the floor in exchange for their PUT
+  cost. Strict mode is unaffected at any setting, since a strict waiter keeps
+  the 2 s delay.
 - The `max_flush_lifetime` abandonment budget is measured from the moment the
   flush's permit is granted, not from flush-open, so time spent queued behind
   a stalled prefix does not count against it: a flush that waited behind a

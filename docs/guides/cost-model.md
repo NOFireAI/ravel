@@ -52,9 +52,56 @@ Either condition is enough, and the two share one threshold:
   threshold lands inside the corridor is per tenant, from the tenant's
   observed arrival gap. Log and span shards have no corridor and always use
   the fixed pair above.
+- **Sub-floor hold** (off by default, all three signals): with
+  `--idle-flush-byte-floor` set to a non-zero byte count, a buffer whose
+  estimated flush size has not reached that floor waits for the sub-floor
+  hold instead of the idle clock. The hold is the pipeline's flush lifetime
+  (1 h) less one flush tick (200 ms), so `age_threshold_s` for such a buffer
+  is 3,599.8 rather than 40, which is 24 flushes a day rather than 2,160. The
+  floor must be below `min_flush_bytes`, and a server given a larger one
+  refuses to start. This band is a durability trade, not only a cost one: an
+  acknowledged buffered-mode row in a buffer under the floor can sit in
+  process memory for up to an hour before its flush opens, and a crash in
+  that window loses it. The graceful-drain residue a shutdown timeout cuts
+  short can hold up to an hour of such a tenant's rows for the same reason.
+  Strict mode is unaffected, since a strict waiter keeps the priority
+  threshold. `ravel_ingest_flushes_by_age_floor_total` counts the flushes
+  this band opened.
 
-A low-volume buffer that never gains priority flushes on the idle clock; a
-strict-mode buffer flushes on the priority threshold.
+A low-volume buffer that never gains priority flushes on the idle clock,
+unless a floor is set and it stays under that floor, in which case it flushes
+on the hold; a strict-mode buffer flushes on the priority threshold.
+
+### Worked example: what the floor is worth, and to whom
+
+A buffer's estimated flush size is measured in object bytes, not in the
+memory the buffer occupies: 32 bytes plus the name and value text of each
+series, counted once per series per object, plus 16 bytes per scalar sample.
+Both terms matter here, because the series term is re-charged on every flush
+and a wide, slow tenant can be dominated by it. Take two tenants, each on one
+shard of one replica, with about 60 bytes of label text per series, and a
+floor of 64 KiB:
+
+| | series | one sample per series every | at the 40 s idle clock | floor off | floor at 64 KiB |
+|---|---|---|---|---|---|
+| Near-empty tenant | 2 | 10 s | 312 bytes per object | 2,160 flushes/day, 4,320 PUTs | 24 flushes/day, 48 PUTs |
+| Small-but-steady tenant | 20 | 10 s | 3,120 bytes per object | 2,160 flushes/day, 4,320 PUTs | about 43 flushes/day, about 87 PUTs |
+
+The first row is the case the floor is for. Two series at one sample each per
+10 seconds accrue `2 x (32 + 60) = 184` bytes of series terms plus 3.2 bytes
+a second, so after the full 3,599.8 s hold the object is about 11.7 KB, still
+far under the 64 KiB floor. That buffer takes the hold every time, and its
+flushes land in `ravel_ingest_flushes_by_age_floor_total`.
+
+The second row shows the floor is not a blanket 90x. The same arithmetic with
+20 series gives `20 x 92 = 1,840` bytes of series terms plus 32 bytes a
+second, which reaches 64 KiB after about 1,990 seconds. At that point the
+buffer leaves the sub-floor band, and because its age is already well past 40
+seconds it flushes on the next tick. Its saving is real but smaller, and its
+flushes count as ordinary idle-clock flushes, not floor ones. A buffer
+crosses bands upward as rows arrive, so the floor never holds a tenant that
+grew past it: the floor picks its boundary in bytes, and each tenant's own
+rate decides which side it sits on.
 
 Age is not the only trigger. A buffer also flushes as soon as its estimated
 object size reaches `target_bytes` (8MiB default), without waiting for any
@@ -94,6 +141,13 @@ covers, in the order that costs the least to use:
    must stay under a client-timeout-derived ceiling (3s, from the smallest
    documented OTLP export timeout of 5s minus an assumed 2s PUT tail). A value
    that violates either is refused at startup, not silently accepted.
+4. **The sub-floor hold** (`--idle-flush-byte-floor`, default 0 = off): the
+   fourth band above. It moves on its own rather than with the three cadence
+   knobs, and it targets exactly the shape the first three cannot reach
+   cheaply, the near-empty tenant, without touching what a tenant at moderate
+   volume pays or what a strict-mode export waits for. It is listed last
+   because it is the only lever here that widens a published durability
+   window; see the fourth band for what an operator accepts by setting it.
 
 ## What the cadence costs
 
@@ -441,8 +495,9 @@ two assumptions above no longer holds.
 ## Background
 
 The two-object commit protocol and request-cost reduction through flush
-cadence and ingest affinity: ADR-0076. Per-query cost accounting and the
-`/metrics` cost family: ADR-0044. The read-side request-cost knob and its
+cadence and ingest affinity: ADR-0076. The idle flush byte floor, the
+sub-floor hold, and the buffered-mode durability window it widens: ADR-1737.
+Per-query cost accounting and the `/metrics` cost family: ADR-0044. The read-side request-cost knob and its
 whole-versus-ranged routing: ADR-0904. The read-side request budget derived
 from shard count and cadence: ADR-0075. Fetch concurrency: ADR-0088. The
 cost-based-versus-latency-first fetch policy and its measured trade: ADR-1196.
