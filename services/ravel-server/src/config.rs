@@ -952,11 +952,11 @@ pub struct Cli {
     ///
     /// The expert escape hatch of ADR-0996 decision 2: SET, it WINS over
     /// `--logs-fetch-policy`'s derived rate and the deployment keeps exactly
-    /// the ADR-0904 behaviour it had. UNSET, the policy derives the rate: under
-    /// `cost-based` (the unset policy, except against a loopback
-    /// `--s3-endpoint`) from the active store cost profile, and under
-    /// `byte-minimal` or `latency-first` (the unset policy on a loopback
-    /// endpoint, ADR-2014) as the compiled-in default.
+    /// the ADR-0904 behaviour it had. UNSET, the policy derives the rate:
+    /// under `cost-based` (the unset policy, on every deployment including a
+    /// loopback `--s3-endpoint`, ADR-2023) from the active store cost
+    /// profile, and under an explicit `byte-minimal` or `latency-first` as
+    /// the compiled-in default.
     /// `Option`-typed for that reason: "the operator asked for this many bytes"
     /// and "nobody asked, use the compiled-in default" are different inputs to
     /// the resolution, and a `default_value_t` would erase the difference.
@@ -966,9 +966,10 @@ pub struct Cli {
     /// The operator's logs fetch-policy intent (ADR-0996 decision 2), resolved
     /// at startup into the byte quantities the fetch layer runs on
     /// (`--logs-request-cost-bytes` and `--logs-block-range-threshold`'s
-    /// engine-side fields) by `ravel_query::resolve_logs_fetch`. Unset, it is
-    /// `cost-based`, or `byte-minimal` with `--store s3` against a loopback
-    /// `--s3-endpoint`.
+    /// engine-side fields) by `ravel_query::resolve_logs_fetch`. Unset, it
+    /// resolves `cost-based` (ADR-1196), on every deployment including a
+    /// `--store s3` deployment against a loopback `--s3-endpoint` (ADR-2023
+    /// decision 1).
     ///
     /// `request-minimal` reads every object whole in one covering GET (the
     /// cost-preferring shape where transfer is free and the bill is requests);
@@ -980,18 +981,11 @@ pub struct Cli {
     /// only: the running engine never changes its own policy, so the stamped
     /// effective policy describes the whole process lifetime.
     ///
-    /// Unset, the default is no longer always `cost-based` (ADR-2014): a
-    /// `--store s3` deployment whose `--s3-endpoint` is loopback (`localhost`
-    /// or a loopback IPv4/IPv6 literal) defaults to `byte-minimal` instead,
-    /// because on a local store the cold path is disk-bound rather than
-    /// network-bound, and `byte-minimal` measured faster there both cold and
-    /// hot (ADR-2014 records the figures). Every other
-    /// unset case keeps `cost-based`, exactly as before. An explicit flag
-    /// always wins, including an explicit `cost-based` on a loopback endpoint.
+    /// An explicit flag always wins, including an explicit `byte-minimal` or
+    /// `cost-based` on a loopback endpoint.
     /// [`crate::config::Cli::resolve_logs_fetch_policy`] is the one place this
-    /// is decided; the resolved policy's source (`flag`, `default`, or
-    /// `derived-loopback-endpoint`) is on the `logs fetch policy resolved`
-    /// startup log line.
+    /// is decided; the resolved policy's source (`flag` or `default`) is on
+    /// the `logs fetch policy resolved` startup log line.
     ///
     /// `latency-first` is an intent, not a tuning constant: it says spend
     /// requests to save wall time, and carries no concurrency default of its
@@ -2087,10 +2081,9 @@ pub struct QueryBudgets {
     /// resolved into the two byte quantities above by
     /// [`Self::logs_fetch_resolution`].
     pub logs_fetch_policy: ravel_query::LogsFetchPolicy,
-    /// Where [`Self::logs_fetch_policy`] came from (ADR-2014):
-    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`], [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`],
-    /// or [`LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT`], from
-    /// [`Cli::resolve_logs_fetch_policy`]. Carried only for
+    /// Where [`Self::logs_fetch_policy`] came from (ADR-1196, ADR-2023):
+    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`] or [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`],
+    /// from [`Cli::resolve_logs_fetch_policy`]. Carried only for
     /// [`Self::logs_fetch_stamp`]; it plays no part in the resolution itself.
     pub logs_fetch_policy_source: &'static str,
     /// The active store cost profile (ADR-0996 decision 1), from
@@ -2233,15 +2226,13 @@ pub const REQUEST_COST_SOURCE_EXPLICIT_FLAG: &str = "explicit-flag";
 pub const REQUEST_COST_SOURCE_POLICY: &str = "policy";
 
 /// [`LogsFetchStamp::policy_source`] when `--logs-fetch-policy` was given
-/// explicitly (ADR-2014). Wins over every derivation, including on a loopback
+/// explicitly (ADR-1196). Wins over the default, including on a loopback
 /// endpoint.
 pub const LOGS_FETCH_POLICY_SOURCE_FLAG: &str = "flag";
-/// [`LogsFetchStamp::policy_source`] when the flag was unset and no
-/// loopback-endpoint derivation applied: `cost-based`, exactly as ADR-1196.
+/// [`LogsFetchStamp::policy_source`] when the flag was unset: `cost-based`,
+/// exactly as ADR-1196, on every deployment including a `--store s3`
+/// deployment against a loopback `--s3-endpoint` (ADR-2023 decision 1).
 pub const LOGS_FETCH_POLICY_SOURCE_DEFAULT: &str = "default";
-/// [`LogsFetchStamp::policy_source`] when the flag was unset, `--store` is
-/// `s3`, and `--s3-endpoint` is loopback (ADR-2014): `byte-minimal`.
-pub const LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT: &str = "derived-loopback-endpoint";
 
 /// The effective logs fetch configuration a process resolved at startup, the
 /// provenance stamp of ADR-0996 decision 2.
@@ -2256,9 +2247,8 @@ pub struct LogsFetchStamp {
     /// `--logs-fetch-policy` as the operator spelled it, or the effective
     /// policy `--logs-fetch-policy` resolved to when it was not given.
     pub policy: &'static str,
-    /// Where [`Self::policy`] came from (ADR-2014):
-    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`], [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`],
-    /// or [`LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT`].
+    /// Where [`Self::policy`] came from (ADR-1196, ADR-2023):
+    /// [`LOGS_FETCH_POLICY_SOURCE_FLAG`] or [`LOGS_FETCH_POLICY_SOURCE_DEFAULT`].
     pub policy_source: &'static str,
     /// The active profile's name, from `--store-cost-profile` or the reference
     /// profile.
@@ -2640,17 +2630,20 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// A cache miss on a loopback store still pays a local disk round trip
 /// rather than a network one, so the fetch cache can afford a larger share
 /// of the budget there without starving the rest of the process the way a
-/// larger share would on a remote store. Attribution on issue #2014 found
-/// ADR-2014's byte-minimal default on a loopback store cut concurrent
-/// throughput on the ClickBench reference machine from about 0.40 to 0.12
-/// queries per second, mostly from cache capacity: the ranged plan caches
-/// column blocks, and ten statements sharing a fetch cache smaller than the
-/// corpus keep missing to the store's disk. A 12 GB fetch cache reached
-/// 0.32, with more memory refusals because `--cache-max-bytes` also
-/// committed 12 GB to a catalog cache that served no hits -- the coupling
-/// this ADR removes. 40 is a starting value: ADR-2023 decision 3 is the
-/// measurement this constant is meant to be checked against, and it is the
-/// number to revisit once a fresh end-to-end run reports a figure.
+/// larger share would on a remote store. A fetch cache sized to hold the
+/// working set's whole objects (ADR-2023 decision 1 restores whole-object
+/// fetching by default there) serves repeated statements without going back
+/// to the store's disk. ADR-2023 records the measured history this constant
+/// rests on: with the ranged plan (`byte-minimal`) and a derived,
+/// default-share fetch cache, concurrent throughput on the ClickBench
+/// reference machine was 0.123 queries per second; raising only the
+/// fetch-cache share to 40% while keeping the ranged plan reached 0.170,
+/// still short of the 0.40 bar the combination was measured against, which
+/// is why decision 1 restores whole-object fetching rather than keeping
+/// `byte-minimal` with a larger share alone. 40 is a starting value:
+/// ADR-2023 decision 4 is the measurement this constant is meant to be
+/// checked against, and it is the number to revisit once a fresh end-to-end
+/// run reports a figure.
 pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 40;
 
 /// Share of `memory_budget_bytes` the derived catalog byte cache takes, a
@@ -4548,11 +4541,10 @@ impl Cli {
 
     /// Whether this deployment's store is a `--store s3` deployment against a
     /// loopback `--s3-endpoint`: the single place this predicate is computed
-    /// (ADR-2014, ADR-2023), shared by [`Self::resolve_logs_fetch_policy`]
-    /// and [`Self::performance_flags`] so the two can never disagree on what
-    /// counts as loopback. Gated on `--store s3` so a stray exported
-    /// `RAVEL_S3_ENDPOINT` cannot change behaviour for a `--store memory`
-    /// start.
+    /// (ADR-2023 decision 3), read by [`Self::performance_flags`] to size the
+    /// fetcher cache's loopback share. Gated on `--store s3` so a stray
+    /// exported `RAVEL_S3_ENDPOINT` cannot change behaviour for a `--store
+    /// memory` start.
     pub(crate) fn store_is_loopback(&self) -> bool {
         matches!(self.store, StoreKind::S3)
             && self
@@ -4561,38 +4553,26 @@ impl Cli {
                 .is_some_and(crate::store::is_loopback_endpoint)
     }
 
-    /// Resolve `--logs-fetch-policy` and its provenance (ADR-2014). The one
-    /// place this decision is made: [`Self::query_budgets`] is its only
-    /// caller, and both the engine-bound policy and the startup stamp
-    /// ([`QueryBudgets::logs_fetch_stamp`]) come from the `QueryBudgets` it
-    /// fills, so neither can independently re-derive a different answer.
+    /// Resolve `--logs-fetch-policy` and its provenance (ADR-1196, ADR-2023
+    /// decision 1). The one place this decision is made:
+    /// [`Self::query_budgets`] is its only caller, and both the engine-bound
+    /// policy and the startup stamp ([`QueryBudgets::logs_fetch_stamp`]) come
+    /// from the `QueryBudgets` it fills, so neither can independently
+    /// re-derive a different answer.
     ///
-    /// An explicit `--logs-fetch-policy` always wins, including an explicit
-    /// `cost-based` on a loopback endpoint ([`LOGS_FETCH_POLICY_SOURCE_FLAG`]).
-    /// Unset, `--store s3` with an `--s3-endpoint` that
-    /// [`ravel_object_store::s3::is_loopback_endpoint`] accepts derives
-    /// `byte-minimal` ([`LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT`]);
-    /// every other unset case keeps `cost-based`
-    /// ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]), exactly as ADR-1196. Gated on
-    /// `--store s3` for the same reason [`Self::validate`]'s plaintext check
-    /// is: a stray exported `RAVEL_S3_ENDPOINT` must not change behaviour for
-    /// a `--store memory` start. Concurrency is untouched either way (ADR-2014
-    /// decision 3): this only selects [`LogsFetchPolicyArg::ByteMinimal`], the
-    /// intent, never a `--fetch-concurrency`/`--store-get-concurrency` value.
+    /// An explicit `--logs-fetch-policy` always wins, including on a loopback
+    /// endpoint ([`LOGS_FETCH_POLICY_SOURCE_FLAG`]). Unset, every deployment
+    /// resolves `cost-based` ([`LOGS_FETCH_POLICY_SOURCE_DEFAULT`]), exactly
+    /// as ADR-1196: ADR-2023 withdrew ADR-2014's loopback-endpoint
+    /// `byte-minimal` derivation, so this no longer consults
+    /// [`Self::store_is_loopback`] at all.
     pub fn resolve_logs_fetch_policy(&self) -> (LogsFetchPolicyArg, &'static str) {
-        if let Some(policy) = self.logs_fetch_policy {
-            return (policy, LOGS_FETCH_POLICY_SOURCE_FLAG);
-        }
-        if self.store_is_loopback() {
-            (
-                LogsFetchPolicyArg::ByteMinimal,
-                LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT,
-            )
-        } else {
-            (
+        match self.logs_fetch_policy {
+            Some(policy) => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG),
+            None => (
                 LogsFetchPolicyArg::CostBased,
                 LOGS_FETCH_POLICY_SOURCE_DEFAULT,
-            )
+            ),
         }
     }
 
@@ -9891,93 +9871,72 @@ mod tests {
         );
     }
 
-    /// ADR-2014: `--logs-fetch-policy` unset derives `byte-minimal` only when
-    /// `--store` is `s3` AND `--s3-endpoint` is loopback; every other unset
-    /// combination keeps the ADR-1196 `cost-based` default, and an explicit
-    /// flag always wins, including an explicit `cost-based` on a loopback
-    /// endpoint. `resolve_logs_fetch_policy` is the one function under test;
-    /// `query_budgets` and `logs_fetch_stamp` only carry its answer forward,
-    /// so a wrong derivation here is a wrong derivation everywhere it is
-    /// consumed.
+    /// ADR-2023 decision 1: `--logs-fetch-policy` unset resolves `cost-based`
+    /// on EVERY deployment, including a `--store s3` deployment against a
+    /// loopback `--s3-endpoint`; ADR-2014's loopback `byte-minimal`
+    /// derivation is withdrawn. An explicit flag always wins, including on a
+    /// loopback endpoint. `resolve_logs_fetch_policy` is the one function
+    /// under test; `query_budgets` and `logs_fetch_stamp` only carry its
+    /// answer forward, so a wrong derivation here is a wrong derivation
+    /// everywhere it is consumed.
     ///
-    /// Prove-the-test (a): drop the `matches!(self.store, StoreKind::S3) &&`
-    /// conjunct in `resolve_logs_fetch_policy`. The `--store memory` case
-    /// below (case 4) then derives `byte-minimal`/`derived-loopback-endpoint`
-    /// from the loopback-shaped `--s3-endpoint` alone, against the expected
-    /// `cost-based`/`default`: a store that never resolves that endpoint
-    /// would still have its logs policy flipped by it.
+    /// Prove-the-test (a): add a `None if self.store_is_loopback() =>
+    /// (LogsFetchPolicyArg::ByteMinimal, "derived-loopback-endpoint")` arm
+    /// ahead of the plain `None` arm in `resolve_logs_fetch_policy`,
+    /// reintroducing ADR-2014's withdrawn derivation. Measured: this fails
+    /// `resolve_logs_fetch_policy_resolves_cost_based_by_default_even_on_a_loopback_endpoint`
+    /// at its case-1 assertion (the `left: (ByteMinimal,
+    /// "derived-loopback-endpoint")` / `right: (CostBased, "default")`
+    /// mismatch on the plain loopback-IPv4 case, before the hostname,
+    /// no-endpoint or explicit-flag cases are even reached).
     ///
-    /// Prove-the-test (b): move the `if let Some(policy) = self
-    /// .logs_fetch_policy { return ... }` early return in
-    /// `resolve_logs_fetch_policy` to run AFTER the loopback check instead of
-    /// before it. Case 5 (an explicit `cost-based` on a loopback endpoint) is
-    /// what catches it, and it fails first: the loopback branch now returns
-    /// unconditionally before ever consulting `self.logs_fetch_policy`, so it
-    /// reads `byte-minimal`/`derived-loopback-endpoint` against the expected
-    /// `cost-based`/`flag`. Case 6 (explicit `latency-first` on the same
-    /// endpoint) would fail the identical way, but the test never reaches it.
-    ///
-    /// Prove-the-test (c): replace the `is_loopback_endpoint` call with a
-    /// substring check for `"127.0.0.1"`. The `localhost` sub-case of case 1
-    /// then reads `cost-based`/`default` against the expected
-    /// `byte-minimal`/`derived-loopback-endpoint` (a bare hostname carries no
-    /// such substring), and the `127.0.0.1.example.com` sub-case of case 2
-    /// reads the reverse: `byte-minimal`/`derived-loopback-endpoint` against
-    /// the expected `cost-based`/`default`, because the substring is present
-    /// in a hostname that never resolves to this machine.
+    /// Prove-the-test (b): change the `match self.logs_fetch_policy { Some(policy)
+    /// => (policy, LOGS_FETCH_POLICY_SOURCE_FLAG), None => ... }` to `match
+    /// self.logs_fetch_policy { Some(policy) if !self.store_is_loopback() =>
+    /// (policy, LOGS_FETCH_POLICY_SOURCE_FLAG), _ => ... }`, so an explicit
+    /// flag on a loopback store falls through to the default arm instead of
+    /// winning. Measured: this fails the same test at case 5 (explicit
+    /// `cost-based` on a loopback endpoint), `left: (CostBased, "default")` /
+    /// `right: (CostBased, "flag")`; case 6 (explicit `byte-minimal` on the
+    /// same endpoint) would fail identically but the test never reaches it.
     #[test]
-    fn resolve_logs_fetch_policy_derives_byte_minimal_only_on_a_loopback_s3_endpoint() {
-        // 1. loopback + no flag -> byte-minimal, derived. An IPv4 literal and
-        // the `localhost` name must both derive it: neither is a special
-        // case of the other in `is_loopback_authority`.
+    fn resolve_logs_fetch_policy_resolves_cost_based_by_default_even_on_a_loopback_endpoint() {
+        // 1. loopback + no flag -> cost-based, default. An IPv4 literal and
+        // the `localhost` name must both resolve it: ADR-2023 withdraws the
+        // loopback derivation entirely, so neither gets special treatment.
         let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
         assert_eq!(
             loopback.resolve_logs_fetch_policy(),
             (
-                LogsFetchPolicyArg::ByteMinimal,
-                LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT
+                LogsFetchPolicyArg::CostBased,
+                LOGS_FETCH_POLICY_SOURCE_DEFAULT
             )
         );
         let loopback_stamp = stamp_from(&loopback);
-        assert_eq!(loopback_stamp.policy, "byte-minimal");
+        assert_eq!(loopback_stamp.policy, "cost-based");
         assert_eq!(
             loopback_stamp.policy_source,
-            LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT
+            LOGS_FETCH_POLICY_SOURCE_DEFAULT
         );
 
         let loopback_hostname = cli(&["--store", "s3", "--s3-endpoint", "http://localhost:9000"]);
         assert_eq!(
             loopback_hostname.resolve_logs_fetch_policy(),
             (
-                LogsFetchPolicyArg::ByteMinimal,
-                LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT
-            )
-        );
-
-        // 2. non-loopback + no flag -> cost-based, default. A hostname that
-        // merely CONTAINS a loopback literal as a label is not loopback: it
-        // resolves on the network, wherever that resolution lands.
-        let remote = cli(&[
-            "--store",
-            "s3",
-            "--s3-endpoint",
-            "http://127.0.0.1.example.com:9000",
-        ]);
-        assert_eq!(
-            remote.resolve_logs_fetch_policy(),
-            (
                 LogsFetchPolicyArg::CostBased,
                 LOGS_FETCH_POLICY_SOURCE_DEFAULT
             )
         );
-        let remote_amazon = cli(&[
+
+        // 2. non-loopback + no flag -> cost-based, default, unchanged.
+        let remote = cli(&[
             "--store",
             "s3",
             "--s3-endpoint",
             "https://s3.us-east-1.amazonaws.com",
         ]);
         assert_eq!(
-            remote_amazon.resolve_logs_fetch_policy(),
+            remote.resolve_logs_fetch_policy(),
             (
                 LogsFetchPolicyArg::CostBased,
                 LOGS_FETCH_POLICY_SOURCE_DEFAULT
@@ -9998,8 +9957,7 @@ mod tests {
         );
 
         // 4. --store memory, even with a loopback-shaped endpoint set (a
-        // stray exported RAVEL_S3_ENDPOINT, say) -> cost-based, default: the
-        // memory store never resolves that endpoint, so its value is inert.
+        // stray exported RAVEL_S3_ENDPOINT, say) -> cost-based, default.
         let memory_with_endpoint = cli(&[
             "--store",
             "memory",
@@ -10013,20 +9971,12 @@ mod tests {
                 LOGS_FETCH_POLICY_SOURCE_DEFAULT
             )
         );
-        let memory_default = cli(&["--store", "memory"]);
-        assert_eq!(
-            memory_default.resolve_logs_fetch_policy(),
-            (
-                LogsFetchPolicyArg::CostBased,
-                LOGS_FETCH_POLICY_SOURCE_DEFAULT
-            )
-        );
 
         // 5. loopback + explicit cost-based -> cost-based, flag: the
         // explicit flag wins even though it names the same policy the
-        // no-flag default would have used before ADR-2014, so the fixed
-        // point is the case worth pinning.
-        let explicit_cost_based_wins_on_loopback = cli(&[
+        // no-flag default now resolves anyway, so the fixed point is the
+        // case worth pinning.
+        let explicit_cost_based_on_loopback = cli(&[
             "--store",
             "s3",
             "--s3-endpoint",
@@ -10035,11 +9985,29 @@ mod tests {
             "cost-based",
         ]);
         assert_eq!(
-            explicit_cost_based_wins_on_loopback.resolve_logs_fetch_policy(),
+            explicit_cost_based_on_loopback.resolve_logs_fetch_policy(),
             (LogsFetchPolicyArg::CostBased, LOGS_FETCH_POLICY_SOURCE_FLAG)
         );
 
-        // 6. loopback + explicit latency-first -> latency-first, flag.
+        // 6. loopback + explicit byte-minimal -> byte-minimal, flag: the
+        // ranged plan stays reachable as an explicit opt-in.
+        let explicit_byte_minimal_on_loopback = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--logs-fetch-policy",
+            "byte-minimal",
+        ]);
+        assert_eq!(
+            explicit_byte_minimal_on_loopback.resolve_logs_fetch_policy(),
+            (
+                LogsFetchPolicyArg::ByteMinimal,
+                LOGS_FETCH_POLICY_SOURCE_FLAG
+            )
+        );
+
+        // 7. loopback + explicit latency-first -> latency-first, flag.
         let explicit_latency_first = cli(&[
             "--store",
             "s3",
@@ -10056,10 +10024,10 @@ mod tests {
             )
         );
 
-        // Concurrency is untouched by the derivation (ADR-2014 decision 3):
-        // the loopback-derived case and the no-endpoint case must resolve
-        // the identical store_get_concurrency/sql_partition_count on the
-        // same reference host.
+        // Concurrency is untouched by the resolution: the loopback case and
+        // the no-endpoint case must resolve the identical
+        // store_get_concurrency/sql_partition_count on the same reference
+        // host.
         let no_endpoint_stamp = stamp_from(&no_endpoint);
         assert_eq!(
             loopback_stamp.store_get_concurrency,
@@ -10075,10 +10043,13 @@ mod tests {
         );
     }
 
-    /// ADR-2014: the resolved policy's source must be operator-visible on the
-    /// same "logs fetch policy resolved" startup line the policy itself and
-    /// its request-cost source already appear on, not a second line an
-    /// operator has to correlate by hand.
+    /// The resolved policy's source must be operator-visible on the same
+    /// "logs fetch policy resolved" startup line the policy itself and its
+    /// request-cost source already appear on, not a second line an operator
+    /// has to correlate by hand. Pinned on a loopback endpoint (ADR-2023
+    /// decision 1: it resolves `cost-based`/`default` there too, exactly as
+    /// everywhere else) so a regression of the withdrawn ADR-2014 derivation
+    /// would also be caught here.
     ///
     /// Prove-the-test: drop the `policy_source = self.policy_source` field
     /// from the `tracing::info!` call in `LogsFetchStamp::emit`, and
@@ -10087,10 +10058,7 @@ mod tests {
     fn logs_fetch_stamp_carries_the_policy_source_on_the_startup_line() {
         let cli = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
         let stamp = stamp_from(&cli);
-        assert_eq!(
-            stamp.policy_source,
-            LOGS_FETCH_POLICY_SOURCE_DERIVED_LOOPBACK_ENDPOINT
-        );
+        assert_eq!(stamp.policy_source, LOGS_FETCH_POLICY_SOURCE_DEFAULT);
 
         let (captured, _guard) = capture_events(tracing::Level::INFO);
         stamp.emit();
@@ -10104,8 +10072,10 @@ mod tests {
             "policy_source must appear exactly once on the resolved-policy line, lines: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("policy=\"byte-minimal\"")
-                && l.contains("policy_source=\"derived-loopback-endpoint\"")),
+            lines
+                .iter()
+                .any(|l| l.contains("policy=\"cost-based\"")
+                    && l.contains("policy_source=\"default\"")),
             "the resolved policy and its source must appear together on the same line, lines: {lines:?}"
         );
     }

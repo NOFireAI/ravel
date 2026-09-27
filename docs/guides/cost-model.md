@@ -166,12 +166,10 @@ configuration carries when nothing resolves over it, and it is what
 flag is unset. On the shipped flag set it is not the value in force.
 
 **The value the shipped flag set resolves to** is derived, not that constant,
-on a remote store. `--logs-fetch-policy` defaults to `cost-based` there, and
-`cost-based` computes the rate from the active store cost profile
-(`--store-cost-profile`, which defaults to the reference `s3-intra-region-2026`
-profile) rather than falling back to the constant. (Against a loopback
-`--s3-endpoint` the unset default is `byte-minimal` instead, so
-that deployment runs the constant above and not the derivation below.) The
+on every deployment, loopback `--s3-endpoint` or not. `--logs-fetch-policy`
+defaults to `cost-based`, and `cost-based` computes the rate from the active
+store cost profile (`--store-cost-profile`, which defaults to the reference
+`s3-intra-region-2026` profile) rather than falling back to the constant. The
 derivation:
 
 ```text

@@ -2332,9 +2332,9 @@ mod tests {
         );
     }
 
-    /// ADR-2014: `is_loopback_endpoint` is `resolve_s3_allow_http`'s own
-    /// loopback branch, exposed standalone for a caller (the server's
-    /// `--logs-fetch-policy` default) that has no `allow_http_flag` and must
+    /// `is_loopback_endpoint` is `resolve_s3_allow_http`'s own loopback
+    /// branch, exposed standalone for a caller (the server's loopback
+    /// fetch-cache share, ADR-2023) that has no `allow_http_flag` and must
     /// not refuse anything, only classify.
     #[test]
     fn is_loopback_endpoint_matches_the_shared_authority_predicate() {

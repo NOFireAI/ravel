@@ -304,8 +304,8 @@ impl ObjectStoreBackend for SharedKmsStore {
 /// `S3Config::allow_http` field they decide, because `ravel-cli` obeys the same
 /// rules against the same bucket and two copies of them would drift.
 /// Re-exported here for `Cli::validate` and [`build_store`], which apply the
-/// endpoint rules, and for `Cli::resolve_logs_fetch_policy`, which reads
-/// `is_loopback_endpoint` to derive the default fetch policy (ADR-2014).
+/// endpoint rules, and for `Cli::store_is_loopback`, which reads
+/// `is_loopback_endpoint` to size the loopback fetch-cache share (ADR-2023).
 pub use ravel_object_store::s3::{
     PlaintextS3Endpoint, S3EndpointRefusal, SchemelessS3Endpoint, is_loopback_endpoint,
     resolve_s3_allow_http,
