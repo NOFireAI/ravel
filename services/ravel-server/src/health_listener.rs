@@ -551,6 +551,9 @@ mod tests {
                 let started = std::time::Instant::now();
                 listener.shutdown().expect("health listener stops");
                 let elapsed = started.elapsed();
+                // hygiene-allow: wall-clock -- the bound under test is real
+                // time the process waits at shutdown; upper bound only, and
+                // the normal path returns at SHUTDOWN_GRACE, a margin early.
                 assert!(
                     elapsed <= SHUTDOWN_GRACE + JOIN_MARGIN,
                     "shutdown took {elapsed:?}, past the {SHUTDOWN_GRACE:?} grace plus \
