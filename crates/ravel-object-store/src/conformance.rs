@@ -4690,4 +4690,202 @@ mod tests {
             .expect_err("a failed PUT must leave no object, partial or otherwise");
         assert!(matches!(err, StoreError::NotFound), "got {err:?}");
     }
+
+    /// The pinned-read cases below run against both the memory oracle and the
+    /// same oracle behind `FaultStore` with no rules armed, so a decorator that
+    /// silently dropped the pin would fail them too.
+    fn pinned_read_subjects() -> Vec<(&'static str, Box<dyn ObjectStoreBackend>)> {
+        vec![
+            ("MemoryStore", Box::new(MemoryStore::new())),
+            (
+                "FaultStore<MemoryStore>",
+                Box::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty())),
+            ),
+        ]
+    }
+
+    async fn pin_of(store: &dyn ObjectStoreBackend, key: &str) -> crate::Pin {
+        let meta = store.head(key).await.expect("head the just-written object");
+        crate::Pin {
+            etag: meta.etag.0,
+            version: Some(meta.version.0),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_matching_pin_serves_the_exact_range() {
+        for (name, store) in pinned_read_subjects() {
+            let key = "pinned/exact";
+            store
+                .put(key, Bytes::from_static(b"0123456789"), PutOptions::default())
+                .await
+                .expect("put");
+            let pin = pin_of(store.as_ref(), key).await;
+
+            let got = store
+                .get_pinned(key, GetRange::Range(2, 5), &pin)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: a matching pin must be served: {e}"));
+            assert_eq!(&got.data[..], b"234", "{name}");
+            assert_eq!(got.total_size, 10, "{name}");
+            assert_eq!(got.etag.0, pin.etag, "{name}");
+
+            let suffix = store
+                .get_pinned(key, GetRange::Suffix(3), &pin)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: a matching pin must be served: {e}"));
+            assert_eq!(&suffix.data[..], b"789", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_etag_or_wrong_version_is_a_precondition_failure() {
+        for (name, store) in pinned_read_subjects() {
+            let key = "pinned/wrong";
+            store
+                .put(key, Bytes::from_static(b"0123456789"), PutOptions::default())
+                .await
+                .expect("put");
+            let pin = pin_of(store.as_ref(), key).await;
+
+            let wrong_etag = crate::Pin {
+                etag: "\"0\"".to_string(),
+                version: pin.version.clone(),
+            };
+            let err = store
+                .get_pinned(key, GetRange::Range(0, 1), &wrong_etag)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{name}: a wrong ETag must not be served"));
+            assert!(
+                matches!(err, StoreError::PreconditionFailed),
+                "{name}: wrong ETag gave {err:?}"
+            );
+
+            // Same object, correct ETag, wrong version: refused on the version
+            // alone, so a backend that checks only the ETag fails here.
+            let wrong_version = crate::Pin {
+                etag: pin.etag.clone(),
+                version: Some("no-such-version".to_string()),
+            };
+            let err = store
+                .get_pinned(key, GetRange::Range(0, 1), &wrong_version)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{name}: a wrong version must not be served"));
+            assert!(
+                matches!(err, StoreError::PreconditionFailed),
+                "{name}: wrong version gave {err:?}"
+            );
+
+            // And the matching pin is still served, so neither refusal above is
+            // a blanket failure of `get_pinned`.
+            let got = store
+                .get_pinned(key, GetRange::Range(0, 1), &pin)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: the matching pin must be served: {e}"));
+            assert_eq!(&got.data[..], b"0", "{name}");
+        }
+    }
+
+    /// The stale-pin case the whole pinning model rests on: after the object is
+    /// overwritten, a read carrying the previous identity must be refused
+    /// rather than served the new bytes.
+    ///
+    /// The stale pin carries an ETag and no version on purpose. The refusal
+    /// then rests on the ETag alone, so a backend that evaluates only the
+    /// version half serves the new bytes here and fails this test.
+    #[tokio::test]
+    async fn a_ranged_get_with_a_stale_etag_is_refused_after_an_overwrite() {
+        for (name, store) in pinned_read_subjects() {
+            let key = "pinned/overwritten";
+            store
+                .put(key, Bytes::from_static(b"old-bytes!"), PutOptions::default())
+                .await
+                .expect("put the first version");
+            let stale = crate::Pin::etag(pin_of(store.as_ref(), key).await.etag);
+
+            store
+                .put(key, Bytes::from_static(b"new-bytes!"), PutOptions::default())
+                .await
+                .expect("overwrite");
+
+            let err = store
+                .get_pinned(key, GetRange::Range(0, 3), &stale)
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("{name}: a read pinned to the replaced version must be refused")
+                });
+            assert!(
+                matches!(err, StoreError::PreconditionFailed),
+                "{name}: got {err:?}"
+            );
+
+            // The current pin still reads, so the refusal above is the
+            // precondition and not a broken object.
+            let fresh = pin_of(store.as_ref(), key).await;
+            let got = store
+                .get_pinned(key, GetRange::Range(0, 3), &fresh)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: the current pin must be served: {e}"));
+            assert_eq!(&got.data[..], b"new", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_is_not_found_not_a_precondition_failure() {
+        for (name, store) in pinned_read_subjects() {
+            let pin = crate::Pin::etag("\"whatever\"");
+            let err = store
+                .get_pinned("pinned/absent", GetRange::Range(0, 1), &pin)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{name}: a missing key must not be served"));
+            assert!(matches!(err, StoreError::NotFound), "{name}: got {err:?}");
+        }
+    }
+
+    /// `head` and `list` must report one object's ETag identically, byte for
+    /// byte: a pin recorded from a listing is later spent on a `get_pinned`,
+    /// and a backend (or a decorator) that quotes one and not the other turns
+    /// every such read into a precondition failure.
+    #[tokio::test]
+    async fn list_and_head_agree_on_the_etag_verbatim() {
+        for (name, store) in pinned_read_subjects() {
+            let prefix = "etag-agreement/";
+            for i in 0..3 {
+                store
+                    .put(
+                        &format!("{prefix}{i}"),
+                        Bytes::from(format!("payload-{i}")),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .expect("put");
+            }
+
+            let page = store.list(prefix, None).await.expect("list");
+            assert_eq!(page.objects.len(), 3, "{name}");
+            for object in &page.objects {
+                let meta = store.head(&object.key).await.expect("head a listed object");
+                assert_eq!(
+                    meta.etag.0, object.etag.0,
+                    "{name}: list and head disagree on the ETag of {}",
+                    object.key
+                );
+                assert_eq!(meta.size, object.size, "{name}");
+
+                // Spend the listed ETag as a pin: the agreement is only worth
+                // asserting because this read depends on it.
+                let pin = crate::Pin::etag(object.etag.0.clone());
+                store
+                    .get_pinned(&object.key, GetRange::Range(0, 1), &pin)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("{name}: the ETag from `list` must be spendable as a pin: {e}")
+                    });
+            }
+        }
+    }
 }
