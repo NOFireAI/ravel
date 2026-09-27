@@ -67,6 +67,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use ravel_commit::{RngSource, SystemRng};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -74,7 +75,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
 
-use crate::audit_write::{AuditRecord, write_audit_batch};
+use crate::audit_write::{AuditRecord, write_audit_batch_with_rng};
 use crate::config::{AuditMode, AuditPipelineConfig};
 use crate::error::{MaintainError, Result};
 
@@ -165,12 +166,26 @@ pub struct AuditPipeline {
 }
 
 impl AuditPipeline {
-    /// Spawn the flush task and return a pipeline writing to `store`. Every
-    /// tenant the process serves shares this one pipeline; each batch is
-    /// grouped by the tenant carried on its events, so the pipeline itself
-    /// holds no tenant. The task runs until [`shutdown`](Self::shutdown) is
-    /// called or the pipeline is dropped.
+    /// Spawn the flush task and return a pipeline writing to `store`, jittering
+    /// its retry backoff (ADR-0062 amendment, 2026-09-27) from OS entropy via
+    /// [`SystemRng`]. Every tenant the process serves shares this one
+    /// pipeline; each batch is grouped by the tenant carried on its events, so
+    /// the pipeline itself holds no tenant. The task runs until
+    /// [`shutdown`](Self::shutdown) is called or the pipeline is dropped.
     pub fn spawn(store: Arc<dyn ObjectStoreBackend>, config: AuditPipelineConfig) -> Self {
+        Self::spawn_with_rng(store, config, Arc::new(SystemRng))
+    }
+
+    /// [`Self::spawn`] with the backoff-jitter source injected (ADR-0068
+    /// decision 2), mirroring `ravel_commit::publish`'s `publish`/
+    /// `publish_with_rng` split: the simulation harness calls this directly
+    /// with a seeded source so retry timing replays deterministically from
+    /// its master seed.
+    pub fn spawn_with_rng(
+        store: Arc<dyn ObjectStoreBackend>,
+        config: AuditPipelineConfig,
+        rng: Arc<dyn RngSource>,
+    ) -> Self {
         let audit_mode = config.audit_mode;
         let (tx, rx) = mpsc::channel(config.channel_capacity.max(1));
         let shutdown = Arc::new(Notify::new());
@@ -184,6 +199,7 @@ impl AuditPipeline {
             shutdown.clone(),
             flush_failures.clone(),
             put_retries.clone(),
+            rng,
         ));
         AuditPipeline {
             tx,
@@ -286,8 +302,11 @@ impl AuditPipeline {
     }
 
     /// Number of individual PUT attempts retried after a transient
-    /// object-store error, across every batch this pipeline has flushed. See
-    /// [`Self::put_retries`] (the field) for what a nonzero count means.
+    /// object-store error, across every batch this pipeline has flushed. A
+    /// nonzero count means the store is degraded even though
+    /// [`Self::flush_failures`] may still be zero: the retries absorbed the
+    /// errors before they reached a submitter. Exported on `/metrics` as
+    /// `ravel_audit_put_retries_total`.
     pub fn put_retries(&self) -> u64 {
         self.put_retries.load(Ordering::Relaxed)
     }
@@ -324,6 +343,7 @@ async fn run_flush_loop(
     shutdown: Arc<Notify>,
     flush_failures: Arc<AtomicU64>,
     put_retries: Arc<AtomicU64>,
+    rng: Arc<dyn RngSource>,
 ) {
     loop {
         // Wait for the first submission of a new batch, or a stop signal.
@@ -337,7 +357,7 @@ async fn run_flush_loop(
                     batch.push(submission);
                 }
                 if !batch.is_empty() {
-                    flush_batch(store.as_ref(), &config, &flush_failures, &put_retries, batch).await;
+                    flush_batch(store.as_ref(), &config, &flush_failures, &put_retries, rng.as_ref(), batch).await;
                 }
                 return;
             }
@@ -382,6 +402,7 @@ async fn run_flush_loop(
             &config,
             &flush_failures,
             &put_retries,
+            rng.as_ref(),
             batch,
         )
         .await;
@@ -404,6 +425,7 @@ async fn flush_batch(
     config: &AuditPipelineConfig,
     flush_failures: &AtomicU64,
     put_retries: &AtomicU64,
+    rng: &dyn RngSource,
     batch: Vec<Submission>,
 ) {
     // `BTreeMap` rather than a hash map so a multi-tenant batch flushes in a
@@ -418,8 +440,15 @@ async fn flush_batch(
 
     for (tenant, (records, dones)) in groups {
         let record_id = Uuid::new_v4();
-        let outcome =
-            write_audit_batch(store, config.shard, record_id, records, Some(put_retries)).await;
+        let outcome = write_audit_batch_with_rng(
+            store,
+            config.shard,
+            record_id,
+            records,
+            Some(put_retries),
+            rng,
+        )
+        .await;
 
         match outcome {
             Ok(()) => {
@@ -1086,6 +1115,55 @@ mod tests {
             pipeline.put_retries(),
             1,
             "the one retry against the commit-record PUT was counted"
+        );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// [`AuditPipeline::spawn_with_rng`] threads a seeded source all the way
+    /// down to [`write_audit_batch_with_rng`]'s jitter: this only proves the
+    /// seam is wired end to end (the retry still succeeds), not any specific
+    /// timing, since a `SeededRng`'s exact draw sequence is not part of this
+    /// test's contract.
+    #[tokio::test]
+    async fn spawn_with_rng_threads_a_seeded_rng_through_the_retry_backoff() {
+        let mem = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Timeout)
+                .with_key_contains("/l0/")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(mem, plan));
+        let tenant = TenantHash([44u8; 16]);
+        let config = pipeline_config(3, Duration::from_secs(3600));
+        let pipeline = Arc::new(AuditPipeline::spawn_with_rng(
+            store.clone(),
+            config,
+            Arc::new(ravel_commit::SeededRng::new(7)),
+        ));
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let pipeline = pipeline.clone();
+            handles.push(tokio::spawn(async move {
+                pipeline.submit(test_event(tenant, 23_000 + i, 7)).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .expect("submit task")
+                .expect("a retried transient timeout must not fail the batch");
+        }
+
+        assert_eq!(
+            commit_record_count(store.as_ref(), &tenant).await,
+            1,
+            "exactly one commit record for the one flushed, retried batch"
+        );
+        assert_eq!(
+            pipeline.put_retries(),
+            1,
+            "the one retry against the data-object PUT was counted"
         );
         pipeline.shutdown().await.expect("shutdown");
     }

@@ -2790,19 +2790,30 @@ fn render_bucket_protection_family(out: &mut String, mode: Mode, unknown: u64) {
     );
 }
 
-/// The query-audit pipeline's write-failure counter (ADR-0062 decision 2c).
+/// The query-audit pipeline's write-failure and PUT-retry counters (ADR-0062
+/// decisions 2c and 2b's amendment).
 ///
 /// Rendered only by a process that installed a pipeline: `maintain` and
 /// `gateway` serve no query surface, and a zero for a subsystem they never ran
 /// would read as "no failures" rather than "not applicable".
-///
-/// Under `--audit-mode required` a failed write is returned to the query as a
-/// 503 and is not counted here, so any nonzero value is the best-effort
-/// posture reporting queries that were served with no durable audit record.
-/// It increments once per tenant group whose write fails within a flush, not
-/// once per flush. It carries no tenant label: that would disclose which
-/// tenant's writes failed on this unauthenticated route.
-fn render_audit_family(out: &mut String, mode: Mode, write_failures: u64) {
+pub struct AuditPipelineMetrics {
+    /// Under `--audit-mode required` a failed write is returned to the query
+    /// as a 503 and is not counted here, so any nonzero value is the
+    /// best-effort posture reporting queries that were served with no durable
+    /// audit record. It increments once per tenant group whose write fails
+    /// within a flush, not once per flush. It carries no tenant label: that
+    /// would disclose which tenant's writes failed on this unauthenticated
+    /// route.
+    pub write_failures: u64,
+    /// Individual PUT attempts retried after a transient object-store error
+    /// (ADR-0062 amendment, 2026-09-27), across every batch this pipeline has
+    /// flushed. A nonzero count means the store is degraded even though
+    /// `write_failures` may still be zero: the retries absorbed the errors
+    /// before they reached a submitter.
+    pub put_retries: u64,
+}
+
+fn render_audit_family(out: &mut String, mode: Mode, metrics: &AuditPipelineMetrics) {
     write_header(
         out,
         "ravel_audit_write_failures_total",
@@ -2813,7 +2824,19 @@ fn render_audit_family(out: &mut String, mode: Mode, write_failures: u64) {
         out,
         "ravel_audit_write_failures_total",
         &[Label::Mode(mode)],
-        write_failures,
+        metrics.write_failures,
+    );
+    write_header(
+        out,
+        "ravel_audit_put_retries_total",
+        "audit PUT attempts retried after a transient object-store error",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_audit_put_retries_total",
+        &[Label::Mode(mode)],
+        metrics.put_retries,
     );
 }
 
@@ -5518,7 +5541,7 @@ pub fn render(
     cache_disk_residency: Option<(usize, u64)>,
     cache_max_bytes: Option<u64>,
     catalog_cache_max_bytes: Option<u64>,
-    audit_write_failures: Option<u64>,
+    audit_pipeline_metrics: Option<&AuditPipelineMetrics>,
     memory_budget: MemoryBudgetSnapshot,
     can_fold: bool,
 ) -> String {
@@ -5575,8 +5598,8 @@ pub fn render(
     if let Some(snapshot) = durable_auth {
         render_durable_auth_family(&mut out, mode, snapshot);
     }
-    if let Some(write_failures) = audit_write_failures {
-        render_audit_family(&mut out, mode, write_failures);
+    if let Some(metrics) = audit_pipeline_metrics {
+        render_audit_family(&mut out, mode, metrics);
     }
     render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
     render_typed_attr_columns_family(&mut out, mode, crate::typed_attr_metrics::stale_fallbacks());
@@ -6101,12 +6124,16 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ));
     }
 
-    // The query-audit pipeline's failure counter, read at scrape time (an
-    // atomic load). `None` in a mode that installed no pipeline.
-    let audit_write_failures = state
-        .audit_pipeline
-        .as_ref()
-        .map(|pipeline| pipeline.flush_failures());
+    // The query-audit pipeline's failure and retry counters, read at scrape
+    // time (atomic loads). `None` in a mode that installed no pipeline.
+    let audit_pipeline_metrics =
+        state
+            .audit_pipeline
+            .as_ref()
+            .map(|pipeline| AuditPipelineMetrics {
+                write_failures: pipeline.flush_failures(),
+                put_retries: pipeline.put_retries(),
+            });
     // The ADR-1170 process memory budget readings (atomic loads), like every
     // other family, rather than baking a snapshot in at construction.
     let memory_budget_snapshot = MemoryBudgetSnapshot {
@@ -6146,7 +6173,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         cache_disk_residency,
         cache_max_bytes,
         catalog_cache_max_bytes,
-        audit_write_failures,
+        audit_pipeline_metrics.as_ref(),
         memory_budget_snapshot,
         state.can_fold,
     );

@@ -110,10 +110,13 @@ const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 /// Grace added to `--audit-max-age` to bound the query-audit drain in
 /// [`Running::shutdown`] (ADR-0062 decision 2b).
 ///
-/// The drain is one final flush per tenant in the buffered batch: a data-object
-/// PUT plus a commit publish, each under the commit retry ladder (five
-/// attempts, about 0.3 s of total backoff). Five seconds is over ten times that
-/// ladder, so a store that is merely slow finishes inside the bound. It is a
+/// The drain is one final flush per tenant in the buffered batch: a
+/// data-object PUT plus a commit PUT, each retried under
+/// `ravel_maintain::audit_write`'s own ladder, all inside that flush's single
+/// `AUDIT_WRITE_BUDGET` (30 seconds, covering both PUTs and every attempt).
+/// Five seconds is well short of that budget, so this grace is the tighter
+/// bound in practice: a store slow enough to still be retrying when it fires
+/// is cut off here, before the ladder would have given up on its own. It is a
 /// ceiling on the work, not a deadline for it: an object store that never
 /// answers must not be able to keep the process alive, and shutdown has already
 /// stopped every listener that could submit, so the only records at risk are
