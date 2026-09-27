@@ -11517,6 +11517,26 @@ mod tests {
     }
 
     #[test]
+    fn listen_health_equal_to_fragment_listener_fails_validate() {
+        // Real TLS material: `validate()` reads the fragment PEM files before
+        // it reaches the health listener collision check.
+        let key = fragment_key_tmp();
+        let material = fragment_tls_material(crate::fragment_cert::test_certs::BOTH_USAGES_PEM);
+        let mut args = fragment_tls_args(key.path().to_str().expect("utf8"), &material);
+        args.extend_from_slice(&["--listen-health", "127.0.0.1:4319"]);
+        let err = cli(&args)
+            .validate()
+            .expect_err("--listen-health aliasing --fragment-listener must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--listen-health"), "names health flag: {msg}");
+        assert!(
+            msg.contains("--fragment-listener"),
+            "names colliding flag: {msg}"
+        );
+        assert!(msg.contains("127.0.0.1:4319"), "names the address: {msg}");
+    }
+
+    #[test]
     fn listen_health_on_its_own_address_validates() {
         cli(&["--listen-health", "127.0.0.1:4316"])
             .validate()
