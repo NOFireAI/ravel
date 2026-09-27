@@ -1970,9 +1970,10 @@ pipeline it never ran.
 | `ravel_audit_put_retries_total` | audit PUT attempts retried after a transient object-store error. |
 
 A transient object-store error (a timeout or a throttle response) is retried
-up to two additional times with a short jittered backoff, all within one
-30-second budget per flush covering both of its PUTs, before a write counts
-as failed here, so `ravel_audit_write_failures_total` reflects writes that
+up to two additional times with a short jittered backoff, all within a
+30-second budget per tenant group covering both of its PUTs (a flush writes
+its tenant groups one after another, each under its own budget), before a
+write counts as failed here, so `ravel_audit_write_failures_total` reflects writes that
 kept failing until that budget ran out, not a single slow request; each
 individual retried attempt along the way is what
 `ravel_audit_put_retries_total` counts, so a climbing value there with a flat

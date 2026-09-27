@@ -111,8 +111,9 @@ const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 ///
 /// The drain is one final flush per tenant in the buffered batch: a
 /// data-object PUT plus a commit PUT, each retried under
-/// `ravel_maintain::audit_write`'s own ladder, all inside that flush's single
-/// `AUDIT_WRITE_BUDGET` (30 seconds, covering both PUTs and every attempt).
+/// `ravel_maintain::audit_write`'s own ladder, each tenant's write inside its
+/// own `AUDIT_WRITE_BUDGET` (30 seconds, covering both PUTs and every
+/// attempt), tenant after tenant.
 /// Five seconds is well short of that budget, so this grace is the tighter
 /// bound in practice: a store slow enough to still be retrying when it fires
 /// is cut off here, before the ladder would have given up on its own. It is a
