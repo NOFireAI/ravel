@@ -89,11 +89,13 @@ mod tests {
     /// ravel-server reachability test pins that the real startup path derives
     /// the budget at this same value.
     const DEFAULT_SHARDS: u32 = 4;
-    /// The ingest pipeline's default `max_flush_delay`
-    /// (`ravel_ingest::IngestConfig::default`, the value the server's metrics
-    /// ingest pipeline actually runs with). Named, not imported, for the same
-    /// reason `DEFAULT_SHARDS` is: ravel-ingest depends on ravel-query, so
-    /// importing it here would be a dependency cycle.
+    /// The cadence `EngineConfig::default` derives its budget at
+    /// (`DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY`), and the fastest cadence any
+    /// deployment here is sized for, so it is the largest open-hour cost a
+    /// shard can present. `ravel_ingest::IngestConfig::default`'s
+    /// `max_flush_delay` is the slower 2 s, whose open hour is a quarter of
+    /// this one and fits the correspondingly smaller budget the same way;
+    /// `derived_budget_covers_healthy_tail_plus_stall_alert_window` pins both.
     const DEFAULT_FLUSH_DELAY: Duration = Duration::from_millis(500);
 
     /// The flat cap this derivation replaces. Its defect: it is a per-query

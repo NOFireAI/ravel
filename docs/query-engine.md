@@ -29,7 +29,9 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
          -> Reader::parse
          -> prune series by that selector's own matchers (SERIES_META +
             LABEL_DICT)
-         -> plan page ranges, coalesce adjacent (gap <= 64 KiB)
+         -> plan page ranges, coalesce adjacent (gap <= 64 KiB), then on an
+            L0 segment bridge the smallest remaining gaps down to at most
+            MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT (4) runs
          -> ranged GETs -> decode pages -> per-series samples
        -> selective-erasure exclusion: every series or sample matching a
           predicate the snapshot carries in `pending_erasure` is dropped
@@ -632,6 +634,25 @@ conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
 below any real compacted sparse L1 segment) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
 
+### The L0 page-range bound (ADR-1306)
+
+An unsealed L0 flush is one ingest buffer, up to ingest's 8 MiB size trigger,
+and above the 512 KiB whole-object threshold its page-range GET count used to
+grow with the page runs a query selected: a matcher taking every other series
+of a 7,700,472-byte flush left 48 runs that coalescing could not join, and
+48 page GETs. `SegmentFetcher::fetch_pages` therefore bridges the smallest
+remaining gaps (`bound_runs`) until at most
+`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4) runs are left, on an L0 segment only.
+Scalar and histogram runs are planned and fetched in one batch, and the four
+catalog sections go as one run, so the bound holds per segment whichever page
+kinds a query selects. One L0 fetch therefore costs at most
+`MAX_GETS_PER_L0_SEGMENT_FETCH` = 7 GETs: the first GET, one footer chase, one
+catalog GET and 4 page GETs. Bridging moves the bytes in a bridged gap that
+the query did not ask for, which is the trade the bound makes: a bounded,
+predictable request count per flush in exchange for bytes inside one segment.
+L1 parts keep unbounded page runs, since a compacted part can be far larger
+than one flush and bridging its gaps would move far more.
+
 ## Fetch-layer memory reservations
 
 The fetch layer reserves the bytes a GET will materialize on a shared
@@ -1097,15 +1118,29 @@ hot tenant's open hour and a read-your-write query no longer 422 on count.
 Their cost is bounded instead by a per-query S3 request budget
 (`EngineConfig::max_s3_requests`, derived from the deployment's shard count
 and ingest flush cadence by `derive_max_s3_requests` rather than a flat
-constant -- ADR-0075 decisions 1-2; the derived default is 15,800 at the
+constant -- ADR-0075 decisions 1-2; the derived default is 343,400 at the
 default 4 shards and the 2s flush cadence ADR-0076 decision 4 sets), checked
 incrementally at the same points `max_bytes_scanned` already is, and reported
 as `RequestBudgetExceeded` (HTTP 422) when tripped. A running server does not
 use the `DEFAULT_BUDGET_REFERENCE_SHARDS` (4) and
 `DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY` (500ms) reference pair that
 `EngineConfig::default` carries for context-free callers (tests, alerting,
-other non-server callers); that pair derives 48,200, which is not the
+other non-server callers); that pair derives 1,358,600, which is not the
 deployment default.
+
+The span the per-shard allowance is sized from is `covered_span` (ADR-1306
+decisions 1-2): the longest unsealed tail a healthy catalog carries
+(`healthy_tail_max`, the fold's seal margin plus the open ingest hour) plus
+the time a stalled fold takes to page an operator (the seal margin again, the
+`RavelCatalogFoldStalled` alert's `for:`, and the alert-delivery slack), 14,100
+s at the catalog's reference seal margin. Each unsealed flush in that span is
+sized at `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of
+`REQUESTS_PER_UNSEALED_FLUSH` (2, the measured cold cost of a flush at or under
+the whole-object threshold) and `MAX_REQUESTS_PER_UNSEALED_FLUSH` (8, its
+commit-record GET plus `MAX_GETS_PER_L0_SEGMENT_FETCH`), so the per-flush term
+is an upper bound at any flush size ingest can produce, not only under the
+threshold. At 4 shards and 2 s that is
+`ceil(14,100 / 2) x 8 x 3/2 x 4 + 5,000 = 343,400`.
 
 `crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
