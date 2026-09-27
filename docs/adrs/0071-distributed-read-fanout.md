@@ -125,6 +125,10 @@ transient wire contract between processes, not a persistent format; no
 stored byte changes. The response oneof gained log-record and span frames
 under the log and span fan-out amendment below.
 
+How a worker turns a pinned segment identity into the segment it reads is
+decided by the pinned-record amendment below (issue #1721): it reads that
+segment's own commit, compaction, or rewrite record, not its catalog.
+
 ## Failure semantics
 
 - Worker unreachable or mid-stream loss: re-dispatch the slice to the next
@@ -152,6 +156,12 @@ under the log and span fan-out amendment below.
   waiting on fragments that need the same permit pool.
 - Remote cluster down or slow: fail by default; with `skip_unavailable`,
   continue and mark, never silently.
+- Bad pinned record (the pinned-record amendment below): a pinned segment's
+  own record is missing, unreadable, fails verification, or disagrees with
+  the identity the coordinator shipped. The worker fails the slice
+  `Unsupported` and the coordinator runs the whole query locally. A retryable
+  store error on that record's GET is `Unavailable` instead, and takes the
+  worker-unreachable path above for that one slice.
 
 ## Security
 
@@ -226,6 +236,10 @@ thresholds (distribute above 256 MiB estimated store bytes or 64 segments)
 are set from the crossover benchmark before defaults freeze, and every later
 optimization (straggler hedging, slice rebalancing, limit hints) requires a
 benchmark demonstrating its value.
+
+The request-count sentence above predates the workers' own record reads: the
+pinned-record amendment below states what those add, which GET semaphore they
+run under, and how they are charged.
 
 ## Operational model
 
@@ -1580,3 +1594,194 @@ the federation path where the caller is another cluster.
   rather than on trusting the budget the caller sent.
 - The per-segment budget check inside a slice is unchanged (ADR-0061
   decision 1): only the limit it compares against moved.
+
+## Amendment (2026-09-26): a worker resolves each pinned segment from its own record
+
+<!-- amendment-applies: sections="Architecture|Failure semantics|Performance" pointer="pinned-record amendment" -->
+
+Status: Accepted. Issue #1721.
+
+### Context
+
+A worker used to turn the coordinator's pinned identities back into segment
+refs by resolving its own catalog snapshot over the slice's event-time window
+and matching each identity by content hash. That re-resolve listed commit and
+compaction prefixes on every fragment request, and a compaction committed
+between the coordinator's resolve and the worker's fetch could drop a pinned
+L0 segment from the worker's snapshot, fail the slice `SnapshotInvalidated`,
+and cost a full coordinator re-resolve and re-dispatch, although the pinned
+objects were all still readable.
+
+### Decision
+
+1. **A pinned slice reads each segment's own record, never the catalog.**
+   For every shipped identity the worker rebuilds, with the ADR-0010 key
+   builders in `ravel_commit::keys`, the key of that segment's own durable
+   record: the commit record for an L0 segment, and for an L1 part the
+   compaction record, or the erasure rewrite record when no compaction record
+   exists at that key. It GETs that one record. It lists nothing and reads no
+   snapshot or manifest. The tenant and signal come from the request the
+   capability already authorized, never from the identity.
+
+2. **The record is verified before anything is built from it.** The record
+   must decode and pass its own validation; its own fields must reconstruct
+   the key it was read from; the data-object key is taken from
+   `verify_object_key` for an L0 record and rebuilt from the verified record
+   for an L1 part; and the full 32-byte content hash and the object size, plus
+   for L1 the full input-set hash and the part index, must equal the
+   identity's. The segment ref is then built from the verified record alone,
+   exactly as the catalog builds one. Records and the objects they name are
+   immutable, so what a pinned slice reads no longer depends on what the
+   catalog says when the fragment arrives.
+
+3. **A bad pinned record runs the query locally.** A record that is missing,
+   unreadable, fails verification, or disagrees with the identity fails the
+   slice `Unsupported`, and the coordinator runs the whole query locally
+   through its own catalog resolve. A record GET that fails with a retryable
+   store error (throttled, timed out, or transient) fails the slice
+   `Unavailable` instead, so only that slice is re-dispatched, as for a lost
+   worker. (True of an INBOUND slice; a slice the coordinator runs itself has
+   no worker left to re-dispatch to, and the local-attempt amendment below
+   decides what it does instead.) A structurally malformed identity is
+   `BadData`. None of these reads another object in place of the one pinned.
+
+4. **Request count.** A worker issues one record GET per pinned L0 segment,
+   one per pinned L1 part, and two for an L1 part only a rewrite record
+   describes (the compaction key misses first), on top of the data-object
+   reads local execution also issues. Every record GET holds a permit of the
+   worker's process-wide GET limiter (ADR-1195), the one its data-object GETs
+   draw from, so instantaneous rate stays capped by `max_parallel_slices`
+   times the per-worker GET semaphore.
+
+5. **Record GETs are not charged to the query.** Local execution never issues
+   them, so charging them to `max_bytes_scanned` or `max_s3_requests` would
+   fail a query distributed that succeeds locally, against this ADR's
+   invariant. A worker charges them to a handle apart from the slice's
+   accounting, and neither its own per-segment budget check nor the
+   coordinator's fold over the slice summaries sees them. The summary carries
+   one pooled accounting snapshot with no phase split, so they are also absent
+   from the slice's reported cost, as the catalog re-resolve they replace was:
+   total S3 request count as reported is identical to local execution, and
+   the store serves the record GETs of item 4 on top of it. Reporting them as
+   a separate resolve-phase figure needs a `queryfrag` field, which is a
+   separate decision. (Still true of the PER-QUERY report; the worker now
+   exports the process-wide totals without one. See the record-GET counter
+   amendment below.)
+
+6. **Unchanged.** The `queryfrag` wire and `PROTOCOL_VERSION` are unchanged.
+   Cross-cluster federation is unchanged: a resolve-scope request still
+   resolves the remote cluster's own snapshot, and its identities are matched
+   against that snapshot.
+
+### Consequences
+
+- A compaction committed mid-query no longer fails an intra-cluster slice:
+  the pinned records and objects stay readable for the query's duration under
+  the `sys/gc` protection horizon the failure semantics above already rely on.
+- A worker's per-slice metadata cost is proportional to its pinned segment
+  count, not to the listing of the whole window.
+
+## Amendment (2026-09-27): the worker exports its record-GET totals
+
+<!-- amendment-applies: sections="Amendment (2026-09-26): a worker resolves each pinned segment from its own record" pointer="record-GET counter amendment" -->
+
+Status: Accepted. Issue #1721.
+
+### Context
+
+Decision 5 above keeps record GETs off the query's accounting, for a reason
+that stands: local execution never issues them, so charging them would fail a
+query distributed that succeeds locally. It then observed that reporting them
+as a resolve-phase figure needs a `queryfrag` field, and left them unreported
+entirely. That is one step too far. Every object-store read this system makes
+is reported under the phase that issued it, and a read charged to a handle
+that is then dropped is a read nobody can see: a worker paying two record
+GETs per pinned L1 part, or falling back to rewrite records across a whole
+tenant, looks identical at the `/metrics` surface to one paying none.
+
+### Decision
+
+1. **A worker exports its record-GET totals as process-wide counters.**
+   `ravel_distrib_fragment_record_get_requests_total` and
+   `ravel_distrib_fragment_record_get_bytes_total` render beside the other
+   `ravel_distrib_fragment_*` series, under the same closed `{mode}` label and
+   with no tenant, shard, or worker label (ADR-0044 section 4). The bytes are
+   wire bytes as the store served them, so a GET that missed contributes a
+   request and no bytes.
+
+2. **What decision 5 above still decides, unchanged.** Record GETs remain
+   outside the slice's accounting, outside `max_bytes_scanned` and
+   `max_s3_requests` on both the worker and the coordinator, and absent from
+   the slice summary. A PER-QUERY resolve-phase figure still needs a
+   `queryfrag` field and is still a separate decision; these counters are per
+   process, not per query, and answer a different question.
+
+3. **Every resolve reports, including one that refuses.** The totals are read
+   after the resolve finishes, whether it resolved every identity or stopped
+   at the first refusal, so a slice that failed `Unsupported` on a bad record
+   still reports the GETs the store served for it.
+
+### Consequences
+
+- The resolve phase's request and byte cost is attributable from a scrape,
+  with no wire change and no `PROTOCOL_VERSION` bump.
+- Dividing the two counters gives the mean record size; dividing the request
+  counter by `ravel_distrib_fragment_requests_total` gives the mean pinned
+  segments per slice, against which a rewrite-record fallback shows up as a
+  rise.
+
+## Amendment (2026-09-27): a retryable record GET on the coordinator's own attempt
+
+<!-- amendment-applies: sections="Amendment (2026-09-26): a worker resolves each pinned segment from its own record" pointer="local-attempt amendment" -->
+
+Status: Accepted. Issue #1721.
+
+### Context
+
+Decision 3 above reads "fails the slice `Unavailable` instead, so only that
+slice is re-dispatched, as for a lost worker." That holds for a slice a
+coordinator dispatched to a worker. It does not hold for a slice the
+coordinator runs itself, and two of the three paths through
+`RoutingSliceFetcher::dispatch` are exactly that:
+
+- A self-mapped or unroutable slice is handed straight to local execution,
+  with no remote attempt before it and no fallback after it.
+- The final fallback, after a remote worker and its one re-dispatch have both
+  failed, is also local execution.
+
+The coordinator treats an `Unavailable` summary as terminal, because on the
+remote path it means every attempt including the local one was already spent.
+So on the self-mapped path a single throttled record GET failed the whole
+query with no retry at all, where the catalog re-resolve this design replaced
+answered the same blip with one re-resolve and retry. That is a regression
+this ADR's own invariant forbids: a query that succeeds locally must not fail
+because it was distributed.
+
+### Decision
+
+1. **A retryable record GET on a LOCAL attempt fails the slice
+   `SnapshotInvalidated`, not `Unavailable`.** The coordinator answers that
+   status with one re-resolve and one retry, which is the recovery the catalog
+   re-resolve had. Both local arms take it: the self-mapped or unroutable
+   slice, and the fallback after the remote ladder is exhausted. An inbound
+   fragment served for another coordinator is unchanged and still fails
+   `Unavailable`, because that coordinator really can re-dispatch it.
+
+2. **Only the resolve phase moves.** A fetch-phase `Unavailable`, which says
+   the segment reads themselves are failing, stays terminal on every path. A
+   record that is missing, unreadable, fails verification, or disagrees with
+   the identity stays `Unsupported` on every path, and a malformed identity
+   stays `BadData`: neither is retryable at any worker, so re-resolving a
+   snapshot that was never the problem would only spend a round.
+
+3. **Which caller this is, is known where the decision is made.** The worker
+   service is told it is executing a local attempt, rather than the
+   coordinator inferring the phase from a status message it cannot parse
+   reliably. Nothing on the wire changes, and `PROTOCOL_VERSION` is unchanged.
+
+### Consequences
+
+- A store blip on one record costs a re-resolve and retry on a single-process
+  or self-mapped deployment, instead of failing the query.
+- The remote failure ladder is unchanged end to end: primary, exactly one
+  re-dispatch, local, and a typed failure only if local fails too.

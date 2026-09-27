@@ -5143,6 +5143,11 @@ pub struct DistribSnapshot {
     pub fragment_inflight_by_class: [(crate::distrib::AdmissionClass, u64); 2],
     /// Cumulative admission-queue waits per class (issue #1722).
     pub fragment_admission_waits_by_class: [(crate::distrib::AdmissionClass, u64); 2],
+    /// Record GETs this worker's pinned resolves issued, cumulative (ADR-0071
+    /// record-GET counter amendment). Not part of any query's accounting.
+    pub fragment_record_get_requests_total: u64,
+    /// Bytes those record GETs transferred, cumulative. Wire bytes as served.
+    pub fragment_record_get_bytes_total: u64,
     pub slices_local_total: u64,
     pub slices_remote_total: u64,
     pub slices_redispatched_total: u64,
@@ -5171,6 +5176,8 @@ impl DistribSnapshot {
             fragment_auth_failures_total: metrics.fragment_auth_failures_total(),
             fragment_inflight_by_class: metrics.fragment_inflight_by_class(),
             fragment_admission_waits_by_class: metrics.fragment_admission_waits_by_class(),
+            fragment_record_get_requests_total: metrics.fragment_record_get_requests_total(),
+            fragment_record_get_bytes_total: metrics.fragment_record_get_bytes_total(),
             slices_local_total: metrics.slices_local_total(),
             slices_remote_total: metrics.slices_remote_total(),
             slices_redispatched_total: metrics.slices_redispatched_total(),
@@ -5249,6 +5256,36 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
             waits,
         );
     }
+
+    write_header(
+        out,
+        "ravel_distrib_fragment_record_get_requests_total",
+        "Object-store GETs this worker's pinned resolves issued to read each pinned \
+         segment's own commit, compaction, or rewrite record (ADR-0071 record-GET \
+         counter amendment). Outside every query's accounting and absent from the slice \
+         summary, so this is the only report of the resolve phase's request cost.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_fragment_record_get_requests_total",
+        &[Label::Mode(mode)],
+        snapshot.fragment_record_get_requests_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_fragment_record_get_bytes_total",
+        "Bytes those record GETs transferred, as the store served them (a GET that \
+         missed transferred none).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_fragment_record_get_bytes_total",
+        &[Label::Mode(mode)],
+        snapshot.fragment_record_get_bytes_total,
+    );
 
     write_header(
         out,
@@ -8569,6 +8606,8 @@ mod tests {
                 (crate::distrib::AdmissionClass::Pinned, 0),
                 (crate::distrib::AdmissionClass::Resolve, 9),
             ],
+            fragment_record_get_requests_total: 13,
+            fragment_record_get_bytes_total: 4_096,
             slices_local_total: 7,
             slices_remote_total: 4,
             slices_redispatched_total: 2,
@@ -8618,6 +8657,8 @@ mod tests {
             "ravel_distrib_fragment_inflight{mode=\"query\",class=\"resolve\"} 4",
             "ravel_distrib_fragment_admission_waits_total{mode=\"query\",class=\"pinned\"} 0",
             "ravel_distrib_fragment_admission_waits_total{mode=\"query\",class=\"resolve\"} 9",
+            "ravel_distrib_fragment_record_get_requests_total{mode=\"query\"} 13",
+            "ravel_distrib_fragment_record_get_bytes_total{mode=\"query\"} 4096",
             "ravel_distrib_slices_local_total{mode=\"query\"} 7",
             "ravel_distrib_slices_remote_total{mode=\"query\"} 4",
             "ravel_distrib_slices_redispatched_total{mode=\"query\"} 2",
@@ -10532,6 +10573,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                 (crate::distrib::AdmissionClass::Pinned, 0),
                 (crate::distrib::AdmissionClass::Resolve, 0),
             ],
+            fragment_record_get_requests_total: 0,
+            fragment_record_get_bytes_total: 0,
             slices_local_total: 0,
             slices_remote_total: 0,
             slices_redispatched_total: 0,
