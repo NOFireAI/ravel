@@ -2541,8 +2541,22 @@ struct CpuGateRow {
     run_nanos_sum: u64,
     run_count: u64,
     abandoned: u64,
-    sites: Vec<(Label, u64, u64)>,
+    sites: Vec<CpuGateSiteRow>,
 }
+
+/// One call site's per-site counters, with its `site` label.
+struct CpuGateSiteRow {
+    site: Label,
+    jobs: u64,
+    inline: u64,
+}
+
+/// Reads one whole-gate figure off a [`CpuGateRow`].
+type GateFigure = fn(&CpuGateRow) -> u64;
+/// Reads one summary's nanosecond sum and count off a [`CpuGateRow`].
+type GateSumCount = fn(&CpuGateRow) -> (u64, u64);
+/// Reads one per-site figure off a [`CpuGateSiteRow`].
+type SiteFigure = fn(&CpuGateSiteRow) -> u64;
 
 impl CpuGateRow {
     fn new<S: ravel_cpu_gate::GateSite>(
@@ -2562,7 +2576,11 @@ impl CpuGateRow {
             sites: snapshot
                 .sites
                 .iter()
-                .map(|site| (site_label(site.site), site.jobs, site.inline))
+                .map(|site| CpuGateSiteRow {
+                    site: site_label(site.site),
+                    jobs: site.jobs,
+                    inline: site.inline,
+                })
                 .collect(),
         }
     }
@@ -2585,7 +2603,7 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
         CpuGateRow::new(&gates.write, Label::WriteGateSite),
     ];
     let nanos_to_seconds = |nanos: u64| nanos as f64 / 1_000_000_000.0;
-    let gauges: [(&str, &str, fn(&CpuGateRow) -> u64); 3] = [
+    let gauges: [(&str, &str, GateFigure); 3] = [
         (
             "ravel_cpu_gate_permits",
             "Jobs this CPU gate may run at once (--cpu-gate-read-permits, --cpu-gate-write-permits).",
@@ -2614,7 +2632,7 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
         }
     }
 
-    let summaries: [(&str, &str, fn(&CpuGateRow) -> (u64, u64)); 2] = [
+    let summaries: [(&str, &str, GateSumCount); 2] = [
         (
             "ravel_cpu_gate_wait_seconds",
             "Time callers waited for a CPU gate permit, over waits that got one.",
@@ -2653,16 +2671,16 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
         );
     }
 
-    let per_site: [(&str, &str, fn(&(Label, u64, u64)) -> u64); 2] = [
+    let per_site: [(&str, &str, SiteFigure); 2] = [
         (
             "ravel_cpu_gate_jobs_total",
             "Jobs a call site ran on the blocking pool through a CPU gate permit.",
-            |site| site.1,
+            |site| site.jobs,
         ),
         (
             "ravel_cpu_gate_inline_total",
             "Jobs a call site ran inline because they were below the CPU gate's inline floor.",
-            |site| site.2,
+            |site| site.inline,
         ),
     ];
     for (name, help, value) in per_site {
@@ -2672,7 +2690,7 @@ fn render_cpu_gate_family(out: &mut String, mode: Mode, gates: &CpuGatesSnapshot
                 write_sample(
                     out,
                     name,
-                    &[Label::Mode(mode), row.gate.clone(), site.0.clone()],
+                    &[Label::Mode(mode), row.gate.clone(), site.site.clone()],
                     value(site),
                 );
             }
