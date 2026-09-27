@@ -142,7 +142,11 @@ flush), ABOVE the 30s Kubernetes default: an unreachable trace collector can
 push the process past the grace period and cost it a SIGKILL. That overrun
 costs traces and a clean exit, not buffered records, which the drain has
 already attempted to flush. The operator half of this work sets the pod grace
-period above 32.5s accordingly.
+period above 32.5s accordingly. With `--listen-health` set (below), stopping
+that listener runs between the drain and the trace flush and takes up to 6s
+(a 5s shutdown deadline plus a 1s join margin), so the worst case becomes
+27.5s + 6s + 5s = 38.5s, and a pod that enables the dedicated health port
+needs a grace period above 38.5s.
 
 Those routes share the application runtime, so a node whose workers are all
 busy cannot answer them. `--listen-health <addr>`, off by default, adds a
