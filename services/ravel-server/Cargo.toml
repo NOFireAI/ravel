@@ -290,6 +290,9 @@ arrow = { workspace = true }
 # std::process::id()-keyed path would risk when tests run on threads within
 # one test binary.
 tempfile = { workspace = true }
+# Test-only: parks every main-runtime worker and bounds a wedged test for the
+# ADR-1702 health listener tests (`src/health_listener.rs`).
+ravel-test-support = { workspace = true }
 
 [lints]
 workspace = true

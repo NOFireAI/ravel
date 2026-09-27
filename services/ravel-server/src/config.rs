@@ -359,6 +359,16 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1:4317")]
     pub listen_grpc: SocketAddr,
 
+    /// Dedicated liveness and readiness listener (ADR-1702 decision 8),
+    /// served from its own thread and runtime so a busy or wedged main
+    /// runtime cannot stop it answering. Serves `/healthz`, `/readyz`,
+    /// `/-/healthy` and `/-/ready` only, and fails them once the main
+    /// runtime's heartbeat is older than 60 s (liveness) or 30 s (readiness).
+    /// Unset, nothing binds; the same routes stay on `--listen-http` either
+    /// way.
+    #[arg(long = "listen-health", value_name = "ADDR")]
+    pub listen_health: Option<SocketAddr>,
+
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
 
@@ -5485,6 +5495,26 @@ impl Cli {
                 "--tenant-hash-key-file and --tenant-hash-unkeyed are mutually exclusive: the \
                  first keys the tenant hash, the second opts out of keying. Pass exactly one."
             );
+        }
+
+        // The health listener binds its own socket before `start`, so an alias
+        // would otherwise surface as a bare "Address already in use" at bind.
+        if let Some(listen_health) = self.listen_health {
+            let others = [
+                ("--listen-http", Some(self.listen_http)),
+                ("--listen-grpc", Some(self.listen_grpc)),
+                ("--mtls-listener", self.mtls_listener),
+                ("--fragment-listener", self.fragment_listener),
+            ];
+            for (flag, other) in others {
+                if other == Some(listen_health) {
+                    anyhow::bail!(
+                        "--listen-health '{listen_health}' must not equal {flag} \
+                         '{listen_health}': the dedicated health listener (ADR-1702 decision 8) \
+                         binds its own address. Bind --listen-health to a different address."
+                    );
+                }
+            }
         }
 
         if let Some(mtls_listener) = self.mtls_listener {
@@ -11439,6 +11469,58 @@ mod tests {
             .parse_tenant_kms_config()
             .expect("no --tenant-kms-config parses to an empty config");
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn listen_health_equal_to_default_listen_http_fails_validate() {
+        let err = cli(&["--listen-health", "127.0.0.1:4318"])
+            .validate()
+            .expect_err("--listen-health aliasing the default --listen-http must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--listen-health"), "names health flag: {msg}");
+        assert!(msg.contains("--listen-http"), "names colliding flag: {msg}");
+        assert!(msg.contains("127.0.0.1:4318"), "names the address: {msg}");
+    }
+
+    #[test]
+    fn listen_health_equal_to_listen_grpc_fails_validate() {
+        let err = cli(&[
+            "--listen-health",
+            "127.0.0.1:4320",
+            "--listen-grpc",
+            "127.0.0.1:4320",
+        ])
+        .validate()
+        .expect_err("--listen-health aliasing --listen-grpc must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--listen-health"), "names health flag: {msg}");
+        assert!(msg.contains("--listen-grpc"), "names colliding flag: {msg}");
+    }
+
+    #[test]
+    fn listen_health_equal_to_mtls_listener_fails_validate() {
+        let err = cli(&[
+            "--listen-health",
+            "127.0.0.1:4321",
+            "--mtls-enabled",
+            "--mtls-listener",
+            "127.0.0.1:4321",
+        ])
+        .validate()
+        .expect_err("--listen-health aliasing --mtls-listener must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--listen-health"), "names health flag: {msg}");
+        assert!(
+            msg.contains("--mtls-listener"),
+            "names colliding flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn listen_health_on_its_own_address_validates() {
+        cli(&["--listen-health", "127.0.0.1:4316"])
+            .validate()
+            .expect("a distinct --listen-health address must validate");
     }
 
     #[test]

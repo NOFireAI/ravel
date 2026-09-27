@@ -27,6 +27,7 @@ pub mod fold_on_demand;
 pub mod fragment_cert;
 pub mod gc_config;
 pub mod health;
+pub mod health_listener;
 pub mod idle_tenant_state;
 pub mod ingest;
 pub mod ingest_byte_metrics;
@@ -1216,6 +1217,13 @@ impl Running {
     /// [`Mode::Maintain`]/[`Mode::Gateway`], which serve no query surface).
     pub fn has_audit_pipeline(&self) -> bool {
         self.audit_pipeline.is_some()
+    }
+
+    /// The readiness handle this server's `/readyz` reads, for the
+    /// `--listen-health` listener, which runs outside this server's routers
+    /// (ADR-1702 decision 8).
+    pub fn readiness(&self) -> health::Readiness {
+        self.readiness.clone()
     }
 
     /// Gracefully stop the server: flip readiness to draining so a probe sees
