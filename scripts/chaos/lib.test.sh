@@ -238,6 +238,7 @@ check "drive_one_export export failure is nonzero" "7" \
 BODY_HIT='{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"demo_requests_total","job":"demo"},"value":[1695800000,"7"]}]}}'
 BODY_EMPTY='{"status":"success","data":{"resultType":"vector","result":[]}}'
 BODY_ERR='{"status":"error","errorType":"bad_data","error":"invalid min_commit_token: \"demo_requests_total\""}'
+BODY_WARN='{"status":"success","data":{"resultType":"vector","result":[]},"warnings":["demo_requests_total matched no samples"]}'
 
 check "query body with the series is visible" "0" \
   "$(rc_of query_body_shows_series "${BODY_HIT}" demo_requests_total)"
@@ -245,6 +246,8 @@ check "empty result is not visible" "1" \
   "$(rc_of query_body_shows_series "${BODY_EMPTY}" demo_requests_total)"
 check "error body naming the series is not visible" "1" \
   "$(rc_of query_body_shows_series "${BODY_ERR}" demo_requests_total)"
+check "success body naming the series only in a warning is not visible" "1" \
+  "$(rc_of query_body_shows_series "${BODY_WARN}" demo_requests_total)"
 check "other series is not visible" "1" \
   "$(rc_of query_body_shows_series "${BODY_HIT}" demo_requests)"
 
@@ -274,6 +277,37 @@ summary_rc() {
 check "summary: all held is 0" "0" "$(summary_rc a "" blocking)"
 check "summary: ordinary failure is 1" "1" "$(summary_rc a "b: detail" normal)"
 check "summary: release-blocking failure is 2" "2" "$(summary_rc a "b: detail" blocking)"
+
+# Each scenario's own prologue (its set line and its ERR trap, read from the
+# script) must make a setup failure inside a helper exit 3, and its cleanup's
+# own guard lines must keep a pending verdict when a command in the EXIT trap
+# fails. Reading the lines from the scripts is what makes dropping -E, the
+# trap, or either guard line fail here.
+contract_rc() {
+  local script="${CHAOS_DIR}/$1" body="$2" out="${SCRATCH}/contract-$1-$3.sh"
+  {
+    grep -m1 -x 'set -eEuo pipefail' "${script}"
+    grep -m1 -x "trap 'exit 3' ERR" "${script}"
+    printf '%s\n' "${body}"
+  } >"${out}"
+  rc_of bash "${out}"
+}
+cleanup_guard() {
+  sed -n '/^cleanup() {/,/^}/p' "${CHAOS_DIR}/$1" | grep -E -x '  (trap - ERR|set \+e)'
+}
+for s in kill-ingest-flush.sh kill-maintain-worker.sh; do
+  check "${s}: setup failure inside a helper exits 3" "3" \
+    "$(contract_rc "${s}" 'helper() { false; :; }
+helper' helper)"
+  check "${s}: failing cleanup keeps a pending exit 2" "2" \
+    "$(contract_rc "${s}" "cleanup() {
+$(cleanup_guard "${s}")
+  false
+  :
+}
+trap cleanup EXIT
+exit 2" cleanup)"
+done
 
 # ---------------------------------------------------------------------------
 # The scenarios against the fixture and each other.

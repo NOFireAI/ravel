@@ -14,8 +14,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   any timestamp, and takes `label=value` selectors, and the mid-flush trigger
   selects `signal="metrics"`. A comma-joined `x-ravel-commit-token` header is
   split into its opaque tokens, and the header name is matched without the
-  gawk-only `IGNORECASE`. Scenario 2 exits 3 on a setup error, so exit 2
-  stays the release-blocking verdict. `scripts/chaos/lib.test.sh` covers the
+  gawk-only `IGNORECASE`. Both scenarios now exit 3 on a setup error:
+  scenario 1 used to exit 1 there, the same code as its strict-ack oracle
+  failure, and scenario 2's exit 2 stays the release-blocking verdict.
+  `scripts/chaos/lib.test.sh` covers the
   helpers on every pull request, and the nightly job annotates each
   scenario's exit code.
 - **OTLP and Remote Write ingest now take the in-flight permit and check the
