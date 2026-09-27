@@ -2,7 +2,7 @@
 
 - Status: Proposed
 - Date: 2026-09-27
-- Refs: #2040, ADR-0013, ADR-0022, ADR-0029, ADR-0046, ADR-0066, ADR-0097, ADR-0109, ADR-0954, ADR-1374, ADR-2023
+- Refs: #2040, ADR-0013, ADR-0022, ADR-0027, ADR-0029, ADR-0046, ADR-0064, ADR-0066, ADR-0071, ADR-0089, ADR-0097, ADR-0109, ADR-1374, ADR-2023
 
 ## Context
 
@@ -41,9 +41,12 @@ table and its 43 statements. The figures are sums over the 43 statements on
 a c6a.4xlarge with a 500 GB gp2 volume. Cold is the first try after a
 page-cache drop; hot is the better of the next two tries. datafusion-cli
 runs each try in a fresh process, so its hot is a page-cache figure. Arms A
-to F and K1 to K5 are datafusion-cli 54.1.0 on fresh machines (#2040). The
-expected bands for A to F were posted before the run, and all six landed
-inside them.
+to F and K1 to K6 are datafusion-cli 54.1.0 on two fresh machines of the
+same type, one for A to F and one for K1 to K6 (#2040). The expected bands
+for A to F were posted before the run, and all six landed inside them. The
+K arms attribute a cost rather than test a prediction, so they carried no
+bands; each is read against arm B or arm E, which ran with the same binary
+and protocol.
 
 | Arm | Store | Layout | Settings | Cold | Hot | Failed |
 |---|---|---|---|---|---|---|
@@ -61,8 +64,8 @@ inside them.
 off, DataFusion's TopK aggregation off, and a 7 GB memory cap. Arm A
 reproduces the published figures within 7%, so the box is comparable.
 
-The one-knob arms change a single setting from arm B (K1 to K4, 100 files)
-or leave out a single setting from arm E (K5, one file):
+The one-knob arms change a single setting from arm B (K1 to K4 and K6,
+100 files) or leave out a single setting from arm E (K5, one file):
 
 | Arm | Change | Hot | Delta | Failed |
 |---|---|---|---|---|
@@ -141,7 +144,9 @@ manifest, both charged to the Resolve phase. `sweep` (D3) deletes old
 versions, so the LIST stays short.
 
 Data objects are content-addressed. A file that fits in one PUT is written
-with `CreateIfAbsent`. A larger file goes through `put_multipart`, which
+with `CreateIfAbsent`, and a conflict there counts as success once a
+`head` confirms the size, since the key already names these bytes. A
+larger file goes through `put_multipart`, which
 takes no put condition and may overwrite. That is safe because the key is
 the BLAKE3 of the bytes, so an overwrite can only write the same bytes, and
 nothing references the object until a manifest commits. No manifest ever
@@ -164,9 +169,10 @@ DROP TABLE [IF EXISTS] name;
   `..`, a glob, or a percent-escape is refused at validation with a typed
   error. The statement never carries a bucket, an absolute key, or a
   credential.
-- `CREATE` lists the dataset prefix once, requires at least one file,
-  reads each file's footer, and commits a manifest that snapshots the file
-  list. Queries never list the dataset. Files uploaded later are picked up
+- `CREATE` lists the dataset once with `list_delimited` at the dataset's
+  prefix, so only the dataset's own files are taken and a nested dataset
+  such as `hits/2024` is not. It requires at least one file, reads each
+  file's footer, and commits a manifest that snapshots the file list. Queries never list the dataset. Files uploaded later are picked up
   by `CREATE OR REPLACE`.
 - `OPTIONS` admits `binary_as_string` and `ravel.cast.<column>` (D5), and
   nothing else.
@@ -184,8 +190,9 @@ catalog, function and index DDL, `SHOW`, DataFusion URL tables, and every
 table function. `CREATE VIEW` is not in this ADR. ClickBench's view exists
 only to cast `EventDate`, which `ravel.cast` covers.
 
-The statement is parsed into a typed intent and executed by Ravel code. It
-is never handed to DataFusion's `SessionContext::sql`. That call would make
+The statement is parsed through `complexity_guard::parse_guarded`, like
+every other parse of caller text, into a typed intent that Ravel code
+executes. It is never handed to DataFusion's `SessionContext::sql`. That call would make
 DataFusion's whole DDL dispatch live (memory tables, views, catalogs,
 functions), each needing a separate refusal. DataFusion's reference
 `TableProviderFactory` also parses `LOCATION` with `ListingTableUrl::parse`,
@@ -349,10 +356,24 @@ cost:
   repartitioning off. Under the 7 GB cap, datafusion-cli spilled q34 and
   q35 and failed q19 and q33 (K4). With spill off, all four would fail.
 
-Ravel's own optimizer rules (metadata-only aggregates, TopK late
-materialization, dictionary group keys) are written against `LogsScanExec`
-and do not apply. DataFusion's row-group, page-index and bloom-filter
-pruning do. A query may name several Parquet tables. A Parquet table and a
+`build_session` installs five physical optimizer rules of Ravel's own, and
+they split by what they match:
+
+- `MetadataOnlyAggregate`, `AttrsPerKeyProjection` and
+  `TopKLateMaterialization` match only a plan whose leaf is a
+  `LogsScanExec`, so they never fire on a Parquet plan.
+- `DictionaryGroupKeysAsViews` matches an `AggregateExec` whose group key
+  is `Dictionary(_, Utf8 | LargeUtf8)`, whatever the scan. It fires on a
+  Parquet plan when a column is read as a dictionary, and its rewrite
+  (group on `Utf8View`, cast the output back) is exact for any source.
+- `BoundedTopKAggregate` matches a `SortExec` with a limit over an
+  aggregate, whatever the scan. It fires on Parquet plans and re-admits
+  the vetted TopK shapes that K3 turned off wholesale. Its exactness
+  argument (issue #1402) rests on the aggregate's ordering and limit, not
+  on the scan, and T4a pins it with a Parquet-plan test.
+
+DataFusion's row-group, page-index and bloom-filter pruning apply to
+Parquet plans. A query may name several Parquet tables. A Parquet table and a
 signal table in one statement is a `CrossSignalQuery` error, as two signal
 tables are today. `target_signal` gains a Parquet arm, since today a name
 it does not know routes to Metrics.
@@ -472,7 +493,7 @@ and the per-query memory cap:
   older than the grace period. It takes the deployment's
   `--gc-max-query-duration` (11 minutes when derived) and refuses a grace
   shorter than that, which covers a query that resolved an older version.
-- **Distributed execution** (ADR-0096 fragments) does not cover Parquet
+- **Distributed execution** (ADR-0071 read fan-out) does not cover Parquet
   tables. A query runs on the node that receives it.
 
 ```mermaid
