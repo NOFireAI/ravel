@@ -235,9 +235,9 @@ const OPEN_REQUESTS_PER_SEGMENT: u64 = 2;
 /// the estimate an upper bound regardless of section layout.
 const CATALOG_REQUESTS_PER_SEGMENT: u64 = 4;
 
-/// Requests one run's page fetch can cost (`fetcher.rs::fetch_scalar_pages` /
-/// `fetch_histogram_pages`): a TS range and a VAL/HIST range, worst case two
-/// separate GETs when `ensure_ranges` cannot coalesce them.
+/// Requests one run's page fetch can cost (`fetcher.rs::fetch_pages`): a TS
+/// range and a VAL/HIST range, worst case two separate GETs when
+/// `ensure_ranges` cannot coalesce them.
 const PAGE_REQUESTS_PER_RUN: u64 = 2;
 
 /// Safety factor applied to a segment's `object_size` for the store-bytes
@@ -2135,7 +2135,7 @@ impl QueryEngine {
         // `QueryIoShape::plan_class` is decided before any segment is opened
         // (issue #1214): `true` for a discovery-only caller
         // (`resolve_series_inner`/`resolve_log_series_inner`, neither of
-        // which reaches `fetch_scalar_pages`/`fetch_histogram_pages`),
+        // which reaches `fetch_pages`),
         // `false` for the metrics evaluation path, which then classifies by
         // the resolve's own pruning outcome below.
         metadata_only: bool,

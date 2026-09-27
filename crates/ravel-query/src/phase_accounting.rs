@@ -24,7 +24,7 @@
 //! - [`QueryPhase::Probe`]: segment catalog fetch -- whole-object, sparse
 //!   catalog-probe, or whole-object-fallback (`SegmentFetcher::decode_selected`).
 //! - [`QueryPhase::Scan`]: the actual block/page/chunk data reads
-//!   (`SegmentFetcher::fetch_scalar_pages`/`fetch_histogram_pages`,
+//!   (`SegmentFetcher::fetch_pages`,
 //!   `LogSegmentFetcher::scan_accounted_with_tenant`).
 //!
 //! Decode (turning fetched bytes into typed samples/rows) is deliberately not

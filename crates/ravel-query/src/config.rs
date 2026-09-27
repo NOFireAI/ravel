@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use ravel_types::cost_profile::StoreCostProfile;
 
+use crate::fetcher::MAX_GETS_PER_L0_SEGMENT_FETCH;
+
 /// Default cap on segments a single query may fan out over.
 pub const DEFAULT_MAX_SEGMENTS: usize = 1024;
 /// Default cap on distinct series a single query may materialize.
@@ -19,11 +21,10 @@ pub const DEFAULT_FETCH_CONCURRENCY: usize = 8;
 /// Prometheus' global `evaluation_interval` default.
 pub const DEFAULT_EVALUATION_INTERVAL: Duration = Duration::from_secs(60);
 /// Numerator/denominator of the headroom factor applied to the per-shard
-/// open-hour segment count when deriving the S3 request budget: 3/2, i.e. 50%
-/// above the one-GET-per-recent-segment floor. That floor is the true cost of
-/// a cold query over a busy shard's open hour; the extra half covers
-/// per-segment fetch retries and the occasional cold-fetch footer read,
-/// without widening the cap so far that it stops bounding a runaway query.
+/// allowance when deriving the S3 request budget: 3/2, i.e. 50% above the
+/// per-flush cost over [`covered_span`]. The extra half is the retry allowance
+/// (ADR-0075, ADR-1306 decision 2), without widening the cap so far that it
+/// stops bounding a runaway query.
 pub const REQUEST_BUDGET_HEADROOM_NUM: u64 = 3;
 pub const REQUEST_BUDGET_HEADROOM_DEN: u64 = 2;
 
@@ -38,8 +39,28 @@ pub const REQUEST_BUDGET_FIXED_OVERHEAD: u64 = 5_000;
 /// whole-object threshold; a larger segment pays a footer read and range reads
 /// on top. `cold_recent_query_requests_per_unsealed_flush_by_phase` pins it.
 /// It is not an upper bound above that threshold, where one flush costs at
-/// least 3 requests (ADR-1306, "Amendment (2026-09-26)").
+/// least 3 requests (ADR-1306, "Amendment (2026-09-26)"); that bound is
+/// [`MAX_REQUESTS_PER_UNSEALED_FLUSH`].
 pub const REQUESTS_PER_UNSEALED_FLUSH: u64 = 2;
+
+/// Most cold requests one unsealed flush inside the query's range costs, per
+/// shard, at any object size: its commit-record GET plus the fetcher's
+/// [`MAX_GETS_PER_L0_SEGMENT_FETCH`] (first GET, footer chase, catalog GET and
+/// at most 4 page-range GETs), 8 in all. Retries are left to the headroom.
+/// `cold_requests_per_unsealed_flush_above_whole_object_threshold` measures
+/// flushes of several MiB against it.
+pub const MAX_REQUESTS_PER_UNSEALED_FLUSH: u64 = 1 + MAX_GETS_PER_L0_SEGMENT_FETCH;
+
+/// The per-flush term the derived budget sizes each unsealed flush at: the
+/// larger of the measured small-flush cost and the ceiling above the
+/// whole-object threshold, so ADR-1306 decision 2's per-flush condition holds
+/// whatever size ingest flushes at.
+pub const BUDGETED_REQUESTS_PER_UNSEALED_FLUSH: u64 =
+    if MAX_REQUESTS_PER_UNSEALED_FLUSH > REQUESTS_PER_UNSEALED_FLUSH {
+        MAX_REQUESTS_PER_UNSEALED_FLUSH
+    } else {
+        REQUESTS_PER_UNSEALED_FLUSH
+    };
 
 /// Reference inputs for [`EngineConfig::default`]'s S3 request budget. The
 /// running server does NOT use these: it derives the budget from its actual
@@ -150,7 +171,7 @@ pub fn covered_span(seal_margin: SealMargin) -> Duration {
 pub struct RequestBudgetParts {
     /// Requests one shard's unsealed flushes over [`covered_span`] cost
     /// before headroom: `ceil(covered_span / max_flush_delay) x
-    /// REQUESTS_PER_UNSEALED_FLUSH`.
+    /// BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`.
     pub per_shard_allowance: u64,
     /// Headroom multiplier numerator applied to the per-shard allowance.
     pub headroom_num: u64,
@@ -184,7 +205,7 @@ pub fn request_budget_parts(
     let flushes = covered_span(seal_margin).as_nanos().div_ceil(flush_ns);
     let flushes = u64::try_from(flushes).unwrap_or(u64::MAX);
     RequestBudgetParts {
-        per_shard_allowance: flushes.saturating_mul(REQUESTS_PER_UNSEALED_FLUSH),
+        per_shard_allowance: flushes.saturating_mul(BUDGETED_REQUESTS_PER_UNSEALED_FLUSH),
         headroom_num: REQUEST_BUDGET_HEADROOM_NUM,
         headroom_den: REQUEST_BUDGET_HEADROOM_DEN,
         fixed_overhead: REQUEST_BUDGET_FIXED_OVERHEAD,
@@ -207,14 +228,16 @@ pub fn derive_max_s3_requests_for(
 ///
 /// ```text
 /// budget = per_shard_allowance * NUM / DEN * shard_count + REQUEST_BUDGET_FIXED_OVERHEAD
-/// per_shard_allowance = ceil(covered_span / max_flush_delay) * REQUESTS_PER_UNSEALED_FLUSH
+/// per_shard_allowance = ceil(covered_span / max_flush_delay)
+///                       * BUDGETED_REQUESTS_PER_UNSEALED_FLUSH
 /// ```
 ///
-/// The cost is per shard and per unsealed flush a query resolves. The span is
-/// [`covered_span`], the longest tail a healthy catalog carries plus the time a
-/// stalled fold takes to page, so a query is not refused for fold lag before
-/// the fold-stall alert reaches an operator: 89,600 at 4 shards and a 2 s
-/// cadence. Deriving from `max_flush_delay` means a deployment that raises the
+/// The cost is per shard and per unsealed flush a query resolves, sized at the
+/// per-flush ceiling so a flush above the whole-object threshold fits too. The
+/// span is [`covered_span`], the longest tail a healthy catalog carries plus
+/// the time a stalled fold takes to page, so a query is not refused for fold
+/// lag before the fold-stall alert reaches an operator: 343,400 at 4 shards
+/// and a 2 s cadence. Deriving from `max_flush_delay` means a deployment that raises the
 /// flush delay (a supported cost lever) gets a correct cap with no hand
 /// recomputation. A caller with a non-default seal margin uses
 /// [`derive_max_s3_requests_for`].

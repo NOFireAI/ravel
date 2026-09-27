@@ -12,8 +12,8 @@
 //! # What is knowable from `ravel-query`, and what is not
 //!
 //! The per-segment fetch pipeline this crate owns
-//! (`SegmentFetcher::open_segment` -> `decode_selected` -> `fetch_scalar_pages`
-//! / `fetch_histogram_pages`, `crate::fetcher`) is visible here, so
+//! (`SegmentFetcher::open_segment` -> `decode_selected` -> `fetch_pages`,
+//! `crate::fetcher`) is visible here, so
 //! [`dependency_depth`](QueryIoShape::dependency_depth) reflects it: whether a
 //! segment resolves in one whole-object GET (depth 1) or needs a
 //! footer-tail-then-dependent-fetch sequence, reported as an upper bound of
@@ -188,7 +188,7 @@ use ravel_catalog::SegmentOrigin;
 pub enum PlanClass {
     /// No page fetch: a labels/label-values/series discovery query, which
     /// opens and catalog-decodes segments but never reaches
-    /// `fetch_scalar_pages`/`fetch_histogram_pages`.
+    /// `fetch_pages`.
     MetadataOnly,
     /// The resolve's postings-based pruning excluded at least one
     /// snapshot-sourced segment (`Snapshot::segments_pruned > 0`): the fetch
@@ -316,10 +316,9 @@ pub fn merge_plan_class(a: PlanClass, b: PlanClass) -> PlanClass {
 ///    front, never inside the footer-tail bytes already in hand, so this is
 ///    a separate dependent GET whenever the footer stage's regions don't
 ///    already cover them.
-/// 4. **Page `ensure_ranges`**: `fetch_scalar_pages` /
-///    `fetch_histogram_pages` fetch the run page ranges the catalog decode
-///    just named; same reasoning, a separate dependent GET unless already
-///    covered.
+/// 4. **Page `ensure_ranges`**: `fetch_pages` fetches the run page ranges the
+///    catalog decode just named; same reasoning, a separate dependent GET
+///    unless already covered.
 ///
 /// Stage 1 always runs; stages 2-4 are each conditional on whether an
 /// earlier GET's bytes happen to already cover the next stage's ranges

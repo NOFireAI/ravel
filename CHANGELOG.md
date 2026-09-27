@@ -10,9 +10,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The default query request budget is now derived from the unsealed tail a
   healthy catalog carries plus the fold-stall alert window** (ADR-1306). At 4
-  shards and a 2 s flush cadence it gives 89,600 requests instead of 15,800,
+  shards and a 2 s flush cadence it gives 343,400 requests instead of 15,800,
   so a wide query is not refused for fold lag before the fold-stall alert
-  pages. An explicit `--max-s3-requests` is still used as given.
+  pages. Each unsealed flush is budgeted at 8 requests, which covers flushes
+  above the fetcher's 512 KiB whole-object threshold: one fetch of an L0
+  segment now issues at most 4 page-range GETs, bridging the smallest gaps
+  between the page runs a query selects when there are more, so it costs at
+  most 7 GETs plus its commit-record GET. An explicit `--max-s3-requests` is
+  still used as given.
 
 ## [0.18.0] - 2026-09-26
 
