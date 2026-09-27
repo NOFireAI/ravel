@@ -50,7 +50,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -97,14 +97,18 @@ pub struct IngestPermitHeld;
 
 /// How long an admitted ingest request may take to deliver its whole body,
 /// counted from the moment its head was admitted. A request that has not
-/// finished by then is refused (408 on HTTP, `DEADLINE_EXCEEDED` on gRPC) and
-/// its permit returns to the ceiling.
+/// finished by then is refused (503 with `Retry-After` on HTTP,
+/// `DEADLINE_EXCEEDED` on gRPC) and its permit returns to the ceiling.
 ///
 /// 30 s is Prometheus' default `remote_timeout`, the most generous default
 /// deadline among the senders this ingests from (the OpenTelemetry
 /// Collector's OTLP exporters default to 5 s), so a sender still inside its
 /// own deadline is never cut off, and a 16 MiB body fits in it at about
 /// 4.5 Mbit/s.
+///
+/// This caps how long one request holds its slot, not how many slots a
+/// client can hold over time: a credentialed client that reopens each slot
+/// as it is refused can keep the ceiling occupied at a trickle.
 pub const INGEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The error a [`DeadlineBody`] yields once [`INGEST_BODY_READ_TIMEOUT`]
@@ -178,10 +182,24 @@ where
     }
 }
 
-/// 408 for an HTTP ingest upload whose body did not arrive within
-/// [`INGEST_BODY_READ_TIMEOUT`].
+/// Seconds a sender is told to wait before resending an upload whose body
+/// timed out.
+const BODY_TIMEOUT_RETRY_AFTER_SECONDS: u64 = 1;
+
+/// 503 with `Retry-After` for an HTTP ingest upload whose body did not arrive
+/// within [`INGEST_BODY_READ_TIMEOUT`]. Not 408: Prometheus remote write and
+/// the OTLP/HTTP exporter retry only 429 and 5xx (OTLP: 502, 503, 504), so a
+/// 408 would drop the batch instead of having it resent.
 fn body_timeout_response() -> Response {
-    (StatusCode::REQUEST_TIMEOUT, BodyReadTimedOut.to_string()).into_response()
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        BodyReadTimedOut.to_string(),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&BODY_TIMEOUT_RETRY_AFTER_SECONDS.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// `DEADLINE_EXCEEDED` for a gRPC ingest export whose message did not arrive
@@ -219,7 +237,7 @@ pub trait IngestAdmissionState: Send + Sync + 'static {
 /// the slot on every exit path including a client disconnect that cancels
 /// this future. The body read is bounded by [`INGEST_BODY_READ_TIMEOUT`]: a
 /// body still incomplete then fails the handler's body extractor, so the
-/// handler never runs, and the request is answered 408.
+/// handler never runs, and the request is answered 503 with `Retry-After`.
 pub async fn admit_ingest_request<S: IngestAdmissionState>(
     State(state): State<Arc<S>>,
     request: Request,
@@ -421,7 +439,7 @@ where
             }
         };
         parts.extensions.insert(tenant);
-        if permit.is_none() {
+        if !unary {
             return Box::pin(self.inner.call(http::Request::from_parts(parts, body)));
         }
         parts.extensions.insert(IngestPermitHeld);
@@ -959,14 +977,16 @@ mod tests {
     }
 
     /// An authenticated HTTP upload that sends its head and one chunk and
-    /// then stalls is answered 408 once [`INGEST_BODY_READ_TIMEOUT`] passes,
+    /// then stalls is answered 503 with `Retry-After` (a status both
+    /// Prometheus remote write and the OTLP/HTTP exporter retry) once
+    /// [`INGEST_BODY_READ_TIMEOUT`] passes,
     /// and the permit it held is released: under a ceiling of 1 the next
     /// upload is admitted and nothing is shed.
     ///
     /// Non-vacuity: without the `DeadlineBody` around the request body the
     /// stalled upload is still unanswered at `TEST_DEADLINE`.
     #[tokio::test(start_paused = true)]
-    async fn stalled_http_upload_is_refused_408_and_releases_its_permit() {
+    async fn stalled_http_upload_is_refused_503_and_releases_its_permit() {
         use tower::ServiceExt;
 
         let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
@@ -983,7 +1003,12 @@ mod tests {
         .expect("infallible router");
         let waited = started.elapsed();
 
-        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1")),
+            "a timed-out upload tells the sender when to resend"
+        );
         // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
         // virtual clock, which moves only when a timer fires.
         assert!(

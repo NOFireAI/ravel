@@ -79,10 +79,13 @@ concurrent uploads plus concurrent decodes and writes: a request holds its
 slot while its body is still being received. That wait is bounded by
 `INGEST_BODY_READ_TIMEOUT`, 30 seconds from admission (a fixed constant in
 `ingest_admission.rs`, not a flag). A body that has not fully arrived by then
-is refused with HTTP 408, or gRPC `DEADLINE_EXCEEDED` for a unary OTLP export,
+is refused with HTTP 503 and `Retry-After` (a status Prometheus remote write
+and the OTLP/HTTP exporter both retry), or gRPC `DEADLINE_EXCEEDED` for a
+unary OTLP export,
 the handler never runs, and the slot returns to the ceiling, so a client that
 sends request heads and trickles the bodies can hold a slot for at most 30
-seconds each. 30 seconds is Prometheus' default `remote_timeout`, the most
+seconds each. That caps one hold, not occupancy: a credentialed client that
+reopens each slot as it is refused can keep the ceiling full at a trickle. 30 seconds is Prometheus' default `remote_timeout`, the most
 generous default deadline among the senders Ravel ingests from, so a sender
 inside its own deadline is not cut off; a 16 MiB body fits in it at about
 4.5 Mbit/s. The OTAP stream is not bounded this way: it holds no permit while
