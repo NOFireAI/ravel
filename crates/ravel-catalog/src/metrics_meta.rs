@@ -42,10 +42,12 @@
 //! caller computed against the body it actually saw.
 
 use prost::Message;
+use ravel_memory::{MemoryBudget, Reservation};
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, Version};
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::TenantHash;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Format version written into every metadata record this build emits: the
 /// writer, including the CAS-loser re-merge rewrite, stamps exactly this. It is
@@ -242,6 +244,11 @@ pub enum MetricsMetaError {
          accepts: refusing rather than allocate an unbounded body"
     )]
     DecompressedTooLarge { key: String, cap: usize },
+    /// The process memory budget refused the reservation for the record's
+    /// declared decompressed size (ADR-1702 decision 6). Carries only the
+    /// budget's three figures.
+    #[error("metadata record decode refused: {0}")]
+    MemoryExhausted(#[from] ravel_memory::MemoryExhausted),
     #[error(
         "metadata record {key:?} would encode to {size} bytes, past the {cap}-byte ceiling readers \
          accept: refusing to write a record no reader could open"
@@ -597,11 +604,42 @@ fn encode_body(
     })
 }
 
-/// Decompress a stored body, bounded by [`MAX_METRICS_META_DECOMPRESSED_BYTES`].
-/// Streams into a growing buffer rather than pre-allocating the ceiling, and
-/// refuses a body that would exceed it. A corrupt or truncated frame is a typed
-/// [`MetricsMetaError::Decompress`], never a panic.
+/// [`decompress_body_within`] at the reader ceiling.
+#[cfg(test)]
 fn decompress_body(key: &str, body: &[u8]) -> Result<Vec<u8>, MetricsMetaError> {
+    decompress_body_within(key, body, MAX_METRICS_META_DECOMPRESSED_BYTES)
+}
+
+/// The most bytes a stored body can decompress to: its zstd frame's declared
+/// content size when the frame carries one (every body [`encode_body`] writes
+/// does), else [`MAX_METRICS_META_DECOMPRESSED_BYTES`]. A declared size past
+/// that ceiling is refused here, before anything is reserved or allocated.
+fn decompressed_len_bound(key: &str, body: &[u8]) -> Result<usize, MetricsMetaError> {
+    let cap = MAX_METRICS_META_DECOMPRESSED_BYTES;
+    match zstd::zstd_safe::get_frame_content_size(body) {
+        Ok(Some(declared)) => match usize::try_from(declared) {
+            Ok(declared) if declared <= cap => Ok(declared),
+            _ => Err(MetricsMetaError::DecompressedTooLarge {
+                key: key.to_string(),
+                cap,
+            }),
+        },
+        Ok(None) => Ok(cap),
+        Err(_) => Err(MetricsMetaError::Decompress {
+            key: key.to_string(),
+            message: "unreadable zstd frame header".to_string(),
+        }),
+    }
+}
+
+/// Decompress a stored body, bounded by `cap`, at most
+/// [`MAX_METRICS_META_DECOMPRESSED_BYTES`]. Streams into a growing buffer rather
+/// than pre-allocating the ceiling, and refuses a body that would exceed it. A
+/// corrupt or truncated frame is a typed [`MetricsMetaError::Decompress`], never
+/// a panic. The serve reader passes the [`decompressed_len_bound`] it reserved,
+/// so a body that inflates past its own declared size is refused rather than
+/// allocating uncharged bytes.
+fn decompress_body_within(key: &str, body: &[u8], cap: usize) -> Result<Vec<u8>, MetricsMetaError> {
     use std::io::Read;
 
     let mut decoder =
@@ -609,7 +647,6 @@ fn decompress_body(key: &str, body: &[u8]) -> Result<Vec<u8>, MetricsMetaError> 
             key: key.to_string(),
             message: e.to_string(),
         })?;
-    let cap = MAX_METRICS_META_DECOMPRESSED_BYTES;
     let mut out = Vec::new();
     // cap + 1 so a body sitting exactly on the ceiling is accepted and the first
     // byte past it is observable as an overflow rather than a silent truncation.
@@ -631,7 +668,7 @@ fn decompress_body(key: &str, body: &[u8]) -> Result<Vec<u8>, MetricsMetaError> 
 }
 
 /// Decompress and prost-decode a stored body into the proto record, with no
-/// validation beyond "these bytes are a record". Split out of [`decode_body`] so
+/// validation beyond "these bytes are a record". Split out of `decode_body` so
 /// a rewrite caller can read the declared `format_version` and refuse a record
 /// newer than it can reproduce BEFORE the read gate speaks (ADR-0066 decision 5):
 /// on a write path the operator needs to hear that nothing was persisted, not
@@ -640,7 +677,17 @@ fn decode_proto(
     body: &[u8],
     key: &str,
 ) -> Result<sysproto::MetricMetadataRecord, MetricsMetaError> {
-    let raw = decompress_body(key, body)?;
+    decode_proto_within(body, key, MAX_METRICS_META_DECOMPRESSED_BYTES)
+}
+
+/// [`decode_proto`] with the decompression ceiling of
+/// [`decompress_body_within`].
+fn decode_proto_within(
+    body: &[u8],
+    key: &str,
+    cap: usize,
+) -> Result<sysproto::MetricMetadataRecord, MetricsMetaError> {
+    let raw = decompress_body_within(key, body, cap)?;
     sysproto::MetricMetadataRecord::decode(raw.as_slice()).map_err(|source| {
         MetricsMetaError::Decode {
             key: key.to_string(),
@@ -654,6 +701,7 @@ fn decode_proto(
 /// alongside the entries so a caller can reason about it; the entry validation
 /// here accepts the full supported read set
 /// (`METRICS_META_MIN_READ_VERSION..=METRICS_META_MAX_READ_VERSION`).
+#[cfg(test)]
 fn decode_body(
     body: &[u8],
     key: &str,
@@ -738,7 +786,7 @@ pub async fn read_metrics_meta(
 /// Unlike [`read_metrics_meta`], this does NOT apply the rewrite refusal
 /// (ADR-0066 decision 5): a serve caller never writes the record back, so a
 /// record it cannot reproduce byte-for-byte is still safe to read for the fields
-/// this build does model. The decode gate is the shared `decode_body`, so the
+/// this build does model. The decode gate is the shared `decode_record`, so the
 /// accepted read set is the full
 /// `METRICS_META_MIN_READ_VERSION..=METRICS_META_MAX_READ_VERSION`.
 /// [`read_metrics_meta`] stays strict for the CAS-loser re-merge rewrite, which
@@ -747,15 +795,27 @@ pub async fn read_metrics_meta(
 /// writer into an empty metadata snapshot for one horizon during that writer's
 /// rollout, which is exactly what the R2 rollout of the version-2 writer would
 /// have done to every serve path.
+///
+/// Before decompressing, the body's declared decompressed size is reserved
+/// against `budget` (ADR-1702 decision 6), and the returned [`Reservation`]
+/// charges the decoded entries for as long as the caller holds it. A refusal
+/// is [`MetricsMetaError::MemoryExhausted`].
+///
+/// [`Reservation`]: ravel_memory::Reservation
 pub async fn read_metrics_meta_for_serve(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
-) -> Result<Option<(Vec<MetricMetadataEntry>, Version)>, MetricsMetaError> {
+    budget: &Arc<MemoryBudget>,
+) -> Result<Option<(Vec<MetricMetadataEntry>, Version, Reservation)>, MetricsMetaError> {
     let key = metrics_meta_key(tenant_hash);
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
-            let (entries, _format_version) = decode_body(outcome.data.as_ref(), &key, tenant_hash)?;
-            Ok(Some((entries, outcome.version)))
+            let body = outcome.data.as_ref();
+            let bound = decompressed_len_bound(&key, body)?;
+            let reservation = budget.reserve(bound as u64)?;
+            let record = decode_proto_within(body, &key, bound)?;
+            let entries = decode_record(&record, &key, tenant_hash)?;
+            Ok(Some((entries, outcome.version, reservation)))
         }
         Err(StoreError::NotFound) => Ok(None),
         Err(err) => Err(MetricsMetaError::store(&key, err)),
@@ -1430,6 +1490,50 @@ mod tests {
         );
     }
 
+    /// ADR-1702 decision 6: the serve reader reserves the record's declared
+    /// decompressed size before decoding it. One byte short of it is a typed
+    /// refusal that charges nothing; within budget the returned reservation
+    /// holds exactly that size until dropped.
+    ///
+    /// FLIP: drop the `budget.reserve(bound as u64)?` line in
+    /// `read_metrics_meta_for_serve` (returning a 0-byte guard instead) and
+    /// the refusal becomes a successful read, failing `expect_err`.
+    #[tokio::test]
+    async fn serve_reader_reserves_the_decoded_record() {
+        let store = mem();
+        let entries = vec![entry("a", MetricKind::Counter, "h", "u", 1)];
+        write_metrics_meta(store.as_ref(), &tenant(), &entries, None)
+            .await
+            .expect("seed");
+        let raw_len = build_record(&tenant(), &entries).encode_to_vec().len() as u64;
+
+        let tight = Arc::new(MemoryBudget::new(raw_len - 1));
+        let err = read_metrics_meta_for_serve(store.as_ref(), &tenant(), &tight)
+            .await
+            .expect_err("a record that does not fit the budget is refused");
+        match err {
+            MetricsMetaError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, raw_len);
+                assert_eq!(exhausted.reserved, 0);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(tight.reserved(), 0);
+
+        let budget = Arc::new(MemoryBudget::new(1 << 20));
+        let starting = budget.reserve(7).expect("starting figure");
+        let (served, _version, reservation) =
+            read_metrics_meta_for_serve(store.as_ref(), &tenant(), &budget)
+                .await
+                .expect("read within budget")
+                .expect("present");
+        assert_eq!(served, entries);
+        assert_eq!(budget.reserved(), 7 + raw_len);
+        drop(reservation);
+        assert_eq!(budget.reserved(), 7, "back to exactly the starting figure");
+        drop(starting);
+    }
+
     /// ADR-0066 item 2: the read-only serve reader and the strict rewrite reader
     /// take different paths on a record newer than this build's writer. Both
     /// refuse a version-3 record, but with different typed errors, and that
@@ -1449,10 +1553,12 @@ mod tests {
             .put(&key, current.into(), PutOptions::default())
             .await
             .expect("seed a version-2 record");
-        let (served, _version) = read_metrics_meta_for_serve(store.as_ref(), &tenant())
-            .await
-            .expect("serve reader must not error on the version this build writes")
-            .expect("a present record is Some");
+        let budget = Arc::new(MemoryBudget::unlimited());
+        let (served, _version, _reservation) =
+            read_metrics_meta_for_serve(store.as_ref(), &tenant(), &budget)
+                .await
+                .expect("serve reader must not error on the version this build writes")
+                .expect("a present record is Some");
         assert_eq!(served, entries, "the serve reader returns the v2 entries");
 
         let seeded = body_at_version(3, &entries);
@@ -1461,7 +1567,7 @@ mod tests {
             .await
             .expect("seed a version-3 record");
 
-        let err = read_metrics_meta_for_serve(store.as_ref(), &tenant())
+        let err = read_metrics_meta_for_serve(store.as_ref(), &tenant(), &budget)
             .await
             .expect_err("the serve reader refuses a record above its ceiling");
         assert!(

@@ -7,6 +7,7 @@
 mod auth_token_map;
 mod cache;
 mod catalog;
+mod charged;
 mod column_stats_build;
 mod column_stats_resolve;
 mod config;

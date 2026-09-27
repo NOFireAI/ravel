@@ -749,6 +749,20 @@ reservations in `fetch_blocks`/`fetch_chunk_ranges` are taken after the probe
 and directory-section GETs, so a refusal there aborts a read that has already
 issued those GETs.
 
+**Decoded output (ADR-1702 decision 6).** The PromQL catalog decode is charged
+to the same budget before it runs. `SegmentFetcher::decode_selected` (and
+`decode_sparse_catalog` on the sparse probe path) reserves the footer-declared
+`uncompressed_len` of every catalog section the object carries (LABEL_DICT,
+SERIES_IDS, SERIES_META, SERIES_IDX, SERIES_META_CHUNKS), each clamped to the
+reader's section ceiling, and the guard travels with the decoded entries rather
+than with the fetched regions. A refusal is the same typed
+`FetchMemoryExhausted`. On a chunked object the SERIES_META_CHUNKS descriptor
+records the stored frames' length, not what they inflate to; the decoder
+inflates one frame at a time. The catalog resolve charges its own decodes the
+same way (`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), and so does
+the `/api/v1/metadata` cache (`MetadataCache::with_memory_budget`). These guards
+come from the same RAII `reserve` API, so they read under `component="fetch"`.
+
 ## Endpoints (Prometheus compatibility subset)
 
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.
@@ -974,7 +988,8 @@ The PromQL engine's fetchers and the SQL executor share this one budget (see
 "Fetch-layer memory reservations" above), and the two `component` samples
 split its reserved total without double-counting. `component="fetch"` is
 `MemoryBudget::fetch_reserved()`, the bytes held by live `Reservation` guards
-(the fetch layer's RAII `reserve` API). `component="sql"` is
+(the RAII `reserve` API: fetched buffers, plus the decoded catalog output
+described under "Decoded output" above). `component="sql"` is
 `MemoryBudget::sql_reserved()`, the reserved total minus the fetch share,
 which is what the SQL executor's per-tenant accountants hold through the raw
 `try_reserve`/`reserve_unchecked`/`release` API. The two counters are separate
