@@ -2,7 +2,7 @@
 
 - Status: Accepted (2026-09-27); implementation tracked on epic #2040
 - Date: 2026-09-27
-- Refs: #2040, ADR-0013, ADR-0022, ADR-0027, ADR-0029, ADR-0046, ADR-0064, ADR-0066, ADR-0071, ADR-0089, ADR-0097, ADR-0109, ADR-1374, ADR-2023
+- Refs: #2040, ADR-0013, ADR-0022, ADR-0027, ADR-0029, ADR-0046, ADR-0064, ADR-0066, ADR-0071, ADR-0089, ADR-0094, ADR-0097, ADR-0109, ADR-0954, ADR-1374, ADR-2023
 
 ## Context
 
@@ -144,10 +144,11 @@ manifest, both charged to the Resolve phase. `sweep` (see Lifecycle under
 Consequences) deletes old versions, so the LIST stays short.
 
 Data objects are content-addressed, and the key carries the full 256-bit
-BLAKE3 digest as 64 hex characters. Every other `hash16` key in the layout
-is disambiguated by a writer id, epoch, sequence or watermark; this one has
-nothing else, so a 64-bit truncation would make two different files of the
-same size one object. A file that fits in one PUT is written with
+BLAKE3 digest as 64 hex characters. The other content-addressed keys that
+use `hash16` (L0 data objects, `.csnap` snapshot parts) also carry a writer
+id, epoch, sequence or watermark. This key carries only the dataset, so a
+64-bit truncation would make two different files of the same size one
+object. A file that fits in one PUT is written with
 `CreateIfAbsent`, and a conflict there counts as success once a `head`
 confirms the size, since the key already names these bytes. A larger file
 goes through `put_multipart`, which
@@ -176,8 +177,18 @@ DROP TABLE [IF EXISTS] name;
 - `CREATE` lists the dataset once with `list_delimited` at the dataset's
   prefix, so only the dataset's own files are taken and a nested dataset
   such as `hits/2024` is not. It requires at least one file, reads each
-  file's footer, and commits a manifest that snapshots the file list. Queries never list the dataset. Files uploaded later are picked up
-  by `CREATE OR REPLACE`.
+  file's footer, and commits a manifest that snapshots the file list.
+  Queries never list the dataset. Files uploaded later are picked up by
+  `CREATE OR REPLACE`.
+- After the manifest commits, `CREATE` checks with a `head` that every
+  object it references still exists at the recorded size, and returns a
+  typed error naming any that do not. A `sweep` that ran between the
+  listing and the commit is the case this covers: sweep ages an
+  unreferenced object from its upload, so a dataset of old files can lose
+  one to a concurrent sweep, and the harmful delete always lands before
+  the commit. The manifest stays, being immutable. The caller re-uploads
+  and issues `CREATE OR REPLACE`. `sweep` also re-resolves every table's
+  newest manifest just before it deletes data, which narrows the window.
 - `OPTIONS` admits `binary_as_string` and `ravel.cast.<column>` (D5), and
   nothing else.
 - Refused: `TEMPORARY`, `UNBOUNDED`, `PARTITIONED BY`, `WITH ORDER`, a
@@ -243,7 +254,9 @@ untouched.
   manifest's file list. Each `PartitionedFile` carries its size and a
   `metadata_size_hint` equal to the footer length plus the 8-byte trailer,
   so the first footer read fetches exactly the footer. Planning never lists
-  the store.
+  the store. The provider chooses the file groups: up to
+  `target_partitions` groups for a query D6 allows to scan in parallel,
+  and exactly one group in manifest file order otherwise.
 
 Resolution happens before the session is built, as it does for the signal
 tables. The executor reads the table names from the statement, resolves
@@ -348,18 +361,32 @@ A query over a Parquet table uses the signal tables' deadline, function
 allowlist, and per-query memory pool. It differs where Stage 0 showed a
 cost:
 
-- File-scan repartitioning is on, so a single large file is split by byte
-  range across `target_partitions` (K5: 203.4 s to 88.1 s hot on one file;
-  K2: 9.1 s on 100 files), but only for a query the ADR-0094
-  classification proves exact-typed: `count`, and `sum`/`min`/`max` over
-  non-float input, with no float group key. Any other query (a float
-  aggregate, or any `avg`) scans as one partition in manifest file order,
-  so its fold is bit-reproducible as it is on the signal tables. A
-  multi-partition scan would merge partial float states in arrival order.
-  The cost of that rule on ClickBench is measured in the first D7 run on
-  the reference machine, and a
-  deterministic ordered merge of partial states is the follow-up if it
-  matters.
+- Scan parallelism follows the `exact_typed_aggregates` value the
+  executor already computes for every query (ADR-0094): the operator's
+  `parallel_final_aggregation` flag AND `plan_is_exact_typed`. The
+  predicate is the executor's, and this ADR does not restate it. As of
+  writing, it admits a plan with no aggregate, `count` including
+  `count(DISTINCT ...)`, `sum`/`min`/`max` over non-float input, and
+  `avg`/`mean` over resolved integer input, and it refuses a float GROUP
+  BY or DISTINCT key.
+  - When the value is true, the provider gives the scan up to
+    `target_partitions` file groups and file-scan repartitioning is on, so
+    a single large file is also split by byte range (K5: 203.4 s to 88.1 s
+    hot on one file; K2: 9.1 s on 100 files).
+  - When it is false, the provider emits exactly one file group, in
+    manifest file order, and file-scan repartitioning is off. The scan
+    then has one partition, the aggregate's input arrives in a fixed
+    order, and a float fold is bit-reproducible. Turning the knob off
+    alone would not do this: the knob only re-splits the groups the
+    provider made, and one group per file would still give a partial
+    aggregate per file merged in arrival order.
+  - A spill-enabled query (ADR-0954) keeps whatever scan partitioning the
+    rule above gives it. That ADR removes `RepartitionExec` above the scan
+    and keeps the scan itself parallel, and file groups and byte-range
+    splits are scan partitions, not `RepartitionExec` nodes.
+  - The cost of the single-group rule on ClickBench is measured in the
+    first D7 run on the reference machine. A deterministic ordered merge
+    of partial states is the follow-up if it matters.
 - Parquet filter pushdown (`pushdown_filters`) is on, which evaluates
   predicates inside the reader and decodes the other columns only for
   surviving rows (K6: 57.5 s to 47.1 s hot, 251.7 s to 203.5 s cold).
