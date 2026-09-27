@@ -239,8 +239,8 @@ pub async fn admit_ingest_request<S: IngestAdmissionState>(
     };
 
     let expired = Arc::new(AtomicBool::new(false));
-    let mut request = request
-        .map(|body| axum::body::Body::new(DeadlineBody::new(body, expired.clone())));
+    let mut request =
+        request.map(|body| axum::body::Body::new(DeadlineBody::new(body, expired.clone())));
     let extensions = request.extensions_mut();
     extensions.insert(IngestPermitHeld);
     extensions.insert(tenant);
@@ -824,6 +824,269 @@ mod tests {
             0,
             "no non-ingest path is charged against the ingest ceiling, even when it is full"
         );
+    }
+
+    /// An ingest path whose service this listener does not register (a
+    /// `--mode query` process, or OTAP without `--otap`) passes through to
+    /// tonic's router, which answers UNIMPLEMENTED, rather than being shed or
+    /// refused for credentials here.
+    ///
+    /// Non-vacuity: ignore `GrpcIngestServices` in `call` and the
+    /// credential-less requests reach `UnreachableInner`'s shed or
+    /// UNAUTHENTICATED arm instead of the inner service.
+    #[tokio::test]
+    async fn unregistered_ingest_paths_pass_through_untouched() {
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
+        let _held = controller.try_admit().expect("the only permit");
+
+        let inner = CountingInner::default();
+        let mut service = GrpcIngestAdmissionLayer::new(
+            controller.clone(),
+            resolver(),
+            GrpcIngestServices {
+                otlp: false,
+                otap: false,
+            },
+        )
+        .layer(inner.clone());
+
+        for path in OTLP_EXPORT_PATHS
+            .into_iter()
+            .chain([OTAP_ARROW_METRICS_PATH])
+        {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let response = service
+                .call(poisoned_request(path, polls, None))
+                .await
+                .expect("infallible inner");
+            assert_eq!(
+                response.status(),
+                http::StatusCode::OK,
+                "{path} passes through"
+            );
+            assert!(
+                Status::from_header_map(response.headers()).is_none(),
+                "{path} carries no refusal from the layer"
+            );
+        }
+
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(inner.held_marker_seen.load(Ordering::SeqCst), 0);
+        assert!(inner.tenants_seen.lock().expect("unpoisoned").is_empty());
+        assert_eq!(controller.shed_total(), 0);
+    }
+
+    /// Longer than [`INGEST_BODY_READ_TIMEOUT`], so a test that waits this
+    /// long without an answer has shown the bound is missing. Under paused
+    /// time neither costs wall-clock time.
+    const TEST_DEADLINE: Duration = Duration::from_secs(2 * INGEST_BODY_READ_TIMEOUT.as_secs());
+
+    /// A body that delivers one chunk of a large declared length and then
+    /// stalls forever: a client trickling its upload.
+    struct StalledBody {
+        sent_first_chunk: bool,
+    }
+
+    impl StalledBody {
+        fn new() -> Self {
+            StalledBody {
+                sent_first_chunk: false,
+            }
+        }
+    }
+
+    impl Body for StalledBody {
+        type Data = Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+            if self.sent_first_chunk {
+                return Poll::Pending;
+            }
+            self.sent_first_chunk = true;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(1024 * 1024)
+        }
+    }
+
+    struct HttpTestState {
+        controller: Arc<IngestConcurrencyController>,
+        resolver: Arc<dyn TenantResolver>,
+    }
+
+    impl IngestAdmissionState for HttpTestState {
+        fn ingest_concurrency(&self) -> &Arc<IngestConcurrencyController> {
+            &self.controller
+        }
+
+        fn tenant_resolver(&self) -> &Arc<dyn TenantResolver> {
+            &self.resolver
+        }
+    }
+
+    /// An ingest route shaped like the real ones: the handler takes the body
+    /// through the `Bytes` extractor, behind the admission middleware.
+    fn http_router(controller: &Arc<IngestConcurrencyController>) -> axum::Router {
+        let state = Arc::new(HttpTestState {
+            controller: controller.clone(),
+            resolver: resolver(),
+        });
+        axum::Router::new()
+            .route(
+                "/v1/metrics",
+                axum::routing::post(|body: Bytes| async move { body.len().to_string() }),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                admit_ingest_request::<HttpTestState>,
+            ))
+            .with_state(state)
+    }
+
+    fn http_upload(body: axum::body::Body) -> Request {
+        http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/v1/metrics")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(body)
+            .expect("request builds")
+    }
+
+    /// An authenticated HTTP upload that sends its head and one chunk and
+    /// then stalls is answered 408 once [`INGEST_BODY_READ_TIMEOUT`] passes,
+    /// and the permit it held is released: under a ceiling of 1 the next
+    /// upload is admitted and nothing is shed.
+    ///
+    /// Non-vacuity: without the `DeadlineBody` around the request body the
+    /// stalled upload is still unanswered at `TEST_DEADLINE`.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_http_upload_is_refused_408_and_releases_its_permit() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
+        let app = http_router(&controller);
+
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            app.clone()
+                .oneshot(http_upload(axum::body::Body::new(StalledBody::new()))),
+        )
+        .await
+        .expect("the stalled upload is answered within the bound, not left hanging")
+        .expect("infallible router");
+        let waited = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(
+            waited >= INGEST_BODY_READ_TIMEOUT && waited < TEST_DEADLINE,
+            "refused at the bound, after {waited:?}"
+        );
+
+        let response = app
+            .oneshot(http_upload(axum::body::Body::from("payload")))
+            .await
+            .expect("infallible router");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the stalled upload's permit was released"
+        );
+        assert_eq!(controller.shed_total(), 0, "nothing was shed");
+    }
+
+    /// Stands in for tonic's unary codec: reads the request body to its end
+    /// and answers OK, or answers the body error the way tonic does, as a
+    /// status other than DEADLINE_EXCEEDED.
+    #[derive(Clone)]
+    struct DrainingInner;
+
+    impl Service<http::Request<TonicBody>> for DrainingInner {
+        type Response = http::Response<TonicBody>;
+        type Error = std::convert::Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<TonicBody>) -> Self::Future {
+            Box::pin(async move {
+                let mut body = std::pin::pin!(req.into_body());
+                loop {
+                    match std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+                        None => return Ok(http::Response::new(TonicBody::empty())),
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            return Ok(Status::unknown(error.to_string()).into_http());
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    fn grpc_export(body: TonicBody) -> http::Request<TonicBody> {
+        http::Request::builder()
+            .method(http::Method::POST)
+            .uri(EXPORT_PATH)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(body)
+            .expect("request builds")
+    }
+
+    /// The gRPC counterpart: an authenticated unary export whose message
+    /// stalls is refused DEADLINE_EXCEEDED once [`INGEST_BODY_READ_TIMEOUT`]
+    /// passes, and its permit is released for the next export.
+    ///
+    /// Non-vacuity: without the `DeadlineBody` the stalled export is still
+    /// unanswered at `TEST_DEADLINE`; without the `expired` check the status
+    /// is `DrainingInner`'s UNKNOWN.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_grpc_export_is_refused_deadline_exceeded_and_releases_its_permit() {
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
+        let mut service = layer(&controller).layer(DrainingInner);
+
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            service.call(grpc_export(TonicBody::new(StalledBody::new()))),
+        )
+        .await
+        .expect("the stalled export is answered within the bound, not left hanging")
+        .expect("infallible inner");
+        let waited = started.elapsed();
+
+        assert_eq!(
+            grpc_status_of(&response),
+            (
+                tonic::Code::DeadlineExceeded,
+                "request body not received within 30s".to_string()
+            )
+        );
+        assert!(
+            waited >= INGEST_BODY_READ_TIMEOUT && waited < TEST_DEADLINE,
+            "refused at the bound, after {waited:?}"
+        );
+
+        let response = service
+            .call(grpc_export(TonicBody::new(axum::body::Body::from(
+                "message",
+            ))))
+            .await
+            .expect("infallible inner");
+        assert!(
+            Status::from_header_map(response.headers()).is_none(),
+            "the stalled export's permit was released"
+        );
+        assert_eq!(controller.shed_total(), 0, "nothing was shed");
     }
 
     /// `grpc_request_tenant` reuses the tenant the layer authenticated and
