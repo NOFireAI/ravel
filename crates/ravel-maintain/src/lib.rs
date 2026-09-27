@@ -95,7 +95,8 @@ pub use legal_hold::{
 };
 pub use memo_snapshot::{MEMO_PREFIX, memo_key, read_all_memo_snapshots, write_memo_snapshot};
 pub use migrate::{
-    FamilyMigrateReport, MigrateBudget, Verification, count_below_target, migrate_family,
+    FamilyCensus, FamilyMigrateReport, MigrateBudget, Verification, census_family,
+    count_below_target, migrate_family,
 };
 pub use provision_audit::write_reshard_audit;
 pub use publish::{

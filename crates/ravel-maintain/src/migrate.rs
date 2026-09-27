@@ -71,7 +71,7 @@
 //! visited by one and counted by the other, rather than being invisible to
 //! both -- which is the false durable claim the floor must never make.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ravel_catalog::{current_floor_from_store, select_authoritative_compaction_records};
 use ravel_commit::{keys, record};
@@ -390,110 +390,26 @@ pub async fn count_below_target(
     scan_shards: u32,
     target_version: u32,
 ) -> Result<(usize, usize)> {
-    use prost::Message;
-
     let mut l0_below = 0usize;
     let mut l1_below = 0usize;
     for shard in 0..scan_shards {
-        let prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)?;
-        let metas = list_all(store, &prefix).await?;
-
-        // First pass: classify every key by shape (parsing a key's shape is
-        // free, it only inspects the filename), read each compaction and
-        // rewrite record, count its below-target parts, and collect the commit
-        // keys it explicitly supersedes. A record must be read for its parts
-        // anyway, so deriving the supersession set from its `inputs` list here
-        // adds no store read over the bucket-membership version this replaced;
-        // commit records are deferred to the third pass because the full
-        // supersession set is only known once every record in the shard has
-        // been seen. Compaction records are additionally held per ingest-hour
-        // bucket rather than resolved inline: an overlap component is a
-        // property of one bucket (the unit the resolver reads), so which of
-        // them are authoritative is only decidable once the whole bucket's set
-        // is in hand.
-        let mut commit_keys = Vec::with_capacity(metas.len());
-        let mut superseded_commits: HashSet<String> = HashSet::new();
-        let mut compaction_by_bucket: HashMap<u32, Vec<(String, CompactionRecord)>> =
-            HashMap::new();
-        for meta in metas {
-            let entry = keys::partition_bucket_entry(&meta.key).map_err(MaintainError::Key)?;
-            let key = meta.key;
-            match entry {
-                keys::BucketEntry::CommitRecord(_) => commit_keys.push(key),
-                keys::BucketEntry::CompactionRecord(_) => {
-                    let got = store.get(&key, GetRange::Full).await?;
-                    let rec = record::decode_compaction(got.data.as_ref()).map_err(|err| {
-                        MaintainError::Invariant(format!(
-                            "compaction record {key} is corrupt during migration re-audit: \
-                             {err}"
-                        ))
-                    })?;
-                    for part in &rec.parts {
-                        if part.segment_format_version < target_version {
-                            l1_below += 1;
-                        }
-                    }
-                    compaction_by_bucket
-                        .entry(rec.ingest_hour_bucket)
-                        .or_default()
-                        .push((key, rec));
-                }
-                // A rewrite record (selective erasure, ADR-0064) carries the
-                // same CompactionPart parts as a compaction record; its
-                // surviving parts can sit below the target version and must
-                // count toward the re-audit exactly like L1 parts, or a
-                // "migration complete" claim could pass over unmigrated
-                // rewritten objects. Its `inputs` list supersedes raw L0
-                // exactly as a compaction record's does; a predecessor rewrite
-                // (empty `inputs`, superseding a whole prior compaction or
-                // rewrite record instead) supersedes no L0 record directly,
-                // and the predecessor record it names still carries the L0
-                // input list for as long as that record exists.
-                keys::BucketEntry::RewriteRecord(_) => {
-                    let got = store.get(&key, GetRange::Full).await?;
-                    let rec = RewriteRecord::decode(got.data.as_ref()).map_err(|err| {
-                        MaintainError::Invariant(format!(
-                            "rewrite record {key} is corrupt during migration re-audit: {err}"
-                        ))
-                    })?;
-                    for part in &rec.parts {
-                        if part.segment_format_version < target_version {
-                            l1_below += 1;
-                        }
-                    }
-                    superseded_commits.extend(superseded_input_commit_keys(
-                        tenant_hash,
-                        signal,
-                        shard,
-                        &rec,
-                    )?);
-                }
-                keys::BucketEntry::Tombstone(_) => {}
-            }
+        let family = read_shard_family(
+            store,
+            tenant_hash,
+            signal,
+            shard,
+            ShardReader::MigrateReaudit,
+        )
+        .await?;
+        for rec in &family.records {
+            l1_below += rec
+                .part_versions
+                .iter()
+                .filter(|v| **v < target_version)
+                .count();
         }
-
-        // Second pass: resolve each bucket's compaction records to one
-        // authoritative record per overlap component and take only a winner's
-        // inputs as superseded. An input a loser alone names has no live
-        // successor -- the loser's parts are ignored -- so it is still served
-        // raw and still counts below the target.
-        for records in compaction_by_bucket.values() {
-            let losing = select_authoritative_compaction_records(records);
-            for (key, rec) in records {
-                if losing.contains(key.as_str()) {
-                    continue;
-                }
-                superseded_commits.extend(superseded_input_commit_keys(
-                    tenant_hash,
-                    signal,
-                    shard,
-                    rec,
-                )?);
-            }
-        }
-
-        for key in commit_keys {
-            if superseded_commits.contains(&key) {
+        for key in family.commit_keys {
+            if family.superseded_commits.contains(&key) {
                 continue;
             }
             let got = store.get(&key, GetRange::Full).await?;
@@ -504,6 +420,235 @@ pub async fn count_below_target(
         }
     }
     Ok((l0_below, l1_below))
+}
+
+/// The live commit-family population of one `(tenant, signal)` by
+/// `segment_format_version`, from one enumeration: the liveness
+/// [`count_below_target`] verifies a floor raise with, bucketed by version so
+/// any number of floors is classified against it without re-listing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FamilyCensus {
+    /// Version -> L0 commit records no authoritative compaction record and no
+    /// rewrite record names as an input.
+    pub live_l0: BTreeMap<u32, usize>,
+    /// Version -> L0 commit records still listed although an authoritative
+    /// compaction or rewrite record supersedes them (sweepable, not live).
+    pub superseded_l0: BTreeMap<u32, usize>,
+    /// Version -> parts of every compaction and rewrite record.
+    pub parts: BTreeMap<u32, usize>,
+    /// Newest `created_unix_ns` among the live commit records and every
+    /// compaction and rewrite record; `None` when there are none.
+    pub newest_live_created_unix_ns: Option<i64>,
+}
+
+impl FamilyCensus {
+    /// Live entries below `target_version`: the sum of the two figures
+    /// [`count_below_target`] returns for that target, as a prefix sum over the
+    /// live histograms.
+    pub fn live_below(&self, target_version: u32) -> usize {
+        let below = |hist: &BTreeMap<u32, usize>| -> usize {
+            hist.range(..target_version).map(|(_, n)| *n).sum()
+        };
+        below(&self.live_l0) + below(&self.parts)
+    }
+
+    fn saw_live_created(&mut self, created_unix_ns: i64) {
+        self.newest_live_created_unix_ns = Some(
+            self.newest_live_created_unix_ns
+                .map_or(created_unix_ns, |n| n.max(created_unix_ns)),
+        );
+    }
+}
+
+/// Enumerate every commit-family record of a `(tenant, signal)` across
+/// `scan_shards` once, read fresh: one LIST pass per shard and one GET per
+/// record, superseded commit records included so the census can report them
+/// apart from the live population.
+pub async fn census_family(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+) -> Result<FamilyCensus> {
+    let mut census = FamilyCensus::default();
+    for shard in 0..scan_shards {
+        let family =
+            read_shard_family(store, tenant_hash, signal, shard, ShardReader::Census).await?;
+        for rec in &family.records {
+            for version in &rec.part_versions {
+                *census.parts.entry(*version).or_default() += 1;
+            }
+            census.saw_live_created(rec.created_unix_ns);
+        }
+        for key in family.commit_keys {
+            let got = store.get(&key, GetRange::Full).await?;
+            let rec = record::decode(&got.data)?;
+            if family.superseded_commits.contains(&key) {
+                *census
+                    .superseded_l0
+                    .entry(rec.segment_format_version)
+                    .or_default() += 1;
+            } else {
+                *census
+                    .live_l0
+                    .entry(rec.segment_format_version)
+                    .or_default() += 1;
+                census.saw_live_created(rec.created_unix_ns);
+            }
+        }
+    }
+    Ok(census)
+}
+
+/// Which caller is reading a shard's records: it names the pass in a
+/// corrupt-record error and decides how strictly a rewrite record is decoded.
+#[derive(Debug, Clone, Copy)]
+enum ShardReader {
+    /// [`count_below_target`]: decodes a rewrite record's protobuf only.
+    MigrateReaudit,
+    /// [`census_family`]: validates a rewrite record as `audit-versions`
+    /// always has.
+    Census,
+}
+
+impl ShardReader {
+    fn label(self) -> &'static str {
+        match self {
+            ShardReader::MigrateReaudit => "migration re-audit",
+            ShardReader::Census => "format census",
+        }
+    }
+}
+
+/// One compaction or rewrite record's contribution to the population.
+struct RecordParts {
+    part_versions: Vec<u32>,
+    created_unix_ns: i64,
+}
+
+/// One shard's commit-family listing with every compaction and rewrite record
+/// read and authority resolved.
+struct ShardFamily {
+    /// Every commit record key the shard lists, in listing order, unread.
+    commit_keys: Vec<String>,
+    /// The subset of `commit_keys` (and possibly keys no longer listed) an
+    /// authoritative compaction record or a rewrite record names as an input.
+    superseded_commits: HashSet<String>,
+    records: Vec<RecordParts>,
+}
+
+async fn read_shard_family(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    reader: ShardReader,
+) -> Result<ShardFamily> {
+    use prost::Message;
+
+    let prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)?;
+    let metas = list_all(store, &prefix).await?;
+
+    // First pass: classify every key by shape (parsing a key's shape is free,
+    // it only inspects the filename), read each compaction and rewrite record,
+    // keep its parts' versions, and collect the commit keys it explicitly
+    // supersedes. Commit records are left to the caller because the full
+    // supersession set is only known once every record in the shard has been
+    // seen. Compaction records are additionally held per ingest-hour bucket
+    // rather than resolved inline: an overlap component is a property of one
+    // bucket (the unit the resolver reads), so which of them are authoritative
+    // is only decidable once the whole bucket's set is in hand.
+    let mut commit_keys = Vec::with_capacity(metas.len());
+    let mut superseded_commits: HashSet<String> = HashSet::new();
+    let mut records = Vec::new();
+    let mut compaction_by_bucket: HashMap<u32, Vec<(String, CompactionRecord)>> = HashMap::new();
+    for meta in metas {
+        let entry = keys::partition_bucket_entry(&meta.key).map_err(MaintainError::Key)?;
+        let key = meta.key;
+        match entry {
+            keys::BucketEntry::CommitRecord(_) => commit_keys.push(key),
+            keys::BucketEntry::CompactionRecord(_) => {
+                let got = store.get(&key, GetRange::Full).await?;
+                let rec = record::decode_compaction(got.data.as_ref()).map_err(|err| {
+                    MaintainError::Invariant(format!(
+                        "compaction record {key} is corrupt during {}: {err}",
+                        reader.label()
+                    ))
+                })?;
+                records.push(RecordParts {
+                    part_versions: rec.parts.iter().map(|p| p.segment_format_version).collect(),
+                    created_unix_ns: rec.created_unix_ns,
+                });
+                compaction_by_bucket
+                    .entry(rec.ingest_hour_bucket)
+                    .or_default()
+                    .push((key, rec));
+            }
+            // A rewrite record (selective erasure, ADR-0064) carries the same
+            // CompactionPart parts as a compaction record; its surviving parts
+            // can sit below the target version and must count exactly like L1
+            // parts, or a "migration complete" claim could pass over
+            // unmigrated rewritten objects. Its `inputs` list supersedes raw L0
+            // exactly as a compaction record's does; a predecessor rewrite
+            // (empty `inputs`, superseding a whole prior compaction or rewrite
+            // record instead) supersedes no L0 record directly, and the
+            // predecessor record it names still carries the L0 input list for
+            // as long as that record exists.
+            keys::BucketEntry::RewriteRecord(_) => {
+                let got = store.get(&key, GetRange::Full).await?;
+                let rec = match reader {
+                    ShardReader::MigrateReaudit => {
+                        RewriteRecord::decode(got.data.as_ref()).map_err(|err| err.to_string())
+                    }
+                    ShardReader::Census => ravel_commit::erasure::decode_rewrite(got.data.as_ref())
+                        .map_err(|err| err.to_string()),
+                }
+                .map_err(|err| {
+                    MaintainError::Invariant(format!(
+                        "rewrite record {key} is corrupt during {}: {err}",
+                        reader.label()
+                    ))
+                })?;
+                records.push(RecordParts {
+                    part_versions: rec.parts.iter().map(|p| p.segment_format_version).collect(),
+                    created_unix_ns: rec.created_unix_ns,
+                });
+                superseded_commits.extend(superseded_input_commit_keys(
+                    tenant_hash,
+                    signal,
+                    shard,
+                    &rec,
+                )?);
+            }
+            keys::BucketEntry::Tombstone(_) => {}
+        }
+    }
+
+    // Second pass: resolve each bucket's compaction records to one
+    // authoritative record per overlap component and take only a winner's
+    // inputs as superseded. An input a loser alone names has no live successor
+    // -- the loser's parts are ignored -- so it is still served raw and still
+    // counts as live.
+    for bucket_records in compaction_by_bucket.values() {
+        let losing = select_authoritative_compaction_records(bucket_records);
+        for (key, rec) in bucket_records {
+            if losing.contains(key.as_str()) {
+                continue;
+            }
+            superseded_commits.extend(superseded_input_commit_keys(
+                tenant_hash,
+                signal,
+                shard,
+                rec,
+            )?);
+        }
+    }
+
+    Ok(ShardFamily {
+        commit_keys,
+        superseded_commits,
+        records,
+    })
 }
 
 /// The commit keys of `listing`'s L0 records that its compaction and rewrite
