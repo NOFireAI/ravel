@@ -4884,13 +4884,7 @@ mod tests {
         let late_key = late_commit_key(9);
         assert!(listed[1].key < late_key && late_key < listed[2].key);
         let store = GetFaults::new(memory.clone(), move |key, earlier| {
-            if key == failing {
-                Some(StoreError::Timeout)
-            } else if key == late_data && earlier == 0 {
-                Some(StoreError::Timeout)
-            } else {
-                None
-            }
+            (key == failing || (key == late_data && earlier == 0)).then_some(StoreError::Timeout)
         });
 
         tick_eight(&store, &metrics).await;
