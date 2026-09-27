@@ -82,6 +82,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Parquet table manifest format and object layer** (ADR-2040, issue #2050):
+  the new `ravel-pqtable` crate and `proto/ravel/parquet_table.proto`. No
+  shipping binary calls it yet.
 - **`ravel-server` builds a read and a write CPU gate and reports their
   queueing on `/metrics`** (ADR-1702, issue #1702). A new crate,
   `ravel-cpu-gate`, holds the gate: a job at or above its inline floor
