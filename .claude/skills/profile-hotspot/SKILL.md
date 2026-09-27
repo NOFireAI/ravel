@@ -114,13 +114,14 @@ starts from zero.
 
 ADR-0044 decision 5 specifies `tracing` spans on the query path for exactly
 this reason, and notes that without them "a slow query cannot be attributed to
-a phase". Once those spans are implemented, steps 2-4 above become reading
-span durations from a documented command, and this skill shrinks to its
-discipline rules.
+a phase". Part of that is shipped: ravel-query carries `debug_span!` spans for
+several phases (`grep -rn 'debug_span!' crates/ravel-query/src` lists them).
+Read those before timing a phase by hand; where a span covers the phase,
+steps 2-4 above become reading its duration.
 
-Until then: if you find yourself hand-instrumenting a path that a shipped span
-should already cover, say so in your report. That is a finding about the
-codebase, not just about your bug.
+If you find yourself hand-instrumenting a path that ADR-0044 says a span
+should cover and none does, say so in your report. That is a finding about
+the codebase, not just about your bug.
 
 ## The shape of a good report
 

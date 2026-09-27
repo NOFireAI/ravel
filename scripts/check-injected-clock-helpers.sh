@@ -48,7 +48,7 @@
 #
 # Scope note. This guard scans one file, services/ravel-cli/src/load.rs. It is
 # not yet enforced workspace-wide: other crates hold injected-clock tests it
-# does not read (see CLAUDE.md for the measured out-of-scope counts).
+# does not read (issue #1278 widens the scan).
 #
 # Usage:
 #   scripts/check-injected-clock-helpers.sh [file]

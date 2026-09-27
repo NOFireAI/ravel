@@ -1,6 +1,6 @@
 ---
 name: merge-fleet-result
-description: Use when a fleet task finishes - fetch its result branch, re-run gates locally, merge to main, push, and clean up; never trust executor-claimed green
+description: Use when a fleet task finishes - inspect its result branch, open the PR through fleet-result-merge.sh, wait for the fleet review and CI, merge through the queue, and clean up the task refs; never trust executor-claimed green
 ---
 
 # Merging a fleet result branch

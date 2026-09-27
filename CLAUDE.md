@@ -94,7 +94,9 @@ cargo clippy -p ravel-server -p ravel-sql --features flight-sql --all-targets --
 cargo test   -p ravel-server -p ravel-sql --features flight-sql
 ```
 
-`scripts/gates.sh` runs these when the crates are in scope. It also runs a
+`scripts/gates.sh` runs these when `ravel-server` or `ravel-sql` is in
+scope; a scoped run that names only `ravel-query` skips them, so add
+`-p ravel-server` for a query-only change. It also runs a
 ravel-bench lane (`--features sql-latency,profiling,flight-lane` clippy and
 tests, plus `--features stage-timing`) whenever ravel-bench, ravel-sql,
 ravel-query, or ravel-ingest is in scope, and a `-p ravel-logseg -p
@@ -755,14 +757,10 @@ than passing for "no pull request open".
   the predicate would silently narrow it from 26 helpers to 5).
   Scope: the default target is the single file
   `services/ravel-cli/src/load.rs`; the rule is NOT yet enforced
-  workspace-wide. Pointing it at every other `.rs` that mentions an
-  injected-clock type surfaces 9 findings across 5 files (in ravel-cache,
-  ravel-maintain, and ravel-server; a mix of idle-eviction sleeps that poll
-  a clock-controlled state and `tokio::time::timeout` deadlock guards that
-  would each need a real allow-wall-clock reason), and it finds no helper at
-  all in 78 more clock-mentioning files, 70 of them integration tests: 60
-  under `crates/*/tests/` and 10 under `services/*/tests/`. Issue #1278 is
-  the follow-up that widens the scan and resolves those.
+  workspace-wide: the other files that mention an injected-clock type,
+  most of them integration tests under `crates/*/tests/` and
+  `services/*/tests/`, are not scanned. Issue #1278 is the follow-up that
+  widens the scan and resolves what it finds.
 
 ### Writing gate and poll shell
 

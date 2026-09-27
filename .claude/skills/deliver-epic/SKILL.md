@@ -146,9 +146,12 @@ the first ledger entry.
    ```
 
    Refusals here are terminal for that task this tick: 65 means a pull
-   request already addresses the ticket, 66 that one is already touching
-   those files, 69 that GitHub could not be asked, which is not the same
-   as a clean answer. Resolve the named pull request rather than reaching
+   request already addresses the ticket, or a previous intent for it has
+   no recorded outcome (reconcile that with `record` or `failed` first),
+   66 that one is already touching those files, 69 that GitHub could not
+   be asked, which is not the same as a clean answer. Any other non-zero
+   exit, including the fresh-ref guard's, is a refusal too. Resolve the
+   named pull request rather than reaching
    for `DISPATCH_SKIP_DUPLICATE_CHECK=1`; that flag is for a deliberate
    second task on one ticket (a fix round, a continuation after a ceiling
    kill), and a habit of using it to get past a refusal retires the guard.

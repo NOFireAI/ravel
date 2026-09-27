@@ -37,13 +37,16 @@ and in what happens next.
 Accepts, in order of preference:
 
 1. A fleet task-id: resolve via `git ls-remote origin
-   refs/heads/task/<id>/result`. If that comes back empty, the branch was
-   already merged and its remote ref deleted (the merge workflow deletes
-   task refs right after a successful merge); fall back to asking
-   for the merge commit instead, and verify `<merge>^2` (the second parent,
-   the branch's own tip before the merge), not the merge commit itself.
-2. A merge-commit SHA: verify `<merge>^2`, diff against `<merge>^1` (main
-   before the merge) for the tier-2 hunk scope.
+   refs/heads/task/<id>/result`. If that comes back empty, the branch has
+   landed and its task refs were deleted (the merge workflow deletes them
+   once the PR is confirmed merged). `main` is rebase-only, so there is no
+   merge commit: find the landed commits on `main` (for example by the
+   ticket number in their `Fixes:`/`Refs:` trailer, `git log --grep`),
+   verify the newest of them, and diff against the parent of the oldest
+   for the tier-2 hunk scope.
+2. A merge-commit SHA, for history from before `main` became rebase-only:
+   verify `<merge>^2`, diff against `<merge>^1` (main before the merge) for
+   the tier-2 hunk scope.
 3. Any other ref `git worktree add` accepts (a branch, a tag, a raw SHA).
 
 Always print the exact SHA resolved before doing anything else: an
