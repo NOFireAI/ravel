@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-27
+
 ### Fixed
 
 - **The chaos lane reads labeled metrics by label and passes multi-shard
@@ -147,7 +149,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fails. The flag is unset by default, so nothing binds, and the routes on
   `--listen-http` are unchanged. Startup refuses a `--listen-health` address
   equal to any other listener's, and shutdown waits at most 5 s for open
-  health connections before dropping them.
+  health connections before dropping them, plus a 1 s join margin, so the
+  worst case from SIGTERM to exit grows by up to 6 s (32.5 s to 38.5 s). A
+  hand-written manifest that sets the flag needs a termination grace period
+  to match.
 - **The operator can point both probes at a dedicated health port with
   `spec.probes.dedicatedHealthPort`** (ADR-1702, issue #1702). Set to true,
   every gateway, query, and maintain container gains
@@ -156,6 +161,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same paths, period, timeout, and failure threshold as before. The health
   listener runs on its own thread, so a main runtime busy decoding segments
   can no longer let a probe time out and have the kubelet restart the pod.
+  Those pods also get `terminationGracePeriodSeconds` 51 instead of 45, to
+  cover the health listener's longer shutdown.
   The same routes stay on 4318 as well, so anything already probing the HTTP
   port is unaffected, and the `ravel-ingest-router` Deployment keeps its
   probes on 8080. The field defaults to false in this release and flips to
@@ -177,8 +184,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fast path. On a single node, a query that selects neither never builds
   those columns; under distributed execution each worker still builds both
   for every row it returns and the coordinator drops them. A bare single-node
-  `SELECT count(*) FROM spans` with no pending erasure now returns the row
-  count instead of failing with "must either specify a row count or at least
+  `SELECT count(*) FROM spans` now returns the row count, with or without a
+  pending erasure, instead of failing with "must either specify a row count or at least
   one column".
 - **`/metrics` now renders a per-shard ingest skew family** (issue #1692).
   `ravel_ingest_shard_messages_enqueued_total`,
@@ -211,8 +218,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writes in a flush, both PUTs and every retry, so a hung store still fails
   closed rather than stretching out for the full retry ladder. A flush
   writes its tenant groups one after another, so against a hung store a
-  query can wait up to 30 s for each group ahead of its own; every retried
-  attempt is now counted on `/metrics` as `ravel_audit_put_retries_total`.
+  query can wait up to 30 s for each group ahead of its own. A throttle
+  response's retry-after hint is honoured when it fits the budget, and a
+  commit record found already stored on a retry counts as written when its
+  bytes match, since the earlier attempt landed and only its acknowledgement
+  was lost. Every retried attempt is now counted on `/metrics` as
+  `ravel_audit_put_retries_total`.
 - **The default query request budget is now derived from the unsealed tail a
   healthy catalog carries plus the fold-stall alert window** (ADR-1306). At 4
   shards and a 2 s flush cadence it gives 343,400 requests instead of 15,800,
@@ -241,7 +252,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   budget once at startup with the span it is measured against
   (`max_s3_requests`, `source`, `covered_span_secs`, `seal_margin_secs`),
   derived or explicit alike, so an operator who pins `--max-s3-requests` can
-  see which span their value undercuts.
+  see which span their value undercuts. Scalar and histogram
+  pages are now fetched in one batch, so a `page_fetch` tracing span can
+  carry `page_kind="mixed"`, where it used to be only `scalar` or
+  `histogram`.
 - **The scheduled catalog fold now runs only in `--mode maintain` and
   `--mode all`, and a `maintain` fleet partitions it across its replicas**
   (ADR-1693, issue #1693). A `maintain` process folds only the
@@ -295,8 +309,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`max by (signal)`) under its threshold. The new
   `RavelCatalogFoldLoopCrashLooping` rule in
   `deploy/prometheus/ravel.rules.yaml` fires on more than 5 restarts in 15m,
-  unaggregated, because the condition is about one replica; a loop panicking
-  on every tick crosses it 31 s after its first panic, while a single
+  unaggregated, because the condition is about one replica. It carries
+  `for: 15m`: a loop panicking on every tick crosses the threshold 31 s after
+  its first panic and pages about 15.5 minutes after it, while a single
   transient panic counts one restart. Supervision covers panics only: a tick
   that hangs on a store call that never returns moves no restart counter, and
   no shipped alert catches it on one replica of several, since only that
@@ -420,7 +435,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and for the coordinator's own no-hop local path.
   An RSEG or RLOG fetch for a PromQL query that needs more than the budget's
   remainder fails with `FetchMemoryExhausted` (HTTP 503 on the PromQL API)
-  instead of running unbounded, and the next query is admitted as before.
+  instead of running unbounded, and the next query is admitted as before. A
+  cache-warm fetch the budget refuses is skipped and logged rather than
+  failing startup.
   The `/metrics` gauges now report real values:
   `ravel_memory_reserved_bytes{component="fetch"}` is the bytes held by live
   fetch reservations, `component="sql"` is the rest of the budget's reserved
@@ -435,7 +452,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   queries on the ClickBench reference machine it cut throughput to about a
   third of `cost-based`'s (0.123 against 0.400 queries per second).
   `--logs-fetch-policy byte-minimal` remains available as
-  an explicit opt-in; only the unset default changes.
+  an explicit opt-in; only the unset default changes. The startup line's
+  `policy_source` now reads only `flag` or `default`; the
+  `derived-loopback-endpoint` value is gone.
 - **`ravel-server`'s catalog byte cache is sized independently of
   `--cache-max-bytes`** (ADR-2023, issue #2023). `--cache-max-bytes` now
   bounds the query fetcher cache only; the catalog byte cache derives its
@@ -449,8 +468,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte cache that small too, and now gets the catalog's own 5% share (about
   1.5 GB on a 30 GiB host) unless `--catalog-cache-max-bytes` is also set.
   Startup still refuses to start when the two caches' resolved ceilings
-  together exceed the process memory budget, exempting `--disable-cache` as
-  before.
+  together reach or exceed the process memory budget, exempting
+  `--disable-cache` as before. With `--cache-dir` set, each cache's disk tier
+  is bounded by that cache's own RAM ceiling, so the catalog disk tier no
+  longer follows `--cache-max-bytes`.
 - **`ravel-server` derives a larger fetcher-cache share on a loopback S3
   store** (ADR-2023, issue #2023). Unset, `--cache-max-bytes` used to
   always derive 25% of the process memory budget; now, a `--store s3`
@@ -461,7 +482,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   explicit `--cache-max-bytes` always wins, and every other deployment
   keeps the 25% share. The resolved value's source (`budget-carve-loopback`)
   is logged on the `performance default resolved` startup line alongside
-  `cache_max_bytes`.
+  `cache_max_bytes`. With `--cache-dir` set, the fetcher cache's disk tier
+  grows with it, on the same disk the store reads from.
 
 ## [0.18.0] - 2026-09-26
 
