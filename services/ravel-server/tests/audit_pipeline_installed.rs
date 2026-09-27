@@ -618,6 +618,81 @@ async fn best_effort_mode_serves_the_response_and_counts_the_failure() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// A single transient timeout on the first audit PUT is retried and the batch
+/// still succeeds (the retry ladder added on top of #2035's fix), and the
+/// retry is observable from outside the process on `/metrics`: exactly one
+/// rendered `ravel_audit_put_retries_total` sample, carrying exactly one
+/// counted retry, alongside a `ravel_audit_write_failures_total` that stays
+/// at zero because the batch never actually failed.
+#[tokio::test]
+async fn a_retried_audit_put_is_counted_on_metrics_and_the_query_still_succeeds() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::Timeout)
+            .with_key_contains("/u/")
+            .with_occurrence(ravel_object_store::fault::Occurrence::Nth(1)),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    // Metric segments live under "/m/", so setup is unaffected by the fault.
+    publish_segment(backend.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+    let running = start_server(backend.clone(), Mode::All, Default::default()).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("{base}/api/v1/query_range"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[
+            ("query", "m".to_string()),
+            ("start", "0".to_string()),
+            ("end", NOW_S.to_string()),
+            ("step", "60s".to_string()),
+        ])
+        .send()
+        .await
+        .expect("query_range request sent");
+    assert_eq!(
+        response.status(),
+        200,
+        "a single retried PUT must not fail the query"
+    );
+
+    assert_eq!(
+        store.fault_count(Op::Put, ravel_object_store::fault::FaultKind::Timeout),
+        1,
+        "exactly one faulted audit PUT, on its first attempt only"
+    );
+
+    let metrics = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request sent")
+        .text()
+        .await
+        .expect("metrics body readable");
+    let retry_samples: Vec<&str> = metrics
+        .lines()
+        .filter(|line| line.starts_with("ravel_audit_put_retries_total{"))
+        .collect();
+    assert_eq!(
+        retry_samples,
+        vec!["ravel_audit_put_retries_total{mode=\"all\"} 1"],
+        "exactly one rendered sample, carrying exactly one counted retry"
+    );
+    let failure_samples: Vec<&str> = metrics
+        .lines()
+        .filter(|line| line.starts_with("ravel_audit_write_failures_total{"))
+        .collect();
+    assert_eq!(
+        failure_samples,
+        vec!["ravel_audit_write_failures_total{mode=\"all\"} 0"],
+        "the retried batch still succeeded, so no write failure is counted"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// `Mode::Query` installs a pipeline and a real query route through it writes
 /// a record; `Mode::Maintain` and `Mode::Gateway` serve no query surface, so
 /// `start` installs no `AuditPipeline` for them and a request either mode does
