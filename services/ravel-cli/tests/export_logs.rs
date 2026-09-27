@@ -26,12 +26,15 @@ use ravel_cli::load::{self, Mapping};
 use ravel_cli::maintain::{SignalArg, compact_tenant};
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
-use ravel_ingest::Clock;
+use ravel_ingest::{Clock, IngestConfig, LogIngestRouter, WriteMode};
+use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
+use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_proto::commit::v1::RetentionTombstone;
-use ravel_types::Signal;
+use ravel_types::logstream::{AttrValue, log_stream_id};
+use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
 
 /// A fixed, plausible (post-2020) base clock, matching `tests/load.rs`'s
@@ -1143,6 +1146,245 @@ async fn a_pending_erasure_request_excludes_exactly_its_subject() {
         vec!["keeper".to_string(), "keeper".to_string()]
     );
     assert_eq!(exported_timestamps(&export_pq), vec![T0, T2]);
+}
+
+/// Submit an unbounded logs erasure request for `user_id = <subject>`.
+async fn erase_user(store: &Arc<dyn ObjectStoreBackend>, tenant: &str, subject: &str, now_ns: i64) {
+    erase::submit(
+        Arc::clone(store),
+        tenant,
+        SignalArg::Logs,
+        vec![("user_id".to_string(), subject.to_string())],
+        0,
+        0,
+        "issue #1712 stream-attribute erasure test".to_string(),
+        Uuid::from_u128(0x1712_0002),
+        now_ns,
+    )
+    .await
+    .expect("the erasure request is recorded");
+}
+
+/// A mapping that loads `user_id` as a resource attribute, so the subject
+/// lives in the record's stream identity and never in its own attributes.
+const RESOURCE_USER_MAPPING: &str = "ts_column = \"ts\"\nts_unit = \"nanos\"\n\
+     body_column = \"body\"\n\n\
+     [[resource_attribute]]\nkey = \"user_id\"\ncolumn = \"user_col\"\ntype = \"str\"\n";
+
+/// A pending erasure whose subject is a resource attribute excludes that
+/// subject's records from the export, as it excludes them from every SQL
+/// surface.
+///
+/// The SQL log scan matches erasure predicates against the merged resource +
+/// scope + record attributes; the fetcher-level filter sees record attributes
+/// alone. `user_id` is loaded through a `[[resource_attribute]]` entry here,
+/// so only the merged match can exclude alice's two records.
+#[tokio::test]
+async fn a_pending_erasure_on_a_resource_attribute_excludes_its_subject() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let export_pq = dir.path().join("export.parquet");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let now_ns = T2 + 1;
+
+    let source_pq = dir.path().join("resource-users.parquet");
+    let rows: [(i64, &str, &str); 4] = [
+        (T0, "bob-first", "bob"),
+        (T1, "alice-first", "alice"),
+        (T2, "carol-first", "carol"),
+        (T2 + 1, "alice-second", "alice"),
+    ];
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "ts".to_string(),
+            i64_col(rows.iter().map(|r| r.0).collect()),
+        ),
+        (
+            "body".to_string(),
+            str_col(rows.iter().map(|r| r.1).collect()),
+        ),
+        (
+            "user_col".to_string(),
+            str_col(rows.iter().map(|r| r.2).collect()),
+        ),
+    ])
+    .expect("batch");
+    write_parquet(&source_pq, &batch);
+    let report = load::load(
+        Arc::clone(&store),
+        &source_pq,
+        "acme",
+        &mapping(RESOURCE_USER_MAPPING),
+        1,
+        10_000,
+        None,
+        1,
+        now_ns,
+        Arc::new(FixedClock(now_ns)),
+    )
+    .await
+    .expect("load succeeds");
+    assert_eq!(report.rows_processed, 4);
+
+    erase_user(&store, "acme", "alice", now_ns).await;
+
+    let report = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        T0,
+        T2 + 2,
+        &mapping(RESOURCE_USER_MAPPING),
+        &export_pq,
+        1,
+        None,
+        now_ns,
+    )
+    .await
+    .expect("export succeeds");
+
+    assert_eq!(report.erasure_predicates, 1);
+    assert_eq!(
+        exported_bodies(&export_pq),
+        vec!["bob-first".to_string(), "carol-first".to_string()],
+        "exactly the records whose resource user_id is not alice"
+    );
+    assert_eq!(exported_timestamps(&export_pq), vec![T0, T2]);
+    let out = read_parquet(&export_pq);
+    let users = out
+        .column_by_name("user_col")
+        .expect("user_col")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("user_col is Utf8");
+    assert_eq!(
+        (0..users.len()).map(|i| users.value(i)).collect::<Vec<_>>(),
+        vec!["bob", "carol"]
+    );
+    assert_eq!(report.rows_written, 2);
+}
+
+/// One OTLP-shaped record whose stream carries `resource` and, under the
+/// instrumentation scope `scope-lib`/`1.0`, `scope_attrs`, and no record
+/// attributes at all.
+fn stream_record(
+    resource: &[(&str, &str)],
+    scope_attrs: &[(&str, &str)],
+    ts_ns: i64,
+    body: &str,
+) -> NormalizedLogRecord {
+    let to_attrs = |pairs: &[(&str, &str)]| -> Vec<(String, AttrValue)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), AttrValue::Str((*v).to_string())))
+            .collect()
+    };
+    let res = to_attrs(resource);
+    let scope = to_attrs(scope_attrs);
+    NormalizedLogRecord {
+        stream_id: log_stream_id(&res, "scope-lib", "1.0", &scope),
+        stream_attrs: stream_attrs_bytes(&res, "scope-lib", "1.0", &scope),
+        ts_ns,
+        observed_ts_ns: ts_ns,
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: body.to_string(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
+/// A pending erasure excludes a subject named only in a scope attribute, and
+/// one named only in an OTLP resource attribute, from the export.
+///
+/// The loader cannot write scope attributes (a Parquet file carries no
+/// instrumentation scope), so these records go through the ingest router the
+/// OTLP path uses. Every record carries no record attributes, so the
+/// fetcher-level filter can exclude none of them.
+#[tokio::test]
+async fn a_pending_erasure_on_a_scope_or_resource_attribute_excludes_its_subject() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let export_pq = dir.path().join("export.parquet");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let now_ns = T2 + 3;
+
+    let router = LogIngestRouter::new(
+        IngestConfig {
+            shard_count: 1,
+            target_bytes: 1,
+            ..IngestConfig::default()
+        },
+        Arc::clone(&store),
+        Arc::new(FixedClock(now_ns)),
+    );
+    router
+        .write(
+            TenantId::new("acme"),
+            vec![
+                stream_record(
+                    &[("service.name", "api")],
+                    &[("user_id", "bob")],
+                    T0,
+                    "bob-scope",
+                ),
+                stream_record(
+                    &[("service.name", "api")],
+                    &[("user_id", "alice")],
+                    T1,
+                    "alice-scope",
+                ),
+                stream_record(
+                    &[("service.name", "api"), ("user_id", "alice")],
+                    &[],
+                    T2,
+                    "alice-resource",
+                ),
+                stream_record(
+                    &[("service.name", "api"), ("user_id", "carol")],
+                    &[],
+                    T2 + 1,
+                    "carol-resource",
+                ),
+                stream_record(
+                    &[("service.name", "web")],
+                    &[("user_id", "alice")],
+                    T2 + 2,
+                    "alice-scope-web",
+                ),
+            ],
+            WriteMode::Strict,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("strict write commits");
+    router.shutdown().await;
+
+    erase_user(&store, "acme", "alice", now_ns).await;
+
+    let report = export::export_logs(
+        Arc::clone(&store),
+        StoreSelection::explicit(StoreKind::Memory),
+        "acme",
+        T0,
+        T2 + 3,
+        &mapping(TS_BODY_MAPPING),
+        &export_pq,
+        1,
+        None,
+        now_ns,
+    )
+    .await
+    .expect("export succeeds");
+
+    assert_eq!(report.erasure_predicates, 1);
+    assert_eq!(
+        exported_bodies(&export_pq),
+        vec!["bob-scope".to_string(), "carol-resource".to_string()],
+        "exactly the records no stream attribute names alice in"
+    );
+    assert_eq!(exported_timestamps(&export_pq), vec![T0, T2 + 1]);
+    assert_eq!(report.rows_written, 2);
 }
 
 /// A retention tombstone (ADR-0019 decision 3) removes exactly its own

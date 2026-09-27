@@ -21,10 +21,14 @@
 //! - Retention tombstones and superseded (compacted-away) objects never enter
 //!   the snapshot, because `Catalog::resolve` applies them.
 //! - Pending selective-erasure requests (ADR-0064) are attached to the
-//!   snapshot and handed to the fetcher as
-//!   [`ravel_query::erasure::ErasurePredicate`]s, which excludes matching rows
-//!   after the fetch and after any cache tier, exactly as the SQL log scan
-//!   does.
+//!   snapshot and applied in two places, exactly as the SQL log scan applies
+//!   them: handed to the fetcher as
+//!   [`ravel_query::erasure::ErasurePredicate`]s, which matches per-record
+//!   attributes, and then run over the decoded records by
+//!   [`ravel_query::erasure::retain_unerased_log_records`], the same function
+//!   the SQL scan's exclusion calls. That second pass matches the merged
+//!   resource + scope + record attributes, so a subject named only in a
+//!   resource or scope attribute is excluded too.
 //!
 //! # Memory and mid-export store changes
 //!
@@ -72,7 +76,7 @@ use parquet::arrow::ArrowWriter;
 use ravel_logseg::record::{attr_value_to_string, decode_stream_attrs};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_query::erasure::snapshot_pending_erasure_predicates;
+use ravel_query::erasure::{retain_unerased_log_records, snapshot_pending_erasure_predicates};
 use ravel_query::{LogQuery, LogSegmentFetcher};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantId, TimeRange};
@@ -232,7 +236,8 @@ pub async fn export_logs(
 
     let predicates = snapshot_pending_erasure_predicates(&snapshot);
     let erasure_predicates = predicates.len();
-    let query = LogQuery::new(start_ns, fetch_range_end_ns(end_ns)).with_erasure(predicates);
+    let query =
+        LogQuery::new(start_ns, fetch_range_end_ns(end_ns)).with_erasure(predicates.clone());
     let fetcher = LogSegmentFetcher::new(Arc::clone(&store));
     let accounting = QueryAccounting::new();
 
@@ -254,6 +259,8 @@ pub async fn export_logs(
         }
     }
     records.retain(|record| in_export_window(record.ts_ns, start_ns, end_ns));
+    retain_unerased_log_records(&mut records, &predicates)
+        .map_err(|err| anyhow::anyhow!("failed to decode a record's stream attributes: {err}"))?;
     records.sort_by_key(|record| record.ts_ns);
 
     let resource_by_stream = decode_resources(&records)?;

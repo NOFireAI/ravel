@@ -27,8 +27,10 @@
 //!   in-window samples of a matching series (ADR-0064 decision 1: "every
 //!   sample of every series whose labels satisfy the conjunction, intersected
 //!   with the time range if present").
-//! - **Logs**: matchers test a row's per-record attributes; the row's `ts_ns`
-//!   is the event time.
+//! - **Logs**: matchers test a row's merged resource + scope + record
+//!   attributes ([`retain_unerased_log_records`]); the row's `ts_ns` is the
+//!   event time. [`retain_log_records`], over per-record attributes alone, is
+//!   the fetcher-level pre-filter, not the whole rule.
 //! - **Spans**: matchers test a span's merged attributes; the span's start
 //!   timestamp is the event time.
 //!
@@ -49,7 +51,7 @@
 //! here treats an empty matcher set as matching **nothing**, never everything.
 
 use ravel_catalog::Snapshot;
-use ravel_logseg::{AttrValue, LogRecord};
+use ravel_logseg::{AttrValue, LogRecord, LogSegError};
 use ravel_segment::SeriesEntry;
 use ravel_types::LabelSet;
 
@@ -332,6 +334,11 @@ pub fn retain_series_entries(entries: &mut Vec<SeriesEntry>, predicates: &[Erasu
 /// any predicate's conjunction matches its per-record attributes and, when the
 /// predicate is windowed, its `ts_ns` falls in the window. A no-op when
 /// `predicates` is empty.
+///
+/// This is the fetcher-level pre-filter, which cannot see a subject named only
+/// in a resource or scope attribute. Every reader that hands log records to a
+/// caller must also run [`retain_unerased_log_records`], the authoritative
+/// exclusion over the merged view.
 pub fn retain_log_records(records: &mut Vec<LogRecord>, predicates: &[ErasurePredicate]) {
     if predicates.is_empty() {
         return;
@@ -341,6 +348,82 @@ pub fn retain_log_records(records: &mut Vec<LogRecord>, predicates: &[ErasurePre
             .iter()
             .any(|p| p.matches_log_attrs(&r.attrs) && (!p.has_window() || p.ts_in_window(r.ts_ns)))
     });
+}
+
+/// The top-level resource and scope attributes of a `stream_attrs` blob, as
+/// `(key, value)` pairs, resource entries first, then scope entries.
+///
+/// The scope name and version are positional fields, not key-value entries,
+/// so they never become synthetic `scope.name`/`scope.version` keys. A
+/// top-level entry whose value is a `Map` or `List` is decoded (so the walk
+/// stays in frame) but omitted: the merged view carries scalar resource and
+/// scope attributes only.
+pub fn stream_identity_attrs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+    let attrs = ravel_logseg::record::decode_stream_attrs(blob)?;
+    Ok(attrs
+        .resource
+        .into_iter()
+        .chain(attrs.scope_attrs)
+        .filter(|(_, v)| !matches!(v, AttrValue::Map(_) | AttrValue::List(_)))
+        .collect())
+}
+
+/// A log record's merged attribute view: its [`stream_identity_attrs`]
+/// overlaid with its per-record attributes, the record's value winning on a
+/// key collision. This is the view the SQL `attrs` column exposes, and the
+/// one [`retain_unerased_log_records`] matches erasure predicates against.
+pub fn merged_log_attrs(r: &LogRecord) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+    let mut merged = stream_identity_attrs(&r.stream_attrs)?;
+    for (k, v) in &r.attrs {
+        if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == k) {
+            slot.1 = v.clone();
+        } else {
+            merged.push((k.clone(), v.clone()));
+        }
+    }
+    Ok(merged)
+}
+
+/// The authoritative selective-erasure exclusion for log records (ADR-0064
+/// decision 2): drops every record erased by any predicate in `predicates`,
+/// matching against the merged resource + scope + record view
+/// ([`merged_log_attrs`]). A subject named only in a resource or scope
+/// attribute (`user_id`, `host.name`) is visible through that view yet
+/// invisible to [`retain_log_records`], so it is matched here.
+///
+/// A no-op when `predicates` is empty. A corrupt `stream_attrs` blob is an
+/// error, never a silently kept or dropped record.
+pub fn retain_unerased_log_records(
+    records: &mut Vec<LogRecord>,
+    predicates: &[ErasurePredicate],
+) -> Result<(), LogSegError> {
+    retain_unerased_log_records_by(records, predicates, |r| r)
+}
+
+/// [`retain_unerased_log_records`] over items that carry a [`LogRecord`]
+/// alongside other per-record state, `record` selecting the record to match,
+/// so the item survives or is dropped as one unit.
+pub fn retain_unerased_log_records_by<T>(
+    items: &mut Vec<T>,
+    predicates: &[ErasurePredicate],
+    record: impl Fn(&T) -> &LogRecord,
+) -> Result<(), LogSegError> {
+    if predicates.is_empty() {
+        return Ok(());
+    }
+    let mut survivors = Vec::with_capacity(items.len());
+    for item in std::mem::take(items) {
+        let r = record(&item);
+        let merged = merged_log_attrs(r)?;
+        let erased = predicates
+            .iter()
+            .any(|p| p.matches_log_attrs(&merged) && (!p.has_window() || p.ts_in_window(r.ts_ns)));
+        if !erased {
+            survivors.push(item);
+        }
+    }
+    *items = survivors;
+    Ok(())
 }
 
 /// The pending selective-erasure predicates attached to a resolved snapshot
@@ -832,6 +915,88 @@ mod tests {
         let mut rows = original.clone();
         retain_log_records(&mut rows, &[]);
         assert_eq!(rows.len(), original.len());
+    }
+
+    /// A log row whose stream carries `resource` and `scope` string attributes
+    /// under the scope `lib`/`1`, plus the per-record `attrs`.
+    fn stream_row(
+        ts: i64,
+        resource: &[(&str, &str)],
+        scope: &[(&str, &str)],
+        attrs: &[(&str, &str)],
+    ) -> LogRecord {
+        let to = |pairs: &[(&str, &str)]| -> Vec<(String, AttrValue)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), AttrValue::Str((*v).to_string())))
+                .collect()
+        };
+        LogRecord {
+            stream_attrs: ravel_logseg::stream_attrs_bytes(&to(resource), "lib", "1", &to(scope)),
+            ..log_row(ts, attrs)
+        }
+    }
+
+    #[test]
+    fn logs_merged_exclusion_matches_resource_and_scope_subjects() {
+        let mut rows = vec![
+            stream_row(1, &[("user_id", "u1")], &[], &[]),
+            stream_row(2, &[], &[("user_id", "u1")], &[]),
+            stream_row(3, &[], &[], &[("user_id", "u1")]),
+            stream_row(4, &[("user_id", "u2")], &[("user_id", "u2")], &[]),
+        ];
+        let predicates = [pred(&[("user_id", "u1")], 0, 0)];
+
+        let mut record_only = rows.clone();
+        retain_log_records(&mut record_only, &predicates);
+        assert_eq!(
+            record_only.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            vec![1, 2, 4],
+            "the fetcher-level filter sees record attributes alone"
+        );
+
+        retain_unerased_log_records(&mut rows, &predicates).expect("valid blobs");
+        assert_eq!(rows.iter().map(|r| r.ts_ns).collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn logs_merged_exclusion_lets_the_record_value_win_a_collision() {
+        let mut rows = vec![
+            stream_row(1, &[("user_id", "u1")], &[], &[("user_id", "u2")]),
+            stream_row(2, &[("user_id", "u2")], &[], &[("user_id", "u1")]),
+        ];
+        retain_unerased_log_records(&mut rows, &[pred(&[("user_id", "u1")], 0, 0)])
+            .expect("valid blobs");
+        assert_eq!(rows.iter().map(|r| r.ts_ns).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn logs_merged_exclusion_honours_the_window() {
+        let mut rows = vec![
+            stream_row(50, &[("user_id", "u1")], &[], &[]),
+            stream_row(150, &[("user_id", "u1")], &[], &[]),
+            stream_row(250, &[("user_id", "u1")], &[], &[]),
+        ];
+        retain_unerased_log_records(&mut rows, &[pred(&[("user_id", "u1")], 100, 200)])
+            .expect("valid blobs");
+        assert_eq!(
+            rows.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            vec![50, 250]
+        );
+    }
+
+    #[test]
+    fn logs_merged_exclusion_refuses_a_corrupt_stream_blob() {
+        let mut good = stream_row(1, &[("user_id", "u1")], &[], &[]);
+        good.stream_attrs.pop();
+        let mut rows = vec![good.clone()];
+        assert!(
+            retain_unerased_log_records(&mut rows, &[pred(&[("user_id", "u1")], 0, 0)]).is_err()
+        );
+        // With no predicate the blob is never decoded, as on every other path.
+        let mut rows = vec![good];
+        assert!(retain_unerased_log_records(&mut rows, &[]).is_ok());
+        assert_eq!(rows.len(), 1);
     }
 
     // ---- spans (reusable core; wired in ravel-sql) ----
