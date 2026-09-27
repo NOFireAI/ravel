@@ -6945,6 +6945,49 @@ mod tests {
     }
 
     #[test]
+    fn shipped_operator_deployment_probes_match_rendered_server_tier_probes() {
+        // ADR-1731 decision 5: the operator's own probe cadence equals what
+        // `probes_on` renders for the server tiers. Only the port differs:
+        // the manifest names the operator's `health` container port, so the
+        // rendered probe is compared with its port replaced by that name.
+        let dep = shipped_operator_deployment();
+        let container = pod_spec_of(&dep)
+            .containers
+            .iter()
+            .find(|c| c.name == "ravel-operator")
+            .expect("operator.yaml's Deployment has a ravel-operator container");
+        let health_port = container
+            .ports
+            .as_ref()
+            .and_then(|ports| ports.iter().find(|p| p.name.as_deref() == Some("health")))
+            .expect("operator.yaml's container declares a `health` port");
+        assert_eq!(
+            health_port.container_port, 8080,
+            "the `health` port matches the --listen-health default"
+        );
+
+        let (rendered_liveness, rendered_readiness) = probes_on(HTTP_PORT);
+        let on_health_port = |mut probe: Probe| {
+            if let Some(http_get) = probe.http_get.as_mut() {
+                http_get.port = IntOrString::String("health".to_string());
+            }
+            probe
+        };
+        assert_eq!(
+            container.liveness_probe.clone(),
+            Some(on_health_port(rendered_liveness)),
+            "deploy/k8s/operator/operator.yaml's livenessProbe must equal the server \
+             tiers' rendered liveness probe on the `health` port"
+        );
+        assert_eq!(
+            container.readiness_probe.clone(),
+            Some(on_health_port(rendered_readiness)),
+            "deploy/k8s/operator/operator.yaml's readinessProbe must equal the server \
+             tiers' rendered readiness probe on the `health` port"
+        );
+    }
+
+    #[test]
     fn each_tier_renders_a_pod_disruption_budget_and_anti_affinity() {
         // Deliverable 3 and 4, render-level. The PDB count equals the number of
         // tiers the reconcile renders a Deployment for, and every tier PodSpec
