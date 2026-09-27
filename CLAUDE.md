@@ -841,15 +841,18 @@ into a false green. When you write or edit any such script:
 Facts about the dispatched clone that executors have re-derived by trial
 and error, one wasted turn (or one lost result) at a time:
 
-- Two executor classes exist; tell them apart with `uname -m` and
-  `nproc`. The amd64 class (label `arch=amd64`, x86_64, 16 vCPU, 30 GB
-  RAM, about 350 GB free on the root volume) has a 1 GB tmpfs as HOME:
-  never write logs or `cargo install` output under HOME there; install
-  tools with `--root "$PWD/.dd-tools"`. The arm64 Pi class (aarch64, 4
-  cores, 8 GB RAM) needs `CARGO_BUILD_JOBS=2` on every cargo command and
-  on every script that runs cargo (`scripts/affected-tests.sh` takes no
-  jobs flag); use `CARGO_BUILD_JOBS=4` on amd64. See "Long commands and
-  the Bash tool" above for the `timeout` consequences.
+- Executor hardware varies: at least a 16 vCPU x86_64, an 8-core x86_64
+  with about 15 GB of RAM, and a 4-core aarch64 Pi with 8 GB. Read
+  `uname -m`, `nproc` and total memory instead of assuming a class. The
+  amd64 class (label `arch=amd64`, x86_64, 16 vCPU, 30 GB RAM, about
+  350 GB free on the root volume) has a 1 GB tmpfs as HOME: never write
+  logs or `cargo install` output under HOME there; install tools with
+  `--root "$PWD/.dd-tools"`. Set `CARGO_BUILD_JOBS` on every cargo command
+  and on every script that runs cargo (`scripts/affected-tests.sh` takes
+  no jobs flag) to `min(4, max(2, nproc / 4))`, or to 2 when memory is
+  11 GB or less: a higher value gets `ld` killed with signal 9 during a
+  cold link, which reads as a compiler error. See "Long commands and the
+  Bash tool" above for the `timeout` consequences.
 - Gate logs go to `.gate-logs/` inside the checkout. The tracked
   `.gitignore` covers `.gate-logs/` and `.dd-tools/` so the harness's
   commit-on-death cannot sweep them into a wip commit; the fleet-task-spec

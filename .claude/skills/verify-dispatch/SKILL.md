@@ -59,9 +59,9 @@ ambiguous or moved ref is a debugging trap later.
 Run `scripts/verify-dispatch-gates.sh --with-gates <ref> <scratchpad-dir>`,
 where `<scratchpad-dir>` is a path **outside this repo's working tree**
 (the session's scratchpad directory is exactly right for this; never a
-subdirectory of the repo itself: an untracked worktree left inside the
-repo blocks the next `fleet_dispatch` call, which refuses to run against
-a dirty primary checkout).
+subdirectory of the repo itself: a worktree left behind inside the repo
+shows up as untracked content in every session's `git status` on the
+shared checkout, unless its path happens to be ignored).
 
 The script always:
 

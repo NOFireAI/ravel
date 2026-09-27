@@ -8,7 +8,9 @@ description: Use when a fleet task finishes - inspect its result branch, open th
 Executor gate claims are not the gate. An executor can report fmt/clippy/
 test clean while its branch does not compile from a cold build, because an
 incremental build cache can mask an error (a stale-cache lifetime error is
-the known shape). Local gates on the merged tree are the only acceptance.
+the known shape). Acceptance is a cold-cache gate run on the result branch
+(the verify-dispatch skill) plus the PR's required checks, which the merge
+queue runs again on the branch rebased onto current main.
 
 **Run the verify-dispatch skill on the result branch before merging.** It
 runs the same gates this skill's procedure below runs, but in an isolated
@@ -128,10 +130,13 @@ scripts/fleet-result-merge.sh $TASK message.txt   # add -p CRATE to scope local 
 
 ## Recurring mechanical conflicts and gotchas
 
-- Run the script from a clean `main` checkout (or a fresh worktree of
-  `origin/main`), not from the worktree you reviewed or fixed the branch
-  in. The script's own guard exists because that mistake recurs; it
-  refuses any other HEAD.
+- Run the script from a fresh worktree detached at `origin/main`
+  (`git worktree add --detach <path> origin/main`), not from the primary
+  checkout and not from the worktree you reviewed or fixed the branch in.
+  The script checks out the cleaned branch in its current directory to
+  run the pre-flight gates, so running it in the primary checkout changes
+  that checkout. Its own guard refuses any HEAD other than `main` or
+  `origin/main`.
 - Append-heavy index files (`docs/adrs/README.md` is the usual one)
   conflict on almost every landing, because `main` moves with unrelated
   entries. This is not a premise conflict. Mechanical resolve: keep both

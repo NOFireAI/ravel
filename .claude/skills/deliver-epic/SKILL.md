@@ -176,21 +176,16 @@ the first ledger entry.
    dropped session with unrecorded task ids orphans running work, and
    hand-editing the body instead leaves the index empty, so the resume
    procedure's first command fails with exit 66.
-4. Watch with `scripts/fleet-watch.sh <watch-url> <interval>` in
-   background, one per task. Pass the bare command straight to the
-   background-execution tool with its own backgrounding flag (e.g. the
-   Bash tool's `run_in_background: true`) - do not wrap it in `nohup
-   ... &` yourself first. Backgrounding it manually returns control to
-   the shell the instant the `&` is issued, so the tool marks that call
-   "complete" right then, before the watch loop has run at all; every
-   later terminal-event notification is then silently lost, and nothing
-   tells you the wave finished. Watchers launched with
-   `nohup fleet-watch.sh ... & echo $!` show "completed" within a
-   second while `fleet_status` still reports
-   `running` for every task. Interval: 120s for tasks expected under an
-   hour, 300s otherwise. Never poll `fleet_status` in a foreground loop
-   and never rely on a single SSE connection - it drops within seconds
-   in this environment.
+4. Watch each task by arming `scripts/fleet-watch-loop.sh <watch-url>`
+   under a Monitor, one per task, as the whole Monitor command (see
+   CLAUDE.md, "Waiting on fleet tasks and PRs"). It relaunches the bounded
+   watcher across the harness's background-process cap and prints one
+   line when the watch is over. Do not run `fleet-watch.sh` with
+   `run_in_background` or `nohup ... &`: the harness kills a background
+   process after about 10 minutes, and every terminal event after that is
+   lost with nothing to say the watch died. Never poll `fleet_status` in
+   a foreground loop and never rely on a single SSE connection - it drops
+   within seconds in this environment.
 
 Failure playbook (in order of check):
 
@@ -358,8 +353,8 @@ Never re-dispatch a task whose result ref exists; merge it.
 
 ## Red flags - stop and reread the relevant stage
 
-- "Executor reported gates green" - not the gate; local gates on the
-  merged tree are.
+- "Executor reported gates green" - not the gate; the cold verify-dispatch
+  run and the PR's required checks are.
 - "Conflict, I'll just resolve it" - premise check first (stage 5.2).
 - "These two tasks touch the same file but different functions" - one
   task or different waves. No exceptions.
