@@ -231,6 +231,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The operator can point both probes at a dedicated health port with
+  `spec.probes.dedicatedHealthPort`** (ADR-1702, issue #1702). Set to true,
+  every gateway, query, and maintain container gains
+  `--listen-health 0.0.0.0:4316`, a container port named `health` on 4316,
+  and liveness and readiness probes on that port instead of 4318, with the
+  same paths, period, timeout, and failure threshold as before. The health
+  listener runs on its own thread, so a main runtime busy decoding segments
+  can no longer let a probe time out and have the kubelet restart the pod.
+  The same routes stay on 4318 as well, so anything already probing the HTTP
+  port is unaffected, and the `ravel-ingest-router` Deployment keeps its
+  probes on 8080. The field defaults to false in this release and flips to
+  true one release later; setting it needs a `ravel-server` image from this
+  release or newer, since an older server rejects the unknown flag and
+  restart-loops.
+
 - **`spans.links` decodes span links into a structured, filterable column**
   (issue #1710). Symmetric to `events`, it is built from the plain
   `attrs["_links_raw"]` protobuf blob at scan time, on every RSPAN version,
