@@ -480,9 +480,24 @@ pub async fn census_family(
             }
             census.saw_live_created(rec.created_unix_ns);
         }
+        let label = ShardReader::Census.label();
         for key in family.commit_keys {
-            let got = store.get(&key, GetRange::Full).await?;
-            let rec = record::decode(&got.data)?;
+            let got = store.get(&key, GetRange::Full).await.map_err(|err| {
+                let why = match err {
+                    StoreError::NotFound => {
+                        "no longer present (deleted after the listing)".to_string()
+                    }
+                    other => other.to_string(),
+                };
+                MaintainError::Invariant(format!(
+                    "commit record {key} could not be read during {label}: {why}"
+                ))
+            })?;
+            let rec = record::decode(&got.data).map_err(|err| {
+                MaintainError::Invariant(format!(
+                    "commit record {key} is corrupt during {label}: {err}"
+                ))
+            })?;
             if family.superseded_commits.contains(&key) {
                 *census
                     .superseded_l0

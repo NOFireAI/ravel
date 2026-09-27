@@ -2654,6 +2654,73 @@ mod tests {
         assert_eq!(three, (LISTS, GETS), "three floors: (LIST, GET)");
     }
 
+    /// `audit-versions` over a commit record whose stored bytes do not decode
+    /// fails naming that record's key, so the operator can find the object.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_an_undecodable_commit_record() {
+        use ravel_object_store::PutOptions;
+
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-corrupt-commit";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let commit =
+            publish_commit_created_at(&store, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = keys::commit_key_for_record(&commit).expect("commit key");
+        store
+            .put(
+                &key,
+                bytes::Bytes::from_static(b"not a commit record"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite the commit record with undecodable bytes");
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("an undecodable commit record must fail the audit");
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(
+            msg.contains("is corrupt during format census"),
+            "got: {msg}"
+        );
+    }
+
+    /// `audit-versions` over a commit record deleted between the LIST and its
+    /// GET fails naming that record's key and saying it is no longer present.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_a_commit_record_gone_after_the_list() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let mem = MemoryStore::new();
+        let tenant = "cli-audit-vanished-commit";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&mem, &tenant_hash).await;
+        let commit =
+            publish_commit_created_at(&mem, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = keys::commit_key_for_record(&commit).expect("commit key");
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(&key));
+        let store = Arc::new(FaultStore::new(mem, plan));
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("a commit record gone after the listing must fail the audit");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the record's GET must have been faulted exactly once"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(msg.contains("no longer present"), "got: {msg}");
+    }
+
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
     const ARN: &str = "arn:aws:kms:us-east-1:111122223333:key/aaaaaaaa";
 
