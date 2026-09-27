@@ -76,23 +76,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decoded as a valid record: a flip in `max_event_ts_ns` moved the segment out
   of a query's range and the answer came back short and error-free. The record
   layout is unchanged; the check moved to the transport that stores the bytes.
-  The S3 adapter asks S3 for the stored checksum with `x-amz-checksum-mode:
-  ENABLED` and recomputes `x-amz-checksum-crc64nvme` or `-crc32c` over the body
-  that arrived, failing a mismatch with the `Corrupted` error the contract
-  already reserves for one, so no reader needed a new error arm. Because the
-  request header must be signed and the HTTP connector that reads the response
-  header runs after signing, the header rides on the client's default headers
-  and is therefore attached to every request, where it is ignored. `MemoryStore`
-  keeps a CRC-32C beside each object and checks it the same way, so the
-  semantics oracle matches. A read with no verifiable checksum is served and
-  counted on the new `ravel_store_get_unverified_total`, never refused: that
-  covers an endpoint that returns no `x-amz-checksum-*` header, a digest this
-  adapter cannot recompute (SHA-256, or a composite multipart digest), and a
-  whole-object read of an object large enough to be split into bounded ranged
-  requests. Caller-issued ranged reads are outside the check entirely, since S3
-  returns the whole-object checksum and a slice cannot be compared against it;
-  they keep the format's own crc32c hierarchy as their check. Write-side upload
-  integrity still defaults to off and is unchanged here.
+  The S3 adapter asks the endpoint for the stored checksum with
+  `x-amz-checksum-mode: ENABLED` and recomputes `x-amz-checksum-crc64nvme` or
+  `-crc32c` over the body that arrived, failing a mismatch with the `Corrupted`
+  error the contract already reserves for one, so no reader needed a new error
+  arm. MinIO-style endpoints, RustFS included, return the checksum only on an
+  unranged GET, so the first request of a full-object read is unranged; its body
+  is read up to the per-request bound and the rest of the response dropped, so
+  the memory and timeout bound on one request is unchanged, and a commit record
+  read is still exactly one request. Because the request header must be signed
+  and the HTTP connector that reads the response header runs after signing, the
+  header rides on the client's default headers, which `object_store` signs onto
+  every request but a LIST; a LIST carries no such header.
+  `S3HttpConfig::request_stored_checksum` (default on) stops sending it; no
+  server flag sets it yet. `MemoryStore` keeps a CRC-32C beside each object and
+  checks it the same way, so the semantics oracle matches;
+  `MemoryStore::corrupt_stored_byte`, which makes that testable, sits behind a
+  new `test-support` crate feature that production builds leave off. A read
+  with no verifiable checksum is served and counted, never refused: that covers
+  an endpoint that returns no `x-amz-checksum-*` header, a digest this adapter
+  cannot recompute (SHA-256, or a composite multipart digest), and an object
+  larger than one request body. The count is
+  `StoreMetricsSnapshot::get_unverified` (and `S3Store::get_unverified`); it is
+  not yet exported at `/metrics`. Caller-issued ranged reads are outside the
+  check entirely, since the endpoint returns no checksum on them; they keep the
+  format's own crc32c hierarchy as their check. Write-side upload integrity
+  still defaults to off and is unchanged here.
 - **`ravel-cli export --signal logs` writes a tenant's stored logs back out to
   a Parquet file `ravel-cli load` reads in** (ADR-1751, issue #1712). The
   command takes the store and tenancy flags the other read commands take, plus

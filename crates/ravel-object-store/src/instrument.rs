@@ -52,16 +52,16 @@
 //!   so it holds there (issue #928). A backend that issues no HTTP requests (for example
 //!   [`crate::memory::MemoryStore`]) leaves `attempts` at zero: there is no bill
 //!   and nothing retried. Because a single logical read may fan a whole-object
-//!   `GetRange::Full` into several bounded ranged GETs, `attempts` can exceed
-//!   `calls` for `get` even with no retry at all; each ranged request is a real
-//!   billed request. `attempts` for `put` likewise counts every request a
+//!   `GetRange::Full` into an unranged GET cut at the per-request bound plus
+//!   ranged GETs for the rest, `attempts` can exceed `calls` for `get` even
+//!   with no retry at all; each of those requests is a real billed request. `attempts` for `put` likewise counts every request a
 //!   multipart upload issues (create, each part, complete), not one per logical
 //!   `put`.
 //! - `get_unverified` (`ravel_store_get_unverified_total`) is a store-wide total,
 //!   not a per-op block: it counts full-object reads the S3 adapter served
 //!   without checking the body against a stored checksum, because the response
 //!   carried no `x-amz-checksum-*` header, carried one this adapter cannot
-//!   recompute, or arrived as several ranged responses none of which is the
+//!   recompute, or arrived as several responses none of which is the
 //!   whole object (ADR-1696 decision 3). Like `attempts`, it is recorded by the
 //!   adapter's HTTP connector's owner rather than by this decorator, through
 //!   [`StoreMetrics::record_get_unverified`]. Zero for a backend that is not the
@@ -452,8 +452,7 @@ impl StoreMetrics {
     /// stored checksum (`ravel_store_get_unverified_total`, ADR-1696
     /// decision 3). The S3 adapter records this once per logical full-object
     /// `get`, not once per HTTP request, so a large object split into several
-    /// bounded ranged requests counts one unverified read rather than one per
-    /// chunk. It touches no other counter.
+    /// bounded requests counts one unverified read rather than one per chunk. It touches no other counter.
     pub fn record_get_unverified(&self) {
         self.get_unverified.fetch_add(1, Ordering::Relaxed);
     }

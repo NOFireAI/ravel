@@ -75,13 +75,18 @@
 //!   checksum (`x-amz-checksum-mode: ENABLED`) must be signed, and the
 //!   connector runs after signing, so it rides on `ClientOptions`' default
 //!   headers instead --- which means it is attached to every request, not only
-//!   to GETs (see [`client_options`]). And [`GetRange::Full`] is served as
-//!   *bounded* ranged requests ([`S3Store::get_whole_object`]), so an object
-//!   above [`S3HttpConfig::max_request_body_bytes`] arrives in pieces that no
-//!   whole-object checksum covers: that read is counted on
-//!   [`S3Store::get_unverified`] rather than verified. Every commit-family
-//!   record is orders of magnitude below that bound, so it is always one
-//!   request and always verifiable.
+//!   to GETs (see [`client_options`]), unless
+//!   [`S3HttpConfig::request_stored_checksum`] turns it off. And an endpoint
+//!   returns the stored checksum only on an *unranged* GET (MinIO and RustFS
+//!   drop it whenever a `Range` header is present), so [`GetRange::Full`]
+//!   starts with one unranged request whose body is read up to
+//!   [`S3HttpConfig::max_request_body_bytes`] ([`S3Store::get_whole_object`]).
+//!   An object that fits arrives in that one response with its checksum and
+//!   is verified; a larger one is cut there, finished with ranged requests,
+//!   and counted on [`S3Store::get_unverified`] rather than verified. Every
+//!   commit-family record is orders of magnitude below that bound, so it is
+//!   always one request and verifiable wherever the endpoint stored a
+//!   checksum this adapter can recompute.
 //! - **Multipart completion is unconditional.** `object_store` 0.14's
 //!   `put_multipart_opts` takes a `PutMultipartOptions` carrying tags,
 //!   attributes, and extensions --- no `PutMode` --- so no
@@ -657,11 +662,12 @@ pub struct S3HttpConfig {
     /// assumed.** A whole-object read is the only request whose size is set by
     /// the data instead of by this crate: `max_l1_part_bytes` defaults to
     /// 256 MiB, 32x an 8 MiB part, so a fixed timeout sized for a part cannot
-    /// also cover an unranged GET. [`S3Store::get`] therefore never issues one:
-    /// [`GetRange::Full`] is served as ranged requests of at most
-    /// [`S3HttpConfig::max_request_body_bytes`] each, which is derived from
-    /// *this field* — so the criterion holds for whatever value is configured
-    /// here, not only for the default.
+    /// also cover an unranged GET read to its end. [`S3Store::get`] therefore
+    /// never reads one to its end: [`GetRange::Full`] reads at most
+    /// [`S3HttpConfig::max_request_body_bytes`] from its one unranged request,
+    /// dropping the rest, and serves any remainder as ranged requests of at
+    /// most that size, which is derived from *this field* — so the criterion
+    /// holds for whatever value is configured here, not only for the default.
     ///
     /// The arithmetic, for the largest request rather than the smallest: at the
     /// default 20 s, [`REQUEST_OVERHEAD_ALLOWANCE`] takes 6 s for connect, TLS,
@@ -719,6 +725,14 @@ pub struct S3HttpConfig {
     /// [`S3Store::builder`], and [`S3Config`] cannot grow fields (struct-literal
     /// built out of this crate's edit scope).
     pub upload_integrity: UploadIntegrity,
+    /// Whether every request carries `x-amz-checksum-mode: ENABLED`, which asks
+    /// the endpoint to return the checksum it stored at upload so a full-object
+    /// read can be verified against it (ADR-1696 decision 2 and its 2026-09-27
+    /// amendment). Default `true`. `false` sends no such header: an endpoint
+    /// then returns no stored checksum, and every full-object read is served
+    /// and counted on [`S3Store::get_unverified`] instead of verified. It is
+    /// the switch for an endpoint that rejects the header outright.
+    pub request_stored_checksum: bool,
 }
 
 impl S3HttpConfig {
@@ -728,9 +742,10 @@ impl S3HttpConfig {
     /// time-to-first-byte.
     ///
     /// This is what makes the timeout's criterion something the code satisfies
-    /// rather than something the doc asserts: [`S3Store::get`] splits a
-    /// [`GetRange::Full`] read into ranged requests of at most this many bytes,
-    /// so no request on the wire is larger than the timeout can carry. Capped
+    /// rather than something the doc asserts: [`S3Store::get`] reads at most
+    /// this many bytes from the unranged first request of a [`GetRange::Full`]
+    /// read and splits the rest into ranged requests of at most this many
+    /// bytes, so no request reads more than the timeout can carry. Capped
     /// at [`MULTIPART_PART_SIZE`] so the read and write paths share one largest
     /// request, and floored at [`MIN_REQUEST_BODY_BYTES`] so an extremely tight
     /// configured timeout degrades into more requests rather than into
@@ -760,6 +775,7 @@ impl Default for S3HttpConfig {
             http2_keep_alive_interval: Duration::from_secs(10),
             http2_keep_alive_timeout: Duration::from_secs(10),
             upload_integrity: UploadIntegrity::Off,
+            request_stored_checksum: true,
         }
     }
 }
@@ -793,14 +809,22 @@ impl Default for S3HttpConfig {
 /// headers and is where the verification itself lives --- cannot add it: a
 /// header inserted there would be unsigned and every request would fail
 /// `SignatureDoesNotMatch`. The hook is whole-client, so the header also rides
-/// on PUT, LIST, and DELETE, where it is meaningless and ignored; that is the
-/// cost of the only signed placement available.
+/// on PUT, DELETE and the multipart requests, where it is meaningless and
+/// ignored; that is the cost of the only signed placement available. LIST is
+/// the one path `object_store` does not sign it onto, and there it is not sent
+/// at all: the connector builds its reqwest client without default headers
+/// ([`connector`]), since reqwest would otherwise add it after signing.
+///
+/// [`S3HttpConfig::request_stored_checksum`] set to `false` leaves the header
+/// out entirely.
 fn client_options(http: &S3HttpConfig) -> ClientOptions {
     let mut default_headers = HeaderMap::new();
-    default_headers.insert(
-        HeaderName::from_static(CHECKSUM_MODE_HEADER),
-        HeaderValue::from_static(CHECKSUM_MODE_ENABLED),
-    );
+    if http.request_stored_checksum {
+        default_headers.insert(
+            HeaderName::from_static(CHECKSUM_MODE_HEADER),
+            HeaderValue::from_static(CHECKSUM_MODE_ENABLED),
+        );
+    }
     ClientOptions::new()
         .with_timeout(http.request_timeout)
         .with_connect_timeout(http.connect_timeout)
@@ -1723,11 +1747,18 @@ impl S3Store {
     /// from it. `if_match` rides along as an `If-Match` precondition, used by
     /// [`S3Store::get_whole_object`] to pin every request of a split read to
     /// one version of the object.
+    ///
+    /// `body_limit` caps how many body bytes are read: once the response has
+    /// delivered that many and more remain, the rest of the body is dropped
+    /// unread and the returned chunk holds exactly `body_limit` bytes. `None`
+    /// reads the whole body, which is only safe for a request whose size this
+    /// adapter or its caller already bounded with a range.
     async fn get_one(
         &self,
         key: &str,
         range: Option<OsGetRange>,
         if_match: Option<String>,
+        body_limit: Option<usize>,
     ) -> Result<GetChunk, StoreError> {
         // The observation slot is scoped to this one request, so the
         // concurrently-polled ranged GETs of a split whole-object read do not
@@ -1751,7 +1782,10 @@ impl S3Store {
         // `Content-Range`, not the length of the slice returned, which is what
         // makes one bounded request enough to learn how many more to issue.
         let total_size = result.meta.size;
-        let data = result.bytes().await.map_err(map_error_common)?;
+        let data = match body_limit {
+            None => result.bytes().await.map_err(map_error_common)?,
+            Some(limit) => read_body_capped(result, total_size, limit).await?,
+        };
         Ok(GetChunk {
             data,
             etag,
@@ -1782,23 +1816,39 @@ impl S3Store {
     }
 
     /// [`GetRange::Full`] as bounded requests: complete-object semantics for
-    /// the caller, no single request larger than
-    /// [`S3HttpConfig::max_request_body_bytes`] on the wire.
+    /// the caller, no single request reading more than
+    /// [`S3HttpConfig::max_request_body_bytes`].
     ///
     /// An unranged GET is the only request this adapter issues whose size the
-    /// data decides rather than this crate, so it is the one that can outgrow
-    /// [`S3HttpConfig::request_timeout`] — a 256 MiB L1 compaction part cannot
-    /// finish inside 20 s at the floor rate the timeout is sized against, and
-    /// retrying it only re-runs a request that never fits. Splitting it makes
-    /// every request one the timeout can carry.
+    /// data decides rather than this crate, so read to its end it is the one
+    /// that can outgrow [`S3HttpConfig::request_timeout`] — a 256 MiB L1
+    /// compaction part cannot finish inside 20 s at the floor rate the timeout
+    /// is sized against, and retrying it only re-runs a request that never
+    /// fits. Cutting it at the bound and splitting the rest makes every request
+    /// one the timeout can carry.
+    ///
+    /// **The first request is unranged.** An endpoint returns the stored
+    /// checksum only on a response to an unranged GET: MinIO, and RustFS which
+    /// derives from it, drop `x-amz-checksum-*` whenever a `Range` header is
+    /// present, whatever the range covers. So the first request asks for the
+    /// whole object and its body is read through [`read_body_capped`], which
+    /// stops after [`S3HttpConfig::max_request_body_bytes`] and drops the rest
+    /// of the response unread. The bound on what one request moves and on what
+    /// this call buffers from it is therefore the same as a ranged first
+    /// request's; what differs is that an object that fits (every commit
+    /// record, footer and index object) arrives in one response that carries
+    /// its checksum, and is verified.
     ///
     /// **Cost.** An object at or below the chunk size is exactly one request,
-    /// as before; above it, `ceil(size / chunk)` requests, up to
-    /// [`WHOLE_OBJECT_GET_CONCURRENCY`] of them in flight. Wire bytes are
-    /// unchanged (the ranges partition the object exactly and none overlap)
-    /// apart from one extra set of response headers per additional request;
-    /// neither figure counts `object_store`'s internal retries, which sit
-    /// inside each request.
+    /// with no HEAD before it; above it, `ceil(size / chunk)` requests, the
+    /// first being the truncated unranged one and the rest ranged, up to
+    /// [`WHOLE_OBJECT_GET_CONCURRENCY`] of them in flight. Wire bytes are the
+    /// object's size apart from one extra set of response headers per
+    /// additional request and whatever the endpoint had already sent of the
+    /// abandoned first body before the connection was dropped; neither figure
+    /// counts `object_store`'s internal retries, which sit inside each request.
+    /// Dropping an unread body closes that connection rather than returning it
+    /// to the pool, which only an object above the chunk size pays.
     ///
     /// **One version, or an error.** Every request after the first carries the
     /// first's ETag as an `If-Match`, so an object overwritten mid-read fails
@@ -1807,31 +1857,18 @@ impl S3Store {
     /// are small enough to take the single-request path anyway.
     async fn get_whole_object(&self, key: &str) -> Result<GetOutcome, StoreError> {
         let chunk = self.max_get_chunk as u64;
-        let first = match self
-            .get_one(key, Some(OsGetRange::Bounded(0..chunk)), None)
-            .await
-        {
-            Ok(first) => first,
-            // A zero-byte object has no satisfiable range, so a ranged request
-            // for one is a 416. That is the single whole-object read the
-            // bounded form cannot express; re-issue it unranged, where an empty
-            // body is a legal 200. `GetRange::Full` carries no caller range, so
-            // an unsatisfiable range here can only mean an empty object.
-            Err(StoreError::InvalidRange(_)) => {
-                let whole = self.get_one(key, None, None).await?;
-                self.verify_full_read(key, Some(&whole))?;
-                return Ok(GetOutcome {
-                    data: whole.data,
-                    etag: Etag(whole.etag.clone()),
-                    version: Version(whole.etag),
-                    total_size: whole.total_size,
-                });
-            }
-            Err(e) => return Err(e),
-        };
+        let first = self
+            .get_one(key, None, None, Some(self.max_get_chunk))
+            .await?;
 
         let total_size = first.total_size;
-        if first.data.len() as u64 >= total_size {
+        if first.data.len() as u64 > total_size {
+            return Err(StoreError::Transient(format!(
+                "get of {key}: response carried {} bytes of a {total_size}-byte object",
+                first.data.len()
+            )));
+        }
+        if first.data.len() as u64 == total_size {
             // One request carried the whole object, so the stored whole-object
             // checksum applies to exactly these bytes.
             self.verify_full_read(key, Some(&first))?;
@@ -1864,7 +1901,12 @@ impl S3Store {
         let etag = first.etag.clone();
         {
             let mut inflight = futures::stream::iter(ranges.into_iter().map(|range| {
-                self.get_one(key, Some(OsGetRange::Bounded(range)), Some(etag.clone()))
+                self.get_one(
+                    key,
+                    Some(OsGetRange::Bounded(range)),
+                    Some(etag.clone()),
+                    None,
+                )
             }))
             .buffered(WHOLE_OBJECT_GET_CONCURRENCY);
             while let Some(piece) = inflight.next().await {
@@ -1887,10 +1929,11 @@ impl S3Store {
                 data.len()
             )));
         }
-        // Assembled from several ranged responses: S3 returns the whole-object
-        // checksum, which no single response's body covers, so this read is
-        // unverified and says so (ADR-1696 decisions 3 and 4). It is counted
-        // once for the logical read, not once per chunk.
+        // Assembled from a truncated first response and ranged ones: no single
+        // body covers the object the stored checksum was computed over, and the
+        // ranged responses carry none, so this read is unverified and says so
+        // (ADR-1696 decision 3 and its amendment). It is counted once for the
+        // logical read, not once per chunk.
         self.verify_full_read(key, None)?;
         Ok(GetOutcome {
             data: data.freeze(),
@@ -1899,6 +1942,30 @@ impl S3Store {
             total_size,
         })
     }
+}
+
+/// Read at most `limit` bytes of `result`'s body. An object larger than that is
+/// cut at exactly `limit` bytes and the rest of the response is dropped unread,
+/// so nothing past the bound is ever buffered here. A body that ends first is
+/// returned whole.
+async fn read_body_capped(
+    result: object_store::GetResult,
+    total_size: u64,
+    limit: usize,
+) -> Result<Bytes, StoreError> {
+    let expected = usize::try_from(total_size).unwrap_or(usize::MAX);
+    let mut data = BytesMut::with_capacity(expected.min(limit));
+    let mut stream = result.into_stream();
+    while let Some(frame) = stream.next().await {
+        let frame = frame.map_err(map_error_common)?;
+        let room = limit.saturating_sub(data.len());
+        if frame.len() > room {
+            data.extend_from_slice(&frame[..room]);
+            break;
+        }
+        data.extend_from_slice(&frame);
+    }
+    Ok(data.freeze())
 }
 
 /// One GET response reduced to what [`ObjectStoreBackend::get`] needs:
@@ -2034,7 +2101,7 @@ impl ObjectStoreBackend for S3Store {
                 }
                 GetRange::Suffix(n) => Some(OsGetRange::Suffix(n)),
             };
-            let chunk = self.get_one(key, os_range, None).await?;
+            let chunk = self.get_one(key, os_range, None, None).await?;
             Ok(GetOutcome {
                 data: chunk.data,
                 etag: Etag(chunk.etag.clone()),

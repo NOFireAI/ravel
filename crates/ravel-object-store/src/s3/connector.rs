@@ -61,6 +61,7 @@ use object_store::client::{
     HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService, ReqwestConnector,
 };
 use parking_lot::Mutex;
+use reqwest::header::HeaderMap;
 
 use crate::instrument::{StoreMetrics, StoreOp};
 use crate::s3::checksum::{self, ObservedChecksum};
@@ -127,8 +128,16 @@ impl S3HttpConnector {
 }
 
 impl HttpConnector for S3HttpConnector {
+    /// Builds the reqwest client with no default headers. `object_store` puts
+    /// `ClientOptions`' default headers on a request itself, before SigV4 signs
+    /// it, on every path except LIST; a reqwest client built from the same
+    /// options would add them again after signing, which leaves
+    /// `x-amz-checksum-mode` unsigned on every LIST, and an S3 endpoint refuses
+    /// a request carrying an unsigned `x-amz-*` header. Dropping them here
+    /// leaves only the signed copies.
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        let inner = self.inner.connect(options)?;
+        let unsigned_defaults_removed = options.clone().with_default_headers(HeaderMap::new());
+        let inner = self.inner.connect(&unsigned_defaults_removed)?;
         Ok(HttpClient::new(S3HttpService {
             metrics: Arc::clone(&self.metrics),
             inner,

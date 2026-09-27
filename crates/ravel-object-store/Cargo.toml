@@ -36,7 +36,17 @@ serde_json = { workspace = true }
 # crates resolve the same reqwest.
 reqwest = { workspace = true }
 
+[features]
+# Test-only hooks on the reference backends, off in every production build:
+# `MemoryStore::corrupt_stored_byte` (ADR-1696 decision 5). Crates whose tests
+# use them enable this in their dev-dependencies.
+test-support = []
+
 [dev-dependencies]
+# This crate's own integration tests (tests/contract.rs) use the test-support
+# hooks; a self dev-dependency is how an integration test binary enables a
+# feature of the crate it tests.
+ravel-object-store = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
 # Test-only fake S3 HTTP endpoint (tests/s3_http_faults.rs): drives S3Store
 # through its endpoint override against a server that returns 503/429/SlowDown,

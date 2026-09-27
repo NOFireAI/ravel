@@ -1537,6 +1537,7 @@ async fn rustfs_contract() {
         auth: Default::default(),
         instance_metadata_endpoint: None,
     };
+    let checksum_config = config.clone();
     // A small page size, like `memory_store_paged_contract`, so the
     // pagination assertion exercises `list_with_offset` continuation
     // against the real bucket instead of fitting in a single page.
@@ -1559,6 +1560,11 @@ async fn rustfs_contract() {
     assert_multipart_composite_etag(&store, &format!("{root}/multipart-etag/")).await;
     assert_put_above_threshold_uses_multipart(&store, &format!("{root}/multipart-threshold/"))
         .await;
+    assert_full_read_is_verified_on_a_real_endpoint(
+        checksum_config,
+        &format!("{root}/read-checksum/"),
+    )
+    .await;
 
     let leftovers = list_all(&store, &format!("{root}/"))
         .await
@@ -1566,6 +1572,54 @@ async fn rustfs_contract() {
     for meta in leftovers {
         let _ = store.delete(&meta.key).await;
     }
+}
+
+/// ADR-1696 read-side verification against a real endpoint, which is the only
+/// place the fake-endpoint tests cannot speak for: whether the endpoint stores
+/// the checksum a `Crc64Nvme` PUT attached and returns it on a full-object GET.
+/// A `get_unverified` delta of exactly 0 means the read took the verified path;
+/// an endpoint that dropped the header, or an adapter that sent the first
+/// request ranged (MinIO-derived endpoints return no checksum then), moves it
+/// to 1. A caller-issued ranged read of the same object is served and does not
+/// count either way.
+async fn assert_full_read_is_verified_on_a_real_endpoint(config: S3Config, prefix: &str) {
+    let http = S3HttpConfig {
+        upload_integrity: UploadIntegrity::Crc64Nvme,
+        ..Default::default()
+    };
+    let store = S3Store::with_http_config(config, http)
+        .expect("an S3Store with Crc64Nvme upload integrity must build");
+    let key = format!("{prefix}record");
+    // Commit-record sized: one request, far below the read chunk bound.
+    let payload = Bytes::from((0..200u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    store
+        .put(&key, payload.clone(), PutOptions::create_if_absent())
+        .await
+        .expect("a Crc64Nvme put must be accepted by the endpoint");
+
+    let before = store.get_unverified();
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("a full-object read of an intact object must be served");
+    assert_eq!(got.data, payload, "the full read returns the stored bytes");
+    assert_eq!(
+        store.get_unverified() - before,
+        0,
+        "the full read must be verified against the stored crc64nvme, not \
+         counted unverified"
+    );
+
+    let ranged = store
+        .get(&key, GetRange::Range(16, 48))
+        .await
+        .expect("a caller-issued ranged read must be served");
+    assert_eq!(&ranged.data[..], &payload[16..48], "the ranged bytes");
+    assert_eq!(
+        store.get_unverified() - before,
+        0,
+        "a caller-issued ranged read is outside the check and not counted"
+    );
 }
 
 /// Real floci conformance test: the capability gate ADR-0034 decision 8 makes

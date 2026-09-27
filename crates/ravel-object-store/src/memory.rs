@@ -24,8 +24,8 @@ struct Entry {
     /// Recorded on every write, not only when the caller supplied a
     /// [`UploadChecksum`], because the real store computes one either way; a
     /// full-object [`ObjectStoreBackend::get`] checks the bytes against it.
-    /// [`MemoryStore::corrupt_stored_byte`] is the only thing that can make the
-    /// two disagree.
+    /// `MemoryStore::corrupt_stored_byte` (feature `test-support`) is the only
+    /// thing that can make the two disagree.
     stored_checksum: u32,
 }
 
@@ -88,6 +88,10 @@ impl MemoryStore {
     /// Returns [`StoreError::NotFound`] for an absent key and
     /// [`StoreError::InvalidRange`] for an offset past the object's end or a
     /// bit index above 7.
+    ///
+    /// Only compiled with the `test-support` feature, which no production
+    /// build enables.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn corrupt_stored_byte(
         &self,
         key: &str,
