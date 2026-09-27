@@ -11162,6 +11162,30 @@ mod tests {
         );
     }
 
+    /// ADR-1737 decision 1: the floor ships disabled, and an operator who sets
+    /// it gets the byte count they typed. The default is asserted against
+    /// `IngestConfig::default().idle_flush_byte_floor` rather than against a
+    /// restated `0`, so the flag and the library default cannot drift apart
+    /// and leave a stock server holding buffers for an hour.
+    #[test]
+    fn idle_flush_byte_floor_defaults_to_the_disabled_library_value() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.idle_flush_byte_floor as usize,
+            ravel_ingest::IngestConfig::default().idle_flush_byte_floor,
+            "--idle-flush-byte-floor must default to IngestConfig's own value"
+        );
+        assert_eq!(
+            cli.idle_flush_byte_floor, 0,
+            "the shipped default must be 0 (the sub-floor hold disabled), since \
+             a non-zero floor widens the buffered-mode loss window"
+        );
+
+        let set = Cli::try_parse_from(["ravel-server", "--idle-flush-byte-floor", "8192"])
+            .expect("an explicit floor parses");
+        assert_eq!(set.idle_flush_byte_floor, 8192);
+    }
+
     #[test]
     fn limits_file_tenant_override_parses() {
         let text = r#"

@@ -7762,6 +7762,91 @@ mod tests {
         );
     }
 
+    /// ADR-1737 decision 6: the sub-floor hold's counter renders under the
+    /// ingest family for every signal, carrying the family's `{mode, signal}`
+    /// labels and a `counter` TYPE, with one header and one sample per signal.
+    ///
+    /// The three values are distinct (11, 5, 2) and come from the ingest
+    /// crate's own snapshots rather than being set on the rendered struct, so
+    /// a conversion that dropped the field, or fed one pipeline's figure to
+    /// another's sample, fails here instead of passing on a shared zero.
+    /// Unlike the adaptive-age family above this one is NOT metrics-only: the
+    /// floor is read by all three shard actors, so the logs and spans samples
+    /// must be present, which is why they carry real nonzero figures here.
+    #[test]
+    fn floor_age_flush_counter_renders_for_every_signal() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                flushes_by_age_floor: 11,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                flushes_by_age_floor: 5,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
+                flushes_by_age_floor: 2,
+                ..Default::default()
+            }),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            true,
+        );
+
+        assert_eq!(
+            body.matches("# TYPE ravel_ingest_flushes_by_age_floor_total counter")
+                .count(),
+            1,
+            "the floor family must declare exactly one counter header:\n{body}"
+        );
+        for (signal, value) in [("metrics", 11), ("logs", 5), ("spans", 2)] {
+            let sample = format!(
+                "ravel_ingest_flushes_by_age_floor_total{{mode=\"gateway\",signal=\"{signal}\"}} \
+                 {value}\n"
+            );
+            assert_eq!(
+                body.matches(&sample).count(),
+                1,
+                "the {signal} pipeline must render {sample:?} exactly once:\n{body}"
+            );
+        }
+        assert_eq!(
+            body.matches("ravel_ingest_flushes_by_age_floor_total{")
+                .count(),
+            3,
+            "the floor family must carry one sample per signal and no other \
+             label set:\n{body}"
+        );
+    }
+
     /// The values travel from the ingest crate's counters to the rendered text:
     /// a constructor that drops any of the three fields while the source
     /// snapshot carries them fails here, not in the render test above. The
@@ -11515,6 +11600,213 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             .await
             .expect("deferred write task")
             .expect("deferred write acks once the cap clears");
+        router.flush_all().await;
+    }
+
+    /// ADR-1737 acceptance test: a flush the sub-floor hold really opened
+    /// reaches the rendered `/metrics` body, moving
+    /// `ravel_ingest_flushes_by_age_floor_total` from 0 to exactly 1.
+    ///
+    /// Every other test of this family builds the snapshot by hand, so all of
+    /// them would keep passing if the shard actor stopped counting floor
+    /// flushes: they pin the renderer, not the path. This one drives a live
+    /// `IngestRouter` at the shipped cadence with only the floor set, writes
+    /// one buffered row far below it, and advances an injected clock past the
+    /// idle clock first and then past the hold.
+    ///
+    /// The pair of final figures is what discriminates: `flushes_by_age` must
+    /// still be 0. Had the buffer taken `max_flush_delay_idle` instead of the
+    /// hold, it would have flushed at 41 s and this body would carry
+    /// `flushes_by_age` 1 with the floor counter at 0. An operator sizes the
+    /// buffered-mode loss window they accepted from this counter, so a flush
+    /// counted under the wrong trigger is the defect, not merely a missing
+    /// sample.
+    #[tokio::test]
+    async fn a_real_sub_floor_hold_flush_renders_on_the_metrics_body() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::time::Duration;
+
+        use ravel_ingest::{
+            Clock, IngestByteBudget, IngestByteBudgetLimit, IngestConfig, IngestRouter, WriteMode,
+        };
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_otlp::normalize::NormalizedPoint;
+        use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+        use tokio::sync::watch;
+
+        struct TestClock {
+            now_ns: AtomicI64,
+            wake_tx: watch::Sender<()>,
+        }
+
+        impl Clock for TestClock {
+            fn now_ns(&self) -> i64 {
+                self.now_ns.load(Ordering::SeqCst)
+            }
+
+            fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                let deadline = self
+                    .now_ns()
+                    .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+                let mut rx = self.wake_tx.subscribe();
+                Box::pin(async move {
+                    loop {
+                        if self.now_ns() >= deadline {
+                            return;
+                        }
+                        if rx.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                })
+            }
+        }
+
+        let (wake_tx, _rx) = watch::channel(());
+        let clock = Arc::new(TestClock {
+            now_ns: AtomicI64::new(1_700_000_000_000_000_000),
+            wake_tx,
+        });
+        let advance = |ns: i64| {
+            clock.now_ns.fetch_add(ns, Ordering::SeqCst);
+            let _ = clock.wake_tx.send(());
+        };
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        // Everything but the floor is the shipped cadence, so the hold this
+        // exercises is the shipped `max_flush_lifetime` less one `flush_tick`,
+        // not a figure this test chose. 64 KiB is below the 256 KiB
+        // `min_flush_bytes` default, which `IngestConfig::validate` requires.
+        const FLOOR_BYTES: usize = 64 * 1024;
+        let config = IngestConfig {
+            shard_count: 1,
+            idle_flush_byte_floor: FLOOR_BYTES,
+            ..IngestConfig::default()
+        };
+        config
+            .validate()
+            .expect("a floor below min_flush_bytes is a legal configuration");
+        let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
+        // The shipped hold is `max_flush_lifetime` less one `flush_tick`, and
+        // the age check itself runs on a tick, so the worst buffer age at
+        // flush open is exactly `max_flush_lifetime`. Advancing that far is
+        // enough, and it is the figure the loss window is stated as.
+        let worst_age_ns = config.max_flush_lifetime.as_nanos() as i64;
+        let router = Arc::new(
+            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
+                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let acme = TenantId::new("acme");
+
+        let labels = LabelSet::new(vec![
+            Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: "cpu_usage".to_string(),
+            },
+            Label {
+                name: "host".to_string(),
+                value: "h0".to_string(),
+            },
+        ])
+        .expect("distinct label names");
+        let series_id = SeriesId::compute(&acme, "cpu_usage", &labels).expect("series id");
+        let point = NormalizedPoint {
+            series_id,
+            labels: Arc::new(labels),
+            sample: Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            },
+            is_monotonic_sum: false,
+        };
+        // One point is tens of object bytes, orders below the floor, so the
+        // buffer stays in the sub-floor tier for the whole hold.
+        router
+            .write(
+                acme.clone(),
+                vec![point],
+                WriteMode::Buffered,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("a buffered write acks at enqueue");
+
+        // Cooperative polling only: every probe reads a counter the actor
+        // publishes, so no wall-clock wait decides anything. The real-clock
+        // bound only turns a regression that never reaches the state into a
+        // failure instead of a hang.
+        async fn until(mut probe: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !probe() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the probed ingest state was not reached within 30s");
+        }
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+
+        let render_body = || {
+            let mut body = String::new();
+            render_ingest_family(
+                &mut body,
+                Mode::Gateway,
+                &[IngestPipelineSnapshot::from_metrics(
+                    router.metrics().snapshot(),
+                )],
+            );
+            body
+        };
+        let before = render_body();
+        assert_eq!(
+            before
+                .matches(
+                    "ravel_ingest_flushes_by_age_floor_total{mode=\"gateway\",signal=\"metrics\"} 0"
+                )
+                .count(),
+            1,
+            "the floor counter must render at 0 before any flush opens:\n{before}"
+        );
+
+        // Past the idle clock, which this buffer must NOT be using.
+        advance(idle_ns + 1_000_000_000);
+        // Past the hold itself, which is what must open the flush.
+        advance(worst_age_ns - idle_ns - 1_000_000_000);
+        until(|| {
+            let snapshot = router.metrics().snapshot();
+            snapshot.flushes_by_age_floor + snapshot.flushes_by_age + snapshot.flushes_by_size >= 1
+        })
+        .await;
+
+        let snapshot = router.metrics().snapshot();
+        assert_eq!(
+            snapshot.flushes_by_age_floor, 1,
+            "the sub-floor hold must have opened exactly one flush"
+        );
+        assert_eq!(
+            snapshot.flushes_by_age, 0,
+            "a buffer under the floor must not flush on max_flush_delay_idle"
+        );
+        let after = render_body();
+        assert_eq!(
+            after
+                .matches(
+                    "ravel_ingest_flushes_by_age_floor_total{mode=\"gateway\",signal=\"metrics\"} 1"
+                )
+                .count(),
+            1,
+            "the floor flush must move the rendered counter to exactly 1:\n{after}"
+        );
+        assert_eq!(
+            after
+                .matches("ravel_ingest_flushes_by_age_total{mode=\"gateway\",signal=\"metrics\"} 0")
+                .count(),
+            1,
+            "the idle-clock counter must stay at 0 on the rendered body:\n{after}"
+        );
         router.flush_all().await;
     }
 
