@@ -126,6 +126,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the part of the fetch share whose bytes went through the read cache, hit
   or miss, whether or not the cache kept them. The SQL path's own RSEG,
   RLOG and RSPAN fetchers still reserve against private unlimited budgets.
+- **`ravel-server` resolves `cost-based` logs fetching on every deployment
+  again, including a `--store s3` deployment against a loopback
+  `--s3-endpoint`** (ADR-2023 decision 1, issue #2023). 0.18.0's loopback
+  `byte-minimal` default (ADR-2014) is withdrawn: under ten concurrent
+  queries on the ClickBench reference machine it cut throughput to about a
+  third of `cost-based`'s (0.123 against 0.400 queries per second).
+  `--logs-fetch-policy byte-minimal` remains available as
+  an explicit opt-in; only the unset default changes.
 - **`ravel-server`'s catalog byte cache is sized independently of
   `--cache-max-bytes`** (ADR-2023, issue #2023). `--cache-max-bytes` now
   bounds the query fetcher cache only; the catalog byte cache derives its
@@ -140,9 +148,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`ravel-server` derives a larger fetcher-cache share on a loopback S3
   store** (ADR-2023, issue #2023). Unset, `--cache-max-bytes` used to
   always derive 25% of the process memory budget; now, a `--store s3`
-  deployment whose `--s3-endpoint` is loopback (the same predicate
-  ADR-2014 uses for `--logs-fetch-policy`) derives 40% instead, since a
-  loopback store has no network cost to amortize with a larger cache. An
+  deployment whose `--s3-endpoint` is loopback (the predicate that also
+  gates a plaintext endpoint) derives 40% instead, so a fetch cache holding
+  the working set's whole objects serves repeated statements without going
+  back to the store's disk. An
   explicit `--cache-max-bytes` always wins, and every other deployment
   keeps the 25% share. The resolved value's source (`budget-carve-loopback`)
   is logged on the `performance default resolved` startup line alongside

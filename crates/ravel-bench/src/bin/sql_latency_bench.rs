@@ -217,13 +217,9 @@ struct Args {
     /// the rate from the pass's store cost profile, which at the reference
     /// intra-region profile resolves to request-minimal behaviour.
     ///
-    /// The default therefore measures the shape a stock server produces against
-    /// a non-loopback S3 endpoint. A stock server whose `--s3-endpoint` is
-    /// loopback derives `byte-minimal` instead (ADR-2014). This bench does not
-    /// apply that derivation, even when `RAVEL_S3_ENDPOINT` is loopback: its
-    /// default stays explicit so a pass's shape never depends on the
-    /// environment, and `--logs-fetch-policy byte-minimal` measures that
-    /// server's shape in process. Before
+    /// The default therefore measures the shape a stock server produces,
+    /// including against a loopback `--s3-endpoint` (ADR-2023 decision 1
+    /// resolves `cost-based` there too, with no loopback exception). Before
     /// this flag existed the bench routed at a fixed 512 KiB threshold whatever
     /// the request cost said, so a full-scan statement range-read every object
     /// per block while the server read each one whole; pass `byte-minimal` to
@@ -1213,9 +1209,8 @@ mod tests {
     }
 
     /// At default flags against the reference (intra-region) profile, the bench
-    /// resolves the shape a server on a non-loopback endpoint resolves (a
-    /// loopback endpoint derives `byte-minimal` there, ADR-2014): a saturated
-    /// request cost AND a saturated
+    /// resolves the same shape a stock server resolves, loopback endpoint or
+    /// not (ADR-2023 decision 1): a saturated request cost AND a saturated
     /// routing threshold, so every object is read whole in one covering GET.
     /// Before the policy was reachable the threshold stayed at 512 KiB whatever
     /// the request cost said, so a full-scan statement range-read every larger
