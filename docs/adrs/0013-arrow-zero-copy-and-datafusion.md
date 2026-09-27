@@ -157,7 +157,11 @@ The code is correct; this amendment makes the ADR match it.
 <!-- amendment-applies: sections="Decision" pointer="ADR-2040 amendment" -->
 
 ADR-2040 replaces the first security invariant with "a SQL caller can name
-tables, never storage". Two parts of it change.
+tables, never storage". Each of the two parts below takes effect when its
+task in epic #2040 lands: the store registry with the read task (issue
+#2053), DDL with the DDL task (issue #2054). Until then the code enforces
+the invariant exactly as the Decision above states it: `validate` refuses
+all DDL and every session installs the empty registry.
 
 - **DDL.** `CREATE EXTERNAL TABLE ... STORED AS PARQUET`,
   `CREATE OR REPLACE EXTERNAL TABLE` and `DROP TABLE` are admitted through a
