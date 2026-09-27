@@ -1176,10 +1176,11 @@ token-resolved via an explicit `min_commit_token`) and `max_segments` applies
 to the sealed count only; recent and token-resolved segments are exempt, so a
 hot tenant's open hour and a read-your-write query no longer 422 on count.
 Their cost is bounded instead by a per-query S3 request budget
-(`EngineConfig::max_s3_requests`, derived from the deployment's shard count
-and ingest flush cadence by `derive_max_s3_requests` rather than a flat
-constant -- ADR-0075 decisions 1-2; the derived default is 343,400 at the
-default 4 shards and the 2s flush cadence ADR-0076 decision 4 sets), checked
+(`EngineConfig::max_s3_requests`, derived from the deployment's shard count,
+ingest flush cadence and catalog seal margin by `derive_max_s3_requests_for`
+rather than a flat constant -- ADR-0075 decisions 1-2, ADR-1306 decisions 1
+and 3; the derived default is 343,400 at the default 4 shards and the 2s
+flush cadence ADR-0076 decision 4 sets), checked
 incrementally at the same points `max_bytes_scanned` already is, and reported
 as `RequestBudgetExceeded` (HTTP 422) when tripped. A running server does not
 use the `DEFAULT_BUDGET_REFERENCE_SHARDS` (4) and
@@ -1193,8 +1194,31 @@ decisions 1-2): the longest unsealed tail a healthy catalog carries
 (`healthy_tail_max`, the fold's seal margin plus the open ingest hour) plus
 the time a stalled fold takes to page an operator (the seal margin again, the
 `RavelCatalogFoldStalled` alert's `for:`, and the alert-delivery slack), 14,100
-s at the catalog's reference seal margin. Each unsealed flush in that span is
-sized at `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of
+s at the shipped seal margin.
+
+The seal margin in that span is the RUNNING catalog's, not a compiled-in
+reference (ADR-1306 decision 3). `ravel-server` reads it off the
+`CatalogConfig` its own `build_catalog` constructs -- the one config `start`
+hands to both resolve and the fold task -- and passes it to
+`derive_max_s3_requests_for`, so a deployment whose catalog seals on a
+different margin gets a budget covering its own tail with no hand
+recomputation, and the fold-stall ordering keeps holding at that margin. It is
+`CatalogConfig::default`'s 1h + 5m + 15m = 4,800s today, which is also what
+`SealMargin::REFERENCE` holds, so the shipped figure is the same either way;
+`derived_request_budget_uses_the_catalogs_seal_margin`
+(`services/ravel-server/src/query.rs`) is what holds the two together if the
+catalog's margin ever moves. An explicit `--max-s3-requests` is still used
+verbatim and follows no margin. The other side of the same coupling is the
+shipped alert: its threshold is that seal margin and its `for:` is
+`FOLD_STALL_ALERT_FOR`, held there by
+`shipped_fold_stall_alert_fits_the_budget_lag_allowance`
+(`services/ravel-server/tests/shipped_fold_stall_alert_budget.rs`), so raising
+either in `deploy/prometheus/ravel.rules.yaml` without widening
+`lag_allowance` fails a test instead of silently putting the first refusal
+before the page.
+
+Each unsealed flush in that span is sized at
+`BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of
 `REQUESTS_PER_UNSEALED_FLUSH` (2, the measured cold cost of a flush at or under
 the whole-object threshold) and `MAX_REQUESTS_PER_UNSEALED_FLUSH` (8, its
 commit-record GET plus `MAX_GETS_PER_L0_SEGMENT_FETCH`), so the per-flush term

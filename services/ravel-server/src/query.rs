@@ -1125,16 +1125,17 @@ mod catalog_cache_tests {
         let expected =
             ravel_query::derive_max_s3_requests_for(cli.shards, cadence.max_flush_delay, running);
         assert_eq!(
-            expected, 343_400,
-            "sanity: at 4 shards, the 2s cadence and the catalog's 4,800s seal margin the \
-             derivation is the figure ADR-1306's 2026-09-27 amendment states"
-        );
-        assert_eq!(
             cli.resolve_max_s3_requests()
                 .expect("server defaults resolve a bounded budget"),
             ravel_query::RequestLimit::Bounded(expected),
             "the budget a running server enforces must be the derivation at the running \
              catalog's own seal margin"
+        );
+        assert_eq!(
+            expected, 343_400,
+            "sanity: at 4 shards, the 2s cadence and the catalog's 4,800s seal margin the \
+             derivation is the figure ADR-1306's 2026-09-27 amendment states, and the figure \
+             the flag help text and docs/query-engine.md give an operator"
         );
 
         // Non-vacuity for the assertions above: the derivation really moves
