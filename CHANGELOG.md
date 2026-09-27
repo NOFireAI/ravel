@@ -8,6 +8,63 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A scrub tick's request count follows its budget, not the corpus size**
+  (issue #1686, ADR-1686). Each content-tier tick used to LIST a shard's whole
+  commit prefix and GET every record in it before verifying its slice. It now
+  lists strictly after a start-after marker held in the per-shard cursor and
+  stops once the tick's budget is filled; the rotation rolls over when the
+  listing runs out. The budget is a pair of caps, one on listing entries and
+  one on requests, recomputed every tick from what the walk has actually
+  observed: every rotation opens with one LIST-only count of the shard's
+  entries, and every later tick recounts the last two ingest hours the previous
+  count met, plus anything after them, and adds their growth, so a commit from
+  any writer on the shard is counted. The per-tick entry cap is the share
+  needed to reach the rotation's deadline, floored at the rotation's sustained
+  rate and capped at four times that rate. The deadline is the smaller of
+  `--scrub-period` and half the tenant's retention window, so a rotation that
+  keeps pace reaches each object by about half its retained life. When the entries per
+  tick the deadline needs exceed four times the sustained rate, the tick
+  increments `ravel_scrub_behind_total{signal}` and logs the entries per tick
+  needed beside the number allowed, with the deadline and the period. Every
+  listing page the walk draws and every record GET attempt is charged against
+  the request cap; the LIST-only count passes are not. A unit where a record or
+  object GET failed with a retryable error (throttled, timeout, transient) does
+  not move the marker past it and counts nothing from it, so the next tick
+  retries the whole unit. That hold is capped at six consecutive held ticks on
+  one unit, six hours of tick cadence at the default one-hour tick (at most 6.6
+  with the jitter the loop adds to every sleep): the next tick that reaches the
+  unit moves past it and counts each record or object that still fails
+  retryably on
+  `ravel_scrub_unreadable_total{reason="retry_exhausted"}`, and the new gauge
+  `ravel_scrub_marker_held_ticks{signal}` reads the current held count of the
+  signal's worst shard. A record or object GET that fails with any other
+  error except not-found, and a record whose bytes do not decode, is counted
+  once on the new `ravel_scrub_unreadable_total{signal, level, reason}` (with
+  `reason="access_denied"` or `reason="permanent"`, at the level of the object
+  or record that failed), and the marker moves on, so one unreadable record
+  cannot pin the rotation. Neither is counted on
+  `ravel_scrub_checksum_mismatch_total`, which counts only bytes that were read
+  and did not match; a new `RavelScrubUnreadable` warning alert fires on any
+  increase of the unreadable counter over an hour. A compaction record that
+  lands in an hour the marker has already passed is still judged against that
+  whole hour, and a tick whose cursor GET fails for any reason other than `NotFound`
+  is skipped with the stored cursor left alone. The cursor gains serde-default
+  fields, so a cursor from an earlier release loads with defaults and its
+  progress restarts: the next tick starts a fresh rotation. During a
+  mixed-version rolling upgrade each version's cursor write drops the other's
+  new fields, so the rotation restarts each time a shard's ownership flips
+  between versions; nothing is corrupted and the cursor stays in object
+  storage. A retention window whose half fits in one tick gives every tick the
+  budget of a whole rotation, so every tick normally walks a full rotation and
+  pays the LIST-only count of the whole commit prefix that opens it, whose cost
+  is not charged against the budget.
+  `ravel_scrub_cursor_position` is now a fraction of listing entries rather
+  than of data objects. Every object the walk reaches and can read is still
+  verified once per rotation, except that a retried unit's records and objects
+  are fetched again,
+  and the hour re-list that judges a late compaction record GETs that hour's
+  compaction and rewrite records already consumed a second time. A record committed behind the marker waits for
+  the next rotation.
 - **PromQL fetches now reserve against the same process-wide memory budget
   as SQL execution** (issue #1255). `ravel-server` hands the PromQL engine
   and the startup cache warm pass the one `MemoryBudget` its SQL executor

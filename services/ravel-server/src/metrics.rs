@@ -77,6 +77,7 @@ use ravel_ingest::{
     TenantUsage,
 };
 use ravel_maintain::ScrubLevel;
+use ravel_maintain::UnreadableReason;
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::instrument::{
     LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT, StoreErrorClass, StoreMetricsSnapshot,
@@ -276,6 +277,10 @@ pub enum Label {
     /// (log/tracing severity), the same shared-key discipline
     /// `RejectReason`/`ScrubReason` already use for `reason`.
     ScrubLevel(ScrubLevel),
+    /// Why the scrub could not read an object or record at all:
+    /// `access_denied`, `permanent`, or `retry_exhausted`. Shares the `reason`
+    /// key with `RejectReason` and `ScrubReason`.
+    ScrubUnreadableReason(UnreadableReason),
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
@@ -477,6 +482,7 @@ impl Label {
             Label::ScrubReason(_) => "reason",
             Label::Shard(_) => "shard",
             Label::ScrubLevel(_) => "level",
+            Label::ScrubUnreadableReason(_) => "reason",
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
@@ -503,6 +509,7 @@ impl Label {
             Label::ScrubReason(reason) => reason.name().to_string(),
             Label::Shard(index) => index.to_string(),
             Label::ScrubLevel(level) => level.as_str().to_string(),
+            Label::ScrubUnreadableReason(reason) => reason.as_str().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
@@ -3593,6 +3600,29 @@ pub struct ScrubLevelCounts {
     pub rewrite: u64,
 }
 
+/// One signal's `ravel_scrub_unreadable_total`, per reason and level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrubUnreadableCounts {
+    pub access_denied: ScrubLevelCounts,
+    pub permanent: ScrubLevelCounts,
+    pub retry_exhausted: ScrubLevelCounts,
+}
+
+impl ScrubUnreadableCounts {
+    fn get(&self, reason: UnreadableReason, level: ScrubLevel) -> u64 {
+        let by_level = match reason {
+            UnreadableReason::AccessDenied => &self.access_denied,
+            UnreadableReason::Permanent => &self.permanent,
+            UnreadableReason::RetryExhausted => &self.retry_exhausted,
+        };
+        match level {
+            ScrubLevel::L0 => by_level.l0,
+            ScrubLevel::L1 => by_level.l1,
+            ScrubLevel::Rewrite => by_level.rewrite,
+        }
+    }
+}
+
 /// One signal's at-rest scrubber counters for one scrape (ADR-0059 decisions
 /// 1, 3).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3605,6 +3635,9 @@ pub struct ScrubSignalSnapshot {
     /// down by which commit-lineage part (`l0`, `l1`, `rewrite`) it came from
     /// (issue #1686).
     pub checksum_mismatch: ScrubLevelCounts,
+    /// Objects and records the scrub could not read at all for this signal,
+    /// by reason and level: `ravel_scrub_unreadable_total`.
+    pub unreadable: ScrubUnreadableCounts,
     /// Objects where the covering name-postings object omitted a `__name__`
     /// the object really carries (a false negative). Wired but only
     /// nonzero once covering-postings resolution lands in the scrub task.
@@ -3617,9 +3650,18 @@ pub struct ScrubSignalSnapshot {
     /// record for this signal:
     /// `ravel_scrub_seal_divergence_total{reason="mismatched"}`.
     pub seal_divergence_mismatched: u64,
-    /// Fraction of the current rotation the content-tier cursor has covered so
-    /// far for this signal, in `[0.0, 1.0]` (operator visibility into cadence).
+    /// Fraction of the current rotation's listing entries the content-tier
+    /// cursor has consumed so far for this signal, in `[0.0, 1.0]` (operator
+    /// visibility into cadence).
     pub cursor_position: f64,
+    /// Shard ticks whose rotation could not finish inside its allotted window
+    /// at the catch-up ceiling for this signal: `ravel_scrub_behind_total`
+    /// (ADR-1686 amendment).
+    pub rotation_behind: u64,
+    /// Consecutive ticks the worst shard of this signal has held its marker
+    /// on one unit whose GETs fail retryably, as of the last scrub cycle:
+    /// `ravel_scrub_marker_held_ticks`.
+    pub marker_held_ticks: u64,
 }
 
 /// One scrape's at-rest scrubber counters (ADR-0059 decisions 1, 3), per
@@ -3677,6 +3719,44 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
 
     write_header(
         out,
+        "ravel_scrub_unreadable_total",
+        "Objects and records the content-tier scrub could not read, and so could not verify, by \
+         signal, level and reason (ADR-1686 amendment). Not corruption: the bytes were never \
+         read, and ravel_scrub_checksum_mismatch_total counts only bytes that were read and did \
+         not match. reason=\"access_denied\" is a GET the store refused as access denied (a \
+         bucket or key policy, or a credential fault); reason=\"permanent\" is any other GET \
+         error retrying cannot clear, or a record whose bytes do not decode; \
+         reason=\"retry_exhausted\" is a GET that still failed with a retryable error after its \
+         unit held the marker for the maximum number of ticks (see \
+         ravel_scrub_marker_held_ticks), so the scrub moved past it. An object counts \
+         once at its own level; a record counts once at the record's own level (l0 a commit \
+         record, l1 a compaction record, rewrite a rewrite record) however many objects it \
+         names, and those objects go unverified this rotation. An object or record deleted after \
+         it was listed is not counted. Alert on increase() > 0: what it counts stays unverified \
+         until a later rotation reads it, and an access denial recurs every rotation until the \
+         policy or credential is fixed.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        for level in [ScrubLevel::L0, ScrubLevel::L1, ScrubLevel::Rewrite] {
+            for reason in UnreadableReason::ALL {
+                write_sample(
+                    out,
+                    "ravel_scrub_unreadable_total",
+                    &[
+                        Label::Mode(mode),
+                        Label::Signal(signal.signal),
+                        Label::ScrubLevel(level),
+                        Label::ScrubUnreadableReason(reason),
+                    ],
+                    signal.unreadable.get(reason, level),
+                );
+            }
+        }
+    }
+
+    write_header(
+        out,
         "ravel_scrub_postings_disagreement_total",
         "Objects whose covering name-postings object omitted a __name__ the object really carries \
          (a false negative), by signal (ADR-0059).",
@@ -3724,9 +3804,10 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
     write_header(
         out,
         "ravel_scrub_cursor_position",
-        "Fraction of the current scrub rotation the content-tier cursor has covered so far, by \
-         signal, in [0,1] (ADR-0059 decision 3). A rotation completes in about the configured \
-         --scrub-period P; a value stuck near 0 means scrubbing is not keeping pace with P.",
+        "Fraction of the current scrub rotation's commit shard listing entries the content-tier \
+         cursor has consumed so far, by signal, in [0,1] (ADR-0059 decision 3, ADR-1686). A \
+         rotation completes within --scrub-period P, or half the tenant's retention window when \
+         that is shorter; a value stuck near 0 means scrubbing is not keeping pace.",
         "gauge",
     );
     for signal in &snapshot.signals {
@@ -3735,6 +3816,53 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
             "ravel_scrub_cursor_position",
             &labels(mode, signal.signal),
             signal.cursor_position,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_scrub_behind_total",
+        "Shard ticks whose content-tier rotation cannot finish inside its window, by signal \
+         (ADR-1686 amendment): the entries the tick needed to reach the end of the listing by the \
+         deadline exceeded four times the rotation's sustained rate, the most one tick may take. \
+         The window is --scrub-period P, capped at half the tenant's retention window. Causes: a \
+         shard whose sustained commit rate is above four times the measured sustained rate, or \
+         scrub cycles that take longer than a tick, so fewer ticks run than the window allows. \
+         Changing P does not help with the first, since the needed rate and the ceiling both \
+         scale with 1/window. A marker held on a unit whose GETs keep failing retryably \
+         increments this only once the lost ticks push the needed rate past the ceiling, so it \
+         is not the signal for a held marker: ravel_scrub_marker_held_ticks is. A nonzero \
+         increase means some objects may expire before they are verified; the log line beside \
+         it names the entries per tick needed and allowed, the window, and P.",
+        "counter",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_scrub_behind_total",
+            &labels(mode, signal.signal),
+            signal.rotation_behind,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_scrub_marker_held_ticks",
+        "Consecutive scrub ticks the worst shard of this signal has held its content-tier marker \
+         on one unit because a GET of it failed with a retryable error (throttled, timeout, \
+         transient), as of the last scrub cycle (ADR-1686 amendment). 0 when no shard is held. \
+         After 6 held ticks, six hours of tick cadence at the default one-hour tick, the next \
+         tick moves past the unit and counts each of its records and objects that still fail \
+         on ravel_scrub_unreadable_total{reason=\"retry_exhausted\"}. A value that keeps \
+         returning to 6 means the store keeps failing that shard's reads.",
+        "gauge",
+    );
+    for signal in &snapshot.signals {
+        write_sample(
+            out,
+            "ravel_scrub_marker_held_ticks",
+            &labels(mode, signal.signal),
+            signal.marker_held_ticks,
         );
     }
 }
@@ -5722,10 +5850,24 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                     l1: metrics.checksum_mismatch(signal, ScrubLevel::L1),
                     rewrite: metrics.checksum_mismatch(signal, ScrubLevel::Rewrite),
                 },
+                unreadable: {
+                    let by_level = |reason| ScrubLevelCounts {
+                        l0: metrics.unreadable(signal, ScrubLevel::L0, reason),
+                        l1: metrics.unreadable(signal, ScrubLevel::L1, reason),
+                        rewrite: metrics.unreadable(signal, ScrubLevel::Rewrite, reason),
+                    };
+                    ScrubUnreadableCounts {
+                        access_denied: by_level(UnreadableReason::AccessDenied),
+                        permanent: by_level(UnreadableReason::Permanent),
+                        retry_exhausted: by_level(UnreadableReason::RetryExhausted),
+                    }
+                },
                 postings_disagreement: metrics.postings_disagreement(signal),
                 seal_divergence_missing: metrics.seal_divergence_missing(signal),
                 seal_divergence_mismatched: metrics.seal_divergence_mismatched(signal),
                 cursor_position: metrics.cursor_position(signal),
+                rotation_behind: metrics.rotation_behind(signal),
+                marker_held_ticks: metrics.marker_held_ticks(signal),
             })
             .collect(),
     });
@@ -6077,6 +6219,7 @@ mod tests {
             Label::ScrubReason(ScrubReason::Missing),
             Label::Shard(0),
             Label::ScrubLevel(ScrubLevel::L0),
+            Label::ScrubUnreadableReason(UnreadableReason::AccessDenied),
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
@@ -6102,6 +6245,7 @@ mod tests {
                 Label::ScrubReason(_) => "reason",
                 Label::Shard(_) => "shard",
                 Label::ScrubLevel(_) => "level",
+                Label::ScrubUnreadableReason(_) => "reason",
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
@@ -6137,6 +6281,9 @@ mod tests {
                 // allowlist of distinct keys is unchanged; two variants map to
                 // it.
                 "level",
+                // ScrubUnreadableReason (ADR-1686 amendment) reuses the
+                // `reason` key, so the allowlist of distinct keys is unchanged.
+                "reason",
                 "cache",
                 "tier",
                 "kind",
@@ -6161,8 +6308,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            21,
-            "exactly 21 label variants, 18 distinct keys"
+            22,
+            "exactly 22 label variants, 18 distinct keys"
         );
     }
 
@@ -8570,18 +8717,40 @@ mod tests {
                         l1: 5,
                         rewrite: 0,
                     },
+                    unreadable: ScrubUnreadableCounts {
+                        access_denied: ScrubLevelCounts {
+                            l0: 0,
+                            l1: 6,
+                            rewrite: 0,
+                        },
+                        permanent: ScrubLevelCounts {
+                            l0: 8,
+                            l1: 0,
+                            rewrite: 0,
+                        },
+                        retry_exhausted: ScrubLevelCounts {
+                            l0: 0,
+                            l1: 0,
+                            rewrite: 9,
+                        },
+                    },
                     postings_disagreement: 1,
                     seal_divergence_missing: 3,
                     seal_divergence_mismatched: 4,
                     cursor_position: 0.5,
+                    rotation_behind: 7,
+                    marker_held_ticks: 3,
                 },
                 ScrubSignalSnapshot {
                     signal: Signal::Logs,
                     checksum_mismatch: ScrubLevelCounts::default(),
+                    unreadable: ScrubUnreadableCounts::default(),
                     postings_disagreement: 0,
                     seal_divergence_missing: 0,
                     seal_divergence_mismatched: 0,
                     cursor_position: 0.0,
+                    rotation_behind: 0,
+                    marker_held_ticks: 0,
                 },
             ],
         };
@@ -8634,6 +8803,37 @@ mod tests {
                 "ravel_scrub_checksum_mismatch_total{mode=\"maintain\",signal=\"metrics\",level=\"rewrite\"} 0"
             ),
             "missing checksum_mismatch rewrite sample:\n{body}"
+        );
+        for (level, reason, value) in [
+            ("l1", "access_denied", 6),
+            ("l0", "permanent", 8),
+            ("rewrite", "retry_exhausted", 9),
+            ("l0", "access_denied", 0),
+        ] {
+            let line = format!(
+                "ravel_scrub_unreadable_total{{mode=\"maintain\",signal=\"metrics\",level=\
+                 \"{level}\",reason=\"{reason}\"}} {value}"
+            );
+            assert_eq!(
+                body.lines().filter(|l| *l == line).count(),
+                1,
+                "expected exactly one {line}:\n{body}"
+            );
+        }
+        assert_eq!(
+            body.lines()
+                .filter(|l| l.starts_with("ravel_scrub_unreadable_total{"))
+                .count(),
+            18,
+            "two signals by three levels by three reasons, zeros included"
+        );
+        assert!(
+            body.contains("ravel_scrub_marker_held_ticks{mode=\"maintain\",signal=\"metrics\"} 3"),
+            "missing marker_held_ticks gauge sample:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_scrub_marker_held_ticks gauge"),
+            "marker_held_ticks must carry a gauge TYPE header:\n{body}"
         );
         assert!(
             body.contains(
