@@ -15,6 +15,10 @@
 //! re-parsed to address the object again, and a key may hold bytes no URL
 //! round trips.
 //!
+//! A body records the tenant it was encoded for, and [`decode_manifest`]
+//! refuses it as [`ManifestError::Misfiled`] under a key of any other tenant,
+//! as it does a body whose table or version differs from its key's.
+//!
 //! Both directions run [`Manifest::validate`], so a manifest this crate
 //! encodes or decodes has a valid table name, a version of at least 1, a
 //! 16-byte apply nonce, a location, grant and file list consistent with
@@ -24,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use prost::Message;
 use ravel_proto::parquet_table::v1 as pb;
+use ravel_types::TenantHash;
 
 use crate::keys::{KeyError, parse_manifest_key};
 use crate::names::{NameError, validate_table};
@@ -227,12 +232,14 @@ impl Manifest {
     }
 }
 
-/// Encode `manifest`, stamped with [`PARQUET_TABLE_FORMAT_VERSION`]. Refuses
-/// a manifest that fails [`Manifest::validate`].
-pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
+/// Encode `manifest` as a version of `tenant`'s table, stamped with
+/// [`PARQUET_TABLE_FORMAT_VERSION`]. Refuses a manifest that fails
+/// [`Manifest::validate`].
+pub fn encode_manifest(tenant: &TenantHash, manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
     manifest.validate()?;
     let body = pb::ParquetTableManifest {
         format_version: PARQUET_TABLE_FORMAT_VERSION,
+        tenant_hash: tenant.0.to_vec(),
         table: manifest.table.clone(),
         version: manifest.version,
         dropped: manifest.dropped,
@@ -263,8 +270,9 @@ pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
 
 /// Decode the manifest stored at `key`. Refuses, with a typed error: a key
 /// that is not a manifest key, bytes that are not a protobuf message, a
-/// `format_version` outside the read window, a body whose table or version
-/// differs from the key's, and a body that fails [`Manifest::validate`].
+/// `format_version` outside the read window, a body whose tenant, table or
+/// version differs from the key's, and a body that fails
+/// [`Manifest::validate`].
 pub fn decode_manifest(key: &str, bytes: &[u8]) -> Result<Manifest, ManifestError> {
     let parsed = parse_manifest_key(key)?;
     let body = pb::ParquetTableManifest::decode(bytes).map_err(|source| ManifestError::Decode {
@@ -283,6 +291,14 @@ pub fn decode_manifest(key: &str, bytes: &[u8]) -> Result<Manifest, ManifestErro
             key: key.to_string(),
             got: body.format_version,
             ceiling: PARQUET_TABLE_MAX_READ_VERSION,
+        });
+    }
+    if body.tenant_hash.as_slice() != parsed.tenant_hash.0.as_slice() {
+        return Err(ManifestError::Misfiled {
+            key: key.to_string(),
+            field: "tenant_hash",
+            expected: parsed.tenant_hash.to_hex(),
+            actual: hex::encode(&body.tenant_hash),
         });
     }
     if body.table != parsed.table {
@@ -335,12 +351,12 @@ pub fn decode_manifest(key: &str, bytes: &[u8]) -> Result<Manifest, ManifestErro
 #[allow(clippy::expect_used)]
 mod tests {
     use proptest::prelude::*;
-    use ravel_types::TenantHash;
 
     use super::*;
     use crate::keys::manifest_key;
 
     const TENANT: TenantHash = TenantHash([0x5c; 16]);
+    const OTHER_TENANT: TenantHash = TenantHash([0x6d; 16]);
 
     fn file(seed: u8) -> ParquetFile {
         ParquetFile {
@@ -374,7 +390,7 @@ mod tests {
     }
 
     fn raw_with_version(format_version: u32, m: &Manifest) -> Vec<u8> {
-        let bytes = encode_manifest(m).expect("encode");
+        let bytes = encode_manifest(&TENANT, m).expect("encode");
         let mut body = pb::ParquetTableManifest::decode(bytes.as_slice()).expect("decode");
         body.format_version = format_version;
         body.encode_to_vec()
@@ -430,7 +446,7 @@ mod tests {
 
     #[test]
     fn a_body_whose_table_or_version_disagrees_with_its_key_is_refused() {
-        let bytes = encode_manifest(&live(3)).expect("encode");
+        let bytes = encode_manifest(&TENANT, &live(3)).expect("encode");
         let wrong_version = manifest_key(&TENANT, "hits", 4).expect("key");
         assert_eq!(
             decode_manifest(&wrong_version, &bytes),
@@ -456,6 +472,38 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_copied_under_another_tenants_key_is_misfiled() {
+        let bytes = encode_manifest(&TENANT, &live(3)).expect("encode");
+        let other = manifest_key(&OTHER_TENANT, "hits", 3).expect("key");
+        assert_eq!(
+            decode_manifest(&other, &bytes),
+            Err(ManifestError::Misfiled {
+                key: other.clone(),
+                field: "tenant_hash",
+                expected: OTHER_TENANT.to_hex(),
+                actual: TENANT.to_hex(),
+            })
+        );
+        // A body with no tenant at all, or a truncated one, is refused too.
+        let mut body = pb::ParquetTableManifest::decode(bytes.as_slice()).expect("decode");
+        for tenant_hash in [vec![], TENANT.0[..15].to_vec()] {
+            body.tenant_hash = tenant_hash;
+            let key = manifest_key(&TENANT, "hits", 3).expect("key");
+            assert!(
+                matches!(
+                    decode_manifest(&key, &body.encode_to_vec()),
+                    Err(ManifestError::Misfiled {
+                        field: "tenant_hash",
+                        ..
+                    })
+                ),
+                "{:?}",
+                body.tenant_hash
+            );
+        }
+    }
+
+    #[test]
     fn a_raw_key_survives_the_round_trip_byte_for_byte() {
         // Bytes a URL would not round trip: an empty path segment, a percent
         // escape, a space, and a non-ASCII sequence that is not valid UTF-8.
@@ -476,7 +524,7 @@ mod tests {
             })
             .collect();
         let key = manifest_key(&TENANT, "hits", 1).expect("key");
-        let bytes = encode_manifest(&m).expect("encode");
+        let bytes = encode_manifest(&TENANT, &m).expect("encode");
         let decoded = decode_manifest(&key, &bytes).expect("decode");
         let got: Vec<Vec<u8>> = decoded.files.iter().map(|f| f.key.clone()).collect();
         assert_eq!(got, raw);
@@ -529,7 +577,7 @@ mod tests {
             let mut m = live(1);
             mutate(&mut m);
             assert_eq!(
-                encode_manifest(&m),
+                encode_manifest(&TENANT, &m),
                 Err(ManifestError::Invalid {
                     table: "hits".into(),
                     version: 1,
@@ -539,7 +587,7 @@ mod tests {
             );
         }
         assert!(matches!(
-            encode_manifest(&live(0)),
+            encode_manifest(&TENANT, &live(0)),
             Err(ManifestError::Invalid {
                 defect: ManifestDefect::ZeroVersion,
                 ..
@@ -554,7 +602,7 @@ mod tests {
             m.apply_nonce = vec![1; len];
             assert!(
                 matches!(
-                    encode_manifest(&m),
+                    encode_manifest(&TENANT, &m),
                     Err(ManifestError::Invalid {
                         defect: ManifestDefect::NonceLen { len: got },
                         ..
@@ -564,7 +612,7 @@ mod tests {
             );
         }
         let key = manifest_key(&TENANT, "hits", 1).expect("key");
-        let bytes = encode_manifest(&live(1)).expect("encode");
+        let bytes = encode_manifest(&TENANT, &live(1)).expect("encode");
         let mut body = pb::ParquetTableManifest::decode(bytes.as_slice()).expect("decode");
         body.apply_nonce.truncate(4);
         assert!(matches!(
@@ -579,7 +627,7 @@ mod tests {
     #[test]
     fn truncation_inside_the_last_field_is_a_decode_error() {
         let key = manifest_key(&TENANT, "hits", 1).expect("key");
-        let bytes = encode_manifest(&live(1)).expect("encode");
+        let bytes = encode_manifest(&TENANT, &live(1)).expect("encode");
         // `apply_nonce` is the highest field number, so it is encoded last and
         // dropping the final byte cuts it mid-value.
         assert!(matches!(
@@ -604,7 +652,7 @@ mod tests {
             apply_nonce: vec![3; APPLY_NONCE_LEN],
         };
         let key = manifest_key(&TENANT, "hits", 9).expect("key");
-        let bytes = encode_manifest(&m).expect("encode");
+        let bytes = encode_manifest(&TENANT, &m).expect("encode");
         assert_eq!(decode_manifest(&key, &bytes), Ok(m));
     }
 
@@ -665,7 +713,7 @@ mod tests {
         #[test]
         fn encode_decode_round_trips(m in arb_manifest()) {
             let key = manifest_key(&TENANT, &m.table, m.version).expect("key");
-            let bytes = encode_manifest(&m).expect("encode");
+            let bytes = encode_manifest(&TENANT, &m).expect("encode");
             prop_assert_eq!(decode_manifest(&key, &bytes), Ok(m));
         }
 
@@ -677,7 +725,7 @@ mod tests {
             flip in 1u8..=255,
         ) {
             let key = manifest_key(&TENANT, &m.table, m.version).expect("key");
-            let bytes = encode_manifest(&m).expect("encode");
+            let bytes = encode_manifest(&TENANT, &m).expect("encode");
             let truncated = &bytes[..cut.index(bytes.len())];
             let mut flipped = bytes.clone();
             let at = flip_at.index(flipped.len());

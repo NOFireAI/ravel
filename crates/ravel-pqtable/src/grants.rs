@@ -6,7 +6,9 @@
 //! rewritten whole under CAS. It is deliberately not a field of the tenant
 //! config record, which the ingest and fold paths read: a grant change must
 //! not invalidate their cached config, and this record has its own reader
-//! floor ([`PARQUET_GRANTS_MIN_READ_VERSION`]).
+//! floor ([`PARQUET_GRANTS_MIN_READ_VERSION`]). The record names the tenant it
+//! was written for, and [`decode_grants`] refuses it as
+//! [`GrantsError::Misfiled`] under another tenant's key.
 //!
 //! A location is identified by (profile, bucket, key), never by its URL
 //! string: an `az://` URL carries no account, and an `s3://` bucket name is
@@ -150,6 +152,14 @@ pub enum GrantsError {
          build reads ({floor}): no supported writer produced it"
     )]
     VersionBelowFloor { key: String, got: u32, floor: u32 },
+    #[error(
+        "grants record {key:?} is misfiled: its body records tenant {actual}, its key {expected}"
+    )]
+    Misfiled {
+        key: String,
+        expected: String,
+        actual: String,
+    },
     #[error("invalid location {url:?}: {defect:?}")]
     InvalidLocation { url: String, defect: LocationDefect },
     #[error("a grant needs a credential profile")]
@@ -356,12 +366,14 @@ pub fn validate_record(grants: &[Grant]) -> Result<(), GrantsError> {
     Ok(())
 }
 
-/// Encode a grants record, stamped with [`PARQUET_GRANTS_FORMAT_VERSION`].
-/// Refuses a record that fails [`validate_record`].
-pub fn encode_grants(grants: &[Grant]) -> Result<Vec<u8>, GrantsError> {
+/// Encode `tenant`'s grants record, stamped with
+/// [`PARQUET_GRANTS_FORMAT_VERSION`]. Refuses a record that fails
+/// [`validate_record`].
+pub fn encode_grants(tenant: &TenantHash, grants: &[Grant]) -> Result<Vec<u8>, GrantsError> {
     validate_record(grants)?;
     let body = pb::ParquetGrants {
         format_version: PARQUET_GRANTS_FORMAT_VERSION,
+        tenant_hash: tenant.0.to_vec(),
         grants: grants
             .iter()
             .map(|g| pb::ParquetGrant {
@@ -379,10 +391,11 @@ pub fn encode_grants(grants: &[Grant]) -> Result<Vec<u8>, GrantsError> {
 
 /// Decode the grants record stored at `key`. Refuses, with a typed error: a
 /// key that is not a grants key, bytes that are not a protobuf message, a
-/// `format_version` outside the read window, and a record that fails
+/// `format_version` outside the read window, a record whose tenant differs
+/// from the key's ([`GrantsError::Misfiled`]), and a record that fails
 /// [`validate_record`].
 pub fn decode_grants(key: &str, bytes: &[u8]) -> Result<Vec<Grant>, GrantsError> {
-    parse_grants_key(key)?;
+    let tenant = parse_grants_key(key)?;
     let body = pb::ParquetGrants::decode(bytes).map_err(|source| GrantsError::Decode {
         key: key.to_string(),
         source,
@@ -399,6 +412,13 @@ pub fn decode_grants(key: &str, bytes: &[u8]) -> Result<Vec<Grant>, GrantsError>
             key: key.to_string(),
             got: body.format_version,
             ceiling: PARQUET_GRANTS_MAX_READ_VERSION,
+        });
+    }
+    if body.tenant_hash.as_slice() != tenant.0.as_slice() {
+        return Err(GrantsError::Misfiled {
+            key: key.to_string(),
+            expected: tenant.to_hex(),
+            actual: hex::encode(&body.tenant_hash),
         });
     }
     let grants: Vec<Grant> = body
@@ -466,7 +486,7 @@ where
         let (grants, version) = read(store, tenant).await?;
         let (mut next, out) = change(grants)?;
         next.sort();
-        let bytes = encode_grants(&next)?;
+        let bytes = encode_grants(tenant, &next)?;
         match store
             .put(&key, Bytes::from(bytes), put_options(&version))
             .await
@@ -815,7 +835,7 @@ mod tests {
     fn a_format_version_outside_the_read_window_is_refused() {
         let key = grants_key(&TENANT_A);
         let grants = vec![grant("prod", "s3://b/data")];
-        let bytes = encode_grants(&grants).expect("encode");
+        let bytes = encode_grants(&TENANT_A, &grants).expect("encode");
         assert_eq!(decode_grants(&key, &bytes).expect("decode"), grants);
 
         let mut body = pb::ParquetGrants::decode(bytes.as_slice()).expect("decode");
@@ -850,7 +870,7 @@ mod tests {
 
     #[test]
     fn a_grants_record_read_from_the_wrong_key_is_refused() {
-        let bytes = encode_grants(&[grant("prod", "s3://b/data")]).expect("encode");
+        let bytes = encode_grants(&TENANT_A, &[grant("prod", "s3://b/data")]).expect("encode");
         for key in [
             format!("t/{}/pq/grantsx", "a1".repeat(16)),
             format!("t/{}/pq/t/hits/v/00000000000000000001.pqm", "a1".repeat(16)),
@@ -862,10 +882,31 @@ mod tests {
                 "{key:?} decoded"
             );
         }
-        // The tenant in the key is the tenant the record belongs to: a valid
-        // grants key of another tenant decodes, and the read path never
-        // builds one, since it derives the key from its own tenant hash.
-        assert!(decode_grants(&grants_key(&TENANT_B), &bytes).is_ok());
+        // The record names its tenant: copied under another tenant's valid
+        // grants key, it is refused rather than read as that tenant's grants.
+        let other = grants_key(&TENANT_B);
+        let got = decode_grants(&other, &bytes);
+        assert!(
+            matches!(
+                &got,
+                Err(GrantsError::Misfiled { key, expected, actual })
+                    if *key == other
+                        && *expected == TENANT_B.to_hex()
+                        && *actual == TENANT_A.to_hex()
+            ),
+            "{got:?}"
+        );
+        assert_eq!(
+            decode_grants(&grants_key(&TENANT_A), &bytes).expect("own key"),
+            vec![grant("prod", "s3://b/data")]
+        );
+        // A record with no tenant at all is refused under every key.
+        let mut body = pb::ParquetGrants::decode(bytes.as_slice()).expect("decode");
+        body.tenant_hash.clear();
+        assert!(matches!(
+            decode_grants(&grants_key(&TENANT_A), &body.encode_to_vec()),
+            Err(GrantsError::Misfiled { .. })
+        ));
     }
 
     #[test]
@@ -875,12 +916,12 @@ mod tests {
             grant("staging", "s3://b/data/x"),
         ];
         assert!(matches!(
-            encode_grants(&cross),
+            encode_grants(&TENANT_A, &cross),
             Err(GrantsError::OverlapsOtherProfile { .. })
         ));
         let dup = vec![grant("prod", "s3://b/data"), grant("prod", "s3://b/data")];
         assert!(matches!(
-            encode_grants(&dup),
+            encode_grants(&TENANT_A, &dup),
             Err(GrantsError::DuplicateGrant { .. })
         ));
         // Built by hand, past the encoder, they are refused on the way back
@@ -888,6 +929,7 @@ mod tests {
         let key = grants_key(&TENANT_A);
         let body = pb::ParquetGrants {
             format_version: PARQUET_GRANTS_FORMAT_VERSION,
+            tenant_hash: TENANT_A.0.to_vec(),
             grants: cross
                 .iter()
                 .map(|g| pb::ParquetGrant {
@@ -907,6 +949,7 @@ mod tests {
         // So is a stored prefix that is not canonical.
         let body = pb::ParquetGrants {
             format_version: PARQUET_GRANTS_FORMAT_VERSION,
+            tenant_hash: TENANT_A.0.to_vec(),
             grants: vec![pb::ParquetGrant {
                 profile: "prod".into(),
                 scheme: "s3".into(),

@@ -57,6 +57,10 @@ message ParquetTableManifest {
   // CreateIfAbsent whose stored bytes differ is another writer's version and
   // not this writer's own retried write.
   bytes apply_nonce = 12;
+  // The 16-byte tenant hash of the tenant this version belongs to; must equal
+  // the `<tenant_hash>` segment of the key it is stored at, so a version
+  // copied under another tenant's key is refused rather than read as theirs.
+  bytes tenant_hash = 13;
 }
 
 // One external Parquet file a manifest pins.
@@ -95,6 +99,11 @@ message ParquetGrants {
   // under different profiles are refused when a grant is added, so a location
   // resolves to exactly one profile.
   repeated ParquetGrant grants = 2;
+  // The 16-byte tenant hash of the tenant these grants belong to; must equal
+  // the `<tenant_hash>` segment of the key the record is stored at, so a
+  // record copied under another tenant's key is refused rather than read as
+  // that tenant's grants.
+  bytes tenant_hash = 3;
 }
 
 // One granted location: a credential profile plus a location in that

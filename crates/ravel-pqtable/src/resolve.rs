@@ -131,7 +131,7 @@ mod tests {
     async fn put_version(store: &MemoryStore, tenant: &TenantHash, version: u64) {
         let m = live_manifest("hits", version, &[version as u8]);
         let key = manifest_key(tenant, "hits", version).expect("key");
-        let bytes = encode_manifest(&m).expect("encode");
+        let bytes = encode_manifest(tenant, &m).expect("encode");
         store
             .put(&key, Bytes::from(bytes), PutOptions::create_if_absent())
             .await

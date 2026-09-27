@@ -290,7 +290,7 @@ pub async fn apply(
             Step::Write(manifest) => manifest,
         };
         let key = manifest_key(tenant, table, manifest.version)?;
-        let bytes = encode_manifest(&manifest)?;
+        let bytes = encode_manifest(tenant, &manifest)?;
         if clock.now_ns().saturating_sub(resolved_at) > budget_ns {
             continue;
         }
