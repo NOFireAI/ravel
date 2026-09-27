@@ -168,6 +168,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   own bucket under another name. `ravel_cache::CacheKey::pinned` keys such an
   object by profile, bucket, key, ETag, version and size. No shipping binary
   reaches any of it yet; the callers are #2052, #2051 and #2054.
+- **Parquet table manifest format and object layer** (ADR-2040, issue #2050):
+  the new `ravel-pqtable` crate and `proto/ravel/parquet_table.proto`. No
+  shipping binary calls it yet.
 - **`ravel-server` builds a read and a write CPU gate and reports their
   queueing on `/metrics`** (ADR-1702, issue #1702). A new crate,
   `ravel-cpu-gate`, holds the gate: a job at or above its inline floor

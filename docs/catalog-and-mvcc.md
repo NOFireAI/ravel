@@ -25,6 +25,8 @@ t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapsho
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942, ADR-1413)
+t/<tenant_hash>/pq/d/<dataset>/<hash16>.parquet                         Parquet table data object (content-addressed by BLAKE3, CreateIfAbsent or multipart, immutable; ADR-2040 D1)
+t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm                        Parquet table manifest version (CreateIfAbsent, immutable, newest version is the table; ADR-2040 D1)
 sys/qualification                                                       store qualification record (once per suite version, re-recorded on a version bump; ADR-1302)
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)

@@ -1,0 +1,26 @@
+[package]
+name = "ravel-pqtable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Parquet table manifests, key layout and object-storage operations (ADR-2040). Arrow-free."
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-object-store = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+blake3 = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

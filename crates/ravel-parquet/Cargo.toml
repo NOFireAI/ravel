@@ -1,0 +1,30 @@
+[package]
+name = "ravel-parquet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DataFusion table provider over Ravel Parquet tables (ADR-2040 D3). Skeleton."
+
+[dependencies]
+ravel-pqtable = { path = "../ravel-pqtable" }
+ravel-query = { workspace = true }
+ravel-cache = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-types = { workspace = true }
+# The workspace has no datafusion pin; ravel-sql names "54" directly too.
+# Without its `parquet` feature: the Parquet reader comes from
+# datafusion-datasource-parquet below.
+datafusion = { version = "54", default-features = false }
+datafusion-datasource-parquet = { version = "54", default-features = false }
+# The object_store major datafusion 54 is built on, beside the workspace's
+# 0.14, for the adapter between the two.
+object_store = { version = "0.13", default-features = false }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
