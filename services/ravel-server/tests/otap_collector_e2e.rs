@@ -109,6 +109,7 @@ async fn start_test_server() -> ravel_server::Running {
         max_flush_delay: std::time::Duration::from_secs(2),
         max_flush_delay_idle: std::time::Duration::from_secs(40),
         min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
         mode: Mode::All,
         // Bound to loopback but reachable from the collector container via
         // `--network host` (Linux only; no Docker Desktop fallback).

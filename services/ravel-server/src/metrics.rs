@@ -571,7 +571,7 @@ impl Label {
 
 /// Exhaustive: adding a [`Signal`] variant breaks this compile until it is
 /// handled here, same discipline as `StoreErrorClass::of`.
-fn signal_name(signal: Signal) -> &'static str {
+pub(crate) fn signal_name(signal: Signal) -> &'static str {
     match signal {
         Signal::Metrics => "metrics",
         Signal::Logs => "logs",
@@ -866,6 +866,13 @@ pub struct IngestPipelineSnapshot {
     pub signal: Signal,
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
+    /// Flushes opened on the sub-floor hold rather than on
+    /// `max_flush_delay_idle`, because the buffer held fewer object bytes than
+    /// `--idle-flush-byte-floor` (ADR-1737 decision 6). Carried for every
+    /// signal, not `Option`-gated like `adaptive_flushes`: the floor is read
+    /// by all three shard actors, so a logs- or spans-only process renders a
+    /// real (zero, unless the flag is set) sample too.
+    pub flushes_by_age_floor: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -1035,6 +1042,7 @@ impl IngestPipelineSnapshot {
             signal: Signal::Metrics,
             flushes_by_size: snapshot.flushes_by_size,
             flushes_by_age: snapshot.flushes_by_age,
+            flushes_by_age_floor: snapshot.flushes_by_age_floor,
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
@@ -1079,6 +1087,7 @@ impl IngestPipelineSnapshot {
             signal: Signal::Logs,
             flushes_by_size: snapshot.flushes_by_size,
             flushes_by_age: snapshot.flushes_by_age,
+            flushes_by_age_floor: snapshot.flushes_by_age_floor,
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
@@ -1122,6 +1131,7 @@ impl IngestPipelineSnapshot {
             signal: Signal::Spans,
             flushes_by_size: snapshot.flushes_by_size,
             flushes_by_age: snapshot.flushes_by_age,
+            flushes_by_age_floor: snapshot.flushes_by_age_floor,
             flushes_manual: snapshot.flushes_manual,
             put_retries: snapshot.put_retries,
             abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
@@ -1184,6 +1194,29 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_flushes_by_age_total",
             &labels(mode, pipeline.signal),
             pipeline.flushes_by_age,
+        );
+    }
+
+    // ADR-1737 decision 6: the sub-floor hold gets its own counter beside the
+    // two age families, so an operator can see the floor holding buffers and
+    // size the buffered-mode loss window they accepted by setting it. An
+    // unconditional family, unlike the adaptive one below: all three actors
+    // read the floor, so a logs- or spans-only process renders it too.
+    write_header(
+        out,
+        "ravel_ingest_flushes_by_age_floor_total",
+        "Flushes opened because the tenant buffer aged past the sub-floor hold, which a buffer \
+         under --idle-flush-byte-floor waits for instead of max_flush_delay_idle, by signal. \
+         Zero unless that flag is set; a rise means the floor is holding buffers, and those \
+         buffers carry a buffered-mode loss window of up to max_flush_lifetime.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_flushes_by_age_floor_total",
+            &labels(mode, pipeline.signal),
+            pipeline.flushes_by_age_floor,
         );
     }
 
