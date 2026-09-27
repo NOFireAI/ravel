@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::budget::IngestByteBudgetLimit;
+use crate::metrics::FlushTrigger;
 
 /// RSEG trailer version every flush emits. ADR-0027 leaves v7 the only
 /// writable version (ADR-0092 bumped it from v6), so this is no longer a
@@ -328,6 +329,32 @@ pub(crate) fn size_trigger_fires(
     flush_est_bytes >= config.target_bytes || memory_backstop_crossed(est_bytes, config, ceiling)
 }
 
+/// The age threshold, and the trigger to record, for a buffer with no
+/// strict-mode waiter and under `min_flush_bytes` of object, shared by the
+/// metrics, log, and span shard actors (ADR-1737 decision 2). Below a non-zero
+/// `idle_flush_byte_floor` the buffer waits for `max_flush_lifetime`, the hold
+/// ceiling ADR-0052's `FLUSH_BOUND_SLACK_HOURS` already covers; otherwise it
+/// waits for `max_flush_delay_idle`. `flush_est_bytes` is the same object-bytes
+/// estimate the caller compared against `min_flush_bytes`, so a buffer moves up
+/// a tier as rows arrive and a trickle that reaches the floor flushes on the
+/// idle clock measured from its oldest row.
+pub(crate) fn idle_age_threshold(
+    flush_est_bytes: usize,
+    config: &IngestConfig,
+) -> (i64, FlushTrigger) {
+    if config.idle_flush_byte_floor > 0 && flush_est_bytes < config.idle_flush_byte_floor {
+        (
+            config.max_flush_lifetime.as_nanos() as i64,
+            FlushTrigger::AgeFloor,
+        )
+    } else {
+        (
+            config.max_flush_delay_idle.as_nanos() as i64,
+            FlushTrigger::Age,
+        )
+    }
+}
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -368,6 +395,22 @@ pub struct IngestConfig {
     /// PUT" is a statement about the object, not about the RAM the buffer
     /// occupies while building it.
     pub min_flush_bytes: usize,
+    /// Opt-in third age tier (ADR-1737). When non-zero, a buffer with no
+    /// strict-mode waiter whose flush would write fewer than this many object
+    /// bytes waits for `max_flush_lifetime` instead of `max_flush_delay_idle`
+    /// before its age trigger fires, and that flush is counted as
+    /// [`FlushTrigger::AgeFloor`]. Read by the metrics, log, and span actors
+    /// against the same object-bytes estimate as `min_flush_bytes`.
+    ///
+    /// 0, the default, disables the tier, and every actor keeps the two-clock
+    /// predicate. A non-zero value widens the buffered-mode loss window that
+    /// docs/consistency-model.md states, for a buffer below the floor, from
+    /// `max_flush_delay_idle` to `max_flush_lifetime`. It must be below
+    /// `min_flush_bytes`;
+    /// [`IngestConfig::validate`] refuses anything else.
+    ///
+    /// [`FlushTrigger::AgeFloor`]: crate::FlushTrigger::AgeFloor
+    pub idle_flush_byte_floor: usize,
     /// Retries after the first attempt for the data-object PUT (total
     /// attempts = this + 1). Also bounds retries of the commit-record PUT.
     /// This matches `ravel_commit::publish::RetryPolicy::max_attempts`'s own
@@ -476,6 +519,7 @@ impl Default for IngestConfig {
             flush_tick: Duration::from_millis(200),
             max_flush_delay_idle: Duration::from_secs(40),
             min_flush_bytes: 256 * 1024,
+            idle_flush_byte_floor: 0,
             put_retry_max_attempts: 4,
             put_retry_base_delay: Duration::from_millis(100),
             put_retry_max_delay: Duration::from_secs(2),
@@ -512,7 +556,37 @@ impl Default for IngestConfig {
     }
 }
 
+/// A cross-field [`IngestConfig`] constraint that [`IngestConfig::validate`]
+/// refuses.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IngestConfigError {
+    /// A non-zero `idle_flush_byte_floor` at or above `min_flush_bytes`
+    /// (ADR-1737 decision 1). Such a floor has no idle tier left between it
+    /// and the fast clock, so every buffer below `min_flush_bytes` would wait
+    /// for `max_flush_lifetime`.
+    #[error(
+        "idle_flush_byte_floor ({floor} bytes) must be below min_flush_bytes \
+         ({min_flush_bytes} bytes), or 0 to disable it"
+    )]
+    IdleFlushByteFloorNotBelowMinFlushBytes {
+        floor: usize,
+        min_flush_bytes: usize,
+    },
+}
+
 impl IngestConfig {
+    /// Checks the cross-field constraints a caller building an `IngestConfig`
+    /// from operator input must refuse before constructing a router.
+    pub fn validate(&self) -> Result<(), IngestConfigError> {
+        if self.idle_flush_byte_floor != 0 && self.idle_flush_byte_floor >= self.min_flush_bytes {
+            return Err(IngestConfigError::IdleFlushByteFloorNotBelowMinFlushBytes {
+                floor: self.idle_flush_byte_floor,
+                min_flush_bytes: self.min_flush_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// The per-shard queued-flush cap as the shard actors enforce it: at least
     /// 1, whatever [`IngestConfig::max_queued_flushes`] holds. This is where
     /// the "at least 1" rule is applied, rather than in a validator every
@@ -646,6 +720,7 @@ mod tests {
         assert_eq!(cfg.flush_tick, Duration::from_millis(200));
         assert_eq!(cfg.max_flush_delay_idle, Duration::from_secs(40));
         assert_eq!(cfg.min_flush_bytes, 256 * 1024);
+        assert_eq!(cfg.idle_flush_byte_floor, 0);
         assert_eq!(cfg.put_retry_max_attempts, 4);
         assert_eq!(cfg.put_retry_base_delay, Duration::from_millis(100));
         assert_eq!(cfg.put_retry_max_delay, Duration::from_secs(2));
@@ -670,6 +745,36 @@ mod tests {
         assert_eq!(
             cfg.strict_visibility_budget_ns,
             cfg.max_flush_delay.as_nanos() as i64 + STRICT_VISIBILITY_RESERVE_NS
+        );
+    }
+
+    /// ADR-1737 decision 1: 0 disables the floor and is always accepted, a
+    /// floor below `min_flush_bytes` is accepted, and a floor at or above it
+    /// is refused with the typed error naming both values.
+    #[test]
+    fn idle_flush_byte_floor_must_be_below_min_flush_bytes() {
+        let min_flush_bytes = 256 * 1024;
+        let with_floor = |floor| IngestConfig {
+            min_flush_bytes,
+            idle_flush_byte_floor: floor,
+            ..IngestConfig::default()
+        };
+        assert_eq!(IngestConfig::default().validate(), Ok(()));
+        assert_eq!(with_floor(0).validate(), Ok(()));
+        assert_eq!(with_floor(min_flush_bytes - 1).validate(), Ok(()));
+        assert_eq!(
+            with_floor(min_flush_bytes).validate(),
+            Err(IngestConfigError::IdleFlushByteFloorNotBelowMinFlushBytes {
+                floor: min_flush_bytes,
+                min_flush_bytes,
+            })
+        );
+        assert_eq!(
+            with_floor(min_flush_bytes + 1).validate(),
+            Err(IngestConfigError::IdleFlushByteFloorNotBelowMinFlushBytes {
+                floor: min_flush_bytes + 1,
+                min_flush_bytes,
+            })
         );
     }
 

@@ -416,11 +416,21 @@ impl std::fmt::Display for FloorDefect {
 pub const MAX_SHARD_COUNT: u32 = 10_000;
 
 /// The flush-timing component of the read-side scan slack `S`, in ingest
-/// hours: `ceil(max_flush_delay_idle + max_flush_lifetime)` with today's
-/// ingest defaults (`max_flush_delay_idle` 40s + `max_flush_lifetime` 3600s)
-/// = 2. `max_flush_delay_idle`, not `max_flush_delay`, is the real worst-case
-/// buffer age before a forced flush (ADR-0076 decision 4): a buffer with no
-/// strict waiter can age all the way to the idle ceiling. Held
+/// hours: `ceil(worst buffer age at flush open + max_flush_lifetime)`. The
+/// worst buffer age at flush open is the hold ceiling of ADR-1737, which is
+/// `max_flush_lifetime` itself: with a non-zero `idle_flush_byte_floor` a
+/// buffer below the floor and with no strict waiter waits that long before
+/// its age trigger fires. So the derivation reads
+/// `ceil(max_flush_lifetime + max_flush_lifetime)` = `ceil(3600s + 3600s)` = 2
+/// with today's ingest defaults. The ingest hour is fixed when the flush
+/// opens, so the gap between routing a record and its ingest hour is at most
+/// that hold plus one `flush_tick` (200ms) of age-check lateness, 3,600.2s,
+/// inside the two hours; the ingest-side test checks that gap in nanoseconds.
+/// With the floor at its default of 0 the worst
+/// age is the idle ceiling, `max_flush_delay_idle` (40s, ADR-0076 decision 4),
+/// which the same two hours cover with room to spare. Because the hold ceiling
+/// is the lifetime rather than a separate knob, no floor value moves this
+/// constant; a hold ceiling above `max_flush_lifetime` would. Held
 /// separately from [`TOLERATED_CLOCK_SKEW_HOURS`] so the two components of the
 /// ADR-0052 section 3 formula (below) are each named and independently
 /// reviewable, rather than folded into one unexplained literal.
@@ -434,7 +444,8 @@ pub const MAX_SHARD_COUNT: u32 = 10_000;
 /// shard's `JoinSet`, which under a stalled store takes up to
 /// `max_flush_lifetime`, and nothing makes the retry fair, so nothing bounds
 /// the number of rounds. At today's defaults one round alone gives
-/// `40s + 3600s + 3600s = 7240s`, past the 7200s this constant allows.
+/// `40s + 3600s + 3600s = 7240s`, past the 7200s this constant allows, and
+/// with a non-zero `idle_flush_byte_floor` it gives `3600s + 3600s + 3600s`.
 /// `ravel_ingest::shard::tests::a_deferred_flush_can_overrun_the_flush_bound_slack`
 /// measures that overrun against a live shard actor, deferring three ingest
 /// hours against this two-hour constant.

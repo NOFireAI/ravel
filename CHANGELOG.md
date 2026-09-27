@@ -166,6 +166,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `span_shard.rs`, matching the metrics and log pipelines, so all six series
   carry live figures on all three signals.
 
+- **`ravel-ingest` has an opt-in idle flush byte floor, off by default**
+  (ADR-1737, issue #1737). `IngestConfig::idle_flush_byte_floor` defaults to
+  0, which changes nothing: every buffer flushes on the same clocks as before.
+  When set to a value below `min_flush_bytes` (`IngestConfig::validate`
+  refuses anything else), a metrics, log, or span buffer with no strict-mode
+  waiter that would write fewer object bytes than the floor waits for
+  `max_flush_lifetime` instead of the 40 s idle clock, and each such flush is
+  counted as `flushes_by_age_floor` in the pipeline's metrics snapshot. A
+  buffer that reaches the floor goes back to the idle clock, and strict-mode
+  writes keep the fast clock. `ravel-server` does not expose the knob yet, so
+  no deployment's flush cadence or buffered-mode loss window changes with this
+  release.
+
 ### Changed
 
 - **The default query request budget is now derived from the unsealed tail a

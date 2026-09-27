@@ -50,6 +50,10 @@ pub struct LogIngestMetrics {
     /// Flushes opened because the tenant buffer aged past `max_flush_delay`.
     /// Attempt-time, same as `flushes_by_size`.
     flushes_by_age: AtomicU64,
+    /// Flushes opened because a tenant buffer below a non-zero
+    /// `idle_flush_byte_floor` aged past `max_flush_lifetime`
+    /// ([`FlushTrigger::AgeFloor`], ADR-1737 decision 6). Attempt-time.
+    flushes_by_age_floor: AtomicU64,
     /// Flushes opened by any [`FlushTrigger::Manual`] path. Attempt-time.
     flushes_manual: AtomicU64,
     /// Retried PUT attempts across both the data-object and commit-record
@@ -249,6 +253,7 @@ pub struct LogIngestMetrics {
 pub struct LogIngestMetricsSnapshot {
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
+    pub flushes_by_age_floor: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -342,7 +347,9 @@ pub struct FlushTriggerMix {
     pub size: u64,
     /// Flushes opened because the tenant buffer aged past `max_flush_delay`
     /// ([`FlushTrigger::Age`], and the metrics-only [`FlushTrigger::AgeAdaptive`]
-    /// the log actor never raises).
+    /// the log actor never raises) or, below a non-zero `idle_flush_byte_floor`,
+    /// past `max_flush_lifetime` ([`FlushTrigger::AgeFloor`]). The process-wide
+    /// counters keep the floor case apart as `flushes_by_age_floor`.
     pub age: u64,
     /// Flushes opened by the final drain at close: a [`FlushTrigger::Manual`]
     /// shutdown drain, channel-close drain, or explicit flush request.
@@ -436,6 +443,7 @@ impl LogIngestMetrics {
             // this arm exists only so the shared `FlushTrigger` enum stays
             // exhaustive here, and is never reached from this actor.
             FlushTrigger::Age | FlushTrigger::AgeAdaptive => &self.flushes_by_age,
+            FlushTrigger::AgeFloor => &self.flushes_by_age_floor,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -449,7 +457,9 @@ impl LogIngestMetrics {
         let entry = map.entry(shard).or_default();
         match trigger {
             FlushTrigger::Size => entry.size += 1,
-            FlushTrigger::Age | FlushTrigger::AgeAdaptive => entry.age += 1,
+            FlushTrigger::Age | FlushTrigger::AgeAdaptive | FlushTrigger::AgeFloor => {
+                entry.age += 1
+            }
             FlushTrigger::Manual => entry.final_drain += 1,
         }
     }
@@ -677,6 +687,7 @@ impl LogIngestMetrics {
         LogIngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
+            flushes_by_age_floor: self.flushes_by_age_floor.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
@@ -997,6 +1008,30 @@ mod tests {
                 FlushTriggerMix {
                     size: 0,
                     age: 1,
+                    final_drain: 0
+                }
+            )]
+        );
+    }
+
+    /// The floor hold counts on its own process-wide counter and, like every
+    /// age cause, on the per-shard mix's `age`.
+    #[test]
+    fn age_floor_counts_separately_and_folds_into_the_age_cause() {
+        let metrics = LogIngestMetrics::default();
+        metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::AgeFloor);
+        metrics.record_flush(0, FlushTrigger::AgeFloor);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_by_age_floor, 2);
+        assert_eq!(
+            metrics.flush_trigger_mix_by_shard(),
+            vec![(
+                0,
+                FlushTriggerMix {
+                    size: 0,
+                    age: 3,
                     final_drain: 0
                 }
             )]
