@@ -201,7 +201,8 @@ corrected in the pinning amendment below.)
   crate sends both for S3, GCS and Azure through `GetOptions`. S3 and Azure
   report a version only on a bucket with versioning on. GCS always reports
   a generation, so a GCS file is pinned exactly.
-- A file that changed fails the query with a typed error naming it, "file
+- A file that changed fails the query (narrowed by the pinning amendment
+  below for a version-pinned file) with a typed error naming it, "file
   changed since the table was created; run `CREATE OR REPLACE`". A file
   that is gone fails the same way. Old and new bytes are never mixed in one
   query.
@@ -325,7 +326,8 @@ untouched.
   `S3Store`, `MemoryStore` and `FaultStore`, so every failure path can be
   tested without a cloud account. Every Parquet read carries the
   manifest's ETag and version, and a failed precondition is a typed
-  `FileChanged` error. The workspace's `object_store` gains its `gcp` and
+  `FileChanged` error (a version pin selects rather than fails; see the
+  pinning amendment below). The workspace's `object_store` gains its `gcp` and
   `azure` features for this.
 - **A `ParquetFileReaderFactory` and `AsyncFileReader`.** They read through
   the external read store, the process-wide `GetLimiter`, and the
@@ -374,7 +376,8 @@ grants record is cached per tenant for at most 60 seconds, so a revoked
 grant stops admitting reads within 60 seconds.
 
 A file changed or deleted under a table fails the
-query with `FileChanged` or `FileMissing`. Re-resolving cannot help,
+query with `FileChanged` or `FileMissing`, as the pinning amendment below
+narrows for version-pinned files. Re-resolving cannot help,
 because the manifest still names the old bytes, so the error tells the
 caller to run `CREATE OR REPLACE`.
 
@@ -674,7 +677,9 @@ and the per-query memory cap:
   typed errors, never panics, and property tests over mutated files pin
   that.
 - **A table breaks when its owner changes a file.** Queries fail with
-  `FileChanged` or `FileMissing` until someone runs `CREATE OR REPLACE`.
+  `FileChanged` or `FileMissing` (per the pinning amendment below, a
+  version-pinned file fails only when that version is deleted) until
+  someone runs `CREATE OR REPLACE`.
   That is deliberate, since the alternative is a silent wrong answer. An
   append-only data lake that only adds files never hits it; a new file
   simply stays invisible until the next `CREATE OR REPLACE`.
@@ -751,12 +756,15 @@ flowchart TB
   ext --> lake[(granted bucket)]
   sess -. any other URL .-> refuse[error]
   tps -. file outside manifest .-> refuse
+  %% amendment-supersedes-allow: the diagram shows the ETag-only case; the pinning amendment below covers version pins
   ext -. file changed .-> changed[FileChanged]
 ```
 
-## Amendment (2026-09-28): version pins select, S3 versions are surfaced, and the bucket probe also looks for Ravel's marker
+## Amendment (2026-09-28): version pins select, S3 versions must be surfaced, and the bucket probe also looks for Ravel's marker
 
 <!-- amendment-applies: sections="D1. A table is a pinned snapshot of Parquet files where they already are" pointer="pinning amendment" -->
+<!-- amendment-supersedes: phrase="`FileChanged`" pointer="pinning amendment" -->
+<!-- amendment-supersedes: phrase="A file that changed fails the query" pointer="pinning amendment" -->
 
 The wave 1 checkpoint review of epic #2040 found three places where D1
 described behaviour the storage backends do not have.
@@ -778,9 +786,13 @@ ETag alone. The corrected rule:
   `PreconditionFailed`, and the query fails with `FileChanged`, as D1 said.
 - Old and new bytes are still never mixed in one query, in either case.
 
-**S3 versions are surfaced.** The S3 adapter must report the object's
-`x-amz-version-id` when the bucket has versioning on, so an S3 file is
-pinned by version as well as ETag. Until it does, S3 pins are ETag-only, and
+**S3 versions must be surfaced.** The external read store's S3 kind is
+built on Ravel's own `S3Store` adapter
+(`crates/ravel-object-store/src/external.rs`), which reports every object's
+version as its ETag and drops `x-amz-version-id`. It must report the real
+version id when the bucket has versioning on, so an S3 file is pinned by
+version as well as ETag; the wave 1 fix round of epic #2040 does this. Until
+it does, S3 pins are ETag-only, and
 D1's closing sentence on the cache key ("A versioned bucket, or GCS, removes
 this") holds for GCS and for Azure but not for S3.
 
