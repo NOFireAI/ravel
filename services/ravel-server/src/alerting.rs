@@ -864,8 +864,9 @@ impl AlertEvaluator {
             // tick folds to Resolved here and does not repeat. No durable record
             // is written for a repeat (decision 4 stands); it rides the existing
             // `undelivered` map and `flush_sinks` drain.
+            let firing = firing_by_rule(&latest);
             for rule in &rules {
-                self.queue_repeat_if_due(rule, &latest, now_ns, &mut report);
+                self.queue_repeat_if_due(rule, firing_of(&firing, rule), now_ns, &mut report);
             }
             self.prune_repeat_marks(&latest);
             self.rules = rules;
@@ -1064,7 +1065,9 @@ impl AlertEvaluator {
     /// latest record is still `Firing` and whose current repeat window has not
     /// yet been queued (ADR-0043 "repeat notifications while firing"
     /// amendment). A rule's alerts are the folded records carrying its
-    /// `rule_id`, one per identity (ADR-0117 decision 4).
+    /// `rule_id`, one per identity (ADR-0117 decision 4); `firing` is the
+    /// rule's `Firing` slice of them, grouped once per tick by
+    /// [`firing_by_rule`].
     ///
     /// The window index is
     ///
@@ -1101,7 +1104,7 @@ impl AlertEvaluator {
     fn queue_repeat_if_due(
         &mut self,
         rule: &Rule,
-        latest: &HashMap<AlertId, AlertRecord>,
+        firing: &[(AlertId, &AlertRecord)],
         now_ns: i64,
         report: &mut AlertEvalReport,
     ) {
@@ -1117,17 +1120,15 @@ impl AlertEvaluator {
         let interval_ns = i64::try_from(interval.as_nanos())
             .unwrap_or(i64::MAX)
             .max(1);
-        for (alert_id, record) in latest {
-            if record.rule_id == rule.rule_id && record.state == AlertState::Firing {
-                self.queue_repeat_for_alert(
-                    *alert_id,
-                    record,
-                    &rule.labels,
-                    interval_ns,
-                    now_ns,
-                    report,
-                );
-            }
+        for (alert_id, record) in firing {
+            self.queue_repeat_for_alert(
+                *alert_id,
+                record,
+                &rule.labels,
+                interval_ns,
+                now_ns,
+                report,
+            );
         }
     }
 
@@ -1651,6 +1652,31 @@ impl Drop for AlertEvaluator {
     fn drop(&mut self) {
         self.metrics.move_undelivered(self.undelivered_reported, 0);
     }
+}
+
+/// The `Firing` records of `latest`, grouped by `rule_id` in one pass so the
+/// repeat pass reads `latest` once per tick rather than once per rule.
+fn firing_by_rule(
+    latest: &HashMap<AlertId, AlertRecord>,
+) -> HashMap<&str, Vec<(AlertId, &AlertRecord)>> {
+    let mut groups: HashMap<&str, Vec<(AlertId, &AlertRecord)>> = HashMap::new();
+    for (alert_id, record) in latest {
+        if record.state == AlertState::Firing {
+            groups
+                .entry(record.rule_id.as_str())
+                .or_default()
+                .push((*alert_id, record));
+        }
+    }
+    groups
+}
+
+/// `rule`'s slice of [`firing_by_rule`], empty when none of its alerts fire.
+fn firing_of<'a>(
+    groups: &'a HashMap<&str, Vec<(AlertId, &'a AlertRecord)>>,
+    rule: &Rule,
+) -> &'a [(AlertId, &'a AlertRecord)] {
+    groups.get(rule.rule_id.as_str()).map_or(&[], Vec::as_slice)
 }
 
 /// A fold in progress: the winning `(ts_ns, epoch, seq)` order and record for
@@ -3314,7 +3340,12 @@ mod tick_tests {
             let mut report = AlertEvalReport::default();
             ev.repeat_marks.clear();
             ev.undelivered.clear();
-            ev.queue_repeat_if_due(&rule, &latest, due, &mut report);
+            ev.queue_repeat_if_due(
+                &rule,
+                firing_of(&firing_by_rule(&latest), &rule),
+                due,
+                &mut report,
+            );
             assert_eq!(report.repeats_queued, 0, "{state:?} must never repeat");
             assert!(
                 ev.undelivered.is_empty(),
@@ -3326,7 +3357,12 @@ mod tick_tests {
         let mut report = AlertEvalReport::default();
         ev.repeat_marks.clear();
         ev.undelivered.clear();
-        ev.queue_repeat_if_due(&rule, &latest, due, &mut report);
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            due,
+            &mut report,
+        );
         assert_eq!(report.repeats_queued, 1, "a firing record repeats when due");
         assert!(
             ev.undelivered.contains_key(&alert_id),
@@ -3353,7 +3389,12 @@ mod tick_tests {
         let new_anchor = NOW_NS + 10_000 * NS_PER_SEC;
         let latest = latest_with(&rule, AlertState::Firing, new_anchor);
         let mut report = AlertEvalReport::default();
-        ev.queue_repeat_if_due(&rule, &latest, new_anchor + 60 * NS_PER_SEC, &mut report);
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            new_anchor + 60 * NS_PER_SEC,
+            &mut report,
+        );
 
         assert_eq!(
             report.repeats_queued, 1,
@@ -3396,6 +3437,41 @@ mod tick_tests {
         assert_eq!(ev.repeat_marks[&firing_id], (NOW_NS, 1));
     }
 
+    /// The per-tick grouping hands each rule exactly its own Firing alerts: a
+    /// resolved alert of the same rule and a firing alert of another rule are
+    /// both left out of its slice.
+    #[test]
+    fn firing_by_rule_hands_each_rule_only_its_own_firing_alerts() {
+        let a = repeat_rule(Some(Duration::from_secs(60)));
+        let mut b = repeat_rule(Some(Duration::from_secs(60)));
+        b.rule_id = "other-rule".to_owned();
+        let a_firing_id = compute_alert_id(&a.rule_id, &a.labels);
+        let b_firing_id = compute_alert_id(&b.rule_id, &b.labels);
+        let a_resolved_labels = vec![("instance".to_owned(), "gone".to_owned())];
+        let a_resolved_id = compute_alert_id(&a.rule_id, &a_resolved_labels);
+
+        let mut latest = latest_with(&a, AlertState::Firing, NOW_NS);
+        latest.extend(latest_with(&b, AlertState::Firing, NOW_NS));
+        let mut resolved = latest_with(&a, AlertState::Resolved, NOW_NS)
+            .into_values()
+            .next()
+            .expect("one record");
+        resolved.alert_id = a_resolved_id;
+        resolved.labels = a_resolved_labels;
+        latest.insert(a_resolved_id, resolved);
+
+        let groups = firing_by_rule(&latest);
+        let ids = |rule: &Rule| -> Vec<AlertId> {
+            firing_of(&groups, rule).iter().map(|(id, _)| *id).collect()
+        };
+        assert_eq!(groups.len(), 2);
+        assert_eq!(ids(&a), vec![a_firing_id]);
+        assert_eq!(ids(&b), vec![b_firing_id]);
+        let mut c = repeat_rule(None);
+        c.rule_id = "silent-rule".to_owned();
+        assert_eq!(ids(&c), Vec::<AlertId>::new());
+    }
+
     /// A backward clock step clamps the window to zero, so no repeat is queued
     /// (matching the pending-duration clamp).
     #[tokio::test]
@@ -3406,7 +3482,12 @@ mod tick_tests {
         let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
 
         let mut report = AlertEvalReport::default();
-        ev.queue_repeat_if_due(&rule, &latest, NOW_NS - 120 * NS_PER_SEC, &mut report);
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            NOW_NS - 120 * NS_PER_SEC,
+            &mut report,
+        );
         assert_eq!(
             report.repeats_queued, 0,
             "a clock behind the firing record clamps to window 0"
@@ -3423,7 +3504,12 @@ mod tick_tests {
         let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
 
         let mut report = AlertEvalReport::default();
-        ev.queue_repeat_if_due(&rule, &latest, NOW_NS + 600 * NS_PER_SEC, &mut report);
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            NOW_NS + 600 * NS_PER_SEC,
+            &mut report,
+        );
         assert_eq!(report.repeats_queued, 0, "0s disables repeats for the rule");
     }
 
@@ -3437,7 +3523,12 @@ mod tick_tests {
         let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
 
         let mut report = AlertEvalReport::default();
-        ev.queue_repeat_if_due(&rule, &latest, NOW_NS + 59 * NS_PER_SEC, &mut report);
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            NOW_NS + 59 * NS_PER_SEC,
+            &mut report,
+        );
         assert_eq!(
             report.repeats_queued, 0,
             "just under the 60s default: no repeat"
@@ -3446,7 +3537,12 @@ mod tick_tests {
         ev.repeat_marks.clear();
         ev.undelivered.clear();
         let mut report = AlertEvalReport::default();
-        ev.queue_repeat_if_due(&rule, &latest, NOW_NS + 60 * NS_PER_SEC, &mut report);
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            NOW_NS + 60 * NS_PER_SEC,
+            &mut report,
+        );
         assert_eq!(
             report.repeats_queued, 1,
             "at the 60s default cadence a repeat is due"
