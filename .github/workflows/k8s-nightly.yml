@@ -184,10 +184,10 @@ jobs:
   # of ravel-sim and not run in PR CI (it needs a real object store, real
   # binaries, a real multi-threaded runtime, a real clock, and a real
   # `kill -9`); this nightly workflow is its home. Both scenarios carry the
-  # exit-code contract they declare themselves: scenario 1 exits nonzero on a
-  # strict-ack violation, scenario 2 exits 2 on any pinned-oracle failure (a
-  # release-blocking bug, not a flaky test), 1 on an ordinary oracle failure
-  # and 3 or more on a setup error. Each step names which of those it got in
+  # exit-code contract they declare themselves: scenario 1 exits 1 on a
+  # pinned-oracle failure, scenario 2 exits 2 on any pinned-oracle failure (a
+  # release-blocking bug, not a flaky test), and both exit 3 or more on a
+  # setup or usage error, with no oracle verdict. Each step names which of those it got in
   # an error annotation, and a nonzero exit from either script fails this job.
   # The helpers both scripts rest on are covered on every pull request by
   # ci.yml's doc-scripts job (scripts/chaos/lib.test.sh).
@@ -240,9 +240,11 @@ jobs:
         run: |
           code=0
           scripts/chaos/kill-ingest-flush.sh || code=$?
-          if [ "$code" -ne 0 ]; then
-            echo "::error::chaos scenario 1 (kill ingest mid-flush) failed with exit ${code}; see the ORACLE SUMMARY block"
-          fi
+          case "$code" in
+            0) ;;
+            1) echo "::error::chaos scenario 1 (kill ingest mid-flush) pinned-oracle failure (exit 1); see the ORACLE SUMMARY block" ;;
+            *) echo "::error::chaos scenario 1 setup or usage error (exit ${code}); no oracle verdict" ;;
+          esac
           exit "$code"
       # Scenario 2: kill a maintain worker mid-compaction, sibling running.
       # RELEASE-BLOCKING (ADR-0077 section 4): exit 2 on any oracle failure.

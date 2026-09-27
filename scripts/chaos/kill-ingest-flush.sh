@@ -29,8 +29,17 @@
 # the orchestrator's job (executors have no object store -- ADR-0077
 # section 4).
 #
+# Exit status: 0 when every pinned oracle assertion held, 1 when one failed
+# (an ordinary oracle failure; this scenario is not release-blocking), 3 on a
+# setup error, 64 on a usage error.
+#
 # Gate-shell discipline: see scripts/chaos/lib.sh header.
-set -euo pipefail
+set -eEuo pipefail
+# -E carries the ERR trap into functions, so a setup command that fails inside
+# a helper exits 3 like one at top level rather than with its own status,
+# which is often the 1 an oracle failure uses. The oracle calls below carry
+# `|| true` and never reach it.
+trap 'exit 3' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
@@ -88,6 +97,8 @@ SERVER_LOG="$(mktemp)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
 
 cleanup() {
+  # A failure in here must not turn the pending exit status into 3.
+  trap - ERR
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
@@ -142,7 +153,7 @@ ACKED_TOKENS=()
 for _ in $(seq 1 "$EXPORT_COUNT"); do
   tokens="$(drive_one_export "$HTTP_ADDR" "$FIXTURE_PATH")" || {
     log "export failed before kill; aborting scenario setup"
-    exit 1
+    exit 3
   }
   mapfile -t export_tokens <<<"$tokens"
   ACKED_TOKENS+=("${export_tokens[@]}")
