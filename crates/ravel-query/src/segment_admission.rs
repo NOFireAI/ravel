@@ -6,10 +6,17 @@
 //! executor, the five SQL providers, and the exemplars state move onto this
 //! seam.
 
-use ravel_catalog::{SegmentOrigins, Snapshot};
+use std::time::Duration;
 
-use crate::config::EngineConfig;
-use crate::error::QueryError;
+use ravel_catalog::{SegmentOrigin, SegmentOrigins, Snapshot};
+
+use crate::config::{EngineConfig, RequestLimit};
+use crate::error::{FoldLag, QueryError};
+
+/// Nanoseconds in one ingest-hour bucket. `ingest_hour_bucket` counts whole
+/// hours since the epoch, so bucket `H` starts at `H * NS_PER_HOUR` and ends at
+/// `(H + 1) * NS_PER_HOUR` (`ravel_catalog`'s `sealed_watermark_hour`).
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// The admitted view of a resolved snapshot: the sealed-set count that was
 /// checked against `max_segments` and the request budget recent/
@@ -48,19 +55,127 @@ pub fn admit(
     })
 }
 
-/// True when `requests` has passed `max_s3_requests`, mirroring
+/// True when this resolve's own outputs prove it read a folded snapshot part,
+/// so its [`SegmentOrigin::Recent`] tags really do mean "above the fold
+/// watermark".
+///
+/// Both witnesses are produced by the snapshot-extract step of
+/// `Catalog::resolve_impl` and by nothing else: `sealed_count` counts
+/// [`SegmentOrigin::SealedBelowWatermark`], which only that step assigns (the
+/// read-your-write token paths tag [`SegmentOrigin::TokenResolved`]), and
+/// `segments_pruned` counts postings pruning, which is applied to
+/// snapshot-sourced segments only.
+///
+/// When neither fired, the resolve either found no usable snapshot (an absent
+/// HEAD, or parts that were corrupt or unreadable) and listed the whole window
+/// live, or the snapshot it did read contributed nothing to this window. Either
+/// way every key it produced is tagged `Recent`, including hours that a fold
+/// keeping up has already sealed, so the span those tags imply is not a tail
+/// the fold can be held to.
+fn resolve_read_a_snapshot_part(snapshot: &Snapshot, origins: &SegmentOrigins) -> bool {
+    origins.sealed_count > 0 || snapshot.segments_pruned > 0
+}
+
+/// The unsealed tail one resolve saw: the span from the start of the oldest
+/// ingest hour it listed live (above the fold watermark) to query time
+/// (ADR-1306 decision 6). `None` when there is no such span it can attribute
+/// to the fold: no unsealed segment was listed, or this resolve read no folded
+/// snapshot part at all ([`resolve_read_a_snapshot_part`]).
+///
+/// Read off the resolve's own outputs, never from a fresh store request. When
+/// a snapshot part was read, an origin of [`SegmentOrigin::Recent`] is exactly
+/// "listed above the watermark", so the oldest such bucket starts at or after
+/// the end of the newest sealed hour and this is a lower bound on
+/// `now - end(watermark hour)`, never an over-estimate. When none was read the
+/// `Recent` tags carry no watermark at all, which is why that case is `None`
+/// rather than a span measured against a watermark this resolve never saw.
+/// `TokenResolved` segments are excluded either way: a read-your-write token
+/// can resolve a segment below the watermark, which is not tail.
+#[must_use]
+pub fn resolved_unsealed_tail(
+    snapshot: &Snapshot,
+    origins: &SegmentOrigins,
+    now_ns: i64,
+) -> Option<Duration> {
+    if !resolve_read_a_snapshot_part(snapshot, origins) {
+        return None;
+    }
+    let oldest_unsealed_hour = snapshot
+        .segments
+        .iter()
+        .zip(origins.origins.iter())
+        .filter(|(_, origin)| matches!(origin, SegmentOrigin::Recent))
+        .map(|(segment, _)| segment.ingest_hour_bucket)
+        .min()?;
+    let hour_start_ns = i64::from(oldest_unsealed_hour).checked_mul(NS_PER_HOUR)?;
+    let tail_ns = now_ns.checked_sub(hour_start_ns)?;
+    u64::try_from(tail_ns).ok().map(Duration::from_nanos)
+}
+
+/// The fold lag a resolve's unsealed tail implies, for the request-budget
+/// refusals downstream of it (ADR-1306 decision 6). `fold_lag_threshold` is
+/// [`crate::config::EngineConfig::fold_lag_threshold`] of the engine the query
+/// runs on.
+#[must_use]
+pub fn resolved_fold_lag(
+    snapshot: &Snapshot,
+    origins: &SegmentOrigins,
+    now_ns: i64,
+    fold_lag_threshold: Duration,
+) -> FoldLag {
+    FoldLag::from_resolved_tail(
+        resolved_unsealed_tail(snapshot, origins, now_ns),
+        fold_lag_threshold,
+    )
+}
+
+/// A request budget together with what the resolve behind this query's
+/// snapshot saw of the catalog's unsealed tail.
+///
+/// The two travel as one value so a check site cannot enforce the limit while
+/// forgetting the tail: every refusal built from a [`RequestBudget`] carries
+/// the fold-lag verdict the resolve computed (ADR-1306 decision 6). A bare
+/// [`RequestLimit`] converts in, for a caller with no resolve in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudget {
+    pub limit: RequestLimit,
+    pub fold_lag: FoldLag,
+}
+
+impl RequestBudget {
+    /// This budget's limit with `fold_lag` attached.
+    #[must_use]
+    pub fn new(limit: RequestLimit, fold_lag: FoldLag) -> RequestBudget {
+        RequestBudget { limit, fold_lag }
+    }
+}
+
+impl From<RequestLimit> for RequestBudget {
+    /// A limit checked with nothing known about the tail: a refusal keeps the
+    /// pre-ADR-1306 message.
+    fn from(limit: RequestLimit) -> RequestBudget {
+        RequestBudget {
+            limit,
+            fold_lag: FoldLag::Healthy,
+        }
+    }
+}
+
+/// True when `requests` has passed the budget's limit, mirroring
 /// `bytes_scanned_exceeded`'s incremental-comparison shape (ADR-0073
 /// decision 3): a typed error, checked at the same points the bytes-scanned
 /// budget already checks, never a truncation.
 pub fn request_budget_exceeded(
     requests: u64,
-    max_s3_requests: crate::config::RequestLimit,
+    budget: impl Into<RequestBudget>,
 ) -> Option<QueryError> {
-    use crate::config::RequestLimit;
-    match max_s3_requests {
-        RequestLimit::Bounded(max) if requests > max => {
-            Some(QueryError::RequestBudgetExceeded { requests, max })
-        }
+    let budget = budget.into();
+    match budget.limit {
+        RequestLimit::Bounded(max) if requests > max => Some(QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag: budget.fold_lag,
+        }),
         _ => None,
     }
 }
@@ -75,12 +190,14 @@ mod tests {
     };
     use uuid::Uuid;
 
-    use super::{admit, request_budget_exceeded};
+    use super::{
+        RequestBudget, admit, request_budget_exceeded, resolved_fold_lag, resolved_unsealed_tail,
+    };
     use crate::config::{
         BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, ByteLimit, EngineConfig, RequestLimit, SealMargin,
         covered_span, derive_max_s3_requests,
     };
-    use crate::error::QueryError;
+    use crate::error::{FoldLag, QueryError};
     use crate::request_budgets::RequestBudgets;
 
     /// The shard count a `ravel-server` process runs with by default
@@ -330,6 +447,245 @@ mod tests {
         assert!(request_budget_exceeded(runaway, RequestLimit::Bounded(new_budget)).is_some());
     }
 
+    /// A snapshot of one segment per `(ingest_hour_bucket, origin)` pair, in
+    /// the order given, with `origins` parallel to `segments`.
+    fn snapshot_of(entries: &[(u32, SegmentOrigin)]) -> (Snapshot, SegmentOrigins) {
+        // One `SegmentRef` template from the fixture below, re-stamped with
+        // each entry's hour: only `ingest_hour_bucket` matters here.
+        let (template, _) = snapshot_with_sealed(0);
+        let mut segments = Vec::with_capacity(entries.len());
+        let mut origins = SegmentOrigins::default();
+        for (hour, origin) in entries {
+            let mut segment = template.segments[0].clone();
+            segment.ingest_hour_bucket = *hour;
+            segments.push(segment);
+            origins.push(*origin);
+        }
+        (
+            Snapshot {
+                segments,
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            origins,
+        )
+    }
+
+    /// ADR-1306 decision 6: the tail is measured from the START of the oldest
+    /// hour the resolve listed live, which is at or after the end of the
+    /// watermark hour, and only `Recent` segments count. A `TokenResolved`
+    /// segment can sit below the watermark, so counting it would invent tail
+    /// the fold is not behind on.
+    #[test]
+    fn the_resolved_tail_is_measured_from_the_oldest_recent_hour() {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let now = 100 * NS_PER_HOUR + 1_800 * 1_000_000_000;
+
+        // Two recent hours: the older one sets the tail.
+        let (snapshot, origins) = snapshot_of(&[
+            (99, SegmentOrigin::Recent),
+            (100, SegmentOrigin::Recent),
+            (40, SegmentOrigin::SealedBelowWatermark),
+        ]);
+        assert_eq!(
+            resolved_unsealed_tail(&snapshot, &origins, now),
+            Some(Duration::from_secs(3_600 + 1_800))
+        );
+
+        // A long-since-sealed segment and an old token-resolved one are not
+        // tail, however far back they sit.
+        let (snapshot, origins) = snapshot_of(&[
+            (10, SegmentOrigin::SealedBelowWatermark),
+            (11, SegmentOrigin::TokenResolved),
+            (100, SegmentOrigin::Recent),
+        ]);
+        assert_eq!(
+            resolved_unsealed_tail(&snapshot, &origins, now),
+            Some(Duration::from_secs(1_800))
+        );
+
+        // No unsealed data resolved: no tail to report, and no lag.
+        let (snapshot, origins) = snapshot_of(&[(10, SegmentOrigin::SealedBelowWatermark)]);
+        assert_eq!(resolved_unsealed_tail(&snapshot, &origins, now), None);
+        assert_eq!(
+            resolved_fold_lag(&snapshot, &origins, now, reference_threshold()),
+            FoldLag::Healthy
+        );
+    }
+
+    /// ADR-1306 "Amendment (2026-09-27, #1306)", finding 2: a resolve that read
+    /// no folded snapshot part listed the whole window live and tagged every
+    /// key `Recent`, including hours a fold that is keeping up has already
+    /// sealed. There is no watermark behind those tags, so there is no tail to
+    /// measure and nothing to blame the fold for. One sealed segment, or one
+    /// postings-pruned one, is the witness that a part WAS read, and then the
+    /// same origins do carry a tail.
+    #[test]
+    fn a_resolve_that_read_no_snapshot_part_reports_no_tail() {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let now = 100 * NS_PER_HOUR + 1_800 * 1_000_000_000;
+        let threshold = reference_threshold();
+
+        // Every key `Recent`: the listing fallback. Six hours of apparent tail
+        // that the fold is not accountable for.
+        let (fallback, fallback_origins) =
+            snapshot_of(&[(94, SegmentOrigin::Recent), (100, SegmentOrigin::Recent)]);
+        assert_eq!(
+            resolved_unsealed_tail(&fallback, &fallback_origins, now),
+            None
+        );
+        assert_eq!(
+            resolved_fold_lag(&fallback, &fallback_origins, now, threshold),
+            FoldLag::Healthy
+        );
+
+        // A token-resolved segment is not a witness either: the token paths
+        // never read a snapshot part.
+        let (tokens, token_origins) = snapshot_of(&[
+            (94, SegmentOrigin::Recent),
+            (11, SegmentOrigin::TokenResolved),
+        ]);
+        assert_eq!(resolved_unsealed_tail(&tokens, &token_origins, now), None);
+
+        // One sealed segment: a part was read, so the same 6 h 30 m tail is
+        // real and is lag.
+        let (sealed, sealed_origins) = snapshot_of(&[
+            (94, SegmentOrigin::Recent),
+            (40, SegmentOrigin::SealedBelowWatermark),
+        ]);
+        let tail = Duration::from_secs(6 * 3_600 + 1_800);
+        assert_eq!(
+            resolved_unsealed_tail(&sealed, &sealed_origins, now),
+            Some(tail)
+        );
+        assert_eq!(
+            resolved_fold_lag(&sealed, &sealed_origins, now, threshold),
+            FoldLag::Lagging {
+                unsealed_tail: tail,
+                fold_lag_threshold: threshold,
+            }
+        );
+
+        // Postings pruning is the other witness: it only ever removes
+        // snapshot-sourced segments, so a pruned count proves a part was read
+        // even when nothing sealed survived into the window.
+        let (mut pruned, pruned_origins) = snapshot_of(&[(94, SegmentOrigin::Recent)]);
+        pruned.segments_pruned = 1;
+        assert_eq!(
+            resolved_unsealed_tail(&pruned, &pruned_origins, now),
+            Some(tail)
+        );
+    }
+
+    /// The reference fold-lag threshold: 8,400 s of healthy tail, plus the
+    /// 300 s fold interval, plus the 30 s HEAD cache TTL.
+    fn reference_threshold() -> Duration {
+        crate::config::fold_lag_tail_threshold(
+            SealMargin::REFERENCE,
+            crate::config::REFERENCE_FOLD_INTERVAL,
+            crate::config::REFERENCE_HEAD_CACHE_TTL,
+        )
+    }
+
+    /// The classification boundary: exactly the fold-lag threshold is healthy,
+    /// one nanosecond more is lag. A refusal at the boundary must not blame a
+    /// fold that is keeping up.
+    ///
+    /// The threshold is not `healthy_tail_max`. A fold leaves at most
+    /// `healthy_tail_max` at the instant it runs, then waits one fold interval
+    /// while the tail grows, and the resolve reads the resulting watermark
+    /// through a HEAD cache that may be one TTL stale. Classifying against
+    /// 8,400 s would report a fold that is keeping up as lagging for the last
+    /// 330 s of every cycle.
+    #[test]
+    fn fold_lag_starts_one_nanosecond_past_the_fold_lag_threshold() {
+        let margin = SealMargin::REFERENCE;
+        assert_eq!(
+            crate::config::healthy_tail_max(margin),
+            Duration::from_secs(8_400)
+        );
+        let threshold = reference_threshold();
+        assert_eq!(threshold, Duration::from_secs(8_730));
+        assert_eq!(
+            EngineConfig::default().fold_lag_threshold(),
+            Duration::from_secs(8_730),
+            "the engine's default config must classify against the same 8,730 s"
+        );
+
+        assert_eq!(
+            FoldLag::from_resolved_tail(Some(threshold), threshold),
+            FoldLag::Healthy
+        );
+        assert_eq!(
+            FoldLag::from_resolved_tail(Some(threshold + Duration::from_nanos(1)), threshold),
+            FoldLag::Lagging {
+                unsealed_tail: threshold + Duration::from_nanos(1),
+                fold_lag_threshold: threshold,
+            }
+        );
+        assert_eq!(
+            FoldLag::from_resolved_tail(None, threshold),
+            FoldLag::Healthy
+        );
+
+        // The window the fix opened: a tail a keeping-up fold really can show,
+        // past the old 8,400 s bound and inside the new one.
+        for tail in [
+            Duration::from_secs(8_401),
+            Duration::from_secs(8_700),
+            Duration::from_secs(8_730),
+        ] {
+            assert_eq!(
+                FoldLag::from_resolved_tail(Some(tail), threshold),
+                FoldLag::Healthy,
+                "{tail:?} is inside one fold interval plus one HEAD cache TTL of the healthy tail"
+            );
+        }
+
+        // The bound follows the configured seal margin, not a constant: a
+        // catalog that folds with a longer margin carries a longer healthy
+        // tail, and the same tail stops counting as lag.
+        let wide = crate::config::fold_lag_tail_threshold(
+            SealMargin {
+                max_flush_lifetime: Duration::from_secs(6 * 3_600),
+                ..margin
+            },
+            crate::config::REFERENCE_FOLD_INTERVAL,
+            crate::config::REFERENCE_HEAD_CACHE_TTL,
+        );
+        assert_eq!(
+            FoldLag::from_resolved_tail(Some(threshold + Duration::from_nanos(1)), wide),
+            FoldLag::Healthy
+        );
+    }
+
+    /// A refusal renders the fold-lag clause; a refusal with a healthy tail
+    /// renders exactly the message this variant had before ADR-1306.
+    #[test]
+    fn only_a_lagging_refusal_names_the_fold_gauge() {
+        let lagging = FoldLag::Lagging {
+            unsealed_tail: Duration::from_secs(19_800),
+            fold_lag_threshold: Duration::from_secs(8_730),
+        };
+        let err = request_budget_exceeded(7, RequestBudget::new(RequestLimit::Bounded(1), lagging))
+            .expect("7 requests exceed a budget of 1");
+        let message = err.to_string();
+        assert!(message.starts_with("query issued 7 S3 requests, exceeding the budget of 1;"));
+        assert!(message.contains("19800 s"), "{message}");
+        assert!(message.contains("8730 s"), "{message}");
+        assert!(
+            message.contains(crate::error::FOLD_LAST_SUCCESS_GAUGE),
+            "{message}"
+        );
+
+        let healthy = request_budget_exceeded(7, RequestLimit::Bounded(1))
+            .expect("7 requests exceed a budget of 1");
+        assert_eq!(
+            healthy.to_string(),
+            "query issued 7 S3 requests, exceeding the budget of 1"
+        );
+    }
+
     /// A snapshot of `sealed` sealed, below-watermark segments and one recent
     /// (exempt) one, with `origins` parallel to `segments` as `admit`'s
     /// debug assertion requires.
@@ -430,7 +786,11 @@ mod tests {
         assert!(request_budget_exceeded(50, raised.max_store_requests).is_none());
         assert!(request_budget_exceeded(50, absent.max_store_requests).is_none());
         match request_budget_exceeded(50, lowered.max_store_requests) {
-            Some(QueryError::RequestBudgetExceeded { requests, max }) => {
+            Some(QueryError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag: _,
+            }) => {
                 assert_eq!(requests, 50);
                 assert_eq!(max, 7);
             }

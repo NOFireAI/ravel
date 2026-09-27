@@ -580,13 +580,26 @@ async fn prepare_partition(
         // `ravel_query::engine`'s PromQL enforcement exactly. Same aliasing
         // hazard as the bytes-scanned check above, so `pooled_snapshot()`
         // here too.
-        if let Some(ravel_query::QueryError::RequestBudgetExceeded { requests, max }) =
-            request_budget_exceeded(
-                phase_accounting.pooled_snapshot().total_s3_requests(),
-                max_s3_requests,
-            )
-        {
-            return Err(SqlError::RequestBudgetExceeded { requests, max }.into());
+        // `fold_lag` is whatever the checked budget carried. This scan's
+        // budget is a bare `RequestLimit` built from the session config, which
+        // carries none, so a trip here reads as a plain budget refusal; the
+        // resolve-boundary check in `executor.rs`, which does hold the
+        // resolve's origins, is where a SQL refusal names fold lag (ADR-1306
+        // decision 6).
+        if let Some(ravel_query::QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag,
+        }) = request_budget_exceeded(
+            phase_accounting.pooled_snapshot().total_s3_requests(),
+            max_s3_requests,
+        ) {
+            return Err(SqlError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag,
+            }
+            .into());
         }
         // The SoA bytes this segment contributes to the merge, plus the
         // per-sample priority column when the fetched series carries one:

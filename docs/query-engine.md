@@ -1246,13 +1246,60 @@ at resolve, so an N-selector query pays up to `1 + 7N` requests per unsealed
 flush against a budget sized at 8. The derived budget does not scale with the
 selector count (ADR-1306, "Amendment (2026-09-27)").
 
+A refusal says when the unsealed tail, not the query, is what the budget was
+spent on (ADR-1306 decision 6): each resolve records the tail it listed live
+above the fold watermark, and a refusal whose tail is longer than the engine's
+`fold_lag_threshold` appends that tail's length in seconds and names
+`ravel_catalog_fold_last_success_timestamp_seconds`, the fold-liveness gauge
+`RavelCatalogFoldStalled` reads, so an operator goes to the fold rather than to
+the budget; every other refusal keeps its unchanged wording. Both forms stay
+HTTP 422 on the PromQL path and `ErrorClass::Unsupported` (422, and gRPC
+`FailedPrecondition` over Flight SQL) on the SQL path.
+
+The threshold is three terms, not one (ADR-1306's 2026-09-27
+refusal-threshold amendment): `healthy_tail_max` of the engine's
+configured seal margin, plus the
+`fold_interval` the scheduled fold waits between cycles, plus the
+`head_cache_ttl` the resolve reads the watermark through. A fold leaves at most
+`healthy_tail_max` unsealed at the instant it runs, then lets the tail grow for
+one interval, and the HEAD a resolve reads may be one TTL older again, so a
+fold that is keeping up can show up to that sum. At the defaults it is
+8,400 + 300 + 30 = 8,730 s. `EngineConfig` carries all three
+(`seal_margin`, `fold_interval`, `head_cache_ttl`), each defaulting to the
+catalog's and the server's own compiled-in values; passing a running server's
+`CatalogConfig` and `FoldTaskConfig` through to them is a follow-up, so a
+deployment that has changed them is classified against the defaults until then.
+
+The tail is read off the origins the resolve already produced, never a new
+store request, and it is reported only when that resolve actually read a folded
+snapshot part: a sealed, below-watermark segment or a postings-pruned one. A
+resolve that found no usable snapshot lists the whole window live and tags every
+key `Recent`, including hours the fold has already sealed, so its `Recent` tags
+carry no watermark and its refusal names nothing. What a refusal therefore
+guarantees is exactly this: it names fold lag only when the resolve behind it
+read a snapshot part and the tail above that watermark exceeded
+`fold_lag_threshold`. The rule is conservative the other way: a wide-enough
+stall whose window holds no sealed segment goes unnamed rather than blaming a
+fold that may be fine.
+
+Which SQL refusals carry the clause: only one. The resolve-boundary check in
+`crates/ravel-sql/src/executor.rs` is the sole SQL site with a resolve verdict
+in hand, so a statement refused there during fold lag names the tail and the
+gauge. A refusal raised mid-scan by the per-segment check in
+`crates/ravel-sql/src/scan.rs` builds its budget from the session config and
+gives the plain message, and so does the exemplars read
+(`services/ravel-server/src/exemplars.rs`), which checks a bare `RequestLimit`.
+A plain SQL budget refusal is therefore not evidence that the fold is healthy;
+re-read it through PromQL, or check the gauge.
+
 `crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
-`request_budget_exceeded(requests, max_s3_requests)` for the incremental
-budget check. `QueryEngine::resolve_bounded` (`engine.rs`) is the call site
-for PromQL; the SQL executor, the five SQL table providers, and the
-exemplars state moved onto the same seam; no site still runs a
-pre-ADR-0073 per-surface check.
+`request_budget_exceeded(requests, budget)` for the incremental budget check,
+where `budget` is a `RequestBudget` pairing the limit with that resolve's
+fold-lag verdict (a bare `RequestLimit` converts in and blames nothing).
+`QueryEngine::resolve_bounded` (`engine.rs`) is the call site for PromQL; the
+SQL executor, the five SQL table providers, and the exemplars state moved onto
+the same seam; no site still runs a pre-ADR-0073 per-surface check.
 
 An end-to-end test proves this seam through both real HTTP query
 surfaces rather than at the seam's own unit level: a real `IngestRouter`

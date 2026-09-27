@@ -29,15 +29,16 @@ pub use config::{
     DEFAULT_LOG_MAX_FETCH_RUN_BYTES, DEFAULT_MAX_SAMPLES, DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES,
     EngineConfig, EngineConfigError, FOLD_STALL_ALERT_FOR, LATENCY_FIRST_MEASURED_CONCURRENCY,
     LogsFetchPolicy, MAX_REQUESTS_PER_UNSEALED_FLUSH, REFERENCE_CLOCK_SKEW_ALLOWANCE,
-    REFERENCE_FOLD_SAFETY_MARGIN, REFERENCE_MAX_FLUSH_LIFETIME, REQUEST_BUDGET_FIXED_OVERHEAD,
-    REQUESTS_PER_UNSEALED_FLUSH, RequestBudgetParts, RequestLimit, ResolvedLogsFetch, SealMargin,
-    covered_span, derive_max_s3_requests, derive_max_s3_requests_for, healthy_tail_max,
+    REFERENCE_FOLD_INTERVAL, REFERENCE_FOLD_SAFETY_MARGIN, REFERENCE_HEAD_CACHE_TTL,
+    REFERENCE_MAX_FLUSH_LIFETIME, REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH,
+    RequestBudgetParts, RequestLimit, ResolvedLogsFetch, SealMargin, covered_span,
+    derive_max_s3_requests, derive_max_s3_requests_for, fold_lag_tail_threshold, healthy_tail_max,
     request_budget_parts, resolve_logs_fetch,
 };
 pub use engine::{
     Coverage, LiveQueryAccounting, QueryEngine, QueryStats, snapshot_erasure_predicates,
 };
-pub use error::QueryError;
+pub use error::{FOLD_LAST_SUCCESS_GAUGE, FoldLag, QueryError};
 pub use fetcher::{
     CacheFetchError, DEFAULT_WHOLE_OBJECT_THRESHOLD, FetchError, FetchStats, FetchedSeries,
     FetchedSeriesSoa, MAX_GETS_PER_L0_SEGMENT_FETCH, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache,
@@ -61,5 +62,8 @@ pub use query_admission::{
     query_admission_snapshot_key, reconcile_query_admission_once,
 };
 pub use request_budgets::{EffectiveBudgets, RequestBudgets};
-pub use segment_admission::{SegmentAdmission, admit, request_budget_exceeded};
+pub use segment_admission::{
+    RequestBudget, SegmentAdmission, admit, request_budget_exceeded, resolved_fold_lag,
+    resolved_unsealed_tail,
+};
 pub use span_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
