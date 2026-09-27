@@ -5060,7 +5060,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-parquet"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5079,7 +5079,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-pqtable"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "blake3",
