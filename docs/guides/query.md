@@ -412,7 +412,7 @@ truncation:
 | Wall-clock deadline | fixed: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
 | Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
 | Bytes scanned | unlimited (opt in via `query_defaults.max_bytes_scanned`) | `query scanned {scanned} bytes, exceeding the budget of {max}` |
-| Object-store requests | derived from the deployment's shard count and flush cadence | `query issued {requests} S3 requests, exceeding the budget of {max}` |
+| Object-store requests | derived from the deployment's shard count and flush cadence | `query issued {requests} S3 requests, exceeding the budget of {max}`, followed by `; the catalog's unsealed tail is {tail} s, longer than the {threshold} s a catalog whose fold is keeping up can show, so the fold is behind and the tail is what the budget was spent on: check ravel_catalog_fold_last_success_timestamp_seconds before raising the budget` when the refusal was caused by a lagging fold (see "Segment admission" in [the query engine reference](../query-engine.md)) |
 
 `timeout` (Prometheus duration syntax like `30s`/`5m`, or bare float
 seconds) lowers the deadline per request. It cannot raise it above the
