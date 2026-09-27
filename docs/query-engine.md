@@ -1232,6 +1232,17 @@ either in `deploy/prometheus/ravel.rules.yaml` without widening
 `lag_allowance` fails a test instead of silently putting the first refusal
 before the page.
 
+That the ordering holds in practice, and not only in the arithmetic, is
+`fold_stall_alert_fires_before_first_request_budget_refusal`
+(`services/ravel-server/tests/fold_lag_budget_ordering.rs`). It runs one
+simulated timeline at a scaled cadence with the fold wedged by a fault on its
+HEAD PUT, evaluates the shipped alert against the rendered
+`/metrics` gauge every simulated minute, and runs a cold query each minute
+under a budget built from `request_budget_parts`: the alert fires 9 minutes
+before the first `RequestBudgetExceeded`, and the same timeline replayed
+against ADR-0075's one-hour span is refused at the very first minute, before
+any stall.
+
 Each unsealed flush in that span is sized at
 `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of
 `REQUESTS_PER_UNSEALED_FLUSH` (2, the measured cold cost of a flush at or under
@@ -1265,10 +1276,18 @@ configured seal margin, plus the
 one interval, and the HEAD a resolve reads may be one TTL older again, so a
 fold that is keeping up can show up to that sum. At the defaults it is
 8,400 + 300 + 30 = 8,730 s. `EngineConfig` carries all three
-(`seal_margin`, `fold_interval`, `head_cache_ttl`), each defaulting to the
-catalog's and the server's own compiled-in values; passing a running server's
-`CatalogConfig` and `FoldTaskConfig` through to them is a follow-up, so a
-deployment that has changed them is classified against the defaults until then.
+(`seal_margin`, `fold_interval`, `head_cache_ttl`). `ravel-server` fills them
+from what this process is actually running, in the one place it turns a
+`ServerConfig` into an `EngineConfig`
+(`services/ravel-server/src/query.rs`'s `build_engine_config`): the seal margin
+and the HEAD cache TTL off the `CatalogConfig` of the catalog it hands to both
+resolve and the fold, and the fold interval off the `FoldTaskConfig` it spawns
+the fold with. The fold interval is the real one only in a process that runs
+the scheduled fold (`--mode all` and `--mode maintain`); a `query` or `gateway`
+process keeps the 300 s default, so where the `maintain` processes fold on a longer
+interval, a query node's threshold is too short by the difference and can
+blame a fold that is keeping up. The compiled-in defaults remain what an `EngineConfig` built
+with no deployment context falls back to.
 
 The tail is read off the origins the resolve already produced, never a new
 store request, and it is reported only when that resolve actually read a folded

@@ -752,7 +752,10 @@ fold_lag_threshold = healthy_tail_max + fold_interval + head_cache_ttl
 `fold_interval` and `head_cache_ttl` alongside `seal_margin`, each defaulting
 to the constant above; wiring the running server's `FoldTaskConfig` and
 `CatalogConfig` through to all three stays a later task, so a deployment that
-has changed them is classified against the defaults until then.
+has changed them is classified against the defaults until then. (Since done,
+as the wiring of follow-up task 5, for the seal margin and HEAD cache TTL everywhere, and for
+the fold interval in `all` and `maintain` processes; a `query` or `gateway`
+process still uses the default fold interval.)
 
 ### A resolve that read no snapshot part has no tail to report
 
