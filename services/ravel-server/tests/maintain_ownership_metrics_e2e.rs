@@ -872,3 +872,340 @@ async fn l0_pending_gauge_sums_every_owned_bucket_including_memo_skipped_ones() 
 
     server.shutdown().await.expect("graceful shutdown");
 }
+
+/// Render the real `/metrics` exposition for a `Mode::Maintain` process whose
+/// only populated family is the maintenance-safety one, from `safety` as the
+/// handler snapshots it on every scrape.
+fn render_safety_exposition(safety: &ravel_server::maintain::MaintenanceSafetyMetrics) -> String {
+    use ravel_server::metrics::{
+        AdmissionCountersSnapshot, CatalogCountersSnapshot, IngestBufferBudgetSnapshot,
+        MaintenanceSafetySnapshot, MemoryBudgetSnapshot,
+    };
+    let snapshot = MaintenanceSafetySnapshot::from_metrics(safety);
+    ravel_server::metrics::render(
+        Mode::Maintain,
+        &ravel_object_store::instrument::StoreMetricsSnapshot::default(),
+        &[],
+        &CatalogCountersSnapshot::default(),
+        None,
+        Some(&snapshot),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &AdmissionCountersSnapshot::default(),
+        &[],
+        0,
+        IngestBufferBudgetSnapshot::default(),
+        None,
+        None,
+        &[],
+        None,
+        ravel_server::mem_stats::AllocatorStats::Other { name: "test" },
+        None,
+        None,
+        None,
+        None,
+        None,
+        MemoryBudgetSnapshot::default(),
+        false,
+    )
+}
+
+/// The clock the fixture below starts from: half past hour 500_000, so every
+/// bucket hour it names is a whole number of hours before it.
+const TICK_1_NS: i64 = 500_000 * NS_PER_HOUR + NS_PER_HOUR / 2;
+/// The second tick's clock: 48 h later, past rule 2's protection horizon
+/// (about 25 h), rule 3's part age gate (25 h) and the tombstone's own
+/// protection horizon, and still inside the quarantine horizon's reach of the
+/// seeded quarantine object's timestamp (see below).
+const TICK_2_NS: i64 = TICK_1_NS + 48 * NS_PER_HOUR;
+/// The retention window the fixture tenant carries: 30 days.
+const RETENTION_WINDOW_NS: i64 = 30 * 24 * NS_PER_HOUR;
+/// L0 depth of the bucket that compacts on tick 2.
+const COMPACTING_DEPTH: u64 = 3;
+/// L0 depth of the bucket that stays below threshold on both ticks.
+const RESIDENT_DEPTH: u64 = 1;
+/// Bytes of the unreferenced L1 part rule 3 deletes on tick 2.
+const UNREFERENCED_PART_LEN: usize = 1_000;
+/// Bytes of the quarantined object the reaper deletes on tick 2.
+const QUARANTINED_LEN: usize = 234;
+
+/// Issue #1729 acceptance test for all four throughput and backlog families,
+/// driven by two deterministic ticks of [`ravel_server::maintain::run_tick_with_clock`]
+/// under a [`ravel_maintain::FixedClock`] and read back from the real
+/// exposition. No wall-clock wait: each tick runs to completion before its
+/// assertions, and the clock only moves between ticks.
+///
+/// Fixture on one tenant, `Metrics` shard 0:
+/// - bucket A, 35 h before tick 1: `COMPACTING_DEPTH` (3) L0 records;
+/// - bucket C, 36 h before tick 1: `RESIDENT_DEPTH` (1) L0 record;
+/// - bucket B, 40 h before tick 1: two L0 records compacted offline one hour
+///   before tick 1, plus one unreferenced L1 part of `UNREFERENCED_PART_LEN`
+///   bytes seeded after that compaction;
+/// - bucket R, 31 days before tick 1: one L0 record, past the tenant's 30-day
+///   retention window;
+/// - one quarantined object of `QUARANTINED_LEN` bytes, quarantined one hour
+///   short of the quarantine horizon at tick 1.
+///
+/// Tick 1 runs at `min_compaction_inputs = 4`, so A (3) and C (1) are both
+/// pending: the gauge reads exactly 4. Nothing is old enough to sweep yet, so
+/// every deleted and reclaimed figure reads 0. R is tombstoned, still present,
+/// and its hour's retention deadline is `(hour + 1) h + 30 d`, so the lag reads
+/// exactly 23.5 h = 84600 s.
+///
+/// Tick 2 runs 48 h later at `min_compaction_inputs = 2`. A compacts its three
+/// records; C stays below threshold. The pending gauge must drop by exactly
+/// the compacted count, 4 to 1. B's compaction record is now past the
+/// protection horizon, so rule 2 deletes exactly its two input records and
+/// their two data objects; the part and the quarantined object are past their
+/// own gates, so rule 3 and the reaper delete exactly one each. The reclaimed
+/// bytes counter must rise by exactly `UNREFERENCED_PART_LEN + QUARANTINED_LEN`:
+/// it sums the listed sizes of those two deletions and nothing else. R's
+/// tombstone is past its horizon, the bucket is physically swept, and no
+/// expired bucket is left present, so the lag gauge falls to 0.
+///
+/// Raising `min_compaction_inputs` between ticks is the one way to compact a
+/// bucket's whole pending depth in a single tick without publishing a new
+/// record into it, which would make the drop differ from the compacted count.
+#[tokio::test]
+async fn one_clocked_tick_moves_every_backlog_and_throughput_figure_by_the_exact_fixture_count() {
+    use ravel_maintain::{
+        CompactorConfig, FixedClock, MaintainMemo, RetentionConfig, RetentionPolicy, WorkerSet,
+    };
+    use ravel_server::maintain::{MaintenanceOwnershipMetrics, MaintenanceSafetyMetrics};
+
+    let tenant = TenantId::new("throughput-e2e");
+    let tenant_hash = tenant.hash();
+    let store = Arc::new(MemoryStore::new());
+    // Every seeded object's last-modified time is tick 1, so rule 3's age gate
+    // on the unreferenced part is shut on tick 1 and open on tick 2.
+    store.set_clock_ms((TICK_1_NS / 1_000_000) as u64);
+
+    let tick_1_hour = (TICK_1_NS / NS_PER_HOUR) as u32;
+    let hour_a = tick_1_hour - 35;
+    let hour_c = tick_1_hour - 36;
+    let hour_b = tick_1_hour - 40;
+    let hour_r = tick_1_hour - 31 * 24;
+
+    let mut writer_seq = 0u64;
+    for (hour, depth) in [
+        (hour_a, COMPACTING_DEPTH),
+        (hour_c, RESIDENT_DEPTH),
+        (hour_b, 2),
+        (hour_r, 1),
+    ] {
+        for _ in 0..depth {
+            writer_seq += 1;
+            publish_l0_segment(store.as_ref(), &tenant, 0, hour, writer_seq).await;
+        }
+    }
+
+    let bucket_b = ravel_maintain::Bucket::new(tenant_hash, Signal::Metrics, 0, hour_b);
+    let offline = ravel_maintain::compact_bucket(
+        store.as_ref(),
+        &FixedClock::new(TICK_1_NS - NS_PER_HOUR),
+        &CompactorConfig::default(),
+        &bucket_b,
+    )
+    .await
+    .expect("pre-compact bucket B");
+    assert!(
+        matches!(offline, ravel_maintain::CompactionOutcome::Compacted { .. }),
+        "bucket B must compact its two L0 inputs before tick 1: {offline:?}"
+    );
+
+    let part_key = keys::l1_part_key(
+        &tenant_hash,
+        Signal::Metrics,
+        0,
+        hour_b,
+        "00000000000000ff",
+        7,
+        "00000000000000ee",
+    )
+    .expect("part key");
+    store
+        .put(
+            &part_key,
+            vec![0u8; UNREFERENCED_PART_LEN].into(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put unreferenced part");
+
+    let quarantined_original = keys::data_key(
+        &tenant_hash,
+        Signal::Metrics,
+        0,
+        Uuid::from_u128(99),
+        1,
+        1,
+        &[9u8; 32],
+    )
+    .expect("data key");
+    let quarantined_at_ns =
+        TICK_1_NS - ravel_maintain::config::DEFAULT_QUARANTINE_HORIZON_NS + NS_PER_HOUR;
+    store
+        .put(
+            &format!("quarantine/{quarantined_original}/q{quarantined_at_ns:020}"),
+            vec![0u8; QUARANTINED_LEN].into(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put quarantined object");
+
+    let tick_config = |min_compaction_inputs: usize| CompactorConfig {
+        min_compaction_inputs,
+        interior_reverify_ns: 0,
+        ..CompactorConfig::default()
+    };
+    let retention = RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: None,
+            tenants: vec![(tenant.as_str().to_string(), RETENTION_WINDOW_NS)],
+        },
+        &CompactorConfig::default(),
+        ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("valid retention config");
+
+    let mut memo = MaintainMemo::new(0);
+    let safety = MaintenanceSafetyMetrics::default();
+    let ownership = MaintenanceOwnershipMetrics::new(3);
+    let worker = WorkerSet::with_defaults(0);
+    let live_set = worker.solo_live_set();
+
+    const PENDING_LINE: &str =
+        "ravel_maintain_l0_records_pending{mode=\"maintain\",signal=\"metrics\"}";
+    const LAG_LINE: &str =
+        "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"metrics\"}";
+    const BYTES_LINE: &str =
+        "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"metrics\"}";
+    const DELETED_KINDS: [&str; 4] = [
+        "superseded_records_deleted",
+        "superseded_data_deleted",
+        "unreferenced_parts_deleted",
+        "quarantine_reaped",
+    ];
+    let deleted = |body: &str, kind: &str| {
+        sample_value(
+            body,
+            &format!("ravel_maintain_objects_deleted_total{{mode=\"maintain\",kind=\"{kind}\"}}"),
+        )
+    };
+
+    // Tick 1.
+    safety.begin_scan_cycle();
+    let report_1 = ravel_server::maintain::run_tick_with_clock(
+        &FixedClock::new(TICK_1_NS),
+        store.as_ref(),
+        &tenant_hash,
+        &tick_config(4),
+        &retention,
+        1,
+        &mut memo,
+        &safety,
+        &ownership,
+        &worker,
+        &live_set,
+    )
+    .await;
+    safety.publish_scan_cycle();
+    assert_eq!(
+        report_1.retired, 1,
+        "tick 1 tombstones bucket R: {report_1:?}"
+    );
+    assert_eq!(
+        report_1.compacted, 0,
+        "nothing reaches threshold 4: {report_1:?}"
+    );
+
+    let body_1 = render_safety_exposition(&safety);
+    let pending_1 = sample_value(&body_1, PENDING_LINE).expect("pending sample");
+    assert_eq!(
+        pending_1,
+        COMPACTING_DEPTH + RESIDENT_DEPTH,
+        "tick 1: buckets A and C are both below threshold 4"
+    );
+    for kind in DELETED_KINDS {
+        assert_eq!(
+            deleted(&body_1, kind),
+            Some(0),
+            "tick 1: nothing is old enough to delete ({kind})"
+        );
+    }
+    assert_eq!(
+        sample_value(&body_1, BYTES_LINE),
+        Some(0),
+        "tick 1: nothing reclaimed"
+    );
+    let deadline_r = (i64::from(hour_r) + 1) * NS_PER_HOUR + RETENTION_WINDOW_NS;
+    assert_eq!(TICK_1_NS - deadline_r, 84_600_000_000_000);
+    assert_eq!(
+        sample_value(&body_1, LAG_LINE),
+        Some(84_600),
+        "tick 1: bucket R is tombstoned and still present, 23.5 h past its deadline"
+    );
+
+    // Tick 2.
+    safety.begin_scan_cycle();
+    let report_2 = ravel_server::maintain::run_tick_with_clock(
+        &FixedClock::new(TICK_2_NS),
+        store.as_ref(),
+        &tenant_hash,
+        &tick_config(2),
+        &retention,
+        1,
+        &mut memo,
+        &safety,
+        &ownership,
+        &worker,
+        &live_set,
+    )
+    .await;
+    safety.publish_scan_cycle();
+    assert_eq!(
+        report_2.compacted, 1,
+        "tick 2 compacts bucket A: {report_2:?}"
+    );
+
+    let body_2 = render_safety_exposition(&safety);
+    let pending_2 = sample_value(&body_2, PENDING_LINE).expect("pending sample");
+    assert_eq!(
+        pending_1.checked_sub(pending_2),
+        Some(COMPACTING_DEPTH),
+        "tick 2: the pending gauge drops by exactly bucket A's compacted depth"
+    );
+    assert_eq!(
+        pending_2, RESIDENT_DEPTH,
+        "bucket C is still pending at threshold 2"
+    );
+    for (kind, expected) in [
+        ("superseded_records_deleted", 2),
+        ("superseded_data_deleted", 2),
+        ("unreferenced_parts_deleted", 1),
+        ("quarantine_reaped", 1),
+    ] {
+        assert_eq!(
+            deleted(&body_2, kind).and_then(|now| now.checked_sub(deleted(&body_1, kind)?)),
+            Some(expected),
+            "tick 2: the deleted counter for {kind} rises by exactly the swept count"
+        );
+    }
+    assert_eq!(
+        sample_value(&body_2, BYTES_LINE)
+            .and_then(|now| now.checked_sub(sample_value(&body_1, BYTES_LINE)?)),
+        Some((UNREFERENCED_PART_LEN + QUARANTINED_LEN) as u64),
+        "tick 2: reclaimed bytes rise by exactly the listed sizes of the deleted part and the \
+         reaped quarantine object"
+    );
+    assert_eq!(
+        sample_value(&body_2, LAG_LINE),
+        Some(0),
+        "tick 2: bucket R is swept, so no expired bucket is left present"
+    );
+}

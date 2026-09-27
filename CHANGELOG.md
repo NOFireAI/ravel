@@ -8,6 +8,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ravel_maintain_bytes_reclaimed_total` and
+  `ravel_maintain_retention_lag_seconds` render on `/metrics`** (issue #1729).
+  The first is a per-signal counter of bytes freed by the sweep, summed from the
+  listed object size of the two deletions that already carry one, the quarantine
+  reaper and the unreferenced-part delete; superseded and retention deletions
+  are excluded because they delete by key without a size, so the counter
+  undercounts the bytes freed and its HELP text says so (a unit swept by two
+  replicas during an ownership handoff can count one object twice). The second is a per-signal gauge of how
+  far past its retention deadline the oldest still-present expired bucket is, as
+  observed by this process's most recent completed maintenance cycle, from the
+  injected clock; it is a per-cycle maximum over the process's units and is 0
+  when no expired bucket is still present. Both sit next to the existing
+  `ravel_maintain_*` families under the same maintain-mode gate and carry only
+  the `mode` and `signal` labels. The troubleshooting and observability guides
+  gain alert suggestions for a retention lag that keeps climbing, and the
+  "storage keeps growing" row now names series an alert can read,
+  `absent(ravel_maintain_workers_live)` for a missing maintain process and the
+  pending, lag and deleted-objects series for one falling behind, before the
+  per-bucket `ravel-cli maintain status` call.
 - **A full-object GET now verifies the body against the checksum the store
   recorded at upload** (ADR-1696, issue #1696). A commit record is a bare
   protobuf with no checksum of its own, so a flipped bit inside a stored record
