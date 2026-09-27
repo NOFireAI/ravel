@@ -37,7 +37,7 @@ pub use config::{
 pub use engine::{
     Coverage, LiveQueryAccounting, QueryEngine, QueryStats, snapshot_erasure_predicates,
 };
-pub use error::QueryError;
+pub use error::{FOLD_LAST_SUCCESS_GAUGE, FoldLag, QueryError};
 pub use fetcher::{
     CacheFetchError, DEFAULT_WHOLE_OBJECT_THRESHOLD, FetchError, FetchStats, FetchedSeries,
     FetchedSeriesSoa, MAX_GETS_PER_L0_SEGMENT_FETCH, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache,
@@ -61,5 +61,8 @@ pub use query_admission::{
     query_admission_snapshot_key, reconcile_query_admission_once,
 };
 pub use request_budgets::{EffectiveBudgets, RequestBudgets};
-pub use segment_admission::{SegmentAdmission, admit, request_budget_exceeded};
+pub use segment_admission::{
+    RequestBudget, SegmentAdmission, admit, request_budget_exceeded, resolved_fold_lag,
+    resolved_unsealed_tail,
+};
 pub use span_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};

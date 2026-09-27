@@ -584,6 +584,15 @@ pub struct EngineConfig {
     /// the derivation at [`DEFAULT_BUDGET_REFERENCE_SHARDS`] shards as a
     /// no-deployment-context fallback.
     pub max_s3_requests: RequestLimit,
+    /// The seal margin the catalog this engine resolves through folds with
+    /// (ADR-1306 decision 3). Not a limit: it is what
+    /// [`healthy_tail_max`] is taken of when a request-budget refusal decides
+    /// whether the unsealed tail the query resolved is a healthy one, so the
+    /// refusal can name fold lag (ADR-1306 decision 6). Defaults to
+    /// [`SealMargin::REFERENCE`], the catalog's own compiled-in durations;
+    /// wiring the running server's `CatalogConfig` through to here is ADR-1306
+    /// follow-up task 5.
+    pub seal_margin: SealMargin,
     pub deadline: Duration,
     pub fetch_concurrency: usize,
     /// Step for a subquery that does not specify its own (`expr[5m:]`).
@@ -708,6 +717,7 @@ impl Default for EngineConfig {
                 DEFAULT_BUDGET_REFERENCE_SHARDS,
                 DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY,
             )),
+            seal_margin: SealMargin::REFERENCE,
             deadline: DEFAULT_DEADLINE,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             default_evaluation_interval: DEFAULT_EVALUATION_INTERVAL,

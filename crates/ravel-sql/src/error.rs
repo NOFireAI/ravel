@@ -33,7 +33,7 @@
 
 use datafusion::error::DataFusionError;
 use ravel_catalog::{CatalogError, LoadColumnStatsError};
-use ravel_query::{FetchError, LogFetchError};
+use ravel_query::{FetchError, FoldLag, LogFetchError};
 
 use crate::spans_fetcher::SpanFetchError;
 use crate::validate::ValidationError;
@@ -242,9 +242,18 @@ pub enum SqlError {
     /// `ravel_query::QueryError::RequestBudgetExceeded` so both query
     /// languages surface the same trip the same way; `requests` and `max`
     /// are counts an operator needs, no server state, so it is echoed
-    /// verbatim like the other budget errors.
-    #[error("query issued {requests} S3 requests, exceeding the budget of {max}")]
-    RequestBudgetExceeded { requests: u64, max: u64 },
+    /// verbatim like the other budget errors. `fold_lag` is the same
+    /// `ravel_query::FoldLag` the wrapped refusal carried (ADR-1306 decision
+    /// 6): a tail longer than a healthy catalog's renders the tail length and
+    /// the fold-liveness gauge here too, so a SQL caller reads the same cause
+    /// a PromQL caller does. It names no server state either: a duration and a
+    /// metric name.
+    #[error("query issued {requests} S3 requests, exceeding the budget of {max}{fold_lag}")]
+    RequestBudgetExceeded {
+        requests: u64,
+        max: u64,
+        fold_lag: FoldLag,
+    },
 
     /// The per-query or per-tenant byte budget was exhausted. The detail is
     /// the pool's own message (byte counts and limits only).
@@ -710,6 +719,7 @@ mod tests {
         let request_budget = SqlError::RequestBudgetExceeded {
             requests: 30_001,
             max: 30_000,
+            fold_lag: FoldLag::Healthy,
         };
         assert_eq!(request_budget.client_message(), request_budget.to_string());
         assert_eq!(request_budget.class(), ErrorClass::Unsupported);

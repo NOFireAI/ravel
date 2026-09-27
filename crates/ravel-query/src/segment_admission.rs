@@ -6,10 +6,17 @@
 //! executor, the five SQL providers, and the exemplars state move onto this
 //! seam.
 
-use ravel_catalog::{SegmentOrigins, Snapshot};
+use std::time::Duration;
 
-use crate::config::EngineConfig;
-use crate::error::QueryError;
+use ravel_catalog::{SegmentOrigin, SegmentOrigins, Snapshot};
+
+use crate::config::{EngineConfig, RequestLimit, SealMargin};
+use crate::error::{FoldLag, QueryError};
+
+/// Nanoseconds in one ingest-hour bucket. `ingest_hour_bucket` counts whole
+/// hours since the epoch, so bucket `H` starts at `H * NS_PER_HOUR` and ends at
+/// `(H + 1) * NS_PER_HOUR` (`ravel_catalog`'s `sealed_watermark_hour`).
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// The admitted view of a resolved snapshot: the sealed-set count that was
 /// checked against `max_segments` and the request budget recent/
@@ -48,19 +55,95 @@ pub fn admit(
     })
 }
 
-/// True when `requests` has passed `max_s3_requests`, mirroring
+/// The unsealed tail one resolve saw: the span from the start of the oldest
+/// ingest hour it listed live (above the fold watermark) to query time
+/// (ADR-1306 decision 6). `None` when the resolve listed no unsealed segment,
+/// so there is no tail it paid for.
+///
+/// Read off the resolve's own outputs, never from a fresh store request: an
+/// origin of [`SegmentOrigin::Recent`] is exactly "listed above the watermark",
+/// so the oldest such bucket starts at or after the end of the newest sealed
+/// hour. That makes this a lower bound on `now - end(watermark hour)`, never an
+/// over-estimate, so a healthy catalog cannot be reported as lagging.
+/// `TokenResolved` segments are excluded: a read-your-write token can resolve a
+/// segment below the watermark, which is not tail.
+#[must_use]
+pub fn resolved_unsealed_tail(
+    snapshot: &Snapshot,
+    origins: &SegmentOrigins,
+    now_ns: i64,
+) -> Option<Duration> {
+    let oldest_unsealed_hour = snapshot
+        .segments
+        .iter()
+        .zip(origins.origins.iter())
+        .filter(|(_, origin)| matches!(origin, SegmentOrigin::Recent))
+        .map(|(segment, _)| segment.ingest_hour_bucket)
+        .min()?;
+    let hour_start_ns = i64::from(oldest_unsealed_hour).checked_mul(NS_PER_HOUR)?;
+    let tail_ns = now_ns.checked_sub(hour_start_ns)?;
+    u64::try_from(tail_ns).ok().map(Duration::from_nanos)
+}
+
+/// The fold lag a resolve's unsealed tail implies, for the request-budget
+/// refusals downstream of it (ADR-1306 decision 6).
+#[must_use]
+pub fn resolved_fold_lag(
+    snapshot: &Snapshot,
+    origins: &SegmentOrigins,
+    now_ns: i64,
+    seal_margin: SealMargin,
+) -> FoldLag {
+    FoldLag::from_resolved_tail(resolved_unsealed_tail(snapshot, origins, now_ns), seal_margin)
+}
+
+/// A request budget together with what the resolve behind this query's
+/// snapshot saw of the catalog's unsealed tail.
+///
+/// The two travel as one value so a check site cannot enforce the limit while
+/// forgetting the tail: every refusal built from a [`RequestBudget`] carries
+/// the fold-lag verdict the resolve computed (ADR-1306 decision 6). A bare
+/// [`RequestLimit`] converts in, for a caller with no resolve in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudget {
+    pub limit: RequestLimit,
+    pub fold_lag: FoldLag,
+}
+
+impl RequestBudget {
+    /// This budget's limit with `fold_lag` attached.
+    #[must_use]
+    pub fn new(limit: RequestLimit, fold_lag: FoldLag) -> RequestBudget {
+        RequestBudget { limit, fold_lag }
+    }
+}
+
+impl From<RequestLimit> for RequestBudget {
+    /// A limit checked with nothing known about the tail: a refusal keeps the
+    /// pre-ADR-1306 message.
+    fn from(limit: RequestLimit) -> RequestBudget {
+        RequestBudget {
+            limit,
+            fold_lag: FoldLag::Healthy,
+        }
+    }
+}
+
+/// True when `requests` has passed the budget's limit, mirroring
 /// `bytes_scanned_exceeded`'s incremental-comparison shape (ADR-0073
 /// decision 3): a typed error, checked at the same points the bytes-scanned
 /// budget already checks, never a truncation.
 pub fn request_budget_exceeded(
     requests: u64,
-    max_s3_requests: crate::config::RequestLimit,
+    budget: impl Into<RequestBudget>,
 ) -> Option<QueryError> {
-    use crate::config::RequestLimit;
-    match max_s3_requests {
-        RequestLimit::Bounded(max) if requests > max => {
-            Some(QueryError::RequestBudgetExceeded { requests, max })
-        }
+    let budget = budget.into();
+    match budget.limit {
+        RequestLimit::Bounded(max) if requests > max => Some(QueryError::RequestBudgetExceeded {
+            requests,
+            max,
+            fold_lag: budget.fold_lag,
+        }),
         _ => None,
     }
 }
@@ -430,7 +513,11 @@ mod tests {
         assert!(request_budget_exceeded(50, raised.max_store_requests).is_none());
         assert!(request_budget_exceeded(50, absent.max_store_requests).is_none());
         match request_budget_exceeded(50, lowered.max_store_requests) {
-            Some(QueryError::RequestBudgetExceeded { requests, max }) => {
+            Some(QueryError::RequestBudgetExceeded {
+                requests,
+                max,
+                fold_lag: _,
+            }) => {
                 assert_eq!(requests, 50);
                 assert_eq!(max, 7);
             }
