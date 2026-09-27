@@ -810,3 +810,54 @@ async fn otap_batch_over_inflight_ceiling_is_shed() {
 
     running.shutdown().await.expect("graceful shutdown");
 }
+
+/// Not a `BatchArrowRecords`: field 1 there is the varint `batch_id`, and this
+/// encodes it as length-delimited bytes, so prost refuses the frame with a
+/// wire-type error the moment tonic decodes it.
+#[derive(Clone, PartialEq, prost::Message)]
+struct UndecodableBatch {
+    #[prost(bytes = "vec", tag = "1")]
+    not_a_batch_id: Vec<u8>,
+}
+
+/// Issue #1705: an OTAP stream opened without credentials is refused
+/// `UNAUTHENTICATED` at stream open, with the message the handler uses, and
+/// its first frame (which would not decode) is never decoded: a decode would
+/// surface as `INTERNAL` instead. On the real listener the admission layer is
+/// what refuses it; `ingest_admission`'s unit tests pin that the layer, not
+/// only the handler behind it, does.
+#[tokio::test]
+async fn otap_stream_without_credentials_is_refused_before_any_frame_is_decoded() {
+    let running = start_test_server().await;
+    let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))
+        .expect("valid endpoint uri")
+        .connect()
+        .await
+        .expect("gRPC client connects");
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.expect("channel ready");
+    let frames = futures::stream::iter(vec![UndecodableBatch {
+        not_a_batch_id: vec![1, 2, 3],
+    }]);
+    let status = grpc
+        .streaming::<_, UndecodableBatch, UndecodableBatch, _>(
+            tonic::Request::new(frames),
+            http::uri::PathAndQuery::from_static(
+                "/opentelemetry.proto.experimental.arrow.v1.ArrowMetricsService/ArrowMetrics",
+            ),
+            tonic_prost::ProstCodec::default(),
+        )
+        .await
+        .expect_err("a stream without credentials is refused at open");
+
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "no credentials is refused before any frame is decoded: {status:?}"
+    );
+    assert_eq!(status.message(), "invalid or missing tenant credentials");
+
+    running.shutdown().await.expect("graceful shutdown");
+}
