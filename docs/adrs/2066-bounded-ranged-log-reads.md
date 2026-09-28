@@ -51,14 +51,25 @@ fetch issues at most 4 page-range GETs, bridging the smallest gaps
    - When FIELD_DIR is fetched, STREAM_DIR comes with it in one GET covering
      both, unless it is already resident. This happens before the read knows
      whether it will cross over to a whole-object GET, so a read that does
-     cross over pays STREAM_DIR's bytes without using them.
-   - Chunk runs per object are capped at 4, as the metrics path caps an L0
+     cross over pays STREAM_DIR's bytes without using them. With a read cache
+     wired, that GET admits each section under its own extent key as well as
+     the combined span's, because the per-section key is the one a later
+     read looks up first; while those entries stay resident, the next read
+     of the object serves both sections from the cache.
+   - Chunk runs per L0 object are capped at 4, as the metrics path caps an L0
      segment's page ranges (`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`): after
      already-covered runs are dropped, runs beyond the cap are merged across
      their smallest gaps. The bridged bytes are fetched, reserved and
      charged like any other. The existing covering-read check (a read that
      would cover most of the object becomes one whole-object GET) still
-     applies after bridging.
+     applies after bridging, and is sized on the same runs the read would
+     issue.
+   - A compacted L1 log part is exempt from the cap, as the metrics path
+     exempts an L1 part (`fetch_pages`). An L1 part can be far larger than a
+     flush, with many row groups; bridging a narrow projection over it down
+     to 4 runs would produce spans covering most of the object. Its runs are
+     fetched as coalescing leaves them, and its covering-read check is sized
+     on those unbridged runs.
    - A narrow projection of a one-row-group object then costs at most 3
      GETs: probe, front sections, one run.
 
@@ -107,6 +118,10 @@ measurement (#2066).
 - Bridging gaps reads some bytes the query does not need. The cap trades
   those bytes for requests, and the covering-read check bounds the trade at
   a whole-object read.
+- The cap binds L0 objects only. A narrow projection over many row groups of
+  a compacted L1 log part still issues one GET per coalesced run, as it did
+  before this decision, trading requests for not moving most of a large
+  object.
 - A read that crosses over to a whole-object GET after fetching FIELD_DIR
   also pays for STREAM_DIR, which it never uses, with no request saved.
   `reconcile_accepts_a_measured_run_with_an_exact_phase_split`

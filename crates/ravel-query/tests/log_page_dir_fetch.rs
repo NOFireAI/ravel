@@ -153,6 +153,23 @@ fn build_object(records: &[LogRecord]) -> Vec<u8> {
 }
 
 fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+    seg_ref_at(size, records, SegmentLevel::L0)
+}
+
+/// The same object as [`seg_ref`] describes, catalogued as one part of a
+/// compacted L1 bucket instead of an L0 flush.
+fn l1_seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+    seg_ref_at(
+        size,
+        records,
+        SegmentLevel::L1 {
+            input_set_hash: [3u8; 32],
+            part_index: 0,
+        },
+    )
+}
+
+fn seg_ref_at(size: u64, records: &[LogRecord], level: SegmentLevel) -> SegmentRef {
     let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
     let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
     SegmentRef {
@@ -169,7 +186,7 @@ fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
         writer_epoch: 1,
         writer_seq: 1,
         created_unix_ns: 0,
-        level: SegmentLevel::L0,
+        level,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         declared_column_stats: Default::default(),
     }
@@ -671,6 +688,152 @@ async fn version_4_projected_read_bridges_chunk_runs_to_the_four_get_cap() {
         "including the probe and the front sections, still under one whole-object read"
     );
     assert_eq!(got.len(), bytes.len(), "an object-sized decode buffer");
+}
+
+// ---- 1c. the chunk-run cap binds L0 only -----------------------------------
+
+/// What one narrow projected read of `bytes` at `seg`'s level issued: its
+/// stats, every range GET that landed in BLOCKS (sorted), the whole-object GET
+/// count and the total GET count.
+async fn projected_read_at(
+    bytes: &[u8],
+    seg: &SegmentRef,
+    coverage_threshold: Option<f64>,
+) -> (ravel_query::BlockRangeStats, Vec<(u64, u64)>, u64, u64) {
+    let mem = store_with(bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+    let mut fetcher = ranged(store, bytes);
+    if let Some(t) = coverage_threshold {
+        fetcher = fetcher.with_coverage_threshold(t);
+    }
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let acc = QueryAccounting::new();
+    let (_got, stats) = fetcher
+        .fetch_object_projected(seg, TENANT, i64::MIN, i64::MAX, &sel, &acc)
+        .await
+        .expect("projected fetch");
+    let (blocks_offset, _) = blocks_extent(bytes);
+    let mut chunk_ranges: Vec<(u64, u64)> = recording
+        .ranges()
+        .into_iter()
+        .filter(|(start, _)| *start >= blocks_offset)
+        .collect();
+    chunk_ranges.sort_unstable();
+    (stats, chunk_ranges, recording.full_gets(), recording.gets())
+}
+
+/// The chunk-run cap is an L0 bound (ADR-2066 decision 1), as it is on the
+/// metrics path (`fetch_pages` exempts L1): the object and projection of
+/// `version_4_projected_read_bridges_chunk_runs_to_the_four_get_cap`,
+/// catalogued as an L1 part, issue one GET per coalesced run with no gap
+/// bridged, while the same bytes catalogued as an L0 flush issue exactly
+/// `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`.
+///
+/// Non-vacuity: with the cap applied regardless of level, or gated on an
+/// object-size threshold above this fixture's size instead of on the level,
+/// the L1 read bridges to 4 runs and the L1 run-count assertion fails.
+#[tokio::test]
+async fn version_4_l1_part_issues_every_chunk_run_while_l0_caps_at_four() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let ids = resolved(&bytes, &sel).expect("a projection, not all columns");
+    let all_blocks: Vec<usize> = (0..BLOCKS).collect();
+    let raw_ends: Vec<(u64, u64)> = expected_runs(&bytes, &all_blocks, Some(&ids), 0)
+        .into_iter()
+        .map(|(s, l)| (s, s + l))
+        .collect();
+    assert_eq!(
+        raw_ends.len(),
+        9,
+        "3 row groups x 3 projected columns, none adjacent at gap 0"
+    );
+    let bridged = bound_runs_oracle(&raw_ends, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT);
+    assert_eq!(bridged.len(), 4, "the L0 cap bridges 9 runs to 4");
+
+    let l1 = l1_seg_ref(bytes.len() as u64, &recs);
+    let (stats, chunk_ranges, full_gets, gets) = projected_read_at(&bytes, &l1, None).await;
+    assert!(!stats.whole_object, "L1: the projection stays ranged");
+    assert_eq!(full_gets, 0, "L1: no whole-object GET");
+    assert_eq!(
+        stats.block_range_gets, 9,
+        "L1: one chunk-run GET per coalesced run, none bridged"
+    );
+    assert_eq!(
+        chunk_ranges, raw_ends,
+        "L1: the chunk GETs are exactly the raw coalesced runs"
+    );
+    assert_eq!(gets, 1 + 1 + 9, "L1: probe + front sections + 9 runs");
+    let raw_bytes: u64 = raw_ends.iter().map(|(s, e)| e - s).sum();
+    assert_eq!(
+        stats.block_bytes_fetched, raw_bytes,
+        "L1: no gap byte is bridged"
+    );
+
+    let l0 = seg_ref(bytes.len() as u64, &recs);
+    let (stats, chunk_ranges, full_gets, gets) = projected_read_at(&bytes, &l0, None).await;
+    assert!(!stats.whole_object, "L0: the projection stays ranged");
+    assert_eq!(full_gets, 0, "L0: no whole-object GET");
+    assert_eq!(
+        stats.block_range_gets, 4,
+        "L0: 9 runs bridged to MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT"
+    );
+    assert_eq!(
+        chunk_ranges, bridged,
+        "L0: the chunk GETs are the bridged runs"
+    );
+    assert_eq!(gets, 1 + 1 + 4, "L0: probe + front sections + 4 runs");
+}
+
+/// The coverage crossover sizes an L1 read on the runs that read would
+/// issue, unbridged, not on the L0-bridged set: with a threshold between the
+/// two coverages, the L1 part stays ranged while the same bytes as an L0 flush
+/// cross over to one whole-object GET.
+///
+/// Non-vacuity: exempting L1 in `bounded_chunk_runs` but still bridging to 4
+/// in `bridged_run_bytes` makes the L1 read cross over, and its
+/// `whole_object` assertion fails.
+#[tokio::test]
+async fn version_4_l1_crossover_is_sized_on_its_unbridged_runs() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let ids = resolved(&bytes, &sel).expect("a projection, not all columns");
+    let all_blocks: Vec<usize> = (0..BLOCKS).collect();
+    let raw_ends: Vec<(u64, u64)> = expected_runs(&bytes, &all_blocks, Some(&ids), 0)
+        .into_iter()
+        .map(|(s, l)| (s, s + l))
+        .collect();
+    let bridged = bound_runs_oracle(&raw_ends, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT);
+    let raw_bytes: u64 = raw_ends.iter().map(|(s, e)| e - s).sum();
+    let bridged_bytes: u64 = bridged.iter().map(|(s, e)| e - s).sum();
+    assert!(
+        raw_bytes < bridged_bytes,
+        "bridging must add gap bytes for the threshold to fit between: \
+         {raw_bytes} vs {bridged_bytes}"
+    );
+    let (_, blocks_len) = blocks_extent(&bytes);
+    let threshold = (raw_bytes + bridged_bytes) as f64 / 2.0 / blocks_len as f64;
+
+    let l1 = l1_seg_ref(bytes.len() as u64, &recs);
+    let (stats, _, full_gets, _) = projected_read_at(&bytes, &l1, Some(threshold)).await;
+    assert!(
+        !stats.whole_object,
+        "L1: the unbridged runs' coverage ({raw_bytes} of {blocks_len}) is under \
+         the threshold, so the read stays ranged"
+    );
+    assert_eq!(full_gets, 0, "L1: no whole-object GET");
+    assert_eq!(stats.block_range_gets, 9, "L1: the 9 unbridged runs");
+
+    let l0 = seg_ref(bytes.len() as u64, &recs);
+    let (stats, _, full_gets, _) = projected_read_at(&bytes, &l0, Some(threshold)).await;
+    assert!(
+        stats.whole_object,
+        "L0: the bridged runs' coverage ({bridged_bytes} of {blocks_len}) clears \
+         the threshold, so the read crosses over"
+    );
+    assert_eq!(full_gets, 1, "L0: one whole-object GET");
 }
 
 // ---- 2. pruned: ranges land in the surviving group only -------------------
@@ -1302,6 +1465,104 @@ async fn plan_phase_field_dir_cache_is_reused_by_a_narrow_scan() {
         scan_acc.snapshot().cache_hits > 0,
         "the scan phase must record at least one cache hit (FIELD_DIR, \
          served from the plan phase's cache entry)"
+    );
+}
+
+/// The combined STREAM_DIR+FIELD_DIR GET admits each section under its own
+/// per-section cache key, the key `place_front_sections` peeks: a second read
+/// of the same object through the same cached fetcher, with a fresh
+/// assembler, serves both front sections from those peeks.
+///
+/// The first read is cold: it misses the probe, the front span and the 4
+/// bridged chunk runs (6 read-through misses on the query's accounting), and
+/// the cache's own counters also carry the two per-section peeks that found
+/// nothing (8). The second read issues no GET and hits the probe, the two
+/// sections and the 4 runs (7 hits, 0 misses on either counter).
+///
+/// Non-vacuity: admitting under the span's key only (the pre-change code)
+/// leaves the second read at 6 hits (the span once, not the two sections) and
+/// 2 cache-counter misses; admitting FIELD_DIR's key only makes the second
+/// read re-fetch STREAM_DIR live.
+#[tokio::test]
+async fn combined_front_get_admits_each_section_under_its_own_key() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let mem = store_with(&bytes).await;
+    let recording = RecordingStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+    let cache = read_cache();
+    let fetcher = ranged(store, &bytes).with_cache(Arc::clone(&cache));
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let sel = ColumnSelection::fixed_only().with_flags();
+
+    let before = cache.metrics().snapshot();
+    let first = QueryAccounting::new();
+    let (_got, stats) = fetcher
+        .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &first)
+        .await
+        .expect("first fetch");
+    let after_first = cache.metrics().snapshot();
+    assert_eq!(
+        stats.metadata_gets, 1,
+        "first read: STREAM_DIR and FIELD_DIR in one combined GET"
+    );
+    assert_eq!(
+        stats.block_range_gets, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+        "first read: 4 bridged chunk runs"
+    );
+    assert_eq!(
+        recording.gets(),
+        1 + 1 + 4,
+        "first read: probe + front + 4 runs"
+    );
+    let first_snap = first.snapshot();
+    assert_eq!(
+        first_snap.cache_misses, 6,
+        "first read: probe + front span + 4 runs, each one read-through miss"
+    );
+    assert_eq!(first_snap.cache_hits, 0, "first read: nothing resident");
+    assert_eq!(
+        after_first.misses - before.misses,
+        8,
+        "first read, cache counters: the 6 read-through misses plus the two \
+         per-section peeks"
+    );
+    assert_eq!(after_first.hits - before.hits, 0, "first read: no hit");
+
+    let gets_before_second = recording.gets();
+    let second = QueryAccounting::new();
+    let (_got, stats) = fetcher
+        .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &second)
+        .await
+        .expect("second fetch");
+    let after_second = cache.metrics().snapshot();
+    assert_eq!(
+        recording.gets(),
+        gets_before_second,
+        "second read: every extent is resident, no GET"
+    );
+    assert_eq!(stats.metadata_gets, 0, "second read: no front-section GET");
+    assert_eq!(
+        stats.block_cache_hits, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+        "second read: the 4 runs hit"
+    );
+    let second_snap = second.snapshot();
+    assert_eq!(
+        second_snap.cache_hits,
+        1 + 2 + 4,
+        "second read: the probe, STREAM_DIR and FIELD_DIR under their own \
+         keys, and the 4 runs"
+    );
+    assert_eq!(second_snap.cache_misses, 0, "second read: no miss recorded");
+    assert_eq!(
+        after_second.hits - after_first.hits,
+        7,
+        "second read, cache counters: the same 7 hits"
+    );
+    assert_eq!(
+        after_second.misses - after_first.misses,
+        0,
+        "second read, cache counters: the section peeks no longer miss"
     );
 }
 

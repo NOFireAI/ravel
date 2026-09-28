@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_logseg::footer::kind;
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
@@ -42,6 +43,7 @@ const TENANT: TenantHash = TenantHash([7u8; 16]);
 struct CountingStore {
     inner: Arc<MemoryStore>,
     gets: AtomicU64,
+    requests: std::sync::Mutex<Vec<GetRange>>,
 }
 
 impl CountingStore {
@@ -49,11 +51,17 @@ impl CountingStore {
         CountingStore {
             inner,
             gets: AtomicU64::new(0),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     fn get_count(&self) -> u64 {
         self.gets.load(Ordering::SeqCst)
+    }
+
+    /// Every `get` range, in issue order.
+    fn requests(&self) -> Vec<GetRange> {
+        self.requests.lock().expect("requests").clone()
     }
 }
 
@@ -70,6 +78,7 @@ impl ObjectStoreBackend for CountingStore {
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().expect("requests").push(range);
         self.inner.get(key, range).await
     }
 
@@ -353,6 +362,7 @@ fn lines_request<'a>(matchers: &'a [LabelMatcher], window: TimeRange) -> LogSeri
 async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     let mem = Arc::new(MemoryStore::new());
     let (ref_a, ref_b) = two_objects(&mem).await;
+    let raw = Arc::clone(&mem);
     let counting = Arc::new(CountingStore::new(mem));
     let fetcher = LogSegmentFetcher::new(counting.clone() as Arc<dyn ObjectStoreBackend>)
         .with_block_range_threshold(0)
@@ -402,16 +412,23 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     assert_eq!(info.labels.get("instance"), Some("i-1"));
     assert_eq!(info.labels.get(METRIC_NAME_LABEL), Some(LOG_LINES_METRIC));
 
-    // Object B was pruned by ts range before any GET. Object A's Plan phase
-    // (footer probe, then a separate range GET for the front STREAM_DIR
-    // section the probe's tail suffix does not cover) and Scan phase (its
-    // own footer probe, then the BLOCKS range reads for the 4 blocks
-    // `small_blocks()` cuts 11 records into, bridged and bounded to at most
-    // `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4) chunk-run GETs per ADR-2066
-    // decision 1) are each pinned exactly, so a regression that adds or
+    // Object B was pruned by ts range before any GET. Object A's GETs are
+    // pinned one by one against its own footer, so a regression that adds or
     // removes a GET on this path is caught by name. `with_suffix_len(300)`
     // fixes the probe window so these counts do not depend on the object's
-    // incidental total size.
+    // incidental total size. This fetcher has no cache, so nothing the Plan
+    // phase read is reused by the Scan phase.
+    //
+    // Plan (2): the footer probe, then STREAM_DIR, which no tail probe reaches.
+    // Scan (5): its own footer probe; SKIP_IDX and PAGE_DIR in one coalesced
+    // GET (the 300-byte probe reaches neither); STREAM_DIR and FIELD_DIR in
+    // one combined front GET (ADR-2066 decision 1); BLOOM, the tail section
+    // the probe also missed; and one chunk run, because the projection's
+    // pages across the 4 blocks `small_blocks()` cuts 11 records into (one
+    // row group) coalesce into a single run at the default gap. The cap
+    // (`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`, 4) cannot bind on one run: the
+    // count fell from 6 to 5 because FIELD_DIR and STREAM_DIR stopped being
+    // fetched separately, not because of bridging.
     let snap = accounting.snapshot();
     let plan_gets = snap.phase(QueryPhase::Plan).s3_requests(AccountedOp::Get);
     let scan_gets = snap.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get);
@@ -426,7 +443,61 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     );
     assert_eq!(
         scan_gets, 5,
-        "Scan: one footer probe GET, plus at most MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT (4) bridged BLOCKS range GETs across the 4 surviving blocks"
+        "Scan: footer probe + SKIP_IDX/PAGE_DIR + combined STREAM_DIR/FIELD_DIR \
+         + BLOOM + one chunk run"
+    );
+
+    let object_a = raw
+        .get("logs/a.rlog", GetRange::Full)
+        .await
+        .expect("object A")
+        .data;
+    let f = ravel_logseg::footer::open(&object_a).expect("object A footer");
+    let section = |k: u32| *f.section(k).expect("section present");
+    let (stream_dir, field_dir) = (section(kind::STREAM_DIR), section(kind::FIELD_DIR));
+    let (skip_idx, page_dir) = (section(kind::SKIP_IDX), section(kind::PAGE_DIR));
+    let (bloom, blocks) = (section(kind::BLOOM), section(kind::BLOCKS));
+    assert_eq!(
+        field_dir.offset,
+        stream_dir.offset + stream_dir.len,
+        "the two front sections are adjacent"
+    );
+    assert_eq!(
+        page_dir.offset,
+        skip_idx.offset + skip_idx.len,
+        "SKIP_IDX and PAGE_DIR are adjacent"
+    );
+    let requests = counting.requests();
+    assert_eq!(
+        requests[..2],
+        [
+            GetRange::Suffix(300),
+            GetRange::Range(stream_dir.offset, stream_dir.offset + stream_dir.len),
+        ],
+        "Plan: the footer probe, then STREAM_DIR alone"
+    );
+    let scan = &requests[2..];
+    assert_eq!(
+        scan[..4],
+        [
+            GetRange::Suffix(300),
+            GetRange::Range(skip_idx.offset, page_dir.offset + page_dir.len),
+            GetRange::Range(stream_dir.offset, field_dir.offset + field_dir.len),
+            GetRange::Range(bloom.offset, bloom.offset + bloom.len),
+        ],
+        "Scan: probe, SKIP_IDX+PAGE_DIR, STREAM_DIR+FIELD_DIR, BLOOM"
+    );
+    let chunk_runs: Vec<&GetRange> = scan[4..]
+        .iter()
+        .filter(|r| {
+            matches!(r, GetRange::Range(a, b)
+                if *a >= blocks.offset && *b <= blocks.offset + blocks.len)
+        })
+        .collect();
+    assert_eq!(
+        (chunk_runs.len(), scan.len()),
+        (1, 5),
+        "Scan: exactly one chunk run inside BLOCKS, and nothing after it"
     );
 
     let plan_bytes = snap.phase(QueryPhase::Plan).total_s3_bytes();
