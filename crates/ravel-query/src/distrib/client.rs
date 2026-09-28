@@ -10,10 +10,8 @@
 //! No transport in this crate decodes a remote's log or span slice. The
 //! log and span fetches are the [`SliceFetcher`] trait defaults, which report
 //! [`pb::status::Code::Unsupported`] and send the coordinator to whole-query
-//! local execution; whoever wires those signals across the slice boundary writes
-//! a bounded incremental decoder for them, the shape
-//! [`SliceStreamDecoder`](crate::distrib::SliceStreamDecoder) establishes (issue
-//! #1912).
+//! local execution. [`SliceFetcher::fetch_logs`] states what wiring either
+//! signal across the slice boundary owes.
 
 use ravel_logseg::LogRecord;
 use ravel_proto::queryfrag::v1 as pb;
@@ -56,8 +54,8 @@ pub enum DistribError {
     /// worker-computed scalar aggregate is never expected (the metrics decoder
     /// does consume it).
     /// Unreachable from a real query today: this crate only ever dispatches
-    /// `Signal::Metrics` across the slice boundary, and nothing here decodes a
-    /// remote's log or span slice (issue #1912). The `frame` oneof is
+    /// `Signal::Metrics` across the slice boundary (see
+    /// [`SliceFetcher::fetch_logs`] for why). The `frame` oneof is
     /// exhaustive, so every decoder must still name the variants: this is a
     /// well-formed frame this build does not consume, not corruption.
     #[error(
@@ -277,11 +275,15 @@ pub trait SliceFetcher: Send + Sync {
     /// ADR's silent version-skew fallback: an unimplemented log fetch is a
     /// coverage gap the coordinator fills locally, never a hard failure.
     ///
-    /// Nothing overrides it today, [`RemoteSliceFetcher`] included (issue
-    /// #1912): an override has to decode the worker's [`pb::LogRecordFrame`]s
-    /// incrementally under a per-slice frame and wire-byte cap, the way
+    /// Nothing overrides it today, [`RemoteSliceFetcher`] included, so no
+    /// transport in this crate decodes a remote's log or span slice: issue
+    /// #1912 deleted the whole-sequence decoders that did
+    /// (`decode_log_slice_frames` and `decode_span_slice_frames`). An override
+    /// has to decode the worker's [`pb::LogRecordFrame`]s incrementally under
+    /// a per-slice frame and wire-byte cap, the way
     /// [`SliceStreamDecoder`](crate::distrib::SliceStreamDecoder) does for
-    /// metrics, so that a remote cannot decide how much the coordinator buffers.
+    /// metrics, so that a remote cannot decide how much the coordinator
+    /// buffers.
     async fn fetch_logs(
         &self,
         _request: pb::FetchRequest,
@@ -315,8 +317,8 @@ pub trait SliceFetcher: Send + Sync {
 /// [`SliceStreamDecoder`], so the per-slice frame and wire-byte caps are checked
 /// before each frame is decoded and the first breach stops the read (issue
 /// #1912). It does not override [`SliceFetcher::fetch_logs`] or
-/// [`SliceFetcher::fetch_spans`]: those report `Unsupported` and the coordinator
-/// falls back to whole-query local execution.
+/// [`SliceFetcher::fetch_spans`]; see those for what an override of either
+/// owes.
 pub struct RemoteSliceFetcher {
     channel: Channel,
     /// `None` leaves the decoder's own frame cap
