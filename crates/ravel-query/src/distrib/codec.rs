@@ -65,7 +65,14 @@ use crate::span_fetcher::SpanRow;
 /// coordinator maps to a silent local fallback, so a rolling deploy degrades
 /// to raw fetch, never a corrupt answer -- the same pattern as the 2 -> 3
 /// bump above.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// Bumped 4 -> 5 for ADR-1689 decision 3: SQL slice `DoGet` moves onto the
+/// dedicated fragment listener, and a worker with `--fragment-listener` refuses
+/// slice tickets on its public listener. No queryfrag frame changes; the bump
+/// exists so the routing-time version filter keeps both lanes from dialing a
+/// worker that serves slices on the other listener. A skewed worker's slices
+/// run coordinator-local, exactly as for the bumps above.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The ceiling on how many response frames a coordinator accepts for ONE slice
 /// before refusing it (issue #1687 part B). Paired with the per-slice byte cap
@@ -1832,12 +1839,12 @@ mod tests {
         }
     }
 
-    /// ADR-0103 (epic #64): the protocol version is 4 now that the coordinator
-    /// sets `FetchRequest.partial_aggregate` live and `MergedSource` consumes
-    /// the reply -- see the doc comment on `PROTOCOL_VERSION`.
+    /// ADR-1689 decision 3: the protocol version is 5 now that SQL slice
+    /// `DoGet` rides the dedicated fragment listener -- see the doc comment on
+    /// `PROTOCOL_VERSION`.
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]

@@ -67,10 +67,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   separate client and slice keys. A `--distributed-query` process in `all` or
   `query` mode missing `--sql-ticket-key-file` or `--fragment-listener` logs
   a startup warning that release B (ADR-1689 decision 4) requires both. Every `--distributed-query` process in `all` or
-  `query` mode also logs, with any flags, that SQL slice tickets still travel
-  in plaintext on the public gRPC listener and are a replayable read
-  capability until their deadline: the SQL lane moves to the dedicated
-  listener in a later change. Every node in a cluster must read the same SQL
+  `query` mode without `--fragment-listener` also logs that SQL slice
+  tickets travel in plaintext on the public gRPC listener and are a
+  replayable read capability until their deadline (next entry). Every node in a cluster must read the same SQL
   ticket key set. A rolling switch straight onto a new key file has a mixed
   window: a client ticket that `GetFlightInfo` minted on a node on the file
   and that `DoGet` redeems on a node still on the derived key (or the
@@ -79,6 +78,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   SQL slices between two such nodes run on the coordinator instead. The
   deployment guide describes a switch without that window: first ship a key
   file holding the key each node derives today, then rotate.
+
+- **SQL slice fetches ride the dedicated TLS fragment listener, and the
+  public gRPC listener refuses slice tickets once one is configured**
+  (ADR-1689 decisions 1 and 3, issues #1689 and #1690). With
+  `--fragment-listener`, the dedicated listener mounts the Flight service
+  beside `SeriesFetch` in a slice-only role: it serves `DoGet` for a slice
+  ticket and answers every other Flight and Flight SQL method with
+  `permission_denied`. The public gRPC listener keeps the client Flight SQL
+  surface and refuses a slice ticket outright with `permission_denied`,
+  counted as `wrong_surface`, the mirror of it refusing pinned fragment
+  fetches. The SQL lane dials each worker's `fragment_endpoint` over the same
+  pinned-CA mutual TLS the PromQL lane uses, with the same certificate, so a
+  peer without a client certificate from `--fragment-tls-ca` fails the
+  handshake; it no longer dials `flight_sql_endpoint` for slices, and a
+  worker whose record has no fragment endpoint gets none. Without
+  `--fragment-listener` nothing changes: the public listener serves both
+  surfaces and slices travel there in plaintext, and the startup line saying
+  so is now logged only in that case (and only where Flight SQL is served).
+  In a build without Flight SQL the release B warning names only
+  `--fragment-listener`. The `queryfrag` protocol version moves from 4 to 5,
+  so during the one rolling deploy onto this release a coordinator drops
+  workers on the other version at routing time and runs their PromQL and SQL
+  slices coordinator-local: parallelism drops for the deploy, results do not
+  change. A slice handle too short to be a ticket is now counted as
+  `missing` rather than `bad_mac`.
 
 ### Fixed
 
