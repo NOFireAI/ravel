@@ -145,11 +145,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retries the reservation a single time. An entry a live resolve still holds
   keeps its reservation until that resolve drops it, so a pass can empty a
   cache and free nothing; the pass is bounded by the entries it removes rather
-  than by the bytes it frees, and a decode larger than the whole budget still
-  fails after one retry. The column-statistics cache is unaffected: its
-  entries carry no reservation and it is already bounded in bytes. The server
-  does not yet pass a finite budget to the catalog, so no deployed read path
-  changes in this release.
+  than by the bytes it frees. A decode wanting more than the budget's whole
+  limit skips the pass and keeps its first refusal, since no eviction could
+  admit it and running the pass anyway flushed every tenant's decoded entries
+  on each such query (issue #2107). A column-statistics load takes the same
+  pass: it reserves its declared body against the same budget these caches
+  hold, and used to fail with `MemoryExhausted` while a cached decoded part
+  held memory that one eviction would have handed back (issue #2107). The
+  column-statistics CACHE is still unaffected: its entries carry no
+  reservation and it is already bounded in bytes. The server does not yet pass
+  a finite budget to the catalog, so no deployment sees the eviction pass in
+  this release; one deployed change does land with it, on every catalog
+  including one on the unlimited default budget, because the two caches' own
+  per-tenant entry cap now evicts least recently used rather than oldest
+  inserted. A tenant whose hot part or postings object is re-read on every
+  query keeps it past the cap instead of losing it to a wide scan.
 - **Alert sink delivery is bounded per evaluation tick, and ADR-0117's stated
   per-tick publish bound is corrected** (issues #2063, #2064). The evaluator
   delivered every undelivered notification to every sink sequentially with no

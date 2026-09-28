@@ -11423,9 +11423,9 @@ mod tests {
     /// FLIP: make `DecodedTenantCache::remove_lru` (cache.rs) skip an entry a
     /// reader still holds -- put the entry back and return `None` when
     /// `Arc::strong_count(&entry.value) > 1` -- the "do not evict what frees
-    /// nothing" rule this test rejects. The pass then drops nothing, and
-    /// `part_cache().total_entries()` below reads 1 instead of 0 with
-    /// `decoded_cache_memory_evictions()` 0 instead of 1.
+    /// nothing" rule this test rejects. The pass then drops nothing, so
+    /// `decoded_cache_memory_evictions()` below reads 0 instead of 1 and
+    /// `part_cache().total_entries()` reads 1 instead of 0.
     #[tokio::test]
     async fn an_evicted_entry_stays_charged_while_a_reader_holds_it() {
         let store = Arc::new(MemoryStore::new());

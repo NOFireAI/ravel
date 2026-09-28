@@ -1894,6 +1894,50 @@ mod tests {
         assert!(cache.get(&tenant, "k4", &accounting).is_some());
     }
 
+    /// The per-tenant cap evicts LEAST RECENTLY USED, not oldest inserted: a
+    /// key read since it was admitted outlives one inserted after it and never
+    /// read. Without this the cap cannot be told from insertion order, since
+    /// an insert-only sequence evicts the same key either way.
+    ///
+    /// FLIP: stop restamping in `DecodedTenantCache::touch` (cache.rs) -- have
+    /// it return `(entry.value.clone(), entry.bytes)` without writing
+    /// `entry.use_tick` or moving the key in `by_use` -- and the cap falls
+    /// back to insertion order: "k0" goes and the assert below fails.
+    #[test]
+    fn part_cache_capacity_cap_evicts_the_least_recently_used() {
+        let cache = PartCache::default();
+        let tenant = TenantHash([0x21; 16]);
+        let accounting = QueryAccounting::new();
+        for i in 0..3 {
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(Charged::for_test(decoded_part(1))),
+                1,
+                3,
+            );
+        }
+        assert!(
+            cache.get(&tenant, "k0", &accounting).is_some(),
+            "the oldest insert, read once and so now the most recently used"
+        );
+        cache.insert(
+            tenant,
+            "k3".to_string(),
+            Arc::new(Charged::for_test(decoded_part(1))),
+            1,
+            3,
+        );
+
+        assert!(
+            cache.get(&tenant, "k1", &accounting).is_none(),
+            "the least recently used key is the one never read, not the oldest insert"
+        );
+        assert!(cache.get(&tenant, "k0", &accounting).is_some());
+        assert!(cache.get(&tenant, "k2", &accounting).is_some());
+        assert!(cache.get(&tenant, "k3", &accounting).is_some());
+    }
+
     #[test]
     fn part_cache_tenants_are_isolated() {
         let cache = PartCache::default();
@@ -1968,6 +2012,48 @@ mod tests {
         assert!(cache.get(&tenant, "k4", &accounting).is_some());
     }
 
+    /// [`part_cache_capacity_cap_evicts_the_least_recently_used`] for the
+    /// other decoded cache: the two share one implementation, and a test on
+    /// only one of them would pass a `PostingsCache` wired to a cap of its
+    /// own.
+    ///
+    /// FLIP: the same one in `DecodedTenantCache::touch` (cache.rs); "k0" is
+    /// evicted instead of "k1" and the assert below fails.
+    #[test]
+    fn postings_cache_capacity_cap_evicts_the_least_recently_used() {
+        let cache = PostingsCache::default();
+        let tenant = TenantHash([0x22; 16]);
+        let accounting = QueryAccounting::new();
+        for i in 0..3 {
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(Charged::for_test(decoded_postings())),
+                1,
+                3,
+            );
+        }
+        assert!(
+            cache.get(&tenant, "k0", &accounting).is_some(),
+            "the oldest insert, read once and so now the most recently used"
+        );
+        cache.insert(
+            tenant,
+            "k3".to_string(),
+            Arc::new(Charged::for_test(decoded_postings())),
+            1,
+            3,
+        );
+
+        assert!(
+            cache.get(&tenant, "k1", &accounting).is_none(),
+            "the least recently used key is the one never read, not the oldest insert"
+        );
+        assert!(cache.get(&tenant, "k0", &accounting).is_some());
+        assert!(cache.get(&tenant, "k2", &accounting).is_some());
+        assert!(cache.get(&tenant, "k3", &accounting).is_some());
+    }
+
     #[test]
     fn postings_cache_tenants_are_isolated() {
         let cache = PostingsCache::default();
@@ -1983,6 +2069,67 @@ mod tests {
         );
         assert!(cache.get(&a, "k", &accounting).is_some());
         assert!(cache.get(&b, "k", &accounting).is_none());
+    }
+
+    /// A memory-pressure eviction orders by the shared recency clock, not by
+    /// which of the two caches holds the entry: whichever of a part and a
+    /// postings entry was used longer ago is the one that goes, in either
+    /// direction.
+    ///
+    /// FLIP: give [`DecodedCaches`] a clock per cache (`PartCache::default()`
+    /// and `PostingsCache::default()` in its `Default` impl, cache.rs) and the
+    /// two stamps are no longer comparable: each cache's first entry is
+    /// stamped 0, so the part is evicted in both halves and the first assert
+    /// below fails.
+    #[test]
+    fn a_memory_eviction_takes_the_older_entry_from_either_cache() {
+        let tenant = TenantHash([0x23; 16]);
+
+        let caches = DecodedCaches::default();
+        caches.postings().insert(
+            tenant,
+            "older-postings".to_string(),
+            Arc::new(Charged::for_test(decoded_postings())),
+            1,
+            10,
+        );
+        caches.parts().insert(
+            tenant,
+            "newer-part".to_string(),
+            Arc::new(Charged::for_test(decoded_part(1))),
+            1,
+            10,
+        );
+        assert!(caches.evict_one_lru());
+        assert_eq!(
+            caches.postings().total_entries(),
+            0,
+            "the older postings entry goes first"
+        );
+        assert_eq!(caches.parts().total_entries(), 1);
+
+        let caches = DecodedCaches::default();
+        caches.parts().insert(
+            tenant,
+            "older-part".to_string(),
+            Arc::new(Charged::for_test(decoded_part(1))),
+            1,
+            10,
+        );
+        caches.postings().insert(
+            tenant,
+            "newer-postings".to_string(),
+            Arc::new(Charged::for_test(decoded_postings())),
+            1,
+            10,
+        );
+        assert!(caches.evict_one_lru());
+        assert_eq!(
+            caches.parts().total_entries(),
+            0,
+            "and the older part goes first when the order is the other way round"
+        );
+        assert_eq!(caches.postings().total_entries(), 1);
     }
 
     // -----------------------------------------------------------------
