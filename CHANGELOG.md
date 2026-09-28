@@ -230,7 +230,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   enforced pass refused (by the lag check or the floor) and every bypass pass
   refused by the floor, so it takes as many consecutive over-bound backwards
   steps on the bypass readings as the pass cap allows passes, the same count
-  the floor alone needed before this check existed. `FlushNow` and every size
+  the floor alone needed before this check existed. One consequence for
+  existing alerting: a bypass pass suspends the lag check only, so a teardown
+  drain whose flushes are all refused by the ADR-1307 floor now runs the
+  bypass passes too and is refused on each of them, and
+  `clock_regressions_refused` counts twice what it counted before this change
+  for the same clock. `FlushNow` and every size
   or age trigger keep refusing. Fix the host clock before restarting a writer
   that is refusing flushes.
 - **Alert sink delivery is bounded per evaluation tick, and ADR-0117's stated

@@ -703,9 +703,9 @@ fn buffer_until_drain_config() -> IngestConfig {
 }
 
 /// How many refusals a drain counts under [`buffer_until_drain_config`] with a
-/// lagging clock: one per enforced pass. A lag refusal re-anchors nothing, so
-/// every pass reads the same lag and refuses again until the bound stops the
-/// enforced loop. Bypass passes add nothing here: they do not run the check.
+/// lagging clock: one per enforced pass, because a lag refusal re-anchors
+/// nothing and every pass reads the same lag (see `MAX_FLUSH_ALL_PASSES`).
+/// Bypass passes add nothing here: they do not run the check.
 const DRAIN_REFUSALS: u64 = MAX_FLUSH_ALL_PASSES as u64;
 
 /// The ADR-1685 teardown amendment. Buffered mode acknowledged these rows, and

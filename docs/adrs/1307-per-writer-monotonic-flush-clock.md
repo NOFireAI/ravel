@@ -230,12 +230,14 @@ flowchart TD
   would never be retried in that call, and on `Shutdown`/channel-close there is
   no later trigger, so its acknowledged buffered-mode rows would be lost on a
   graceful path. `flush_all` therefore retries over fresh snapshots until the
-  map empties, bounded by a small pass cap (`MAX_FLUSH_ALL_PASSES`). This
-  terminates because a refusal re-anchors the floor to `raw_ns`, so the next
-  pass stamps it and proceeds; the cap only guards the pathological clock that
-  steps back on every reading. Residue left after the cap is never dropped
-  silently, but only the caller knows whether it is a loss, so `flush_all`
-  takes the caller's intent. On `Shutdown` and the channel-close arm the actor
+  map empties, bounded by a small pass cap (`MAX_FLUSH_ALL_PASSES`). For the
+  refusal this ADR decides that terminates, because the refusal re-anchors the
+  floor to `raw_ns`, so the next pass stamps it and proceeds; the cap only
+  guards the pathological clock that steps back on every reading. It does not
+  terminate that way for the store-clock lag refusal ADR-1685 later added: see
+  the drain-termination scoping amendment below. Residue left after the cap is
+  never dropped silently, but only the caller knows whether it is a loss, so
+  `flush_all` takes the caller's intent. On `Shutdown` and the channel-close arm the actor
   breaks immediately after the drain: nothing will retry the residue, so it is
   logged at ERROR and counted (`flush_all_residue_tenants`, whose nonzero value
   is a durability defect). On `FlushNow` the actor keeps running and the
@@ -306,5 +308,27 @@ dedup, not a guard on an existing variable. The invariant the fix establishes,
 stated in prose, is: within one writer's process lifetime the sequence of
 `created_unix_ns` stamps it issues is non-decreasing. It says nothing about
 order across a restart (see Known limitation).
+
+## Amendment (2026-09-28): the drain-termination argument covers only this ADR's own refusal
+
+<!-- amendment-applies: sections="Consequences" pointer="drain-termination scoping amendment" -->
+
+The Consequences argue that `flush_all` terminates because a refusal re-anchors
+the floor to `raw_ns`, so the next pass stamps it and proceeds. That holds for
+the refusal this ADR decides, the over-bound clock regression, and for no other.
+
+ADR-1685 added a second flush-open refusal, the store-clock lag check, which
+returns before the floor is read. It changes neither the floor nor the store's
+observation, so a drain that keeps enforcing it reads the same lag on every pass
+and refuses again: `MAX_FLUSH_ALL_PASSES` alone is what ends that loop, not a
+re-anchoring. ADR-1685's "teardown with a lagging clock" amendment is normative
+for what the drain does next (on `Shutdown` and the channel-close arm it makes
+further passes with the lag check bypassed, so those rows publish rather than
+becoming residue) and for what teardown residue takes once both refusals are in
+play.
+
+This ADR's own decision is unchanged. The floor rules, the hold bound, and the
+regression refusal behave exactly as decided here, and they still apply on a
+bypass pass: a bypass suspends the ADR-1685 check only.
 
 Refs: #1307

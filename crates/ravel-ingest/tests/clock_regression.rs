@@ -1751,13 +1751,10 @@ const RECEDING_STEP_NS: i64 = 2 * MAX_FLUSH_CLOCK_HOLD_NS;
 /// the `MAX_FLUSH_ALL_PASSES` enforced passes, plus the `MAX_FLUSH_ALL_PASSES`
 /// bypass passes a teardown adds with the ADR-1685 store-clock lag check
 /// bypassed. Those passes exist so a lagging clock cannot strand acknowledged
-/// rows (a lag refusal re-anchors nothing, so it would refuse every enforced
-/// pass), and they are a bounded loop rather than a single pass because the
-/// ADR-1307 floor rules stay in force on them: a backwards step the lag check
-/// kept the floor from seeing is refused on the first bypass pass, which
-/// re-anchors the floor, and published on the next. A clock that recedes on
-/// every reading is refused on all of them. A `FlushNow` drain adds no bypass
-/// pass and makes `MAX_FLUSH_ALL_PASSES` attempts.
+/// rows, and they are a bounded loop because the ADR-1307 floor rules stay in
+/// force on them (see `MAX_FLUSH_ALL_PASSES`). A clock that recedes on every
+/// reading is refused on all of them. A `FlushNow` drain adds no bypass pass
+/// and makes `MAX_FLUSH_ALL_PASSES` attempts.
 const TEARDOWN_DRAIN_ATTEMPTS: u64 = 2 * MAX_FLUSH_ALL_PASSES as u64;
 
 /// F1 (metrics, teardown): a drain whose refusals outlive the pass cap. The

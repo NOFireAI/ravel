@@ -456,36 +456,31 @@ proceeds unchecked and `clock_lag_unchecked` counts it; refusing there
 would deadlock, because the flush is itself a source of responses.
 
 A graceful shutdown is the one place the check is bypassed. Unlike an
-over-bound clock regression, a lag refusal re-anchors nothing: it leaves
-both the monotonic floor and the store's observation unchanged, so every
-pass of a drain reads the same lag and refuses again. On the `Shutdown` and
-channel-close drains there is no later tick, so enforcing it to the pass cap
-would report the buffered rows as residue and lose them, and in buffered
-mode those rows were already acknowledged. Durability wins there: once the
-bounded enforced passes leave a tenant refused, a teardown drain keeps
-making passes with the lag check bypassed while tenants remain, under the
-same pass cap, publishing with the stamp the floor rules give (the raw
-reading, or the floor itself when it absorbs a backwards step within the
-hold bound) and counting each bypassed flush-open attempt as
-`clock_lag_bypassed_at_shutdown`, logged at WARN with the measured lag.
-Those rows can land in an ingest hour the fold has already sealed, so a
-token-less read sees them only after a HEAD rebuild -- the same recoverable
-outcome the writer had before this check existed, rather than a drop.
-`FlushNow` and every size or age trigger keep refusing, since their actor
-keeps running to retry.
+over-bound clock regression, a lag refusal re-anchors nothing, so every pass
+of a drain reads the same lag and refuses again (the ADR-1685 teardown
+amendment carries that argument). On the `Shutdown` and channel-close drains
+there is no later tick, so enforcing it to the pass cap would report the
+buffered rows as residue and lose them, and in buffered mode those rows were
+already acknowledged. Durability wins there: once the bounded enforced passes
+leave a tenant refused, a teardown drain keeps making passes with the lag
+check bypassed while tenants remain, under the same pass cap, publishing with
+the stamp the floor rules give (the raw reading, or the floor itself when it
+absorbs a backwards step within the hold bound) and counting each bypassed
+flush-open attempt as `clock_lag_bypassed_at_shutdown`, logged at WARN with
+the measured lag. Those rows can land in an ingest hour the fold has already
+sealed, so a token-less read sees them only after a HEAD rebuild -- the same
+recoverable outcome the writer had before this check existed, rather than a
+drop. `FlushNow` and every size or age trigger keep refusing, since their
+actor keeps running to retry. All three counters here (`clock_lag_refused`,
+`clock_lag_unchecked`, and `clock_lag_bypassed_at_shutdown`) live on the
+`ravel-ingest` metrics snapshots, and `/metrics` renders none of them yet:
+that is ADR-1685 follow-up task 3.
 
-The bypass passes are a loop because the floor still applies on them. A lag
-refusal returns before the floor is read, so a backwards step past
-`MAX_FLUSH_CLOCK_HOLD_NS` stays hidden behind the lag check until the first
-bypass pass reaches the floor and is refused there; that refusal re-anchors
-the floor, and the next bypass pass stamps and publishes. Residue on a
-teardown therefore needs every enforced pass refused, by the lag check or by
-the floor, and every bypass pass refused by the floor; since a lag refusal
-never consults the floor, what the bypass passes need is
-`MAX_FLUSH_ALL_PASSES` consecutive backwards steps past the hold bound on
-their own readings, the same count the floor alone needed for residue before
-this check existed. Either way: fix the host clock before restarting a
-writer that is refusing flushes.
+The bypass passes are a bounded loop rather than one pass because the ADR-1307
+floor still applies on them, which is also what decides how many over-bound
+backwards steps teardown residue now takes; the ADR-1685 teardown amendment
+and `MAX_FLUSH_ALL_PASSES`'s doc comment carry that argument. Either way: fix
+the host clock before restarting a writer that is refusing flushes.
 
 ### Pipelined flushes (ADR-0067)
 
