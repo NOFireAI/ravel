@@ -22,12 +22,41 @@
 //!
 //! [`Checkpoint`] names the quiescent points the merge pipeline already has.
 //! At each one the guard renews if a third of the lease has elapsed since its
-//! last successful write, and reports [`Verdict::Cancel`] if that renewal
-//! failed or the claim was observed stolen. A cancelled run publishes nothing:
+//! last successful write, and reports [`Verdict::Cancel`] if that renewal was
+//! rejected because the claim was stolen or is gone. Any other store error on
+//! the renewal is not a cancel: the checkpoint returns it, and the run fails
+//! with it before its record PUT. A cancelled run publishes nothing:
 //! the parts it already PUT stay where they are, which is safe for exactly the
 //! reason [`crate::publish::PublishOutcome::Abandoned`] documents (parts are
 //! content-addressed and deterministic over the frozen input set, so a later
 //! run republishes the identical keys, and sweep rule 3 collects any leftover).
+//!
+//! # Where the claim is taken
+//!
+//! The claim is acquired after the bucket listing and after the input commit
+//! records are read, because the cost gate is priced on the `object_size`
+//! those records carry. It precedes every catalog and block read and every
+//! PUT. Outside its claim requests, a contender refused the claim has paid the
+//! bucket listing and one GET per input commit record, and no catalog, block
+//! or part request (ADR-1029, the amendment on where the claim is taken).
+//!
+//! # Jitter is paid once per attempt
+//!
+//! The deterministic jitter is waited out immediately before the
+//! `CreateIfAbsent`, through the participant's [`ClaimSleeper`], and nowhere
+//! else: [`ClaimSkip::reschedule_after_unix_ms`] is one millisecond past the
+//! holder's expiry and carries no jitter, so a retry scheduled from it pays
+//! the jitter exactly once, in its own pre-acquisition wait.
+//!
+//! # An unreadable claim does not starve its bucket
+//!
+//! A claim whose payload does not decode (corruption, or a newer format
+//! written before a rollback) is never stolen: a reader that cannot read a
+//! claim cannot know it is safe to overwrite. Claims are advisory
+//! (ADR-1029 decision 2), so once the unreadable object's age by the store's
+//! `last_modified` exceeds one lease plus this contender's jitter, the run
+//! proceeds UNCLAIMED ([`Acquire::Unclaimed`]) with a warning naming the key.
+//! Before that age the bucket is deferred like any held claim.
 //!
 //! # Time and requests
 //!
@@ -47,9 +76,15 @@
 //! against a missing key to `PreconditionFailed`, while the S3 adapter answers
 //! `NotFound`, so both spellings reach this code from a live deployment).
 //! Both are the same protocol fact -- this attempt is no longer the owner --
-//! and both cancel the run at the next checkpoint rather than escalating.
+//! and both cancel the run at the next checkpoint rather than escalating. A
+//! steal answered either way is the same lost race
+//! ([`ClaimSkipReason::StealLost`]), and a completion answered either way is a
+//! no-op.
 
 use std::sync::Arc;
+use std::time::Duration;
+
+use futures::future::BoxFuture;
 
 use ravel_fleet::claim::{
     self, Acquisition, ClaimConfig, ClaimObservation, ClaimOwner, Completion, Renewal, Steal,
@@ -70,7 +105,8 @@ use crate::request_ledger::{RequestLedger, RequestPhase};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checkpoint {
     /// After the seal / tombstone / already-compacted / min-input gates and
-    /// before any input read: where the claim is acquired.
+    /// the input commit-record reads the cost gate is priced on, before any
+    /// catalog or block read and before any PUT: where the claim is acquired.
     Gates,
     /// After the input listing and `input_set_hash`, before the per-input
     /// catalog fan-out.
@@ -113,11 +149,13 @@ pub enum ClaimSkipReason {
     HeldByAnother,
     /// The claim had expired, but another thief's CAS landed first (or the
     /// owner was not dead and renewed, which moves the version and defeats the
-    /// steal).
+    /// steal), or the claim object was gone by the steal's CAS.
     StealLost,
     /// The claim's payload does not decode, or declares a format floor this
-    /// build does not understand. Such a claim is never stolen: a reader that
-    /// cannot read a claim cannot know it is safe to take.
+    /// build does not understand, and it is not yet older than one lease plus
+    /// this contender's jitter. Such a claim is never stolen: a reader that
+    /// cannot read a claim cannot know it is safe to take. Past that age the
+    /// run goes ahead unclaimed instead ([`Acquire::Unclaimed`]).
     UnreadableClaim,
     /// The claim existed at the `CreateIfAbsent` and was gone by the read that
     /// followed, twice in a row. One retry is free; a second vanishing means
@@ -151,9 +189,11 @@ pub struct ClaimSkip {
     /// `last_modified + lease`, from the store's own timestamp. `0` when there
     /// was no observation to date (a vanished claim).
     pub expiry_unix_ms: i64,
-    /// The earliest this bucket should be retried: strictly after the holder's
-    /// expiry, offset by this contender's deterministic jitter. Never poll
-    /// before it.
+    /// The earliest this bucket should be retried: one millisecond past the
+    /// holder's expiry (past the observation instant for a vanished claim).
+    /// It carries no jitter, because the retry's own acquisition waits out
+    /// this contender's jitter before its `CreateIfAbsent`. Never poll before
+    /// it.
     pub reschedule_after_unix_ms: i64,
 }
 
@@ -164,6 +204,36 @@ pub enum Acquire {
     Acquired,
     /// The claim is not available to this run; see [`ClaimSkip`].
     Skipped(ClaimSkip),
+    /// The claim object is unreadable and older than one lease plus this
+    /// contender's jitter by the store's `last_modified`. It is left in place
+    /// (never stolen, never deleted), and this run proceeds without a claim so
+    /// the bucket is not deferred forever. Advisory either way: the record's
+    /// `CreateIfAbsent` still serializes racing publishes.
+    Unclaimed {
+        /// The unreadable claim's object key.
+        key: String,
+    },
+}
+
+/// How the pre-acquisition jitter is waited out.
+///
+/// The jitter is a duration, not an instant, so the injected
+/// [`crate::clock::Clock`] cannot shorten it; this hook is what lets a test
+/// record the requested wait without paying it. Production uses
+/// [`TokioSleeper`].
+pub trait ClaimSleeper: Send + Sync {
+    /// Wait for `duration`.
+    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()>;
+}
+
+/// The production [`ClaimSleeper`]: tokio's timer.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokioSleeper;
+
+impl ClaimSleeper for TokioSleeper {
+    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
+        Box::pin(tokio::time::sleep(duration))
+    }
 }
 
 /// One bucket's claim, for the length of one compaction run.
@@ -184,6 +254,7 @@ struct Inner {
     owner: ClaimOwner,
     cfg: ClaimConfig,
     clock: Arc<dyn Clock>,
+    sleeper: Arc<dyn ClaimSleeper>,
     ledger: Option<RequestLedger>,
     /// A third of the lease, in nanoseconds: the renewal cadence
     /// (ADR-1029 decision 3), evaluated at checkpoints and never on a timer.
@@ -251,6 +322,7 @@ impl ClaimGuard {
                 owner,
                 cfg,
                 clock,
+                sleeper: Arc::clone(participant.sleeper()),
                 ledger,
                 renew_after_ns: (lease_ns / 3).max(1),
                 state: tokio::sync::Mutex::new(State::default()),
@@ -289,7 +361,9 @@ impl ClaimGuard {
     /// The jitter (a pure function of the work id and this process id, see
     /// [`jitter_ms`]) spreads simultaneous starts so N contenders do not all
     /// issue their `CreateIfAbsent` in the same instant. It precedes the
-    /// attempt, never follows it.
+    /// attempt, never follows it, and is waited out through the participant's
+    /// [`ClaimSleeper`]. This wait is the only place the jitter is paid: the
+    /// reschedule point a skip reports carries none.
     ///
     /// An expired claim is stolen in the same call: the steal CASes against the
     /// observed version, so exactly one of N thieves wins and a renewal by an
@@ -309,7 +383,10 @@ impl ClaimGuard {
             &inner.cfg,
         );
         if jitter > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(jitter.unsigned_abs())).await;
+            inner
+                .sleeper
+                .sleep(Duration::from_millis(jitter.unsigned_abs()))
+                .await;
         }
 
         // One free retry: a claim that existed at the `CreateIfAbsent` and was
@@ -356,9 +433,7 @@ impl ClaimGuard {
                             work_id_hex: inner.work_id.hex(),
                             holder_process_id: None,
                             expiry_unix_ms: 0,
-                            reschedule_after_unix_ms: now_ms
-                                .saturating_add(jitter)
-                                .saturating_add(1),
+                            reschedule_after_unix_ms: now_ms.saturating_add(1),
                         }));
                     }
                 }
@@ -373,7 +448,8 @@ impl ClaimGuard {
         ))
     }
 
-    /// The contention path: steal an expired claim, or report the skip.
+    /// The contention path: steal an expired claim, run past a stale
+    /// unreadable one, or report the skip.
     async fn contend(
         &self,
         store: &dyn ObjectStoreBackend,
@@ -387,14 +463,28 @@ impl ClaimGuard {
                 work_id_hex: observed.work_id.hex(),
                 holder_process_id: observed.holder_process_id(),
                 expiry_unix_ms: observed.expiry_unix_ms,
-                reschedule_after_unix_ms: observed.reschedule_after_unix_ms,
+                // The observation's own reschedule point adds this contender's
+                // jitter; the retry's acquisition waits that jitter out itself.
+                reschedule_after_unix_ms: observed.expiry_unix_ms.saturating_add(1),
             })
         };
+        if observed.holder.is_none() {
+            return Ok(self
+                .past_unreadable(&observed, now_ms)
+                .unwrap_or_else(|| skip(ClaimSkipReason::UnreadableClaim)));
+        }
         if !observed.is_expired(now_ms) {
             return Ok(skip(ClaimSkipReason::HeldByAnother));
         }
 
-        match claim::steal(store, &observed, &inner.owner, &inner.cfg, now_ms).await? {
+        let stolen = match claim::steal(store, &observed, &inner.owner, &inner.cfg, now_ms).await {
+            // The claim object was deleted between the observation and the
+            // steal's CAS: the S3 adapter's spelling of the lost race a
+            // `MemoryStore` answers with `PreconditionFailed`.
+            Err(StoreError::NotFound) => Steal::Lost,
+            other => other?,
+        };
+        match stolen {
             Steal::Acquired {
                 key,
                 version,
@@ -415,14 +505,40 @@ impl ClaimGuard {
                 self.note_requests(1).await;
                 Ok(skip(ClaimSkipReason::StealLost))
             }
-            // Refused locally: no store request was issued at all.
-            Steal::Refused(claim::StealRefused::UnreadableClaim) => {
-                Ok(skip(ClaimSkipReason::UnreadableClaim))
-            }
+            // Refused locally: no store request was issued at all. The
+            // unreadable case is answered above before any steal; this arm
+            // only keeps the primitive's refusal from being misread.
+            Steal::Refused(claim::StealRefused::UnreadableClaim) => Ok(self
+                .past_unreadable(&observed, now_ms)
+                .unwrap_or_else(|| skip(ClaimSkipReason::UnreadableClaim))),
             Steal::Refused(claim::StealRefused::NotExpired { .. }) => {
                 Ok(skip(ClaimSkipReason::HeldByAnother))
             }
         }
+    }
+
+    /// [`Acquire::Unclaimed`] once an unreadable claim's age by the store's
+    /// `last_modified` exceeds one lease plus this contender's jitter, and
+    /// `None` before that.
+    ///
+    /// The threshold is the observation's own reschedule point
+    /// (`last_modified + lease + jitter + 1`), so the retry a skip schedules
+    /// at `expiry + 1`, having waited out its jitter before the
+    /// `CreateIfAbsent`, is the attempt that runs.
+    fn past_unreadable(&self, observed: &ClaimObservation, now_ms: i64) -> Option<Acquire> {
+        if now_ms < observed.reschedule_after_unix_ms {
+            return None;
+        }
+        tracing::warn!(
+            key = %observed.key,
+            work_id = %observed.work_id.hex(),
+            last_modified_unix_ms = observed.last_modified_unix_ms,
+            "compaction claim is unreadable and older than one lease plus jitter; \
+             running the bucket unclaimed and leaving the claim in place (ADR-1029)"
+        );
+        Some(Acquire::Unclaimed {
+            key: observed.key.clone(),
+        })
     }
 
     /// Consult the claim at `at`: renew when a third of the lease has elapsed
@@ -491,10 +607,15 @@ impl ClaimGuard {
     }
 
     /// Mark the claim completed after a successful run (ADR-1029 decision 1
-    /// step 6). A courtesy marker for operators and for a contender that would
-    /// otherwise wait out the lease: the published compaction record is the
-    /// only completion marker that means anything, so a `NotOwner` outcome
-    /// (someone stole the claim) and a vanished claim are both fine.
+    /// step 6). A forensic marker for operators, and nothing more: neither
+    /// expiry nor steal reads the completed state, so a contender that
+    /// observes a completed claim still defers until its expiry. What spares
+    /// later runs is the published compaction record, which sends them out at
+    /// the already-compacted gate before they reach the claim. A `NotOwner`
+    /// outcome (someone stole the claim) and a vanished claim are both fine.
+    ///
+    /// Any other store error is returned, and the driver logs it rather than
+    /// failing a run whose pipeline has already finished.
     ///
     /// Never a DELETE. An unconditional delete here is exactly the write that
     /// would destroy a newer owner's claim (ADR-1029 rejected alternative 4).
@@ -608,16 +729,48 @@ mod tests {
 
     /// A participant on a fixed clock, so every renewal and expiry decision in
     /// these tests is driven by the test rather than by wall time.
+    ///
+    /// Its sleeper records the jitter waits it is asked for and returns at
+    /// once, so no test here waits on the real timer.
     fn participant(process: u128, clock: &FixedClock) -> ClaimParticipant {
-        ClaimParticipant::new(
+        recording_participant(process, clock).0
+    }
+
+    /// [`participant`], also returning the waits its sleeper was asked for.
+    fn recording_participant(
+        process: u128,
+        clock: &FixedClock,
+    ) -> (ClaimParticipant, Arc<RecordingSleeper>) {
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let participant = ClaimParticipant::new(
             Uuid::from_u128(process),
             Arc::new(clock.clone()) as Arc<dyn Clock>,
         )
+        .with_sleeper(Arc::clone(&sleeper) as Arc<dyn ClaimSleeper>);
+        (participant, sleeper)
     }
 
-    /// A short lease keeps the deterministic acquisition jitter (10% of the
-    /// lease) well under a second, so these tests spend milliseconds rather
-    /// than the 30 s a 300 s production lease would draw from.
+    /// A [`ClaimSleeper`] that records every requested wait and returns at
+    /// once.
+    #[derive(Default)]
+    struct RecordingSleeper {
+        waits: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl RecordingSleeper {
+        fn waits(&self) -> Vec<Duration> {
+            self.waits.lock().expect("sleeper lock").clone()
+        }
+    }
+
+    impl ClaimSleeper for RecordingSleeper {
+        fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
+            self.waits.lock().expect("sleeper lock").push(duration);
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// A 3 s lease: a 1 s renewal cadence the tests move the clock across.
     fn cfg() -> ClaimConfig {
         ClaimConfig {
             lease_duration: Duration::from_secs(3),
@@ -799,9 +952,10 @@ mod tests {
     /// `NotFound` from a claim CAS is treated exactly like a lost claim, never
     /// escalated as an error: a `MemoryStore` answers `PreconditionFailed` for
     /// a CAS against a missing key while the S3 adapter answers `NotFound`, so
-    /// both spellings reach this code from a live deployment. Driven by
-    /// deleting the claim object out from under a live owner on a store whose
-    /// `delete` really removes it, then renewing.
+    /// both spellings reach this code from a live deployment. Driven by a
+    /// store that answers `NotFound` to every `CasVersion` PUT, which is what
+    /// the S3 adapter returns for a renewal of a claim deleted under its
+    /// owner; the claim object itself is never deleted here.
     #[tokio::test]
     async fn not_found_on_renew_cancels_rather_than_erroring() {
         let store = NotFoundOnCas(MemoryStore::new());
@@ -897,5 +1051,198 @@ mod tests {
             b.acquire(&store).await.expect("b observes"),
             Acquire::Skipped(_)
         ));
+    }
+
+    /// The jitter is waited out through the participant's sleeper, exactly
+    /// `jitter_ms(work_id, process_id, lease)`, once per acquisition attempt,
+    /// and it is NOT also folded into the reschedule point a skip reports: the
+    /// skip reschedules to one millisecond past expiry, and the retry at that
+    /// point requests the jitter wait exactly once more.
+    ///
+    /// Shown failing against the pre-change reschedule (the observation's own
+    /// `reschedule_after_unix_ms`, which adds the jitter): "the reschedule
+    /// point carries no jitter" reads left 1700000003164, right
+    /// 1700000003001 (a 163 ms draw for this work id and process). Against a
+    /// guard that sleeps on tokio's timer directly, "the first attempt
+    /// requests exactly its jitter, once" reads left [], right [163ms].
+    #[tokio::test]
+    async fn jitter_is_requested_once_per_attempt_and_not_folded_into_the_reschedule() {
+        let store = MemoryStore::new();
+        store.set_clock_ms(1_700_000_000_000);
+        let clock = FixedClock::new(1_700_000_000_000 * 1_000_000);
+        let holder = guard(&clock, 1, None);
+        assert!(matches!(
+            holder.acquire(&store).await.expect("holder acquires"),
+            Acquire::Acquired
+        ));
+
+        let (contender, sleeper) = recording_participant(2, &clock);
+        let expected = jitter_ms(
+            &bucket_identity().work_id(),
+            &Uuid::from_u128(2),
+            cfg().lease_duration.as_millis() as i64,
+            &cfg(),
+        );
+        assert!(expected > 0, "a zero draw would make this test vacuous");
+        let expected = Duration::from_millis(expected as u64);
+
+        let first = ClaimGuard::new(&bucket(), &contender, cfg(), None);
+        let skip = match first.acquire(&store).await.expect("contender observes") {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("expected a skip, got {other:?}"),
+        };
+        assert_eq!(skip.reason, ClaimSkipReason::HeldByAnother);
+        assert_eq!(
+            sleeper.waits(),
+            vec![expected],
+            "the first attempt requests exactly its jitter, once"
+        );
+        assert_eq!(
+            skip.reschedule_after_unix_ms,
+            skip.expiry_unix_ms + 1,
+            "the reschedule point carries no jitter"
+        );
+
+        // The retry lands exactly at the reschedule point, where the holder's
+        // claim has expired and is stolen.
+        store.set_clock_ms(skip.reschedule_after_unix_ms as u64);
+        clock.set(skip.reschedule_after_unix_ms * 1_000_000);
+        let retry = ClaimGuard::new(&bucket(), &contender, cfg(), None);
+        assert!(matches!(
+            retry.acquire(&store).await.expect("retry steals"),
+            Acquire::Acquired
+        ));
+        assert_eq!(
+            sleeper.waits(),
+            vec![expected, expected],
+            "the rescheduled retry requests the jitter exactly once"
+        );
+    }
+
+    /// An unreadable claim is deferred while its age by the store's
+    /// `last_modified` is at most one lease plus this contender's jitter, and
+    /// past that the run goes ahead unclaimed. Neither side steals: the
+    /// unreadable object is left exactly as it was, and no PUT is issued
+    /// beyond the rejected `CreateIfAbsent`.
+    ///
+    /// Shown failing against a guard that skips an unreadable claim whatever
+    /// its age (`past_unreadable` always `None`): "past one lease plus jitter
+    /// the run proceeds unclaimed" panics with `Skipped(ClaimSkip { reason:
+    /// UnreadableClaim, .. })`.
+    #[tokio::test]
+    async fn an_unreadable_claim_defers_until_a_lease_plus_jitter_then_runs_unclaimed() {
+        let store = MemoryStore::new();
+        let written_ms: i64 = 1_700_000_000_000;
+        store.set_clock_ms(written_ms as u64);
+        let key = claim::compaction_claim_key(&bucket_identity().work_id());
+        let garbage = bytes::Bytes::from_static(b"\xffnot a claim");
+        let written = store
+            .put(&key, garbage.clone(), PutOptions::create_if_absent())
+            .await
+            .expect("seed an unreadable claim");
+        let lease_ms = cfg().lease_duration.as_millis() as i64;
+        let jitter = jitter_ms(
+            &bucket_identity().work_id(),
+            &Uuid::from_u128(2),
+            lease_ms,
+            &cfg(),
+        );
+        let clock = FixedClock::new(0);
+
+        // Younger than the lease: deferred to one millisecond past expiry.
+        clock.set((written_ms + 1_000) * 1_000_000);
+        let young = guard(&clock, 2, None);
+        let skip = match young.acquire(&store).await.expect("young observes") {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("an unreadable claim younger than the lease defers: {other:?}"),
+        };
+        assert_eq!(skip.reason, ClaimSkipReason::UnreadableClaim);
+        assert_eq!(skip.expiry_unix_ms, written_ms + lease_ms);
+        assert_eq!(skip.reschedule_after_unix_ms, written_ms + lease_ms + 1);
+        assert_eq!(
+            young.requests().await,
+            3,
+            "rejected PUT, GET, HEAD; no steal"
+        );
+
+        // Exactly one lease plus jitter old: still deferred.
+        clock.set((written_ms + lease_ms + jitter) * 1_000_000);
+        let boundary = guard(&clock, 2, None);
+        assert!(
+            matches!(
+                boundary.acquire(&store).await.expect("boundary observes"),
+                Acquire::Skipped(ClaimSkip {
+                    reason: ClaimSkipReason::UnreadableClaim,
+                    ..
+                })
+            ),
+            "at exactly one lease plus jitter the claim still defers"
+        );
+
+        // Past it: the run proceeds unclaimed, and the claim is untouched.
+        clock.set((written_ms + lease_ms + jitter + 1) * 1_000_000);
+        let old = guard(&clock, 2, None);
+        match old.acquire(&store).await.expect("old observes") {
+            Acquire::Unclaimed { key: seen } => assert_eq!(seen, key),
+            other => panic!("past one lease plus jitter the run proceeds unclaimed: {other:?}"),
+        }
+        assert!(!old.is_held().await, "an unclaimed run holds nothing");
+        assert_eq!(
+            old.requests().await,
+            3,
+            "rejected PUT, GET, HEAD; no steal was issued"
+        );
+        let after = store.get(&key, GetRange::Full).await.expect("claim read");
+        assert_eq!(
+            after.data, garbage,
+            "the unreadable claim was not overwritten"
+        );
+        assert_eq!(
+            after.version, written.version,
+            "and its version never moved"
+        );
+    }
+
+    /// `NotFound` on the steal's CAS (the claim was deleted between the
+    /// observation and the steal, as the S3 adapter reports it) is the same
+    /// lost race a `MemoryStore`'s `PreconditionFailed` is, not a store error.
+    ///
+    /// Shown failing with the `NotFound` arm removed from `contend`, which is
+    /// the pre-change propagation: "a NotFound steal is a lost race, not an
+    /// error" panics with `Store(NotFound)`.
+    #[tokio::test]
+    async fn not_found_on_steal_is_a_lost_race() {
+        let store = NotFoundOnCas(MemoryStore::new());
+        store.0.set_clock_ms(1_700_000_000_000);
+        let clock = FixedClock::new(1_700_000_000_000 * 1_000_000);
+        let holder = guard(&clock, 1, None);
+        assert!(matches!(
+            holder.acquire(&store).await.expect("holder acquires"),
+            Acquire::Acquired
+        ));
+
+        store.0.set_clock_ms(1_700_000_004_000);
+        clock.set(1_700_000_004_000 * 1_000_000);
+        let thief = guard(&clock, 2, None);
+        let skip = match thief
+            .acquire(&store)
+            .await
+            .expect("a NotFound steal is a lost race, not an error")
+        {
+            Acquire::Skipped(skip) => skip,
+            other => panic!("expected a skip, got {other:?}"),
+        };
+        assert_eq!(skip.reason, ClaimSkipReason::StealLost);
+        assert!(!thief.is_held().await);
+        assert_eq!(
+            thief.requests().await,
+            4,
+            "rejected PUT, GET, HEAD, and the steal CAS"
+        );
+    }
+
+    fn bucket_identity() -> WorkIdentity {
+        let b = bucket();
+        WorkIdentity::new(b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket)
     }
 }

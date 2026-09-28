@@ -839,11 +839,16 @@ pub enum Coordination {
 /// ([`crate::codec::SegmentCodec::build_parts`] and the per-signal merges
 /// below it). Library logic never reads `SystemTime::now()`: a test installs a
 /// [`crate::clock::FixedClock`] here and drives every renewal and expiry
-/// decision deterministically.
+/// decision deterministically. The pre-acquisition jitter wait goes through
+/// the participant's [`ClaimSleeper`] for the same reason: tokio's timer by
+/// default, and a recording or no-op sleeper in a test.
+///
+/// [`ClaimSleeper`]: crate::claim_guard::ClaimSleeper
 #[derive(Clone)]
 pub struct ClaimParticipant {
     process_id: Uuid,
     clock: Arc<dyn crate::clock::Clock>,
+    sleeper: Arc<dyn crate::claim_guard::ClaimSleeper>,
 }
 
 impl std::fmt::Debug for ClaimParticipant {
@@ -857,9 +862,25 @@ impl std::fmt::Debug for ClaimParticipant {
 impl ClaimParticipant {
     /// A participant claiming as `process_id` (the ADR-0057/0065 startup uuid,
     /// the same identity this process's `sys/maintain/workers/<id>` heartbeat
-    /// is keyed under), reading `clock` for every claim decision.
+    /// is keyed under), reading `clock` for every claim decision and waiting
+    /// out the acquisition jitter on tokio's timer.
     pub fn new(process_id: Uuid, clock: Arc<dyn crate::clock::Clock>) -> Self {
-        ClaimParticipant { process_id, clock }
+        ClaimParticipant {
+            process_id,
+            clock,
+            sleeper: Arc::new(crate::claim_guard::TokioSleeper),
+        }
+    }
+
+    /// This participant, waiting out the acquisition jitter through `sleeper`
+    /// instead of tokio's timer.
+    pub fn with_sleeper(self, sleeper: Arc<dyn crate::claim_guard::ClaimSleeper>) -> Self {
+        ClaimParticipant { sleeper, ..self }
+    }
+
+    /// The sleeper the acquisition jitter is waited out on.
+    pub fn sleeper(&self) -> &Arc<dyn crate::claim_guard::ClaimSleeper> {
+        &self.sleeper
     }
 
     /// The process id claims are written under.

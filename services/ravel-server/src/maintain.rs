@@ -3187,8 +3187,8 @@ mod tests {
         const SHARDS: u32 = 1;
         // A lease long enough that a `MemoryStore` merge never renews inside
         // it, and short enough that the acquisition jitter (10% of the lease)
-        // costs the test milliseconds. The shipped 300 s default is pinned in
-        // ravel-maintain's own tests.
+        // costs the test milliseconds. The shipped 300 s default is pinned by
+        // ravel-maintain's `the_cost_gate_decides_whether_a_bucket_is_claimed_at_all`.
         const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
         // A modern instant: ingest hour 0 is long sealed by it, and it is the
         // store's clock too, so a claim written now is not already expired.

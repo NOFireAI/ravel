@@ -17,14 +17,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already written where they are. A supervisor refused a claim reports the
   bucket skipped, with the holder and the reason, and holds it until that
   holder's lease can have expired rather than re-requesting it every tick.
-  Coordination is on by default and claims are taken only above 64 MiB of
-  listed input bytes (`claim_min_input_bytes`), so a small bucket is merged
-  exactly as before; `coordination = off` disables claiming entirely. Claims
+  Coordination is on by default and claims are taken only at or above 64 MiB
+  of listed input bytes (`claim_min_input_bytes`), so a small bucket is merged
+  exactly as before. The switch that turns claiming off is the
+  `CompactorConfig::coordination` field; no server flag or config file reaches
+  it yet, and its operator flag lands with #1035. Claims
   stay advisory: the compaction record's `CreateIfAbsent` still decides which
   output is published, so a stale owner that finishes after losing its claim
-  converges on the one record rather than publishing a second. Claim traffic is
-  counted under a new `coordinate` phase in the compaction request ledger,
-  never pooled into the merge's own phases.
+  converges on the one record rather than publishing a second. For the same
+  reason a store error while marking a claim completed is logged and the
+  published compaction stands, and a claim object that cannot be decoded is
+  never stolen but, once older than one lease plus the contender's jitter, no
+  longer holds its bucket back: the bucket is compacted unclaimed. Claim
+  traffic is counted under a new `coordinate` phase in the compaction request
+  ledger, never pooled into the merge's own phases.
 
 - **This release reads provisioning record format 3 and still writes 2, and
   `ravel-cli maintain audit-versions` now classifies every recorded format

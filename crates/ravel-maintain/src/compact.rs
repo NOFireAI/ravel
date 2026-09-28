@@ -294,15 +294,25 @@ async fn compact_bucket_scoped(
 
     // A run that lost its claim cancelled at a checkpoint and published
     // nothing; only a run that still holds its claim marks it completed
-    // (ADR-1029 decision 1 step 6). The completion marker is a courtesy for
-    // operators and for a contender that would otherwise wait out the lease:
-    // the published compaction record remains the only completion marker that
-    // decides anything.
+    // (ADR-1029 decision 1 step 6). The marker is forensic: the published
+    // compaction record is the only completion marker that decides anything,
+    // so a failure to write the marker is logged and the pipeline's outcome
+    // stands. The claim then ages out under its lease.
     if let Some(guard) = guard {
         if let Some(at) = guard.cancelled_at().await {
             return Ok(ClaimedCompaction::Cancelled { at, outcome });
         }
-        guard.complete(store).await?;
+        if let Err(err) = guard.complete(store).await {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                work_id = %guard.work_id_hex(),
+                error = %err,
+                "compaction finished, but marking its claim completed failed; \
+                 the claim ages out under its lease (ADR-1029)"
+            );
+        }
     }
     Ok(ClaimedCompaction::Ran(outcome))
 }
@@ -311,10 +321,11 @@ async fn compact_bucket_scoped(
 enum Claimed {
     /// This run holds the bucket's claim for its duration.
     Held(ClaimGuard),
-    /// No claim was taken, and none was needed: coordination is off, no
-    /// participant is installed, the caller is the unclaimed
-    /// [`compact_bucket`] entry point, or the bucket is below the cost gate.
-    /// The run proceeds exactly as it did before claims existed.
+    /// No claim was taken: coordination is off, no participant is installed,
+    /// the caller is the unclaimed [`compact_bucket`] entry point, the bucket
+    /// is below the cost gate, or the bucket's claim object is unreadable and
+    /// older than one lease plus jitter ([`Acquire::Unclaimed`]). The run
+    /// proceeds exactly as it did before claims existed.
     Unclaimed,
     /// Another attempt holds the claim; this run does nothing at all.
     Skipped(ClaimSkip),
@@ -358,6 +369,8 @@ async fn acquire_claim(
     );
     match guard.acquire(store).await? {
         Acquire::Acquired => Ok(Claimed::Held(guard)),
+        // A stale unreadable claim: the guard already warned with its key.
+        Acquire::Unclaimed { .. } => Ok(Claimed::Unclaimed),
         Acquire::Skipped(skip) => {
             tracing::info!(
                 signal = ?bucket.signal,

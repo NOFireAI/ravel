@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::*;
 use ravel_fleet::claim::{COMPACTION_CLAIMS_PREFIX, ClaimConfig};
-use ravel_maintain::claim_guard::{Acquire, ClaimGuard};
+use ravel_maintain::claim_guard::{Acquire, ClaimGuard, ClaimSleeper};
 use ravel_maintain::{
     Checkpoint, ClaimParticipant, ClaimedCompaction, Clock, CompactionOutcome, CompactorConfig,
     Coordination, FixedClock, PublishOutcome, RequestLedger, compact_bucket_claimed,
@@ -32,19 +32,31 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError, list_all,
 };
+use ravel_types::Signal;
 use uuid::Uuid;
 
 /// A lease long enough that a whole `MemoryStore` merge fits inside a third of
 /// it, so a test that does not move the clock itself issues exactly zero
-/// renewals. Short enough that the deterministic acquisition jitter (10% of the
-/// lease) stays under a third of a second.
+/// renewals.
 const LEASE: Duration = Duration::from_secs(3);
 
+/// A participant on `clock` whose acquisition jitter returns at once, so no
+/// test in this file waits on the real timer.
 fn participant(process: u128, clock: &FixedClock) -> ClaimParticipant {
     ClaimParticipant::new(
         Uuid::from_u128(process),
         Arc::new(clock.clone()) as Arc<dyn Clock>,
     )
+    .with_sleeper(Arc::new(NoWait))
+}
+
+/// A [`ClaimSleeper`] that returns immediately.
+struct NoWait;
+
+impl ClaimSleeper for NoWait {
+    fn sleep(&self, _duration: Duration) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// A compactor config that claims as `process`, on `clock`, over any bucket at
@@ -91,10 +103,14 @@ async fn seed_two_metric_inputs(store: &dyn ObjectStoreBackend) {
     .await;
 }
 
-/// Every compaction record key in the bucket.
+/// Every compaction record key in the metrics bucket.
 async fn record_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+    record_keys_in(store, &bucket()).await
+}
+
+/// Every compaction record key in `b`.
+async fn record_keys_in(store: &dyn ObjectStoreBackend, b: &ravel_maintain::Bucket) -> Vec<String> {
     use ravel_commit::keys;
-    let b = bucket();
     let prefix =
         keys::commit_shard_hour_prefix(&b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket)
             .expect("prefix");
@@ -138,6 +154,11 @@ async fn the_cost_gate_decides_whether_a_bucket_is_claimed_at_all() {
         CompactorConfig::default().coordination,
         Coordination::On,
         "and coordination is on by default"
+    );
+    assert_eq!(
+        CompactorConfig::default().claim_lease_duration,
+        Duration::from_secs(300),
+        "and the shipped claim lease is 300 s"
     );
 
     // Below the gate: the shipped 64 MiB default over a few-KiB bucket.
@@ -341,6 +362,16 @@ async fn a_held_claim_skips_the_bucket_without_merging_it() {
     assert_eq!(
         report.coordinate.requests, 3,
         "the contention path is one rejected PUT, one GET and one HEAD"
+    );
+    assert_eq!(
+        report.record_read.requests, 2,
+        "the claim is taken after the input commit records are read (one GET \
+         per input), because the cost gate is priced on them"
+    );
+    assert_eq!(
+        report.catalog_read.requests + report.block_read.requests,
+        0,
+        "and before any catalog or block read"
     );
     assert_eq!(
         report.part_put.requests, 0,
@@ -671,13 +702,7 @@ async fn checkpoints_taken(store: &dyn ObjectStoreBackend, bucket: &ravel_mainta
     let clock = FixedClock::new(sealed_now_ns());
     let ledger = RequestLedger::new();
     let config = CompactorConfig {
-        claim_participant: Some(ClaimParticipant::new(
-            Uuid::from_u128(1),
-            Arc::new(TickingClock::new(
-                sealed_now_ns(),
-                LEASE.as_nanos() as i64 / 3,
-            )) as Arc<dyn Clock>,
-        )),
+        claim_participant: Some(ticking_participant()),
         ..claiming_config(1, &clock, 1, &ledger)
     };
     let outcome = compact_bucket_claimed(store, &clock, &config, bucket)
@@ -691,6 +716,19 @@ async fn checkpoints_taken(store: &dyn ObjectStoreBackend, bucket: &ravel_mainta
         "the bucket must really compact for its seams to be reached: {outcome:?}"
     );
     ledger.report().coordinate.requests - 2
+}
+
+/// A participant whose claim clock advances one renewal cadence per read, so
+/// every checkpoint the run reaches issues exactly one renewal.
+fn ticking_participant() -> ClaimParticipant {
+    ClaimParticipant::new(
+        Uuid::from_u128(1),
+        Arc::new(TickingClock::new(
+            sealed_now_ns(),
+            LEASE.as_nanos() as i64 / 3,
+        )) as Arc<dyn Clock>,
+    )
+    .with_sleeper(Arc::new(NoWait))
 }
 
 /// A clock that advances one renewal cadence on every read, so a guard
@@ -816,5 +854,369 @@ impl ObjectStoreBackend for PauseFirstPartPut {
     }
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
+    }
+}
+
+/// Marking the claim completed is advisory, so a store error on that last CAS
+/// does not fail a run whose record is published: the bucket still reports
+/// `Compacted`, and the supervisor's pass goes on to the unit's next bucket.
+///
+/// The completion is the second claim PUT of a run whose merge renews nothing
+/// (acquisition, then completion), so a transient fault scripted on the
+/// second PUT under the claims prefix lands on exactly the first bucket's
+/// completion.
+///
+/// Shown failing against the pre-change driver (`guard.complete(store).await?`
+/// in `compact_bucket_scoped`): the direct call panics at "a failed
+/// completion does not fail a published run" with `Store(Transient(..))`, and
+/// the scan half at "the pass is not aborted" with the same error.
+#[tokio::test]
+async fn a_failed_completion_keeps_the_published_outcome_and_the_pass_goes_on() {
+    let transient_on_completion = || {
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Transient("completion CAS dropped".into()),
+            )
+            .with_key_contains(COMPACTION_CLAIMS_PREFIX)
+            .with_occurrence(Occurrence::Nth(2)),
+        )
+    };
+
+    // One bucket, driven directly.
+    let store = FaultStore::new(MemoryStore::new(), transient_on_completion());
+    seed_two_metric_inputs(&store).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let ledger = RequestLedger::new();
+    let outcome = compact_bucket_claimed(
+        &store,
+        &clock,
+        &claiming_config(1, &clock, 1, &ledger),
+        &bucket(),
+    )
+    .await
+    .expect("a failed completion does not fail a published run");
+    assert!(
+        matches!(
+            outcome,
+            ClaimedCompaction::Ran(CompactionOutcome::Compacted {
+                publish: PublishOutcome::Published,
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(store.fault_count(Op::Put, FaultKind::Transient), 1);
+    assert_eq!(record_keys(&store).await.len(), 1);
+
+    // Two sealed buckets in one unit, driven by the supervisor's pass.
+    let store = FaultStore::new(MemoryStore::new(), transient_on_completion());
+    for hour in [HOUR, HOUR + 1] {
+        for (writer, seq, name) in [(1u128, 1u64, "alpha"), (2, 2, "beta")] {
+            seed_input(
+                &store,
+                &InputSpec::new_at(
+                    hour,
+                    Uuid::from_u128(writer),
+                    1,
+                    seq,
+                    vec![raw_series(name, &[], &[(10, 1.0)])],
+                ),
+            )
+            .await;
+        }
+    }
+    let clock = FixedClock::new(sealed_now_ns() + NS_PER_HOUR);
+    let ledger = RequestLedger::new();
+    let mut memo = ravel_maintain::MaintainMemo::with_default_interval();
+    let report = ravel_maintain::scan::scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &clock,
+        &claiming_config(1, &clock, 1, &ledger),
+        &ravel_maintain::RetentionConfig::default(),
+        &ravel_maintain::NoLeases,
+        bucket().tenant_hash,
+        bucket().signal,
+        bucket().shard,
+    )
+    .await
+    .expect("the pass is not aborted");
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::Transient),
+        1,
+        "the scripted completion fault fired exactly once"
+    );
+    assert_eq!(report.compacted, 2, "both buckets compacted in one pass");
+    for hour in [HOUR, HOUR + 1] {
+        assert_eq!(
+            record_keys_in(&store, &bucket_at(hour)).await.len(),
+            1,
+            "hour {hour} published its record"
+        );
+    }
+}
+
+/// An unreadable claim older than one lease plus jitter does not starve its
+/// bucket: the run goes ahead unclaimed and publishes, the claim object is
+/// left untouched, and the claim protocol issues only the contention path
+/// (no steal, no completion).
+///
+/// Shown failing against a guard that skips an unreadable claim whatever its
+/// age: the outcome is `SkippedClaimed(.. UnreadableClaim ..)` instead.
+#[tokio::test]
+async fn a_stale_unreadable_claim_runs_the_bucket_unclaimed() {
+    let store = MemoryStore::new();
+    let now_ns = sealed_now_ns();
+    let written_ms = now_ns / 1_000_000;
+    store.set_clock_ms(written_ms as u64);
+    seed_two_metric_inputs(&store).await;
+    let holder = ClaimGuard::new(
+        &bucket(),
+        &participant(9, &FixedClock::new(now_ns)),
+        ClaimConfig {
+            lease_duration: LEASE,
+            ..ClaimConfig::default()
+        },
+        None,
+    );
+    let key = format!("{COMPACTION_CLAIMS_PREFIX}{}", holder.work_id_hex());
+    let garbage = Bytes::from_static(b"\xffnot a claim");
+    store
+        .put(&key, garbage.clone(), PutOptions::create_if_absent())
+        .await
+        .expect("seed an unreadable claim");
+
+    // Well past one lease plus the largest possible jitter (10% of the lease).
+    let later_ns = now_ns + 2 * LEASE.as_nanos() as i64;
+    let clock = FixedClock::new(later_ns);
+    let ledger = RequestLedger::new();
+    let outcome = compact_bucket_claimed(
+        &store,
+        &clock,
+        &claiming_config(2, &clock, 1, &ledger),
+        &bucket(),
+    )
+    .await
+    .expect("compact");
+    assert!(
+        matches!(
+            outcome,
+            ClaimedCompaction::Ran(CompactionOutcome::Compacted {
+                publish: PublishOutcome::Published,
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        ledger.report().coordinate.requests,
+        3,
+        "the rejected CreateIfAbsent, one GET and one HEAD: no steal, no completion"
+    );
+    assert_eq!(
+        store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("claim read")
+            .data,
+        garbage,
+        "the unreadable claim is left in place"
+    );
+    assert_eq!(record_keys(&store).await.len(), 1);
+}
+
+/// The Publish checkpoint (rewrite.rs, immediately before the record PUT)
+/// cancels a run whose claim is lost after its last part PUT: the run reports
+/// `Cancelled` at `Checkpoint::Publish` and issues exactly zero record PUTs.
+///
+/// The claim clock advances a renewal cadence per read, so every checkpoint
+/// renews. For this one-part metrics fixture the claim PUTs are the
+/// acquisition, then renewals at InputSet, MergeLoop, PartBoundary and
+/// Publish; the fifth claim PUT is rejected, which is the loss landing after
+/// the part-boundary renewal that followed the last part PUT.
+///
+/// Shown failing with the Publish checkpoint removed from
+/// `rewrite_and_publish_loaded`: the run then publishes and the rejected CAS
+/// lands on the completion instead, and the test panics "expected a
+/// cancelled run, got Ran(Compacted { parts: 1, publish: Published })".
+#[tokio::test]
+async fn a_claim_lost_after_the_last_part_cancels_at_publish() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite)
+            .with_key_contains(COMPACTION_CLAIMS_PREFIX)
+            .with_occurrence(Occurrence::Nth(5)),
+    );
+    let store = FaultStore::new(MemoryStore::new(), plan);
+    seed_two_metric_inputs(&store).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let ledger = RequestLedger::new();
+    let config = CompactorConfig {
+        claim_participant: Some(ticking_participant()),
+        ..claiming_config(1, &clock, 1, &ledger)
+    };
+
+    let outcome = compact_bucket_claimed(&store, &clock, &config, &bucket())
+        .await
+        .expect("a lost claim is an outcome, never an error");
+    match outcome {
+        ClaimedCompaction::Cancelled { at, outcome } => {
+            assert_eq!(at, Checkpoint::Publish);
+            assert_eq!(
+                outcome,
+                CompactionOutcome::Compacted {
+                    parts: 0,
+                    publish: PublishOutcome::Abandoned
+                }
+            );
+        }
+        other => panic!("expected a cancelled run, got {other:?}"),
+    }
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+        1,
+        "the scripted claim loss fired exactly once"
+    );
+    let report = ledger.report();
+    assert_eq!(report.part_put.requests, 1, "the one part was already PUT");
+    assert_eq!(report.publish.requests, 0, "exactly zero record PUTs");
+    assert_eq!(record_keys(&store).await.len(), 0);
+}
+
+/// Three metrics series in two inputs. At `max_l1_part_bytes = 1` every series
+/// is its own fetch window and its own part, so the merge writes three parts
+/// and the first two part boundaries are the mid-loop checkpoint in
+/// `build.rs`, not the tail one.
+async fn seed_three_metric_series(store: &dyn ObjectStoreBackend) {
+    seed_input(
+        store,
+        &InputSpec::new(
+            Uuid::from_u128(1),
+            1,
+            1,
+            vec![
+                raw_series("alpha", &[], &[(10, 1.0)]),
+                raw_series("beta", &[], &[(20, 2.0)]),
+            ],
+        ),
+    )
+    .await;
+    seed_input(
+        store,
+        &InputSpec::new(
+            Uuid::from_u128(2),
+            1,
+            2,
+            vec![raw_series("gamma", &[], &[(30, 3.0)])],
+        ),
+    )
+    .await;
+}
+
+/// Part-size knobs small enough that every metrics series and every RSPAN
+/// trace closes its own part. RSEG splits on `max_l1_part_bytes`, RSPAN on
+/// `l1_part_memory_target_bytes`; both are set.
+fn tiny_parts(config: CompactorConfig) -> CompactorConfig {
+    CompactorConfig {
+        max_l1_part_bytes: 1,
+        l1_part_memory_target_bytes: 1,
+        ..config
+    }
+}
+
+/// A claim lost after the FIRST part of a multi-part merge cancels at the
+/// part-boundary checkpoint right after that part's PUT, for RSEG
+/// (`build.rs`'s mid-loop flush) and RSPAN (`rspan_codec.rs`'s trace-boundary
+/// flush), with exactly one part PUT.
+///
+/// Each fixture is first compacted unclaimed with the same knobs to prove it
+/// really writes three parts, so the cancel site is not the tail checkpoint.
+/// The renewal is made due by advancing the claim clock at the first L1 part
+/// PUT and rejected by a scripted conditional-write failure on the second
+/// claim PUT (the first is the acquisition).
+///
+/// Shown failing with each mid-loop checkpoint removed: the next merge-loop
+/// head catches the loss instead, and the `at` assertion reads left
+/// `MergeLoop`, right `PartBoundary` (rseg in `build.rs`, rspan in
+/// `rspan_codec.rs`).
+#[tokio::test]
+async fn a_claim_lost_after_the_first_of_three_parts_cancels_at_that_boundary() {
+    // metrics
+    let baseline = MemoryStore::new();
+    seed_three_metric_series(&baseline).await;
+    assert_eq!(unclaimed_parts(&baseline, &bucket()).await, 3, "rseg parts");
+    let (at, part_puts) = cancel_after_first_part(Signal::Metrics).await;
+    assert_eq!(at, Checkpoint::PartBoundary, "rseg");
+    assert_eq!(part_puts, 1, "rseg: exactly one part PUT");
+
+    // spans: traces {0,1} and {0,2} merge to three traces, one part each.
+    let baseline = MemoryStore::new();
+    let spans = seed_rspan_two_inputs(&baseline).await;
+    assert_eq!(unclaimed_parts(&baseline, &spans).await, 3, "rspan parts");
+    let (at, part_puts) = cancel_after_first_part(Signal::Spans).await;
+    assert_eq!(at, Checkpoint::PartBoundary, "rspan");
+    assert_eq!(part_puts, 1, "rspan: exactly one part PUT");
+}
+
+/// Compact `b` unclaimed under [`tiny_parts`] and return its part count.
+async fn unclaimed_parts(store: &dyn ObjectStoreBackend, b: &ravel_maintain::Bucket) -> usize {
+    let clock = FixedClock::new(sealed_now_ns());
+    let config = tiny_parts(CompactorConfig::default());
+    match ravel_maintain::compact_bucket(store, &clock, &config, b)
+        .await
+        .expect("baseline compact")
+    {
+        CompactionOutcome::Compacted {
+            parts,
+            publish: PublishOutcome::Published,
+        } => parts,
+        other => panic!("the baseline must publish: {other:?}"),
+    }
+}
+
+/// Seed the three-part fixture for `signal`, lose the claim after its first
+/// part PUT, and return the cancel site and the part PUT count.
+async fn cancel_after_first_part(signal: Signal) -> (Checkpoint, u64) {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite)
+            .with_key_contains(COMPACTION_CLAIMS_PREFIX)
+            .with_occurrence(Occurrence::Nth(2)),
+    );
+    let clock = FixedClock::new(sealed_now_ns());
+    let store = AdvanceClockOnFirstPartPut {
+        inner: FaultStore::new(MemoryStore::new(), plan),
+        clock: clock.clone(),
+        advance_ns: LEASE.as_nanos() as i64,
+        fired: AtomicBool::new(false),
+    };
+    let b = match signal {
+        Signal::Metrics => {
+            seed_three_metric_series(&store).await;
+            bucket()
+        }
+        Signal::Spans => seed_rspan_two_inputs(&store).await,
+        other => panic!("no three-part fixture for {other:?}"),
+    };
+    let ledger = RequestLedger::new();
+    let config = tiny_parts(claiming_config(1, &clock, 1, &ledger));
+    let outcome = compact_bucket_claimed(&store, &clock, &config, &b)
+        .await
+        .expect("a lost claim is an outcome, never an error");
+    assert!(
+        store.fired.load(Ordering::SeqCst),
+        "the clock really advanced"
+    );
+    assert_eq!(
+        store
+            .inner
+            .fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+        1,
+        "the scripted renewal rejection fired exactly once"
+    );
+    assert_eq!(ledger.report().publish.requests, 0, "no record PUT");
+    assert_eq!(record_keys_in(&store, &b).await.len(), 0);
+    match outcome {
+        ClaimedCompaction::Cancelled { at, .. } => (at, ledger.report().part_put.requests),
+        other => panic!("expected a cancelled run, got {other:?}"),
     }
 }

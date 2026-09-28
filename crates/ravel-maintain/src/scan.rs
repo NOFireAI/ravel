@@ -185,8 +185,9 @@ pub struct MaintainReport {
 }
 
 /// The claim hold a skipped bucket earns, as the injected clock reads it: the
-/// observation's reschedule point (the holder's expiry plus this contender's
-/// deterministic jitter) converted from unix milliseconds to nanoseconds.
+/// skip's reschedule point (one millisecond past the holder's expiry; the
+/// retry's own acquisition waits out this contender's jitter) converted from
+/// unix milliseconds to nanoseconds.
 /// Saturating, so an absurd observed expiry cannot wrap into the past.
 fn reschedule_ns(skip: &ClaimSkip) -> i64 {
     skip.reschedule_after_unix_ms.saturating_mul(1_000_000)
@@ -463,8 +464,9 @@ struct MemoEntry {
 pub struct MaintainMemo {
     entries: HashMap<BucketKey, MemoEntry>,
     /// Buckets another attempt holds an advisory compaction claim on, and the
-    /// clock reading before which re-attempting one is pointless (the observed
-    /// expiry plus this contender's jitter, ADR-1029 decision 1 step 2).
+    /// clock reading before which re-attempting one is pointless (one
+    /// millisecond past the observed expiry, ADR-1029 decision 1 step 2; the
+    /// retry pays this contender's jitter in its pre-acquisition wait).
     ///
     /// In memory only, never in the durable snapshot: it is a scheduling hint
     /// whose whole lifetime is shorter than one lease, and a restarted worker
@@ -1430,9 +1432,9 @@ pub async fn scan_and_maintain_with_memo(
                 )) => report.already_done += 1,
                 // Another attempt holds the claim: this process merged nothing
                 // and must not report a compaction. Hold the bucket until the
-                // holder's lease expires (plus this contender's jitter) so the
-                // next tick does not re-issue the claim request, which is the
-                // polling the protocol exists to avoid.
+                // holder's lease expires so the next tick does not re-issue
+                // the claim request, which is the polling the protocol exists
+                // to avoid.
                 Some(ClaimedCompaction::SkippedClaimed(skip)) => {
                     report.claim_skipped += 1;
                     memo.defer_claim_until(key, reschedule_ns(skip));
