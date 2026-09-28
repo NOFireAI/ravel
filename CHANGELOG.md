@@ -213,7 +213,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reason and carries the drained tokens. A classic-histogram data point with
   more explicit bounds than `max_histogram_buckets` (160) is refused as its
   rows arrive rather than after the whole group is buffered, and a schema
-  error in a `--mapping` section names its line and column. Everything that shapes the objects (`--shards`, `--batch-rows`,
+  error in a `--mapping` section names its line and column. Everything that
+  shapes the objects (`--shards`, `--batch-rows`,
   `--target-bytes`, `--max-inflight-flushes`, `--max-flush-delay`,
   `--pipeline-depth`) applies unchanged. A data point may span a batch
   boundary; its rows are credited to the write that carries its points, so
