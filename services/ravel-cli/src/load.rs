@@ -52,10 +52,7 @@ use ravel_otlp::logs_limits::LogIngestLimits;
 use ravel_otlp::normalize::{prometheus_family_name, sanitize_label_name, sanitize_metric_name};
 use ravel_otlp::promcompat::format_float;
 use ravel_otlp::traces_limits::SpanIngestLimits;
-use ravel_otlp::traces_normalize::{
-    ATTR_EVENTS_RAW, ATTR_LINKS_RAW, ATTR_SPAN_FLAGS, ATTR_SPAN_KIND, ATTR_TRACE_STATE,
-    status_code_from_i32,
-};
+use ravel_otlp::traces_normalize::{is_reserved_key, status_code_from_i32};
 use ravel_otlp::{IngestLimits, MetricKind, NormalizedLogRecord, NormalizedPoint, NormalizedSpan};
 use ravel_rspan::{StatusCode, merge_attrs};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
@@ -935,21 +932,6 @@ fn span_shape_rejected(what: &str) -> LoadError {
     ))
 }
 
-/// The `attrs` keys `ravel_otlp::traces_normalize` reserves for span fields
-/// RSPAN has no column for: span kind, trace state, span flags, and the
-/// events and links blobs. A `[spans]` mapping may not name any of them,
-/// which is the same refusal [`span_shape_rejected`] gives the section keys:
-/// the OTLP path strips a sender's own attribute under these keys and then
-/// writes the span's real field, so a mapped column here could only fabricate
-/// a field this version does not map.
-const RESERVED_SPAN_ATTR_KEYS: [&str; 5] = [
-    ATTR_SPAN_KIND,
-    ATTR_TRACE_STATE,
-    ATTR_SPAN_FLAGS,
-    ATTR_EVENTS_RAW,
-    ATTR_LINKS_RAW,
-];
-
 /// The `[spans]` section of a `--mapping` TOML (ADR-1751 decision 2).
 ///
 /// ```toml
@@ -1098,7 +1080,10 @@ impl SpansMapping {
                     limits.max_attribute_key_len
                 )));
             }
-            if RESERVED_SPAN_ATTR_KEYS.contains(&attr.key.as_str()) {
+            // The OTLP path strips a sender's own attribute under a reserved
+            // key and writes the span's real field there, so a mapped column
+            // could only fabricate a field this version does not map.
+            if is_reserved_key(&attr.key) {
                 return Err(span_shape_rejected(&format!(
                     "the reserved attribute key {:?}",
                     attr.key
@@ -1738,11 +1723,14 @@ fn unused_lever_warning(
              stride reads would buy a spread the trace_id routing already gives while costing the \
              file-prefix property a resume depends on)",
         ),
-        _ => (
+        SignalArg::Metrics => (
             "metrics",
             "It reads one sequential cursor (a classic histogram's data point is a contiguous run \
              of rows, which stride reads would split)",
         ),
+        // The logs load reads stride cursors and runs a decode queue, so it
+        // uses both levers and there is nothing to warn about.
+        SignalArg::Logs => return None,
     };
     Some(format!(
         "warning: a {noun} load ignores {}. {why} and has no decode/encode queue. --shards, \
@@ -3858,7 +3846,8 @@ impl ColumnIndex {
     }
 
     /// The column indices alone, with no dictionary column resolved: the
-    /// columnar path ([`build_columnar_batch`]) reads dictionaries in place.
+    /// columnar path ([`build_columnar_batch`]) reads dictionaries in place,
+    /// except the two id columns, which it resolves itself.
     fn locate(batch: &RecordBatch, mapping: &Mapping) -> Result<ColumnIndex, String> {
         let schema = batch.schema();
         let idx = |name: &str| -> Result<usize, String> {
@@ -3924,6 +3913,9 @@ fn build_record(
     let ts_col = cols.col(batch, cols.ts);
     let raw_ts = read_ts(ts_col, row, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
+    if raw_ts < 0 {
+        return Err(negative_ts_rejection(raw_ts, mapping.ts_unit));
+    }
 
     // Kept: future-skew bound, same `max_future_skew_ns` as ravel-otlp. The
     // past-event-time lag check is deliberately omitted (ADR-0089 relaxation).
@@ -4338,6 +4330,19 @@ fn read_bytes(arr: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
         }
         other => Err(format!("expected a binary column, found {other:?}")),
     }
+}
+
+/// The row rejection for a negative resolved `ts`, the logs and metrics
+/// counterpart of the spans load's refusal: OTLP's timestamps are `u64`.
+/// Every unit conversion multiplies by a positive factor and refuses overflow,
+/// so a negative result always comes from a negative cell, never from the
+/// declared unit.
+fn negative_ts_rejection(ts_ns: i64, declared: TsUnit) -> String {
+    format!(
+        "timestamp is before the Unix epoch ({ts_ns} ns, read as ts_unit = {}); the column \
+         holds a negative value",
+        declared.as_str()
+    )
 }
 
 /// Read the `ts` column to nanoseconds. An integer column uses the mapping's
@@ -4845,6 +4850,13 @@ fn id_src(arr: &ArrayRef) -> IdSrc<'_> {
     }
 }
 
+/// An id column as [`IdSrc`] reads it: a dictionary-encoded string or binary
+/// column resolved to its flat value type (a null key is a null cell), any
+/// other column unchanged.
+fn flat_id_column(arr: &ArrayRef) -> Result<ArrayRef, String> {
+    Ok(resolve_dictionary_column(arr)?.unwrap_or_else(|| Arc::clone(arr)))
+}
+
 impl IdSrc<'_> {
     fn get(&self, row: usize) -> Result<Option<Vec<u8>>, String> {
         match self {
@@ -5037,8 +5049,21 @@ fn build_columnar_batch(
         let body = cols.body.map(|i| str_src(span.column(i)));
         let sev_num = cols.severity_number.map(|i| int_src(span.column(i)));
         let sev_text = cols.severity_text.map(|i| str_src(span.column(i)));
-        let trace = cols.trace_id.map(|i| id_src(span.column(i)));
-        let span_id_src = cols.span_id.map(|i| id_src(span.column(i)));
+        // The id columns are the only ones resolved from a dictionary here:
+        // `IdSrc` reads flat string or binary cells, and a default Parquet
+        // writer dictionary-encodes a hex id column.
+        let trace_col = cols
+            .trace_id
+            .map(|i| flat_id_column(span.column(i)))
+            .transpose()
+            .map_err(ColBuildError::Batch)?;
+        let span_id_col = cols
+            .span_id
+            .map(|i| flat_id_column(span.column(i)))
+            .transpose()
+            .map_err(ColBuildError::Batch)?;
+        let trace = trace_col.as_ref().map(id_src);
+        let span_id_src = span_id_col.as_ref().map(id_src);
         let resource: Vec<(usize, AttrSrc)> = cols
             .resource
             .iter()
@@ -5073,7 +5098,8 @@ fn build_columnar_batch(
                 reason,
             };
 
-            // 1. ts (required) and 2. future-skew bound, in build_record order.
+            // 1. ts (required), not negative, and 2. future-skew bound, in
+            // build_record order.
             let raw_ts = match ts.get(local).map_err(row_err)? {
                 Some(t) => t,
                 None => {
@@ -5083,6 +5109,9 @@ fn build_columnar_batch(
                     )));
                 }
             };
+            if raw_ts < 0 {
+                return Err(row_err(negative_ts_rejection(raw_ts, mapping.ts_unit)));
+            }
             let skew_ns = raw_ts.saturating_sub(now_ns);
             if skew_ns > limits.max_future_skew_ns {
                 return Err(row_err(format!(
@@ -5575,6 +5604,9 @@ fn build_metric_row(
 ) -> Result<MetricRow, String> {
     let raw_ts = read_ts(cols.col(batch, cols.ts), row, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
+    if raw_ts < 0 {
+        return Err(negative_ts_rejection(raw_ts, mapping.ts_unit));
+    }
 
     // Kept: the future-skew bound, at the metrics OTLP limit. The past-lag
     // check is deliberately omitted (ADR-0089 relaxation, widened to every
@@ -7018,13 +7050,13 @@ fn build_span(
     };
     // A negative timestamp has no OTLP counterpart (its two are `u64`), and a
     // negative start beside a positive end stores a span whose interval
-    // overlaps nearly every query window. The usual cause is a declared unit
-    // that does not match the column, so the refusal names both.
+    // overlaps nearly every query window. Unit conversion cannot flip a sign,
+    // so a negative value always comes from a negative cell.
     if start_ts_ns < 0 || end_ts_ns < 0 {
         return Err(format!(
             "span timestamps are before the Unix epoch (start {start_ts_ns} ns, end {end_ts_ns} \
-             ns, read as start_ts_unit = {}, end_ts_unit = {}); check the declared units against \
-             the columns",
+             ns, read as start_ts_unit = {}, end_ts_unit = {}); a timestamp column holds a \
+             negative value",
             mapping.start_ts_unit.as_str(),
             mapping.end_ts_unit.as_str()
         ));
@@ -14256,6 +14288,42 @@ type = "str"
             );
         }
 
+        /// Every key ravel-otlp reserves for a span field RSPAN has no column
+        /// for is refused in either attribute list. The list is ravel-otlp's
+        /// own, so a key added there is covered here without an edit.
+        #[test]
+        fn every_reserved_attribute_key_is_refused_in_either_list() {
+            use ravel_otlp::traces_normalize::RESERVED_ATTR_KEYS;
+
+            for key in RESERVED_ATTR_KEYS {
+                for list in ["attribute", "resource_attribute"] {
+                    let text = format!(
+                        "{MAPPING_TOML}\n[[spans.{list}]]\nkey = \"{key}\"\ncolumn = \"x\"\ntype \
+                         = \"str\"\n"
+                    );
+                    let err = parse_spans_mapping(&text).expect_err("a reserved key is refused");
+                    let LoadError::Setup(message) = err else {
+                        panic!("expected a setup error for {key:?} in {list}");
+                    };
+                    assert!(
+                        message.starts_with(&format!(
+                            "--mapping [spans] names the reserved attribute key {key:?}, which \
+                             this version does not map"
+                        )),
+                        "the refusal names {key:?} in {list}: {message}"
+                    );
+                }
+            }
+        }
+
+        /// A logs load uses both levers a sequential load ignores, so it has
+        /// no warning to give whatever they are set to.
+        #[test]
+        fn a_logs_load_has_no_unused_lever_warning() {
+            assert_eq!(unused_lever_warning(Some(4), 8, SignalArg::Logs), None);
+            assert!(unused_lever_warning(Some(4), 8, SignalArg::Metrics).is_some());
+        }
+
         /// The future-skew bound is kept and the past-lag bound is relaxed,
         /// both anchored on the span's END exactly as `checked_span_interval`
         /// anchors them.
@@ -14974,8 +15042,7 @@ type = "str"
             assert_eq!(dropped, 0, "nothing was dropped");
         }
 
-        /// A negative start or end is refused, naming both declared units: a
-        /// mapping that calls a seconds column nanos is the usual cause, and
+        /// A negative start or end is refused, naming both declared units:
         /// OTLP's two `u64` timestamps have no negative to match against.
         #[test]
         fn a_negative_timestamp_is_refused() {
@@ -14988,8 +15055,8 @@ type = "str"
                 err,
                 format!(
                     "span timestamps are before the Unix epoch (start -1 ns, end {NOW_NS} ns, \
-                     read as start_ts_unit = nanos, end_ts_unit = nanos); check the declared \
-                     units against the columns"
+                     read as start_ts_unit = nanos, end_ts_unit = nanos); a timestamp column \
+                     holds a negative value"
                 )
             );
 
@@ -15552,6 +15619,276 @@ type = "str"
                      the limit of 4"
                 ),
             );
+        }
+    }
+
+    mod logs_ids_and_negative_timestamps {
+        use std::path::PathBuf;
+
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use ravel_object_store::memory::MemoryStore;
+
+        use super::*;
+
+        const TRACE_A: &str = "0102030405060708090a0b0c0d0e0f10";
+        const TRACE_B: &str = "a1a2a3a4a5a6a7a8a9aaabacadaeafb0";
+        const SPAN_A: &str = "1112131415161718";
+        const SPAN_B: &str = "b1b2b3b4b5b6b7b8";
+
+        /// Write `batch` to a Parquet file with dictionary encoding on or off
+        /// for every column.
+        fn write_with(batch: &RecordBatch, dictionary: bool) -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("in.parquet");
+            let props = WriterProperties::builder()
+                .set_dictionary_enabled(dictionary)
+                .build();
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut w =
+                ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
+            w.write(batch).expect("write batch");
+            w.close().expect("close writer");
+            (dir, pq)
+        }
+
+        /// A stored log record's `(ts, trace_id, span_id)`.
+        type StoredIds = (i64, Option<[u8; 16]>, Option<[u8; 8]>);
+
+        /// Every stored log record's [`StoredIds`], sorted by ts.
+        async fn stored_ids(store: &dyn ObjectStoreBackend) -> Vec<StoredIds> {
+            use ravel_logseg::{Predicate, RlogConfig, RlogReader};
+            use ravel_object_store::GetRange;
+
+            let cfg = RlogConfig::default();
+            let mut out = Vec::new();
+            for (key, _) in list_data_objects(store).await {
+                let got = store.get(&key, GetRange::Full).await.expect("get object");
+                let reader = RlogReader::new(got.data.as_ref(), &cfg).expect("open rlog");
+                let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+                out.extend(rows.into_iter().map(|r| (r.ts_ns, r.trace_id, r.span_id)));
+            }
+            out.sort();
+            out
+        }
+
+        fn id<const N: usize>(hex_id: &str) -> Option<[u8; N]> {
+            hex::decode(hex_id).ok().and_then(|b| b.try_into().ok())
+        }
+
+        async fn load_columnar(
+            pq: &Path,
+            mapping: &Mapping,
+        ) -> (Result<LoadReport, LoadError>, Arc<dyn ObjectStoreBackend>) {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let result = load(
+                Arc::clone(&store),
+                pq,
+                "acme",
+                mapping,
+                1,
+                1_000,
+                None,
+                1,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await;
+            (result, store)
+        }
+
+        /// A hex id column loads the same whether its Parquet pages are plain
+        /// or dictionary-encoded: the columnar path resolves a dictionary id
+        /// column instead of refusing it, and a null cell (a null key, once
+        /// encoded) stores no id either way.
+        #[tokio::test]
+        async fn dictionary_encoded_hex_id_columns_load_like_plain_ones() {
+            let ts: Vec<i64> = (0..6).map(|i| NOW_NS - 1_000 + i).collect();
+            let trace = vec![
+                Some(TRACE_A),
+                Some(TRACE_A),
+                None,
+                Some(TRACE_B),
+                Some(TRACE_A),
+                Some(TRACE_B),
+            ];
+            let span = vec![
+                Some(SPAN_A),
+                Some(SPAN_B),
+                Some(SPAN_A),
+                None,
+                Some(SPAN_B),
+                Some(SPAN_A),
+            ];
+            let b = batch(vec![
+                ("ts", i64_col(ts.clone())),
+                ("svc", str_col(vec!["api"; 6])),
+                (
+                    "trace_id",
+                    Arc::new(StringArray::from(trace.clone())) as ArrayRef,
+                ),
+                (
+                    "span_id",
+                    Arc::new(StringArray::from(span.clone())) as ArrayRef,
+                ),
+            ]);
+            let mut m = base_mapping();
+            m.trace_id_column = Some("trace_id".to_string());
+            m.span_id_column = Some("span_id".to_string());
+            m.resource_attributes = vec![attr("service.name", "svc", ColType::Str)];
+
+            let (_plain_dir, plain) = write_with(&b, false);
+            let (_dict_dir, dict) = write_with(&b, true);
+            let id_types = |pq: &Path| -> Vec<DataType> {
+                let schema = reader_schema_for(pq);
+                ["trace_id", "span_id"]
+                    .iter()
+                    .map(|name| {
+                        schema.as_ref().map_or(DataType::Utf8, |s| {
+                            s.field_with_name(name)
+                                .expect("id field")
+                                .data_type()
+                                .clone()
+                        })
+                    })
+                    .collect()
+            };
+            let dict_ty = DataType::Dictionary(Box::new(DICT_KEY_TYPE), Box::new(DataType::Utf8));
+            assert_eq!(id_types(&plain), vec![DataType::Utf8, DataType::Utf8]);
+            assert_eq!(
+                id_types(&dict),
+                vec![dict_ty.clone(), dict_ty],
+                "the loader reads both id columns of the encoded file as dictionaries"
+            );
+
+            let (plain_result, plain_store) = load_columnar(&plain, &m).await;
+            let plain_report = plain_result.expect("the plain file loads");
+            let (dict_result, dict_store) = load_columnar(&dict, &m).await;
+            let dict_report = dict_result.expect("the dictionary-encoded file loads");
+            assert_eq!(plain_report.rows_processed, 6);
+            assert_eq!(dict_report.rows_processed, 6);
+            assert!(
+                dict_report.columnar_batches_built > 0,
+                "the columnar path ran"
+            );
+
+            let want: Vec<StoredIds> = (0..6)
+                .map(|i| (ts[i], trace[i].and_then(id), span[i].and_then(id)))
+                .collect();
+            assert_eq!(stored_ids(plain_store.as_ref()).await, want);
+            assert_eq!(
+                stored_ids(dict_store.as_ref()).await,
+                want,
+                "the encoded file stores the same ids, and none for a null key"
+            );
+            assert_eq!(
+                decoded_records(dict_store.as_ref()).await,
+                decoded_records(plain_store.as_ref()).await,
+                "every stored field matches the plain load"
+            );
+        }
+
+        fn logs_mapping_millis() -> Mapping {
+            let mut m = base_mapping();
+            m.ts_unit = TsUnit::Millis;
+            m
+        }
+
+        fn negative_ts_file() -> (tempfile::TempDir, PathBuf) {
+            let now_ms = NOW_NS / 1_000_000;
+            write_with(
+                &batch(vec![("ts", i64_col(vec![now_ms, -5, now_ms]))]),
+                false,
+            )
+        }
+
+        const NEGATIVE_MILLIS: &str = "timestamp is before the Unix epoch (-5000000 ns, read as \
+                                       ts_unit = millis); the column holds a negative value";
+
+        /// The logs row path refuses a negative resolved timestamp as a row
+        /// rejection naming the declared unit, and stores nothing.
+        #[tokio::test]
+        async fn the_logs_row_path_refuses_a_negative_timestamp() {
+            let (_dir, pq) = negative_ts_file();
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let err = load_row(
+                Arc::clone(&store),
+                &pq,
+                "acme",
+                &logs_mapping_millis(),
+                1,
+                1_000,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await
+            .expect_err("a negative timestamp is refused");
+            let LoadError::RowRejected { row, reason, .. } = &err else {
+                panic!("expected RowRejected, got {err:?}");
+            };
+            assert_eq!(*row, 1);
+            assert_eq!(reason, NEGATIVE_MILLIS);
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
+        }
+
+        /// The same refusal on the columnar path.
+        #[tokio::test]
+        async fn the_logs_columnar_path_refuses_a_negative_timestamp() {
+            let (_dir, pq) = negative_ts_file();
+            let (result, store) = load_columnar(&pq, &logs_mapping_millis()).await;
+            let err = result.expect_err("a negative timestamp is refused");
+            let LoadError::RowRejected { row, reason, .. } = &err else {
+                panic!("expected RowRejected, got {err:?}");
+            };
+            assert_eq!(*row, 1);
+            assert_eq!(reason, NEGATIVE_MILLIS);
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
+        }
+
+        /// The same refusal on the metrics path.
+        #[tokio::test]
+        async fn the_metrics_path_refuses_a_negative_timestamp() {
+            let mapping = parse_metrics_mapping(
+                "[metrics]\nname = \"probe\"\nvalue_column = \"value\"\nts_column = \
+                 \"ts\"\nts_unit = \"millis\"\nkind = \"gauge\"\n",
+            )
+            .expect("valid mapping");
+            let now_ms = NOW_NS / 1_000_000;
+            let (_dir, pq) = write_with(
+                &batch(vec![
+                    ("ts", i64_col(vec![now_ms, -5, now_ms])),
+                    (
+                        "value",
+                        Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])) as ArrayRef,
+                    ),
+                ]),
+                false,
+            );
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let err = load_metrics(
+                Arc::clone(&store),
+                &pq,
+                "acme",
+                &mapping,
+                1,
+                1_000,
+                0,
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await
+            .expect_err("a negative timestamp is refused");
+            let LoadError::RowRejected { row, reason, .. } = &err else {
+                panic!("expected RowRejected, got {err:?}");
+            };
+            assert_eq!(*row, 1);
+            assert_eq!(reason, NEGATIVE_MILLIS);
+            assert!(list_data_objects(store.as_ref()).await.is_empty());
         }
     }
 }
