@@ -3736,6 +3736,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "httparse",
  "humantime",
  "hyper",
  "itertools 0.15.0",
@@ -4591,6 +4592,7 @@ dependencies = [
 name = "ravel-cache"
 version = "0.19.0"
 dependencies = [
+ "blake3",
  "bytes",
  "crc32c",
  "parking_lot",
