@@ -604,27 +604,6 @@ type = "str"
     );
 }
 
-/// `--signal spans` is refused by name and never falls back to another
-/// signal (ADR-1751 follow-up task 2 is what adds it).
-#[test]
-fn spans_signal_is_refused_rather_than_falling_back() {
-    let err = load::parse_mapping_document(
-        r#"
-        [spans]
-        trace_id_column = "trace_id"
-        "#,
-        SignalArg::Spans,
-    )
-    .expect_err("--signal spans is not supported yet");
-    let LoadError::Setup(message) = err else {
-        panic!("expected a setup error");
-    };
-    assert!(
-        message.contains("not yet supported") && message.contains("does not fall back"),
-        "the refusal says both what is missing and that nothing was written: {message}"
-    );
-}
-
 /// A histogram whose rows are not contiguous is refused rather than exploded
 /// twice: a contiguous-run grouping cannot read interleaved data points, and
 /// a second explosion of the same identity would write two conflicting

@@ -13493,6 +13493,243 @@ type = "i64"
         assert_eq!(exact_count(below).expect("below 2^64 fits"), below as u64);
     }
 
+    /// `ravel-cli load --signal spans` (ADR-1751 follow-up task 2). The
+    /// end-to-end round trip and the OTLP differential live in
+    /// `tests/load_spans.rs`; these cover what needs the crate-internal entry
+    /// point or a mapping that never reaches a router.
+    mod spans {
+        use super::*;
+
+        /// The smallest legal spans mapping plus one attribute of each kind.
+        const MAPPING_TOML: &str = r#"
+[spans]
+trace_id_column = "trace_id"
+span_id_column  = "span_id"
+name_column     = "name"
+start_ts_column = "start_ns"
+start_ts_unit   = "nanos"
+end_ts_column   = "end_ns"
+end_ts_unit     = "nanos"
+
+[[spans.attribute]]
+key = "http.method"
+column = "method"
+type = "str"
+"#;
+
+        fn bin_col(vals: Vec<Vec<u8>>) -> ArrayRef {
+            let refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+            Arc::new(BinaryArray::from(refs))
+        }
+
+        /// One span's Parquet file and mapping file on disk, for a test that
+        /// drives the CLI entry point rather than [`load_spans`].
+        fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("spans.parquet");
+            let mapping_path = dir.path().join("mapping.toml");
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]])),
+                ("span_id", bin_col(vec![vec![2u8; 8]])),
+                ("name", str_col(vec!["op"])),
+                ("start_ns", i64_col(vec![NOW_NS])),
+                ("end_ns", i64_col(vec![NOW_NS])),
+                ("method", str_col(vec!["GET"])),
+            ]);
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+                .expect("arrow writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+            std::fs::write(&mapping_path, MAPPING_TOML).expect("write mapping");
+            (dir, pq, mapping_path)
+        }
+
+        /// `--read-cursors 0` and `--decode-queue-batches 0` are rejected on
+        /// the spans path with the same messages the other paths give: a lever
+        /// this path ignores is still not one that may take a value its own
+        /// documentation calls invalid.
+        #[tokio::test]
+        async fn zero_levers_are_rejected() {
+            let (_dir, pq, mapping_path) = fixture();
+            for (read_cursors, decode_queue_batches, want) in [
+                (Some(0), DEFAULT_DECODE_QUEUE_BATCHES, READ_CURSORS_ZERO),
+                (None, 0, DECODE_QUEUE_BATCHES_ZERO),
+            ] {
+                let store: Arc<dyn ObjectStoreBackend> =
+                    Arc::new(ravel_object_store::memory::MemoryStore::new());
+                let mut sink: Vec<u8> = Vec::new();
+                let err = run_warning_to(
+                    store,
+                    &pq,
+                    "acme",
+                    &mapping_path,
+                    SignalArg::Spans,
+                    1,
+                    10_000,
+                    0,
+                    read_cursors,
+                    1,
+                    DEFAULT_MAX_INFLIGHT_FLUSHES,
+                    decode_queue_batches,
+                    DEFAULT_TARGET_BYTES,
+                    None,
+                    NOW_NS,
+                    &mut sink,
+                )
+                .await
+                .expect_err("a zero lever is rejected before anything is written");
+                assert_eq!(err.to_string(), want);
+            }
+        }
+
+        /// The entry point prints the spans admission-bypass warning and names
+        /// both levers a spans load ignores.
+        #[tokio::test]
+        async fn the_entry_point_warns_about_the_levers_it_ignores() {
+            let (_dir, pq, mapping_path) = fixture();
+            let store: Arc<dyn ObjectStoreBackend> =
+                Arc::new(ravel_object_store::memory::MemoryStore::new());
+            let mut sink: Vec<u8> = Vec::new();
+            run_warning_to(
+                store,
+                &pq,
+                "acme",
+                &mapping_path,
+                SignalArg::Spans,
+                1,
+                10_000,
+                0,
+                Some(4),
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                8,
+                DEFAULT_TARGET_BYTES,
+                None,
+                NOW_NS,
+                &mut sink,
+            )
+            .await
+            .expect("an ignored lever is a warning, not a failure");
+            let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+            assert!(
+                emitted.contains(SPANS_ADMISSION_BYPASS_WARNING),
+                "the spans admission-bypass warning reaches the CLI's stream: {emitted}"
+            );
+            assert!(
+                emitted
+                    .contains("a spans load ignores --read-cursors 4 and --decode-queue-batches 8"),
+                "both ignored levers are named: {emitted}"
+            );
+        }
+
+        /// Two mapped attributes cannot share a key, in either list: the
+        /// stored `attrs` is one map and the merge would silently pick one.
+        #[test]
+        fn a_duplicate_attribute_key_is_refused() {
+            let text = format!(
+                "{MAPPING_TOML}\n[[spans.resource_attribute]]\nkey = \"http.method\"\ncolumn = \
+                 \"m2\"\ntype = \"str\"\n"
+            );
+            let err = parse_spans_mapping(&text).expect_err("one key, two columns");
+            let LoadError::Setup(message) = err else {
+                panic!("expected a setup error");
+            };
+            assert!(
+                message.contains("declares the attribute key \"http.method\" twice"),
+                "the refusal names the key: {message}"
+            );
+        }
+
+        /// A mapped attribute key over the OTLP key-length cap is refused
+        /// before any row is read, since the mapping alone decides it.
+        #[test]
+        fn an_oversized_attribute_key_is_refused_at_the_otlp_bound() {
+            let limit = SpanIngestLimits::default().max_attribute_key_len;
+            let key = "k".repeat(limit + 1);
+            let text = format!(
+                "{MAPPING_TOML}\n[[spans.attribute]]\nkey = \"{key}\"\ncolumn = \"x\"\ntype = \
+                 \"str\"\n"
+            );
+            let err = parse_spans_mapping(&text).expect_err("over the key-length cap");
+            let LoadError::Setup(message) = err else {
+                panic!("expected a setup error");
+            };
+            assert!(
+                message.contains(&format!(
+                    "is {} bytes, more than the attribute-key limit of {limit}",
+                    limit + 1
+                )),
+                "the refusal names both lengths: {message}"
+            );
+        }
+
+        /// The future-skew bound is kept and the past-lag bound is relaxed,
+        /// both anchored on the span's END exactly as `checked_span_interval`
+        /// anchors them.
+        #[test]
+        fn future_skew_is_kept_and_past_lag_is_relaxed() {
+            let limits = SpanIngestLimits::default();
+            let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+            let build = |start_ns: i64, end_ns: i64| {
+                let batch = batch(vec![
+                    ("trace_id", bin_col(vec![vec![1u8; 16]])),
+                    ("span_id", bin_col(vec![vec![2u8; 8]])),
+                    ("name", str_col(vec!["op"])),
+                    ("start_ns", i64_col(vec![start_ns])),
+                    ("end_ns", i64_col(vec![end_ns])),
+                    ("method", str_col(vec!["GET"])),
+                ]);
+                let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+                build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
+            };
+
+            let at_bound = NOW_NS + limits.max_future_skew_ns;
+            let span = build(at_bound, at_bound).expect("exactly at the bound is admitted");
+            assert_eq!(span.end_ts_ns, at_bound);
+            let over = build(at_bound + 1, at_bound + 1).expect_err("one ns past it is rejected");
+            assert!(
+                over.contains("more than the max future skew"),
+                "the rejection names the bound: {over}"
+            );
+
+            // Thirty days old: far past `max_ingest_lag_ns`, and admitted.
+            let old = NOW_NS - 30 * 86_400 * 1_000_000_000;
+            let span = build(old, old).expect("the past-lag bound is relaxed on this path");
+            assert_eq!(span.start_ts_ns, old);
+            assert!(
+                limits.max_ingest_lag_ns < NOW_NS - old,
+                "the fixture really is past the OTLP lag bound"
+            );
+        }
+
+        /// A span that ends before it starts is rejected rather than stored
+        /// with an interval no query window can mean anything against.
+        #[test]
+        fn an_end_before_its_start_is_rejected() {
+            let limits = SpanIngestLimits::default();
+            let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]])),
+                ("span_id", bin_col(vec![vec![2u8; 8]])),
+                ("name", str_col(vec!["op"])),
+                ("start_ns", i64_col(vec![NOW_NS])),
+                ("end_ns", i64_col(vec![NOW_NS - 1])),
+                ("method", str_col(vec!["GET"])),
+            ]);
+            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let err = build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
+                .expect_err("end before start");
+            assert_eq!(
+                err,
+                format!(
+                    "span ends at {} ns, before it starts at {NOW_NS} ns",
+                    NOW_NS - 1
+                )
+            );
+        }
+    }
+
     /// Fix-round regressions for the metrics submit loop and the histogram
     /// grouper (PR #2096 review).
     mod metrics_pipeline_review {
@@ -13512,7 +13749,7 @@ type = "i64"
             match parse_mapping_document(DRAIN_MAPPING, SignalArg::Metrics).expect("valid mapping")
             {
                 MappingSection::Metrics(m) => m,
-                MappingSection::Logs(_) => panic!("a [metrics] section parses as metrics"),
+                _ => panic!("a [metrics] section parses as metrics"),
             }
         }
 
