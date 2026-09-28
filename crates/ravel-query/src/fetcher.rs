@@ -125,18 +125,22 @@ pub const DEFAULT_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 /// semaphore, so this also bounds the total in-flight GETs across every
 /// concurrent segment fetch in a query, not just within one segment.
 pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
-/// Most page-range GETs one fetch of an L0 segment issues. When the coalesced
-/// page runs a query selects outnumber it, the smallest gaps between runs are
-/// bridged until this many remain, trading gap bytes for requests. It gives an
-/// unsealed flush's request cost a ceiling above the whole-object threshold
-/// ([`MAX_GETS_PER_L0_SEGMENT_FETCH`], ADR-1306). L1 parts are left unbounded:
-/// they can be far larger than a flush, so bridging would move far more bytes.
+/// Most page-range GETs one fetch of an L0 segment issues, and since ADR-2066
+/// the most chunk-run GETs one ranged read of an L0 RLOG object issues
+/// (`log_fetcher.rs`, `chunk_run_cap`): changing it changes both request laws.
+/// When the coalesced runs a query selects outnumber it, the smallest gaps
+/// between runs are bridged until this many remain, trading gap bytes for
+/// requests. It gives an unsealed flush's request cost a ceiling above the
+/// whole-object threshold ([`MAX_GETS_PER_L0_SEGMENT_FETCH`], ADR-1306). L1
+/// segments are left unbounded on both paths: they can be far larger than a
+/// flush, so bridging would move far more bytes.
 pub const MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT: usize = 4;
 /// Most GETs one fetch of an L0 segment issues: the first GET (whole object,
 /// footer tail, or suffix), at most one footer chase (a second `NeedRange` is
 /// `Truncated`), one catalog GET (the catalog sections are fetched as one
 /// run), and [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] page-range GETs. Retries
-/// are not counted here.
+/// are not counted here. This is the RSEG shape only: an L0 RLOG read can
+/// exceed it, since it may add front-section and BLOOM/POSTINGS GETs.
 pub const MAX_GETS_PER_L0_SEGMENT_FETCH: u64 =
     1 + 1 + 1 + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64;
 
