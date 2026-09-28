@@ -17,11 +17,19 @@
 //! session, file, or instance role), so there is no second credential path and
 //! `S3Config`'s "no credential-chain magic" rule still holds.
 //!
-//! No credential or signature bytes are ever logged: errors carry HTTP status
-//! and a short body excerpt, never a header value.
+//! No credential or signature bytes are ever logged: errors carry the HTTP
+//! status and the S3 error code parsed from the body, never a header value and
+//! never the rest of the body (an S3 `SignatureDoesNotMatch` body echoes the
+//! canonical request, session token included).
+//!
+//! A condition is `Pass` only when a response proves it and `Fail` only when a
+//! response proves the opposite; everything else is `Unknown` (ADR-1727
+//! decision 3).
 
+use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use object_store::aws::{AwsCredential, AwsCredentialProvider};
 use quick_xml::Reader;
@@ -36,11 +44,23 @@ const SERVICE: &str = "s3";
 /// SHA-256 of the empty body: every request here is a bodyless `GET`.
 const EMPTY_SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// Wall-clock seam for SigV4's request timestamp, mirroring
-/// [`super::instance_role`]'s `WallClock`: SigV4 requires a timestamp within a
-/// few minutes of the endpoint's clock, which is inherently "now", but a fixed
-/// clock makes the signer's tests deterministic (the repo's no-`SystemTime::now`
-/// rule).
+/// Largest response body read. Every configuration document and listing page
+/// this module asks for is far smaller; a larger body is `Unknown`.
+pub(crate) const MAX_BODY_BYTES: usize = 1 << 20;
+
+/// `?versions` page size and page cap for retention sampling.
+const LISTING_PAGE_KEYS: u32 = 1000;
+const LISTING_MAX_PAGES: usize = 10;
+
+/// The data root the sanctioned lifecycle rules must cover (ADR-1727 decision
+/// 3, `rule-scope`), and the two roots no foreign rule may target.
+const DATA_ROOT: &str = "t/";
+const RAVEL_ROOTS: [&str; 2] = ["t/", "sys/"];
+
+/// Clock seam for SigV4's request timestamp and for judging whether a sampled
+/// object's retention has lapsed, mirroring [`super::instance_role`]'s
+/// `WallClock`: a fixed clock makes both deterministic in tests (the repo's
+/// no-`SystemTime::now` rule).
 pub(crate) trait SigningClock: Send + Sync {
     fn now_unix_secs(&self) -> i64;
 }
@@ -221,8 +241,81 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+/// Unix seconds and nanoseconds for the ISO 8601 timestamps S3 returns in
+/// `LastModified` and `RetainUntilDate` (`2030-01-01T00:00:00Z`, optional
+/// fractional seconds, `Z` or a `+HH:MM`/`-HH:MM` offset). `None` for anything
+/// else, so a value the reader cannot place in time is never compared.
+pub(crate) fn parse_iso8601(value: &str) -> Option<(i64, u32)> {
+    let v = value.trim();
+    let bytes = v.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = v.get(range)?;
+        if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    let year = num(0..4)?;
+    let month = u32::try_from(num(5..7)?).ok()?;
+    let day = u32::try_from(num(8..10)?).ok()?;
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > super::http_date::days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut rest = &v[19..];
+    let mut nanos = 0u32;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || digits > 9 {
+            return None;
+        }
+        let scale = 10u32.pow(u32::try_from(9 - digits).ok()?);
+        nanos = fraction[..digits].parse::<u32>().ok()? * scale;
+        rest = &fraction[digits..];
+    }
+    let offset_secs = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first() {
+                Some(b'+') => 1,
+                Some(b'-') => -1,
+                _ => return None,
+            };
+            let offset = &rest[1..];
+            if offset.len() != 5 || offset.as_bytes()[2] != b':' {
+                return None;
+            }
+            let hours: i64 = offset[..2].parse().ok()?;
+            let minutes: i64 = offset[3..].parse().ok()?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            sign * (hours * 3600 + minutes * 60)
+        }
+    };
+    let days = super::http_date::days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
+    Some((secs, nanos))
+}
+
 // --- Request target (URL, host, canonical path) ---
 
+#[derive(Debug)]
 struct RequestTarget {
     /// Full URL for reqwest; every character is URL-safe (unreserved or `%XX`),
     /// so `reqwest`/`url` parse it without re-encoding the query we signed.
@@ -235,7 +328,11 @@ struct RequestTarget {
 }
 
 /// Compute the request target for a bucket-subresource or object-subresource
-/// `GET`. `object_key` `None` targets the bucket; `Some(key)` targets an object.
+/// `GET`, addressed the way `object_store`'s `AmazonS3Builder` addresses the
+/// data plane: path style is `{endpoint}/{bucket}`; virtual-hosted style with a
+/// custom endpoint uses the endpoint as given, since `object_store` expects the
+/// bucket to be in it already; with no endpoint, AWS's regional host.
+/// `object_key` `None` targets the bucket; `Some(key)` targets an object.
 fn request_target(
     bucket: &str,
     region: &str,
@@ -255,28 +352,26 @@ fn request_target(
         })
         .unwrap_or_default();
 
-    let (scheme, host, path) = match endpoint {
+    let (scheme, host, base_path) = match endpoint {
         Some(endpoint) => {
-            let trimmed = endpoint.trim_end_matches('/');
-            let (scheme, authority) = split_scheme(trimmed);
-            if force_path_style {
-                (
-                    scheme,
-                    authority.to_string(),
-                    format!("/{bucket}{key_path}"),
-                )
-            } else {
-                (scheme, format!("{bucket}.{authority}"), key_path.clone())
-            }
+            let (scheme, rest) = split_scheme(endpoint.trim_end_matches('/'));
+            let (authority, base_path) = match rest.find('/') {
+                Some(index) => (&rest[..index], &rest[index..]),
+                None => (rest, ""),
+            };
+            (scheme, authority.to_string(), base_path.to_string())
         }
-        None => {
-            let base = format!("s3.{region}.amazonaws.com");
-            if force_path_style {
-                ("https", base, format!("/{bucket}{key_path}"))
-            } else {
-                ("https", format!("{bucket}.{base}"), key_path.clone())
-            }
-        }
+        None if force_path_style => ("https", format!("s3.{region}.amazonaws.com"), String::new()),
+        None => (
+            "https",
+            format!("{bucket}.s3.{region}.amazonaws.com"),
+            String::new(),
+        ),
+    };
+    let path = if force_path_style {
+        format!("{base_path}/{bucket}{key_path}")
+    } else {
+        format!("{base_path}{key_path}")
     };
 
     // The canonical/URL path is always non-empty (at least "/").
@@ -310,6 +405,27 @@ fn split_scheme(endpoint: &str) -> (&'static str, &str) {
     }
 }
 
+/// The `reqwest` client the control plane sends through: the data plane's
+/// timeouts, plain HTTP only where the store allows it (the data plane's
+/// `allow_http` rule), and no redirects. A followed redirect would carry
+/// `Authorization` and the session token to another URL, and the target's
+/// unsigned body is not the bucket's answer, so a 3xx comes back as-is and reads
+/// as `Unknown`.
+pub(crate) fn control_plane_http_client(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    pool_idle_timeout: Duration,
+    allow_http: bool,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .pool_idle_timeout(pool_idle_timeout)
+        .https_only(!allow_http)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 // --- Fetch outcomes and errors ---
 
 /// The outcome of fetching one bucket subresource.
@@ -317,44 +433,217 @@ fn split_scheme(endpoint: &str) -> (&'static str, &str) {
 pub(crate) enum FetchOutcome<T> {
     /// The configuration was read and parsed.
     Present(T),
-    /// The endpoint reported no such configuration (a 404 `NoSuch*`): the
-    /// configuration is affirmatively absent, so the derived condition is a
-    /// `Fail`, not `Unknown`. Carries a human-readable reason.
+    /// The endpoint answered 404 with this call's own not-configured S3 error
+    /// code (for example `NoSuchLifecycleConfiguration` on `?lifecycle`), read
+    /// from the body's `<Error><Code>` element: the configuration is
+    /// affirmatively absent. Carries a human-readable reason.
     Absent(String),
-    /// The configuration could not be determined (access denied, transport
-    /// failure, an unparseable body, or an unexpected status): the derived
-    /// condition is `Unknown`, never `Fail`.
+    /// The configuration could not be determined (access denied, any other 404,
+    /// transport failure, an unparseable or oversized body, a redirect, or an
+    /// unexpected status): the derived condition is `Unknown`, never `Fail`.
     Unknown(String),
 }
 
 /// A control-plane request failure, classified so the caller can tell an
-/// affirmative "not configured" (a `Fail`) from a "could not tell" (an
-/// `Unknown`).
+/// affirmative "not configured" from a "could not tell" (an `Unknown`).
 #[derive(Debug)]
 pub(crate) enum ControlPlaneError {
     /// 403: the credential cannot read this configuration -> `Unknown`.
     AccessDenied(String),
-    /// 404 `NoSuch*`/`*NotFoundError`: affirmatively absent -> `Fail`.
+    /// 404 whose `<Error><Code>` is one of the not-configured codes the call
+    /// named -> `Absent`. Carries the code.
     NotConfigured(String),
+    /// Any other 404 (`NoSuchBucket`, `NoSuchKey`, `NoSuchVersion`, an empty or
+    /// non-XML body, an endpoint without the API) -> `Unknown`.
+    NotFound(String),
     /// Transport failure (connect, timeout, dropped connection) -> `Unknown`.
     Transport(String),
     /// The response body could not be parsed -> `Unknown`.
     Parse(String),
+    /// A 3xx, never followed -> `Unknown`.
+    Redirect(u16),
+    /// The body passed [`MAX_BODY_BYTES`] -> `Unknown`.
+    BodyTooLarge,
     /// Any other non-success status -> `Unknown`.
-    UnexpectedStatus(u16),
+    UnexpectedStatus(u16, String),
 }
 
 impl ControlPlaneError {
     fn into_unknown_detail(self) -> String {
         match self {
             ControlPlaneError::AccessDenied(msg) => format!("access denied: {msg}"),
-            ControlPlaneError::NotConfigured(msg) => msg,
+            ControlPlaneError::NotConfigured(code) => format!("not configured ({code})"),
+            ControlPlaneError::NotFound(msg) => format!("HTTP 404: {msg}"),
             ControlPlaneError::Transport(msg) => format!("transport error: {msg}"),
             ControlPlaneError::Parse(msg) => format!("could not parse response: {msg}"),
-            ControlPlaneError::UnexpectedStatus(status) => {
-                format!("unexpected HTTP status {status}")
+            ControlPlaneError::Redirect(status) => {
+                format!("HTTP {status} redirect, not followed")
+            }
+            ControlPlaneError::BodyTooLarge => {
+                format!("response body exceeds {MAX_BODY_BYTES} bytes")
+            }
+            ControlPlaneError::UnexpectedStatus(status, msg) => {
+                format!("unexpected HTTP status {status}: {msg}")
             }
         }
+    }
+}
+
+// --- A small XML tree over quick-xml ---
+
+/// One XML element with its local name, its own text, and its child elements.
+/// Every body read here is capped at [`MAX_BODY_BYTES`], so building a tree and
+/// walking it is simpler and no more costly than streaming.
+#[derive(Debug, Default)]
+struct XmlElement {
+    name: String,
+    text: String,
+    children: Vec<XmlElement>,
+}
+
+impl XmlElement {
+    fn child(&self, name: &str) -> Option<&XmlElement> {
+        self.children.iter().find(|child| child.name == name)
+    }
+
+    fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a XmlElement> {
+        self.children.iter().filter(move |child| child.name == name)
+    }
+
+    fn count(&self, name: &str) -> usize {
+        self.children_named(name).count()
+    }
+
+    /// The element's text with surrounding whitespace removed.
+    fn value(&self) -> &str {
+        self.text.trim()
+    }
+}
+
+fn local_name(name: &[u8]) -> Result<String, ControlPlaneError> {
+    let local = match name.iter().rposition(|&b| b == b':') {
+        Some(idx) => &name[idx + 1..],
+        None => name,
+    };
+    String::from_utf8(local.to_vec())
+        .map_err(|_| ControlPlaneError::Parse("element name is not UTF-8".to_string()))
+}
+
+fn attach(stack: &mut [XmlElement], root: &mut Option<XmlElement>, element: XmlElement) -> bool {
+    match stack.last_mut() {
+        Some(parent) => {
+            parent.children.push(element);
+            true
+        }
+        None if root.is_none() => {
+            *root = Some(element);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Parse `body` into a tree whose root must be `<expected_root>`. A body that is
+/// not that XML (garbage, an `<Error>` document, another shape), a body that
+/// stops mid-element, and an entity the reader cannot resolve are all parse
+/// errors, so the derived condition is `Unknown` rather than a misleading
+/// partial read. quick-xml's `check_end_names` rejects a mismatched end tag but
+/// reports plain EOF for a truncated body, so the open stack is checked at EOF.
+fn parse_document(body: &[u8], expected_root: &str) -> Result<XmlElement, ControlPlaneError> {
+    let parse_err = |e: &dyn fmt::Display| ControlPlaneError::Parse(e.to_string());
+    let mut reader = Reader::from_reader(body);
+    let mut buf = Vec::new();
+    let mut stack: Vec<XmlElement> = Vec::new();
+    let mut root: Option<XmlElement> = None;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => stack.push(XmlElement {
+                name: local_name(e.name().as_ref())?,
+                ..XmlElement::default()
+            }),
+            Ok(Event::Empty(e)) => {
+                let element = XmlElement {
+                    name: local_name(e.name().as_ref())?,
+                    ..XmlElement::default()
+                };
+                if !attach(&mut stack, &mut root, element) {
+                    return Err(ControlPlaneError::Parse(
+                        "more than one root element".to_string(),
+                    ));
+                }
+            }
+            Ok(Event::End(_)) => {
+                let Some(element) = stack.pop() else {
+                    return Err(ControlPlaneError::Parse("unbalanced end tag".to_string()));
+                };
+                if !attach(&mut stack, &mut root, element) {
+                    return Err(ControlPlaneError::Parse(
+                        "more than one root element".to_string(),
+                    ));
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(top) = stack.last_mut() {
+                    top.text.push_str(&t.decode().map_err(|e| parse_err(&e))?);
+                }
+            }
+            Ok(Event::CData(t)) => {
+                if let Some(top) = stack.last_mut() {
+                    top.text.push_str(&t.decode().map_err(|e| parse_err(&e))?);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                let resolved = if r.is_char_ref() {
+                    r.resolve_char_ref()
+                        .map_err(|e| parse_err(&e))?
+                        .map(String::from)
+                } else {
+                    let name = r.decode().map_err(|e| parse_err(&e))?;
+                    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_string)
+                };
+                let Some(resolved) = resolved else {
+                    return Err(ControlPlaneError::Parse(
+                        "unresolvable entity reference".to_string(),
+                    ));
+                };
+                if let Some(top) = stack.last_mut() {
+                    top.text.push_str(&resolved);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => return Err(parse_err(&e)),
+        }
+        buf.clear();
+    }
+    if let Some(open) = stack.last() {
+        return Err(ControlPlaneError::Parse(format!(
+            "response ended inside <{}>",
+            open.name
+        )));
+    }
+    match root {
+        Some(root) if root.name == expected_root => Ok(root),
+        _ => Err(ControlPlaneError::Parse(format!(
+            "response is not <{expected_root}> XML"
+        ))),
+    }
+}
+
+/// The `<Error><Code>` of an S3 error body, or `None` when the body is not one.
+pub(crate) fn parse_error_code(body: &[u8]) -> Option<String> {
+    let root = parse_document(body, "Error").ok()?;
+    let code = root.child("Code")?.value();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
+/// The S3 error code of a failure body, for an error detail. Only the code: the
+/// rest of an S3 error body can echo the canonical request, session token
+/// included.
+fn error_code_detail(body: &[u8]) -> String {
+    match parse_error_code(body) {
+        Some(code) => format!("S3 error code {}", short_excerpt(&code)),
+        None => "no S3 error code in the body".to_string(),
     }
 }
 
@@ -366,34 +655,247 @@ pub(crate) struct VersioningConfig {
     pub status: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A rule's `Status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuleStatus {
+    Enabled,
+    Disabled,
+    /// Neither `Enabled` nor `Disabled`, or missing.
+    Other(String),
+}
+
+impl RuleStatus {
+    fn parse(element: Option<&XmlElement>) -> RuleStatus {
+        match element.map(XmlElement::value) {
+            Some(value) if value.eq_ignore_ascii_case("Enabled") => RuleStatus::Enabled,
+            Some(value) if value.eq_ignore_ascii_case("Disabled") => RuleStatus::Disabled,
+            Some(value) => RuleStatus::Other(value.to_string()),
+            None => RuleStatus::Other("<missing>".to_string()),
+        }
+    }
+
+    fn active(&self) -> Tri {
+        match self {
+            RuleStatus::Enabled => Tri::Yes,
+            RuleStatus::Disabled => Tri::No,
+            RuleStatus::Other(_) => Tri::Maybe,
+        }
+    }
+}
+
+/// A day count from a lifecycle rule. A value that does not parse is kept
+/// distinct from absence, so it reads as `Unknown`, never as a missing rule or
+/// a wrong value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Days {
+    Value(u32),
+    Invalid(String),
+}
+
+impl Days {
+    fn parse(element: Option<&XmlElement>) -> Days {
+        match element.map(XmlElement::value) {
+            Some(value) => value
+                .parse()
+                .map(Days::Value)
+                .unwrap_or_else(|_| Days::Invalid(value.to_string())),
+            None => Days::Invalid("<missing>".to_string()),
+        }
+    }
+
+    fn as_result(&self) -> Result<u32, String> {
+        match self {
+            Days::Value(days) => Ok(*days),
+            Days::Invalid(raw) => Err(raw.clone()),
+        }
+    }
+}
+
+/// A boolean from a lifecycle rule, with the same absent/invalid split as
+/// [`Days`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Flag {
+    Value(bool),
+    Invalid(String),
+}
+
+impl Flag {
+    fn parse(element: &XmlElement) -> Flag {
+        match element.value() {
+            value if value.eq_ignore_ascii_case("true") => Flag::Value(true),
+            value if value.eq_ignore_ascii_case("false") => Flag::Value(false),
+            value => Flag::Invalid(value.to_string()),
+        }
+    }
+}
+
+/// Which objects a lifecycle or replication rule applies to, read from its
+/// `Filter` (or legacy rule-level `Prefix`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuleScope {
+    /// Every object whose key starts with the prefix (empty: the whole bucket).
+    Prefix(String),
+    /// Only the objects under the prefix that also match a tag or an object-size
+    /// bound: a subset, so the rule never covers a whole prefix.
+    Narrowed { prefix: String, by: String },
+    /// A filter shape the reader does not recognise.
+    Unrecognized(String),
+}
+
+/// How much of `t/` a rule applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coverage {
+    /// Every key under `t/`.
+    Full,
+    /// A plain prefix strictly under `t/`. Several such rules could cover all
+    /// of `t/` as a union (ADR-1727 decision 3), which this reader does not
+    /// evaluate, so it is neither proof of coverage nor of its absence.
+    UnionMember,
+    /// No key under `t/`, or only a tag- or size-narrowed subset.
+    None,
+    /// An unrecognised filter.
+    Unknown,
+}
+
+/// Three-valued answer for a rule property that depends on something the reader
+/// may not recognise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tri {
+    Yes,
+    No,
+    Maybe,
+}
+
+impl RuleScope {
+    fn coverage_of_data_root(&self) -> Coverage {
+        match self {
+            RuleScope::Prefix(prefix) if DATA_ROOT.starts_with(prefix.as_str()) => Coverage::Full,
+            RuleScope::Prefix(prefix) if prefix.starts_with(DATA_ROOT) => Coverage::UnionMember,
+            RuleScope::Prefix(_) | RuleScope::Narrowed { .. } => Coverage::None,
+            RuleScope::Unrecognized(_) => Coverage::Unknown,
+        }
+    }
+
+    fn targets_ravel(&self) -> Tri {
+        match self {
+            RuleScope::Prefix(prefix) | RuleScope::Narrowed { prefix, .. } => {
+                if RAVEL_ROOTS
+                    .iter()
+                    .any(|root| prefix_intersects(prefix, root))
+                {
+                    Tri::Yes
+                } else {
+                    Tri::No
+                }
+            }
+            RuleScope::Unrecognized(_) => Tri::Maybe,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            RuleScope::Prefix(prefix) if prefix.is_empty() => "the whole bucket".to_string(),
+            RuleScope::Prefix(prefix) => format!("prefix {prefix:?}"),
+            RuleScope::Narrowed { prefix, by } => format!("prefix {prefix:?} narrowed by {by}"),
+            RuleScope::Unrecognized(detail) => format!("an unrecognised filter ({detail})"),
+        }
+    }
+}
+
+/// Read a rule's scope. Accepted shapes: a legacy rule-level `<Prefix>`, or a
+/// `<Filter>` that is empty or holds exactly one of `<Prefix>`, `<Tag>`,
+/// `<ObjectSizeGreaterThan>`, `<ObjectSizeLessThan>`, or `<And>` (whose children
+/// are at most one `<Prefix>` plus any `<Tag>` and size bounds). Anything else
+/// is [`RuleScope::Unrecognized`].
+fn rule_scope(rule: &XmlElement) -> RuleScope {
+    let unrecognized = |detail: &str| RuleScope::Unrecognized(detail.to_string());
+    if rule.count("Prefix") > 1 || rule.count("Filter") > 1 {
+        return unrecognized("repeated Prefix or Filter");
+    }
+    match (rule.child("Prefix"), rule.child("Filter")) {
+        (Some(prefix), None) => RuleScope::Prefix(prefix.text.clone()),
+        (None, Some(filter)) => filter_scope(filter),
+        (Some(_), Some(_)) => unrecognized("both a rule-level Prefix and a Filter"),
+        (None, None) => unrecognized("neither a Filter nor a Prefix"),
+    }
+}
+
+fn filter_scope(filter: &XmlElement) -> RuleScope {
+    let [condition] = filter.children.as_slice() else {
+        return if filter.children.is_empty() && filter.value().is_empty() {
+            RuleScope::Prefix(String::new())
+        } else {
+            RuleScope::Unrecognized(
+                "a Filter with more than one condition outside <And>".to_string(),
+            )
+        };
+    };
+    match condition.name.as_str() {
+        "Prefix" => RuleScope::Prefix(condition.text.clone()),
+        "Tag" => RuleScope::Narrowed {
+            prefix: String::new(),
+            by: "a tag".to_string(),
+        },
+        "ObjectSizeGreaterThan" | "ObjectSizeLessThan" => RuleScope::Narrowed {
+            prefix: String::new(),
+            by: condition.name.clone(),
+        },
+        "And" => and_scope(condition),
+        other => RuleScope::Unrecognized(format!("<Filter><{other}>")),
+    }
+}
+
+fn and_scope(and: &XmlElement) -> RuleScope {
+    let mut prefix: Option<String> = None;
+    let mut narrowing: Vec<String> = Vec::new();
+    for child in &and.children {
+        match child.name.as_str() {
+            "Prefix" if prefix.is_none() => prefix = Some(child.text.clone()),
+            "Prefix" => return RuleScope::Unrecognized("<And> with two prefixes".to_string()),
+            "Tag" => narrowing.push("a tag".to_string()),
+            "ObjectSizeGreaterThan" | "ObjectSizeLessThan" => narrowing.push(child.name.clone()),
+            other => return RuleScope::Unrecognized(format!("<And><{other}>")),
+        }
+    }
+    let prefix = prefix.unwrap_or_default();
+    if narrowing.is_empty() {
+        RuleScope::Prefix(prefix)
+    } else {
+        narrowing.dedup();
+        RuleScope::Narrowed {
+            prefix,
+            by: narrowing.join(" and "),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LifecycleRule {
-    pub status: String,
-    pub prefix: Option<String>,
-    pub noncurrent_days: Option<u32>,
-    pub expired_object_delete_marker: Option<bool>,
-    pub abort_incomplete_days: Option<u32>,
-    pub expiration_days: Option<u32>,
+    pub id: Option<String>,
+    pub status: RuleStatus,
+    pub scope: RuleScope,
+    pub noncurrent_days: Option<Days>,
+    /// `NewerNoncurrentVersions`: that many noncurrent versions outlive
+    /// `NoncurrentDays`.
+    pub newer_noncurrent_versions: Option<String>,
+    pub expired_object_delete_marker: Option<Flag>,
+    pub expiration_days: Option<Days>,
+    pub expiration_date: Option<String>,
+    /// An `<Expiration>` shape the reader does not classify.
+    pub expiration_unrecognized: Option<String>,
+    pub abort_incomplete_days: Option<Days>,
     pub has_transition: bool,
+    /// A rule-level action element the reader does not classify (for example a
+    /// vendor extension that deletes versions).
+    pub unrecognized_action: Option<String>,
 }
 
 impl LifecycleRule {
-    fn enabled(&self) -> bool {
-        self.status.eq_ignore_ascii_case("Enabled")
-    }
-
-    fn carries_sanctioned(&self) -> bool {
-        self.noncurrent_days.is_some()
-            || self.abort_incomplete_days.is_some()
-            || self.expired_object_delete_marker == Some(true)
-    }
-
-    fn carries_foreign(&self) -> bool {
-        self.has_transition || self.expiration_days.is_some()
-    }
-
-    fn effective_prefix(&self) -> &str {
-        self.prefix.as_deref().unwrap_or("")
+    fn label(&self, index: usize) -> String {
+        match &self.id {
+            Some(id) => format!("rule {id:?}"),
+            None => format!("rule #{}", index + 1),
+        }
     }
 }
 
@@ -402,9 +904,18 @@ pub(crate) struct LifecycleConfig {
     pub rules: Vec<LifecycleRule>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplicationRule {
+    pub id: Option<String>,
+    pub status: RuleStatus,
+    pub scope: RuleScope,
+    /// `DeleteMarkerReplication/Status`, `None` when the element is missing.
+    pub delete_marker_replication: Option<RuleStatus>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReplicationConfig {
-    pub delete_marker_replication_enabled: bool,
+    pub rules: Vec<ReplicationRule>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -416,6 +927,8 @@ pub(crate) struct ObjectLockConfig {
 pub(crate) struct RetentionConfig {
     /// `Some("COMPLIANCE")`, `Some("GOVERNANCE")`, or `None`.
     pub mode: Option<String>,
+    /// `RetainUntilDate` as sent.
+    pub retain_until: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -423,340 +936,171 @@ pub(crate) struct ObjectVersion {
     pub key: String,
     pub version_id: String,
     pub is_latest: bool,
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ObjectVersionListing {
     pub versions: Vec<ObjectVersion>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_version_id_marker: Option<String>,
 }
 
-// --- XML parsers (quick-xml 0.41, event-based, no serde) ---
-
-fn xml_reader(body: &[u8]) -> Reader<&[u8]> {
-    let mut reader = Reader::from_reader(body);
-    // Default well-formedness checks stay on (check_end_names): an unterminated
-    // or mismatched body errors rather than parsing to a misleading partial, so
-    // a malformed response maps to Unknown, never Fail (ADR-1727 decision 3).
-    reader.config_mut().trim_text(true);
-    reader
-}
-
-/// Confirm the parse reached the expected root element and closed every element
-/// it opened. A body that is not the S3 XML this call returns (garbage, an
-/// unexpected shape) and a body that stops mid-element are both parse errors, so
-/// the derived condition is Unknown rather than a wrong Fail. quick-xml's
-/// `check_end_names` rejects a *mismatched* end tag but reports plain EOF for a
-/// truncated body, which would otherwise yield a misleading partial parse, so
-/// `open` (the elements still unclosed at EOF) is checked here too.
-fn require_well_formed(
-    saw_root: bool,
-    open: &[Vec<u8>],
-    expected: &str,
-) -> Result<(), ControlPlaneError> {
-    if let Some(name) = open.last() {
-        return Err(ControlPlaneError::Parse(format!(
-            "response ended inside <{}>",
-            String::from_utf8_lossy(name)
-        )));
-    }
-    if saw_root {
-        Ok(())
-    } else {
-        Err(ControlPlaneError::Parse(format!(
-            "response is not <{expected}> XML"
-        )))
-    }
-}
-
-fn local(name: &[u8]) -> Vec<u8> {
-    match name.iter().rposition(|&b| b == b':') {
-        Some(idx) => name[idx + 1..].to_vec(),
-        None => name.to_vec(),
-    }
-}
-
-fn decode_text(text: &quick_xml::events::BytesText) -> Result<String, ControlPlaneError> {
-    text.decode()
-        .map(|cow| cow.into_owned())
-        .map_err(|e| ControlPlaneError::Parse(e.to_string()))
-}
+// --- XML readers ---
 
 pub(crate) fn parse_versioning(body: &[u8]) -> Result<VersioningConfig, ControlPlaneError> {
-    let mut reader = xml_reader(body);
-    let mut buf = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut config = VersioningConfig::default();
-    let mut saw_root = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = local(e.name().as_ref());
-                saw_root |= name == b"VersioningConfiguration";
-                stack.push(name);
-            }
-            Ok(Event::Empty(e)) => {
-                saw_root |= local(e.name().as_ref()) == b"VersioningConfiguration";
-            }
-            Ok(Event::End(_)) => {
-                stack.pop();
-            }
-            Ok(Event::Text(t)) => {
-                if stack.last().map(Vec::as_slice) == Some(b"Status".as_slice()) {
-                    config.status = Some(decode_text(&t)?);
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(ControlPlaneError::Parse(e.to_string())),
-        }
-        buf.clear();
-    }
-    require_well_formed(saw_root, &stack, "VersioningConfiguration")?;
-    Ok(config)
+    let root = parse_document(body, "VersioningConfiguration")?;
+    Ok(VersioningConfig {
+        status: root.child("Status").map(|s| s.value().to_string()),
+    })
 }
 
 pub(crate) fn parse_lifecycle(body: &[u8]) -> Result<LifecycleConfig, ControlPlaneError> {
-    let mut reader = xml_reader(body);
-    let mut buf = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut config = LifecycleConfig::default();
-    let mut rule: Option<LifecycleRule> = None;
-    let mut saw_root = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = local(e.name().as_ref());
-                saw_root |= name == b"LifecycleConfiguration";
-                if name == b"Rule" {
-                    rule = Some(LifecycleRule::default());
-                } else if let Some(rule) = rule.as_mut()
-                    && (name == b"Transition" || name == b"NoncurrentVersionTransition")
-                {
-                    rule.has_transition = true;
+    let root = parse_document(body, "LifecycleConfiguration")?;
+    Ok(LifecycleConfig {
+        rules: root.children_named("Rule").map(lifecycle_rule).collect(),
+    })
+}
+
+fn lifecycle_rule(rule: &XmlElement) -> LifecycleRule {
+    let mut out = LifecycleRule {
+        id: rule.child("ID").map(|id| id.value().to_string()),
+        status: RuleStatus::parse(rule.child("Status")),
+        scope: rule_scope(rule),
+        noncurrent_days: None,
+        newer_noncurrent_versions: None,
+        expired_object_delete_marker: None,
+        expiration_days: None,
+        expiration_date: None,
+        expiration_unrecognized: None,
+        abort_incomplete_days: None,
+        has_transition: false,
+        unrecognized_action: None,
+    };
+    for child in &rule.children {
+        match child.name.as_str() {
+            "ID" | "Status" | "Filter" | "Prefix" => {}
+            "Transition" | "NoncurrentVersionTransition" => out.has_transition = true,
+            "NoncurrentVersionExpiration" => {
+                out.noncurrent_days = Some(Days::parse(child.child("NoncurrentDays")));
+                if let Some(newer) = child.child("NewerNoncurrentVersions") {
+                    out.newer_noncurrent_versions = Some(newer.value().to_string());
                 }
-                stack.push(name);
             }
-            Ok(Event::Empty(e)) => {
-                let name = local(e.name().as_ref());
-                saw_root |= name == b"LifecycleConfiguration";
-                if let Some(rule) = rule.as_mut()
-                    && (name == b"Transition" || name == b"NoncurrentVersionTransition")
-                {
-                    rule.has_transition = true;
+            "Expiration" => {
+                if child.children.is_empty() {
+                    out.expiration_unrecognized = Some("an empty <Expiration>".to_string());
                 }
-            }
-            Ok(Event::End(e)) => {
-                let name = local(e.name().as_ref());
-                if name == b"Rule"
-                    && let Some(rule) = rule.take()
-                {
-                    config.rules.push(rule);
-                }
-                stack.pop();
-            }
-            Ok(Event::Text(t)) => {
-                if let Some(rule) = rule.as_mut() {
-                    let top = stack.last().map(Vec::as_slice);
-                    let parent = if stack.len() >= 2 {
-                        Some(stack[stack.len() - 2].as_slice())
-                    } else {
-                        None
-                    };
-                    let text = decode_text(&t)?;
-                    match (top, parent) {
-                        (Some(b"Status"), Some(b"Rule")) => rule.status = text,
-                        (Some(b"NoncurrentDays"), Some(b"NoncurrentVersionExpiration")) => {
-                            rule.noncurrent_days = text.trim().parse().ok();
+                for part in &child.children {
+                    match part.name.as_str() {
+                        "Days" => out.expiration_days = Some(Days::parse(Some(part))),
+                        "Date" => out.expiration_date = Some(part.value().to_string()),
+                        "ExpiredObjectDeleteMarker" => {
+                            out.expired_object_delete_marker = Some(Flag::parse(part));
                         }
-                        (Some(b"ExpiredObjectDeleteMarker"), Some(b"Expiration")) => {
-                            rule.expired_object_delete_marker =
-                                Some(text.trim().eq_ignore_ascii_case("true"));
+                        other => {
+                            out.expiration_unrecognized = Some(format!("<Expiration><{other}>"));
                         }
-                        (Some(b"Days"), Some(b"Expiration")) => {
-                            rule.expiration_days = text.trim().parse().ok();
-                        }
-                        (Some(b"DaysAfterInitiation"), Some(b"AbortIncompleteMultipartUpload")) => {
-                            rule.abort_incomplete_days = text.trim().parse().ok();
-                        }
-                        (Some(b"Prefix"), _) => rule.prefix = Some(text),
-                        _ => {}
                     }
                 }
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(ControlPlaneError::Parse(e.to_string())),
+            "AbortIncompleteMultipartUpload" => {
+                out.abort_incomplete_days = Some(Days::parse(child.child("DaysAfterInitiation")));
+            }
+            other => out.unrecognized_action = Some(format!("<{other}>")),
         }
-        buf.clear();
     }
-    require_well_formed(saw_root, &stack, "LifecycleConfiguration")?;
-    Ok(config)
+    out
 }
 
 pub(crate) fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, ControlPlaneError> {
-    let mut reader = xml_reader(body);
-    let mut buf = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut config = ReplicationConfig::default();
-    let mut saw_root = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = local(e.name().as_ref());
-                saw_root |= name == b"ReplicationConfiguration";
-                stack.push(name);
-            }
-            Ok(Event::Empty(e)) => {
-                saw_root |= local(e.name().as_ref()) == b"ReplicationConfiguration";
-            }
-            Ok(Event::End(_)) => {
-                stack.pop();
-            }
-            Ok(Event::Text(t)) => {
-                let top = stack.last().map(Vec::as_slice);
-                let parent = if stack.len() >= 2 {
-                    Some(stack[stack.len() - 2].as_slice())
-                } else {
-                    None
-                };
-                if top == Some(b"Status") && parent == Some(b"DeleteMarkerReplication") {
-                    config.delete_marker_replication_enabled =
-                        decode_text(&t)?.trim().eq_ignore_ascii_case("Enabled");
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(ControlPlaneError::Parse(e.to_string())),
-        }
-        buf.clear();
-    }
-    require_well_formed(saw_root, &stack, "ReplicationConfiguration")?;
-    Ok(config)
+    let root = parse_document(body, "ReplicationConfiguration")?;
+    Ok(ReplicationConfig {
+        rules: root
+            .children_named("Rule")
+            .map(|rule| ReplicationRule {
+                id: rule.child("ID").map(|id| id.value().to_string()),
+                status: RuleStatus::parse(rule.child("Status")),
+                scope: rule_scope(rule),
+                delete_marker_replication: rule
+                    .child("DeleteMarkerReplication")
+                    .map(|dmr| RuleStatus::parse(dmr.child("Status"))),
+            })
+            .collect(),
+    })
 }
 
 pub(crate) fn parse_object_lock(body: &[u8]) -> Result<ObjectLockConfig, ControlPlaneError> {
-    let mut reader = xml_reader(body);
-    let mut buf = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut config = ObjectLockConfig::default();
-    let mut saw_root = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = local(e.name().as_ref());
-                saw_root |= name == b"ObjectLockConfiguration";
-                stack.push(name);
-            }
-            Ok(Event::Empty(e)) => {
-                saw_root |= local(e.name().as_ref()) == b"ObjectLockConfiguration";
-            }
-            Ok(Event::End(_)) => {
-                stack.pop();
-            }
-            Ok(Event::Text(t)) => {
-                if stack.last().map(Vec::as_slice) == Some(b"ObjectLockEnabled".as_slice()) {
-                    config.enabled = decode_text(&t)?.trim().eq_ignore_ascii_case("Enabled");
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(ControlPlaneError::Parse(e.to_string())),
-        }
-        buf.clear();
-    }
-    require_well_formed(saw_root, &stack, "ObjectLockConfiguration")?;
-    Ok(config)
+    let root = parse_document(body, "ObjectLockConfiguration")?;
+    Ok(ObjectLockConfig {
+        enabled: root
+            .child("ObjectLockEnabled")
+            .is_some_and(|e| e.value().eq_ignore_ascii_case("Enabled")),
+    })
 }
 
 pub(crate) fn parse_retention(body: &[u8]) -> Result<RetentionConfig, ControlPlaneError> {
-    let mut reader = xml_reader(body);
-    let mut buf = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut config = RetentionConfig::default();
-    let mut saw_root = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = local(e.name().as_ref());
-                saw_root |= name == b"Retention";
-                stack.push(name);
-            }
-            Ok(Event::Empty(e)) => {
-                saw_root |= local(e.name().as_ref()) == b"Retention";
-            }
-            Ok(Event::End(_)) => {
-                stack.pop();
-            }
-            Ok(Event::Text(t)) => {
-                if stack.last().map(Vec::as_slice) == Some(b"Mode".as_slice()) {
-                    config.mode = Some(decode_text(&t)?.trim().to_string());
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(ControlPlaneError::Parse(e.to_string())),
-        }
-        buf.clear();
+    let root = parse_document(body, "Retention")?;
+    Ok(RetentionConfig {
+        mode: root.child("Mode").map(|m| m.value().to_string()),
+        retain_until: root.child("RetainUntilDate").map(|d| d.value().to_string()),
+    })
+}
+
+fn parse_bool(element: &XmlElement) -> Result<bool, ControlPlaneError> {
+    match Flag::parse(element) {
+        Flag::Value(value) => Ok(value),
+        Flag::Invalid(raw) => Err(ControlPlaneError::Parse(format!(
+            "<{}> is {raw:?}, not true or false",
+            element.name
+        ))),
     }
-    require_well_formed(saw_root, &stack, "Retention")?;
-    Ok(config)
 }
 
 pub(crate) fn parse_object_versions(
     body: &[u8],
 ) -> Result<ObjectVersionListing, ControlPlaneError> {
-    let mut reader = xml_reader(body);
-    let mut buf = Vec::new();
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut listing = ObjectVersionListing::default();
-    let mut current: Option<ObjectVersion> = None;
-    let mut saw_root = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = local(e.name().as_ref());
-                saw_root |= name == b"ListVersionsResult";
-                if name == b"Version" {
-                    current = Some(ObjectVersion::default());
-                }
-                stack.push(name);
-            }
-            Ok(Event::Empty(e)) => {
-                saw_root |= local(e.name().as_ref()) == b"ListVersionsResult";
-            }
-            Ok(Event::End(e)) => {
-                let name = local(e.name().as_ref());
-                if name == b"Version"
-                    && let Some(version) = current.take()
-                {
-                    listing.versions.push(version);
-                }
-                stack.pop();
-            }
-            Ok(Event::Text(t)) => {
-                if let Some(version) = current.as_mut() {
-                    let text = decode_text(&t)?;
-                    match stack.last().map(Vec::as_slice) {
-                        Some(b"Key") => version.key = text,
-                        Some(b"VersionId") => version.version_id = text,
-                        Some(b"IsLatest") => {
-                            version.is_latest = text.trim().eq_ignore_ascii_case("true")
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(ControlPlaneError::Parse(e.to_string())),
-        }
-        buf.clear();
+    let root = parse_document(body, "ListVersionsResult")?;
+    let mut listing = ObjectVersionListing {
+        is_truncated: match root.child("IsTruncated") {
+            Some(element) => parse_bool(element)?,
+            None => false,
+        },
+        next_key_marker: root.child("NextKeyMarker").map(|m| m.text.clone()),
+        next_version_id_marker: root
+            .child("NextVersionIdMarker")
+            .map(|m| m.value().to_string()),
+        versions: Vec::new(),
+    };
+    for version in root.children_named("Version") {
+        listing.versions.push(ObjectVersion {
+            key: version
+                .child("Key")
+                .map(|k| k.text.clone())
+                .unwrap_or_default(),
+            version_id: version
+                .child("VersionId")
+                .map(|v| v.value().to_string())
+                .unwrap_or_default(),
+            is_latest: match version.child("IsLatest") {
+                Some(element) => parse_bool(element)?,
+                None => false,
+            },
+            last_modified: version.child("LastModified").map(|m| m.value().to_string()),
+        });
     }
-    require_well_formed(saw_root, &stack, "ListVersionsResult")?;
     Ok(listing)
 }
 
 // --- The control plane ---
+
+/// Not-configured error codes per call: a 404 carrying one of these is an
+/// affirmatively absent configuration; every other 404 is `Unknown`.
+const LIFECYCLE_NOT_CONFIGURED: &[&str] = &["NoSuchLifecycleConfiguration"];
+const REPLICATION_NOT_CONFIGURED: &[&str] = &["ReplicationConfigurationNotFoundError"];
+const OBJECT_LOCK_NOT_CONFIGURED: &[&str] = &["ObjectLockConfigurationNotFoundError"];
+const RETENTION_NOT_CONFIGURED: &[&str] = &["NoSuchObjectLockConfiguration"];
 
 /// A read-only bucket-configuration client for one S3 bucket (ADR-1727 decision
 /// 1). Holds the `reqwest` client, the credential provider `S3Store` already
@@ -797,15 +1141,16 @@ impl BucketControlPlaneClient {
         self
     }
 
-    /// Sign and send one read-only `GET`, returning the 200 body or a classified
-    /// error. `not_configured_markers` are the response markers (S3 error codes)
-    /// that mean "affirmatively absent" for this call, so a 404 carrying one maps
-    /// to [`ControlPlaneError::NotConfigured`] rather than an opaque status.
+    /// Sign and send one read-only `GET`, returning the 2xx body or a classified
+    /// error. A 404 is [`ControlPlaneError::NotConfigured`] only when the body's
+    /// `<Error><Code>` is one of `not_configured`; any other 404 is
+    /// [`ControlPlaneError::NotFound`].
     async fn send_get(
         &self,
         object_key: Option<&str>,
         query_pairs: &[(String, String)],
-    ) -> Result<String, ControlPlaneError> {
+        not_configured: &[&str],
+    ) -> Result<Vec<u8>, ControlPlaneError> {
         let credential =
             self.credentials.get_credential().await.map_err(|e| {
                 ControlPlaneError::Transport(format!("credential fetch failed: {e}"))
@@ -874,56 +1219,67 @@ impl BucketControlPlaneClient {
             builder = builder.header("x-amz-security-token", token);
         }
 
-        let response = builder
+        let mut response = builder
             .send()
             .await
             .map_err(|e| ControlPlaneError::Transport(e.to_string()))?;
         let status = response.status();
-        let body = response
-            .text()
+        if status.is_redirection() {
+            return Err(ControlPlaneError::Redirect(status.as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+        {
+            return Err(ControlPlaneError::BodyTooLarge);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| ControlPlaneError::Transport(e.to_string()))?;
+            .map_err(|e| ControlPlaneError::Transport(e.to_string()))?
+        {
+            if body.len() + chunk.len() > MAX_BODY_BYTES {
+                return Err(ControlPlaneError::BodyTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
 
         if status.is_success() {
             return Ok(body);
         }
         match status.as_u16() {
-            403 => Err(ControlPlaneError::AccessDenied(short_excerpt(&body))),
-            404 => Err(ControlPlaneError::NotConfigured(short_excerpt(&body))),
-            other => {
-                // A 404 marker can also arrive with a 200/400 in some S3-compatible
-                // endpoints; treat an explicit NoSuch* / NotFound body as absent.
-                if body.contains("NoSuch") || body.contains("NotFoundError") {
-                    Err(ControlPlaneError::NotConfigured(short_excerpt(&body)))
-                } else {
-                    Err(ControlPlaneError::UnexpectedStatus(other))
+            403 => Err(ControlPlaneError::AccessDenied(error_code_detail(&body))),
+            404 => match parse_error_code(&body) {
+                Some(code) if not_configured.contains(&code.as_str()) => {
+                    Err(ControlPlaneError::NotConfigured(code))
                 }
-            }
+                _ => Err(ControlPlaneError::NotFound(error_code_detail(&body))),
+            },
+            other => Err(ControlPlaneError::UnexpectedStatus(
+                other,
+                error_code_detail(&body),
+            )),
         }
     }
 
     async fn fetch_versioning(&self) -> FetchOutcome<VersioningConfig> {
-        match self
-            .send_get(None, &[("versioning".to_string(), String::new())])
-            .await
-        {
-            Ok(body) => match parse_versioning(body.as_bytes()) {
-                Ok(config) => FetchOutcome::Present(config),
-                Err(e) => FetchOutcome::Unknown(e.into_unknown_detail()),
-            },
-            Err(ControlPlaneError::NotConfigured(_)) => {
-                // ?versioning always answers 200 on real S3; a 404 here means the
-                // endpoint has no versioning API at all -> Unknown, not a Fail.
-                FetchOutcome::Unknown("endpoint has no ?versioning API".to_string())
-            }
-            Err(e) => FetchOutcome::Unknown(e.into_unknown_detail()),
-        }
+        classify_fetch(
+            self.send_get(None, &[("versioning".to_string(), String::new())], &[])
+                .await,
+            parse_versioning,
+            "",
+        )
     }
 
     async fn fetch_lifecycle(&self) -> FetchOutcome<LifecycleConfig> {
         classify_fetch(
-            self.send_get(None, &[("lifecycle".to_string(), String::new())])
-                .await,
+            self.send_get(
+                None,
+                &[("lifecycle".to_string(), String::new())],
+                LIFECYCLE_NOT_CONFIGURED,
+            )
+            .await,
             parse_lifecycle,
             "no lifecycle configuration on the bucket",
         )
@@ -931,8 +1287,12 @@ impl BucketControlPlaneClient {
 
     async fn fetch_replication(&self) -> FetchOutcome<ReplicationConfig> {
         classify_fetch(
-            self.send_get(None, &[("replication".to_string(), String::new())])
-                .await,
+            self.send_get(
+                None,
+                &[("replication".to_string(), String::new())],
+                REPLICATION_NOT_CONFIGURED,
+            )
+            .await,
             parse_replication,
             "no replication configuration on the bucket",
         )
@@ -940,26 +1300,38 @@ impl BucketControlPlaneClient {
 
     async fn fetch_object_lock(&self) -> FetchOutcome<ObjectLockConfig> {
         classify_fetch(
-            self.send_get(None, &[("object-lock".to_string(), String::new())])
-                .await,
+            self.send_get(
+                None,
+                &[("object-lock".to_string(), String::new())],
+                OBJECT_LOCK_NOT_CONFIGURED,
+            )
+            .await,
             parse_object_lock,
             "Object Lock is not enabled on the bucket",
         )
     }
 
-    async fn fetch_object_versions(&self, prefix: &str) -> FetchOutcome<ObjectVersionListing> {
+    async fn fetch_object_versions(
+        &self,
+        prefix: &str,
+        marker: Option<(&str, &str)>,
+    ) -> FetchOutcome<ObjectVersionListing> {
+        let mut pairs = vec![
+            ("versions".to_string(), String::new()),
+            ("prefix".to_string(), prefix.to_string()),
+            ("max-keys".to_string(), LISTING_PAGE_KEYS.to_string()),
+        ];
+        if let Some((key_marker, version_id_marker)) = marker {
+            pairs.push(("key-marker".to_string(), key_marker.to_string()));
+            pairs.push((
+                "version-id-marker".to_string(),
+                version_id_marker.to_string(),
+            ));
+        }
         classify_fetch(
-            self.send_get(
-                None,
-                &[
-                    ("versions".to_string(), String::new()),
-                    ("prefix".to_string(), prefix.to_string()),
-                    ("max-keys".to_string(), "100".to_string()),
-                ],
-            )
-            .await,
+            self.send_get(None, &pairs, &[]).await,
             parse_object_versions,
-            "no versions under the prefix",
+            "",
         )
     }
 
@@ -971,15 +1343,25 @@ impl BucketControlPlaneClient {
                     ("retention".to_string(), String::new()),
                     ("versionId".to_string(), version_id.to_string()),
                 ],
+                RETENTION_NOT_CONFIGURED,
             )
             .await,
             parse_retention,
-            "the object carries no retention",
+            "the object version carries no retention",
         )
     }
 
     /// Fetch every subresource and assemble the report (ADR-1727 decision 3).
     pub(crate) async fn report(&self, params: &BucketProtectionParams) -> BucketProtectionReport {
+        self.report_with_notes(params).await.0
+    }
+
+    /// [`Self::report`] plus the [`ReportNotes`] the `BucketConfigProbe`
+    /// mapping needs.
+    pub(crate) async fn report_with_notes(
+        &self,
+        params: &BucketProtectionParams,
+    ) -> (BucketProtectionReport, ReportNotes) {
         let versioning = self.fetch_versioning().await;
         let lifecycle = self.fetch_lifecycle().await;
         let replication = self.fetch_replication().await;
@@ -1001,83 +1383,216 @@ impl BucketControlPlaneClient {
         )
     }
 
-    /// Sample one current and one noncurrent object under each protected prefix
-    /// and read their retention (ADR-1727 decision 3, reusing a versioned
-    /// listing). Returns the worst outcome across all samples.
+    /// Every version under `prefix`, following the listing for at most
+    /// [`LISTING_MAX_PAGES`] pages. `Err` carries an `Unknown` detail.
+    async fn list_versions(&self, prefix: &str) -> Result<VersionPages, String> {
+        let mut pages = VersionPages::default();
+        let mut marker: Option<(String, String)> = None;
+        for page_number in 1..=LISTING_MAX_PAGES {
+            let page = match self
+                .fetch_object_versions(
+                    prefix,
+                    marker.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+                )
+                .await
+            {
+                FetchOutcome::Present(page) => page,
+                FetchOutcome::Absent(detail) | FetchOutcome::Unknown(detail) => {
+                    return Err(format!("versions listing: {detail}"));
+                }
+            };
+            pages.versions.extend(page.versions);
+            if !page.is_truncated {
+                return Ok(pages);
+            }
+            if page_number == LISTING_MAX_PAGES {
+                break;
+            }
+            match (page.next_key_marker, page.next_version_id_marker) {
+                (Some(key), Some(version)) => marker = Some((key, version)),
+                _ => {
+                    return Err(
+                        "versions listing is truncated but carries no next markers".to_string()
+                    );
+                }
+            }
+        }
+        pages.truncated = true;
+        Ok(pages)
+    }
+
+    /// Sample, under each protected prefix family, the newest current object
+    /// version and (when there is one) the newest noncurrent version, and read
+    /// their retention (ADR-1727 decision 3). Newest is by `LastModified`: the
+    /// retention a deployment applies is finite, so only a recent object is
+    /// expected to still be locked, and the first key in listing order is the
+    /// oldest shard and hour, not the newest write.
     async fn sample_retention(&self, prefixes: &[String]) -> RetentionSample {
         if prefixes.is_empty() {
             return RetentionSample::Unknown(
                 "no protected prefixes configured to sample".to_string(),
             );
         }
-        let mut sampled_any = false;
-        let mut worst_fail: Option<String> = None;
-        let mut worst_unknown: Option<String> = None;
+        let now = self.clock.now_unix_secs();
+        let mut fails: Vec<String> = Vec::new();
+        let mut unknowns: Vec<String> = Vec::new();
+        let mut noncurrent_sampled = false;
 
         for prefix in prefixes {
-            let listing = match self.fetch_object_versions(prefix).await {
-                FetchOutcome::Present(listing) => listing,
-                FetchOutcome::Absent(_) => continue,
-                FetchOutcome::Unknown(detail) => {
-                    worst_unknown.get_or_insert(format!("{prefix}: {detail}"));
+            let pages = match self.list_versions(prefix).await {
+                Ok(pages) => pages,
+                Err(detail) => {
+                    unknowns.push(format!("{prefix}: {detail}"));
                     continue;
                 }
             };
-            let current = listing.versions.iter().find(|v| v.is_latest);
-            let noncurrent = listing.versions.iter().find(|v| !v.is_latest);
-            for sample in [current, noncurrent].into_iter().flatten() {
-                sampled_any = true;
-                match self.fetch_retention(&sample.key, &sample.version_id).await {
-                    FetchOutcome::Present(config) => {
-                        if !config
-                            .mode
-                            .as_deref()
-                            .is_some_and(|m| m.eq_ignore_ascii_case("COMPLIANCE"))
-                        {
-                            worst_fail.get_or_insert(format!(
-                                "{}: retention mode {:?} is not COMPLIANCE",
-                                sample.key, config.mode
-                            ));
-                        }
+            let current = newest(pages.versions.iter().filter(|v| v.is_latest));
+            let noncurrent = newest(pages.versions.iter().filter(|v| !v.is_latest));
+            let mut samples: Vec<(&ObjectVersion, &str)> = Vec::new();
+            match current {
+                Ok(Some(version)) => samples.push((version, "newest current version")),
+                Ok(None) => unknowns.push(format!("{prefix}: no current object version to sample")),
+                Err(detail) => unknowns.push(format!("{prefix}: {detail}")),
+            }
+            match noncurrent {
+                Ok(Some(version)) => samples.push((version, "newest noncurrent version")),
+                Ok(None) => {}
+                Err(detail) => unknowns.push(format!("{prefix}: {detail}")),
+            }
+            for (version, role) in samples {
+                if role == "newest noncurrent version" {
+                    noncurrent_sampled = true;
+                }
+                let outcome = self
+                    .fetch_retention(&version.key, &version.version_id)
+                    .await;
+                let label = format!("{} ({role})", version.key);
+                match retention_verdict(&outcome, now, pages.truncated) {
+                    SampleVerdict::Protects => {}
+                    SampleVerdict::NotProtecting(detail) => {
+                        fails.push(format!("{label}: {detail}"))
                     }
-                    FetchOutcome::Absent(detail) => {
-                        worst_fail
-                            .get_or_insert(format!("{}: no retention ({detail})", sample.key));
-                    }
-                    FetchOutcome::Unknown(detail) => {
-                        worst_unknown.get_or_insert(format!("{}: {detail}", sample.key));
-                    }
+                    SampleVerdict::Unknown(detail) => unknowns.push(format!("{label}: {detail}")),
                 }
             }
         }
 
-        if let Some(fail) = worst_fail {
-            RetentionSample::Fail(fail)
-        } else if let Some(unknown) = worst_unknown {
-            RetentionSample::Unknown(unknown)
-        } else if sampled_any {
-            RetentionSample::Pass
-        } else {
+        if !fails.is_empty() {
+            RetentionSample::Fail(fails.join("; "))
+        } else if !unknowns.is_empty() {
+            RetentionSample::Unknown(unknowns.join("; "))
+        } else if !noncurrent_sampled {
             RetentionSample::Unknown(
-                "no objects under the protected prefixes to sample".to_string(),
+                "no noncurrent version under any protected prefix to sample".to_string(),
             )
+        } else {
+            RetentionSample::Pass
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct VersionPages {
+    versions: Vec<ObjectVersion>,
+    /// The page cap was reached with more versions left unlisted.
+    truncated: bool,
+}
+
+/// The version with the latest `LastModified` (ties broken by key), `Ok(None)`
+/// for none, and `Err` when a candidate's `LastModified` is missing or does not
+/// parse, since the newest then cannot be told.
+fn newest<'a>(
+    versions: impl Iterator<Item = &'a ObjectVersion>,
+) -> Result<Option<&'a ObjectVersion>, String> {
+    let mut best: Option<((i64, u32), &ObjectVersion)> = None;
+    for version in versions {
+        let Some(raw) = version.last_modified.as_deref() else {
+            return Err(format!("{}: listing carries no LastModified", version.key));
+        };
+        let Some(at) = parse_iso8601(raw) else {
+            return Err(format!(
+                "{}: LastModified {raw:?} does not parse",
+                version.key
+            ));
+        };
+        if best.as_ref().is_none_or(|(best_at, best_version)| {
+            (at, &version.key) > (*best_at, &best_version.key)
+        }) {
+            best = Some((at, version));
+        }
+    }
+    Ok(best.map(|(_, version)| version))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SampleVerdict {
+    Protects,
+    NotProtecting(String),
+    Unknown(String),
+}
+
+/// Whether one sampled version's retention protects it at `now`: compliance
+/// mode with a `RetainUntilDate` still in the future. A lapsed or missing lock
+/// on a sample drawn from a listing cut off at the page cap is `Unknown`, since
+/// that sample may not be the family's newest object.
+fn retention_verdict(
+    outcome: &FetchOutcome<RetentionConfig>,
+    now_unix_secs: i64,
+    listing_truncated: bool,
+) -> SampleVerdict {
+    let not_protecting = |detail: String| {
+        if listing_truncated {
+            SampleVerdict::Unknown(format!(
+                "{detail}, but the versions listing stopped at {LISTING_MAX_PAGES} pages, so \
+                 this may not be the newest object"
+            ))
+        } else {
+            SampleVerdict::NotProtecting(detail)
+        }
+    };
+    let config = match outcome {
+        FetchOutcome::Present(config) => config,
+        FetchOutcome::Absent(detail) => return not_protecting(detail.clone()),
+        FetchOutcome::Unknown(detail) => return SampleVerdict::Unknown(detail.clone()),
+    };
+    if !config
+        .mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("COMPLIANCE"))
+    {
+        return not_protecting(format!(
+            "retention mode {:?} is not COMPLIANCE",
+            config.mode
+        ));
+    }
+    let Some(raw) = config.retain_until.as_deref() else {
+        return SampleVerdict::Unknown("retention carries no RetainUntilDate".to_string());
+    };
+    let Some((until, _)) = parse_iso8601(raw) else {
+        return SampleVerdict::Unknown(format!("RetainUntilDate {raw:?} does not parse"));
+    };
+    if until > now_unix_secs {
+        SampleVerdict::Protects
+    } else {
+        not_protecting(format!("compliance retention lapsed at {raw}"))
     }
 }
 
 /// Classify a raw fetch result into a [`FetchOutcome`] with the given parser and
 /// absent-reason.
 fn classify_fetch<T>(
-    result: Result<String, ControlPlaneError>,
+    result: Result<Vec<u8>, ControlPlaneError>,
     parse: impl Fn(&[u8]) -> Result<T, ControlPlaneError>,
     absent_reason: &str,
 ) -> FetchOutcome<T> {
     match result {
-        Ok(body) => match parse(body.as_bytes()) {
+        Ok(body) => match parse(&body) {
             Ok(config) => FetchOutcome::Present(config),
             Err(e) => FetchOutcome::Unknown(e.into_unknown_detail()),
         },
-        Err(ControlPlaneError::NotConfigured(_)) => FetchOutcome::Absent(absent_reason.to_string()),
+        Err(ControlPlaneError::NotConfigured(code)) => {
+            FetchOutcome::Absent(format!("{absent_reason} ({code})"))
+        }
         Err(e) => FetchOutcome::Unknown(e.into_unknown_detail()),
     }
 }
@@ -1087,29 +1602,38 @@ fn classify_fetch<T>(
 pub(crate) enum RetentionSample {
     /// Retention was not sampled (server path, ADR-1727 decision 5).
     NotSampled,
-    /// Every sampled object carried compliance-mode retention.
+    /// Every sampled object carried unexpired compliance-mode retention.
     Pass,
-    /// At least one sampled object lacked compliance-mode retention.
+    /// At least one sampled object was not protected.
     Fail(String),
     /// Sampling could not determine the state.
     Unknown(String),
 }
 
-/// The first 200 bytes of a body, for an error detail. Never a header or
-/// credential value.
-fn short_excerpt(body: &str) -> String {
+/// At most the first 200 bytes of `text`, for an error detail.
+fn short_excerpt(text: &str) -> String {
     const LIMIT: usize = 200;
-    let trimmed = body.trim();
+    let trimmed = text.trim();
     if trimmed.len() <= LIMIT {
         return trimmed.to_string();
     }
-    // The body is whatever the endpoint sent, so the 200th byte can land inside
+    // The text is whatever the endpoint sent, so the 200th byte can land inside
     // a multi-byte character, where slicing panics.
     let mut end = LIMIT;
     while end > 0 && !trimmed.is_char_boundary(end) {
         end -= 1;
     }
     format!("{}...", &trimmed[..end])
+}
+
+/// Facts the `BucketConfigProbe` mapping needs that a condition state cannot
+/// carry: whether an enabled rule covering every key under `t/` carries the
+/// action at all, so a rule that is present but out of range is not reported
+/// as absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReportNotes {
+    pub abort_rule_covers_data: bool,
+    pub noncurrent_rule_covers_data: bool,
 }
 
 /// Turn the fetched subresources into a [`BucketProtectionReport`] (ADR-1727
@@ -1122,12 +1646,11 @@ pub(crate) fn assemble_report(
     object_lock: &FetchOutcome<ObjectLockConfig>,
     retention: &RetentionSample,
     params: &BucketProtectionParams,
-) -> BucketProtectionReport {
+) -> (BucketProtectionReport, ReportNotes) {
     use ProtectionConditionId as Id;
 
     let mut states: Vec<(Id, ConditionState)> = Vec::new();
 
-    // versioning
     states.push((
         Id::Versioning,
         match versioning {
@@ -1145,37 +1668,30 @@ pub(crate) fn assemble_report(
                     ))
                 }
             }
-            FetchOutcome::Absent(detail) => ConditionState::Fail(detail.clone()),
-            FetchOutcome::Unknown(detail) => ConditionState::Unknown(detail.clone()),
+            // `?versioning` has no not-configured code, so this cannot occur;
+            // a not-configured answer is still not proof of anything.
+            FetchOutcome::Absent(detail) | FetchOutcome::Unknown(detail) => {
+                ConditionState::Unknown(detail.clone())
+            }
         },
     ));
 
-    // The five lifecycle-derived conditions share one fetched config.
-    let (noncurrent_state, expired_marker_state, abort_state, rule_scope_state, no_foreign_state) =
-        lifecycle_conditions(lifecycle, params.expected_noncurrent_days);
-    states.push((Id::NoncurrentExpiration, noncurrent_state));
-    states.push((Id::ExpiredDeleteMarker, expired_marker_state));
-    states.push((Id::AbortMultipart, abort_state));
-    states.push((Id::RuleScope, rule_scope_state));
-    states.push((Id::NoForeignRule, no_foreign_state));
+    let verdicts = lifecycle_conditions(lifecycle, params.expected_noncurrent_days);
+    states.push((Id::NoncurrentExpiration, verdicts.noncurrent));
+    states.push((Id::ExpiredDeleteMarker, verdicts.expired_marker));
+    states.push((Id::AbortMultipart, verdicts.abort));
+    states.push((Id::RuleScope, verdicts.rule_scope));
+    states.push((Id::NoForeignRule, verdicts.no_foreign));
 
-    // delete-marker-replication
     states.push((
         Id::DeleteMarkerReplication,
         match replication {
-            FetchOutcome::Present(config) => {
-                if config.delete_marker_replication_enabled {
-                    ConditionState::Pass
-                } else {
-                    ConditionState::Fail("DeleteMarkerReplication is not Enabled".to_string())
-                }
-            }
+            FetchOutcome::Present(config) => delete_marker_replication_state(config),
             FetchOutcome::Absent(detail) => ConditionState::Fail(detail.clone()),
             FetchOutcome::Unknown(detail) => ConditionState::Unknown(detail.clone()),
         },
     ));
 
-    // object-lock
     states.push((
         Id::ObjectLock,
         match object_lock {
@@ -1191,7 +1707,6 @@ pub(crate) fn assemble_report(
         },
     ));
 
-    // object-retention
     states.push((
         Id::ObjectRetention,
         match retention {
@@ -1204,123 +1719,399 @@ pub(crate) fn assemble_report(
         },
     ));
 
-    BucketProtectionReport::from_states(states)
+    (BucketProtectionReport::from_states(states), verdicts.notes)
+}
+
+/// The five lifecycle-derived condition states plus their [`ReportNotes`].
+#[derive(Debug, Clone)]
+pub(crate) struct LifecycleVerdicts {
+    pub noncurrent: ConditionState,
+    pub expired_marker: ConditionState,
+    pub abort: ConditionState,
+    pub rule_scope: ConditionState,
+    pub no_foreign: ConditionState,
+    pub notes: ReportNotes,
 }
 
 /// Derive the five lifecycle conditions from the fetched lifecycle config.
-fn lifecycle_conditions(
+pub(crate) fn lifecycle_conditions(
     lifecycle: &FetchOutcome<LifecycleConfig>,
     expected_noncurrent_days: Option<u32>,
-) -> (
-    ConditionState,
-    ConditionState,
-    ConditionState,
-    ConditionState,
-    ConditionState,
-) {
+) -> LifecycleVerdicts {
     let config = match lifecycle {
         FetchOutcome::Present(config) => config,
         FetchOutcome::Absent(detail) => {
-            // No lifecycle configuration: every lifecycle condition affirmatively
-            // fails except no-foreign-rule, which is satisfied by there being no
-            // rules at all.
+            // The endpoint said NoSuchLifecycleConfiguration: every sanctioned
+            // rule is affirmatively missing, and with no rules at all no rule
+            // can be foreign.
             let absent = ConditionState::Fail(detail.clone());
-            return (
-                absent.clone(),
-                absent.clone(),
-                absent,
-                ConditionState::Fail("no lifecycle rules to scope t/".to_string()),
-                ConditionState::Pass,
-            );
+            return LifecycleVerdicts {
+                noncurrent: absent.clone(),
+                expired_marker: absent.clone(),
+                abort: absent,
+                rule_scope: ConditionState::Fail(format!(
+                    "no lifecycle rules to cover t/: {detail}"
+                )),
+                no_foreign: ConditionState::Pass,
+                notes: ReportNotes::default(),
+            };
         }
         FetchOutcome::Unknown(detail) => {
             let unknown = ConditionState::Unknown(detail.clone());
-            return (
-                unknown.clone(),
-                unknown.clone(),
-                unknown.clone(),
-                unknown.clone(),
-                unknown,
-            );
+            return LifecycleVerdicts {
+                noncurrent: unknown.clone(),
+                expired_marker: unknown.clone(),
+                abort: unknown.clone(),
+                rule_scope: unknown.clone(),
+                no_foreign: unknown,
+                notes: ReportNotes::default(),
+            };
         }
     };
+    let rules = config.rules.as_slice();
 
-    let enabled: Vec<&LifecycleRule> = config.rules.iter().filter(|r| r.enabled()).collect();
-
-    // noncurrent-expiration
-    let noncurrent = enabled
-        .iter()
-        .find(|r| r.noncurrent_days.is_some())
-        .copied();
-    let noncurrent_state = match noncurrent {
-        None => ConditionState::Fail("no enabled noncurrent-version expiration rule".to_string()),
-        Some(rule) => {
-            let days = rule.noncurrent_days.unwrap_or_default();
+    let noncurrent = evaluate_action(
+        rules,
+        "NoncurrentVersionExpiration",
+        |rule| rule.noncurrent_days.as_ref().map(Days::as_result),
+        |rule, days| {
+            if let Some(newer) = &rule.newer_noncurrent_versions {
+                return Err(format!(
+                    "NoncurrentVersionExpiration also keeps NewerNoncurrentVersions = {newer}, so \
+                     versions can outlive NoncurrentDays"
+                ));
+            }
             match expected_noncurrent_days {
-                Some(expected) if days != expected => ConditionState::Fail(format!(
-                    "noncurrent-version expiration is {days} days, expected {expected}"
-                )),
-                _ => ConditionState::Pass,
+                Some(expected) if days != expected => {
+                    Err(format!("NoncurrentDays is {days}, expected {expected}"))
+                }
+                _ => Ok(()),
+            }
+        },
+        true,
+    );
+    let expired_marker = evaluate_action(
+        rules,
+        "ExpiredObjectDeleteMarker",
+        |rule| {
+            rule.expired_object_delete_marker
+                .as_ref()
+                .map(|flag| match flag {
+                    Flag::Value(value) => Ok(*value),
+                    Flag::Invalid(raw) => Err(raw.clone()),
+                })
+        },
+        |_, value| {
+            if value {
+                Ok(())
+            } else {
+                Err("ExpiredObjectDeleteMarker is false".to_string())
+            }
+        },
+        false,
+    );
+    let abort = evaluate_action(
+        rules,
+        "AbortIncompleteMultipartUpload",
+        |rule| rule.abort_incomplete_days.as_ref().map(Days::as_result),
+        |_, days| {
+            if days <= 7 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "AbortIncompleteMultipartUpload is {days} days, more than 7"
+                ))
+            }
+        },
+        false,
+    );
+
+    let actions = [
+        ("NoncurrentVersionExpiration", &noncurrent),
+        ("ExpiredObjectDeleteMarker", &expired_marker),
+        ("AbortIncompleteMultipartUpload", &abort),
+    ];
+    let missing: Vec<&str> = actions
+        .iter()
+        .filter(|(_, eval)| !eval.carried && eval.possibly_carried.is_empty())
+        .map(|(name, _)| *name)
+        .collect();
+    let uncertain: Vec<String> = actions
+        .iter()
+        .filter(|(_, eval)| !eval.carried && !eval.possibly_carried.is_empty())
+        .map(|(name, eval)| format!("{name} ({})", eval.possibly_carried.join(", ")))
+        .collect();
+    let rule_scope = if !missing.is_empty() {
+        ConditionState::Fail(format!(
+            "no enabled rule covering every key under t/ carries {}",
+            missing.join(", ")
+        ))
+    } else if !uncertain.is_empty() {
+        ConditionState::Unknown(format!(
+            "coverage of t/ not provable for {}",
+            uncertain.join("; ")
+        ))
+    } else {
+        ConditionState::Pass
+    };
+
+    let notes = ReportNotes {
+        abort_rule_covers_data: abort.carried,
+        noncurrent_rule_covers_data: noncurrent.carried,
+    };
+    LifecycleVerdicts {
+        noncurrent: noncurrent.state,
+        expired_marker: expired_marker.state,
+        abort: abort.state,
+        rule_scope,
+        no_foreign: no_foreign_rule_state(rules),
+        notes,
+    }
+}
+
+/// One sanctioned lifecycle action evaluated over every rule.
+struct ActionEval {
+    state: ConditionState,
+    /// An enabled rule covering every key under `t/` carries the action.
+    carried: bool,
+    /// Rules that might carry it over `t/`: an unrecognised filter or status,
+    /// or a plain prefix strictly under `t/` (a possible union member).
+    possibly_carried: Vec<String>,
+}
+
+/// Evaluate one sanctioned action against the enabled rules whose filter covers
+/// every key under `t/`, independent of rule order. Any such rule whose value
+/// `check` rejects, or (with `require_agreement`) such rules that carry
+/// different values, is `Fail`. A value that does not parse, or a rule whose
+/// filter or status is unrecognised, is `Unknown`. `Pass` needs at least one
+/// covering rule and nothing uncertain. With no covering rule, rules on
+/// narrower `t/` prefixes make it `Unknown` (they may form a union) and
+/// otherwise it is `Fail`.
+fn evaluate_action<T: Copy + fmt::Display>(
+    rules: &[LifecycleRule],
+    action: &str,
+    value_of: impl Fn(&LifecycleRule) -> Option<Result<T, String>>,
+    check: impl Fn(&LifecycleRule, T) -> Result<(), String>,
+    require_agreement: bool,
+) -> ActionEval {
+    let mut fails: Vec<String> = Vec::new();
+    let mut unknowns: Vec<String> = Vec::new();
+    let mut union_members: Vec<String> = Vec::new();
+    let mut possibly_carried: Vec<String> = Vec::new();
+    let mut accepted: Vec<(String, T)> = Vec::new();
+    let mut carried = false;
+
+    for (index, rule) in rules.iter().enumerate() {
+        let Some(value) = value_of(rule) else {
+            continue;
+        };
+        let label = rule.label(index);
+        let active = rule.status.active();
+        if active == Tri::No {
+            continue;
+        }
+        match (active, rule.scope.coverage_of_data_root()) {
+            (_, Coverage::None) => {}
+            (Tri::Yes, Coverage::Full) => {
+                carried = true;
+                match value {
+                    Err(raw) => {
+                        unknowns.push(format!("{label}: {action} value {raw:?} does not parse"))
+                    }
+                    Ok(value) => match check(rule, value) {
+                        Ok(()) => accepted.push((label, value)),
+                        Err(detail) => fails.push(format!("{label}: {detail}")),
+                    },
+                }
+            }
+            (Tri::Yes, Coverage::UnionMember) => {
+                possibly_carried.push(label.clone());
+                union_members.push(format!("{label} on {}", rule.scope.describe()));
+            }
+            (_, coverage) => {
+                let why = match (&rule.status, coverage) {
+                    (RuleStatus::Other(status), _) => {
+                        format!("its Status {status:?} is neither Enabled nor Disabled")
+                    }
+                    _ => format!("it applies to {}", rule.scope.describe()),
+                };
+                possibly_carried.push(label.clone());
+                unknowns.push(format!("{label} carries {action} but {why}"));
             }
         }
-    };
+    }
 
-    // expired-delete-marker
-    let expired_marker_state = if enabled
-        .iter()
-        .any(|r| r.expired_object_delete_marker == Some(true))
-    {
+    if require_agreement {
+        let distinct: BTreeSet<String> = accepted.iter().map(|(_, v)| v.to_string()).collect();
+        if distinct.len() > 1 {
+            fails.push(format!(
+                "rules covering t/ disagree on {action}: {}",
+                accepted
+                    .iter()
+                    .map(|(label, value)| format!("{label} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    let state = if !fails.is_empty() {
+        ConditionState::Fail(fails.join("; "))
+    } else if !unknowns.is_empty() {
+        ConditionState::Unknown(unknowns.join("; "))
+    } else if !accepted.is_empty() {
         ConditionState::Pass
+    } else if !union_members.is_empty() {
+        ConditionState::Unknown(format!(
+            "no enabled rule covering every key under t/ carries {action}; rules on narrower \
+             prefixes ({}) might cover t/ as a union, which is not evaluated",
+            union_members.join(", ")
+        ))
     } else {
-        ConditionState::Fail("no enabled expired-object-delete-marker rule".to_string())
+        ConditionState::Fail(format!(
+            "no enabled rule covering every key under t/ carries {action}"
+        ))
     };
+    ActionEval {
+        state,
+        carried,
+        possibly_carried,
+    }
+}
 
-    // abort-multipart
-    let abort_state = if enabled
-        .iter()
-        .any(|r| r.abort_incomplete_days.is_some_and(|d| d <= 7))
-    {
+/// `no-foreign-rule`: no enabled rule that targets `t/` or `sys/` carries a
+/// transition or a current-version expiration (by days or by date). An
+/// expiration or action the reader cannot classify, a day count that does not
+/// parse, or a rule whose filter or status is unrecognised makes it `Unknown`.
+fn no_foreign_rule_state(rules: &[LifecycleRule]) -> ConditionState {
+    let mut fails: Vec<String> = Vec::new();
+    let mut unknowns: Vec<String> = Vec::new();
+    for (index, rule) in rules.iter().enumerate() {
+        let active = rule.status.active();
+        let targets = rule.scope.targets_ravel();
+        if active == Tri::No || targets == Tri::No {
+            continue;
+        }
+        let label = rule.label(index);
+        let mut definite: Vec<String> = Vec::new();
+        let mut unclassified: Vec<String> = Vec::new();
+        if rule.has_transition {
+            definite.push("a transition".to_string());
+        }
+        match &rule.expiration_days {
+            Some(Days::Value(days)) => definite.push(format!("expiration after {days} days")),
+            Some(Days::Invalid(raw)) => {
+                unclassified.push(format!("Expiration Days {raw:?} that does not parse"))
+            }
+            None => {}
+        }
+        if let Some(date) = &rule.expiration_date {
+            definite.push(format!("expiration on date {date}"));
+        }
+        if let Some(shape) = &rule.expiration_unrecognized {
+            unclassified.push(shape.clone());
+        }
+        if let Some(action) = &rule.unrecognized_action {
+            unclassified.push(format!("the unclassified action {action}"));
+        }
+        if definite.is_empty() && unclassified.is_empty() {
+            continue;
+        }
+        let scope = rule.scope.describe();
+        if active == Tri::Yes && targets == Tri::Yes && !definite.is_empty() {
+            fails.push(format!(
+                "{label} on {scope} carries {}",
+                definite.join(" and ")
+            ));
+        } else {
+            let carried: Vec<String> = definite.into_iter().chain(unclassified).collect();
+            unknowns.push(format!(
+                "{label} on {scope} (Status {:?}) carries {}",
+                rule.status,
+                carried.join(" and ")
+            ));
+        }
+    }
+    if !fails.is_empty() {
+        ConditionState::Fail(format!(
+            "foreign expiration or transition rule targets a Ravel prefix: {}",
+            fails.join("; ")
+        ))
+    } else if !unknowns.is_empty() {
+        ConditionState::Unknown(format!(
+            "rule on a Ravel prefix not classifiable: {}",
+            unknowns.join("; ")
+        ))
+    } else {
         ConditionState::Pass
+    }
+}
+
+/// `delete-marker-replication`: only enabled replication rules whose filter
+/// covers every key under `t/` count. All of them must replicate delete markers;
+/// a covering rule that does not, or covering rules that disagree, is `Fail`.
+fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState {
+    let mut enabled: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    let mut unknowns: Vec<String> = Vec::new();
+    let mut union_members: Vec<String> = Vec::new();
+    for (index, rule) in config.rules.iter().enumerate() {
+        let label = match &rule.id {
+            Some(id) => format!("rule {id:?}"),
+            None => format!("rule #{}", index + 1),
+        };
+        let active = rule.status.active();
+        if active == Tri::No {
+            continue;
+        }
+        match (active, rule.scope.coverage_of_data_root()) {
+            (_, Coverage::None) => {}
+            (Tri::Yes, Coverage::Full) => match &rule.delete_marker_replication {
+                Some(RuleStatus::Enabled) => enabled.push(label),
+                Some(RuleStatus::Disabled) => disabled.push(label),
+                Some(RuleStatus::Other(status)) => unknowns.push(format!(
+                    "{label}: DeleteMarkerReplication Status {status:?}"
+                )),
+                None => unknowns.push(format!("{label}: no DeleteMarkerReplication element")),
+            },
+            (Tri::Yes, Coverage::UnionMember) => {
+                union_members.push(format!("{label} on {}", rule.scope.describe()))
+            }
+            (_, _) => unknowns.push(format!(
+                "{label} (Status {:?}) applies to {}",
+                rule.status,
+                rule.scope.describe()
+            )),
+        }
+    }
+    if !disabled.is_empty() && !enabled.is_empty() {
+        ConditionState::Fail(format!(
+            "enabled replication rules covering t/ disagree on DeleteMarkerReplication: Enabled \
+             on {}, Disabled on {}",
+            enabled.join(", "),
+            disabled.join(", ")
+        ))
+    } else if !disabled.is_empty() {
+        ConditionState::Fail(format!(
+            "DeleteMarkerReplication is Disabled on {} covering t/",
+            disabled.join(", ")
+        ))
+    } else if !unknowns.is_empty() {
+        ConditionState::Unknown(unknowns.join("; "))
+    } else if !enabled.is_empty() {
+        ConditionState::Pass
+    } else if !union_members.is_empty() {
+        ConditionState::Unknown(format!(
+            "no enabled replication rule covers every key under t/; rules on narrower prefixes \
+             ({}) might as a union, which is not evaluated",
+            union_members.join(", ")
+        ))
     } else {
         ConditionState::Fail(
-            "no enabled AbortIncompleteMultipartUpload rule of 7 days or less".to_string(),
+            "no enabled replication rule covering every key under t/ replicates delete markers"
+                .to_string(),
         )
-    };
-
-    // rule-scope: some enabled sanctioned rule covers all of t/ (empty filter or
-    // a prefix that t/ starts with).
-    let rule_scope_state = if enabled
-        .iter()
-        .filter(|r| r.carries_sanctioned())
-        .any(|r| "t/".starts_with(r.effective_prefix()))
-    {
-        ConditionState::Pass
-    } else {
-        ConditionState::Fail("no enabled sanctioned rule covers every t/ prefix".to_string())
-    };
-
-    // no-foreign-rule: no enabled rule with a current-version expiration or a
-    // transition targets t/ or sys/.
-    let foreign = enabled.iter().find(|r| {
-        r.carries_foreign()
-            && (prefix_intersects(r.effective_prefix(), "t/")
-                || prefix_intersects(r.effective_prefix(), "sys/"))
-    });
-    let no_foreign_state = match foreign {
-        None => ConditionState::Pass,
-        Some(rule) => ConditionState::Fail(format!(
-            "a foreign expiration/transition rule targets a Ravel prefix (prefix: {:?})",
-            rule.prefix
-        )),
-    };
-
-    (
-        noncurrent_state,
-        expired_marker_state,
-        abort_state,
-        rule_scope_state,
-        no_foreign_state,
-    )
+    }
 }
 
 /// Whether two prefixes name overlapping key ranges (either is a prefix of the
@@ -1346,826 +2137,4 @@ pub(crate) fn static_credential_provider(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-
-    use axum::Router;
-    use axum::extract::State;
-    use axum::http::{HeaderMap, StatusCode, Uri};
-    use axum::response::Response;
-    use axum::routing::get;
-    use parking_lot::Mutex;
-
-    use super::*;
-
-    /// A fixed clock so signatures are reproducible.
-    struct FixedClock(i64);
-    impl SigningClock for FixedClock {
-        fn now_unix_secs(&self) -> i64 {
-            self.0
-        }
-    }
-
-    // --- SigV4 known-answer test (AWS's published GET Object example) ---
-    //
-    // https://docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html
-    // GET /test.txt from examplebucket, region us-east-1, service s3, with a
-    // Range header, credentials AKIAIOSFODNN7EXAMPLE /
-    // wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY, date 20130524T000000Z. AWS
-    // publishes the signature; recomputing it here pins the signer independently
-    // of any endpoint.
-
-    const KAT_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
-    const KAT_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-    const KAT_REGION: &str = "us-east-1";
-    const KAT_AMZ_DATE: &str = "20130524T000000Z";
-    const KAT_DATE_STAMP: &str = "20130524";
-    const KAT_PUBLISHED_SIGNATURE: &str =
-        "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41";
-
-    /// The exact canonical request AWS documents for the example, so the byte-flip
-    /// test below flips a real one.
-    fn kat_canonical_request() -> (String, String) {
-        let headers = vec![
-            SignedHeader {
-                name: "host".to_string(),
-                value: "examplebucket.s3.amazonaws.com".to_string(),
-            },
-            SignedHeader {
-                name: "range".to_string(),
-                value: "bytes=0-9".to_string(),
-            },
-            SignedHeader {
-                name: "x-amz-content-sha256".to_string(),
-                value: EMPTY_SHA256_HEX.to_string(),
-            },
-            SignedHeader {
-                name: "x-amz-date".to_string(),
-                value: KAT_AMZ_DATE.to_string(),
-            },
-        ];
-        canonical_request("GET", "/test.txt", "", &headers, EMPTY_SHA256_HEX)
-    }
-
-    #[test]
-    fn sigv4_known_answer_matches_aws_published_signature() {
-        let (request, signed_headers) = kat_canonical_request();
-        assert_eq!(signed_headers, "host;range;x-amz-content-sha256;x-amz-date");
-        let scope = format!("{KAT_DATE_STAMP}/{KAT_REGION}/{SERVICE}/aws4_request");
-        let sts = string_to_sign(KAT_AMZ_DATE, &scope, &request);
-        let sig = signature(KAT_SECRET_KEY, KAT_DATE_STAMP, KAT_REGION, SERVICE, &sts);
-        assert_eq!(
-            sig, KAT_PUBLISHED_SIGNATURE,
-            "signer must reproduce AWS's published SigV4 signature"
-        );
-        // The credential scope is what the Authorization header carries.
-        assert!(scope.starts_with(KAT_DATE_STAMP));
-    }
-
-    /// Flipping a single byte of the canonical request changes the signature away
-    /// from the published value: the signer is not accidentally constant.
-    #[test]
-    fn sigv4_known_answer_fails_with_one_byte_flipped() {
-        let (request, _) = kat_canonical_request();
-        // Flip the last byte of the path: "/test.txt" -> "/test.txu".
-        let mut bytes = request.into_bytes();
-        let last = bytes
-            .iter()
-            .rposition(|&b| b == b't')
-            .expect("a 't' to flip");
-        bytes[last] = b'u';
-        let tampered = String::from_utf8(bytes).expect("still utf8");
-
-        let scope = format!("{KAT_DATE_STAMP}/{KAT_REGION}/{SERVICE}/aws4_request");
-        let sts = string_to_sign(KAT_AMZ_DATE, &scope, &tampered);
-        let sig = signature(KAT_SECRET_KEY, KAT_DATE_STAMP, KAT_REGION, SERVICE, &sts);
-        assert_ne!(
-            sig, KAT_PUBLISHED_SIGNATURE,
-            "a flipped canonical-request byte must change the signature"
-        );
-    }
-
-    #[test]
-    fn amz_time_formats_the_kat_instant() {
-        // 20130524T000000Z is 1_369_353_600 unix seconds.
-        let (amz, stamp) = format_amz_time(1_369_353_600);
-        assert_eq!(amz, "20130524T000000Z");
-        assert_eq!(stamp, "20130524");
-    }
-
-    #[test]
-    fn canonical_query_sorts_and_encodes() {
-        let pairs = vec![
-            ("versionId".to_string(), "a+b/c".to_string()),
-            ("retention".to_string(), String::new()),
-        ];
-        assert_eq!(canonical_query(&pairs), "retention=&versionId=a%2Bb%2Fc");
-    }
-
-    /// The excerpt is cut at a byte offset in a body the endpoint controls, so a
-    /// multi-byte character straddling that offset must not panic.
-    #[test]
-    fn short_excerpt_cuts_on_a_character_boundary() {
-        // 'é' is two bytes, so one leading ASCII byte puts a character across
-        // byte 200: the cut walks back to 199 and keeps 1 + 99 characters.
-        let body = format!("x{}", "é".repeat(150));
-        assert!(!body.is_char_boundary(200), "the test body must straddle");
-        let excerpt = short_excerpt(&body);
-        assert_eq!(excerpt.trim_end_matches('.').len(), 199);
-        assert!(excerpt.ends_with("..."));
-        assert_eq!(excerpt.trim_end_matches('.').chars().count(), 100);
-
-        let short = "<Error><Code>AccessDenied</Code></Error>";
-        assert_eq!(short_excerpt(short), short);
-    }
-
-    // --- XML reader tests (each response shape -> parsed value) ---
-
-    #[test]
-    fn parses_versioning_enabled() {
-        let body =
-            br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
-        assert_eq!(
-            parse_versioning(body).expect("parse").status.as_deref(),
-            Some("Enabled")
-        );
-    }
-
-    #[test]
-    fn parses_versioning_empty() {
-        let body = br#"<VersioningConfiguration/>"#;
-        assert_eq!(parse_versioning(body).expect("parse").status, None);
-    }
-
-    #[test]
-    fn parses_lifecycle_rule_fields() {
-        let body = br#"<LifecycleConfiguration>
-          <Rule><ID>r1</ID><Status>Enabled</Status>
-            <Filter><Prefix>t/</Prefix></Filter>
-            <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays></NoncurrentVersionExpiration>
-            <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>
-            <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>
-          </Rule>
-        </LifecycleConfiguration>"#;
-        let config = parse_lifecycle(body).expect("parse");
-        assert_eq!(config.rules.len(), 1);
-        let rule = &config.rules[0];
-        assert_eq!(rule.status, "Enabled");
-        assert_eq!(rule.prefix.as_deref(), Some("t/"));
-        assert_eq!(rule.noncurrent_days, Some(30));
-        assert_eq!(rule.expired_object_delete_marker, Some(true));
-        assert_eq!(rule.abort_incomplete_days, Some(7));
-        assert!(!rule.has_transition);
-    }
-
-    #[test]
-    fn parses_lifecycle_foreign_transition() {
-        let body = br#"<LifecycleConfiguration>
-          <Rule><Status>Enabled</Status><Prefix>t/</Prefix>
-            <Transition><Days>10</Days><StorageClass>GLACIER</StorageClass></Transition>
-          </Rule>
-        </LifecycleConfiguration>"#;
-        let config = parse_lifecycle(body).expect("parse");
-        assert!(config.rules[0].has_transition);
-    }
-
-    #[test]
-    fn parses_replication_delete_marker_enabled() {
-        let body = br#"<ReplicationConfiguration><Rule><Status>Enabled</Status>
-          <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
-        </Rule></ReplicationConfiguration>"#;
-        assert!(
-            parse_replication(body)
-                .expect("parse")
-                .delete_marker_replication_enabled
-        );
-    }
-
-    #[test]
-    fn parses_object_lock_enabled() {
-        let body = br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"#;
-        assert!(parse_object_lock(body).expect("parse").enabled);
-    }
-
-    #[test]
-    fn parses_retention_compliance() {
-        let body = br#"<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>"#;
-        assert_eq!(
-            parse_retention(body).expect("parse").mode.as_deref(),
-            Some("COMPLIANCE")
-        );
-    }
-
-    #[test]
-    fn parses_object_versions() {
-        let body = br#"<ListVersionsResult>
-          <Version><Key>t/a</Key><VersionId>v1</VersionId><IsLatest>true</IsLatest></Version>
-          <Version><Key>t/a</Key><VersionId>v0</VersionId><IsLatest>false</IsLatest></Version>
-        </ListVersionsResult>"#;
-        let listing = parse_object_versions(body).expect("parse");
-        assert_eq!(listing.versions.len(), 2);
-        assert!(listing.versions[0].is_latest);
-        assert_eq!(listing.versions[1].version_id, "v0");
-    }
-
-    #[test]
-    fn malformed_xml_is_a_parse_error() {
-        // Unterminated: the body stops inside <Status>, so the truncation is
-        // reported rather than the partial "Enabled" being believed.
-        let body = br#"<VersioningConfiguration><Status>Enabled"#;
-        let detail = parse_versioning(body)
-            .expect_err("truncated body must not parse")
-            .into_unknown_detail();
-        assert!(
-            detail.contains("ended inside <Status>"),
-            "unexpected detail: {detail}"
-        );
-        // Not XML at all: no root element reached.
-        let broken = b"not xml at all";
-        let detail = parse_versioning(broken)
-            .expect_err("non-XML body must not parse")
-            .into_unknown_detail();
-        assert!(
-            detail.contains("not <VersioningConfiguration> XML"),
-            "unexpected detail: {detail}"
-        );
-        // Wrong root: an <Error> body where a config was expected.
-        let wrong = br#"<Error><Code>AccessDenied</Code></Error>"#;
-        let detail = parse_versioning(wrong)
-            .expect_err("an <Error> body must not parse as a configuration")
-            .into_unknown_detail();
-        assert!(
-            detail.contains("not <VersioningConfiguration> XML"),
-            "unexpected detail: {detail}"
-        );
-    }
-
-    /// The truncation check is per parser, not just the one the test above
-    /// drives: each of the six reads its own element stack.
-    #[test]
-    fn every_parser_rejects_a_truncated_body() {
-        assert!(parse_lifecycle(br#"<LifecycleConfiguration><Rule><Status>Enabled"#).is_err());
-        assert!(
-            parse_replication(
-                br#"<ReplicationConfiguration><Rule><DeleteMarkerReplication><Status>Enabled"#
-            )
-            .is_err()
-        );
-        assert!(
-            parse_object_lock(br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled"#).is_err()
-        );
-        assert!(parse_retention(br#"<Retention><Mode>COMPLIANCE"#).is_err());
-        assert!(parse_object_versions(br#"<ListVersionsResult><Version><Key>a"#).is_err());
-    }
-
-    // --- assemble_report unit tests ---
-
-    #[test]
-    fn assemble_maps_unknown_never_to_fail() {
-        let report = assemble_report(
-            &FetchOutcome::Unknown("denied".to_string()),
-            &FetchOutcome::Unknown("denied".to_string()),
-            &FetchOutcome::Unknown("denied".to_string()),
-            &FetchOutcome::Unknown("denied".to_string()),
-            &RetentionSample::Unknown("denied".to_string()),
-            &BucketProtectionParams::default(),
-        );
-        assert_eq!(report.failed_count(), 0);
-        assert_eq!(report.unknown_count(), ProtectionConditionId::ALL.len());
-    }
-
-    #[test]
-    fn assemble_compliant_bucket_passes_expected_conditions() {
-        let lifecycle = LifecycleConfig {
-            rules: vec![LifecycleRule {
-                status: "Enabled".to_string(),
-                prefix: Some("t/".to_string()),
-                noncurrent_days: Some(30),
-                expired_object_delete_marker: Some(true),
-                abort_incomplete_days: Some(7),
-                ..Default::default()
-            }],
-        };
-        let params = BucketProtectionParams {
-            expected_noncurrent_days: Some(30),
-            ..Default::default()
-        };
-        let report = assemble_report(
-            &FetchOutcome::Present(VersioningConfig {
-                status: Some("Enabled".to_string()),
-            }),
-            &FetchOutcome::Present(lifecycle),
-            &FetchOutcome::Present(ReplicationConfig {
-                delete_marker_replication_enabled: true,
-            }),
-            &FetchOutcome::Present(ObjectLockConfig { enabled: true }),
-            &RetentionSample::NotSampled,
-            &params,
-        );
-        for id in [
-            ProtectionConditionId::Versioning,
-            ProtectionConditionId::NoncurrentExpiration,
-            ProtectionConditionId::ExpiredDeleteMarker,
-            ProtectionConditionId::AbortMultipart,
-            ProtectionConditionId::RuleScope,
-            ProtectionConditionId::NoForeignRule,
-            ProtectionConditionId::DeleteMarkerReplication,
-            ProtectionConditionId::ObjectLock,
-        ] {
-            assert!(
-                report.state(id).expect("present").is_pass(),
-                "{} should pass, got {:?}",
-                id.id(),
-                report.state(id)
-            );
-        }
-        // Retention was not sampled -> Unknown, never Fail.
-        assert!(
-            report
-                .state(ProtectionConditionId::ObjectRetention)
-                .expect("present")
-                .is_unknown()
-        );
-    }
-
-    #[test]
-    fn assemble_wrong_noncurrent_days_fails() {
-        let lifecycle = LifecycleConfig {
-            rules: vec![LifecycleRule {
-                status: "Enabled".to_string(),
-                prefix: Some("t/".to_string()),
-                noncurrent_days: Some(14),
-                ..Default::default()
-            }],
-        };
-        let params = BucketProtectionParams {
-            expected_noncurrent_days: Some(30),
-            ..Default::default()
-        };
-        let (noncurrent, ..) = lifecycle_conditions(
-            &FetchOutcome::Present(lifecycle),
-            params.expected_noncurrent_days,
-        );
-        assert!(noncurrent.is_fail());
-    }
-
-    #[test]
-    fn assemble_foreign_expiration_fails_no_foreign_rule() {
-        let lifecycle = LifecycleConfig {
-            rules: vec![LifecycleRule {
-                status: "Enabled".to_string(),
-                prefix: Some("t/".to_string()),
-                expiration_days: Some(90),
-                ..Default::default()
-            }],
-        };
-        let (.., no_foreign) = lifecycle_conditions(&FetchOutcome::Present(lifecycle), None);
-        assert!(no_foreign.is_fail());
-    }
-
-    // --- Fake-endpoint test: signer + XML reader over real HTTP ---
-
-    /// What the fake endpoint answers, keyed by (subresource, path).
-    type Responder = Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync>;
-
-    #[derive(Default)]
-    struct SeenRequest {
-        method: String,
-        path: String,
-        query: String,
-        headers: Vec<(String, String)>,
-    }
-
-    #[derive(Clone)]
-    struct FakeState {
-        seen: Arc<Mutex<Vec<SeenRequest>>>,
-        /// Response body keyed by the subresource query's first key.
-        respond: Responder,
-    }
-
-    async fn fake_handler(
-        State(state): State<FakeState>,
-        method: axum::http::Method,
-        uri: Uri,
-        headers: HeaderMap,
-    ) -> Response {
-        let query = uri.query().unwrap_or("").to_string();
-        let path = uri.path().to_string();
-        let recorded = SeenRequest {
-            method: method.to_string(),
-            path: path.clone(),
-            query: query.clone(),
-            headers: headers
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.as_str().to_ascii_lowercase(),
-                        v.to_str().unwrap_or("").to_string(),
-                    )
-                })
-                .collect(),
-        };
-        state.seen.lock().push(recorded);
-        let subresource = query
-            .split('&')
-            .next()
-            .and_then(|p| p.split('=').next())
-            .unwrap_or("");
-        let (status, body) = (state.respond)(subresource, &path);
-        Response::builder()
-            .status(status)
-            .body(axum::body::Body::from(body))
-            .expect("response")
-    }
-
-    /// Stand up the fake, returning its base URL and the recorded-requests handle.
-    async fn spawn_fake(respond: Responder) -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let state = FakeState {
-            seen: Arc::clone(&seen),
-            respond,
-        };
-        let app = Router::new()
-            .route("/", get(fake_handler))
-            .route("/{*rest}", get(fake_handler))
-            .with_state(state);
-        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        (format!("http://{addr}"), seen)
-    }
-
-    fn test_client(endpoint: &str) -> BucketControlPlaneClient {
-        BucketControlPlaneClient::new(
-            reqwest::Client::new(),
-            static_credential_provider(KAT_ACCESS_KEY, KAT_SECRET_KEY, None),
-            "ravel-test-bucket".to_string(),
-            KAT_REGION.to_string(),
-            Some(endpoint.to_string()),
-            true,
-        )
-        .with_clock(Arc::new(FixedClock(1_369_353_600)))
-    }
-
-    /// Recompute the signature the server received and compare it to the
-    /// Authorization header's, from the same credentials and canonical request.
-    /// Proves the client signed what it sent.
-    fn verify_authorization(req: &SeenRequest) {
-        let auth = req
-            .headers
-            .iter()
-            .find(|(k, _)| k == "authorization")
-            .map(|(_, v)| v.clone())
-            .expect("authorization header present");
-        // Parse SignedHeaders and Signature out of the header.
-        let signed_headers = auth
-            .split("SignedHeaders=")
-            .nth(1)
-            .and_then(|s| s.split(',').next())
-            .expect("SignedHeaders")
-            .to_string();
-        let carried_sig = auth
-            .split("Signature=")
-            .nth(1)
-            .expect("Signature")
-            .trim()
-            .to_string();
-
-        let host = req
-            .headers
-            .iter()
-            .find(|(k, _)| k == "host")
-            .map(|(_, v)| v.clone())
-            .expect("host header");
-        let amz_date = req
-            .headers
-            .iter()
-            .find(|(k, _)| k == "x-amz-date")
-            .map(|(_, v)| v.clone())
-            .expect("x-amz-date header");
-
-        // Rebuild the SignedHeader set from the request's own headers.
-        let mut headers = Vec::new();
-        for name in signed_headers.split(';') {
-            let value = if name == "host" {
-                host.clone()
-            } else {
-                req.headers
-                    .iter()
-                    .find(|(k, _)| k == name)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default()
-            };
-            headers.push(SignedHeader {
-                name: name.to_string(),
-                value,
-            });
-        }
-        let canonical_uri: String = req
-            .path
-            .split('/')
-            .map(|segment| uri_encode(segment, true))
-            .collect::<Vec<_>>()
-            .join("/");
-        // The query pairs, decoded from the wire and re-canonicalized.
-        let pairs: Vec<(String, String)> = if req.query.is_empty() {
-            Vec::new()
-        } else {
-            req.query
-                .split('&')
-                .map(|p| {
-                    let mut it = p.splitn(2, '=');
-                    let k = percent_decode(it.next().unwrap_or(""));
-                    let v = percent_decode(it.next().unwrap_or(""));
-                    (k, v)
-                })
-                .collect()
-        };
-        let (request, _) = canonical_request(
-            &req.method,
-            &canonical_uri,
-            &canonical_query(&pairs),
-            &headers,
-            EMPTY_SHA256_HEX,
-        );
-        let scope = format!("{KAT_DATE_STAMP}/{KAT_REGION}/{SERVICE}/aws4_request");
-        let sts = string_to_sign(&amz_date, &scope, &request);
-        let recomputed = signature(KAT_SECRET_KEY, KAT_DATE_STAMP, KAT_REGION, SERVICE, &sts);
-        assert_eq!(
-            recomputed, carried_sig,
-            "server-side recomputed signature must match the Authorization header"
-        );
-        assert_eq!(req.method, "GET", "every control-plane request is a GET");
-    }
-
-    fn percent_decode(input: &str) -> String {
-        let bytes = input.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
-                    i += 3;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    #[tokio::test]
-    async fn versioning_get_signs_and_parses_over_http() {
-        let respond: Responder = Arc::new(|sub, _path| {
-            assert_eq!(sub, "versioning");
-            (
-                StatusCode::OK,
-                "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
-                    .to_string(),
-            )
-        });
-        let (base, seen) = spawn_fake(respond).await;
-        let client = test_client(&base);
-        let outcome = client.fetch_versioning().await;
-        match outcome {
-            FetchOutcome::Present(config) => assert_eq!(config.status.as_deref(), Some("Enabled")),
-            other => panic!("expected Present, got {other:?}"),
-        }
-        let requests = seen.lock();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].query, "versioning=");
-        verify_authorization(&requests[0]);
-    }
-
-    #[tokio::test]
-    async fn lifecycle_get_signs_and_parses_over_http() {
-        let respond: Responder = Arc::new(|_sub, _path| {
-            (
-                    StatusCode::OK,
-                    r#"<LifecycleConfiguration><Rule><Status>Enabled</Status>
-                      <Filter><Prefix>t/</Prefix></Filter>
-                      <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays></NoncurrentVersionExpiration>
-                    </Rule></LifecycleConfiguration>"#
-                        .to_string(),
-                )
-        });
-        let (base, seen) = spawn_fake(respond).await;
-        let client = test_client(&base);
-        match client.fetch_lifecycle().await {
-            FetchOutcome::Present(config) => {
-                assert_eq!(config.rules[0].noncurrent_days, Some(30))
-            }
-            other => panic!("expected Present, got {other:?}"),
-        }
-        verify_authorization(&seen.lock()[0]);
-    }
-
-    #[tokio::test]
-    async fn replication_and_object_lock_get_over_http() {
-        let respond: Responder = Arc::new(|sub, _path| {
-            match sub {
-                "replication" => (
-                    StatusCode::OK,
-                    "<ReplicationConfiguration><Rule><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule></ReplicationConfiguration>".to_string(),
-                ),
-                "object-lock" => (
-                    StatusCode::OK,
-                    "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_string(),
-                ),
-                other => panic!("unexpected subresource {other}"),
-            }
-        });
-        let (base, seen) = spawn_fake(respond).await;
-        let client = test_client(&base);
-        assert!(matches!(
-            client.fetch_replication().await,
-            FetchOutcome::Present(ReplicationConfig {
-                delete_marker_replication_enabled: true
-            })
-        ));
-        assert!(matches!(
-            client.fetch_object_lock().await,
-            FetchOutcome::Present(ObjectLockConfig { enabled: true })
-        ));
-        let requests = seen.lock();
-        assert_eq!(requests.len(), 2);
-        for req in requests.iter() {
-            verify_authorization(req);
-        }
-    }
-
-    #[tokio::test]
-    async fn retention_get_with_version_id_over_http() {
-        let respond: Responder = Arc::new(|sub, path| {
-            assert_eq!(sub, "retention");
-            assert!(path.contains("t/a"), "object key in path: {path}");
-            (
-                StatusCode::OK,
-                "<Retention><Mode>COMPLIANCE</Mode></Retention>".to_string(),
-            )
-        });
-        let (base, seen) = spawn_fake(respond).await;
-        let client = test_client(&base);
-        match client.fetch_retention("t/a", "v1+/x").await {
-            FetchOutcome::Present(config) => assert_eq!(config.mode.as_deref(), Some("COMPLIANCE")),
-            other => panic!("expected Present, got {other:?}"),
-        }
-        let requests = seen.lock();
-        assert!(requests[0].query.contains("retention="));
-        assert!(requests[0].query.contains("versionId="));
-        verify_authorization(&requests[0]);
-    }
-
-    #[tokio::test]
-    async fn access_denied_is_unknown_not_fail() {
-        let respond: Responder = Arc::new(|_sub, _path| {
-            (
-                StatusCode::FORBIDDEN,
-                "<Error><Code>AccessDenied</Code></Error>".to_string(),
-            )
-        });
-        let (base, _seen) = spawn_fake(respond).await;
-        let client = test_client(&base);
-        assert!(matches!(
-            client.fetch_lifecycle().await,
-            FetchOutcome::Unknown(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn not_configured_is_absent_then_fail() {
-        let respond: Responder = Arc::new(|_sub, _path| {
-            (
-                StatusCode::NOT_FOUND,
-                "<Error><Code>NoSuchLifecycleConfiguration</Code></Error>".to_string(),
-            )
-        });
-        let (base, _seen) = spawn_fake(respond).await;
-        let client = test_client(&base);
-        assert!(matches!(
-            client.fetch_lifecycle().await,
-            FetchOutcome::Absent(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn malformed_body_is_unknown() {
-        let respond: Responder =
-            Arc::new(|_sub, _path| (StatusCode::OK, "this is not xml".to_string()));
-        let (base, _seen) = spawn_fake(respond).await;
-        let client = test_client(&base);
-        // A 200 body that is not the expected XML must map to Unknown, never a
-        // Fail (ADR-1727 decision 3): "could not parse" is not "not configured".
-        assert!(matches!(
-            client.fetch_lifecycle().await,
-            FetchOutcome::Unknown(_)
-        ));
-    }
-
-    /// Params that put every condition in play, including the retention sampling
-    /// the server path leaves off (ADR-1727 decision 5).
-    fn full_params() -> BucketProtectionParams {
-        BucketProtectionParams {
-            expected_noncurrent_days: Some(30),
-            sample_object_retention: true,
-            protected_retention_prefixes: vec!["t/".to_string()],
-        }
-    }
-
-    /// The whole report over HTTP, not one call at a time: a compliant bucket
-    /// yields `Pass` on all nine conditions, and every request is a signed GET.
-    #[tokio::test]
-    async fn compliant_bucket_reports_every_condition_pass_over_http() {
-        let respond: Responder = Arc::new(|sub, _path| {
-            // `sub` is the first key of the canonical (sorted) query, so the
-            // `?versions` listing arrives keyed by `max-keys`.
-            let body = match sub {
-                "versioning" => {
-                    "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
-                        .to_string()
-                }
-                "lifecycle" => r#"<LifecycleConfiguration><Rule><Status>Enabled</Status>
-                      <Filter><Prefix></Prefix></Filter>
-                      <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays></NoncurrentVersionExpiration>
-                      <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>
-                      <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>
-                    </Rule></LifecycleConfiguration>"#
-                    .to_string(),
-                "replication" => "<ReplicationConfiguration><Rule><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule></ReplicationConfiguration>".to_string(),
-                "object-lock" => "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_string(),
-                "max-keys" => r#"<ListVersionsResult>
-                      <Version><Key>t/a/1.rseg</Key><VersionId>v1</VersionId><IsLatest>true</IsLatest></Version>
-                      <Version><Key>t/a/1.rseg</Key><VersionId>v0</VersionId><IsLatest>false</IsLatest></Version>
-                    </ListVersionsResult>"#
-                    .to_string(),
-                "retention" => "<Retention><Mode>COMPLIANCE</Mode></Retention>".to_string(),
-                other => panic!("unexpected subresource {other}"),
-            };
-            (StatusCode::OK, body)
-        });
-        let (base, seen) = spawn_fake(respond).await;
-        let report = test_client(&base).report(&full_params()).await;
-
-        for id in ProtectionConditionId::ALL {
-            let state = report.state(id).expect("every id present");
-            assert!(state.is_pass(), "{} is {state:?}", id.id());
-        }
-        assert_eq!(report.failed_count(), 0);
-        assert_eq!(report.unknown_count(), 0);
-
-        let requests = seen.lock();
-        // versioning, lifecycle, replication, object-lock, the versions listing,
-        // and one retention read per sampled version.
-        assert_eq!(requests.len(), 7);
-        for req in requests.iter() {
-            verify_authorization(req);
-        }
-    }
-
-    /// A credential that cannot read the control plane reports `Unknown` on every
-    /// condition, never `Fail` (ADR-1727 decision 3): "could not verify" must not
-    /// read as "verified broken".
-    #[tokio::test]
-    async fn access_denied_reports_every_condition_unknown_over_http() {
-        let respond: Responder = Arc::new(|_sub, _path| {
-            (
-                StatusCode::FORBIDDEN,
-                "<Error><Code>AccessDenied</Code></Error>".to_string(),
-            )
-        });
-        let (base, _seen) = spawn_fake(respond).await;
-        let report = test_client(&base).report(&full_params()).await;
-
-        for id in ProtectionConditionId::ALL {
-            let state = report.state(id).expect("every id present");
-            assert!(state.is_unknown(), "{} is {state:?}", id.id());
-        }
-        assert_eq!(report.failed_count(), 0);
-        assert_eq!(report.unknown_count(), ProtectionConditionId::ALL.len());
-    }
-
-    /// A 200 whose body the reader cannot parse is the other `Unknown` source,
-    /// and it must not reach `Fail` through the assembled report either.
-    #[tokio::test]
-    async fn malformed_bodies_report_every_condition_unknown_over_http() {
-        let respond: Responder =
-            Arc::new(|_sub, _path| (StatusCode::OK, "<not-the-expected-root/>".to_string()));
-        let (base, _seen) = spawn_fake(respond).await;
-        let report = test_client(&base).report(&full_params()).await;
-
-        for id in ProtectionConditionId::ALL {
-            let state = report.state(id).expect("every id present");
-            assert!(state.is_unknown(), "{} is {state:?}", id.id());
-        }
-        assert_eq!(report.failed_count(), 0);
-    }
-}
+mod tests;
