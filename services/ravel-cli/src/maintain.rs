@@ -2485,7 +2485,7 @@ mod tests {
         inputs: &[&ravel_proto::commit::v1::CommitRecord],
         created_unix_ns: i64,
         part_version: u32,
-    ) {
+    ) -> String {
         use prost::Message;
         use ravel_object_store::PutOptions;
         use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
@@ -2544,6 +2544,7 @@ mod tests {
             )
             .await
             .expect("put compaction record");
+        key
     }
 
     /// Seed one live commit record in hour 99 and a commit record in hour 100
@@ -2722,6 +2723,47 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(msg.contains("no longer present"), "got: {msg}");
+    }
+
+    /// `audit-versions` over a compaction record deleted between the LIST and
+    /// its GET fails naming that record's key, the same as a commit record.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_a_compaction_record_gone_after_the_list() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let mem = MemoryStore::new();
+        let tenant = "cli-audit-vanished-compaction";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&mem, &tenant_hash).await;
+        let input =
+            publish_commit_created_at(&mem, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = put_compaction_over(
+            &mem,
+            &tenant_hash,
+            &[&input],
+            100 * NS_PER_HOUR,
+            rseg_newest(),
+        )
+        .await;
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(&key));
+        let store = Arc::new(FaultStore::new(mem, plan));
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("a compaction record gone after the listing must fail the audit");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the record's GET must have been faulted exactly once"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(msg.contains("compaction record"), "got: {msg}");
         assert!(msg.contains("no longer present"), "got: {msg}");
     }
 

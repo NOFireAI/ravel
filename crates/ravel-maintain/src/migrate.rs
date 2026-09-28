@@ -482,17 +482,7 @@ pub async fn census_family(
         }
         let label = ShardReader::Census.label();
         for key in family.commit_keys {
-            let got = store.get(&key, GetRange::Full).await.map_err(|err| {
-                let why = match err {
-                    StoreError::NotFound => {
-                        "no longer present (deleted after the listing)".to_string()
-                    }
-                    other => other.to_string(),
-                };
-                MaintainError::Invariant(format!(
-                    "commit record {key} could not be read during {label}: {why}"
-                ))
-            })?;
+            let got = read_named_record(store, &key, "commit record", label).await?;
             let rec = record::decode(&got.data).map_err(|err| {
                 MaintainError::Invariant(format!(
                     "commit record {key} is corrupt during {label}: {err}"
@@ -533,6 +523,25 @@ impl ShardReader {
             ShardReader::Census => "format census",
         }
     }
+}
+
+/// GET one record for a population read, naming its key and the reader in the
+/// error so an operator can find the object that failed.
+async fn read_named_record(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    kind: &str,
+    label: &str,
+) -> Result<ravel_object_store::GetOutcome> {
+    store.get(key, GetRange::Full).await.map_err(|err| {
+        let why = match err {
+            StoreError::NotFound => "no longer present (deleted after the listing)".to_string(),
+            other => other.to_string(),
+        };
+        MaintainError::Invariant(format!(
+            "{kind} {key} could not be read during {label}: {why}"
+        ))
+    })
 }
 
 /// One compaction or rewrite record's contribution to the population.
@@ -583,7 +592,8 @@ async fn read_shard_family(
         match entry {
             keys::BucketEntry::CommitRecord(_) => commit_keys.push(key),
             keys::BucketEntry::CompactionRecord(_) => {
-                let got = store.get(&key, GetRange::Full).await?;
+                let got =
+                    read_named_record(store, &key, "compaction record", reader.label()).await?;
                 let rec = record::decode_compaction(got.data.as_ref()).map_err(|err| {
                     MaintainError::Invariant(format!(
                         "compaction record {key} is corrupt during {}: {err}",
@@ -610,7 +620,7 @@ async fn read_shard_family(
             // predecessor record it names still carries the L0 input list for
             // as long as that record exists.
             keys::BucketEntry::RewriteRecord(_) => {
-                let got = store.get(&key, GetRange::Full).await?;
+                let got = read_named_record(store, &key, "rewrite record", reader.label()).await?;
                 let rec = match reader {
                     ShardReader::MigrateReaudit => {
                         RewriteRecord::decode(got.data.as_ref()).map_err(|err| err.to_string())
