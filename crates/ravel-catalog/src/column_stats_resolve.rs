@@ -396,42 +396,34 @@ pub(crate) async fn fetch_stats_object(
     }
 
     let limits = ColumnStatsLimits::default();
-    // ADR-1702 decision 6: charge the declared body before decoding it. A
-    // header that does not parse fails `decode_column_stats` the same way, so
-    // it takes the same refusal arm.
-    let declared = match decode_column_stats_header(&data) {
-        Ok(peek) => peek.header.body_uncompressed_len,
+    // Every header check runs on the peeked header, before the body is charged
+    // or decoded, so a foreign-tenant or stale-binding object is reported as
+    // what it is rather than as a budget refusal. A header that does not parse
+    // fails `decode_column_stats` the same way, so it takes the same refusal
+    // arm.
+    let header = match decode_column_stats_header(&data) {
+        Ok(peek) => peek.header,
         Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
     };
-    let reservation = reserve_decoded(budget, declared, limits.max_column_stats_bytes)?;
-    let decoded = match decode_column_stats(&data, &limits) {
-        Ok(decoded) => decoded,
-        // Decode of an object the ref points at: the fold wrote it, so a
-        // failure to open it is never the ordinary not-covered case. Surface
-        // it for the caller to log once and count (issue #1400); the query
-        // still degrades to a miss and scans.
-        Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
-    };
+
+    if header.tenant_hash != tenant.0.to_vec() {
+        return Err(LoadColumnStatsError::TenantHashMismatch {
+            key: resolved.key.clone(),
+            expected: tenant.to_hex(),
+            actual: hex::encode(&header.tenant_hash),
+        });
+    }
 
     // A part's field 7 promises a v3 envelope; `decode_column_stats` only
     // checks the envelope byte against the object's OWN header, never against
     // which slot named it. A mismatch here means the object at `resolved.key`
     // is not v3 (a stale object left behind by a downgrade, or a future writer
     // bug), so it must not be accepted: degrade like any other stale binding.
-    if decoded.header.tenant_hash != tenant.0.to_vec() {
-        return Err(LoadColumnStatsError::TenantHashMismatch {
-            key: resolved.key.clone(),
-            expected: tenant.to_hex(),
-            actual: hex::encode(&decoded.header.tenant_hash),
-        });
-    }
-
-    if decoded.header.format_version != resolved.expected_version {
+    if header.format_version != resolved.expected_version {
         return Ok(FetchOutcome::Absent);
     }
 
-    let actual_part_blake3: Result<Vec<[u8; 32]>, _> = decoded
-        .header
+    let actual_part_blake3: Result<Vec<[u8; 32]>, _> = header
         .part_blake3
         .iter()
         .map(|h| <[u8; 32]>::try_from(h.as_slice()))
@@ -442,6 +434,21 @@ pub(crate) async fn fetch_stats_object(
     if actual_part_blake3 != resolved.expected_part_blake3 {
         return Ok(FetchOutcome::Absent);
     }
+
+    // ADR-1702 decision 6: charge the declared body before decoding it.
+    let reservation = reserve_decoded(
+        budget,
+        header.body_uncompressed_len,
+        limits.max_column_stats_bytes,
+    )?;
+    let decoded = match decode_column_stats(&data, &limits) {
+        Ok(decoded) => decoded,
+        // Decode of an object the ref points at: the fold wrote it, so a
+        // failure to open it is never the ordinary not-covered case. Surface
+        // it for the caller to log once and count (issue #1400); the query
+        // still degrades to a miss and scans.
+        Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
+    };
 
     let mut segments = HashMap::new();
     let mut by_content_hash = HashMap::new();

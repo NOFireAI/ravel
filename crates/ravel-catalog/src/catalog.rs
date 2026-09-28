@@ -11100,4 +11100,144 @@ mod tests {
         }
         assert_eq!(budget.reserved(), 0);
     }
+
+    /// Installs the default logs fixture for [`tenant`], then replaces its
+    /// column-stats object with a v3 object encoded under `object_tenant` and
+    /// bound to `object_part`, and re-points the HEAD's stats ref blake3 and
+    /// size at it, so the load's blake3 gate passes and the header checks are
+    /// what decide.
+    async fn install_repointed_stats(
+        store: &MemoryStore,
+        object_tenant: TenantHash,
+        object_part: [u8; 32],
+    ) {
+        let part_hash = *blake3::hash(b"part-repointed").as_bytes();
+        install_logs_stats(store, part_hash, 1).await;
+        let head_key = crate::fold::head_object_key(&tenant(), Signal::Logs);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("get head")
+            .data;
+        let mut head = crate::snapshot_format::decode_head(&head_bytes).expect("decode head");
+        let stats_ref = head.parts[0]
+            .column_stats
+            .as_mut()
+            .expect("the fixture's part carries a stats ref");
+
+        let segments = [ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            writer_id: object_part.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            ..Default::default()
+        }];
+        let stats_bytes = crate::snapshot_format::encode_column_stats_v3(
+            object_tenant.0,
+            signal::to_proto(Signal::Logs) as u32,
+            object_part,
+            &segments,
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        )
+        .expect("encode v3 column stats");
+        let declared = crate::snapshot_format::decode_column_stats_header(&stats_bytes)
+            .expect("the object just encoded has a readable header")
+            .header
+            .body_uncompressed_len;
+        assert!(
+            declared > 0,
+            "a zero budget must be unable to hold the body"
+        );
+        store
+            .put(
+                &stats_ref.key,
+                Bytes::from(stats_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put repointed stats");
+        stats_ref.blake3 = blake3::hash(&stats_bytes).as_bytes().to_vec();
+        stats_ref.size = stats_bytes.len() as u64;
+        store
+            .put(
+                &head_key,
+                Bytes::from(crate::snapshot_format::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+    }
+
+    /// A foreign-tenant stats object is an ADR-0050 section 2 breach and
+    /// surfaces as one even when the budget has no room for its body: the
+    /// tenant check runs on the peeked header, before the reservation.
+    ///
+    /// FLIP: move `reserve_decoded` above the header checks in
+    /// `fetch_stats_object` and the load fails with `MemoryExhausted` instead.
+    #[tokio::test]
+    async fn foreign_tenant_stats_under_memory_pressure_is_a_tenant_mismatch() {
+        let store = Arc::new(MemoryStore::new());
+        let foreign = TenantHash([0xEE; 16]);
+        assert_ne!(foreign, tenant());
+        install_repointed_stats(&store, foreign, *blake3::hash(b"part-repointed").as_bytes()).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        let catalog = Catalog::new(store.clone(), config(8))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let (range, now_ns) = full_window();
+
+        let err = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect_err("a foreign-tenant stats object fails the load");
+        match err {
+            column_stats_resolve::LoadColumnStatsError::TenantHashMismatch {
+                expected,
+                actual,
+                ..
+            } => {
+                assert_eq!(expected, tenant().to_hex());
+                assert_eq!(actual, foreign.to_hex());
+            }
+            other => panic!("expected LoadColumnStatsError::TenantHashMismatch, got {other:?}"),
+        }
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A stats object bound to a different part than the one naming it is a
+    /// stale binding and degrades to no statistics even when the budget has
+    /// no room for its body, rather than failing the load.
+    ///
+    /// FLIP: move `reserve_decoded` above the header checks in
+    /// `fetch_stats_object` and the load fails with `MemoryExhausted` instead.
+    #[tokio::test]
+    async fn stale_binding_stats_under_memory_pressure_degrades_to_absent() {
+        let store = Arc::new(MemoryStore::new());
+        install_repointed_stats(&store, tenant(), *blake3::hash(b"another-part").as_bytes()).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        let catalog = Catalog::new(store.clone(), config(8))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("a stale binding degrades rather than failing the load");
+        let covered = loaded.map_or(0, |l| l.by_content_hash.len() + l.segments.len());
+        assert_eq!(covered, 0, "the stale-bound object covers nothing");
+        assert_eq!(budget.reserved(), 0);
+    }
 }

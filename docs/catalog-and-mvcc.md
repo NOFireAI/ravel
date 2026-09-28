@@ -1325,12 +1325,17 @@ pinning are unchanged:
    as a memory refusal with the breach and its counter lost. The
    column-statistics load reserves each object's declared body the same
    way and fails with `LoadColumnStatsError::MemoryExhausted`, which a SQL
-   client sees as the transient 503, never as corrupt data; that
+   client sees as the transient 503, never as corrupt data. Its header
+   checks (tenant_hash, format version and part binding) also read the
+   peeked header and run before that reservation, so under memory pressure
+   a foreign-tenant object still fails with
+   `LoadColumnStatsError::TenantHashMismatch` and a stale-bound one still
+   degrades to no statistics; that
    reservation is released when `load_column_stats` returns, since
    `LoadedColumnStats` has no slot to carry it.
    The catalog's budget defaults to unlimited and the server does not yet
    pass it the process budget, so these reservations account without
-   refusing today. The PromQL fetch path's own decode reservations
+   refusing today. The segment fetcher's own decode reservations
    (docs/query-engine.md) are already wired to the process budget and do
    refuse.
 2. On any other failure in step 1 (HEAD absent, corrupt, part missing or
