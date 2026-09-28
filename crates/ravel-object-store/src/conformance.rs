@@ -5176,4 +5176,27 @@ mod tests {
         assert_eq!(report.failed_count(), 1);
         assert_eq!(report.unknown_count(), 1);
     }
+
+    /// Deliverable: the fixture reaches every state for *every* id, not just the
+    /// three the test above names, so a later task can build the exact report it
+    /// needs for any condition.
+    #[tokio::test]
+    async fn fixture_reaches_every_state_for_every_condition() {
+        for id in ProtectionConditionId::ALL {
+            let states = [
+                ConditionState::Pass,
+                ConditionState::Fail(format!("{} failed", id.id())),
+                ConditionState::Unknown(format!("{} not determined", id.id())),
+            ];
+            for state in states {
+                let fixture =
+                    FixtureBucketControlPlane::compliant().with_condition(id, state.clone());
+                let report =
+                    probe_bucket_protection(&fixture, &BucketProtectionParams::default()).await;
+                assert_eq!(report.conditions.len(), ProtectionConditionId::ALL.len());
+                let observed = report.state(id).expect("every id is present");
+                assert_eq!(observed, &state, "id {}", id.id());
+            }
+        }
+    }
 }

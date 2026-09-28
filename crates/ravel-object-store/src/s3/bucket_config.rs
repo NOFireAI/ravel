@@ -441,10 +441,24 @@ fn xml_reader(body: &[u8]) -> Reader<&[u8]> {
     reader
 }
 
-/// Confirm the parse actually reached the expected root element; a body that is
-/// not the S3 XML this call returns (garbage, an unexpected shape) is a parse
-/// error, so the derived condition is Unknown rather than a wrong Fail.
-fn require_root(saw_root: bool, expected: &str) -> Result<(), ControlPlaneError> {
+/// Confirm the parse reached the expected root element and closed every element
+/// it opened. A body that is not the S3 XML this call returns (garbage, an
+/// unexpected shape) and a body that stops mid-element are both parse errors, so
+/// the derived condition is Unknown rather than a wrong Fail. quick-xml's
+/// `check_end_names` rejects a *mismatched* end tag but reports plain EOF for a
+/// truncated body, which would otherwise yield a misleading partial parse, so
+/// `open` (the elements still unclosed at EOF) is checked here too.
+fn require_well_formed(
+    saw_root: bool,
+    open: &[Vec<u8>],
+    expected: &str,
+) -> Result<(), ControlPlaneError> {
+    if let Some(name) = open.last() {
+        return Err(ControlPlaneError::Parse(format!(
+            "response ended inside <{}>",
+            String::from_utf8_lossy(name)
+        )));
+    }
     if saw_root {
         Ok(())
     } else {
@@ -497,7 +511,7 @@ pub(crate) fn parse_versioning(body: &[u8]) -> Result<VersioningConfig, ControlP
         }
         buf.clear();
     }
-    require_root(saw_root, "VersioningConfiguration")?;
+    require_well_formed(saw_root, &stack, "VersioningConfiguration")?;
     Ok(config)
 }
 
@@ -515,28 +529,28 @@ pub(crate) fn parse_lifecycle(body: &[u8]) -> Result<LifecycleConfig, ControlPla
                 saw_root |= name == b"LifecycleConfiguration";
                 if name == b"Rule" {
                     rule = Some(LifecycleRule::default());
-                } else if let Some(rule) = rule.as_mut() {
-                    if name == b"Transition" || name == b"NoncurrentVersionTransition" {
-                        rule.has_transition = true;
-                    }
+                } else if let Some(rule) = rule.as_mut()
+                    && (name == b"Transition" || name == b"NoncurrentVersionTransition")
+                {
+                    rule.has_transition = true;
                 }
                 stack.push(name);
             }
             Ok(Event::Empty(e)) => {
                 let name = local(e.name().as_ref());
                 saw_root |= name == b"LifecycleConfiguration";
-                if let Some(rule) = rule.as_mut() {
-                    if name == b"Transition" || name == b"NoncurrentVersionTransition" {
-                        rule.has_transition = true;
-                    }
+                if let Some(rule) = rule.as_mut()
+                    && (name == b"Transition" || name == b"NoncurrentVersionTransition")
+                {
+                    rule.has_transition = true;
                 }
             }
             Ok(Event::End(e)) => {
                 let name = local(e.name().as_ref());
-                if name == b"Rule" {
-                    if let Some(rule) = rule.take() {
-                        config.rules.push(rule);
-                    }
+                if name == b"Rule"
+                    && let Some(rule) = rule.take()
+                {
+                    config.rules.push(rule);
                 }
                 stack.pop();
             }
@@ -575,7 +589,7 @@ pub(crate) fn parse_lifecycle(body: &[u8]) -> Result<LifecycleConfig, ControlPla
         }
         buf.clear();
     }
-    require_root(saw_root, "LifecycleConfiguration")?;
+    require_well_formed(saw_root, &stack, "LifecycleConfiguration")?;
     Ok(config)
 }
 
@@ -616,7 +630,7 @@ pub(crate) fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, Contro
         }
         buf.clear();
     }
-    require_root(saw_root, "ReplicationConfiguration")?;
+    require_well_formed(saw_root, &stack, "ReplicationConfiguration")?;
     Ok(config)
 }
 
@@ -650,7 +664,7 @@ pub(crate) fn parse_object_lock(body: &[u8]) -> Result<ObjectLockConfig, Control
         }
         buf.clear();
     }
-    require_root(saw_root, "ObjectLockConfiguration")?;
+    require_well_formed(saw_root, &stack, "ObjectLockConfiguration")?;
     Ok(config)
 }
 
@@ -684,7 +698,7 @@ pub(crate) fn parse_retention(body: &[u8]) -> Result<RetentionConfig, ControlPla
         }
         buf.clear();
     }
-    require_root(saw_root, "Retention")?;
+    require_well_formed(saw_root, &stack, "Retention")?;
     Ok(config)
 }
 
@@ -712,10 +726,10 @@ pub(crate) fn parse_object_versions(
             }
             Ok(Event::End(e)) => {
                 let name = local(e.name().as_ref());
-                if name == b"Version" {
-                    if let Some(version) = current.take() {
-                        listing.versions.push(version);
-                    }
+                if name == b"Version"
+                    && let Some(version) = current.take()
+                {
+                    listing.versions.push(version);
                 }
                 stack.pop();
             }
@@ -738,7 +752,7 @@ pub(crate) fn parse_object_versions(
         }
         buf.clear();
     }
-    require_root(saw_root, "ListVersionsResult")?;
+    require_well_formed(saw_root, &stack, "ListVersionsResult")?;
     Ok(listing)
 }
 
@@ -1534,15 +1548,52 @@ mod tests {
 
     #[test]
     fn malformed_xml_is_a_parse_error() {
-        // Unterminated: well-formedness checks catch the missing close tags.
+        // Unterminated: the body stops inside <Status>, so the truncation is
+        // reported rather than the partial "Enabled" being believed.
         let body = br#"<VersioningConfiguration><Status>Enabled"#;
-        assert!(parse_versioning(body).is_err());
+        let detail = parse_versioning(body)
+            .expect_err("truncated body must not parse")
+            .into_unknown_detail();
+        assert!(
+            detail.contains("ended inside <Status>"),
+            "unexpected detail: {detail}"
+        );
         // Not XML at all: no root element reached.
         let broken = b"not xml at all";
-        assert!(parse_versioning(broken).is_err());
+        let detail = parse_versioning(broken)
+            .expect_err("non-XML body must not parse")
+            .into_unknown_detail();
+        assert!(
+            detail.contains("not <VersioningConfiguration> XML"),
+            "unexpected detail: {detail}"
+        );
         // Wrong root: an <Error> body where a config was expected.
         let wrong = br#"<Error><Code>AccessDenied</Code></Error>"#;
-        assert!(parse_versioning(wrong).is_err());
+        let detail = parse_versioning(wrong)
+            .expect_err("an <Error> body must not parse as a configuration")
+            .into_unknown_detail();
+        assert!(
+            detail.contains("not <VersioningConfiguration> XML"),
+            "unexpected detail: {detail}"
+        );
+    }
+
+    /// The truncation check is per parser, not just the one the test above
+    /// drives: each of the six reads its own element stack.
+    #[test]
+    fn every_parser_rejects_a_truncated_body() {
+        assert!(parse_lifecycle(br#"<LifecycleConfiguration><Rule><Status>Enabled"#).is_err());
+        assert!(
+            parse_replication(
+                br#"<ReplicationConfiguration><Rule><DeleteMarkerReplication><Status>Enabled"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_object_lock(br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled"#).is_err()
+        );
+        assert!(parse_retention(br#"<Retention><Mode>COMPLIANCE"#).is_err());
+        assert!(parse_object_versions(br#"<ListVersionsResult><Version><Key>a"#).is_err());
     }
 
     // --- assemble_report unit tests ---
@@ -1652,6 +1703,9 @@ mod tests {
 
     // --- Fake-endpoint test: signer + XML reader over real HTTP ---
 
+    /// What the fake endpoint answers, keyed by (subresource, path).
+    type Responder = Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync>;
+
     #[derive(Default)]
     struct SeenRequest {
         method: String,
@@ -1664,7 +1718,7 @@ mod tests {
     struct FakeState {
         seen: Arc<Mutex<Vec<SeenRequest>>>,
         /// Response body keyed by the subresource query's first key.
-        respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync>,
+        respond: Responder,
     }
 
     async fn fake_handler(
@@ -1703,9 +1757,7 @@ mod tests {
     }
 
     /// Stand up the fake, returning its base URL and the recorded-requests handle.
-    async fn spawn_fake(
-        respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync>,
-    ) -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
+    async fn spawn_fake(respond: Responder) -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let state = FakeState {
             seen: Arc::clone(&seen),
@@ -1850,15 +1902,14 @@ mod tests {
 
     #[tokio::test]
     async fn versioning_get_signs_and_parses_over_http() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> =
-            Arc::new(|sub, _path| {
-                assert_eq!(sub, "versioning");
-                (
-                    StatusCode::OK,
-                    "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
-                        .to_string(),
-                )
-            });
+        let respond: Responder = Arc::new(|sub, _path| {
+            assert_eq!(sub, "versioning");
+            (
+                StatusCode::OK,
+                "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+                    .to_string(),
+            )
+        });
         let (base, seen) = spawn_fake(respond).await;
         let client = test_client(&base);
         let outcome = client.fetch_versioning().await;
@@ -1874,9 +1925,8 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_get_signs_and_parses_over_http() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> = Arc::new(
-            |_sub, _path| {
-                (
+        let respond: Responder = Arc::new(|_sub, _path| {
+            (
                     StatusCode::OK,
                     r#"<LifecycleConfiguration><Rule><Status>Enabled</Status>
                       <Filter><Prefix>t/</Prefix></Filter>
@@ -1884,8 +1934,7 @@ mod tests {
                     </Rule></LifecycleConfiguration>"#
                         .to_string(),
                 )
-            },
-        );
+        });
         let (base, seen) = spawn_fake(respond).await;
         let client = test_client(&base);
         match client.fetch_lifecycle().await {
@@ -1899,9 +1948,8 @@ mod tests {
 
     #[tokio::test]
     async fn replication_and_object_lock_get_over_http() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> = Arc::new(
-            |sub, _path| {
-                match sub {
+        let respond: Responder = Arc::new(|sub, _path| {
+            match sub {
                 "replication" => (
                     StatusCode::OK,
                     "<ReplicationConfiguration><Rule><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule></ReplicationConfiguration>".to_string(),
@@ -1912,8 +1960,7 @@ mod tests {
                 ),
                 other => panic!("unexpected subresource {other}"),
             }
-            },
-        );
+        });
         let (base, seen) = spawn_fake(respond).await;
         let client = test_client(&base);
         assert!(matches!(
@@ -1935,15 +1982,14 @@ mod tests {
 
     #[tokio::test]
     async fn retention_get_with_version_id_over_http() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> =
-            Arc::new(|sub, path| {
-                assert_eq!(sub, "retention");
-                assert!(path.contains("t/a"), "object key in path: {path}");
-                (
-                    StatusCode::OK,
-                    "<Retention><Mode>COMPLIANCE</Mode></Retention>".to_string(),
-                )
-            });
+        let respond: Responder = Arc::new(|sub, path| {
+            assert_eq!(sub, "retention");
+            assert!(path.contains("t/a"), "object key in path: {path}");
+            (
+                StatusCode::OK,
+                "<Retention><Mode>COMPLIANCE</Mode></Retention>".to_string(),
+            )
+        });
         let (base, seen) = spawn_fake(respond).await;
         let client = test_client(&base);
         match client.fetch_retention("t/a", "v1+/x").await {
@@ -1958,13 +2004,12 @@ mod tests {
 
     #[tokio::test]
     async fn access_denied_is_unknown_not_fail() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> =
-            Arc::new(|_sub, _path| {
-                (
-                    StatusCode::FORBIDDEN,
-                    "<Error><Code>AccessDenied</Code></Error>".to_string(),
-                )
-            });
+        let respond: Responder = Arc::new(|_sub, _path| {
+            (
+                StatusCode::FORBIDDEN,
+                "<Error><Code>AccessDenied</Code></Error>".to_string(),
+            )
+        });
         let (base, _seen) = spawn_fake(respond).await;
         let client = test_client(&base);
         assert!(matches!(
@@ -1975,13 +2020,12 @@ mod tests {
 
     #[tokio::test]
     async fn not_configured_is_absent_then_fail() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> =
-            Arc::new(|_sub, _path| {
-                (
-                    StatusCode::NOT_FOUND,
-                    "<Error><Code>NoSuchLifecycleConfiguration</Code></Error>".to_string(),
-                )
-            });
+        let respond: Responder = Arc::new(|_sub, _path| {
+            (
+                StatusCode::NOT_FOUND,
+                "<Error><Code>NoSuchLifecycleConfiguration</Code></Error>".to_string(),
+            )
+        });
         let (base, _seen) = spawn_fake(respond).await;
         let client = test_client(&base);
         assert!(matches!(
@@ -1992,7 +2036,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_body_is_unknown() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> =
+        let respond: Responder =
             Arc::new(|_sub, _path| (StatusCode::OK, "this is not xml".to_string()));
         let (base, _seen) = spawn_fake(respond).await;
         let client = test_client(&base);
