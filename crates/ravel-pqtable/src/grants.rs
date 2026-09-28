@@ -242,7 +242,7 @@ pub fn parse_location(url: &str) -> Result<ParsedLocation, GrantsError> {
     }
     let directory = key.is_empty() || key.ends_with('/');
     let canonical = key.strip_suffix('/').unwrap_or(key);
-    if !canonical.is_empty() && canonical.split('/').any(str::is_empty) {
+    if !key.is_empty() && canonical.split('/').any(str::is_empty) {
         return refuse(LocationDefect::EmptySegment);
     }
     Ok(ParsedLocation {
@@ -452,8 +452,10 @@ async fn read(
     }
 }
 
-/// Every location granted to `tenant`, in (scheme, bucket, prefix, profile)
-/// order.
+/// Every location granted to `tenant`, in the order the record holds them.
+/// Every write through [`add`] or [`remove`] sorts the record by the derived
+/// `Ord` on [`Grant`] first, which compares profile, scheme, bucket, prefix,
+/// then the creation fields.
 pub async fn list(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -663,7 +665,7 @@ mod tests {
         }
 
         // Every refused URL form is refused before containment is considered.
-        let cases: [(&str, LocationDefect); 12] = [
+        let cases: [(&str, LocationDefect); 14] = [
             ("", LocationDefect::Empty),
             ("b/data", LocationDefect::NoScheme),
             (
@@ -684,6 +686,8 @@ mod tests {
             ("s3://b/data%2f..", LocationDefect::PercentEscape),
             ("s3://b/data/*.parquet", LocationDefect::Glob),
             ("s3://b/data//x.parquet", LocationDefect::EmptySegment),
+            ("s3://b//", LocationDefect::EmptySegment),
+            ("s3://b//data", LocationDefect::EmptySegment),
             ("s3://b/data/../secrets", LocationDefect::DotDot),
         ];
         for (url, defect) in cases {
@@ -794,6 +798,24 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{url}: {e}"));
         }
+        // Listed in the derived `Ord` order, profile first.
+        let listed: Vec<(String, String)> = list(&store, &TENANT_A)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|g| (g.profile.clone(), g.url()))
+            .collect();
+        let pair = |p: &str, u: &str| (p.to_string(), u.to_string());
+        assert_eq!(
+            listed,
+            vec![
+                pair("prod", "s3://b/data"),
+                pair("prod", "s3://b/data/sub"),
+                pair("staging", "gs://b/data"),
+                pair("staging", "s3://b/data2"),
+                pair("staging", "s3://other/data"),
+            ]
+        );
         // Another tenant's grants are a separate record.
         assert_eq!(list(&store, &TENANT_B).await.expect("list"), vec![]);
         add(&store, &TENANT_B, "staging", "s3://b/data", "op", &clock)
