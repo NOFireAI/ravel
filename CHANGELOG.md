@@ -158,6 +158,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runs inline as before. The server does not install the gate on its catalog
   or the metadata cache yet, so no server read path runs on it in this
   release.
+- **A ranged log read's chunk-run GETs against one L0 RLOG object are now
+  bounded at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4)** (ADR-2066 decision 1).
+  A projection whose coalesced candidate runs exceed the cap bridges the
+  smallest remaining gaps between them down to it, the same bound already
+  applied to L0 metrics flushes (ADR-1306); the whole-object coverage
+  crossover is computed against that bridged run set, so bridging can itself
+  push a projection over the 75% threshold and convert it to one whole-object
+  GET. A compacted L1 log part is exempt, as an L1 metrics part is: it can be
+  far larger than a flush, so bridging would move most of the object, and its
+  crossover is computed against its unbridged runs. When neither front section
+  (STREAM_DIR/FIELD_DIR) is resident, the two are fetched in one combined GET,
+  including on the narrow-projection path that resolves column ids before
+  choosing candidates; a front section a plan-phase read already cached is
+  served from cache instead of re-fetched into that GET, and a combined GET
+  admits each section under its own cache key, so while those entries stay
+  resident the next read of the object serves both from cache. No default or
+  config surface changes.
 
 ### Security
 
@@ -710,26 +727,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tenant hash they were written for, and a grants record or manifest read
   under another tenant's key is refused as `Misfiled` rather than read as that
   tenant's. No shipping binary calls it yet.
-
-### Changed
-
-- **A ranged log read's chunk-run GETs against one L0 RLOG object are now
-  bounded at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4)** (ADR-2066 decision 1).
-  A projection whose coalesced candidate runs exceed the cap bridges the
-  smallest remaining gaps between them down to it, the same bound already
-  applied to L0 metrics flushes (ADR-1306); the whole-object coverage
-  crossover is computed against that bridged run set, so bridging can itself
-  push a projection over the 75% threshold and convert it to one whole-object
-  GET. A compacted L1 log part is exempt, as an L1 metrics part is: it can be
-  far larger than a flush, so bridging would move most of the object, and its
-  crossover is computed against its unbridged runs. When neither front section
-  (STREAM_DIR/FIELD_DIR) is resident, the two are fetched in one combined GET,
-  including on the narrow-projection path that resolves column ids before
-  choosing candidates; a front section a plan-phase read already cached is
-  served from cache instead of re-fetched into that GET, and a combined GET
-  admits each section under its own cache key, so while those entries stay
-  resident the next read of the object serves both from cache. No default or
-  config surface changes.
 
 ## [0.19.0] - 2026-09-27
 
