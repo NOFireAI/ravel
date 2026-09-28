@@ -1793,20 +1793,40 @@ fn validated_ingest_config(config: IngestConfig, signal: Signal) -> anyhow::Resu
     Ok(config)
 }
 
-/// Set once the ADR-1689 release A warning has been logged, so a process that
-/// calls [`start`] more than once logs it once.
+/// Set once the ADR-1689 release A warnings have been logged, so a process that
+/// calls [`start`] more than once logs them once.
 static RELEASE_B_WARNING_LOGGED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// The SQL lane's transport warning for a `--distributed-query` process that
+/// serves Flight SQL. The lane dials each worker's `flight_sql_endpoint` over
+/// plaintext whatever `--fragment-listener` says, so this holds with every flag
+/// combination until the slice `DoGet` moves to the dedicated listener
+/// (ADR-1689 decision 1).
+const SQL_SLICE_PLAINTEXT_WARNING: &str = "--distributed-query: SQL slice tickets travel in \
+     plaintext on the public gRPC listener (--listen-grpc), with or without --fragment-listener, \
+     and a slice ticket read off the wire is a replayable read capability for its tenant and \
+     segments until its deadline. ADR-1689 decision 1 moves SQL slice fetches onto the dedicated \
+     fragment listener.";
 
 /// The ADR-1689 decision 4 release A warning for a `--distributed-query`
 /// process, or `None` when both flags release B requires are already set.
 fn release_b_requirements_warning(settings: &config::DistribSettings) -> Option<String> {
     let mut missing = Vec::new();
+    let mut consequences = Vec::new();
     if settings.fragment_listener.is_none() {
         missing.push("--fragment-listener");
+        consequences.push(
+            "fragment fetches without --fragment-listener travel in plaintext on the public gRPC \
+             listener",
+        );
     }
     if settings.sql_ticket_keys.is_none() {
         missing.push("--sql-ticket-key-file");
+        consequences.push(
+            "the SQL ticket key without --sql-ticket-key-file is derived from the first \
+             --fragment-key-file key",
+        );
     }
     if missing.is_empty() {
         return None;
@@ -1814,27 +1834,49 @@ fn release_b_requirements_warning(settings: &config::DistribSettings) -> Option<
     Some(format!(
         "--distributed-query is running without {}. Release B (ADR-1689 decision 4) refuses to \
          start --distributed-query without both --fragment-listener and --sql-ticket-key-file. \
-         Until then, fragment and SQL slice fetches without --fragment-listener travel in \
-         plaintext on the public gRPC listener, and the SQL ticket key without \
-         --sql-ticket-key-file is derived from the first --fragment-key-file key.",
-        missing.join(" and ")
+         Until then, {}.",
+        missing.join(" and "),
+        consequences.join(", and ")
     ))
 }
 
-/// Log [`release_b_requirements_warning`] at most once per `logged` flag.
-/// Returns whether this call logged it.
-fn warn_release_b_requirements_once(
-    logged: &std::sync::atomic::AtomicBool,
+/// Every ADR-1689 release A warning a `--distributed-query` process in `mode`
+/// logs at startup, in order. Empty outside the query-serving modes: a gateway
+/// or maintain process builds no Flight SQL service and no fragment
+/// coordinator, and derives no SQL ticket key. `flight_sql` is whether this
+/// build serves Flight SQL at all.
+fn distributed_query_startup_warnings(
+    mode: Mode,
     settings: &config::DistribSettings,
-) -> bool {
-    let Some(message) = release_b_requirements_warning(settings) else {
-        return false;
-    };
-    if logged.swap(true, Ordering::Relaxed) {
-        return false;
+    flight_sql: bool,
+) -> Vec<String> {
+    if !matches!(mode, Mode::All | Mode::Query) {
+        return Vec::new();
     }
-    tracing::warn!("{message}");
-    true
+    let mut warnings = Vec::new();
+    if flight_sql {
+        warnings.push(SQL_SLICE_PLAINTEXT_WARNING.to_string());
+    }
+    warnings.extend(release_b_requirements_warning(settings));
+    warnings
+}
+
+/// Log [`distributed_query_startup_warnings`] at most once per `logged` flag.
+/// Returns how many lines this call logged.
+fn warn_distributed_query_once(
+    logged: &std::sync::atomic::AtomicBool,
+    mode: Mode,
+    settings: &config::DistribSettings,
+    flight_sql: bool,
+) -> usize {
+    let warnings = distributed_query_startup_warnings(mode, settings, flight_sql);
+    if warnings.is_empty() || logged.swap(true, Ordering::Relaxed) {
+        return 0;
+    }
+    for message in &warnings {
+        tracing::warn!("{message}");
+    }
+    warnings.len()
 }
 
 /// Binds both listeners (as configured by `mode`) and starts serving in the
@@ -2391,7 +2433,12 @@ pub async fn start(
         parking_lot::RwLock<Arc<Vec<ravel_fleet::query_workers::QueryWorkerRecord>>>,
     > = Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new())));
     if let Some(settings) = config.distrib.as_ref() {
-        warn_release_b_requirements_once(&RELEASE_B_WARNING_LOGGED, settings);
+        warn_distributed_query_once(
+            &RELEASE_B_WARNING_LOGGED,
+            config.mode,
+            settings,
+            cfg!(feature = "flight-sql"),
+        );
     }
     if let (Some(settings), true) = (
         config.distrib.as_ref(),
@@ -3266,7 +3313,8 @@ pub async fn start(
                     distrib_self_id.clone(),
                     settings,
                 )
-            });
+            })
+            .transpose()?;
         let (distributed, ticket_keys) = match distributed {
             Some((config, keys)) => (Some(config), keys),
             None => (None, None),
@@ -4711,26 +4759,191 @@ mod release_b_warning_tests {
             },
             fragment_listener: fragment_listener.then(|| config::FragmentListenerSettings {
                 addr: "127.0.0.1:0".parse().expect("addr"),
-                tls_cert_pem: Vec::new(),
-                tls_key_pem: Vec::new(),
-                tls_ca_pem: Vec::new(),
+                tls_cert_pem: TEST_FRAGMENT_CERT_PEM.as_bytes().to_vec(),
+                tls_key_pem: TEST_FRAGMENT_KEY_PEM.as_bytes().to_vec(),
+                tls_ca_pem: TEST_FRAGMENT_CA_PEM.as_bytes().to_vec(),
             }),
             advertise_endpoint: None,
         }
     }
 
-    /// Run `calls` startups against one fresh once-flag, returning the WARN
-    /// messages they logged.
-    fn warnings_over(calls: &[config::DistribSettings]) -> Vec<String> {
+    /// Test-only fragment listener material (EC P-256, generated offline, valid
+    /// to 2126): a CA and a `ravel-fragment` leaf carrying both serverAuth and
+    /// clientAuth, so [`start`] can bind the dedicated TLS listener.
+    const TEST_FRAGMENT_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBmTCCAT+gAwIBAgIUKzvDE65FAeqiphx+u7lG8qNhsdYwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWcmF2ZWwtdGVzdC1mcmFnbWVudC1jYTAgFw0yNjA5MjgwODAy
+MTlaGA8yMTI2MDkwNDA4MDIxOVowITEfMB0GA1UEAwwWcmF2ZWwtdGVzdC1mcmFn
+bWVudC1jYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJm5aePCQ3HjavHSO5LL
+AYu+dFwvhiTJS+Ybf7sEzCbDtXWULsbbjA63H8zakE8wYEaaWM8MjEAIUtzNXj5O
+kLajUzBRMB0GA1UdDgQWBBSLQmC4hVzvFramFYd1gDlAGy/qMjAfBgNVHSMEGDAW
+gBSLQmC4hVzvFramFYd1gDlAGy/qMjAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49
+BAMCA0gAMEUCIQD+hpiU93kODGYTkuxkdpRGdH+TVumUeHraJekIB+ynFAIgLWC4
+Gx0s3wauX74OjySJBWm9t3cxtT34KJR/DxqIeOA=
+-----END CERTIFICATE-----
+";
+    const TEST_FRAGMENT_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBuzCCAWCgAwIBAgIUMI77M0rj5vPvg5dcaKfrL+V7ohgwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWcmF2ZWwtdGVzdC1mcmFnbWVudC1jYTAgFw0yNjA5MjgwODAy
+MTlaGA8yMTI2MDkwNDA4MDIxOVowGTEXMBUGA1UEAwwOcmF2ZWwtZnJhZ21lbnQw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATZF6WyVVmx4T+C/DPB7z/HOuAH5VDM
+PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Dso3wwejAZ
+BgNVHREEEjAQgg5yYXZlbC1mcmFnbWVudDAdBgNVHSUEFjAUBggrBgEFBQcDAQYI
+KwYBBQUHAwIwHQYDVR0OBBYEFAKcPiOiDUzVowE8vlGdtHA+pq32MB8GA1UdIwQY
+MBaAFItCYLiFXO8WtqYVh3WAOUAbL+oyMAoGCCqGSM49BAMCA0kAMEYCIQCgWFxO
+Cc6WB9Jy+7LDM0tjT7RplcvPwPuGb5saNgqPYQIhAObL2bcGdXGmuU0iilKCM6BM
+hvWCptKQzt5OqnLn/Et7
+-----END CERTIFICATE-----
+";
+    const TEST_FRAGMENT_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgCpR6mZ9onVWIjADu
+PP3MhLLdBGHdRzz0zL9z+4NhslOhRANCAATZF6WyVVmx4T+C/DPB7z/HOuAH5VDM
+PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
+-----END PRIVATE KEY-----
+";
+
+    /// Run `calls` startups in `mode` of a Flight SQL build against one fresh
+    /// once-flag, returning the WARN messages they logged.
+    fn warnings_over(mode: Mode, calls: &[config::DistribSettings]) -> Vec<String> {
         let capture = WarnCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let logged = AtomicBool::new(false);
         tracing::subscriber::with_default(subscriber, || {
             for settings in calls {
-                warn_release_b_requirements_once(&logged, settings);
+                warn_distributed_query_once(&logged, mode, settings, true);
             }
         });
         capture.0.lock().clone()
+    }
+
+    fn is_release_b_line(line: &str) -> bool {
+        line.contains("Release B (ADR-1689 decision 4)")
+    }
+
+    /// A `ServerConfig` for a `mode` process carrying `distrib`, bound to
+    /// ephemeral loopback ports.
+    fn server_config(mode: Mode, distrib: config::DistribSettings) -> ServerConfig {
+        ServerConfig {
+            mode,
+            listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            shard_count: 1,
+            max_inflight_flushes: 1,
+            max_queued_flushes: 8,
+            adaptive_flush_delay: false,
+            max_flush_delay: Duration::from_secs(2),
+            max_flush_delay_idle: Duration::from_secs(40),
+            min_flush_bytes: 256 * 1024,
+            idle_flush_byte_floor: 0,
+            tenant_resolver: tenant::build_resolver(std::collections::HashMap::new(), false),
+            mtls_listener: None,
+            fold_tenants: Vec::new(),
+            fold: FoldTaskConfig {
+                enabled: false,
+                ..FoldTaskConfig::default()
+            },
+            maintain: MaintenanceTaskConfig::default(),
+            alerting: AlertEvalConfig::default(),
+            oidc_refresh: None,
+            otap: false,
+            limits: LimitsConfig::default(),
+            metrics_tenant_labels: false,
+            deployment_key: None,
+            gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+            query_deadline: ravel_query::EngineConfig::default().deadline,
+            store_probe_interval: store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+            admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+            query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+            max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
+            query_budgets: config::QueryBudgets::default(),
+            scrub_period: Duration::from_secs(7 * 86_400),
+            indexed_fields: Default::default(),
+            typed_attr_columns: Default::default(),
+            disable_cache: false,
+            cache_max_bytes: 256 * 1024 * 1024,
+            catalog_cache_max_bytes: 256 * 1024 * 1024,
+            process_memory_budget_bytes: u64::MAX,
+            process_memory_budget_is_fallback: false,
+            cache_dir: None,
+            catalog_resolve_concurrency: None,
+            cpu_gate_permits: Default::default(),
+            ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+            ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            idle_tenant_state_ttl: Duration::from_secs(3600),
+            distrib: Some(distrib),
+            remote_clusters: Vec::new(),
+            audit_pipeline: Default::default(),
+            audit_text: Default::default(),
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            drain_settle_interval: Duration::ZERO,
+            max_ingest_lag: DEFAULT_MAX_INGEST_LAG,
+        }
+    }
+
+    /// Start a `mode` process over a fresh in-memory store, shut it down, and
+    /// return the WARN messages its startup logged on this thread.
+    async fn start_and_capture(mode: Mode, distrib: config::DistribSettings) -> Vec<String> {
+        let capture = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let running = start(
+            server_config(mode, distrib),
+            store.clone(),
+            store,
+            Arc::new(StoreMetrics::default()),
+            None,
+        )
+        .await
+        .expect("server starts");
+        running.shutdown().await.expect("server shuts down");
+        drop(guard);
+        capture.0.lock().clone()
+    }
+
+    /// The real startup path, in one test because the once-flag is the
+    /// process's own static and no other test in this binary calls [`start`]
+    /// with distributed settings. A maintain process logs neither line, even
+    /// with both flags missing; the first query process with both flags set
+    /// logs the SQL plaintext line exactly once and no release B line; a second
+    /// query process in the same process logs nothing more.
+    #[tokio::test]
+    async fn start_logs_the_sql_plaintext_warning_once_and_only_in_query_modes() {
+        let maintain = start_and_capture(Mode::Maintain, settings(false, false)).await;
+        assert!(
+            maintain
+                .iter()
+                .all(|line| !line.contains("--distributed-query")),
+            "a maintain process derives no SQL key and logs no ADR-1689 warning: {maintain:?}"
+        );
+        assert!(
+            !RELEASE_B_WARNING_LOGGED.load(Ordering::Relaxed),
+            "a maintain process must not spend the once-flag"
+        );
+
+        let first = start_and_capture(Mode::Query, settings(true, true)).await;
+        let plaintext = first
+            .iter()
+            .filter(|line| line.as_str() == SQL_SLICE_PLAINTEXT_WARNING)
+            .count();
+        assert_eq!(
+            plaintext,
+            usize::from(cfg!(feature = "flight-sql")),
+            "a Flight SQL build logs the plaintext line once with both flags set: {first:?}"
+        );
+        assert!(
+            !first.iter().any(|line| is_release_b_line(line)),
+            "both flags set: no release B line: {first:?}"
+        );
+
+        let second = start_and_capture(Mode::Query, settings(true, true)).await;
+        assert!(
+            second
+                .iter()
+                .all(|line| !line.contains("--distributed-query")),
+            "once per process: {second:?}"
+        );
     }
 
     #[test]
@@ -4745,30 +4958,80 @@ mod release_b_warning_tests {
             (false, true, "--fragment-listener"),
         ] {
             let startup = settings(fragment_listener, sql_ticket_key_file);
-            let lines = warnings_over(&[startup.clone(), startup.clone(), startup]);
-            assert_eq!(lines.len(), 1, "exactly one warning per process: {lines:?}");
+            let lines = warnings_over(Mode::Query, &[startup.clone(), startup.clone(), startup]);
+            assert_eq!(
+                lines.len(),
+                2,
+                "the plaintext line and the release B line, once per process: {lines:?}"
+            );
+            assert_eq!(lines[0], SQL_SLICE_PLAINTEXT_WARNING);
+            let release_b = &lines[1];
             assert!(
-                lines[0].starts_with(&format!(
+                release_b.starts_with(&format!(
                     "--distributed-query is running without {missing}."
                 )),
-                "names what is missing: {}",
-                lines[0]
+                "names what is missing: {release_b}"
             );
             assert!(
-                lines[0].contains("Release B")
-                    && lines[0]
+                is_release_b_line(release_b)
+                    && release_b
                         .contains("without both --fragment-listener and --sql-ticket-key-file"),
-                "names release B and both flags it requires: {}",
-                lines[0]
+                "names release B and both flags it requires: {release_b}"
+            );
+            assert_eq!(
+                release_b
+                    .contains("fragment fetches without --fragment-listener travel in plaintext"),
+                !fragment_listener,
+                "the fragment plaintext clause appears exactly when the listener is missing: \
+                 {release_b}"
+            );
+            assert_eq!(
+                release_b.contains("derived from the first --fragment-key-file key"),
+                !sql_ticket_key_file,
+                "the derived-key clause appears exactly when the key file is missing: {release_b}"
+            );
+            assert!(
+                !release_b.contains("SQL slice"),
+                "SQL slices are plaintext whatever the flags say, so the release B line does not \
+                 tie them to --fragment-listener: {release_b}"
             );
         }
     }
 
+    /// With both flags set the release B line goes, but the SQL lane still
+    /// dials the public gRPC listener in plaintext, so that line stays.
     #[test]
-    fn release_a_warning_is_silent_with_both_flags_set() {
+    fn both_flags_set_still_logs_the_sql_plaintext_line() {
         let startup = settings(true, true);
         assert_eq!(release_b_requirements_warning(&startup), None);
-        let lines = warnings_over(&[startup.clone(), startup]);
-        assert!(lines.is_empty(), "no warning with both flags: {lines:?}");
+        let lines = warnings_over(Mode::All, &[startup.clone(), startup]);
+        assert_eq!(lines, vec![SQL_SLICE_PLAINTEXT_WARNING.to_string()]);
+    }
+
+    /// A build without Flight SQL has no SQL lane to warn about.
+    #[test]
+    fn a_build_without_flight_sql_logs_only_the_release_b_line() {
+        assert!(
+            distributed_query_startup_warnings(Mode::Query, &settings(true, true), false)
+                .is_empty()
+        );
+        let lines = distributed_query_startup_warnings(Mode::Query, &settings(false, true), false);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(is_release_b_line(&lines[0]), "{lines:?}");
+    }
+
+    /// Gateway and maintain processes build no Flight SQL service and derive no
+    /// SQL key, so they log neither line with any flag combination.
+    #[test]
+    fn gateway_and_maintain_log_neither_line() {
+        for mode in [Mode::Gateway, Mode::Maintain] {
+            for (fragment_listener, sql_ticket_key_file) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let startup = settings(fragment_listener, sql_ticket_key_file);
+                let lines = warnings_over(mode, &[startup]);
+                assert!(lines.is_empty(), "{mode:?}: {lines:?}");
+            }
+        }
     }
 }

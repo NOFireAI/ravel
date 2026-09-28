@@ -168,17 +168,26 @@ pub fn distributed_flight_config(
 /// `None` and the config carries the key derived from
 /// [`DistribSettings::sql_ticket_secret`], so a fleet rolling onto this release
 /// keeps agreeing on one ticket key.
+///
+/// An empty key list is an error rather than `None`: `None` would leave the
+/// service on its per-process random keys, and every slice ticket would then
+/// fail every other process's MAC.
 pub fn distributed_flight_setup(
     live_workers: LiveWorkers,
     self_id: SelfId,
     settings: &DistribSettings,
-) -> (DistributedFlightConfig, Option<SqlTicketKeys>) {
+) -> anyhow::Result<(DistributedFlightConfig, Option<SqlTicketKeys>)> {
     match settings.sql_ticket_keys.as_deref() {
-        Some(file_keys) => (
-            distributed_flight_config(live_workers, self_id, settings.thresholds, None),
-            SqlTicketKeys::from_file_keys(file_keys),
-        ),
-        None => (
+        Some(file_keys) => {
+            let keys = SqlTicketKeys::from_file_keys(file_keys).ok_or_else(|| {
+                anyhow::anyhow!("--sql-ticket-key-file resolved to no keys; it needs at least one")
+            })?;
+            Ok((
+                distributed_flight_config(live_workers, self_id, settings.thresholds, None),
+                Some(keys),
+            ))
+        }
+        None => Ok((
             distributed_flight_config(
                 live_workers,
                 self_id,
@@ -186,7 +195,7 @@ pub fn distributed_flight_setup(
                 Some(&settings.sql_ticket_secret()),
             ),
             None,
-        ),
+        )),
     }
 }
 
@@ -424,7 +433,8 @@ mod tests {
             live.clone(),
             no_self(),
             &settings(Some(vec![NEW_KEY, OLD_KEY])),
-        );
+        )
+        .expect("setup");
         assert_eq!(
             config.shared_ticket_key, None,
             "nothing derived from the fragment secret"
@@ -458,7 +468,8 @@ mod tests {
     #[test]
     fn setup_without_the_sql_ticket_key_file_keeps_the_release_a_derivation() {
         let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(Vec::new())));
-        let (config, keys) = distributed_flight_setup(live, no_self(), &settings(None));
+        let (config, keys) =
+            distributed_flight_setup(live, no_self(), &settings(None)).expect("setup");
         assert!(keys.is_none());
         assert_eq!(
             config.shared_ticket_key,
@@ -466,5 +477,87 @@ mod tests {
                 hex::encode(FRAGMENT_KEY).as_bytes()
             ))
         );
+    }
+
+    /// A key file that resolved to no keys refuses startup instead of leaving
+    /// the service on per-process random keys.
+    #[test]
+    fn setup_refuses_an_empty_sql_ticket_key_list() {
+        let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(Vec::new())));
+        let err = distributed_flight_setup(live, no_self(), &settings(Some(Vec::new())))
+            .err()
+            .expect("an empty key list is an error");
+        assert!(
+            err.to_string().contains("--sql-ticket-key-file"),
+            "names the flag: {err}"
+        );
+    }
+
+    /// The BLAKE3 context `ravel_sql::derive_ticket_key` uses, spelled here as
+    /// the deployment guide spells it for `b3sum --derive-key`.
+    const DOCUMENTED_DERIVATION_CONTEXT: &str =
+        "ravel-sql flight ticket MAC key 2026-08 (RFT1 v4, ADR-0071)";
+
+    /// The gapless switch onto `--sql-ticket-key-file` the deployment guide
+    /// documents: a file holding only the key a release A node derives from its
+    /// first fragment key makes the file node and the derived node agree on
+    /// both surfaces, in both directions. The guide's recipe for that key
+    /// (BLAKE3 derive-key over the first fragment key's lowercase hex) is
+    /// pinned too.
+    #[test]
+    fn a_file_of_the_derived_key_agrees_with_the_release_a_derivation() {
+        use ravel_sql::TicketSurface;
+
+        let derived_key = ravel_sql::derive_ticket_key(hex::encode(FRAGMENT_KEY).as_bytes());
+        assert_eq!(
+            derived_key,
+            blake3::derive_key(
+                DOCUMENTED_DERIVATION_CONTEXT,
+                hex::encode(FRAGMENT_KEY).as_bytes()
+            ),
+            "the documented recipe computes the key a release A node derives"
+        );
+
+        let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(Vec::new())));
+        let (_, file_keys) =
+            distributed_flight_setup(live.clone(), no_self(), &settings(Some(vec![derived_key])))
+                .expect("setup");
+        let file_node = file_keys.expect("keys from the file");
+        let (derived_config, none) =
+            distributed_flight_setup(live, no_self(), &settings(None)).expect("setup");
+        assert!(none.is_none());
+        // What `with_distributed_scan` installs from the config's key.
+        let derived_node = SqlTicketKeys::from_file_key(
+            &derived_config
+                .shared_ticket_key
+                .expect("release A carries the derived key"),
+        );
+        let unrelated = SqlTicketKeys::from_file_key(&NEW_KEY);
+
+        let mut ticket = slice_ticket();
+        for surface in [TicketSurface::Client, TicketSurface::Slice] {
+            ticket.slice_count = if surface == TicketSurface::Slice {
+                2
+            } else {
+                1
+            };
+            for (minter, verifier, direction) in [
+                (&file_node, &derived_node, "file to derived"),
+                (&derived_node, &file_node, "derived to file"),
+            ] {
+                let bytes = minter.encode(&ticket, surface).expect("encode");
+                assert_eq!(
+                    verifier
+                        .decode(&bytes, surface)
+                        .unwrap_or_else(|e| panic!("{surface:?} {direction}: {e}")),
+                    ticket,
+                    "{surface:?} {direction}"
+                );
+                assert!(
+                    unrelated.decode(&bytes, surface).is_err(),
+                    "{surface:?} {direction}: a different key refuses it"
+                );
+            }
+        }
     }
 }

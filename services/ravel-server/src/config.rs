@@ -1842,8 +1842,8 @@ pub struct Cli {
     /// separate from the fragment key file: one key file no longer covers both
     /// lanes. Meaningful only with `--distributed-query`. Optional in this
     /// release, where a process without it derives the SQL ticket key from the
-    /// first fragment key and logs a startup warning; the next release requires
-    /// it with `--distributed-query`.
+    /// first fragment key and logs a startup warning; release B (ADR-1689
+    /// decision 4) requires it with `--distributed-query`.
     #[arg(long = "sql-ticket-key-file", value_name = "PATH")]
     pub sql_ticket_key_file: Option<PathBuf>,
 
@@ -3733,7 +3733,7 @@ pub struct AuthResolverSettings {
 /// `Some` only when `--distributed-query` is set. Carries the cluster fragment
 /// keys (read from `--fragment-key-file`), the fragment admission cap, and the
 /// cost gate/fan-out thresholds.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DistribSettings {
     /// The cluster fragment keys guarding the fragment surface (ADR-0071
     /// amendment, decision 2), read from `--fragment-key-file`. The first mints
@@ -3767,6 +3767,28 @@ pub struct DistribSettings {
     /// the bound addresses verbatim, which `Cli::validate` has proven are not
     /// wildcards.
     pub advertise_endpoint: Option<AdvertisedEndpoint>,
+}
+
+impl std::fmt::Debug for DistribSettings {
+    /// Redacts the fragment and SQL ticket keys, printing only how many of
+    /// each are configured.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistribSettings")
+            .field("fragment_keys", &self.fragment_keys.len())
+            .field(
+                "sql_ticket_keys",
+                &self.sql_ticket_keys.as_ref().map(Vec::len),
+            )
+            .field("max_inflight_fragments", &self.max_inflight_fragments)
+            .field(
+                "max_inflight_federated_resolves",
+                &self.max_inflight_federated_resolves,
+            )
+            .field("thresholds", &self.thresholds)
+            .field("fragment_listener", &self.fragment_listener)
+            .field("advertise_endpoint", &self.advertise_endpoint)
+            .finish()
+    }
 }
 
 /// A parsed `--advertise-fragment-endpoint` (issue #1724): the host sibling
@@ -6390,7 +6412,8 @@ fn parse_deployment_key(raw: &[u8]) -> anyhow::Result<[u8; 32]> {
 /// first key is the minting key, the rest are additional verify keys for
 /// rotation. A file with no key line, or any line that is not exactly 64 hex
 /// characters, fails rather than truncating or padding a wrong-length key into
-/// place.
+/// place. `--sql-ticket-key-file` is parsed here too, so no error names the
+/// kind of key; the caller prefixes the flag.
 fn parse_fragment_keys(raw: &str) -> anyhow::Result<Vec<[u8; 32]>> {
     let mut keys = Vec::new();
     for (i, line) in raw.lines().enumerate() {
@@ -6412,9 +6435,7 @@ fn parse_fragment_keys(raw: &str) -> anyhow::Result<Vec<[u8; 32]>> {
         keys.push(arr);
     }
     if keys.is_empty() {
-        anyhow::bail!(
-            "must contain at least one 32-byte fragment key (64 hex characters on its own line)"
-        );
+        anyhow::bail!("must contain at least one 32-byte key (64 hex characters on its own line)");
     }
     Ok(keys)
 }
@@ -12363,6 +12384,69 @@ mod tests {
         assert!(
             err.to_string().starts_with("invalid --sql-ticket-key-file"),
             "names the flag: {err}"
+        );
+
+        std::fs::write(sql.path(), "# comments only\n\n").expect("write key");
+        let err = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            fragment_path,
+            "--sql-ticket-key-file",
+            sql_path,
+        ])
+        .parse_distrib_settings()
+        .expect_err("an SQL ticket key file with no key line fails startup");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("invalid --sql-ticket-key-file")
+                && msg.contains("must contain at least one 32-byte key"),
+            "names the flag and the missing key: {msg}"
+        );
+        assert!(
+            !msg.contains("fragment"),
+            "an SQL ticket key file error does not call its key a fragment key: {msg}"
+        );
+    }
+
+    /// `DistribSettings` holds raw fragment and SQL ticket keys, so its `Debug`
+    /// prints how many there are and never their bytes.
+    #[test]
+    fn distrib_settings_debug_redacts_every_key() {
+        let fragment = fragment_key_tmp();
+        let sql = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(
+            sql.path(),
+            format!("{}\n{}\n", "cd".repeat(32), "ef".repeat(32)),
+        )
+        .expect("write key");
+        let settings = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            fragment.path().to_str().expect("utf8"),
+            "--sql-ticket-key-file",
+            sql.path().to_str().expect("utf8"),
+        ])
+        .parse_distrib_settings()
+        .expect("settings parse")
+        .expect("--distributed-query yields settings");
+        let debug = format!("{settings:?}");
+        let pretty = format!("{settings:#?}");
+        for key in [[0xab_u8; 32], [0xcd; 32], [0xef; 32]] {
+            for rendering in [&debug, &pretty] {
+                assert!(
+                    !rendering.contains(&hex::encode(key)),
+                    "no hex key bytes: {rendering}"
+                );
+                assert!(
+                    !rendering.contains(&format!("{key:?}"))
+                        && !rendering.contains(&format!("{key:#?}")),
+                    "no decimal key bytes: {rendering}"
+                );
+            }
+        }
+        assert!(
+            debug.contains("fragment_keys: 1") && debug.contains("sql_ticket_keys: Some(2)"),
+            "prints the key counts: {debug}"
         );
     }
 
