@@ -77,17 +77,16 @@
 
 - id: query-engine-stamp-write-side
   doc: docs/query-engine.md
-  quote: "The write side of the stamp carrier does not exist."
-  kind: negative
+  quote: "The logs flush stamps each commit record"
+  kind: positive
   binds:
     - crates/ravel-ingest/src/log_shard.rs::run_flush
     - crates/ravel-ingest/src/log_declared_stats.rs::build_stamps
     - crates/ravel-maintain/src/rlog.rs::finalize_part
     - crates/ravel-commit/src/declared_stats.rs::stamp_commit_record
     - crates/ravel-commit/src/declared_stats.rs::stamp_compaction_part
-  status: contradicted
-  issue: "2082"
-  note: "The logs flush path calls stamp_commit_record (LogShard run_flush, with stamps from build_stamps), and RLOG compaction calls stamp_compaction_part with real stamps in finalize_part; ravel-maintain publish.rs does the same. The paragraph's 'their only callers are tests' and 'every record a real tenant has written carries an empty list' are false for logs tenants with declared columns. ADR-1658 follow-up task 3."
+  status: verified
+  note: "run_flush calls stamp_commit_record with the stamps build_stamps returns when the tenant declares columns; finalize_part calls stamp_compaction_part with real stamps. The span compaction codec and the RSEG part builder stamp an empty list, and the metrics and span flushes call neither. Corrected by #2082."
 
 # --- NEGATIVE marker lines -------------------------------------------------
 
@@ -205,14 +204,13 @@
 
 - id: query-engine-attrs-per-key-projection
   doc: docs/query-engine.md
-  quote: "per-key `attrs['k']` projection is not implemented."
-  kind: negative
+  quote: "the `AttrsPerKeyProjection` rule rewrites the scan to one per-key column"
+  kind: positive
   binds:
     - crates/ravel-sql/src/attrs_per_key.rs::AttrsPerKeyProjection
     - crates/ravel-sql/src/logs_scan.rs::reproject_attr_keys
-  status: contradicted
-  issue: "2082"
-  note: "Issue #1768 shipped AttrsPerKeyProjection, a physical optimizer rule session.rs installs on every session: an attrs['k'] query decodes only that key's FIELD_DIR columns plus attrs_raw via LogsScanExec::reproject_attr_keys."
+  status: verified
+  note: "Issue #1768 shipped AttrsPerKeyProjection, a physical optimizer rule session.rs installs on every session: a query that reads attrs only through literal subscripts decodes only those keys' FIELD_DIR columns plus attrs_raw via LogsScanExec::reproject_attr_keys. Corrected by #2082."
 
 - id: troubleshooting-breaker-guarantee
   doc: docs/guides/operations/troubleshooting.md

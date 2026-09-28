@@ -259,17 +259,16 @@ Two carriers feed it, unioned per segment and per column (ADR-0873 decision
   string with no scalar form on this path, so `MIN`/`MAX` over one is always
   answered by the scan.
 
-**The write side of the stamp carrier does not exist.** Nothing in the
-flush or compaction path calls the stamp writers in
-`ravel_commit::declared_stats` (`stamp_commit_record`,
-`stamp_compaction_part`); their only callers are tests. Every record a real
-tenant has written carries an empty list, so
-the stamp half of the union is empty for every segment of every tenant, every
-answer above comes from `.cstat` alone, and the stamp path is exercised only by
-tests that stamp a record directly and by the fold's carriage of whatever a
-record happens to carry. The reader that refuses a defective stamp has to exist
-before any writer can emit one, so on today's deployments this shortcut is
-inert on the stamp side, and no coverage change is observable from it.
+**Which records carry a stamp.** The logs flush stamps each commit record
+with the extrema it accumulated for the tenant's typed attribute columns
+(`run_flush` in `ravel_ingest::log_shard`, stamps built by
+`DeclaredStatAccum::build_stamps`), and RLOG compaction stamps each part it
+writes (`finalize_part` in `ravel_maintain::rlog`). A flush for a tenant with
+no typed attribute columns, or whose stream attributes could not be decoded,
+writes no stamp, and records written before the stamp writer shipped carry an
+empty list; for those segments the answer comes from `.cstat` alone. The
+metrics and span paths write no stamps, which does not affect this rule, since
+it reads only logs segments.
 
 Stamp eligibility is an allowlist, `I64` and `BOOL`
 (`ravel_types::declared_stats`). `Str`/`Bytes` are excluded because a stamped
@@ -3427,9 +3426,12 @@ Two consequences an operator and a plan reader both see:
   columns, plus `ts`/`stream_ref` (always), plus every field a pushed content
   predicate names, plus every attribute key a pending erasure predicate names
   (ADR-0064). `read_block` decompresses and decodes only those columns' pages.
-  Because `attrs` is one merged map column, a query referencing `attrs` at all
+  Because `attrs` is one merged map column, a query that uses the whole map
   -- `SELECT *` included -- resolves to every dynamic column plus the
-  `attrs_raw` overflow; per-key `attrs['k']` projection is not implemented.
+  `attrs_raw` overflow. A query that reads `attrs` only through literal
+  subscripts (`attrs['k']`) decodes only those keys' columns plus `attrs_raw`:
+  the `AttrsPerKeyProjection` rule rewrites the scan to one per-key column
+  each, through `LogsScanExec::reproject_attr_keys`.
   Skip-index, POSTINGS, and bloom pruning are unchanged: they read stored
   statistics, not decoded pages.
 
