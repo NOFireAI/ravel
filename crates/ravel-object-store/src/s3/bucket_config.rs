@@ -1098,12 +1098,18 @@ pub(crate) enum RetentionSample {
 /// The first 200 bytes of a body, for an error detail. Never a header or
 /// credential value.
 fn short_excerpt(body: &str) -> String {
+    const LIMIT: usize = 200;
     let trimmed = body.trim();
-    if trimmed.len() <= 200 {
-        trimmed.to_string()
-    } else {
-        format!("{}...", &trimmed[..200])
+    if trimmed.len() <= LIMIT {
+        return trimmed.to_string();
     }
+    // The body is whatever the endpoint sent, so the 200th byte can land inside
+    // a multi-byte character, where slicing panics.
+    let mut end = LIMIT;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &trimmed[..end])
 }
 
 /// Turn the fetched subresources into a [`BucketProtectionReport`] (ADR-1727
@@ -1455,6 +1461,23 @@ mod tests {
             ("retention".to_string(), String::new()),
         ];
         assert_eq!(canonical_query(&pairs), "retention=&versionId=a%2Bb%2Fc");
+    }
+
+    /// The excerpt is cut at a byte offset in a body the endpoint controls, so a
+    /// multi-byte character straddling that offset must not panic.
+    #[test]
+    fn short_excerpt_cuts_on_a_character_boundary() {
+        // 'é' is two bytes, so one leading ASCII byte puts a character across
+        // byte 200: the cut walks back to 199 and keeps 1 + 99 characters.
+        let body = format!("x{}", "é".repeat(150));
+        assert!(!body.is_char_boundary(200), "the test body must straddle");
+        let excerpt = short_excerpt(&body);
+        assert_eq!(excerpt.trim_end_matches('.').len(), 199);
+        assert!(excerpt.ends_with("..."));
+        assert_eq!(excerpt.trim_end_matches('.').chars().count(), 100);
+
+        let short = "<Error><Code>AccessDenied</Code></Error>";
+        assert_eq!(short_excerpt(short), short);
     }
 
     // --- XML reader tests (each response shape -> parsed value) ---

@@ -978,8 +978,20 @@ impl S3Store {
                 config.session_token.as_deref(),
             )
         };
+        // Same timeouts the data plane runs under: an unbounded control-plane GET
+        // would hang the startup gate and the CLI on an endpoint that accepts the
+        // connection and never answers. `Client::new` would also panic on a TLS
+        // backend that fails to initialize; the builder reports it.
+        let control_plane_client = reqwest::Client::builder()
+            .connect_timeout(http.connect_timeout)
+            .timeout(http.request_timeout)
+            .pool_idle_timeout(http.pool_idle_timeout)
+            .build()
+            .map_err(|e| {
+                StoreError::Permanent(format!("failed to build bucket control-plane client: {e}"))
+            })?;
         let control_plane = Arc::new(BucketControlPlaneClient::new(
-            reqwest::Client::new(),
+            control_plane_client,
             control_plane_credentials,
             config.bucket.clone(),
             config.region.clone(),
