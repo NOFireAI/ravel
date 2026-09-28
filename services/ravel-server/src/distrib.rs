@@ -612,6 +612,27 @@ impl AdmissionClasses {
 /// capability, not the certificate, is the authorization).
 pub const FRAGMENT_TLS_SERVER_NAME: &str = "ravel-fragment";
 
+/// The channel configuration a coordinator dials a peer's dedicated fragment
+/// listener with, on both lanes: `SeriesFetch` (ADR-0071 amendment decision 1)
+/// and SQL slice `DoGet` (ADR-1689 decision 1). It pins the operator CA,
+/// verifies [`FRAGMENT_TLS_SERVER_NAME`], and presents this process's own
+/// fragment certificate, since the listener requires one signed by that CA
+/// (issue #1690). One key pair serves both directions: every fragment process
+/// is both a worker and a coordinator.
+pub fn fragment_client_tls(
+    listener: &crate::config::FragmentListenerSettings,
+) -> tonic::transport::ClientTlsConfig {
+    tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(
+            &listener.tls_ca_pem,
+        ))
+        .identity(tonic::transport::Identity::from_pem(
+            &listener.tls_cert_pem,
+            &listener.tls_key_pem,
+        ))
+        .domain_name(FRAGMENT_TLS_SERVER_NAME)
+}
+
 /// Which listener a [`FragmentService`] instance is mounted on, and therefore
 /// which request scopes it serves (ADR-0071 amendment decision 1). One
 /// `FragmentServiceInner` is shared by every mounted clone; the role is the only

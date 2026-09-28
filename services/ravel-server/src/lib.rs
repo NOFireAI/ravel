@@ -1003,6 +1003,18 @@ pub struct Running {
     /// decision 1), `Some` exactly when `--fragment-listener` was configured on a
     /// `--distributed-query` query-serving process.
     pub fragment_addr: Option<SocketAddr>,
+    /// Refused SQL slice capabilities by reason (ADR-1689 decision 2), one set
+    /// shared by the Flight service on every listener of this process, `Some`
+    /// whenever Flight SQL is served. Public as a test seam: the counts are not
+    /// rendered on `/metrics` yet.
+    #[cfg(feature = "flight-sql")]
+    pub sql_slice_rejects: Option<ravel_sql::SliceRejectCounters>,
+    /// The SQL lane's worker roster, resolved per query exactly as the
+    /// coordinator resolves it, `Some` under `--distributed-query` in a
+    /// query-serving mode. Public as a test seam, so a test can read which
+    /// location a slice is dialed at.
+    #[cfg(feature = "flight-sql")]
+    pub sql_slice_workers: Option<Arc<dyn ravel_sql::WorkerEndpoints>>,
     http_shutdown: oneshot::Sender<()>,
     http_task: JoinHandle<anyhow::Result<()>>,
     grpc_shutdown: Option<oneshot::Sender<()>>,
@@ -1799,19 +1811,23 @@ static RELEASE_B_WARNING_LOGGED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// The SQL lane's transport warning for a `--distributed-query` process that
-/// serves Flight SQL. The lane dials each worker's `flight_sql_endpoint` over
-/// plaintext whatever `--fragment-listener` says, so this holds with every flag
-/// combination until the slice `DoGet` moves to the dedicated listener
-/// (ADR-1689 decision 1).
-const SQL_SLICE_PLAINTEXT_WARNING: &str = "--distributed-query: SQL slice tickets travel in \
-     plaintext on the public gRPC listener (--listen-grpc), with or without --fragment-listener, \
-     and a slice ticket read off the wire is a replayable read capability for its tenant and \
-     segments until its deadline. ADR-1689 decision 1 moves SQL slice fetches onto the dedicated \
-     fragment listener.";
+/// serves Flight SQL without `--fragment-listener`: the lane then dials each
+/// worker's public gRPC listener in plaintext. With the flag, slices ride the
+/// dedicated TLS listener (ADR-1689 decision 1) and this line is not logged.
+const SQL_SLICE_PLAINTEXT_WARNING: &str = "--distributed-query without --fragment-listener: SQL \
+     slice tickets travel in plaintext on the public gRPC listener (--listen-grpc), and a slice \
+     ticket read off the wire is a replayable read capability for its tenant and segments until \
+     its deadline. With --fragment-listener, SQL slice fetches ride the dedicated TLS listener \
+     instead.";
 
 /// The ADR-1689 decision 4 release A warning for a `--distributed-query`
-/// process, or `None` when both flags release B requires are already set.
-fn release_b_requirements_warning(settings: &config::DistribSettings) -> Option<String> {
+/// process, or `None` when every flag release B requires is already set.
+/// `flight_sql` is whether this build serves Flight SQL: a build without it
+/// has no SQL lane, so release B requires only `--fragment-listener` of it.
+fn release_b_requirements_warning(
+    settings: &config::DistribSettings,
+    flight_sql: bool,
+) -> Option<String> {
     let mut missing = Vec::new();
     let mut consequences = Vec::new();
     if settings.fragment_listener.is_none() {
@@ -1821,7 +1837,7 @@ fn release_b_requirements_warning(settings: &config::DistribSettings) -> Option<
              listener",
         );
     }
-    if settings.sql_ticket_keys.is_none() {
+    if flight_sql && settings.sql_ticket_keys.is_none() {
         missing.push("--sql-ticket-key-file");
         consequences.push(
             "the SQL ticket key without --sql-ticket-key-file is derived from the first \
@@ -1831,10 +1847,14 @@ fn release_b_requirements_warning(settings: &config::DistribSettings) -> Option<
     if missing.is_empty() {
         return None;
     }
+    let required = if flight_sql {
+        "both --fragment-listener and --sql-ticket-key-file"
+    } else {
+        "--fragment-listener"
+    };
     Some(format!(
         "--distributed-query is running without {}. Release B (ADR-1689 decision 4) refuses to \
-         start --distributed-query without both --fragment-listener and --sql-ticket-key-file. \
-         Until then, {}.",
+         start --distributed-query without {required}. Until then, {}.",
         missing.join(" and "),
         consequences.join(", and ")
     ))
@@ -1854,10 +1874,10 @@ fn distributed_query_startup_warnings(
         return Vec::new();
     }
     let mut warnings = Vec::new();
-    if flight_sql {
+    if flight_sql && settings.fragment_listener.is_none() {
         warnings.push(SQL_SLICE_PLAINTEXT_WARNING.to_string());
     }
-    warnings.extend(release_b_requirements_warning(settings));
+    warnings.extend(release_b_requirements_warning(settings, flight_sql));
     warnings
 }
 
@@ -2473,23 +2493,13 @@ pub async fn start(
         // amendment decision 1), its coordinator dials remote workers' TLS
         // fragment endpoints: pin the operator CA and verify the fixed
         // `ravel-fragment` server name. `None` under the pre-amendment layout,
-        // where the dial stays plaintext against the public gRPC listener.
-        //
-        // It also presents this process's own fragment certificate as client
-        // identity (issue #1690), because the peer's listener now requires one
-        // signed by the same pinned CA. One key pair serves both directions:
-        // every fragment process is both a worker and a coordinator, and the
-        // CA membership, not the certificate's subject, is what either side
-        // reads from it.
-        let fragment_client_tls = settings.fragment_listener.as_ref().map(|fl| {
-            tonic::transport::ClientTlsConfig::new()
-                .ca_certificate(tonic::transport::Certificate::from_pem(&fl.tls_ca_pem))
-                .identity(tonic::transport::Identity::from_pem(
-                    &fl.tls_cert_pem,
-                    &fl.tls_key_pem,
-                ))
-                .domain_name(distrib::FRAGMENT_TLS_SERVER_NAME)
-        });
+        // where the dial stays plaintext against the public gRPC listener. It
+        // presents this process's own fragment certificate as client identity
+        // (issue #1690); the SQL lane dials slices with the same configuration.
+        let fragment_client_tls = settings
+            .fragment_listener
+            .as_ref()
+            .map(distrib::fragment_client_tls);
         let fetcher = Arc::new(
             distrib::RoutingSliceFetcher::new(
                 distrib_self_id.clone(),
@@ -3319,17 +3329,79 @@ pub async fn start(
             Some((config, keys)) => (Some(config), keys),
             None => (None, None),
         };
-        let service = sql_state.as_ref().map(|state| {
-            flight::service_with_ticket_keys(state, ceiling, distributed, ticket_keys)
+        // ADR-1689 decision 1: with a dedicated fragment listener, slice `DoGet`
+        // is served there (`SliceOnly`) and the public listener refuses slice
+        // tickets (`ClientOnly`); the coordinator dials slices over the same
+        // pinned-CA TLS configuration the PromQL lane uses. Without one, the
+        // public listener keeps both surfaces (`Combined`) and dials plaintext.
+        let fragment_listener = config
+            .distrib
+            .as_ref()
+            .filter(|_| matches!(config.mode, Mode::All | Mode::Query))
+            .and_then(|settings| settings.fragment_listener.as_ref());
+        let slice_rejects = ravel_sql::SliceRejectCounters::default();
+        // The dedicated listener verifies what this process's coordinator mints,
+        // so it holds the same keys: the file's, or the release A derived key.
+        let slice_keys = ticket_keys.clone().or_else(|| {
+            distributed
+                .as_ref()
+                .and_then(|config| config.shared_ticket_key)
+                .map(|key| ravel_sql::SqlTicketKeys::from_file_key(&key))
         });
+        let sql_slice_workers = distributed
+            .as_ref()
+            .map(|config| Arc::clone(&config.workers));
+        let public_mount = flight::FlightMount {
+            role: if fragment_listener.is_some() {
+                ravel_sql::FlightListenerRole::ClientOnly
+            } else {
+                ravel_sql::FlightListenerRole::Combined
+            },
+            slice_client_tls: fragment_listener.map(distrib::fragment_client_tls),
+            slice_rejects: Some(slice_rejects.clone()),
+        };
+        let service = sql_state.as_ref().map(|state| {
+            flight::service_on_listener(state, ceiling, distributed, ticket_keys, public_mount)
+        });
+        let slice_service = match (sql_state.as_ref(), fragment_listener) {
+            (Some(state), Some(_)) => {
+                let keys = slice_keys.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--fragment-listener serves SQL slices, but this process has no SQL \
+                         ticket keys to verify them with"
+                    )
+                })?;
+                Some(flight::service_on_listener(
+                    state,
+                    ceiling,
+                    None,
+                    Some(keys),
+                    flight::FlightMount {
+                        role: ravel_sql::FlightListenerRole::SliceOnly,
+                        slice_client_tls: None,
+                        slice_rejects: Some(slice_rejects.clone()),
+                    },
+                ))
+            }
+            _ => None,
+        };
         if service.is_some() {
             tracing::info!(
                 "Flight SQL registered on the gRPC listener; ad-hoc statements are served, \
                  prepared statements answer UNIMPLEMENTED"
             );
         }
-        service
+        if slice_service.is_some() {
+            tracing::info!(
+                "SQL slice fetches are served on the dedicated fragment listener; the public \
+                 gRPC listener refuses slice tickets"
+            );
+        }
+        let slice_rejects = service.as_ref().map(|_| slice_rejects);
+        (service, slice_service, slice_rejects, sql_slice_workers)
     };
+    #[cfg(feature = "flight-sql")]
+    let (flight_service, sql_slice_service, sql_slice_rejects, sql_slice_workers) = flight_service;
     // The ADR-0071 fragment `SeriesFetch` service is a
     // cluster-internal query surface: it binds this listener too, so a
     // query-only process with `--distributed-query` on (but no OTLP ingest and
@@ -3435,10 +3507,12 @@ pub async fn start(
     // `fragment_service` exists). It terminates TLS in-process (rustls, the same
     // provider the federation client already uses) presenting the operator's
     // `--fragment-tls-cert`/`--fragment-tls-key`, and serves the `SeriesFetch`
-    // surface with the `DedicatedFragment` role: Pinned capability-authorized
-    // fetches only, Resolve rejected outright. The public gRPC listener above was
-    // built with `PublicFederation` in this same configuration, so Pinned traffic
-    // lives here and nowhere else.
+    // surface with the `DedicatedFragment` role (Pinned capability-authorized
+    // fetches only, Resolve rejected outright) and, in a Flight SQL build, SQL
+    // slice `DoGet` in the `SliceOnly` role (ADR-1689 decision 1). The public
+    // gRPC listener above was built with `PublicFederation` and `ClientOnly` in
+    // this same configuration, so Pinned and slice traffic live here and
+    // nowhere else.
     let fragment_dedicated: Option<(
         SocketAddr,
         oneshot::Sender<()>,
@@ -3472,6 +3546,11 @@ pub async fn start(
                         .with_role(distrib::FragmentListenerRole::DedicatedFragment)
                         .into_server(),
                 );
+            // ADR-1689 decision 1: the Flight service in the `SliceOnly` role,
+            // beside `SeriesFetch`. It answers `DoGet` for a slice ticket and
+            // `permission_denied` for every other Flight and Flight SQL method.
+            #[cfg(feature = "flight-sql")]
+            let server = server.add_optional_service(sql_slice_service);
             let listener = tokio::net::TcpListener::bind(fl.addr).await?;
             let addr = listener.local_addr()?;
             let (tx, rx) = oneshot::channel::<()>();
@@ -3514,11 +3593,11 @@ pub async fn start(
                 // decision 1). The PromQL lane's `SeriesFetch` moves to the
                 // dedicated TLS fragment listener when one is configured;
                 // otherwise it stays on the public gRPC address (pre-amendment).
-                // The SQL lane's Flight SQL `DoGet` always lives on the public
-                // gRPC listener (`addr`), which is never the TLS-only fragment
-                // listener, so it is advertised separately: dialing the fragment
-                // endpoint for a Flight `DoGet` reaches a port with no Flight
-                // service (issue #1296).
+                // SQL slice `DoGet` follows it (ADR-1689 decision 1): a
+                // coordinator with `--fragment-listener` dials
+                // `fragment_endpoint`, one without dials `flight_sql_endpoint`,
+                // the public gRPC listener (`addr`), which is advertised
+                // separately until the field leaves the record.
                 //
                 // Both are the address the listener actually bound, unless
                 // `--advertise-fragment-endpoint` supplies the host peers reach
@@ -3758,6 +3837,10 @@ pub async fn start(
         grpc_addr,
         mtls_addr,
         fragment_addr,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_rejects,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_workers,
         http_shutdown: http_shutdown_tx,
         http_task,
         grpc_shutdown,
@@ -4905,9 +4988,11 @@ PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
     /// The real startup path, in one test because the once-flag is the
     /// process's own static and no other test in this binary calls [`start`]
     /// with distributed settings. A maintain process logs neither line, even
-    /// with both flags missing; the first query process with both flags set
-    /// logs the SQL plaintext line exactly once and no release B line; a second
-    /// query process in the same process logs nothing more.
+    /// with both flags missing; a query process with both flags set, whose SQL
+    /// slices ride the dedicated TLS listener, logs no line and leaves the flag
+    /// unspent; the first query process without `--fragment-listener` logs the
+    /// SQL plaintext line (in a Flight SQL build) and the release B line
+    /// exactly once each; a second one in the same process logs nothing more.
     #[tokio::test]
     async fn start_logs_the_sql_plaintext_warning_once_and_only_in_query_modes() {
         let maintain = start_and_capture(Mode::Maintain, settings(false, false)).await;
@@ -4922,7 +5007,18 @@ PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
             "a maintain process must not spend the once-flag"
         );
 
-        let first = start_and_capture(Mode::Query, settings(true, true)).await;
+        let both = start_and_capture(Mode::Query, settings(true, true)).await;
+        assert!(
+            both.iter()
+                .all(|line| !line.contains("--distributed-query")),
+            "both flags set: SQL slices ride the dedicated listener, no line: {both:?}"
+        );
+        assert!(
+            !RELEASE_B_WARNING_LOGGED.load(Ordering::Relaxed),
+            "a process that logged nothing must not spend the once-flag"
+        );
+
+        let first = start_and_capture(Mode::Query, settings(false, true)).await;
         let plaintext = first
             .iter()
             .filter(|line| line.as_str() == SQL_SLICE_PLAINTEXT_WARNING)
@@ -4930,14 +5026,16 @@ PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
         assert_eq!(
             plaintext,
             usize::from(cfg!(feature = "flight-sql")),
-            "a Flight SQL build logs the plaintext line once with both flags set: {first:?}"
+            "a Flight SQL build without --fragment-listener logs the plaintext line once: \
+             {first:?}"
         );
-        assert!(
-            !first.iter().any(|line| is_release_b_line(line)),
-            "both flags set: no release B line: {first:?}"
+        assert_eq!(
+            first.iter().filter(|line| is_release_b_line(line)).count(),
+            1,
+            "without --fragment-listener: one release B line: {first:?}"
         );
 
-        let second = start_and_capture(Mode::Query, settings(true, true)).await;
+        let second = start_and_capture(Mode::Query, settings(false, true)).await;
         assert!(
             second
                 .iter()
@@ -4959,13 +5057,22 @@ PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
         ] {
             let startup = settings(fragment_listener, sql_ticket_key_file);
             let lines = warnings_over(Mode::Query, &[startup.clone(), startup.clone(), startup]);
-            assert_eq!(
-                lines.len(),
-                2,
-                "the plaintext line and the release B line, once per process: {lines:?}"
-            );
-            assert_eq!(lines[0], SQL_SLICE_PLAINTEXT_WARNING);
-            let release_b = &lines[1];
+            let release_b = lines.last().expect("a release B line");
+            if fragment_listener {
+                assert_eq!(
+                    lines.len(),
+                    1,
+                    "with --fragment-listener only the release B line, once per process: \
+                     {lines:?}"
+                );
+            } else {
+                assert_eq!(
+                    lines.len(),
+                    2,
+                    "the plaintext line and the release B line, once per process: {lines:?}"
+                );
+                assert_eq!(lines[0], SQL_SLICE_PLAINTEXT_WARNING);
+            }
             assert!(
                 release_b.starts_with(&format!(
                     "--distributed-query is running without {missing}."
@@ -4992,32 +5099,53 @@ PTREtiuqNQ9HYwDc6S9HnUYgt9z+qtP0A5BTFL4jvybiT6/CRnVuZ0Ds
             );
             assert!(
                 !release_b.contains("SQL slice"),
-                "SQL slices are plaintext whatever the flags say, so the release B line does not \
-                 tie them to --fragment-listener: {release_b}"
+                "the SQL slice transport has its own line: {release_b}"
             );
         }
     }
 
-    /// With both flags set the release B line goes, but the SQL lane still
-    /// dials the public gRPC listener in plaintext, so that line stays.
+    /// With both flags set a Flight SQL build logs nothing: the release B line
+    /// goes, and SQL slices ride the dedicated TLS listener, so the plaintext
+    /// line goes too.
     #[test]
-    fn both_flags_set_still_logs_the_sql_plaintext_line() {
+    fn both_flags_set_log_no_line() {
         let startup = settings(true, true);
-        assert_eq!(release_b_requirements_warning(&startup), None);
+        assert_eq!(release_b_requirements_warning(&startup, true), None);
         let lines = warnings_over(Mode::All, &[startup.clone(), startup]);
-        assert_eq!(lines, vec![SQL_SLICE_PLAINTEXT_WARNING.to_string()]);
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
-    /// A build without Flight SQL has no SQL lane to warn about.
+    /// A build without Flight SQL has no SQL lane: it logs no plaintext line,
+    /// and its release B line names only `--fragment-listener`.
     #[test]
-    fn a_build_without_flight_sql_logs_only_the_release_b_line() {
-        assert!(
-            distributed_query_startup_warnings(Mode::Query, &settings(true, true), false)
-                .is_empty()
-        );
-        let lines = distributed_query_startup_warnings(Mode::Query, &settings(false, true), false);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(is_release_b_line(&lines[0]), "{lines:?}");
+    fn a_build_without_flight_sql_names_only_the_fragment_listener() {
+        for sql_ticket_key_file in [false, true] {
+            assert!(
+                distributed_query_startup_warnings(
+                    Mode::Query,
+                    &settings(true, sql_ticket_key_file),
+                    false
+                )
+                .is_empty(),
+                "with --fragment-listener nothing is missing (key file {sql_ticket_key_file})"
+            );
+            let lines = distributed_query_startup_warnings(
+                Mode::Query,
+                &settings(false, sql_ticket_key_file),
+                false,
+            );
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let line = &lines[0];
+            assert!(is_release_b_line(line), "{line}");
+            assert!(
+                line.starts_with("--distributed-query is running without --fragment-listener.")
+                    && line.contains(
+                        "refuses to start --distributed-query without --fragment-listener."
+                    ),
+                "{line}"
+            );
+            assert!(!line.contains("--sql-ticket-key-file"), "{line}");
+        }
     }
 
     /// Gateway and maintain processes build no Flight SQL service and derive no
