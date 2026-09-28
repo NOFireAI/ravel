@@ -1047,6 +1047,154 @@ fn repeated_noncurrent_expiration_is_unknown() {
     }
 }
 
+/// A rule whose Status is repeated has no single status: it is neither skipped
+/// as Disabled nor trusted as Enabled, so its 1-day expiration keeps
+/// no-foreign-rule Unknown whichever order the two values arrive in.
+#[test]
+fn repeated_rule_status_is_unknown() {
+    for (first, second) in [("Disabled", "Enabled"), ("Enabled", "Disabled")] {
+        let v = evaluate(&format!(
+            "{}<Rule><ID>twice</ID><Status>{first}</Status><Status>{second}</Status><Filter/>\
+             <Expiration><Days>1</Days></Expiration></Rule>",
+            rule(
+                "ravel",
+                "<Filter/>",
+                &format!("{}{MARKER}{ABORT_7}", noncurrent("30"))
+            ),
+        ));
+        assert!(
+            v.no_foreign.is_unknown(),
+            "{first},{second}: {:?}",
+            v.no_foreign
+        );
+        assert!(
+            v.no_foreign.detail().contains("a repeated <Status>"),
+            "{first},{second}: {:?}",
+            v.no_foreign
+        );
+    }
+}
+
+/// A NoncurrentVersionExpiration whose NoncurrentDays is repeated has no single
+/// day count, so both conditions that read it are Unknown in either order.
+#[test]
+fn repeated_noncurrent_days_is_unknown() {
+    for (first, second) in [("30", "1"), ("1", "30")] {
+        let v = evaluate(&rule(
+            "twice",
+            "<Filter/>",
+            &format!(
+                "<NoncurrentVersionExpiration><NoncurrentDays>{first}</NoncurrentDays>\
+                 <NoncurrentDays>{second}</NoncurrentDays></NoncurrentVersionExpiration>\
+                 {MARKER}{ABORT_7}"
+            ),
+        ));
+        for (name, state) in [("noncurrent", &v.noncurrent), ("no_foreign", &v.no_foreign)] {
+            assert!(state.is_unknown(), "{first},{second} {name}: {state:?}");
+            assert!(
+                state.detail().contains("a repeated <NoncurrentDays>"),
+                "{first},{second} {name}: {state:?}"
+            );
+        }
+    }
+}
+
+/// A repeated DaysAfterInitiation has no single day count: abort-multipart is
+/// Unknown rather than whichever value came first.
+#[test]
+fn repeated_days_after_initiation_is_unknown() {
+    for (first, second) in [("7", "30"), ("30", "7")] {
+        let v = evaluate(&rule(
+            "twice",
+            "<Filter/>",
+            &format!(
+                "{}{MARKER}<AbortIncompleteMultipartUpload>\
+                 <DaysAfterInitiation>{first}</DaysAfterInitiation>\
+                 <DaysAfterInitiation>{second}</DaysAfterInitiation>\
+                 </AbortIncompleteMultipartUpload>",
+                noncurrent("30")
+            ),
+        ));
+        assert!(v.abort.is_unknown(), "{first},{second}: {:?}", v.abort);
+        assert!(
+            v.abort.detail().contains("a repeated <DaysAfterInitiation>"),
+            "{first},{second}: {:?}",
+            v.abort
+        );
+    }
+}
+
+/// A repeated AbortIncompleteMultipartUpload, a repeated Expiration, and a
+/// repeated ExpiredObjectDeleteMarker inside one Expiration are each Unknown
+/// for the condition they carry, in either order.
+#[test]
+fn repeated_action_elements_are_unknown() {
+    let abort = |days: &str| {
+        format!(
+            "<AbortIncompleteMultipartUpload><DaysAfterInitiation>{days}</DaysAfterInitiation>\
+             </AbortIncompleteMultipartUpload>"
+        )
+    };
+    let marker = |value: &str| {
+        format!("<ExpiredObjectDeleteMarker>{value}</ExpiredObjectDeleteMarker>")
+    };
+    for (first, second) in [("true", "false"), ("false", "true")] {
+        let (d1, d2) = if first == "true" { ("7", "30") } else { ("30", "7") };
+        let v = evaluate(&rule(
+            "twice",
+            "<Filter/>",
+            &format!("{}{MARKER}{}{}", noncurrent("30"), abort(d1), abort(d2)),
+        ));
+        assert!(v.abort.is_unknown(), "abort {d1},{d2}: {:?}", v.abort);
+
+        let v = evaluate(&rule(
+            "twice",
+            "<Filter/>",
+            &format!(
+                "{}<Expiration>{}</Expiration><Expiration>{}</Expiration>{ABORT_7}",
+                noncurrent("30"),
+                marker(first),
+                marker(second)
+            ),
+        ));
+        assert!(
+            v.expired_marker.is_unknown(),
+            "Expiration {first},{second}: {:?}",
+            v.expired_marker
+        );
+        assert!(
+            v.no_foreign.is_unknown(),
+            "Expiration {first},{second}: {:?}",
+            v.no_foreign
+        );
+
+        let v = evaluate(&rule(
+            "twice",
+            "<Filter/>",
+            &format!(
+                "{}<Expiration>{}{}</Expiration>{ABORT_7}",
+                noncurrent("30"),
+                marker(first),
+                marker(second)
+            ),
+        ));
+        assert!(
+            v.expired_marker.is_unknown(),
+            "ExpiredObjectDeleteMarker {first},{second}: {:?}",
+            v.expired_marker
+        );
+    }
+    let v = evaluate(&rule(
+        "twice",
+        "<Filter/>",
+        &format!(
+            "{}{ABORT_7}<Expiration><Days>1</Days><Days>400</Days></Expiration>",
+            noncurrent("30")
+        ),
+    ));
+    assert!(v.no_foreign.is_unknown(), "Days: {:?}", v.no_foreign);
+}
+
 /// An empty And names no condition at all, so it is not read as the whole
 /// bucket.
 #[test]
@@ -1150,6 +1298,31 @@ fn replication_rule(status: &str, filter: &str, dmr: &str) -> String {
         "<Rule><Status>{status}</Status>{filter}<DeleteMarkerReplication><Status>{dmr}</Status>\
          </DeleteMarkerReplication><Destination><Bucket>b</Bucket></Destination></Rule>"
     )
+}
+
+/// A covering replication rule whose DeleteMarkerReplication Status is
+/// repeated, or whose DeleteMarkerReplication element is, states no single
+/// value: Unknown in either order.
+#[test]
+fn repeated_delete_marker_replication_is_unknown() {
+    let tail = "<Destination><Bucket>b</Bucket></Destination></Rule>";
+    for (first, second) in [("Enabled", "Disabled"), ("Disabled", "Enabled")] {
+        let state = dmr_state(&format!(
+            "<Rule><Status>Enabled</Status><Filter/><DeleteMarkerReplication>\
+             <Status>{first}</Status><Status>{second}</Status></DeleteMarkerReplication>{tail}"
+        ));
+        assert!(state.is_unknown(), "Status {first},{second}: {state:?}");
+        assert!(
+            state.detail().contains("a repeated <Status>"),
+            "Status {first},{second}: {state:?}"
+        );
+        let state = dmr_state(&format!(
+            "<Rule><Status>Enabled</Status><Filter/>\
+             <DeleteMarkerReplication><Status>{first}</Status></DeleteMarkerReplication>\
+             <DeleteMarkerReplication><Status>{second}</Status></DeleteMarkerReplication>{tail}"
+        ));
+        assert!(state.is_unknown(), "element {first},{second}: {state:?}");
+    }
 }
 
 /// The reviewer's pin: a Disabled rule carrying DeleteMarkerReplication
@@ -1330,6 +1503,97 @@ fn object_lock_reads_the_enabled_element_three_ways() {
          </Rule></ObjectLockConfiguration>",
     );
     assert!(silent.is_unknown(), "{silent:?}");
+}
+
+fn object_lock_state(body: &str) -> ConditionState {
+    assembled(
+        FetchOutcome::Unknown("not under test".to_string()),
+        classify_fetch(
+            Ok(body.as_bytes().to_vec()),
+            parse_object_lock,
+            "not configured",
+        ),
+    )
+    .state(ProtectionConditionId::ObjectLock)
+    .expect("present")
+    .clone()
+}
+
+/// A repeated ObjectLockEnabled states no single value, so object-lock is
+/// Unknown in either order.
+#[test]
+fn repeated_object_lock_enabled_is_unknown() {
+    for (first, second) in [("Enabled", "Disabled"), ("Disabled", "Enabled")] {
+        let state = object_lock_state(&format!(
+            "<ObjectLockConfiguration><ObjectLockEnabled>{first}</ObjectLockEnabled>\
+             <ObjectLockEnabled>{second}</ObjectLockEnabled></ObjectLockConfiguration>"
+        ));
+        assert!(state.is_unknown(), "{first},{second}: {state:?}");
+        assert!(
+            state.detail().contains("a repeated <ObjectLockEnabled>"),
+            "{first},{second}: {state:?}"
+        );
+    }
+}
+
+/// An empty ObjectLockEnabled states nothing: Unknown, not Fail. A non-empty
+/// value other than Enabled still fails.
+#[test]
+fn empty_object_lock_enabled_is_unknown() {
+    for element in [
+        "<ObjectLockEnabled></ObjectLockEnabled>",
+        "<ObjectLockEnabled/>",
+        "<ObjectLockEnabled>  </ObjectLockEnabled>",
+    ] {
+        let state = object_lock_state(&format!(
+            "<ObjectLockConfiguration>{element}</ObjectLockConfiguration>"
+        ));
+        assert!(state.is_unknown(), "{element}: {state:?}");
+    }
+    let state = object_lock_state(
+        "<ObjectLockConfiguration><ObjectLockEnabled>Suspended</ObjectLockEnabled>\
+         </ObjectLockConfiguration>",
+    );
+    assert!(state.is_fail(), "{state:?}");
+}
+
+/// Document-level single values that are repeated make the whole response
+/// unparseable rather than taking whichever came first.
+#[test]
+fn repeated_document_values_are_parse_errors() {
+    assert!(
+        parse_versioning(
+            b"<VersioningConfiguration><Status>Enabled</Status><Status>Suspended</Status>\
+              </VersioningConfiguration>"
+        )
+        .is_err()
+    );
+    assert!(
+        parse_retention(
+            b"<Retention><Mode>COMPLIANCE</Mode><Mode>GOVERNANCE</Mode>\
+              <RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>"
+        )
+        .is_err()
+    );
+    assert!(
+        parse_object_versions(
+            b"<ListVersionsResult><IsTruncated>false</IsTruncated>\
+              <IsTruncated>true</IsTruncated></ListVersionsResult>"
+        )
+        .is_err()
+    );
+    assert!(
+        parse_object_versions(
+            b"<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>a</Key>\
+              <VersionId>1</VersionId><IsLatest>false</IsLatest><IsLatest>true</IsLatest>\
+              </Version></ListVersionsResult>"
+        )
+        .is_err()
+    );
+    assert_eq!(
+        parse_error_code(b"<Error><Code>NoSuchLifecycleConfiguration</Code><Code>X</Code></Error>"),
+        None
+    );
 }
 
 // --- Retention verdicts ---

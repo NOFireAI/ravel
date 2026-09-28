@@ -501,17 +501,37 @@ struct XmlElement {
     children: Vec<XmlElement>,
 }
 
+/// A child element that appeared more than once where one value is expected.
+/// It is never resolved to either copy: the value it carries is unparseable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Repeated(String);
+
+impl fmt::Display for Repeated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "a repeated <{}>", self.0)
+    }
+}
+
+impl From<Repeated> for ControlPlaneError {
+    fn from(repeated: Repeated) -> Self {
+        ControlPlaneError::Parse(repeated.to_string())
+    }
+}
+
 impl XmlElement {
-    fn child(&self, name: &str) -> Option<&XmlElement> {
-        self.children.iter().find(|child| child.name == name)
+    /// The single child named `name`: `Ok(None)` when absent, `Err` when it
+    /// appears more than once.
+    fn single(&self, name: &str) -> Result<Option<&XmlElement>, Repeated> {
+        let mut named = self.children.iter().filter(|child| child.name == name);
+        match (named.next(), named.next()) {
+            (None, _) => Ok(None),
+            (Some(one), None) => Ok(Some(one)),
+            (Some(_), Some(_)) => Err(Repeated(name.to_string())),
+        }
     }
 
     fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a XmlElement> {
         self.children.iter().filter(move |child| child.name == name)
-    }
-
-    fn count(&self, name: &str) -> usize {
-        self.children_named(name).count()
     }
 
     /// The element's text with surrounding whitespace removed.
@@ -633,7 +653,7 @@ fn parse_document(body: &[u8], expected_root: &str) -> Result<XmlElement, Contro
 /// The `<Error><Code>` of an S3 error body, or `None` when the body is not one.
 pub(crate) fn parse_error_code(body: &[u8]) -> Option<String> {
     let root = parse_document(body, "Error").ok()?;
-    let code = root.child("Code")?.value();
+    let code = root.single("Code").ok()??.value();
     (!code.is_empty()).then(|| code.to_string())
 }
 
@@ -660,17 +680,18 @@ pub(crate) struct VersioningConfig {
 pub(crate) enum RuleStatus {
     Enabled,
     Disabled,
-    /// Neither `Enabled` nor `Disabled`, or missing.
+    /// Neither `Enabled` nor `Disabled`, missing, or repeated.
     Other(String),
 }
 
 impl RuleStatus {
-    fn parse(element: Option<&XmlElement>) -> RuleStatus {
-        match element.map(XmlElement::value) {
-            Some(value) if value.eq_ignore_ascii_case("Enabled") => RuleStatus::Enabled,
-            Some(value) if value.eq_ignore_ascii_case("Disabled") => RuleStatus::Disabled,
-            Some(value) => RuleStatus::Other(value.to_string()),
-            None => RuleStatus::Other("<missing>".to_string()),
+    fn parse(element: Result<Option<&XmlElement>, Repeated>) -> RuleStatus {
+        match element.map(|e| e.map(XmlElement::value)) {
+            Ok(Some(value)) if value.eq_ignore_ascii_case("Enabled") => RuleStatus::Enabled,
+            Ok(Some(value)) if value.eq_ignore_ascii_case("Disabled") => RuleStatus::Disabled,
+            Ok(Some(value)) => RuleStatus::Other(value.to_string()),
+            Ok(None) => RuleStatus::Other("<missing>".to_string()),
+            Err(repeated) => RuleStatus::Other(repeated.to_string()),
         }
     }
 
@@ -693,13 +714,14 @@ pub(crate) enum Days {
 }
 
 impl Days {
-    fn parse(element: Option<&XmlElement>) -> Days {
-        match element.map(XmlElement::value) {
-            Some(value) => value
+    fn parse(element: Result<Option<&XmlElement>, Repeated>) -> Days {
+        match element.map(|e| e.map(XmlElement::value)) {
+            Ok(Some(value)) => value
                 .parse()
                 .map(Days::Value)
                 .unwrap_or_else(|_| Days::Invalid(value.to_string())),
-            None => Days::Invalid("<missing>".to_string()),
+            Ok(None) => Days::Invalid("<missing>".to_string()),
+            Err(repeated) => Days::Invalid(repeated.to_string()),
         }
     }
 
@@ -818,10 +840,10 @@ impl RuleScope {
 /// is [`RuleScope::Unrecognized`].
 fn rule_scope(rule: &XmlElement) -> RuleScope {
     let unrecognized = |detail: &str| RuleScope::Unrecognized(detail.to_string());
-    if rule.count("Prefix") > 1 || rule.count("Filter") > 1 {
+    let (Ok(prefix), Ok(filter)) = (rule.single("Prefix"), rule.single("Filter")) else {
         return unrecognized("repeated Prefix or Filter");
-    }
-    match (rule.child("Prefix"), rule.child("Filter")) {
+    };
+    match (prefix, filter) {
         (Some(prefix), None) => RuleScope::Prefix(prefix.text.clone()),
         (None, Some(filter)) => filter_scope(filter),
         (Some(_), Some(_)) => unrecognized("both a rule-level Prefix and a Filter"),
@@ -933,7 +955,7 @@ pub(crate) struct ReplicationConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ObjectLockConfig {
     /// `ObjectLockEnabled` read as `Enabled` or not, `None` when the element is
-    /// missing (a document that states nothing either way).
+    /// missing or empty (a document that states nothing either way).
     pub enabled: Option<bool>,
 }
 
@@ -966,7 +988,7 @@ pub(crate) struct ObjectVersionListing {
 pub(crate) fn parse_versioning(body: &[u8]) -> Result<VersioningConfig, ControlPlaneError> {
     let root = parse_document(body, "VersioningConfiguration")?;
     Ok(VersioningConfig {
-        status: root.child("Status").map(|s| s.value().to_string()),
+        status: root.single("Status")?.map(|s| s.value().to_string()),
     })
 }
 
@@ -979,8 +1001,8 @@ pub(crate) fn parse_lifecycle(body: &[u8]) -> Result<LifecycleConfig, ControlPla
 
 fn lifecycle_rule(rule: &XmlElement) -> LifecycleRule {
     let mut out = LifecycleRule {
-        id: rule.child("ID").map(|id| id.value().to_string()),
-        status: RuleStatus::parse(rule.child("Status")),
+        id: rule_id(rule),
+        status: RuleStatus::parse(rule.single("Status")),
         scope: rule_scope(rule),
         noncurrent_days: None,
         newer_noncurrent_versions: None,
@@ -994,43 +1016,78 @@ fn lifecycle_rule(rule: &XmlElement) -> LifecycleRule {
     };
     for child in &rule.children {
         match child.name.as_str() {
-            "ID" | "Status" | "Filter" | "Prefix" => {}
+            "ID" | "Status" | "Filter" | "Prefix" | "NoncurrentVersionExpiration"
+            | "Expiration" | "AbortIncompleteMultipartUpload" => {}
             "Transition" | "NoncurrentVersionTransition" => out.has_transition = true,
-            "NoncurrentVersionExpiration" => {
-                out.noncurrent_days = Some(Days::parse(child.child("NoncurrentDays")));
-                if let Some(newer) = child.child("NewerNoncurrentVersions") {
-                    out.newer_noncurrent_versions = Some(newer.value().to_string());
-                }
-            }
-            "Expiration" => {
-                if child.children.is_empty() {
-                    out.expiration_unrecognized = Some("an empty <Expiration>".to_string());
-                }
-                for part in &child.children {
-                    match part.name.as_str() {
-                        "Days" => out.expiration_days = Some(Days::parse(Some(part))),
-                        "Date" => out.expiration_date = Some(part.value().to_string()),
-                        "ExpiredObjectDeleteMarker" => {
-                            out.expired_object_delete_marker = Some(Flag::parse(part));
-                        }
-                        other => {
-                            out.expiration_unrecognized = Some(format!("<Expiration><{other}>"));
-                        }
-                    }
-                }
-            }
-            "AbortIncompleteMultipartUpload" => {
-                out.abort_incomplete_days = Some(Days::parse(child.child("DaysAfterInitiation")));
-            }
             other => out.unrecognized_action = Some(format!("<{other}>")),
         }
     }
-    if rule.count("NoncurrentVersionExpiration") > 1 {
-        out.noncurrent_days = Some(Days::Invalid(
-            "a repeated <NoncurrentVersionExpiration>".to_string(),
-        ));
+    match rule.single("NoncurrentVersionExpiration") {
+        Ok(None) => {}
+        Ok(Some(action)) => {
+            out.noncurrent_days = Some(match action.single("NewerNoncurrentVersions") {
+                Ok(newer) => {
+                    out.newer_noncurrent_versions = newer.map(|n| n.value().to_string());
+                    Days::parse(action.single("NoncurrentDays"))
+                }
+                Err(repeated) => Days::Invalid(repeated.to_string()),
+            });
+        }
+        Err(repeated) => out.noncurrent_days = Some(Days::Invalid(repeated.to_string())),
+    }
+    match rule.single("Expiration") {
+        Ok(None) => {}
+        Ok(Some(expiration)) => read_expiration(expiration, &mut out),
+        Err(repeated) => {
+            out.expiration_unrecognized = Some(repeated.to_string());
+            out.expired_object_delete_marker = Some(Flag::Invalid(repeated.to_string()));
+        }
+    }
+    match rule.single("AbortIncompleteMultipartUpload") {
+        Ok(None) => {}
+        Ok(Some(action)) => {
+            out.abort_incomplete_days = Some(Days::parse(action.single("DaysAfterInitiation")));
+        }
+        Err(repeated) => out.abort_incomplete_days = Some(Days::Invalid(repeated.to_string())),
     }
     out
+}
+
+/// A rule's `ID`, for its label only. A repeated `ID` labels the rule by its
+/// position instead; no condition reads the ID.
+fn rule_id(rule: &XmlElement) -> Option<String> {
+    match rule.single("ID") {
+        Ok(id) => id.map(|id| id.value().to_string()),
+        Err(_) => None,
+    }
+}
+
+fn read_expiration(expiration: &XmlElement, out: &mut LifecycleRule) {
+    if expiration.children.is_empty() {
+        out.expiration_unrecognized = Some("an empty <Expiration>".to_string());
+    }
+    for part in &expiration.children {
+        match part.name.as_str() {
+            "Days" | "Date" | "ExpiredObjectDeleteMarker" => {}
+            other => out.expiration_unrecognized = Some(format!("<Expiration><{other}>")),
+        }
+    }
+    match expiration.single("Days") {
+        Ok(None) => {}
+        days => out.expiration_days = Some(Days::parse(days)),
+    }
+    match expiration.single("Date") {
+        Ok(None) => {}
+        Ok(Some(date)) => out.expiration_date = Some(date.value().to_string()),
+        Err(repeated) => out.expiration_unrecognized = Some(format!("<Expiration> {repeated}")),
+    }
+    match expiration.single("ExpiredObjectDeleteMarker") {
+        Ok(None) => {}
+        Ok(Some(marker)) => out.expired_object_delete_marker = Some(Flag::parse(marker)),
+        Err(repeated) => {
+            out.expired_object_delete_marker = Some(Flag::Invalid(repeated.to_string()));
+        }
+    }
 }
 
 pub(crate) fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, ControlPlaneError> {
@@ -1039,12 +1096,13 @@ pub(crate) fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, Contro
         rules: root
             .children_named("Rule")
             .map(|rule| ReplicationRule {
-                id: rule.child("ID").map(|id| id.value().to_string()),
-                status: RuleStatus::parse(rule.child("Status")),
+                id: rule_id(rule),
+                status: RuleStatus::parse(rule.single("Status")),
                 scope: rule_scope(rule),
-                delete_marker_replication: rule
-                    .child("DeleteMarkerReplication")
-                    .map(|dmr| RuleStatus::parse(dmr.child("Status"))),
+                delete_marker_replication: match rule.single("DeleteMarkerReplication") {
+                    Ok(dmr) => dmr.map(|dmr| RuleStatus::parse(dmr.single("Status"))),
+                    Err(repeated) => Some(RuleStatus::Other(repeated.to_string())),
+                },
             })
             .collect(),
     })
@@ -1054,16 +1112,20 @@ pub(crate) fn parse_object_lock(body: &[u8]) -> Result<ObjectLockConfig, Control
     let root = parse_document(body, "ObjectLockConfiguration")?;
     Ok(ObjectLockConfig {
         enabled: root
-            .child("ObjectLockEnabled")
-            .map(|e| e.value().eq_ignore_ascii_case("Enabled")),
+            .single("ObjectLockEnabled")?
+            .map(XmlElement::value)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.eq_ignore_ascii_case("Enabled")),
     })
 }
 
 pub(crate) fn parse_retention(body: &[u8]) -> Result<RetentionConfig, ControlPlaneError> {
     let root = parse_document(body, "Retention")?;
     Ok(RetentionConfig {
-        mode: root.child("Mode").map(|m| m.value().to_string()),
-        retain_until: root.child("RetainUntilDate").map(|d| d.value().to_string()),
+        mode: root.single("Mode")?.map(|m| m.value().to_string()),
+        retain_until: root
+            .single("RetainUntilDate")?
+            .map(|d| d.value().to_string()),
     })
 }
 
@@ -1082,7 +1144,7 @@ pub(crate) fn parse_object_versions(
 ) -> Result<ObjectVersionListing, ControlPlaneError> {
     let root = parse_document(body, "ListVersionsResult")?;
     let mut listing = ObjectVersionListing {
-        is_truncated: match root.child("IsTruncated") {
+        is_truncated: match root.single("IsTruncated")? {
             Some(element) => parse_bool(element)?,
             None => {
                 return Err(ControlPlaneError::Parse(
@@ -1090,19 +1152,19 @@ pub(crate) fn parse_object_versions(
                 ));
             }
         },
-        next_key_marker: root.child("NextKeyMarker").map(|m| m.text.clone()),
+        next_key_marker: root.single("NextKeyMarker")?.map(|m| m.text.clone()),
         next_version_id_marker: root
-            .child("NextVersionIdMarker")
+            .single("NextVersionIdMarker")?
             .map(|m| m.value().to_string()),
         versions: Vec::new(),
     };
     for version in root.children_named("Version") {
         listing.versions.push(ObjectVersion {
             key: version
-                .child("Key")
+                .single("Key")?
                 .map(|k| k.text.clone())
                 .unwrap_or_default(),
-            version_id: match version.child("VersionId").map(XmlElement::value) {
+            version_id: match version.single("VersionId")?.map(XmlElement::value) {
                 Some(id) if !id.is_empty() => id.to_string(),
                 _ => {
                     return Err(ControlPlaneError::Parse(
@@ -1110,11 +1172,13 @@ pub(crate) fn parse_object_versions(
                     ));
                 }
             },
-            is_latest: match version.child("IsLatest") {
+            is_latest: match version.single("IsLatest")? {
                 Some(element) => parse_bool(element)?,
                 None => false,
             },
-            last_modified: version.child("LastModified").map(|m| m.value().to_string()),
+            last_modified: version
+                .single("LastModified")?
+                .map(|m| m.value().to_string()),
         });
     }
     Ok(listing)
@@ -1733,7 +1797,7 @@ pub(crate) fn assemble_report(
                 Some(true) => ConditionState::Pass,
                 Some(false) => ConditionState::Fail("Object Lock is not enabled".to_string()),
                 None => ConditionState::Unknown(
-                    "ObjectLockConfiguration carries no ObjectLockEnabled element".to_string(),
+                    "ObjectLockConfiguration carries no ObjectLockEnabled value".to_string(),
                 ),
             },
             FetchOutcome::Absent(detail) => ConditionState::Fail(detail.clone()),
