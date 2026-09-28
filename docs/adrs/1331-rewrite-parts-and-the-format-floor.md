@@ -79,7 +79,10 @@ obligations. That path is not built here.
    cannot read; or a later erasure request against the bucket produces a
    superseding rewrite at the current `OUTPUT_FORMAT_VERSION`, which the
    erasure driver does on its own schedule. Neither is a command the operator
-   runs to clear the block, and the guide says so.
+   runs to clear the block, and the guide says so. **Corrected: see the
+   2026-09-28 sweep amendment below** -- a `sweep` IS a command the operator
+   runs, and it clears a bucket blocked only by a superseded predecessor rewrite
+   record whose successor is already at the current version.
 
 4. **ADR-0066 is narrowed accordingly.** Decision 4 Class A force 2,
    rewrite-on-touch over "live L1 part with `segment_format_version` <
@@ -154,3 +157,24 @@ flowchart TD
   2. `services/ravel-cli/src/maintain.rs`: print the list; the server
      maintain-mode driver logs it.
   3. Docs: the maintenance guide section above and the ADR-0066 pointer.
+
+## Amendment (2026-09-28): a `sweep` is a command the operator runs to clear a superseded predecessor
+
+<!-- amendment-supersedes: phrase="Neither is a command the operator runs" pointer="2026-09-28 sweep amendment" -->
+
+Decision 3 above said neither clearing path is a command the operator runs. That
+is wrong for one path. `count_below_target` counts the parts of every rewrite
+record a bucket still LISTS, including a predecessor a later rewrite already
+superseded (`crates/ravel-maintain/src/migrate.rs`), and `sweep` deletes a record
+another present rewrite supersedes (`crates/ravel-maintain/src/sweep.rs`). `sweep`
+is a `ravel-cli maintain` subcommand, and the resolver serves the successor, not
+the superseded predecessor.
+
+So when a bucket is blocked only by a superseded predecessor whose successor is
+already at the current `OUTPUT_FORMAT_VERSION`, `ravel-cli maintain sweep` for
+that tenant, signal and shard -- subject to the protection horizon -- removes the
+predecessor and clears the block. The erasure request that produces a superseding
+rewrite is still not something the operator triggers; the `sweep` that removes the
+superseded predecessor is. When the live rewrite is itself still below target, a
+superseding rewrite has to land first AND then be swept, so that path stays a
+two-step one.
