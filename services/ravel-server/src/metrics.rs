@@ -4024,7 +4024,7 @@ fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
     write_header(
         out,
         "ravel_alert_notifications_failed_total",
-        "Notifications still undelivered after a tick's attempt, counted once per tick per notification, so one stuck notification keeps advancing this while it is retried.",
+        "Notifications attempted but not accepted by every configured sink, counted once per tick per notification, so one stuck notification keeps advancing this while it is retried.",
         "counter",
     );
     write_sample(
@@ -4037,7 +4037,7 @@ fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
     write_header(
         out,
         "ravel_alert_notifications_deferred_total",
-        "Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first. They stay queued, oldest first, and are retried next tick; a rising value means a sink is too slow to drain the queue within a tick.",
+        "Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first, counted once per notification per tick: a notification deferred again on the next tick is counted again. They keep their place at the front of the queue; a rising value means a sink is too slow to drain the queue within a tick.",
         "counter",
     );
     write_sample(

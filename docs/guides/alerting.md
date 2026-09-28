@@ -147,17 +147,40 @@ pending, firing, and resolved on its own.
   identity that fires or resolves, until it accepts them;
   `ravel_alert_undelivered_notifications` reports that queue's size.
 - **The per-tick delivery deadline.** Delivery to the sinks is bounded to half
-  the evaluation interval on each tick, so one slow or unresponsive sink cannot
-  stall a tick past its own interval and delay every later tick's evaluation.
-  Notifications not attempted before the deadline stay queued, oldest first, and
-  are retried next tick; `ravel_alert_notifications_deferred_total` counts them,
-  and a rising value means a sink is too slow to drain the queue within a tick.
-  The oldest queued notification is always attempted, even on a tick whose rule
-  evaluation alone used the budget, so delivery never stops entirely.
+  the evaluation interval on each tick, so a slow or unresponsive sink cannot
+  make the delivery phase grow with the queue behind it. The deadline is
+  checked before each attempt, not during one, and the first attempt of a tick
+  is unconditional, so the delivery phase ends at the latest at
+  `max(tick start + half the interval, end of rule evaluation)` plus one whole
+  attempt, which is the number of configured sinks times the 10-second sink
+  HTTP timeout. What it does not bound is rule evaluation, which runs as long as
+  its queries take, and so it does not bound the tick as a whole either. A tick
+  that overruns its interval delays the next tick rather than overlapping it,
+  because the evaluator sleeps for an interval after a tick returns rather than
+  running on a fixed schedule.
+  Notifications not attempted before the deadline stay queued and keep
+  their place at the front; `ravel_alert_notifications_deferred_total` counts
+  them once per notification per tick, so a notification deferred on several
+  consecutive ticks is counted on each, and a rising value means a sink is too
+  slow to drain the queue within a tick.
   Because a tick both raises new alerts and resolves alerts that stopped
   matching, the per-tick publish worst case for one rule is twice the cap: up to
   1000 new transitions plus up to 1000 resolutions, so up to 2000 records and
   2000 notifications per sink.
+- **Delivery order, and what one dead sink costs the others.** The queue is
+  served in the order notifications were queued, not by how old the transition
+  they carry is. A notification some sink refused goes to the back of the queue
+  after the attempt, and one the deadline never reached keeps its place, so the
+  pass rotates over the whole queue instead of spending every tick's budget on
+  the same few entries. A notification leaves the queue only once *every*
+  configured sink has accepted it. That is the remaining cost of a dead sink:
+  while one sink is blackholed the queue never drains, so total delivery for
+  *every* sink, healthy ones included, is throttled to what fits in one tick's
+  budget. What the rotation guarantees is that a healthy sink receives every
+  notification eventually rather than the same few forever. Watch
+  `ravel_alert_undelivered_notifications`: a queue that only grows means one
+  sink is refusing, and every other sink is paying for it. Remove a sink that
+  is down rather than leaving it configured.
 
 The labels a rule's query returns are retained with every alert record it
 writes, alongside the rule's own labels, and no erasure path reaches alert
@@ -315,7 +338,7 @@ never arrived, which is indistinguishable from a condition that never occurred.
 | `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record. |
 | `ravel_alert_notifications_delivered_total` | Notifications accepted by every configured sink. |
 | `ravel_alert_notifications_failed_total` | Notifications attempted but not accepted by every sink, counted once per tick while they are retried. |
-| `ravel_alert_notifications_deferred_total` | Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first. They stay queued, oldest first, and are retried next tick. |
+| `ravel_alert_notifications_deferred_total` | Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first. Counted once per notification per tick: a notification deferred again on the next tick is counted again. They keep their place at the front of the queue. |
 | `ravel_alert_undelivered_notifications` | Gauge. Notifications not yet accepted by every configured sink, at most one per alert identity. While a sink keeps failing it grows by one for every identity that transitions, without bound. |
 | `ravel_alert_ticks_total` | Evaluation ticks, split by an `outcome` label: `evaluated`, `lease_not_held`, `lease_unavailable`, `history_unavailable`. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Unix time this process last completed a tick. Its age is the liveness signal. |
