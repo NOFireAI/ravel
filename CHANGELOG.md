@@ -63,10 +63,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file no longer covers both lanes. Without it, this release keeps deriving
   the SQL ticket key from the first fragment key so a rolling upgrade keeps
   working, and a `--distributed-query` process missing `--sql-ticket-key-file`
-  or `--fragment-listener` logs one startup warning that the next release
-  requires both. Every node in a cluster must read the same SQL ticket key
-  set; while a fleet rolls onto the file, SQL slices between a node on the
-  file and a node on the derived key run on the coordinator instead.
+  or `--fragment-listener` logs one startup warning that release B (ADR-1689
+  decision 4) requires both. Every `--distributed-query` process in `all` or
+  `query` mode also logs, with any flags, that SQL slice tickets still travel
+  in plaintext on the public gRPC listener and are a replayable read
+  capability until their deadline: the SQL lane moves to the dedicated
+  listener in a later change. Every node in a cluster must read the same SQL
+  ticket key set. A rolling switch straight onto a new key file has a mixed
+  window: a client ticket that `GetFlightInfo` minted on a node on the file
+  and that `DoGet` redeems on a node still on the derived key (or the
+  reverse) fails with `invalid_argument`, a client-visible query failure,
+  since a client ticket can be redeemed on any node behind a balancer, and
+  SQL slices between two such nodes run on the coordinator instead. The
+  deployment guide describes a switch without that window: first ship a key
+  file holding the key each node derives today, then rotate.
 
 ### Fixed
 

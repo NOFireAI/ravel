@@ -428,14 +428,56 @@ fn rows(batch: &arrow::record_batch::RecordBatch) -> Vec<(i64, u64)> {
         .collect()
 }
 
+/// A worker and a coordinator started on one shared store, with the published
+/// data and the query window.
+struct Pair {
+    shared: Arc<MemoryStore>,
+    worker: ravel_server::Running,
+    worker_store: Arc<DataStore>,
+    coordinator: ravel_server::Running,
+    coordinator_grpc: std::net::SocketAddr,
+    start_ns: i64,
+    end_ns: i64,
+}
+
+impl Pair {
+    async fn shutdown(self) {
+        self.coordinator
+            .shutdown()
+            .await
+            .expect("coordinator shuts down");
+        self.worker.shutdown().await.expect("worker shuts down");
+    }
+}
+
+/// How many query-worker records the shared store holds.
+async fn heartbeat_records(store: &MemoryStore) -> usize {
+    store
+        .list(ravel_fleet::query_workers::QUERY_WORKERS_PREFIX, None)
+        .await
+        .expect("list query workers")
+        .objects
+        .len()
+}
+
+/// Wait until the shared store holds `count` query-worker records.
+async fn await_heartbeat_records(store: &MemoryStore, count: usize) {
+    let deadline = Instant::now() + ROSTER_DEADLINE;
+    while heartbeat_records(store).await < count {
+        assert!(
+            Instant::now() < deadline,
+            "{count} query-worker records never appeared within {ROSTER_DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Two processes on one shared store: a worker whose SQL ticket key file is
 /// `worker_sql_keys` and a coordinator whose file is `coordinator_sql_keys`,
-/// each with its own fragment key file. Runs the statement on the coordinator
-/// and returns its result next to a single-process server's result.
-async fn cross_process_query(
-    coordinator_sql_keys: &[&str],
-    worker_sql_keys: &[&str],
-) -> (Vec<(i64, u64)>, Vec<(i64, u64)>) {
+/// each with its own fragment key file. The worker's heartbeat record is in
+/// the store before the coordinator starts, so the coordinator's first
+/// heartbeat read lists it.
+async fn start_pair(coordinator_sql_keys: &[&str], worker_sql_keys: &[&str]) -> Pair {
     let shared = Arc::new(MemoryStore::new());
     let tenant = TenantId::new(TENANT);
     let base = now_ns() - 10 * NS_PER_MIN;
@@ -473,6 +515,7 @@ async fn cross_process_query(
         Some(distrib_settings(&worker_fragment, &worker_sql)),
     )
     .await;
+    await_heartbeat_records(&shared, 1).await;
     let coordinator_store = DataStore::new(shared.clone(), data_keys.clone(), true);
     let coordinator = start_server(
         coordinator_store.clone(),
@@ -480,6 +523,25 @@ async fn cross_process_query(
     )
     .await;
     let coordinator_grpc = coordinator.grpc_addr.expect("gRPC binds in All mode");
+    await_heartbeat_records(&shared, 2).await;
+    Pair {
+        shared,
+        worker,
+        worker_store,
+        coordinator,
+        coordinator_grpc,
+        start_ns,
+        end_ns,
+    }
+}
+
+/// Runs the statement on the coordinator of a [`start_pair`] and returns its
+/// result next to a single-process server's result.
+async fn cross_process_query(
+    coordinator_sql_keys: &[&str],
+    worker_sql_keys: &[&str],
+) -> (Vec<(i64, u64)>, Vec<(i64, u64)>) {
+    let pair = start_pair(coordinator_sql_keys, worker_sql_keys).await;
 
     // Until the coordinator's first heartbeat read lists the worker, it runs
     // the statement itself and its store refuses the data. Retry until the
@@ -487,7 +549,7 @@ async fn cross_process_query(
     // error.
     let deadline = Instant::now() + ROSTER_DEADLINE;
     let distributed = loop {
-        match run_query(coordinator_grpc, start_ns, end_ns).await {
+        match run_query(pair.coordinator_grpc, pair.start_ns, pair.end_ns).await {
             Ok(batch) => break batch,
             Err(last) if Instant::now() >= deadline => panic!(
                 "the cross-process query never succeeded within {ROSTER_DEADLINE:?}; last error: \
@@ -497,25 +559,21 @@ async fn cross_process_query(
         }
     };
     assert!(
-        worker_store.data_gets.load(Ordering::SeqCst) > 0,
+        pair.worker_store.data_gets.load(Ordering::SeqCst) > 0,
         "the worker process read the segments"
     );
 
-    let local = start_server(shared.clone(), None).await;
+    let local = start_server(pair.shared.clone(), None).await;
     let single = run_query(
         local.grpc_addr.expect("gRPC binds in All mode"),
-        start_ns,
-        end_ns,
+        pair.start_ns,
+        pair.end_ns,
     )
     .await
     .expect("the single-process query succeeds");
 
     local.shutdown().await.expect("local shuts down");
-    coordinator
-        .shutdown()
-        .await
-        .expect("coordinator shuts down");
-    worker.shutdown().await.expect("worker shuts down");
+    pair.shutdown().await;
     (rows(&distributed), rows(&single))
 }
 
@@ -551,4 +609,41 @@ async fn sql_ticket_key_file_rotation_verifies_tickets_minted_under_the_old_key(
         distributed, single,
         "a ticket minted under the old key verifies under [new, old]"
     );
+}
+
+/// How long the negative control keeps querying once both heartbeat records
+/// are in the store. The two positive cases above succeed well inside it.
+const NEGATIVE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Negative control for the harness: a worker holding only `[new]` never
+/// verifies the slice tickets of a coordinator minting under `[old]`, so with
+/// the coordinator's own data reads refused the cross-process query fails on
+/// every attempt and the worker reads nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_without_the_minting_key_fails_the_cross_process_query() {
+    let pair = start_pair(&[OLD_KEY], &[NEW_KEY]).await;
+    let deadline = Instant::now() + NEGATIVE_WINDOW;
+    let mut attempts = 0;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match run_query(pair.coordinator_grpc, pair.start_ns, pair.end_ns).await {
+            Ok(batch) => panic!(
+                "a worker without the coordinator's minting key served the query: {:?}",
+                rows(&batch)
+            ),
+            Err(err) => last = err,
+        }
+        attempts += 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        attempts >= 5,
+        "the window ran only {attempts} attempts; last error: {last}"
+    );
+    assert_eq!(
+        pair.worker_store.data_gets.load(Ordering::SeqCst),
+        0,
+        "the worker read no segment for a ticket it could not verify"
+    );
+    pair.shutdown().await;
 }

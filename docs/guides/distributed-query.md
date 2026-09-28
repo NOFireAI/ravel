@@ -122,14 +122,29 @@ ravel-server --mode all \
   every file key. Same file shape and rotation rule as
   `--fragment-key-file` (the first key mints, every key verifies), but a
   separate file: one key file no longer covers both lanes. **Every node in one
-  cluster must read the same SQL ticket key set**, or every SQL slice ticket
-  fails the worker's MAC and its slice falls back to the coordinator. Setting
-  it without `--distributed-query` fails startup. In this release it is
-  optional: without it the SQL ticket key is derived from the first fragment
-  key, as before, and startup logs one warning naming the flags the next
-  release requires with `--distributed-query` (`--fragment-listener` and
-  `--sql-ticket-key-file`). The same warning fires when only
-  `--fragment-listener` is missing.
+  cluster must read the same SQL ticket key set.** Two nodes that disagree
+  cost more than parallelism: a client's whole-set ticket comes back from
+  `GetFlightInfo` as an endpoint with no location, so a client behind a
+  balancer can redeem it on any node, and a node that does not hold the key
+  it was minted under answers `DoGet` with `invalid_argument` ("malformed
+  flight ticket"). That is a client-visible query failure. SQL slice tickets
+  between two such nodes fail the worker's MAC and those slices fall back to
+  the coordinator. Setting the flag without `--distributed-query` fails
+  startup. In this release it is optional: without it the SQL ticket key is
+  derived from the first fragment key, as before, and startup logs one
+  warning naming the flags release B (the release after the operator
+  renders the dedicated listener) requires with
+  `--distributed-query` (`--fragment-listener` and `--sql-ticket-key-file`).
+  The same warning fires when only `--fragment-listener` is missing. To move
+  a running fleet onto the file without a mixed window, follow the switch in
+  the [deployment guide](operations/deployment.md#the-dedicated-fragment-listener).
+- In this release SQL slice tickets travel in plaintext on the public gRPC
+  listener whatever the flags say: the SQL lane dials each worker's
+  `--listen-grpc` address, not its `--fragment-listener` address. A slice
+  ticket read off that network is a replayable read capability for its tenant
+  and segment set until its deadline, so keep the public gRPC port on a
+  network you trust. Every `--distributed-query` process in `--mode all` or
+  `--mode query` logs this once at startup, with both flags set as well.
 - `--listen-grpc` is required in practice. By default the fragment surface is
   bound only on the cluster-internal gRPC listener, never on the client HTTP
   listener and never on the mTLS listener. A node with no gRPC listener never

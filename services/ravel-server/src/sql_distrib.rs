@@ -517,6 +517,13 @@ mod tests {
             ),
             "the documented recipe computes the key a release A node derives"
         );
+        // `printf '%s' abab...ab | b3sum --derive-key "<context>" --no-names`,
+        // run with b3sum 1.8.7 over this test's fragment key.
+        assert_eq!(
+            hex::encode(derived_key),
+            "eb8273766cadffb0a66e51bd709785eb7bcf9811ec4a6968952791bccc83c691",
+            "the guide's b3sum command prints the key file line"
+        );
 
         let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(Vec::new())));
         let (_, file_keys) =
