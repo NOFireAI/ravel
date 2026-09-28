@@ -134,6 +134,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The catalog's decoded-part and postings caches give memory back to a
+  refused decode** (ADR-1702 decision 6, issue #2088). Both caches hold each
+  decoded value together with its memory reservation and were bounded only by
+  an entry cap per tenant, so once a finite memory budget is wired into the
+  catalog, other tenants' cached entries could hold the whole budget and every
+  later decode would be refused with nothing able to release the memory. A
+  refused reservation now evicts cached entries least recently used across
+  every tenant of both caches until it would fit or the caches are empty, then
+  retries the reservation a single time. An entry a live resolve still holds
+  keeps its reservation until that resolve drops it, so a pass can empty a
+  cache and free nothing; the pass is bounded by the entries it removes rather
+  than by the bytes it frees, and a decode larger than the whole budget still
+  fails after one retry. The column-statistics cache is unaffected: its
+  entries carry no reservation and it is already bounded in bytes. The server
+  does not yet pass a finite budget to the catalog, so no deployed read path
+  changes in this release.
 - **Alert sink delivery is bounded per evaluation tick, and ADR-0117's stated
   per-tick publish bound is corrected** (issues #2063, #2064). The evaluator
   delivered every undelivered notification to every sink sequentially with no
