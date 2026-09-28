@@ -1748,27 +1748,14 @@ impl AlertEvaluator {
     ///
     /// # The per-tick deadline
     ///
-    /// Delivery is bounded to `now_ns + sink_delivery_budget`
-    /// ([`SINK_DELIVERY_DEADLINE_FRACTION`] of the interval), measured on the
-    /// injected clock. Without it, the pass costs
-    /// `notifications * sinks * sink_timeout` against a timing-out sink, which
-    /// grows with the undelivered queue: a rule over many series could hold the
-    /// tick for minutes and push every later tick's rule evaluation late.
-    /// Notifications not attempted before the deadline stay in the undelivered
-    /// map and are counted in
-    /// [`AlertEvalReport::notifications_deferred`].
-    ///
-    /// `now_ns` is the tick's own reading, taken before the memo read that opens
-    /// the tick, so the deadline bounds the delivery phase against the start of
-    /// the tick rather than against the start of delivery. See
-    /// [`SINK_DELIVERY_DEADLINE_FRACTION`] for the bound that yields, which is
-    /// not "before the next tick is due".
-    ///
-    /// The first notification is always attempted, deadline or not. A tick
-    /// whose work before delivery alone consumed the budget would otherwise
-    /// defer every notification, every tick, and deliver nothing at all while
-    /// the sinks were healthy. In that regime a tick attempts exactly one
-    /// notification, however healthy the sinks are.
+    /// The pass stops attempting at `now_ns + sink_delivery_budget`, where
+    /// `now_ns` is the tick's own clock reading rather than the start of
+    /// delivery, and the first notification of a pass is attempted whether or
+    /// not that deadline has already passed. Notifications not attempted stay
+    /// in the undelivered map, keep their queue places, and are counted in
+    /// [`AlertEvalReport::notifications_deferred`]. See
+    /// [`SINK_DELIVERY_DEADLINE_FRACTION`] for what this bounds and what it
+    /// does not, which is not "before the next tick is due".
     ///
     /// # Round-robin over the queue, not oldest transition first
     ///
@@ -1811,14 +1798,18 @@ impl AlertEvaluator {
         let deadline_ns = now_ns.saturating_add(
             i64::try_from(self.sink_delivery_budget.as_nanos()).unwrap_or(i64::MAX),
         );
-        let mut pending: Vec<(u64, AlertId, AlertNotification)> = self
+        // Only the queue order is materialized here. The notification itself is
+        // cloned inside the loop, after the deadline check has let it be
+        // attempted, so a pass that attempts one notification out of a long
+        // queue pays for one clone and not for the whole queue.
+        let mut pending: Vec<(u64, AlertId)> = self
             .undelivered
             .iter()
-            .map(|(id, queued)| (queued.seq, *id, queued.notification.clone()))
+            .map(|(id, queued)| (queued.seq, *id))
             .collect();
-        pending.sort_by_key(|(seq, _, _)| *seq);
+        pending.sort_unstable_by_key(|(seq, _)| *seq);
         let mut attempted = false;
-        for (_, alert_id, notification) in pending {
+        for (_, alert_id) in pending {
             if attempted && self.clock.now_ns() >= deadline_ns {
                 // Past the per-tick deadline: leave this and every later
                 // notification in the undelivered map, at their current queue
@@ -1828,6 +1819,16 @@ impl AlertEvaluator {
                 continue;
             }
             attempted = true;
+            // Each `alert_id` appears once in `pending`, and the only removal
+            // below is of the entry just delivered, so the lookup holds for
+            // every entry of the pass.
+            let Some(notification) = self
+                .undelivered
+                .get(&alert_id)
+                .map(|queued| queued.notification.clone())
+            else {
+                continue;
+            };
             let mut all_ok = true;
             for sink in self.sinks.iter() {
                 if let Err(err) = deliver(&self.http, sink, &notification).await {
@@ -5980,6 +5981,69 @@ mod tick_tests {
             NOW_NS,
             "the healthy sink costs no injected time, so the deferrals are the \
              deadline's doing and not the pass's own cost"
+        );
+    }
+
+    /// A pass costs the notifications it attempts, not the queue it walks.
+    /// Behind a sink that never drains it, the undelivered queue grows without
+    /// bound, and a tick that is already past its deadline when delivery begins
+    /// attempts exactly one entry of it: exactly one request reaches the sink
+    /// and the other `QUEUED - 1` entries are deferred without being touched
+    /// beyond their queue positions.
+    #[tokio::test]
+    async fn a_deferred_pass_attempts_one_notification_out_of_a_long_queue() {
+        const QUEUED: usize = 32;
+
+        let clock = TestClock::at(NOW_NS);
+        // Costs no injected time per delivery, so the single attempt is the
+        // deadline's doing and not a cost this pass ran up itself.
+        let sink = recording_sink(Arc::clone(&clock), 0, "200 OK").await;
+        let mut ev = evaluator_with(
+            Arc::new(MemoryStore::new()),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::new(AlertMetrics::default()),
+        );
+
+        for i in 0..QUEUED {
+            let rule = Rule {
+                rule_id: format!("rule-{i:04}"),
+                ..threshold_rule()
+            };
+            let record = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+            let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+            ev.enqueue_if_absent(alert_id, AlertNotification::new(record, None, &rule.labels));
+        }
+        assert_eq!(ev.undelivered.len(), QUEUED);
+
+        let tick_start = NOW_NS - 2 * sink_delivery_budget_ns();
+        let mut report = AlertEvalReport::default();
+        ev.flush_sinks(tick_start, &mut report).await;
+
+        assert_eq!(
+            sink.seen().len(),
+            1,
+            "the pass makes one attempt, not one per queued notification; seen: {:?}",
+            sink.seen()
+        );
+        assert_eq!(
+            report.notifications_delivered, 1,
+            "the unconditional first attempt is the whole of this pass's delivery"
+        );
+        assert_eq!(
+            report.notifications_deferred,
+            QUEUED as u32 - 1,
+            "everything the pass did not attempt is deferred and counted"
+        );
+        assert_eq!(
+            ev.undelivered.len(),
+            QUEUED - 1,
+            "the deferred notifications are still queued, at their own places"
+        );
+        assert_eq!(
+            clock.now_ns(),
+            NOW_NS,
+            "no injected time passes, so the one attempt is not a timing artefact"
         );
     }
 
