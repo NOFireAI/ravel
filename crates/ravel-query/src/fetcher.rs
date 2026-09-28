@@ -179,14 +179,15 @@ fn retained_catalog_len(entries: &[SeriesEntryV4]) -> u64 {
 
 /// The series a catalog decode selected, and the reservation charging the
 /// decoded catalog to the memory budget (ADR-1702 decision 6) for as long as
-/// they are held. Derefs to the entries.
+/// they are held. Derefs to the entries. `None` holds nothing: a decode that
+/// retained no entries has nothing left to charge.
 struct DecodedCatalog {
     entries: Vec<SeriesEntryV4>,
-    reservation: ravel_memory::Reservation,
+    reservation: Option<ravel_memory::Reservation>,
 }
 
 impl DecodedCatalog {
-    fn into_parts(self) -> (Vec<SeriesEntryV4>, ravel_memory::Reservation) {
+    fn into_parts(self) -> (Vec<SeriesEntryV4>, Option<ravel_memory::Reservation>) {
         (self.entries, self.reservation)
     }
 }
@@ -1054,31 +1055,38 @@ impl SegmentFetcher {
     /// page fetches that follow, and charging the whole catalog for all of
     /// them overstates the query's memory for the rest of its life.
     ///
-    /// The full reservation is released before the retained one is taken,
-    /// which is the order that matches what is alive: the filter's `collect`
-    /// has already finished and dropped the decoded vector by the time this
-    /// runs, so only the retained entries exist. Releasing first also keeps
-    /// this query from being refused against headroom it is itself about to
-    /// give back; only another reserver landing in between can refuse a
-    /// shrink, and that refusal is the ordinary typed one.
+    /// This never fails: the decode it follows already succeeded, and a shrink
+    /// only gives memory back. The retained reservation is taken before the
+    /// held one is released, so a refusal (a concurrent reserver, or a
+    /// `reserve_unchecked` caller that pushed the budget over its limit) keeps
+    /// the held reservation and skips the shrink. A decode that retained no
+    /// entries releases what it holds and reserves nothing, since even a
+    /// zero-byte reservation is refused once the budget is over its limit.
     ///
     /// A retained figure at or above what is held keeps the existing
     /// reservation untouched, so this only ever shrinks: the pre-decode figure
     /// is an estimate over section bytes and the retained figure measures
     /// structs, and exchanging upward would turn a filter that retained
     /// everything into a new refusal point.
-    fn shrink_to_retained(&self, decoded: DecodedCatalog) -> Result<DecodedCatalog, FetchError> {
-        let retained = retained_catalog_len(&decoded.entries);
-        if retained >= decoded.reservation.size() {
-            return Ok(decoded);
+    fn shrink_to_retained(&self, decoded: DecodedCatalog) -> DecodedCatalog {
+        let held = decoded.reservation.as_ref().map_or(0, |r| r.size());
+        if decoded.entries.is_empty() {
+            return DecodedCatalog {
+                entries: decoded.entries,
+                reservation: None,
+            };
         }
-        let (entries, held) = decoded.into_parts();
-        drop(held);
-        let reservation = self.reserve_fetch(retained)?;
-        Ok(DecodedCatalog {
-            entries,
-            reservation,
-        })
+        let retained = retained_catalog_len(&decoded.entries);
+        if retained >= held {
+            return decoded;
+        }
+        match self.memory_budget.reserve(retained) {
+            Ok(reservation) => DecodedCatalog {
+                entries: decoded.entries,
+                reservation: Some(reservation),
+            },
+            Err(_) => decoded,
+        }
     }
 
     /// One store GET, bounded by the shared in-flight limiter. The permit
@@ -1711,7 +1719,7 @@ impl SegmentFetcher {
                 };
                 DecodedCatalog {
                     entries,
-                    reservation,
+                    reservation: Some(reservation),
                 }
             } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
                 let (entries, reservation) = self
@@ -1757,7 +1765,7 @@ impl SegmentFetcher {
                         .into_iter()
                         .filter(|e| matches_series(matchers, &e.entry.labels))
                         .collect(),
-                    reservation,
+                    reservation: Some(reservation),
                 }
             };
             accounting.add_series_matched(matched.len() as u64);
@@ -1769,7 +1777,7 @@ impl SegmentFetcher {
             // The decode was charged for the whole catalog; from here only the
             // matched entries are held, through the page fetches the caller
             // runs next.
-            self.shrink_to_retained(matched)
+            Ok(self.shrink_to_retained(matched))
         }
         .instrument(span.clone())
         .await
@@ -1872,7 +1880,7 @@ impl SegmentFetcher {
             .map_err(|source| corrupt(key, source))?;
         Ok(DecodedCatalog {
             entries,
-            reservation,
+            reservation: Some(reservation),
         })
     }
 
@@ -4498,6 +4506,100 @@ mod tests {
         );
         drop(decoded);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The two fixture series, decoded, with the decode's reservation dropped:
+    /// entries to hand `shrink_to_retained` under a budget the test controls.
+    async fn fixture_catalog_entries() -> (Arc<MemoryStore>, Vec<SeriesEntryV4>) {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fetcher = SegmentFetcher::new(backend);
+        let accounting = QueryAccounting::new();
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let decoded = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &[],
+                &accounting,
+            )
+            .await
+            .expect("decode catalog");
+        let (entries, _reservation) = decoded.into_parts();
+        assert_eq!(entries.len(), 2, "both fixture series decode");
+        (store, entries)
+    }
+
+    /// A decode whose matchers retained nothing gives its whole reservation
+    /// back, even when a `reserve_unchecked` caller has pushed the budget past
+    /// its limit on its own, where a zero-byte reservation is itself refused.
+    ///
+    /// FLIP: restore the release-then-`reserve_fetch(retained)?` body and the
+    /// zero-byte reserve is refused (`requested: 0, reserved: 4097, limit:
+    /// 4096`), so the shrink fails a decode that had already succeeded.
+    #[tokio::test]
+    async fn shrink_of_an_empty_decode_over_the_limit_releases_everything() {
+        let (store, _entries) = fixture_catalog_entries().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(4096));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let decoded = DecodedCatalog {
+            entries: Vec::new(),
+            reservation: Some(budget.reserve(4096).expect("the held figure fits")),
+        };
+        budget.reserve_unchecked(4097);
+        assert_eq!(budget.reserved(), 8193);
+
+        let shrunk = fetcher.shrink_to_retained(decoded);
+        assert!(shrunk.is_empty());
+        assert_eq!(
+            budget.reserved(),
+            4097,
+            "only the unchecked bytes stay charged once the empty decode shrinks"
+        );
+        drop(shrunk);
+        assert_eq!(budget.reserved(), 4097);
+        budget.release(4097);
+    }
+
+    /// A shrink the budget refuses keeps the held reservation and the entries,
+    /// rather than failing: the retained figure is reserved before the held
+    /// one is released, and a refusal leaves both where they were.
+    ///
+    /// FLIP: restore the release-then-reserve body and the held reservation
+    /// is gone before the retained one is taken, so the budget reads
+    /// `retained + 1` rather than `held + 1`.
+    #[tokio::test]
+    async fn refused_shrink_keeps_the_held_reservation() {
+        let (store, entries) = fixture_catalog_entries().await;
+        let retained = retained_catalog_len(&entries);
+        let held = 2 * retained;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(held));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let decoded = DecodedCatalog {
+            entries,
+            reservation: Some(budget.reserve(held).expect("the held figure fits")),
+        };
+        budget.reserve_unchecked(1);
+
+        let shrunk = fetcher.shrink_to_retained(decoded);
+        assert_eq!(shrunk.len(), 2, "the entries survive a refused shrink");
+        assert_eq!(
+            budget.reserved(),
+            held + 1,
+            "a refused shrink keeps the held reservation"
+        );
+        drop(shrunk);
+        assert_eq!(budget.reserved(), 1);
+        budget.release(1);
     }
 
     /// An object that does not qualify for the probe path keeps the
