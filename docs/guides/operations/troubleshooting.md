@@ -346,34 +346,46 @@ the row says which counters corroborate it.
 
 When a server's resident memory runs well above what its ledgers account for
 (`ravel_memory_reserved_bytes` plus `ravel_cache_resident_bytes`), first read
-`ravel_process_allocator_bytes` on `/metrics`. If `stat="resident"` sits far
-above `stat="allocated"`, the allocator is holding freed memory and no buffer
-is to blame. If the two are close, live buffers hold the memory, and a heap
-profile names the allocation sites.
+`ravel_process_allocator_bytes` on `/metrics`, which splits the process's
+memory three ways:
+
+- `stat="resident"` minus `stat="active"`: pages the allocator holds but has
+  not returned to the operating system. A large figure here is allocator
+  retention, and no buffer is to blame.
+- `stat="active"` minus `stat="allocated"`: size-class fragmentation inside
+  live allocations.
+- `stat="allocated"`: the live allocations themselves. If this is close to
+  resident, live buffers hold the memory, and a heap profile names the
+  allocation sites.
 
 1. Build the server with jemalloc's profiler compiled in. It is off by
-   default and not in the published image:
+   default and not in the published image. The binary lands at
+   `target/release/ravel-server`:
 
    ```sh
    cargo build --release -p ravel-server --features "sql heap-profiling"
    ```
 
-2. Start that binary with profiling turned on. On Linux the vendored
-   jemalloc reads `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`. `prof_gdump`
-   writes a dump at every new memory peak, and `lg_prof_sample:17` samples
-   about every 128 KiB allocated:
+2. Start that binary with profiling turned on. The vendored jemalloc is
+   built with an `_rjem_` symbol prefix, so it reads `_RJEM_MALLOC_CONF`,
+   not `MALLOC_CONF`. `prof_gdump` writes a dump at every new memory peak,
+   and `lg_prof_sample:17` samples about every 128 KiB allocated. jemalloc
+   does not create the dump directory, so make an empty one for each run:
 
    ```sh
-   _RJEM_MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:17,prof_gdump:true,prof_prefix:/tmp/ravel-heap/g \
-     ravel-server ...
+   mkdir -p /tmp/ravel-heap
+   _RJEM_MALLOC_CONF=prof:true,lg_prof_sample:17,prof_gdump:true,prof_prefix:/tmp/ravel-heap/g \
+     target/release/ravel-server ...
    ```
 
 3. Reproduce the workload, then read the last dump, which is the highest
-   peak, with `jeprof` (Debian and Ubuntu ship it in `libjemalloc-dev`):
+   peak, with `jeprof` (Debian and Ubuntu ship it in `libjemalloc-dev`). A
+   dump is named `g.<pid>.<seq>.u<n>.heap`, so the version sort below picks
+   the latest peak only while the directory holds a single run:
 
    ```sh
-   jeprof --text --inuse_space ./ravel-server "$(ls -1v /tmp/ravel-heap/g.*.heap | tail -1)"
-   jeprof --collapsed --inuse_space ./ravel-server "$(ls -1v /tmp/ravel-heap/g.*.heap | tail -1)"
+   jeprof --text --inuse_space target/release/ravel-server "$(ls -1v /tmp/ravel-heap/g.*.heap | tail -1)"
+   jeprof --collapsed --inuse_space target/release/ravel-server "$(ls -1v /tmp/ravel-heap/g.*.heap | tail -1)"
    ```
 
    `--collapsed` gives full stacks for grouping by the innermost Ravel frame.
