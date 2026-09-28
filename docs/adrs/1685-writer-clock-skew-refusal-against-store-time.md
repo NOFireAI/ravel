@@ -226,7 +226,8 @@ flowchart LR
      the retried data.
   3. ravel-server: render the two counters in the ingest family; add the
      alert rule to docs/guides/observability.md and the row to the
-     troubleshooting table.
+     troubleshooting table. (The third counter, from the teardown amendment,
+     joins this task: see the task-3 scope amendment below.)
   4. docs: docs/ingest.md flush-open section and the consistency-model
      paragraph update described above.
 
@@ -309,3 +310,13 @@ and neither does a lagging clock plus a single backwards step. The operator
 remedy is unchanged: fix the host clock before restarting a writer that is
 refusing flushes, and rebuild the catalog HEAD if a token-less read is
 missing rows a bypassed flush published.
+
+## Amendment (2026-09-28): task 3 renders all three clock-lag counters
+
+<!-- amendment-applies: sections="Consequences" pointer="task-3 scope amendment" -->
+
+The teardown amendment added a third counter, `clock_lag_bypassed_at_shutdown`,
+without assigning its rendering to a task. Follow-up task 3 now renders all
+three counters in the ingest family (`clock_lag_refused`,
+`clock_lag_unchecked` and `clock_lag_bypassed_at_shutdown`) and documents the
+third beside the other two, so no counter this ADR adds is left untracked.

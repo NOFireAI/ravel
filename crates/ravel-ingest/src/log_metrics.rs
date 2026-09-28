@@ -119,8 +119,8 @@ pub struct LogIngestMetrics {
     /// the attempts made before the first response was observed are expected,
     /// and they stay in the total for the life of the process. Growth is a
     /// wiring defect only against a store that observes a clock at all: a
-    /// `MemoryStore` never reports one, so on a deployment backed by it this
-    /// counter grows by design. Intended for
+    /// `MemoryStore` reports none unless a test sets one, so on a deployment
+    /// backed by it this counter grows by design. Intended for
     /// Prometheus export under the name
     /// `ravel_ingest_clock_lag_unchecked_total`.
     clock_lag_unchecked: AtomicU64,
