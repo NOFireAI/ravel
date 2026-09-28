@@ -60,8 +60,8 @@ use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
-    SPAN_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, idle_age_threshold,
-    memory_backstop_crossed, size_trigger_fires,
+    SPAN_SEGMENT_FORMAT_VERSION, StoreClockLag, checked_ingest_hour_bucket, idle_age_threshold,
+    memory_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
 use crate::metrics::FlushTrigger;
 use crate::span_error::SpanWriteError;
@@ -976,6 +976,19 @@ impl SpanShardActor {
     /// the cross-restart limitation.
     fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, FlushClockError> {
         checked_ingest_hour_bucket(raw_ns).map_err(FlushClockError::InvalidReading)?;
+        match store_clock_lag(raw_ns, self.ctx.store.observed_store_time_ns()) {
+            StoreClockLag::WithinAllowance => {}
+            StoreClockLag::Unobserved => self.metrics.record_clock_lag_unchecked(),
+            StoreClockLag::Refused(msg) => {
+                self.metrics.record_clock_lag_refused();
+                tracing::warn!(
+                    shard = self.shard,
+                    raw_ns,
+                    "ravel-ingest: span flush clock lags the object store's observed clock beyond the clock-skew allowance; refusing the flush"
+                );
+                return Err(FlushClockError::LagRefused(msg));
+            }
+        }
         if raw_ns >= self.last_flush_open_ns {
             self.last_flush_open_ns = raw_ns;
             return Ok(raw_ns);
@@ -1071,7 +1084,10 @@ impl SpanShardActor {
                     .ack_waiters(buf.waiters, Err(SpanWriteError::SegmentBuild(msg)));
                 return;
             }
-            Err(FlushClockError::RegressionRefused(msg)) => {
+            Err(FlushClockError::RegressionRefused(msg) | FlushClockError::LagRefused(msg)) => {
+                // A lag refusal (ADR-1685) takes this same path: counted as
+                // `clock_lag_refused` inside the helper, retryable once the host
+                // clock converges, and the floor was never consulted.
                 // Already counted as `clock_regressions_refused` inside the
                 // helper; a clock regression is a transient server condition the
                 // next flush recovers from, so it is retryable (`Abandoned`, 503),

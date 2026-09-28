@@ -187,7 +187,8 @@ flowchart LR
   answers every write with a retryable error until its clock converges. In
   buffered mode the rows stay buffered and retry each tick under the
   ADR-0069 byte budget, so a host whose clock never converges eventually
-  sheds at the ceiling. That is the same operator surface as
+  sheds at the ceiling (and loses them on a graceful shutdown: see the
+  teardown amendment below). That is the same operator surface as
   `clock_regressions_refused`: fix the host clock.
 - Two cases remain outside the check and are stated here rather than
   claimed closed. A process with no observation yet flushes unchecked and
@@ -257,3 +258,16 @@ The parser also clamps a leap second (`:60`) to `:59`, so a correct `Date`
 still yields a value no later than the instant the store stamped, which is
 what decision 3's lower-bound argument needs. A wrong `Date` can move the
 observation in either direction, as the Consequences already state.
+
+## Amendment (2026-09-28): teardown with a lagging clock
+
+<!-- amendment-applies: sections="Consequences" pointer="teardown amendment" -->
+
+The Consequences name shedding at the byte-budget ceiling as the end state
+for a writer whose clock never converges, but not the graceful-shutdown
+path. A shutdown drain retries the refused flush over a bounded number of
+passes and then reports the remaining buffered rows as residue, logged at
+ERROR and counted; they are lost. In buffered mode those rows were already
+acknowledged. This is the same outcome an over-bound clock regression
+already has at shutdown (ADR-1307), and the remedy is the same: fix the host
+clock before restarting a writer that is refusing flushes.

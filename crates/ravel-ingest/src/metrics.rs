@@ -173,6 +173,17 @@ pub struct IngestMetrics {
     /// separately. Intended for Prometheus export under the name
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     clock_regressions_refused: AtomicU64,
+    /// Flushes refused because the raw flush-open reading lagged the object
+    /// store's observed clock by more than the clock-skew allowance (ADR-1685):
+    /// the writer's clock is slow enough to publish into a sealed ingest hour.
+    /// Intended for Prometheus export under the name
+    /// `ravel_ingest_clock_lag_refused_total`.
+    clock_lag_refused: AtomicU64,
+    /// Flushes that opened with no store-clock observation yet, so the ADR-1685
+    /// lag check could not run and the flush proceeded unchecked. Nonzero past
+    /// a process's first minute is a wiring defect. Intended for Prometheus
+    /// export under the name `ravel_ingest_clock_lag_unchecked_total`.
+    clock_lag_unchecked: AtomicU64,
     /// Tenants still buffered after a TEARDOWN `flush_all` exhausted its
     /// bounded retry passes (ADR-1307 finding F1). A graceful drain re-buffers
     /// a clock-refused flush and retries it in the same call; this counts the
@@ -677,6 +688,14 @@ pub struct IngestMetricsSnapshot {
     /// bound (ADR-1307). Intended for export as
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     pub clock_regressions_refused: u64,
+    /// Flushes refused because the raw flush-open reading lagged the store's
+    /// observed clock beyond the clock-skew allowance (ADR-1685). Intended for
+    /// export as `ravel_ingest_clock_lag_refused_total`.
+    pub clock_lag_refused: u64,
+    /// Flushes that opened before any store-clock observation, so the ADR-1685
+    /// lag check did not run. Intended for export as
+    /// `ravel_ingest_clock_lag_unchecked_total`.
+    pub clock_lag_unchecked: u64,
     /// Tenants left buffered after a teardown `flush_all` (`Shutdown`, channel
     /// close) exhausted its retry passes (ADR-1307 finding F1): a lost
     /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
@@ -954,6 +973,18 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush refused because its raw reading lagged the store's observed
+    /// clock beyond the clock-skew allowance (ADR-1685).
+    pub(crate) fn record_clock_lag_refused(&self) {
+        self.clock_lag_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush that opened with no store-clock observation, so the ADR-1685
+    /// lag check did not run.
+    pub(crate) fn record_clock_lag_unchecked(&self) {
+        self.clock_lag_unchecked.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `count` tenants still buffered after a teardown `flush_all` drained
     /// (ADR-1307 finding F1). Called once per teardown drain that leaves a
     /// residue, with the residual tenant count; never from the `FlushNow`
@@ -1058,6 +1089,8 @@ impl IngestMetrics {
             series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
             clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
             clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            clock_lag_refused: self.clock_lag_refused.load(Ordering::Relaxed),
+            clock_lag_unchecked: self.clock_lag_unchecked.load(Ordering::Relaxed),
             flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
@@ -1108,6 +1141,9 @@ mod tests {
         metrics.record_series_id_collision();
         metrics.record_clock_regression();
         metrics.record_clock_regression_refused();
+        metrics.record_clock_lag_refused();
+        metrics.record_clock_lag_unchecked();
+        metrics.record_clock_lag_unchecked();
         metrics.record_flush_all_residue(2);
         metrics.record_partial_write();
         metrics.record_shard_death();
@@ -1130,6 +1166,8 @@ mod tests {
         assert_eq!(snap.series_id_collisions, 1);
         assert_eq!(snap.clock_regressions, 1);
         assert_eq!(snap.clock_regressions_refused, 1);
+        assert_eq!(snap.clock_lag_refused, 1);
+        assert_eq!(snap.clock_lag_unchecked, 2);
         assert_eq!(snap.flush_all_residue_tenants, 2);
         assert_eq!(snap.partial_writes, 1);
         assert_eq!(snap.shard_deaths, 1);
