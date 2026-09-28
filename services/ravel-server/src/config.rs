@@ -1850,14 +1850,17 @@ pub struct Cli {
     /// The dedicated TLS fragment listener address (ADR-0071 amendment decision
     /// 1): a fourth listener, alongside `--listen-http`, `--listen-grpc`, and
     /// `--mtls-listener`, that terminates TLS in-process and serves `Pinned`
-    /// fragment fetches ONLY. When set, the public gRPC listener stops serving
-    /// `Pinned` scope entirely (`Resolve`/federation stays there with ordinary
-    /// tenant credentials), and this listener rejects `Resolve` outright.
-    /// Requires `--distributed-query` and all three of `--fragment-tls-cert`,
-    /// `--fragment-tls-key`, and `--fragment-tls-ca`. Must not equal any other
-    /// listener address. Without this flag the fragment surface stays on the
-    /// public gRPC listener (the pre-amendment layout), so distribution keeps
-    /// working during a rolling deploy.
+    /// fragment fetches and SQL slice `DoGet` ONLY (ADR-1689 decision 1). When
+    /// set, the public gRPC listener stops serving `Pinned` scope entirely
+    /// (`Resolve`/federation stays there with ordinary tenant credentials) and
+    /// refuses SQL slice tickets, and this listener rejects `Resolve` and every
+    /// client Flight SQL method outright. Coordinators dial both lanes' slices
+    /// here over mutual TLS. Requires `--distributed-query` and all three of
+    /// `--fragment-tls-cert`, `--fragment-tls-key`, and `--fragment-tls-ca`.
+    /// Must not equal any other listener address. Without this flag the
+    /// fragment surface and SQL slices stay on the public gRPC listener, in
+    /// plaintext (the pre-amendment layout), so distribution keeps working
+    /// during a rolling deploy.
     #[arg(long = "fragment-listener", value_name = "ADDR")]
     pub fragment_listener: Option<SocketAddr>,
 
