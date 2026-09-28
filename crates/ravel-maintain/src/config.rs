@@ -1036,14 +1036,17 @@ pub struct CompactorConfig {
     /// this, and which is not the current-state record of any live identity
     /// (the keep set passed to [`crate::alert_retention::sweep_alert_retention`],
     /// ADR-1688 decision 2), is swept, horizon-gated on the record's durable
-    /// `created_unix_ns` and legal-hold-gated exactly as the audit retention and
-    /// superseded-input sweeps are. The window doubles as the evaluator's
+    /// `created_unix_ns` and gated on the caller-supplied
+    /// [`crate::sweep::LeaseCheck`] -- the same hook the audit retention and
+    /// superseded-input sweeps consult, which the server populates with the
+    /// tenant's legal holds. The window doubles as the evaluator's
     /// cold-start fold horizon (decision 4). Independent of [`RetentionConfig`]'s
     /// per-tenant ADR-0019 windows: alert transitions are a server-written
     /// history, not tenant data, and are not tombstone-gated through the
     /// resolver. Threaded through the config like every other sweep knob so
     /// `..CompactorConfig::default()` call sites are unaffected. Default
-    /// [`DEFAULT_ALERT_RETENTION_NS`] (90 days); `0` disables the sweep.
+    /// [`DEFAULT_ALERT_RETENTION_NS`] (90 days); `0`, or any negative value,
+    /// disables the sweep.
     pub alert_retention_window_ns: i64,
     /// Dry-run switch. When `true`, every maintenance path
     /// computes exactly the same eligible set and decision it would in a real
