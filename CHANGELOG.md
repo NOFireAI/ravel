@@ -297,6 +297,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The fold checks a previous postings object's tenant before reusing it**
+  (ADR-0050 section 2, ADR-1702, issue #2081). The fold's previous-postings
+  reuse path verified the object's blake3 and its binding to the HEAD's part
+  hashes, but never compared the declared `tenant_hash` with the tenant being
+  folded, which the query path has always done. A postings object naming
+  another tenant now fails the fold with the same typed field-mismatch error
+  the resolve path raises and is counted as an isolation breach, instead of
+  being reused or degrading into a quiet rebuild. The check reads the already
+  hash-verified header before the decode reservation, so neither the
+  part-binding degrade nor a memory refusal can mask it.
+- **A declared length over the decoder's ceiling is charged 0, not the
+  ceiling** (ADR-1702, the decode-refusal amendment, issue #2081). A decoder
+  refuses an oversized unit before it allocates anything, so reserving the
+  ceiling for one charged memory nobody would ask for, and turned that refusal
+  into a budget refusal on any budget with less than the ceiling free: a
+  snapshot part that should fall back to listing failed the query with a
+  memory error instead, and a PromQL catalog chunk frame lost its own typed
+  error the same way (a whole section over the ceiling is refused earlier,
+  when the segment is opened). Every decode reservation (snapshot parts,
+  postings and column statistics, PromQL catalog sections, and per-frame
+  `SERIES_META_CHUNKS`) now charges 0 for a declared length over its decoder's
+  ceiling and lets the decoder's refusal decide the outcome. Only the PromQL
+  fetcher half is visible in the shipped server, whose catalog budget is
+  unlimited.
+- **A refused decode reservation fails the fold instead of rebuilding its
+  postings from scratch** (ADR-1702, the decode-refusal amendment, issue
+  #2081). The fold answered a refused previous-postings reservation by
+  rebuilding the index from every segment's names, which fetches and decodes
+  far more than the one postings object the budget had just refused, so the
+  reaction to memory pressure took the more expensive path. It now fails with
+  the typed budget error, matching what the resolve path already did with the
+  same refusal; the next fold retries. The shipped server cannot reach this,
+  because its catalog budget is unlimited.
 - **The catalog's decoded-part and postings caches give memory back to a
   refused decode** (ADR-1702 decision 6, issue #2088). Both caches hold each
   decoded value together with its memory reservation and were bounded only by
