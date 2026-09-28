@@ -95,11 +95,14 @@ pub fn query_worker_key(process_id: &str) -> String {
 
 /// The process id a heartbeat key names, or `None` if the key is not a
 /// well-formed `sys/query/workers/<uuid>` key. Worker identity is the key, not
-/// the record body (mirrors [`crate::worker_set`]'s `process_id_of`): the key
-/// is the one thing a single writer alone controls, so deriving identity from
-/// it means a record whose body disagrees with its key cannot smuggle a false
-/// identity into the live set. `list_all` yields the prefix itself and any
-/// unexpected nested key under it; both parse to `None` and are skipped.
+/// the record body (mirrors [`crate::worker_set`]'s `process_id_of`), so a
+/// record whose body disagrees with its key cannot claim another worker's
+/// identity. It does not stop a new identity: the shipped query-role IAM grant
+/// allows `PutObject` across the whole `sys/query/workers/` prefix and records
+/// carry no MAC, so any principal holding that role can write a
+/// self-consistent record at a fresh UUID key and join the live set.
+/// `list_all` yields the prefix itself and any unexpected nested key under it;
+/// both parse to `None` and are skipped.
 fn process_id_of(key: &str) -> Option<Uuid> {
     let raw = key.strip_prefix(QUERY_WORKERS_PREFIX)?;
     Uuid::parse_str(raw).ok()
@@ -320,9 +323,11 @@ impl QueryWorkers {
     /// record body (mirrors [`crate::worker_set::WorkerSet::live_set`]): a key
     /// that is not a well-formed `sys/query/workers/<uuid>` is skipped, and a
     /// record whose body `process_id` disagrees with the id its key names is
-    /// skipped as malformed. A single writer alone controls its own key, so a
-    /// body/key mismatch means a corrupt or forged record and must not enter
-    /// the live set under either identity.
+    /// skipped as malformed, under either identity. That catches corruption and
+    /// a careless forgery. It does not establish that the writer was entitled
+    /// to the key: the shipped query-role IAM grant allows `PutObject` across
+    /// the whole prefix and records carry no MAC, so a self-consistent record
+    /// written at a fresh UUID key passes this check and enters the live set.
     ///
     /// A corrupt or mismatched sibling record is skipped (treated as absent,
     /// self-correcting next interval); only a failed LIST or GET is an `Err`,
