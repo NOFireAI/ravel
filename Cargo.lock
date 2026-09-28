@@ -4644,6 +4644,7 @@ dependencies = [
  "crc32c",
  "hex",
  "humantime",
+ "opentelemetry-proto",
  "parquet",
  "pprof",
  "proptest",

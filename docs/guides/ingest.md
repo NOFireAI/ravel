@@ -620,14 +620,21 @@ A record with neither `time_unix_nano` nor `observed_time_unix_nano` set
 
 ## Bulk import (`ravel-cli load --parquet`)
 
-OTLP is the only *networked* way to write logs. For loading an existing
+OTLP is the only *networked* way to write to Ravel. For loading an existing
 structured dataset offline (a Parquet export, an archive migration, a
-historical backfill), `ravel-cli load` imports a Parquet file into the logs
-signal:
+historical backfill), `ravel-cli load` imports a Parquet file into the signal
+`--signal` names:
 
 ```sh
 ravel-cli load --parquet events.parquet --tenant acme --mapping map.toml --shards 4
+ravel-cli load --signal metrics --parquet samples.parquet --tenant acme \
+  --mapping metrics.toml --shards 4
 ```
+
+`--signal` defaults to `logs`, so an invocation written before the flag
+existed is unaffected. `--signal metrics` loads the metrics signal ([Loading
+metrics](#loading-metrics) below). `--signal spans` is refused by name until
+the spans loader lands, and never falls back to another signal.
 
 The loader is an in-process caller of the same log ingest router OTLP uses --
 the same shard actors, flush cadence, and commit protocol, not a parallel write
@@ -663,7 +670,15 @@ the per-row string path; both produce identical output.
 
 ### The `--mapping` TOML
 
-The mapping declares how source Parquet columns become record fields. Resource
+The mapping declares how source Parquet columns become record fields. It
+carries exactly one signal section -- `[logs]`, `[metrics]` or `[spans]` --
+and that section must match `--signal`. A mapping
+written before the sections existed, whose logs keys sit at the document root with no
+section at all, is still read as the `[logs]` section, so no existing mapping
+file needs migrating. Mixing the two spellings in one file is refused: with
+both present there is no rule saying which one a load would use.
+
+The logs section declares how source columns become record fields. Resource
 attributes determine stream identity and are declared separately from
 record attributes, which never enter identity:
 
@@ -705,6 +720,135 @@ rejects it there). So a query comparing against a mapped date column compares
 against that raw day or millisecond integer, not a timestamp -- e.g. a `Date32`
 for 2024-05-16 is the integer `19876`.
 
+### Loading metrics
+
+`--signal metrics` provisions or validates the tenant's metrics signal, builds
+an `IngestRouter` from the same configuration the logs load uses, and writes
+every batch with strict acknowledgement, exactly as the logs path does. What
+differs is the mapping and the normalization.
+
+```toml
+[metrics]
+name_column  = "metric"   # a column, OR name = "http.server.duration"
+value_column = "value"
+ts_column    = "ts"
+ts_unit      = "millis"   # seconds | millis | micros | nanos
+unit         = "s"        # optional UCUM unit (see below)
+kind         = "counter"  # optional: gauge (default) | counter
+
+[[metrics.label]]
+name   = "job"
+column = "svc"
+
+# Optional classic-histogram shape. With it, one input row is one bucket.
+[metrics.histogram]
+le_column    = "le"
+sum_column   = "sum"
+count_column = "count"
+```
+
+A label cell that is null is omitted from the series, and so is one holding
+the empty string: an empty attribute value is dropped before the label set is
+built on every ingest path, so `{job=""}` and `{}` are one series,
+not two. A non-string label column is stringified -- a float through the same
+Go-compatible formatter the `le` label uses, so two columns carrying the same
+number never produce two series.
+
+#### The name is normalized exactly as OTLP normalizes it
+
+**A metric loaded here lands on the same `SeriesId` as the same metric
+admitted over OTLP.** That is a property of the loader, not a coincidence of
+how a mapping is written, and it is what makes a bulk import and a live
+OTLP feed of the same metric one series rather than two. The loader applies
+the OTLP name pipeline (`ravel_otlp::normalize`) in the same order:
+
+1. the raw name is checked against the metric-name length cap;
+2. every character outside the Prometheus metric-name set is rewritten to `_`,
+   so `http.server.duration` becomes `http_server_duration`; each mapped label
+   name goes through the same rewrite for label names, so `http.method`
+   becomes `http_method`;
+3. the `unit` key's UCUM value selects a suffix by the OTLP-to-Prometheus
+   unit table (`s` gives `_seconds`, `By` gives `_bytes`, `1` gives `_ratio` on a
+   gauge), appended unless the name already ends with it;
+4. `kind = "counter"` sets `is_monotonic_sum` on every point and appends
+   `_total`, exactly as a monotonic OTLP `Sum` does, again unless the name
+   already ends with it.
+
+So `name = "http.server.request"`, `unit = "1"`, `kind = "counter"` stores
+`http_server_request_total`. Declare `unit` when the source data has one: a
+mapping that omits it stores an unsuffixed name, which is a *different series*
+from the same metric arriving over OTLP with its unit set. See [metric
+metadata and OTLP name suffixing](#metric-metadata-and-otlp-name-suffixing)
+for the suffix table itself.
+
+`kind` may not be set together with `[metrics.histogram]`: OTLP has no
+monotonic histogram, every series a classic histogram explodes into is
+non-monotonic, and its family name takes no `_total`. The combination is
+refused rather than ignored.
+
+#### Classic histograms: one row is one bucket
+
+With `[metrics.histogram]`, **one input row is one bucket of one data point**,
+and a data point is a contiguous run of rows sharing a metric name, label set
+and `ts`:
+
+| ts | le | value | sum | count | svc |
+| --- | --- | --- | --- | --- | --- |
+| 1700000000000 | 0.1 | 2 | 12.5 | 7 | api |
+| 1700000000000 | 1.0 | 3 | 12.5 | 7 | api |
+| 1700000000000 | 10.0 | 1 | 12.5 | 7 | api |
+
+- the `value` column is that bucket's **own** count (the OTLP `bucket_counts`
+  convention), not a running total. The loader accumulates, so an
+  already-cumulative Prometheus `_bucket` export must be de-accumulated before
+  it is loaded. The three rows above store cumulative bucket values 2, 5, 6;
+- `le` is that bucket's explicit upper bound and must be finite. The `+Inf`
+  bucket is **not a row**: it is synthesized from the `count` column, matching
+  OTLP, where `explicit_bounds` carries only the finite bounds. Bounds must
+  strictly increase in row order;
+- `sum` and `count` describe the whole data point, so every row of one group
+  must repeat the same values; a row that disagrees is refused, naming the
+  first row of its group. A null `sum` cell emits no `_sum` series, matching an
+  OTLP data point with no `sum` field;
+- the group explodes into `<name>_bucket` (one per bound plus `+Inf`),
+  `<name>_sum` and `<name>_count`, the same series
+  `ravel_otlp::normalize`'s `explode_histogram` produces.
+
+Counts are whole numbers: a fractional `value`, `count` or bucket count is
+refused rather than truncated, and an integer column is read as an integer, so
+a count above 2^53 survives.
+
+**Sort each data point's rows together.** The grouping reads a contiguous run,
+and a group whose identity was already closed earlier in the file is refused
+rather than exploded twice, since two explosions of one `(series, ts)` would
+write two conflicting cumulative ladders. Interleaved bucket rows are a
+rejection, not a silent misread.
+
+A metrics load therefore reads **one sequential cursor**, not the logs path's
+K stride cursors: a stride read interleaves far-apart file regions inside one
+batch, which would split every contiguous run. `--read-cursors` and
+`--decode-queue-batches` change nothing here and the loader warns when either
+was set to a value it ignores. Everything that shapes the objects
+(`--shards`, `--batch-rows`, `--target-bytes`, `--max-inflight-flushes`,
+`--max-flush-delay`, `--pipeline-depth`) applies unchanged.
+
+A data point may span a batch boundary: the open group is carried into the
+next batch and closed there. Its rows are credited to the write that carries
+its points and to no earlier one, so `rows_written` -- and the
+`next --skip-rows` offset a failed run prints -- always lands on a group
+boundary. Resuming there loads the next data point whole rather than a
+truncated one.
+
+#### Historical samples bucket by load time
+
+As for logs, a metric sample buckets by the *flush-open wall clock*, not by
+its event time. A thirty-day-old sample lands in today's
+ingest hour, retention and GC for it run from the **load hour**, a folded
+catalog sees the bulk objects in the load hour, and the sample's own event
+range is what decides query overlap. Query bulk-loaded metrics with a window
+that reaches now. The sort advice below applies unchanged: unsorted input
+costs every later query the bulk objects' fetch.
+
 ### Which admission rules this path keeps, relaxes, and bypasses
 
 - **Future skew: kept.** The loader enforces the same `max_future_skew_ns`
@@ -728,8 +872,10 @@ for 2024-05-16 is the integer `19876`.
   [late and skewed data](../consistency-model.md#late-and-skewed-data) for the
   paired admission/discoverability bound this relies on. **Query bulk-loaded data with
   a window that reaches now, not just the records' event times.**
-- **Per-record attribute cap: relaxed** from OTLP's 128 to a loader-specific
-  1024. Bulk import is an operator-initiated, offline action over a file the
+- **Per-record attribute cap: relaxed** to a loader-specific 1024, from the
+  OTLP cap of the signal it stands in for: 128 attributes per log record, 64
+  per metric data point, 128 per span. Bulk import is an operator-initiated,
+  offline action over a file the
   operator already controls -- a different threat model than a networked sender.
   This 1024 cap is a *per-record* axis and is unrelated to the RLOG object's
   1000-distinct-`(name, type)` dynamic-column budget: past that per-object
@@ -858,6 +1004,13 @@ at `rows_skipped + rows_written` re-ingests them. The error is one-sided by
 construction: the offset never skips a row that landed, it can only repeat
 one, and a duplicate is visible in the data where a gap is not.
 
+A metrics load always reads one cursor, so only `--pipeline-depth 1` is left
+to arrange. On a classic-histogram mapping the offset is additionally a group
+boundary: `rows_written` counts only the rows of data points whose points a
+write acked, so a resume loads the next data point whole rather than starting
+part-way through its buckets (see [Classic histograms: one row is one
+bucket](#classic-histograms-one-row-is-one-bucket)).
+
 At the default settings, treat `--skip-rows` as a deliberate positional tool
 instead: splitting one file across several runs at offsets **you** chose (rows
 `0..10000000` in one run, `--skip-rows 10000000` in the next), where the
@@ -902,9 +1055,11 @@ ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
 
 **Logs only.** `--signal` has no default, and today it accepts only `logs`.
 `--signal metrics` and `--signal spans` are refused by name: bulk export for a
-signal is sequenced behind bulk import for that signal, neither metrics import
-nor spans import exists yet, and an exported file that no command can load back
-is not an export. The refusal says which missing piece each one waits on.
+signal is sequenced behind bulk import for that signal, and an exported file
+that no command can load back is not an export. `load --signal metrics` has
+landed ([Loading metrics](#loading-metrics)); metrics export is the next piece
+of the sequence, and spans have neither half yet. The refusal says
+which missing piece each one waits on.
 
 ### What the window means
 

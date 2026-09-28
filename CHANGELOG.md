@@ -152,6 +152,68 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ravel-cli load` takes `--signal {metrics,logs,spans}` and loads the
+  metrics signal** (ADR-1751 decisions 1 and 2, follow-up task 1, issues
+  #1751 and #1712). The flag defaults to `logs`, so an invocation written
+  before this change is unaffected. A metrics load provisions or validates
+  the metrics signal, builds an `IngestRouter` from the same
+  `build_ingest_config` the logs load uses, and writes every batch in
+  `WriteMode::Strict`; ADR-0089's admission decisions apply per signal, with
+  the metrics OTLP limits (past event-time lag relaxed, future skew kept,
+  metric-name and label length caps kept, the loader per-record cap of 1024
+  in place of OTLP's `max_attributes_per_point`, the server's admission
+  controller bypassed by construction). `--signal spans` is refused with a
+  message naming ADR-1751 follow-up task 2 and never falls back to another
+  signal.
+
+  The `--mapping` TOML gains per-signal sections: exactly one of `[logs]`,
+  `[metrics]` and `[spans]` may be present and it must match `--signal`. A
+  mapping file written before this change needs no migration: its logs keys
+  sit at the document root with no section, and that shape is still read as
+  the `[logs]` section. Mixing the two spellings in one file is refused,
+  since which one wins would otherwise be an invisible precedence rule.
+
+  The `[metrics]` section names the metric (a literal `name` or a
+  `name_column`), `value_column`, `ts_column` and `ts_unit`, an optional
+  `unit`, `[[metrics.label]]` columns, an optional `kind` of `gauge` or
+  `counter` that sets `is_monotonic_sum`, and an optional
+  `[metrics.histogram]` classic shape (`le_column` plus `sum_column` and
+  `count_column`). A loaded metric lands on the same `SeriesId` as the same
+  metric admitted over OTLP: the metric name and every label name go through
+  the same sanitizers `ravel_otlp::normalize` applies, then the same
+  `prometheus_family_name` suffix pass, so `unit = "s"` stores `_seconds` and
+  `kind = "counter"` stores `_total` exactly as a monotonic OTLP `Sum` does.
+  A label cell holding the empty string is dropped from the series, as OTLP
+  drops an empty attribute value, so `{job=""}` and `{}` are one series on
+  both paths. `kind` may not be set together with `[metrics.histogram]`:
+  OTLP has no monotonic histogram, and the key would otherwise name a
+  behaviour the load cannot produce. With the
+  histogram shape one input row is one bucket, and its `value` column is that
+  bucket's own count (the OTLP `bucket_counts` convention, not an
+  already-cumulative Prometheus `_bucket` value): the loader groups a
+  contiguous run of rows sharing a metric name, label set and `ts` into one
+  data point and explodes it into `_bucket`/`_sum`/`_count` series mirroring
+  `ravel_otlp::normalize`'s `explode_histogram`, accumulating the per-bucket
+  counts, taking the `+Inf` bucket and `_count` from the `count` column
+  rather than from the accumulated total, and formatting `le` through
+  `ravel_otlp::promcompat::format_float`, so the same histogram lands on the
+  same `SeriesId` whichever surface admitted it. A mapping that names a
+  native (exponential) histogram is rejected. Rows of one data point must be
+  contiguous; interleaved rows are refused rather than exploded twice.
+
+  A metrics load reads one sequential cursor rather than the logs path's K
+  stride cursors, because a classic histogram's data point is a contiguous
+  run of rows a stride read would split, and it warns when `--read-cursors`
+  or `--decode-queue-batches` was set to a value it therefore ignores.
+  Everything that shapes the objects (`--shards`, `--batch-rows`,
+  `--target-bytes`, `--max-inflight-flushes`, `--max-flush-delay`,
+  `--pipeline-depth`) applies unchanged. A data point may span a batch
+  boundary; its rows are credited to the write that carries its points, so
+  `rows_written` and the `next --skip-rows` offset a failed load prints
+  always land on a data-point boundary and a resume loads the next data point
+  whole rather than a truncated one. As for logs, a historical sample buckets
+  by load time, so retention runs from the load hour and a query needs a
+  window that reaches it.
 - **A documentation claims registry and its gate** (ADR-1658, issue #1658).
   `docs/review/claims.yaml` records, for each registered sentence of a normative
   doc, what it claims, whether the code agrees, and the code or test that makes
