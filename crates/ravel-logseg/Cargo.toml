@@ -18,6 +18,7 @@ rust-version.workspace = true
 stage-timing = []
 
 [dependencies]
+bytes = { workspace = true }
 ravel-codec = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-types = { workspace = true }

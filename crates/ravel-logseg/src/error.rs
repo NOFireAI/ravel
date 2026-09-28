@@ -28,6 +28,12 @@ pub enum LogSegError {
     UnsupportedVersion(u16),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
+    /// A read of `[start, end)` from a [`crate::source::SparseObject`] that
+    /// holds none, or not all, of it: the range is inside the object but no
+    /// placed region covers it. Distinct from `Corrupted` because the object
+    /// may be sound; the read asked for bytes its fetch never placed.
+    #[error("read of [{start}, {end}) outside the placed regions")]
+    Unplaced { start: u64, end: u64 },
     /// Records handed to one writer share a `stream_id` but carry different
     /// `stream_attrs` bytes, so the object has no single truthful STREAM_DIR
     /// blob for that stream. Either a caller bug or a stream-id hash

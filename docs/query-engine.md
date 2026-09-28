@@ -737,10 +737,14 @@ tied to the buffer it accounts for:
   coalesced run lengths, reserved once ahead of the concurrent GETs. The guard
   is held by the `FetchedRegions` the runs fill, so it releases when those
   region bytes drop.
-- **RLOG block-range fetch** (`BlockRangeFetcher`): the object size at the
-  `ObjectAssembler` that reassembles a covering read (the guard travels with
-  the assembled `Bytes`), and the summed range lengths ahead of the concurrent
-  GETs in `fetch_blocks` and `fetch_chunk_ranges`.
+- **RLOG block-range fetch** (`BlockRangeFetcher`): a ranged read holds only
+  the regions it placed, with no object-sized buffer. Each GET that places
+  bytes reserves its length first; the chunk runs of `fetch_chunk_ranges` and
+  the blocks of `fetch_blocks` are reserved as one summed length ahead of
+  their concurrent GETs. The guards travel with the placed regions to the
+  reader and release when it drops them. A covering read reserves the object
+  size once and, when segmented at the fetch bound, keeps its sub-ranges as
+  fetched.
 - **RLOG / RSPAN whole-object fetch** (`whole_object_bytes`, and the RSPAN
   `fetch`): the object size, with the guard attached to the returned `Bytes`.
 
@@ -764,11 +768,11 @@ typed `FetchMemoryExhausted { requested, reserved, limit }` (on each fetcher's
 error enum), mapped onto the query error path. The refusal carries only byte
 counts -- never an object key or tenant identity -- and is never a smaller fetch
 or a partial result: no GET is issued for the refused bytes, and the budget is
-left unchanged. This holds before any GET for the RSEG range, whole-object, and
-block-range object-assembly reservations. The transient summed-run
-reservations in `fetch_blocks`/`fetch_chunk_ranges` are taken after the probe
-and directory-section GETs, so a refusal there aborts a read that has already
-issued those GETs.
+left unchanged. This holds before any GET for the RSEG range, whole-object and
+covering reservations. A ranged RLOG read reserves per placement, so a refusal
+after its probe and directory-section GETs aborts a read that has already
+issued those; the refused GET itself is never issued, and the regions already
+placed release with the read.
 
 **Decoded output (ADR-1702 decision 6).** The PromQL catalog decode is charged
 to the same budget before it runs. `SegmentFetcher::decode_selected` (and
@@ -1225,13 +1229,13 @@ engine, or SQL session is constructed. See
 reference.
 
 The permit bounds GETs in flight, not fetch tasks in flight. An RLOG
-block-range read builds its object assembler (charged to the assembly pool)
-before its first extent asks the limiter for a permit, so when
-`promql_fetch_fanout` or `sql_partition_count` exceeds `store_get_concurrency`,
-up to that many object-sized assemblies can wait behind the limiter at once.
-Peak assembly memory therefore follows the fan-out setting, and an operator
-who raises fan-out without raising GET concurrency trades store pressure for
-memory, not for nothing.
+block-range read holds the regions it has already placed while its next
+extent waits for a permit, so when `promql_fetch_fanout` or
+`sql_partition_count` exceeds `store_get_concurrency`, up to that many
+partially assembled reads can wait behind the limiter at once. Peak assembly
+memory therefore follows the fan-out setting times the bytes each read places
+(not the object size), and an operator who raises fan-out without raising GET
+concurrency trades store pressure for memory, not for nothing.
 
 `EngineConfig::validate` rejects zero on `fetch_concurrency` and on each
 knob's resolved value (an explicit override of `0`, not just an unset one),
@@ -3423,11 +3427,12 @@ configuration raises that bound above the old
 `min(target_partitions, segment_count)` one; an un-cached deployment's bound is
 unchanged by ADR-0102. Raw bytes behave differently on the two read shapes: at
 or below the threshold every partition shares one cached whole-object `Bytes`
-(a cheap clone), while above it each partition assembles its own object-sized
-buffer with only the fetched extents populated, so resident raw bytes are
-`n × object_size` even though bytes on the wire are pruning-proportional. The
-same test measures it: 8 partitions × 906,791 bytes = 7,254,328 resident bytes
-for one segment. The per-query DataFusion pool enforces the decoded bound either
+(a cheap clone), while above it each partition holds only the regions its own
+ranged read placed, so resident raw bytes are at most `n ×` the placed bytes
+rather than `n × object_size`; with the cache wired, each region is offered to
+the cache, and the ones it admits are shared by the partitions that read them
+rather than copied per partition. The per-query
+DataFusion pool enforces the decoded bound either
 way: a partition count that would exceed the budget fails the query rather than
 spilling (ADR-0013).
 
