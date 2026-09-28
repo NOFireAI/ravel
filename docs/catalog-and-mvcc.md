@@ -1338,6 +1338,22 @@ pinning are unchanged:
    refusing today. The segment fetcher's own decode reservations
    (docs/query-engine.md) are already wired to the process budget and do
    refuse.
+   With `Catalog::with_read_gate` (ADR-1702 decision 4), the part,
+   postings and column-statistics decodes run as jobs on the read CPU gate
+   instead of on the resolving task, each sized by its declared
+   uncompressed length, so a unit below the gate's inline floor still runs
+   inline. The header checks and the reservation above still run first,
+   and the reservation moves into the job with the object's bytes. A job
+   the gate cannot complete (the decode panicked, or the runtime dropped
+   the job before it ran while shutting down) fails that object's decode
+   with `SnapshotFormatError::DecodeJob`, and the resolve treats it like
+   any other decode error of that object without the object being
+   corrupt: a part falls back to listing (step 2), a postings object
+   disables pruning for the resolve, and a column-statistics object leaves
+   its part uncovered and is counted as a refused decode, with the
+   statistics loaded from the other parts cached for that HEAD as usual.
+   Without a gate every decode runs on the resolving task. The server does
+   not install the gate yet.
 2. On any other failure in step 1 (HEAD absent, corrupt, part missing or
    hash-mismatched, postings content-hash or entry-count mismatch): log,
    fall back to full listing for the whole window. Queries never
