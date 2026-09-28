@@ -70,7 +70,7 @@ else
     have_result="no"
     grep -q "refs/heads/task/${tid}/start$" <<<"${remote_refs}" && have_start="yes"
     grep -q "refs/heads/task/${tid}/result$" <<<"${remote_refs}" && have_result="yes"
-    if pr_info=$(gh pr list --state all --head "task/${tid}/merge" --limit 5 \
+    if pr_info=$(gh pr list --state all --head "task/${tid}/merge" --limit 100 \
       --json number,state \
       --jq '(map(select(.state == "MERGED")) + .)[0] // empty | "#\(.number) \(.state)"' \
       2>/dev/null); then

@@ -327,8 +327,9 @@ fleet_task_verdict() {
   local env_file="${RAVEL_FLEET_CP_ENV:-${HOME}/.fleet/cp.env}"
   local url="${FLEET_CP_URL:-${FLEET_PUBLIC_URL:-}}" token="${FLEET_ENQUEUE_TOKEN:-}"
   if [[ -r "${env_file}" ]]; then
-    [[ -n "${url}" ]] || url="$(sed -n 's/^FLEET_PUBLIC_URL=//p' "${env_file}" | head -1 | tr -d "\"'")"
-    [[ -n "${token}" ]] || token="$(sed -n 's/^FLEET_ENQUEUE_TOKEN=//p' "${env_file}" | head -1 | tr -d "\"'")"
+    # Accepts `KEY=value` and `export KEY=value`, with or without indentation.
+    [[ -n "${url}" ]] || url="$(sed -E -n 's/^[[:space:]]*(export[[:space:]]+)?FLEET_PUBLIC_URL=//p' "${env_file}" | head -1 | tr -d "\"'")"
+    [[ -n "${token}" ]] || token="$(sed -E -n 's/^[[:space:]]*(export[[:space:]]+)?FLEET_ENQUEUE_TOKEN=//p' "${env_file}" | head -1 | tr -d "\"'")"
   fi
   if [[ -z "${url}" || -z "${token}" ]]; then
     echo "UNRESOLVED no control-plane URL or token (set FLEET_CP_URL and FLEET_ENQUEUE_TOKEN)"
@@ -353,16 +354,16 @@ fleet_task_verdict() {
     echo "UNRESOLVED control plane answered HTTP ${code}"
     return
   fi
-  local status result_ref
-  status="$(jq -r '.status // ""' "${out}" 2>/dev/null || true)"
+  local cp_status result_ref
+  cp_status="$(jq -r '.status // ""' "${out}" 2>/dev/null || true)"
   result_ref="$(jq -r '.result_ref // ""' "${out}" 2>/dev/null || true)"
   rm -f "${out}"
-  case "${status}" in
+  case "${cp_status}" in
     queued | pending | waiting | claimed | running)
-      echo "RUNNING ${status}"
+      echo "RUNNING ${cp_status}"
       ;;
     failed | cancelled | canceled | expired)
-      echo "DEAD ${status}"
+      echo "DEAD ${cp_status}"
       ;;
     done)
       # Only reached with no result ref on origin: a done task whose ref
@@ -370,7 +371,7 @@ fleet_task_verdict() {
       echo "DEAD done, but its result ref ${result_ref:-(none)} is not on origin"
       ;;
     *)
-      echo "UNRESOLVED control plane status '${status}' is not one this script classifies"
+      echo "UNRESOLVED control plane status '${cp_status}' is not one this script classifies"
       ;;
   esac
 }
@@ -423,7 +424,7 @@ cmd_reconcile() {
     # a `--limit N` sweep silently drops every older PR, and a landed task
     # then reads LOST.
     rc=0
-    pr_row="$(gh pr list --state all --head "task/${task}/merge" --limit 5 \
+    pr_row="$(gh pr list --state all --head "task/${task}/merge" --limit 100 \
       --json number,state --jq '.[] | "\(.number)\t\(.state)"' 2>/dev/null)" || rc=$?
     if ((rc != 0)); then
       die "UNKNOWN: gh pr list for task/${task}/merge failed (exit ${rc}); pull-request state could not be read." 65
