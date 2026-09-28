@@ -2813,6 +2813,23 @@ fn render_runtime_family(out: &mut String, mode: Mode, runtime: &RuntimeSnapshot
     }
 }
 
+/// The ADR-1702 decision 11 heartbeat age, `{mode}` only: time since the
+/// heartbeat task on the main runtime last beat, rendered in every mode.
+fn render_heartbeat_age_family(out: &mut String, mode: Mode, age: std::time::Duration) {
+    write_header(
+        out,
+        "ravel_health_heartbeat_age_seconds",
+        "Time since the main runtime's heartbeat task last ran. It beats every second; a growing value means the main runtime is not scheduling the heartbeat task.",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_health_heartbeat_age_seconds",
+        &[Label::Mode(mode)],
+        age.as_secs_f64(),
+    );
+}
+
 /// The logs prune-selectivity family (ADR-0049):
 /// blocks the logs scans saw, survived, and pruned by postings, cumulative
 /// across queries. Reads the `LogsScanExec` DataFusion counters that
@@ -6346,6 +6363,11 @@ pub struct MetricsState {
     /// `ravel_catalog_fold_loop_restarts_total`, which renders under the same
     /// `Mode::runs_scheduled_fold` gate as the liveness gauge.
     pub fold_loop: Arc<crate::fold::FoldLoopMetrics>,
+    /// The ADR-1702 runtime heartbeat, the same one the `--listen-health`
+    /// listener reads when it is bound. Always present: `crate::start` builds
+    /// and beats one in every mode. Read at scrape time for
+    /// `ravel_health_heartbeat_age_seconds`.
+    pub heartbeat: crate::health_listener::Heartbeat,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -6625,6 +6647,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     if let Some(runtime) = RuntimeSnapshot::current() {
         render_runtime_family(&mut body, state.mode, &runtime);
     }
+    render_heartbeat_age_family(&mut body, state.mode, state.heartbeat.age());
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -7018,6 +7041,67 @@ mod tests {
                 "{family} renders one sample per gate"
             );
         }
+    }
+
+    /// `ravel_health_heartbeat_age_seconds` reads the heartbeat's injected
+    /// clock: it grows while the clock advances with no beat, and a beat
+    /// resets it to zero.
+    #[test]
+    fn heartbeat_age_gauge_grows_while_the_heartbeat_is_stopped() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        struct StepClock(AtomicI64);
+        impl ravel_ingest::Clock for StepClock {
+            fn now_ns(&self) -> i64 {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+
+        let clock = Arc::new(StepClock(AtomicI64::new(1_800_000_000_000_000_000)));
+        let heartbeat = crate::health_listener::Heartbeat::new(clock.clone());
+        let render = || {
+            let mut body = String::new();
+            render_heartbeat_age_family(&mut body, Mode::Query, heartbeat.age());
+            body
+        };
+        let sample = |body: &str| {
+            let lines: Vec<&str> = body
+                .lines()
+                .filter(|line| line.starts_with("ravel_health_heartbeat_age_seconds{"))
+                .collect();
+            assert_eq!(lines.len(), 1, "one sample:\n{body}");
+            lines[0].to_string()
+        };
+
+        let body = render();
+        assert_eq!(
+            body.matches("# TYPE ravel_health_heartbeat_age_seconds gauge\n")
+                .count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            sample(&body),
+            "ravel_health_heartbeat_age_seconds{mode=\"query\"} 0"
+        );
+
+        clock.0.fetch_add(2_500_000_000, Ordering::SeqCst);
+        assert_eq!(
+            sample(&render()),
+            "ravel_health_heartbeat_age_seconds{mode=\"query\"} 2.5"
+        );
+        clock.0.fetch_add(60_000_000_000, Ordering::SeqCst);
+        assert_eq!(
+            sample(&render()),
+            "ravel_health_heartbeat_age_seconds{mode=\"query\"} 62.5",
+            "the age keeps growing while nothing beats"
+        );
+
+        heartbeat.beat();
+        assert_eq!(
+            sample(&render()),
+            "ravel_health_heartbeat_age_seconds{mode=\"query\"} 0"
+        );
     }
 
     /// The POSTINGS family renders one sample per metric for the

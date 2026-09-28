@@ -245,6 +245,8 @@ rule on thread placement.
     `ravel_runtime_alive_tasks`, `ravel_runtime_global_queue_depth` and, on
     64-bit targets, `ravel_runtime_worker_busy_seconds_total{worker}`.
     `ravel_health_heartbeat_age_seconds` comes from the health listener.
+    (Corrected by the heartbeat age source amendment below: the value
+    comes from the decision 9 runtime heartbeat, in every mode.)
     No metric needs `tokio_unstable`.
 
 12. **What the gate does not cover.** DataFusion operator CPU (sort,
@@ -523,3 +525,15 @@ descriptor's uncompressed length". None changes where decode runs.
   before the body is reserved, so memory
   pressure never turns a tenant breach or a stale binding into a retryable
   refusal.
+
+## Amendment (2026-09-28): where the heartbeat age comes from
+
+<!-- amendment-supersedes: phrase="`ravel_health_heartbeat_age_seconds` comes from the health listener" pointer="heartbeat age source amendment" -->
+
+Decision 11 said `ravel_health_heartbeat_age_seconds` is read from the health
+listener. The listener exists only when `--listen-health` is set, and the
+metric renders in every mode without it. The value comes from the decision 9
+runtime heartbeat, which the server builds and beats on the main runtime in
+every mode. `/metrics` reads its age at scrape time, and the health listener,
+when configured, reads the same heartbeat for its `/healthz` and `/readyz`
+verdicts, so the gauge and the probes never disagree about the age.

@@ -597,27 +597,37 @@ async fn main() -> anyhow::Result<()> {
         max_ingest_lag,
     };
 
-    // The --listen-health listener (ADR-1702 decisions 8 and 9) binds before
-    // `start` so the kubelet can probe liveness during a long startup; its
-    // `/readyz` stays 503 until the readiness handle is attached below. The
-    // heartbeat is stamped when constructed, before the bind, and ticks on
-    // this (the main) runtime.
+    // The runtime heartbeat (ADR-1702 decision 9) exists in every mode, so
+    // `/metrics` renders its age whether or not --listen-health is set. It is
+    // stamped when constructed and its task ticks on this (the main) runtime.
+    // The --listen-health listener (decision 8) reads the same heartbeat and
+    // binds before `start` so the kubelet can probe liveness during a long
+    // startup; its `/readyz` stays 503 until the readiness handle is attached
+    // below.
+    let heartbeat =
+        ravel_server::health_listener::Heartbeat::new(Arc::new(ravel_ingest::SystemClock));
+    let heartbeat_task = heartbeat.spawn();
     let health_listener = match cli.listen_health {
         Some(addr) => {
-            let heartbeat =
-                ravel_server::health_listener::Heartbeat::new(Arc::new(ravel_ingest::SystemClock));
-            let heartbeat_task = heartbeat.spawn();
-            let listener = ravel_server::health_listener::HealthListener::bind(addr, heartbeat)?;
+            let listener =
+                ravel_server::health_listener::HealthListener::bind(addr, heartbeat.clone())?;
             tracing::info!(health = %listener.local_addr(), "health listener bound");
-            Some((listener, heartbeat_task))
+            Some(listener)
         }
         None => None,
     };
 
-    let running =
-        ravel_server::start(config, store, store_background, store_metrics, cache).await?;
+    let running = ravel_server::start_with_heartbeat(
+        config,
+        store,
+        store_background,
+        store_metrics,
+        cache,
+        heartbeat,
+    )
+    .await?;
     tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
-    if let Some((listener, _)) = &health_listener {
+    if let Some(listener) = &health_listener {
         listener.attach_readiness(running.readiness());
     }
 
@@ -631,9 +641,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
         return Err(err);
     }
+    heartbeat_task.abort();
     // Stopped after the drain so its `/readyz` reports 503 throughout it.
-    if let Some((listener, heartbeat_task)) = health_listener {
-        heartbeat_task.abort();
+    if let Some(listener) = health_listener {
         tokio::task::spawn_blocking(move || listener.shutdown())
             .await
             .context("health listener shutdown task failed")??;
