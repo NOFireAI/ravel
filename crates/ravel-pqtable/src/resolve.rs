@@ -209,9 +209,11 @@ mod tests {
             put_version(&inner, &TENANT_A, v).await;
         }
         let store = CountingStore::new(inner);
-        store.delete_after_each_list((1..=MAX_RESOLVE_ATTEMPTS as u64).rev().map(|v| {
-            manifest_key(&TENANT_A, "hits", v).expect("key")
-        }));
+        store.delete_after_each_list(
+            (1..=MAX_RESOLVE_ATTEMPTS as u64)
+                .rev()
+                .map(|v| manifest_key(&TENANT_A, "hits", v).expect("key")),
+        );
         let got = newest(&store, &TENANT_A, "hits").await;
         assert!(
             matches!(
@@ -280,6 +282,11 @@ mod tests {
             .expect("put");
         assert!(matches!(
             newest(&store, &TENANT_A, "hits").await,
+            Err(ResolveError::ForeignKey { key, .. }) if key == junk
+        ));
+        // The tenant-wide listing makes the same refusal.
+        assert!(matches!(
+            tables(&store, &TENANT_A).await,
             Err(ResolveError::ForeignKey { key, .. }) if key == junk
         ));
     }

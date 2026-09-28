@@ -870,6 +870,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tenant hash they were written for, and a grants record or manifest read
   under another tenant's key is refused as `Misfiled` rather than read as that
   tenant's. No shipping binary calls it yet.
+- **`ravel-cli tenant parquet-grant add|remove|ls` and `ravel-cli parquet
+  ls|sweep`** (ADR-2040, issue #2051): the first shipping caller of the
+  Parquet location grants record, of manifest resolution, and of both
+  qualification probes. `add` refuses a location whose scheme the named
+  credential profile's store kind does not address, refuses a granted prefix
+  that holds no object (there is nothing to probe preconditions on), refuses a
+  store that serves a pinned read carrying an ETag it never issued, and
+  refuses a bucket that `probe_not_ravel_bucket` does not clear as external,
+  including an inconclusive answer. Only a location that clears all four is
+  written. Credential profiles are read from the JSON file named by the new
+  top-level `--parquet-profiles` flag or `RAVEL_PARQUET_PROFILES`. `parquet
+  sweep` takes its minimum `--grace` from `sys/gc`'s `max_query_duration_ns`,
+  the value ADR-0050 section 4 bounds every engine deadline against, and
+  refuses a bucket that has no `sys/gc` rather than assuming a default.
 
 ## [0.19.0] - 2026-09-27
 

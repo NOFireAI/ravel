@@ -30,9 +30,11 @@
 //!
 //! Profiles are read from the JSON file named by the global
 //! `--parquet-profiles` flag (or `RAVEL_PARQUET_PROFILES`), through
-//! [`load_profiles`], which is the same loader the server uses. The file holds
-//! secrets by reference, never in the clear; see
-//! [`ravel_object_store::external`] for the shapes.
+//! [`load_profiles`], which is the same loader the server uses. A profile
+//! names its secrets through [`ravel_object_store::external::SecretSource`],
+//! whose two forms are an environment variable name and a file path, so the
+//! profile file carries a reference to secret material rather than the
+//! material.
 //!
 //! # The test seam
 //!
@@ -64,8 +66,8 @@ const MAX_PROBE_LIST_PAGES: usize = 8;
 pub type OpenExternal<'a> =
     &'a dyn Fn(&ExternalProfile, &str) -> anyhow::Result<Arc<dyn ObjectStoreBackend>>;
 
-/// A [`Clock`] reading a timestamp the caller already took, so this module
-/// never reads the system clock itself.
+/// A [`Clock`] returning a timestamp the caller already took, so the clock
+/// read stays at the clap layer and a test can drive a fixed one.
 pub struct AtNs(pub i64);
 
 impl Clock for AtNs {
@@ -87,15 +89,10 @@ pub fn find_profile<'a>(
     profiles: &'a [ExternalProfile],
     name: &str,
 ) -> anyhow::Result<&'a ExternalProfile> {
-    profiles
-        .iter()
-        .find(|p| p.name == name)
-        .ok_or_else(|| {
-            let defined: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
-            anyhow::anyhow!(
-                "no credential profile named {name:?}; the file defines {defined:?}"
-            )
-        })
+    profiles.iter().find(|p| p.name == name).ok_or_else(|| {
+        let defined: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        anyhow::anyhow!("no credential profile named {name:?}; the file defines {defined:?}")
+    })
 }
 
 /// Does a location scheme address the store kind this profile configures?
@@ -198,27 +195,38 @@ pub async fn add_grant(
         .await
         .with_context(|| format!("the bucket behind {url:?} did not qualify as external"))?;
 
-    let grant = grants::add(
-        ravel_store,
-        tenant,
-        &profile.name,
-        url,
-        created_by,
-        clock,
-    )
-    .await?;
+    let grant = grants::add(ravel_store, tenant, &profile.name, url, created_by, clock).await?;
     Ok(grant)
 }
 
-/// Print every field of one grant.
+/// One line per field of one grant, plus the URL those fields spell.
+///
+/// The destructuring is exhaustive on purpose: a field added to [`Grant`]
+/// stops this compiling rather than silently dropping out of `ls`.
+fn grant_lines(grant: &Grant) -> Vec<String> {
+    let Grant {
+        profile,
+        scheme,
+        bucket,
+        prefix,
+        created_unix_ns,
+        created_by,
+    } = grant;
+    vec![
+        format!("url: {}", grant.url()),
+        format!("  profile: {profile}"),
+        format!("  scheme: {scheme}"),
+        format!("  bucket: {bucket}"),
+        format!("  prefix: {prefix}"),
+        format!("  created_unix_ns: {created_unix_ns}"),
+        format!("  created_by: {created_by}"),
+    ]
+}
+
 fn print_grant(grant: &Grant) {
-    println!("url: {}", grant.url());
-    println!("  profile: {}", grant.profile);
-    println!("  scheme: {}", grant.scheme);
-    println!("  bucket: {}", grant.bucket);
-    println!("  prefix: {}", grant.prefix);
-    println!("  created_unix_ns: {}", grant.created_unix_ns);
-    println!("  created_by: {}", grant.created_by);
+    for line in grant_lines(grant) {
+        println!("{line}");
+    }
 }
 
 /// `tenant parquet-grant add`.
@@ -637,6 +645,36 @@ mod tests {
         );
     }
 
+    /// Every field of a grant reaches the output `ls` prints. The exhaustive
+    /// destructuring in [`grant_lines`] is what makes a new field a compile
+    /// error; this pins the values themselves.
+    #[test]
+    fn every_grant_field_is_printed() {
+        let grant = Grant {
+            profile: "prod".into(),
+            scheme: "s3".into(),
+            bucket: "customer".into(),
+            prefix: "data".into(),
+            created_unix_ns: NOW,
+            created_by: "ravel-cli".into(),
+        };
+        let printed = grant_lines(&grant).join("\n");
+        for expected in [
+            "url: s3://customer/data",
+            "profile: prod",
+            "scheme: s3",
+            "bucket: customer",
+            "prefix: data",
+            "created_unix_ns: 1700000000000000000",
+            "created_by: ravel-cli",
+        ] {
+            assert!(
+                printed.contains(expected),
+                "{expected:?} missing:\n{printed}"
+            );
+        }
+    }
+
     /// `remove` takes the grant back out, and `ls` then reports none.
     #[tokio::test]
     async fn remove_takes_the_grant_back_out() {
@@ -658,7 +696,12 @@ mod tests {
             .await
             .expect("remove");
         assert_eq!(removed.prefix, "data");
-        assert!(grants::list(&ravel, &tenant).await.expect("list").is_empty());
+        assert!(
+            grants::list(&ravel, &tenant)
+                .await
+                .expect("list")
+                .is_empty()
+        );
     }
 
     #[test]
