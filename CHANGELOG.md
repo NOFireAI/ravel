@@ -26,7 +26,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sweep` removes the superseded predecessor: `below_target` counts the parts
   of every rewrite record the bucket still LISTS, and a superseded record stays
   listed until the sweep deletes it, so the superseding rewrite alone does not
-  clear the block. A `loser_only_inputs` block clears only when retention ages
+  clear the block. The `sweep` is a command the operator runs (`ravel-cli
+  maintain sweep` for that tenant, signal and shard, subject to the protection
+  horizon), and when a bucket is blocked only by a superseded predecessor whose
+  successor is already at the current output version, that `sweep` alone clears
+  it; the refusal message and the maintenance guide say so, and `l0_commit_records`
+  and `l1_compaction_parts` are scoped as the genuinely-live figures a `sweep`
+  will not move. A `loser_only_inputs` block clears only when retention ages
   those inputs out, since compaction refuses a bucket that already carries a
   compaction record and so never publishes the covering record that would
   otherwise clear it. `buckets_blocked` is the number of those lines, covers

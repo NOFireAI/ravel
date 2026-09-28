@@ -539,8 +539,9 @@ the buckets THIS INVOCATION EXAMINED. The rewrite-record half comes from the
 re-audit, which reads every shard, so it is complete; the loser-only half comes
 from the walk, so an invocation that resumed from a cursor does not re-report
 the loser-only buckets an earlier invocation found. When `buckets_blocked` is
-non-zero, re-running is not the remedy, and neither reason is something a
-command clears.
+non-zero, re-running is not the remedy. A `loser_only_inputs` block is not
+something a command clears; a `rewrite_parts` block can be, when it lists a
+superseded predecessor a `sweep` removes (see below).
 
 **`loser_only_inputs`.** An L0 input that only a losing compaction record names
 is served raw and the walk cannot migrate it: a new record over that subset
@@ -567,16 +568,22 @@ supersedes; `sweep` does, on its own schedule, so a superseded predecessor's
 parts keep counting until then. That is what makes the second clearing path
 below a two-step one.
 
-It clears one of two ways, neither of them a command you run: retention ages the
-bucket out, subject to the format-version hold that keeps an object this build
-cannot read; or a later erasure request against the same bucket produces a
-superseding rewrite at the current output version, which the erasure driver does
-on its own schedule, AND a subsequent `sweep` removes the superseded
-predecessor. Until both of those have happened the bucket stays blocked on the
-predecessor's parts even though its live rewrite is already at the current
-version. Until then the family's floor stays where it is, which is the correct
-outcome rather than a fault: raising it would claim a format floor over objects
-every query still reads.
+It clears one of two ways. Retention ages the bucket out, subject to the
+format-version hold that keeps an object this build cannot read; or the
+below-target parts stop being listed. The erasure request that produces a
+superseding rewrite at the current output version is not something you trigger:
+the erasure driver does it on its own schedule. The `sweep` that removes a
+superseded predecessor, though, is a command you run: `ravel-cli maintain sweep`
+for that tenant, signal and shard deletes a superseded predecessor rewrite record
+once it is past the protection horizon. So when a bucket is blocked only by a
+superseded predecessor whose successor is already at the current output version, a
+`sweep` alone clears it. When the live rewrite is itself still below target, a
+superseding rewrite has to land first AND then be swept, so that path stays a
+two-step one. Until the below-target parts are gone the family's floor stays where
+it is, which is the correct outcome rather than a fault: raising it would claim a
+format floor over objects that still exist below the target, some of which queries
+still read (a superseded predecessor is not one of them, but the current output
+version's own below-target parts are).
 
 Blocked buckets are narrowed to those two cases deliberately. The rewrite
 primitive also refuses a bucket when a concurrent compaction or erasure lands

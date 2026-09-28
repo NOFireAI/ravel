@@ -221,8 +221,12 @@ pub struct BelowTargetReport {
 }
 
 impl BelowTargetReport {
-    /// Every live entry below the target: a nonzero total refuses the floor
-    /// raise.
+    /// Every object that still exists below the target, some of which queries
+    /// still read: a nonzero total refuses the floor raise. Not every entry is
+    /// live to a reader -- `rewrite_parts` counts the parts of every rewrite
+    /// record a bucket LISTS, so a superseded predecessor a later rewrite
+    /// replaced (which the resolver no longer serves, and which `sweep` deletes)
+    /// is in the total too.
     pub fn total(&self) -> usize {
         self.l0 + self.l1 + self.rewrite_parts
     }

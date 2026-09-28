@@ -1390,8 +1390,11 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 }
 
 /// One line per blocked bucket, followed by the sentences that say what an
-/// operator can do about them, which is not re-running this command
-/// (ADR-1331 decisions 2 and 3).
+/// operator can do about each reason present, which is never re-running this
+/// command (ADR-1331 decisions 2 and 3). A `rewrite_parts` block can be lowered
+/// by `ravel-cli maintain sweep` when it lists a superseded predecessor; a
+/// `loser_only_inputs` block clears only with retention. Each reason's
+/// paragraph prints only when a bucket with that reason is in the list.
 ///
 /// The prose lines carry a leading `# ` because the rest of this command's
 /// output is `key: value` and the prose contains its own colons; without the
@@ -1417,20 +1420,38 @@ fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
             bucket.shard, bucket.ingest_hour
         ));
     }
-    out.push_str(
-        "# Re-running migrate does not clear any blocked bucket above; it reports the same list \
-         again. A rewrite_parts bucket holds a live selective-erasure rewrite record whose \
-         surviving parts sit below the target, and migrate never rewrites those. below_target \
-         counts the parts of every rewrite record the bucket still LISTS, including a \
-         predecessor a later rewrite already superseded, because a superseded record stays \
-         listed until sweep deletes it. So the block clears when retention ages the bucket out \
-         (subject to the format-version hold, which keeps an object this build cannot read), or \
-         when a later erasure request supersedes the record at the current output version AND a \
-         subsequent sweep removes the superseded predecessor.\n\
-         # A loser_only_inputs bucket clears only when retention ages those inputs out: no \
-         later compaction covers them, because compaction refuses a bucket that already carries \
-         a compaction record. Neither is a command you run.",
-    );
+    let has_rewrite_parts = blocked
+        .iter()
+        .any(|b| matches!(b.reason, BlockedReason::RewriteParts { .. }));
+    let has_loser_only = blocked
+        .iter()
+        .any(|b| matches!(b.reason, BlockedReason::LoserOnlyInputs));
+    if has_rewrite_parts {
+        out.push_str(
+            "# Re-running migrate does not clear any blocked bucket above; it reports the same \
+             list again. A rewrite_parts bucket holds a live selective-erasure rewrite record \
+             whose surviving parts sit below the target, and migrate never rewrites those. \
+             below_target counts the parts of every rewrite record the bucket still LISTS, \
+             including a predecessor a later rewrite already superseded, because a superseded \
+             record stays listed until sweep deletes it. So the block clears when retention \
+             ages the bucket out (subject to the format-version hold, which keeps an object \
+             this build cannot read), or when a later erasure request supersedes the record at \
+             the current output version AND a subsequent sweep removes the superseded \
+             predecessor. The erasure request is not something you trigger, but the sweep is: \
+             `ravel-cli maintain sweep` for that tenant, signal and shard removes the \
+             superseded predecessor once it is past the protection horizon.",
+        );
+    }
+    if has_loser_only {
+        if has_rewrite_parts {
+            out.push('\n');
+        }
+        out.push_str(
+            "# A loser_only_inputs bucket clears only when retention ages those inputs out: no \
+             later compaction covers them, because compaction refuses a bucket that already \
+             carries a compaction record. That is not a command you run.",
+        );
+    }
     out
 }
 
@@ -1590,9 +1611,14 @@ pub async fn migrate(
                  {rewrite_parts} rewrite record part(s) still \
                  below target version {target} (data landed below the target between the walk \
                  finishing and the floor raise, or is not yet migratable -- e.g. still \
-                 unsealed). These are genuinely live: a bucket's own pre-rewrite commit records \
-                 are already excluded from this count once that bucket has been migrated, so a \
-                 `sweep` will not make this converge. The floor was NOT raised.\n\n\
+                 unsealed). The l0_commit_records and l1_compaction_parts here are genuinely \
+                 live: a bucket's own pre-rewrite commit records are already excluded from this \
+                 count once that bucket has been migrated, so a `sweep` will not make those two \
+                 converge. A nonzero rewrite_record_parts is different: below_target counts every \
+                 part the bucket still LISTS, so it may include a superseded predecessor rewrite \
+                 record that `ravel-cli maintain sweep` for this tenant, signal and shard removes \
+                 once it is past the protection horizon, which lowers that figure. The floor was \
+                 NOT raised.\n\n\
                  Whether re-running helps depends on why they are below target. Only \
                  l0_commit_records can move: a below-target L0 record that is merely not yet \
                  sealed migrates on a later run. Nothing else does. A below-target L0 that only \
@@ -2393,6 +2419,62 @@ mod tests {
             key_lines.contains(&"buckets_blocked: 2")
                 && key_lines.contains(&"records_migrated: 41"),
             "the prose sits between these two and must not have displaced either: {printed}"
+        );
+
+        // Each reason's explanatory paragraph prints only when a bucket with
+        // that reason is present. Printed unconditionally, the loser-only
+        // report below carries the rewrite paragraph and the rewrite-only
+        // report carries the loser paragraph; each `assert!(!...)` below fails
+        // with `printed` naming the paragraph that leaked.
+        let rewrite_para = "A rewrite_parts bucket holds a live selective-erasure rewrite record";
+        let loser_para = "A loser_only_inputs bucket clears only when retention ages those inputs out";
+
+        let loser_only = migrate_report_text(
+            "acme",
+            Signal::Metrics,
+            "rseg",
+            8,
+            0,
+            &FamilyMigrateReport {
+                blocked_buckets: vec![BlockedBucket {
+                    shard: 3,
+                    ingest_hour: 47,
+                    reason: BlockedReason::LoserOnlyInputs,
+                }],
+                ..report.clone()
+            },
+        );
+        assert!(
+            loser_only.contains(loser_para),
+            "a loser-only report keeps the loser paragraph: {loser_only}"
+        );
+        assert!(
+            !loser_only.contains(rewrite_para),
+            "a loser-only report does not carry the rewrite_parts paragraph: {loser_only}"
+        );
+
+        let rewrite_only = migrate_report_text(
+            "acme",
+            Signal::Metrics,
+            "rseg",
+            8,
+            0,
+            &FamilyMigrateReport {
+                blocked_buckets: vec![BlockedBucket {
+                    shard: 0,
+                    ingest_hour: 100,
+                    reason: BlockedReason::RewriteParts { below_target: 2 },
+                }],
+                ..report.clone()
+            },
+        );
+        assert!(
+            rewrite_only.contains(rewrite_para),
+            "a rewrite-only report keeps the rewrite paragraph: {rewrite_only}"
+        );
+        assert!(
+            !rewrite_only.contains(loser_para),
+            "a rewrite-only report does not carry the loser_only_inputs paragraph: {rewrite_only}"
         );
 
         let clean = FamilyMigrateReport {
