@@ -36,7 +36,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--distributed-query` a `GetFlightInfo` and its `DoGet` that land on an
   old and a new process fail with `invalid_argument` until the rollout
   completes, and the query has to be run again.
+
 ### Fixed
+
+- **Alert sink delivery is bounded per evaluation tick, and ADR-0117's stated
+  per-tick publish bound is corrected** (issues #2063, #2064). The evaluator
+  delivered every undelivered notification to every sink sequentially with no
+  per-tick limit, so one slow or unresponsive sink could hold a tick well past
+  its own interval and delay every later tick's rule evaluation. Delivery is now
+  bounded to half the evaluation interval, measured on the evaluator's injected
+  clock: notifications not attempted before the deadline stay queued and are
+  retried on the next tick, oldest first, so the same notification is never
+  starved. The new `ravel_alert_notifications_deferred_total` counter reports
+  how many were deferred. Separately, ADR-0117 stated the per-tick publish worst
+  case for one rule as `MAX_ALERTS_PER_RULE` (1000); the true worst case is
+  `2 x MAX_ALERTS_PER_RULE`, because one tick also writes a resolution for each
+  previously-open alert that stopped matching. A dated amendment to the ADR and
+  the alerting guide carry the corrected bound.
 
 - **A query's fold-lag refusal threshold is now sized from the fold and the
   catalog the process is actually running** (issue #1306). The threshold that
