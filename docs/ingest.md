@@ -462,17 +462,27 @@ pass of a drain reads the same lag and refuses again. On the `Shutdown` and
 channel-close drains there is no later tick, so enforcing it to the pass cap
 would report the buffered rows as residue and lose them, and in buffered
 mode those rows were already acknowledged. Durability wins there: once the
-bounded passes leave a tenant refused, a teardown drain makes one final pass
-with the lag check bypassed, publishing with the raw-reading stamp (the
-floor rules unchanged) and counting each such flush as
+bounded enforced passes leave a tenant refused, a teardown drain keeps
+making passes with the lag check bypassed while tenants remain, under the
+same pass cap, publishing with the stamp the floor rules give (the raw
+reading, or the floor itself when it absorbs a backwards step within the
+hold bound) and counting each bypassed flush-open attempt as
 `clock_lag_bypassed_at_shutdown`, logged at WARN with the measured lag.
 Those rows can land in an ingest hour the fold has already sealed, so a
 token-less read sees them only after a HEAD rebuild -- the same recoverable
 outcome the writer had before this check existed, rather than a drop.
 `FlushNow` and every size or age trigger keep refusing, since their actor
-keeps running to retry. A regression refusal still refuses on that final
-pass, so the residue path stays reachable for ADR-1307's case. Either way:
-fix the host clock before restarting a writer that is refusing flushes.
+keeps running to retry.
+
+The bypass passes are a loop because the floor still applies on them. A lag
+refusal returns before the floor is read, so a backwards step past
+`MAX_FLUSH_CLOCK_HOLD_NS` stays hidden behind the lag check until the first
+bypass pass reaches the floor and is refused there; that refusal re-anchors
+the floor, and the next bypass pass stamps and publishes. Residue on a
+teardown therefore needs the floor to refuse every pass, enforced and
+bypassed alike, which takes a clock stepping backwards beyond the hold
+bound on every reading. Either way: fix the host clock before restarting a
+writer that is refusing flushes.
 
 ### Pipelined flushes (ADR-0067)
 

@@ -73,19 +73,27 @@ Buffered mode (opt-in per request, named "buffered"):
   one.
 - Loss from a stalled co-resident prefix is therefore not a buffered-mode
   outcome: a flush queued behind the stall reaches the store once the stall
-  clears. Buffered rows are dropped with no crash in exactly two cases, and
-  those rows were already acked in both. One: the flush's own store calls,
+  clears. Buffered rows are dropped with no crash in exactly three cases, and
+  those rows were already acked in all three. One: the flush's own store calls,
   after it holds the permit, cannot complete within `max_flush_lifetime` (a
   genuinely stuck backend, not a queue wait). `max_flush_lifetime` defaults to
   3600 s and is not operator-tunable from the server. Two: a graceful drain
   (`Shutdown`, channel close) whose flushes are still refused by the ADR-1307
-  monotonic-floor check after its bounded retry passes, which needs a clock
-  stepping backwards beyond the hold bound on every reading; the residue is
-  logged at ERROR and counted (`flush_all_residue_tenants`). The ADR-1685
-  store-clock lag check does NOT belong on this list: that check is bypassed on
-  a teardown drain's final pass precisely so it cannot drop acknowledged rows,
-  and what it costs instead is visibility until a HEAD rebuild (see "Catalog
-  snapshot staleness" below).
+  monotonic-floor check after every pass it makes, enforced and bypassed alike,
+  which needs a clock stepping backwards beyond the hold bound on every
+  reading; the residue is logged at ERROR and counted
+  (`flush_all_residue_tenants`). Three: the flush-open clock reading is not a
+  usable wall-clock value at all, being non-positive, below the 2020
+  plausibility floor, or yielding no representable ingest-hour bucket. That is
+  a grossly broken host clock rather than a transient step, so it is fail-loud
+  and non-retryable: the buffer is dropped, any strict waiter is acked with
+  `SegmentBuild` (400), and `abandoned_input_rejected` counts it. The ADR-1685
+  store-clock lag check is not a case of its own: a teardown drain's bypass
+  passes disable that check precisely so it cannot drop acknowledged rows, and
+  what it costs instead is visibility until a HEAD rebuild (see "Catalog
+  snapshot staleness" below). What it does change is when the floor gets its
+  say, since a lag refusal returns before the floor is read, which is why case
+  two counts every pass of the drain and not only the enforced ones.
 - Strict mode does not share the buffered loss exposure, because a strict
   write is acked only after its flush commits and an abandoned flush returns a
   retryable error instead. A strict write co-resident with a stalled prefix

@@ -279,17 +279,31 @@ acknowledged writes.
 
 Durability wins at teardown. On the `Shutdown` and channel-close drains
 only, once the bounded retry passes leave a tenant still refused, the drain
-makes one final pass with the lag check bypassed: the flush publishes with
-the raw-reading stamp, the ADR-1307 floor rules unchanged, and each such
-flush increments `clock_lag_bypassed_at_shutdown` and logs at WARN naming
+makes further passes with the lag check bypassed, while tenants remain and
+bounded by the same `MAX_FLUSH_ALL_PASSES`: the flush publishes with
+whatever stamp the ADR-1307 floor rules give it, which is the raw reading
+unless the floor absorbs a backwards step within the hold bound and holds
+the stamp there, and each bypassed flush-open attempt increments
+`clock_lag_bypassed_at_shutdown` and logs at WARN naming
 the measured lag. Those rows may land in an ingest hour the fold has
 sealed, invisible to token-less reads until a HEAD rebuild, exactly as they
 were before this ADR and recoverable in the same way. `FlushNow` and every
 size or age trigger keep refusing, because their actor keeps running and
-retries once the host clock converges. A regression refusal still refuses
-on the bypass pass, so the residue path (ERROR plus
-`flush_all_residue_tenants`) remains reachable for the ADR-1307 case and
-unreachable for this one. The operator remedy is unchanged: fix the host
+retries once the host clock converges.
+
+A regression refusal still refuses on a bypass pass, and that is why the
+drain makes those passes in a loop rather than one. A lag refusal returns
+before the floor is read, so a backwards step past the hold bound stays
+hidden behind it: the first bypass pass is where the floor sees that step
+and refuses, and that refusal re-anchors the floor, so the pass after it
+stamps and publishes. With a single bypass pass those acknowledged rows
+became residue, which is the durability hole this paragraph replaces. The
+residue path (ERROR plus `flush_all_residue_tenants`) therefore remains
+reachable exactly when the floor refuses every pass of the drain, enforced
+and bypassed alike, which takes a clock stepping backwards beyond the hold
+bound on every reading. A lagging clock alone never reaches it, and neither
+does a lagging clock plus a single backwards step. The operator remedy is
+unchanged: fix the host
 clock before restarting a writer that is refusing flushes, and rebuild the
 catalog HEAD if a token-less read is missing rows a bypassed flush
 published.

@@ -7,10 +7,13 @@
 //! with the store's observed clock (the latest response `Date`, a lower bound)
 //! and refuses the flush, retryably, when the reading lags by more than
 //! `DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`. With no observation the flush proceeds
-//! and is counted as unchecked. The one exception is a teardown drain's final
-//! pass, where durability wins: the check is bypassed so acknowledged
+//! and is counted as unchecked. The one exception is a teardown drain's bypass
+//! passes, where durability wins: the check is bypassed so acknowledged
 //! buffered-mode rows publish rather than being dropped (the ADR-1685 teardown
-//! amendment).
+//! amendment). The ADR-1307 floor still applies on a bypass pass, so the drain
+//! makes those passes in a bounded loop: the first one is where a backwards
+//! step the lag check had hidden from the floor surfaces, and the pass after it
+//! publishes.
 //!
 //! Every case drives a real write through the router the server builds, over
 //! `MemoryStore` with `set_observed_store_time_ns` standing in for the S3
@@ -702,18 +705,19 @@ fn buffer_until_drain_config() -> IngestConfig {
 /// How many refusals a drain counts under [`buffer_until_drain_config`] with a
 /// lagging clock: one per enforced pass. A lag refusal re-anchors nothing, so
 /// every pass reads the same lag and refuses again until the bound stops the
-/// loop.
+/// enforced loop. Bypass passes add nothing here: they do not run the check.
 const DRAIN_REFUSALS: u64 = MAX_FLUSH_ALL_PASSES as u64;
 
 /// The ADR-1685 teardown amendment. Buffered mode acknowledged these rows, and
 /// a lag refusal changes neither the monotonic floor nor the store's
-/// observation, so every drain pass refuses identically and the pass cap would
-/// have reported them as residue and dropped them. Durability wins at
-/// teardown: the drain's final pass bypasses the check, the rows publish with
-/// the raw-reading stamp, and the bypass is counted once.
+/// observation, so every enforced drain pass refuses identically and the pass
+/// cap would have reported them as residue and dropped them. Durability wins at
+/// teardown: the drain's bypass passes skip the check, and here the floor is
+/// unarmed, so the first of them stamps the raw reading, publishes, and counts
+/// the bypass once.
 ///
-/// Deleting the teardown bypass pass from all three `flush_all`s fails this on
-/// its first assertion, the commit-record count: the drain publishes nothing
+/// Deleting the teardown bypass passes from all three `flush_all`s fails this
+/// on its first assertion, the commit-record count: the drain publishes nothing
 /// (left 0, right 1). The twelve cases above this one still pass under that
 /// deletion, so none of them rests on the bypass.
 #[tokio::test]
@@ -916,4 +920,448 @@ async fn spans_shutdown_publishes_what_the_lag_check_refused() {
     assert_eq!(snap.flush_all_residue_tenants, 0);
     assert_eq!(snap.clock_lag_bypassed_at_shutdown, 1);
     assert_eq!(snap.clock_lag_refused, DRAIN_REFUSALS);
+}
+
+/// The tenant whose flush arms the shard's ADR-1307 monotonic floor at the
+/// store's time before the lagging tenant buffers its row. One shard, so both
+/// tenants share the floor.
+const FLOOR_TENANT: &str = "floor-arm";
+
+/// The bypass pass reads the floor the enforced passes never did, so a lag
+/// refusal can hide a backwards step big enough to be refused there.
+///
+/// An earlier flush in this process stamped the store's time, arming the floor.
+/// The clock then steps two hours back, which is both past the lag allowance
+/// and past `MAX_FLUSH_CLOCK_HOLD_NS` below that floor. Every enforced pass
+/// returns `LagRefused` before the floor is consulted, so nothing re-anchors;
+/// the first bypass pass reaches the floor and is refused there. With a single
+/// bypass pass that was the end of the drain and these acknowledged rows became
+/// residue, where the same backwards step without the lag is refused once,
+/// re-anchors, and publishes on the next pass. The drain now keeps making
+/// bounded bypass passes, so the pass after the re-anchor stamps the raw
+/// reading and publishes.
+///
+/// Reverting `flush_all` in shard.rs to the single
+/// `self.flush_all_pass(trigger, LagCheck::BypassedAtTeardown).await;` fails
+/// this on the commit-record count (left 0, right 1), with
+/// `flush_all_residue_tenants` 1: the acknowledged row is lost.
+#[tokio::test]
+async fn shutdown_publishes_when_a_lag_refusal_hid_a_backwards_step() {
+    let (_memory, store) = observed_store(Some(STORE_NS));
+    let clock = TestClock::new(STORE_NS);
+    let router = IngestRouter::new(
+        buffer_until_drain_config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    );
+
+    // Arm the floor: this flush's reading is the store's own time, so it is
+    // within the allowance, publishes, and leaves the shard's floor at
+    // `STORE_NS`.
+    let floor_tenant = tenant(FLOOR_TENANT);
+    router
+        .write(
+            floor_tenant.clone(),
+            vec![make_point(
+                &floor_tenant,
+                "cpu_usage",
+                &[("host", "floor")],
+                500,
+                2.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write acknowledged");
+    router.flush_all().await;
+    assert_eq!(
+        commit_records(store.as_ref(), &floor_tenant, Signal::Metrics)
+            .await
+            .len(),
+        1,
+        "the arming flush published, so the shard's floor is now the store's time"
+    );
+
+    // Two hours back: beyond the lag allowance, and beyond the hold bound
+    // below the floor the arming flush just set.
+    clock.set_ns(STORE_NS - TWO_HOURS_NS);
+    let tenant = tenant("acme");
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                1_000,
+                1.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a buffered write is acknowledged without waiting for its flush");
+
+    let metrics = router.metrics_handle();
+    router.shutdown().await;
+
+    assert_eq!(
+        commit_records(store.as_ref(), &tenant, Signal::Metrics)
+            .await
+            .len(),
+        1,
+        "the teardown drain publishes the acknowledged rows after the floor re-anchors"
+    );
+    assert_eq!(
+        published_samples(store.as_ref(), &tenant).await,
+        vec![(1_000, 1.0_f64.to_bits())],
+        "and that commit's segment holds exactly the buffered row"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "nothing was left buffered, so nothing is residue"
+    );
+    assert_eq!(
+        snap.clock_lag_refused, DRAIN_REFUSALS,
+        "every enforced drain pass refused on the lag, before the floor"
+    );
+    assert_eq!(
+        snap.clock_regressions_refused, 1,
+        "the first bypass pass reached the floor and was refused there once"
+    );
+    assert_eq!(
+        snap.clock_lag_bypassed_at_shutdown, 2,
+        "two bypass passes: the one the floor refused, and the one that published"
+    );
+}
+
+/// Logs: the same hole, at the log shard's drain.
+#[tokio::test]
+async fn logs_shutdown_publishes_when_a_lag_refusal_hid_a_backwards_step() {
+    let (_memory, store) = observed_store(Some(STORE_NS));
+    let clock = TestClock::new(STORE_NS);
+    let router = LogIngestRouter::new(
+        buffer_until_drain_config(),
+        Arc::clone(&store),
+        clock.clone(),
+    );
+
+    let floor_tenant = tenant(FLOOR_TENANT);
+    router
+        .write(
+            floor_tenant.clone(),
+            vec![norm_log_record(500, "arming")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered log write acknowledged");
+    router.flush_all().await;
+    assert_eq!(
+        commit_records(store.as_ref(), &floor_tenant, Signal::Logs)
+            .await
+            .len(),
+        1,
+        "the arming flush published, so the shard's floor is now the store's time"
+    );
+
+    clock.set_ns(STORE_NS - TWO_HOURS_NS);
+    let tenant = tenant("acme");
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "acked")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered log write acknowledged");
+
+    let metrics = router.metrics_handle();
+    router.shutdown().await;
+
+    assert_eq!(
+        commit_records(store.as_ref(), &tenant, Signal::Logs)
+            .await
+            .len(),
+        1,
+        "the teardown drain publishes the acknowledged record after the floor re-anchors"
+    );
+    assert_eq!(
+        published_log_bodies(store.as_ref(), &tenant).await,
+        vec!["acked".to_string()],
+        "and that commit's segment holds exactly the buffered record"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(snap.flush_all_residue_tenants, 0);
+    assert_eq!(snap.clock_lag_refused, DRAIN_REFUSALS);
+    assert_eq!(snap.clock_regressions_refused, 1);
+    assert_eq!(snap.clock_lag_bypassed_at_shutdown, 2);
+}
+
+/// Spans: the same hole, at the span shard's drain.
+#[tokio::test]
+async fn spans_shutdown_publishes_when_a_lag_refusal_hid_a_backwards_step() {
+    let (_memory, store) = observed_store(Some(STORE_NS));
+    let clock = TestClock::new(STORE_NS);
+    let router = SpanIngestRouter::new(
+        buffer_until_drain_config(),
+        Arc::clone(&store),
+        clock.clone(),
+    );
+
+    let floor_tenant = tenant(FLOOR_TENANT);
+    router
+        .write(
+            floor_tenant.clone(),
+            vec![norm_span(500)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered span write acknowledged");
+    router.flush_all().await;
+    assert_eq!(
+        commit_records(store.as_ref(), &floor_tenant, Signal::Spans)
+            .await
+            .len(),
+        1,
+        "the arming flush published, so the shard's floor is now the store's time"
+    );
+
+    clock.set_ns(STORE_NS - TWO_HOURS_NS);
+    let tenant = tenant("acme");
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered span write acknowledged");
+
+    let metrics = router.metrics_handle();
+    router.shutdown().await;
+
+    assert_eq!(
+        commit_records(store.as_ref(), &tenant, Signal::Spans)
+            .await
+            .len(),
+        1,
+        "the teardown drain publishes the acknowledged span after the floor re-anchors"
+    );
+    assert_eq!(
+        published_span_starts(store.as_ref(), &tenant).await,
+        vec![1_000],
+        "and that commit's segment holds exactly the buffered span"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(snap.flush_all_residue_tenants, 0);
+    assert_eq!(snap.clock_lag_refused, DRAIN_REFUSALS);
+    assert_eq!(snap.clock_regressions_refused, 1);
+    assert_eq!(snap.clock_lag_bypassed_at_shutdown, 2);
+}
+
+/// Logs: the bypass is teardown-only there too. Extending it to the
+/// `FlushNow` drain (`DrainIntent::Retryable`) in log_shard.rs fails this on
+/// the commit-record assertion: the drain publishes, where its actor is still
+/// running and a later trigger would have published on a converged clock.
+#[tokio::test]
+async fn logs_flush_now_is_still_refused_with_a_lagging_clock() {
+    let (_memory, store) = observed_store(Some(STORE_NS));
+    let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
+    let router = LogIngestRouter::new(
+        buffer_until_drain_config(),
+        Arc::clone(&store),
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "acked")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered log write acknowledged");
+
+    router.flush_all().await;
+
+    assert_eq!(
+        commit_records(store.as_ref(), &tenant, Signal::Logs).await,
+        Vec::<String>::new(),
+        "FlushNow never bypasses the lag check"
+    );
+    let snap = router.metrics().snapshot();
+    assert_eq!(snap.clock_lag_bypassed_at_shutdown, 0);
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "a Retryable drain's residue is a WARN, not a durability-defect bump"
+    );
+    assert_eq!(snap.clock_lag_refused, DRAIN_REFUSALS);
+
+    // Re-buffered, not dropped: the record publishes once the clock converges.
+    clock.set_ns(STORE_NS);
+    router.flush_all().await;
+    assert_eq!(
+        published_log_bodies(store.as_ref(), &tenant).await,
+        vec!["acked".to_string()]
+    );
+    assert_eq!(
+        router.metrics().snapshot().clock_lag_bypassed_at_shutdown,
+        0
+    );
+
+    router.shutdown().await;
+}
+
+/// Spans: the same, at the span shard's `FlushNow` drain. Extending the bypass
+/// to `DrainIntent::Retryable` in span_shard.rs fails this the same way.
+#[tokio::test]
+async fn spans_flush_now_is_still_refused_with_a_lagging_clock() {
+    let (_memory, store) = observed_store(Some(STORE_NS));
+    let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
+    let router = SpanIngestRouter::new(
+        buffer_until_drain_config(),
+        Arc::clone(&store),
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered span write acknowledged");
+
+    router.flush_all().await;
+
+    assert_eq!(
+        commit_records(store.as_ref(), &tenant, Signal::Spans).await,
+        Vec::<String>::new(),
+        "FlushNow never bypasses the lag check"
+    );
+    let snap = router.metrics().snapshot();
+    assert_eq!(snap.clock_lag_bypassed_at_shutdown, 0);
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "a Retryable drain's residue is a WARN, not a durability-defect bump"
+    );
+    assert_eq!(snap.clock_lag_refused, DRAIN_REFUSALS);
+
+    clock.set_ns(STORE_NS);
+    router.flush_all().await;
+    assert_eq!(
+        published_span_starts(store.as_ref(), &tenant).await,
+        vec![1_000]
+    );
+    assert_eq!(
+        router.metrics().snapshot().clock_lag_bypassed_at_shutdown,
+        0
+    );
+
+    router.shutdown().await;
+}
+
+/// The other teardown path: the router is dropped without `shutdown()`, which
+/// production reaches whenever `Arc::try_unwrap` fails or `Running::shutdown`
+/// returns early (services/ravel-server/src/lib.rs). The channel-close arm is a
+/// teardown too, so it bypasses the lag check rather than drop rows buffered
+/// mode already acknowledged.
+///
+/// Changing that arm's `DrainIntent::Teardown` to `DrainIntent::Retryable` in
+/// shard.rs fails this: no bypass pass runs, nothing is published, and the
+/// commit-record assertion below reports an empty store.
+#[tokio::test]
+async fn channel_close_publishes_what_the_lag_check_refused() {
+    let (_memory, store) = observed_store(Some(STORE_NS));
+    let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
+    let router = IngestRouter::new(
+        buffer_until_drain_config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                1_000,
+                1.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a buffered write is acknowledged without waiting for its flush");
+
+    // A buffered ack fires at enqueue, so wait until the actor has actually
+    // buffered the point before dropping the router; otherwise the drop could
+    // race the actor and prove nothing.
+    let metrics = router.metrics_handle();
+    for _ in 0..100 {
+        if metrics.snapshot().buffered_points_total == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        metrics.snapshot().buffered_points_total,
+        1,
+        "the point must be buffered in the actor before the router is dropped"
+    );
+
+    drop(router);
+
+    // The detached actor notices the closed channel, drains, and stops. Wait
+    // for the commit record rather than a flat sleep: a slow host takes
+    // longer instead of failing, and a host that never writes one fails on
+    // the assertion below.
+    let mut commits = Vec::new();
+    for _ in 0..2_000 {
+        commits = commit_records(store.as_ref(), &tenant, Signal::Metrics).await;
+        if !commits.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    assert_eq!(
+        commits.len(),
+        1,
+        "the channel-close drain publishes the acknowledged rows"
+    );
+    assert_eq!(
+        published_samples(store.as_ref(), &tenant).await,
+        vec![(1_000, 1.0_f64.to_bits())],
+        "and that commit's segment holds exactly the buffered row"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "nothing was left buffered, so nothing is residue"
+    );
+    assert_eq!(
+        snap.clock_lag_bypassed_at_shutdown, 1,
+        "one flush published with the check bypassed"
+    );
+    assert_eq!(
+        snap.clock_lag_refused, DRAIN_REFUSALS,
+        "every enforced pass of the channel-close drain refused first"
+    );
 }
