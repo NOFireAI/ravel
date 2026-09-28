@@ -6892,11 +6892,11 @@ mod tests {
             .join("../../deploy/k8s/operator/operator.yaml");
         let manifest = std::fs::read_to_string(&manifest_path)
             .unwrap_or_else(|error| panic!("reading {}: {error}", manifest_path.display()));
-        for document in serde_yaml::Deserializer::from_str(&manifest) {
-            let value = serde_yaml::Value::deserialize(document)
+        for document in serde_yaml_ng::Deserializer::from_str(&manifest) {
+            let value = serde_yaml_ng::Value::deserialize(document)
                 .expect("each YAML document in operator.yaml parses");
-            if value.get("kind").and_then(serde_yaml::Value::as_str) == Some("Deployment") {
-                return serde_yaml::from_value(value)
+            if value.get("kind").and_then(serde_yaml_ng::Value::as_str) == Some("Deployment") {
+                return serde_yaml_ng::from_value(value)
                     .expect("the shipped Deployment document deserializes as a k8s Deployment");
             }
         }
