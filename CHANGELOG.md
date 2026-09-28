@@ -24,6 +24,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writes keep the fast clock. `ravel-server` does not expose the knob yet, so
   no deployment's flush cadence or buffered-mode loss window changes with this
   release.
+- **`ObjectStoreBackend::get_pinned` reads an object only while it still has
+  the identity the catalog recorded, and `ravel-object-store` gains read-only
+  external stores per credential profile** (ADR-2040, issue #2065). A pinned
+  read asserts the recorded ETag (and the backend's version, when the store
+  issues one) on the wire and fails with `PreconditionFailed` when the object
+  was replaced; the default implementation refuses with the new
+  `Unsupported` error rather than falling back to an unconditional read.
+  `external::ExternalStore` opens one granted bucket per `ExternalProfile`
+  read-only, refusing every write with the new `ReadOnly` error, whose
+  profile names where its secrets live and never holds their values, and
+  `external::probe` qualifies a candidate bucket for preconditions and
+  against being Ravel's own bucket under another name. `ravel_cache::CacheKey::pinned` keys such an
+  object by profile, bucket, key, ETag, version and size. No shipping binary
+  reaches any of it yet; the callers are #2052, #2051 and #2054.
+- **Parquet table location grants and in-place manifest format** (ADR-2040,
+  issue #2050): the new `ravel-pqtable` crate and
+  `proto/ravel/parquet_table.proto`. A per-tenant grants record at
+  `t/<tenant_hash>/pq/grants` holds the locations an operator admitted, each
+  with the credential profile to read it under, and resolves a `LOCATION` URL
+  to exactly one grant. A table manifest version pins the tenant's own
+  Parquet files in place, by bucket and object key with the ETag and store
+  version read at the time, rather than copying them into Ravel's bucket; a
+  key that object_store's `Path` would rewrite is refused. Both records carry
+  the tenant hash they were written for, and a grants record or manifest read
+  under another tenant's key is refused as `Misfiled` rather than read as that
+  tenant's. No shipping binary calls it yet.
 
 ## [0.19.0] - 2026-09-27
 
@@ -154,29 +180,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     series.
 ### Added
 
-- **`ObjectStoreBackend::get_pinned` reads an object only while it still has
-  the identity the catalog recorded, and `ravel-object-store` gains read-only
-  external stores per credential profile** (ADR-2040, issue #2065). A pinned
-  read asserts the recorded ETag (and the backend's version, when the store
-  issues one) on the wire and fails with `PreconditionFailed` when the object
-  was replaced; the default implementation refuses with the new
-  `Unsupported` error rather than falling back to an unconditional read.
-  `external::ExternalStore` opens one granted bucket per `ExternalProfile`
-  read-only, refusing every write with the new `ReadOnly` error and holding
-  only where its secrets live, never their values, and `external::probe`
-  qualifies a candidate bucket for preconditions and against being Ravel's
-  own bucket under another name. `ravel_cache::CacheKey::pinned` keys such an
-  object by profile, bucket, key, ETag, version and size. No shipping binary
-  reaches any of it yet; the callers are #2052, #2051 and #2054.
-- **Parquet table location grants and in-place manifest format** (ADR-2040,
-  issue #2050): the new `ravel-pqtable` crate and
-  `proto/ravel/parquet_table.proto`. A per-tenant grants record at
-  `t/<tenant_hash>/pq/grants` holds the locations an operator admitted, each
-  with the credential profile to read it under, and resolves a `LOCATION` URL
-  to exactly one grant. A table manifest version pins the tenant's own
-  Parquet files in place, by bucket and raw object key with the ETag and store
-  version read at the time, rather than copying them into Ravel's bucket. No
-  shipping binary calls it yet.
 - **`ravel-server` builds a read and a write CPU gate and reports their
   queueing on `/metrics`** (ADR-1702, issue #1702). A new crate,
   `ravel-cpu-gate`, holds the gate: a job at or above its inline floor
