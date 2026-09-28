@@ -1457,6 +1457,57 @@ async fn a_ranged_get_of_a_corrupted_stored_object_is_still_served() {
     assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
 }
 
+/// A pin decides which bytes are served, never whether they are checked: the
+/// pinned read paths refuse a corrupted stored object exactly as `get` does.
+/// The pin is taken before the corruption and still matches after it, because
+/// bit rot at rest changes neither the ETag nor the version, so the read gets
+/// past both halves of the pin and only the stored CRC-32C can refuse it.
+///
+/// Removing the `verify_full_read` call from `MemoryStore::get_pinned` makes
+/// the first `expect_err` below fail with the flipped bytes served; removing it
+/// from `MemoryStore::get_with_pin` does the same to the second.
+#[tokio::test]
+async fn pinned_full_reads_of_a_corrupted_stored_object_are_refused() {
+    let store = MemoryStore::new();
+    let key = "corrupt/pinned";
+    store
+        .put(
+            key,
+            Bytes::from_static(b"a pinned record whose bytes rot in place"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed the object");
+    let (_, pin) = store.pin_of(key).await.expect("pin the seeded object");
+    assert!(
+        pin.version.is_some(),
+        "the oracle reports a version selector, so the pin exercises both halves"
+    );
+    store
+        .corrupt_stored_byte(key, 5, 2)
+        .expect("flip one bit of the stored object");
+
+    let err = store
+        .get_pinned(key, GetRange::Full, &pin)
+        .await
+        .expect_err("a pinned full read of corrupted stored bytes must be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+
+    let err = store
+        .get_with_pin(key, GetRange::Full)
+        .await
+        .expect_err("a full read that reports its pin must also refuse corrupted bytes");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+
+    // The pin still matches: a ranged pinned read is served, which is what
+    // shows the refusal above came from the checksum and not from the pin.
+    let got = store
+        .get_pinned(key, GetRange::Range(0, 2), &pin)
+        .await
+        .expect("a ranged pinned read is outside the whole-object check");
+    assert_eq!(&got.outcome.data[..], b"a ");
+}
+
 /// The startup gate `--mode maintain` applies, asserted against the real
 /// `S3Store` without an endpoint: `required_capabilities(Mode::
 /// Maintain)` is `mandatory()` with `multipart: true`, and this is the
