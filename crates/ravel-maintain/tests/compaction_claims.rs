@@ -580,7 +580,7 @@ async fn a_paused_stale_owner_that_finishes_after_a_steal_converges_on_one_recor
 /// path; the second pass, on the same memo and the same clock, issues no claim
 /// request at all and still reports the bucket skipped rather than compacted.
 ///
-/// Shown failing by removing the `memo.claim_deferred` check at the top of
+/// Shown failing by removing the `memo.claim_deferred` hold from
 /// `scan_and_maintain_with_memo`'s bucket loop: the second pass then issues the
 /// same three coordinate requests again, which is the polling loop the claim
 /// protocol exists to avoid.
@@ -652,6 +652,90 @@ async fn a_claimed_away_bucket_is_not_polled_on_the_next_tick() {
         second_ledger.report().coordinate.requests,
         0,
         "and the second pass issues no claim request at all"
+    );
+    assert_eq!(record_keys(&store).await.len(), 0, "nothing was published");
+}
+
+/// A claim hold skips only the held bucket's compaction. Retention and the
+/// zone split still run for it, so a held head-zone hour stays in
+/// `head_tail_hours`, which is what scopes the supervisor's zoned sweep, and
+/// the bucket is still not compacted.
+///
+/// Shown failing against the loop that `continue`d on a held bucket before
+/// classifying its zone: "a held head hour still reaches head_tail_hours"
+/// reads left [], right [495000].
+#[tokio::test]
+async fn a_held_bucket_still_reaches_the_zone_split() {
+    let store = MemoryStore::new();
+    let config = CompactorConfig::default();
+    // Sealed, and within the hour of slack past the seal margin that keeps a
+    // bucket in the head zone.
+    let now_ns = bucket().end_ns() + config.seal_margin_ns() + NS_PER_HOUR / 2;
+    assert_eq!(
+        ravel_maintain::scan::classify_zone(HOUR, now_ns, &config, None),
+        ravel_maintain::scan::Zone::Head,
+        "the fixture hour must be a head hour for this test to mean anything"
+    );
+    store.set_clock_ms((now_ns / 1_000_000) as u64);
+    seed_two_metric_inputs(&store).await;
+    let clock = FixedClock::new(now_ns);
+
+    let holder = ClaimGuard::new(
+        &bucket(),
+        &participant(1, &clock),
+        ClaimConfig {
+            lease_duration: LEASE,
+            ..ClaimConfig::default()
+        },
+        None,
+    );
+    assert!(matches!(
+        holder.acquire(&store).await.expect("holder acquires"),
+        Acquire::Acquired
+    ));
+
+    let mut memo = ravel_maintain::MaintainMemo::with_default_interval();
+    let first = ravel_maintain::scan::scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &clock,
+        &claiming_config(2, &clock, 1, &RequestLedger::new()),
+        &ravel_maintain::RetentionConfig::default(),
+        &ravel_maintain::NoLeases,
+        bucket().tenant_hash,
+        bucket().signal,
+        bucket().shard,
+    )
+    .await
+    .expect("first pass");
+    assert_eq!(first.claim_skipped, 1, "the first pass observes the holder");
+    assert_eq!(first.head_tail_hours, vec![HOUR]);
+
+    let second_ledger = RequestLedger::new();
+    let second = ravel_maintain::scan::scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &clock,
+        &claiming_config(2, &clock, 1, &second_ledger),
+        &ravel_maintain::RetentionConfig::default(),
+        &ravel_maintain::NoLeases,
+        bucket().tenant_hash,
+        bucket().signal,
+        bucket().shard,
+    )
+    .await
+    .expect("second pass");
+    assert_eq!(
+        second.head_tail_hours,
+        vec![HOUR],
+        "a held head hour still reaches head_tail_hours"
+    );
+    assert_eq!(second.claim_skipped, 1, "the hold still skips the bucket");
+    assert_eq!(second.compacted, 0, "and it is not compacted");
+    assert_eq!(
+        second_ledger.report().coordinate.requests,
+        0,
+        "the hold issues no claim request"
     );
     assert_eq!(record_keys(&store).await.len(), 0, "nothing was published");
 }

@@ -18,11 +18,12 @@
 //! the run is allowed to stop, and how a lost claim turns into
 //! [`crate::publish::PublishOutcome::Abandoned`].
 //!
-//! # The five checkpoints
+//! # The checkpoints
 //!
-//! [`Checkpoint`] names the quiescent points the merge pipeline already has.
-//! At each one the guard renews if a third of the lease has elapsed since its
-//! last successful write, and reports [`Verdict::Cancel`] if that renewal was
+//! The claim is acquired at the first of ADR-1029 decision 3's five quiescent
+//! points, and [`Checkpoint`] names the other four. At each of those the guard
+//! renews if a third of the lease has elapsed since its last successful write,
+//! and reports [`Verdict::Cancel`] if that renewal was
 //! rejected because the claim was stolen or is gone. Any other store error on
 //! the renewal is not a cancel: the checkpoint returns it, and the run fails
 //! with it before its record PUT. A cancelled run publishes nothing:
@@ -40,13 +41,18 @@
 //! bucket listing and one GET per input commit record, and no catalog, block
 //! or part request (ADR-1029, the amendment on where the claim is taken).
 //!
-//! # Jitter is paid once per attempt
+//! # Jitter is paid on the contended path only
 //!
-//! The deterministic jitter is waited out immediately before the
-//! `CreateIfAbsent`, through the participant's [`ClaimSleeper`], and nowhere
-//! else: [`ClaimSkip::reschedule_after_unix_ms`] is one millisecond past the
-//! holder's expiry and carries no jitter, so a retry scheduled from it pays
-//! the jitter exactly once, in its own pre-acquisition wait.
+//! The first `CreateIfAbsent` is issued with no wait: it resolves the race on
+//! its own, and an uncontended bucket has nobody to decorrelate from. The
+//! deterministic jitter is waited out, through the participant's
+//! [`ClaimSleeper`], before the two writes that follow a refused create: the
+//! steal of an expired claim, and the second `CreateIfAbsent` after a claim
+//! vanished between the refusal and its read. Each of those waits once.
+//! [`ClaimSkip::reschedule_after_unix_ms`] for a held claim is one millisecond
+//! past the holder's expiry and carries no jitter, so the retry scheduled from
+//! it pays the jitter once, before its steal (ADR-1029, the amendment on
+//! jitter on the contended path).
 //!
 //! # An unreadable claim does not starve its bucket
 //!
@@ -100,14 +106,12 @@ use crate::config::{ClaimParticipant, CompactorConfig, Coordination};
 use crate::error::{MaintainError, Result};
 use crate::request_ledger::{RequestLedger, RequestPhase};
 
-/// One of the five quiescent points a claimed run may be cancelled at
-/// (ADR-1029 decision 3). Ordered as the pipeline reaches them.
+/// One of the quiescent points a claimed run may be cancelled at (ADR-1029
+/// decision 3). Ordered as the pipeline reaches them. Decision 3's first
+/// point, after the gates, is where the claim is acquired, so it has no
+/// variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checkpoint {
-    /// After the seal / tombstone / already-compacted / min-input gates and
-    /// the input commit-record reads the cost gate is priced on, before any
-    /// catalog or block read and before any PUT: where the claim is acquired.
-    Gates,
     /// After the input listing and `input_set_hash`, before the per-input
     /// catalog fan-out.
     InputSet,
@@ -124,7 +128,6 @@ impl Checkpoint {
     /// Stable snake_case name, for logs and error text.
     pub fn name(self) -> &'static str {
         match self {
-            Checkpoint::Gates => "gates",
             Checkpoint::InputSet => "input_set",
             Checkpoint::MergeLoop => "merge_loop",
             Checkpoint::PartBoundary => "part_boundary",
@@ -191,9 +194,11 @@ pub struct ClaimSkip {
     pub expiry_unix_ms: i64,
     /// The earliest this bucket should be retried: one millisecond past the
     /// holder's expiry (past the observation instant for a vanished claim).
-    /// It carries no jitter, because the retry's own acquisition waits out
-    /// this contender's jitter before its `CreateIfAbsent`. Never poll before
-    /// it.
+    /// It carries no jitter, because the retry waits out this contender's
+    /// jitter itself before it steals the expired claim. For an unreadable
+    /// claim it is the instant the claim stops holding the bucket back, one
+    /// millisecond past one lease plus this contender's jitter, since that
+    /// retry steals nothing and so waits nothing. Never poll before it.
     pub reschedule_after_unix_ms: i64,
 }
 
@@ -215,7 +220,7 @@ pub enum Acquire {
     },
 }
 
-/// How the pre-acquisition jitter is waited out.
+/// How the contended-path jitter is waited out.
 ///
 /// The jitter is a duration, not an instant, so the injected
 /// [`crate::clock::Clock`] cannot shorten it; this hook is what lets a test
@@ -356,43 +361,27 @@ impl ClaimGuard {
         self.inner.state.lock().await.held.is_some()
     }
 
-    /// Take the claim, after this contender's deterministic jitter delay.
+    /// Take the claim.
     ///
-    /// The jitter (a pure function of the work id and this process id, see
-    /// [`jitter_ms`]) spreads simultaneous starts so N contenders do not all
-    /// issue their `CreateIfAbsent` in the same instant. It precedes the
-    /// attempt, never follows it, and is waited out through the participant's
-    /// [`ClaimSleeper`]. This wait is the only place the jitter is paid: the
-    /// reschedule point a skip reports carries none.
+    /// The first `CreateIfAbsent` goes out with no wait. The deterministic
+    /// jitter (a pure function of the work id and this process id, see
+    /// [`jitter_ms`]) is waited out through the participant's [`ClaimSleeper`]
+    /// only on the contended path: once before the retried `CreateIfAbsent`
+    /// that follows a vanished claim, and once before a steal. The reschedule
+    /// point a held claim's skip reports carries none.
     ///
     /// An expired claim is stolen in the same call: the steal CASes against the
     /// observed version, so exactly one of N thieves wins and a renewal by an
     /// owner that was merely slow defeats every thief.
     pub async fn acquire(&self, store: &dyn ObjectStoreBackend) -> Result<Acquire> {
         let inner = &self.inner;
-        // The jitter span is a fraction of the lease, so it is priced from the
-        // lease this guard was configured with (the same arithmetic
-        // `ClaimConfig` uses internally: whole milliseconds, floored at 1).
-        let lease_ms = i64::try_from(inner.cfg.lease_duration.as_millis())
-            .unwrap_or(i64::MAX)
-            .max(1);
-        let jitter = jitter_ms(
-            &inner.work_id,
-            &inner.owner.process_id,
-            lease_ms,
-            &inner.cfg,
-        );
-        if jitter > 0 {
-            inner
-                .sleeper
-                .sleep(Duration::from_millis(jitter.unsigned_abs()))
-                .await;
-        }
-
         // One free retry: a claim that existed at the `CreateIfAbsent` and was
         // gone by the read that followed is an ordinary interleaving, and the
         // retry takes the now-absent key.
         for attempt in 0..2 {
+            if attempt > 0 {
+                self.wait_jitter().await;
+            }
             let outcome = claim::acquire(store, &inner.identity, &inner.owner, &inner.cfg).await?;
             match outcome {
                 Acquisition::Acquired {
@@ -448,6 +437,30 @@ impl ClaimGuard {
         ))
     }
 
+    /// Wait out this contender's deterministic jitter through the
+    /// participant's sleeper. Called only on the contended path.
+    async fn wait_jitter(&self) {
+        let inner = &self.inner;
+        // The jitter span is a fraction of the lease, so it is priced from the
+        // lease this guard was configured with (the same arithmetic
+        // `ClaimConfig` uses internally: whole milliseconds, floored at 1).
+        let lease_ms = i64::try_from(inner.cfg.lease_duration.as_millis())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let jitter = jitter_ms(
+            &inner.work_id,
+            &inner.owner.process_id,
+            lease_ms,
+            &inner.cfg,
+        );
+        if jitter > 0 {
+            inner
+                .sleeper
+                .sleep(Duration::from_millis(jitter.unsigned_abs()))
+                .await;
+        }
+    }
+
     /// The contention path: steal an expired claim, run past a stale
     /// unreadable one, or report the skip.
     async fn contend(
@@ -458,14 +471,21 @@ impl ClaimGuard {
         let inner = &self.inner;
         let now_ms = self.now_unix_ms();
         let skip = |reason: ClaimSkipReason| {
+            // A held claim's retry steals, and waits out the jitter before it,
+            // so its reschedule point is the bare expiry. An unreadable claim's
+            // retry steals nothing, so it is rescheduled to the observation's
+            // own point, which adds the jitter: the instant `past_unreadable`
+            // lets the run proceed.
+            let reschedule_after_unix_ms = match reason {
+                ClaimSkipReason::UnreadableClaim => observed.reschedule_after_unix_ms,
+                _ => observed.expiry_unix_ms.saturating_add(1),
+            };
             Acquire::Skipped(ClaimSkip {
                 reason,
                 work_id_hex: observed.work_id.hex(),
                 holder_process_id: observed.holder_process_id(),
                 expiry_unix_ms: observed.expiry_unix_ms,
-                // The observation's own reschedule point adds this contender's
-                // jitter; the retry's acquisition waits that jitter out itself.
-                reschedule_after_unix_ms: observed.expiry_unix_ms.saturating_add(1),
+                reschedule_after_unix_ms,
             })
         };
         if observed.holder.is_none() {
@@ -477,6 +497,10 @@ impl ClaimGuard {
             return Ok(skip(ClaimSkipReason::HeldByAnother));
         }
 
+        // Contenders rescheduled to the same expiry arrive here together; the
+        // jitter spreads their steals.
+        self.wait_jitter().await;
+        let now_ms = self.now_unix_ms();
         let stolen = match claim::steal(store, &observed, &inner.owner, &inner.cfg, now_ms).await {
             // The claim object was deleted between the observation and the
             // steal's CAS: the S3 adapter's spelling of the lost race a
@@ -522,9 +546,9 @@ impl ClaimGuard {
     /// `None` before that.
     ///
     /// The threshold is the observation's own reschedule point
-    /// (`last_modified + lease + jitter + 1`), so the retry a skip schedules
-    /// at `expiry + 1`, having waited out its jitter before the
-    /// `CreateIfAbsent`, is the attempt that runs.
+    /// (`last_modified + lease + jitter + 1`), which is also the reschedule
+    /// point an unreadable claim's skip reports, so the retry scheduled from
+    /// that skip is the attempt that runs.
     fn past_unreadable(&self, observed: &ClaimObservation, now_ms: i64) -> Option<Acquire> {
         if now_ms < observed.reschedule_after_unix_ms {
             return None;
@@ -1053,20 +1077,57 @@ mod tests {
         ));
     }
 
-    /// The jitter is waited out through the participant's sleeper, exactly
-    /// `jitter_ms(work_id, process_id, lease)`, once per acquisition attempt,
-    /// and it is NOT also folded into the reschedule point a skip reports: the
-    /// skip reschedules to one millisecond past expiry, and the retry at that
-    /// point requests the jitter wait exactly once more.
+    /// Contender 2's jitter draw for [`bucket`] under [`cfg`], asserted
+    /// non-zero so a test built on it cannot pass vacuously.
+    fn contender_jitter() -> Duration {
+        let draw = jitter_ms(
+            &bucket_identity().work_id(),
+            &Uuid::from_u128(2),
+            cfg().lease_duration.as_millis() as i64,
+            &cfg(),
+        );
+        assert!(draw > 0, "a zero draw would make this test vacuous");
+        Duration::from_millis(draw as u64)
+    }
+
+    /// An uncontended acquisition asks the sleeper for no wait at all: its one
+    /// `CreateIfAbsent` settles the claim, and there is no contender to
+    /// decorrelate from.
+    ///
+    /// Shown failing against the guard that waited out the jitter before every
+    /// first `CreateIfAbsent`: "an uncontended claim waits for nothing" reads
+    /// left [163ms], right [].
+    #[tokio::test]
+    async fn an_uncontended_claim_requests_no_jitter_wait() {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(1_700_000_000_000 * 1_000_000);
+        let expected = contender_jitter();
+        let (participant, sleeper) = recording_participant(2, &clock);
+        let guard = ClaimGuard::new(&bucket(), &participant, cfg(), None);
+        assert!(matches!(
+            guard.acquire(&store).await.expect("acquire"),
+            Acquire::Acquired
+        ));
+        assert_eq!(
+            sleeper.waits(),
+            Vec::<Duration>::new(),
+            "an uncontended claim waits for nothing (its draw would be {expected:?})"
+        );
+        assert_eq!(guard.requests().await, 1, "one CreateIfAbsent, no reads");
+    }
+
+    /// A held claim is observed with no wait, the skip it reports reschedules
+    /// to one millisecond past expiry with no jitter folded in, and the retry
+    /// at that point asks for exactly its jitter once, before the steal.
     ///
     /// Shown failing against the pre-change reschedule (the observation's own
     /// `reschedule_after_unix_ms`, which adds the jitter): "the reschedule
     /// point carries no jitter" reads left 1700000003164, right
-    /// 1700000003001 (a 163 ms draw for this work id and process). Against a
-    /// guard that sleeps on tokio's timer directly, "the first attempt
-    /// requests exactly its jitter, once" reads left [], right [163ms].
+    /// 1700000003001 (a 163 ms draw for this work id and process). Against the
+    /// guard that waited before every first `CreateIfAbsent`, "observing a
+    /// live claim waits for nothing" reads left [163ms], right [].
     #[tokio::test]
-    async fn jitter_is_requested_once_per_attempt_and_not_folded_into_the_reschedule() {
+    async fn a_steal_requests_the_jitter_once_and_the_reschedule_carries_none() {
         let store = MemoryStore::new();
         store.set_clock_ms(1_700_000_000_000);
         let clock = FixedClock::new(1_700_000_000_000 * 1_000_000);
@@ -1077,14 +1138,7 @@ mod tests {
         ));
 
         let (contender, sleeper) = recording_participant(2, &clock);
-        let expected = jitter_ms(
-            &bucket_identity().work_id(),
-            &Uuid::from_u128(2),
-            cfg().lease_duration.as_millis() as i64,
-            &cfg(),
-        );
-        assert!(expected > 0, "a zero draw would make this test vacuous");
-        let expected = Duration::from_millis(expected as u64);
+        let expected = contender_jitter();
 
         let first = ClaimGuard::new(&bucket(), &contender, cfg(), None);
         let skip = match first.acquire(&store).await.expect("contender observes") {
@@ -1094,8 +1148,8 @@ mod tests {
         assert_eq!(skip.reason, ClaimSkipReason::HeldByAnother);
         assert_eq!(
             sleeper.waits(),
-            vec![expected],
-            "the first attempt requests exactly its jitter, once"
+            Vec::<Duration>::new(),
+            "observing a live claim waits for nothing"
         );
         assert_eq!(
             skip.reschedule_after_unix_ms,
@@ -1114,9 +1168,118 @@ mod tests {
         ));
         assert_eq!(
             sleeper.waits(),
-            vec![expected, expected],
-            "the rescheduled retry requests the jitter exactly once"
+            vec![expected],
+            "the steal requests the jitter exactly once"
         );
+        assert_eq!(
+            retry.requests().await,
+            4,
+            "rejected PUT, GET, HEAD, and the steal CAS"
+        );
+    }
+
+    /// A create refused for a claim that is gone by the read retries its
+    /// `CreateIfAbsent` once, and asks for exactly its jitter once, before
+    /// that retry and not before the first attempt.
+    ///
+    /// The total wait is one jitter either way, so the figure that tells the
+    /// two orders apart is what the sleeper had been asked for at the moment
+    /// the first create was refused. Shown failing against the guard that
+    /// waited before every first `CreateIfAbsent`: "the refused first attempt
+    /// waited for nothing" reads left Some([163ms]), right Some([]).
+    #[tokio::test]
+    async fn a_refused_then_retried_create_requests_the_jitter_once() {
+        let clock = FixedClock::new(1_700_000_000_000 * 1_000_000);
+        let expected = contender_jitter();
+        let (participant, sleeper) = recording_participant(2, &clock);
+        let store = RefuseFirstCreate {
+            inner: MemoryStore::new(),
+            refused: std::sync::atomic::AtomicBool::new(false),
+            sleeper: Arc::clone(&sleeper),
+            waits_at_refusal: std::sync::Mutex::new(None),
+        };
+        let guard = ClaimGuard::new(&bucket(), &participant, cfg(), None);
+
+        assert!(matches!(
+            guard.acquire(&store).await.expect("acquire"),
+            Acquire::Acquired
+        ));
+        assert_eq!(
+            store.waits_at_refusal.lock().expect("refusal lock").clone(),
+            Some(Vec::<Duration>::new()),
+            "the refused first attempt waited for nothing"
+        );
+        assert_eq!(
+            sleeper.waits(),
+            vec![expected],
+            "the retried create waits out the jitter once"
+        );
+        assert_eq!(
+            guard.requests().await,
+            3,
+            "the refused PUT, the GET that found the claim gone, and the retried PUT"
+        );
+    }
+
+    /// A store that answers the first `CreateIfAbsent` with `AlreadyExists`
+    /// without writing anything, so the GET that follows finds the key absent:
+    /// the claim-vanished interleaving, on demand. At that refusal it records
+    /// the waits `sleeper` had been asked for so far.
+    struct RefuseFirstCreate {
+        inner: MemoryStore,
+        refused: std::sync::atomic::AtomicBool,
+        sleeper: Arc<RecordingSleeper>,
+        waits_at_refusal: std::sync::Mutex<Option<Vec<Duration>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RefuseFirstCreate {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> std::result::Result<ravel_object_store::PutOutcome, StoreError> {
+            if matches!(opts.mode, ravel_object_store::PutMode::CreateIfAbsent)
+                && !self.refused.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                *self.waits_at_refusal.lock().expect("refusal lock") = Some(self.sleeper.waits());
+                return Err(StoreError::AlreadyExists);
+            }
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> std::result::Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> std::result::Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> std::result::Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
     }
 
     /// An unreadable claim is deferred while its age by the store's
@@ -1128,7 +1291,10 @@ mod tests {
     /// Shown failing against a guard that skips an unreadable claim whatever
     /// its age (`past_unreadable` always `None`): "past one lease plus jitter
     /// the run proceeds unclaimed" panics with `Skipped(ClaimSkip { reason:
-    /// UnreadableClaim, .. })`.
+    /// UnreadableClaim, .. })`. Against a skip that reschedules an unreadable
+    /// claim to one millisecond past expiry, as a held one is, "the retry is
+    /// scheduled for the attempt that runs unclaimed" reads left
+    /// 1700000003001, right 1700000003164.
     #[tokio::test]
     async fn an_unreadable_claim_defers_until_a_lease_plus_jitter_then_runs_unclaimed() {
         let store = MemoryStore::new();
@@ -1149,7 +1315,8 @@ mod tests {
         );
         let clock = FixedClock::new(0);
 
-        // Younger than the lease: deferred to one millisecond past expiry.
+        // Younger than the lease: deferred to the instant it stops holding the
+        // bucket back, one millisecond past one lease plus jitter.
         clock.set((written_ms + 1_000) * 1_000_000);
         let young = guard(&clock, 2, None);
         let skip = match young.acquire(&store).await.expect("young observes") {
@@ -1158,7 +1325,11 @@ mod tests {
         };
         assert_eq!(skip.reason, ClaimSkipReason::UnreadableClaim);
         assert_eq!(skip.expiry_unix_ms, written_ms + lease_ms);
-        assert_eq!(skip.reschedule_after_unix_ms, written_ms + lease_ms + 1);
+        assert_eq!(
+            skip.reschedule_after_unix_ms,
+            written_ms + lease_ms + jitter + 1,
+            "the retry is scheduled for the attempt that runs unclaimed"
+        );
         assert_eq!(
             young.requests().await,
             3,
