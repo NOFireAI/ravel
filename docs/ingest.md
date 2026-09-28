@@ -474,12 +474,12 @@ drop. `FlushNow` and every size or age trigger keep refusing, since their
 actor keeps running to retry. All three counters here (`clock_lag_refused`,
 `clock_lag_unchecked`, and `clock_lag_bypassed_at_shutdown`) live on the
 `ravel-ingest` metrics snapshots, and `/metrics` renders none of them yet:
-that is ADR-1685 follow-up task 3.
+ADR-1685 follow-up task 3 renders all three.
 
 The bypass passes are a bounded loop rather than one pass because the ADR-1307
 floor still applies on them, which is also what decides how many over-bound
 backwards steps teardown residue now takes; the ADR-1685 teardown amendment
-and `MAX_FLUSH_ALL_PASSES`'s doc comment carry that argument. Either way: fix
+carries that argument. Either way: fix
 the host clock before restarting a writer that is refusing flushes.
 
 ### Pipelined flushes (ADR-0067)

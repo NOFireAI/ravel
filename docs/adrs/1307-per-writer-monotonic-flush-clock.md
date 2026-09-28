@@ -237,10 +237,10 @@ flowchart TD
   terminate that way for the store-clock lag refusal ADR-1685 later added: see
   the drain-termination scoping amendment below. Residue left after the cap is
   never dropped silently, but only the caller knows whether it is a loss, so
-  `flush_all` takes the caller's intent. On `Shutdown` and the channel-close arm the actor
-  breaks immediately after the drain: nothing will retry the residue, so it is
-  logged at ERROR and counted (`flush_all_residue_tenants`, whose nonzero value
-  is a durability defect). On `FlushNow` the actor keeps running and the
+  `flush_all` takes the caller's intent. On `Shutdown` and the channel-close
+  arm the actor breaks immediately after the drain: nothing will retry the
+  residue, so it is logged at ERROR and counted (`flush_all_residue_tenants`,
+  whose nonzero value is a durability defect). On `FlushNow` the actor keeps running and the
   residue is still in the tenant map with its `oldest_arrival_ns`, so the age
   tick and the next explicit flush both retry it and no row is lost; that case
   is logged at WARN and not counted. The distinction matters because the

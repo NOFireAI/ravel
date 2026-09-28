@@ -844,8 +844,9 @@ impl SpanShardActor {
     /// the enforced loop and a [`DrainIntent::Teardown`] then keeps making
     /// passes with [`LagCheck::BypassedAtTeardown`] while tenants remain, under
     /// the same bound, rather than strand acknowledged buffered-mode rows; see
-    /// [`MAX_FLUSH_ALL_PASSES`] for why those passes are a loop and what
-    /// teardown residue takes. [`DrainIntent::Retryable`] never bypasses: its
+    /// [`MAX_FLUSH_ALL_PASSES`] for why those passes are a loop, and the
+    /// ADR-1685 teardown amendment for what teardown residue takes.
+    /// [`DrainIntent::Retryable`] never bypasses: its
     /// actor keeps running, so a later trigger retries once the host clock
     /// converges.
     ///
