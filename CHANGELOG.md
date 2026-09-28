@@ -69,11 +69,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it cannot be expired, and deletes an expired, past-horizon record's commit
   record before its data object, consulting the same legal-hold hook the other
   sweeps use. It writes no tombstone, because the evaluator's fold refuses any
-  bucket entry that is not a commit or compaction record. A keep set of
-  `(epoch, seq)` pairs names each identity's current-state record and spares it
-  whatever its age, so a firing alert older than the window keeps the one
-  record that says so and a cold-start fold over the survivors still recovers
-  every identity's state. `CompactorConfig::alert_retention_window_ns` is the
+  bucket entry that is not a commit or compaction record. A keep set built from
+  the alert state memo spares each identity's current-state record whatever its
+  age, so a firing alert older than the window keeps the one record that says
+  so and a cold-start fold over the survivors still recovers every identity's
+  state. The keep set is the `ts_ns` of those records, which is what the memo
+  carries and what each commit record's `max_event_ts_ns` equals, together with
+  the memo's watermark hour; a record is deleted only when its ingest hour is
+  strictly below that watermark, since the memo is complete only below it and a
+  late write into the watermark hour itself may be an identity's newest
+  transition. `CompactorConfig::alert_retention_window_ns` is the
   window, default 90 days, the same value as the query-audit window; `0`
   disables the sweep and keeps the previous grow-forever behaviour. Nothing in
   the server calls the sweep yet: the driver that reads the memo, builds the

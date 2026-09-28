@@ -1033,10 +1033,15 @@ pub struct CompactorConfig {
     pub audit_retention_window_ns: i64,
     /// Retention window for the `Signal::Alerts` transition history (ADR-1688
     /// decision 5). An alert commit record whose newest event is older than
-    /// this, and which is not the current-state record of any live identity
-    /// (the keep set passed to [`crate::alert_retention::sweep_alert_retention`],
-    /// ADR-1688 decision 2), is swept, horizon-gated on the record's durable
-    /// `created_unix_ns` and gated on the caller-supplied
+    /// this is swept by
+    /// [`crate::alert_retention::sweep_alert_retention`], unless the keep set
+    /// that sweep is given spares it (ADR-1688 decision 2). The keep set holds
+    /// the last record of every identity the alert state memo carries, which is
+    /// a firing alert's current state and also the final `resolved` record of a
+    /// rule that has since been deleted, and its watermark hour: a record whose
+    /// ingest hour is not strictly below that watermark is kept too, because the
+    /// memo is not complete for it. The sweep is horizon-gated on the record's
+    /// durable `created_unix_ns` and gated on the caller-supplied
     /// [`crate::sweep::LeaseCheck`] -- the same hook the audit retention and
     /// superseded-input sweeps consult, which the server populates with the
     /// tenant's legal holds. The window doubles as the evaluator's
