@@ -4,10 +4,11 @@
 //! Only `--signal logs` is implemented. Bulk import for metrics and for spans
 //! has landed (`load --signal metrics`, `load --signal spans`), so what an
 //! export of either now waits on is its own follow-up, ADR-1751 follow-up
-//! task 3, which is where the read path, the column layout each signal's
-//! `--mapping` describes, and the round trip back through `load` are worked
-//! out. [`unsupported_signal_message`] refuses those two by name rather than
-//! producing a file whose shape nothing has agreed on yet.
+//! task 3, which is where each signal's read path and the round trip back
+//! through `load` are worked out. The output columns are not open: decision 4
+//! already says the same mapping TOML names them.
+//! [`unsupported_signal_message`] refuses those two by name rather than
+//! producing an empty file.
 //!
 //! # What makes this a store read rather than a query
 //!
@@ -113,7 +114,10 @@ pub struct ExportReport {
 ///
 /// `logs` is the only supported signal. Bulk import for metrics (follow-up 1)
 /// and for spans (follow-up 2) has landed, so the missing piece each of them
-/// now waits on is export itself, ADR-1751 follow-up task 3. Refusing by name
+/// now waits on is export itself, ADR-1751 follow-up task 3. The message names
+/// that and stops there: ADR-1751 decision 4 already settles the output
+/// columns (the same mapping TOML names them), so a refusal saying the
+/// follow-up decides them contradicts the decision record. Refusing by name
 /// keeps naming what is missing rather than reporting an empty file.
 pub fn unsupported_signal_message(signal: SignalArg) -> Option<String> {
     let (name, loader) = match signal {
@@ -122,10 +126,9 @@ pub fn unsupported_signal_message(signal: SignalArg) -> Option<String> {
         SignalArg::Spans => ("spans", "load --signal spans"),
     };
     Some(format!(
-        "export --signal {name} is not available: it waits on ADR-1751 follow-up task 3, which \
-         is where the {name} read path and the column layout a {name} --mapping describes are \
-         decided. Bulk import for {name} has landed (`{loader}`), so this is the remaining half \
-         of that round trip. Only --signal logs is supported."
+        "export --signal {name} is not available: it is ADR-1751 follow-up task 3. Bulk import \
+         for {name} has landed (`{loader}`), so this is the remaining half of that round trip. \
+         Only --signal logs is supported."
     ))
 }
 
@@ -810,23 +813,28 @@ mod tests {
             unsupported_signal_message(SignalArg::Metrics).expect("metrics is unsupported");
         assert_eq!(
             metrics,
-            "export --signal metrics is not available: it waits on ADR-1751 follow-up task 3, \
-             which is where the metrics read path and the column layout a metrics --mapping \
-             describes are decided. Bulk import for metrics has landed (`load --signal metrics`), \
-             so this is the remaining half of that round trip. Only --signal logs is supported."
+            "export --signal metrics is not available: it is ADR-1751 follow-up task 3. Bulk \
+             import for metrics has landed (`load --signal metrics`), so this is the remaining \
+             half of that round trip. Only --signal logs is supported."
         );
         let spans = unsupported_signal_message(SignalArg::Spans).expect("spans is unsupported");
         assert_eq!(
             spans,
-            "export --signal spans is not available: it waits on ADR-1751 follow-up task 3, which \
-             is where the spans read path and the column layout a spans --mapping describes are \
-             decided. Bulk import for spans has landed (`load --signal spans`), so this is the \
-             remaining half of that round trip. Only --signal logs is supported."
+            "export --signal spans is not available: it is ADR-1751 follow-up task 3. Bulk import \
+             for spans has landed (`load --signal spans`), so this is the remaining half of that \
+             round trip. Only --signal logs is supported."
         );
         for message in [&metrics, &spans] {
             assert!(
                 !message.contains("does not exist yet"),
                 "neither import is the missing piece any more: {message}"
+            );
+            // ADR-1751 decision 4 already settles the output columns: the same
+            // mapping TOML names them. A refusal claiming the follow-up decides
+            // them contradicts the decision record.
+            assert!(
+                !message.contains("column layout"),
+                "the follow-up does not decide the column layout: {message}"
             );
         }
     }

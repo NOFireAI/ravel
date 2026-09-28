@@ -986,41 +986,173 @@ async fn dictionary_encoded_hex_id_columns_load() {
         ("request.digest".to_string(), String::new()),
         ("service.name".to_string(), "cart".to_string()),
     ];
+    /// What one stored span is expected to hold, field by field.
+    struct Want {
+        span_id: [u8; 8],
+        parent_span_id: Option<[u8; 8]>,
+        name: &'static str,
+        end_ts_ns: i64,
+        digest_hex: &'static str,
+    }
+
     // `records` is sorted by (trace_id, span_id), and the three span ids are
     // 0x11 < 0x22 < 0x33, so the root is first.
-    let expected: Vec<(&[u8; 8], Option<[u8; 8]>, &str, i64, &str)> = vec![
-        (&root_span_id, None, "GET /cart", event_ns + 1, "01"),
-        (
-            &child_a_span_id,
-            Some(root_span_id),
-            "db.query",
-            event_ns + 2,
-            "02",
-        ),
-        (
-            &child_b_span_id,
-            Some(root_span_id),
-            "db.query",
-            event_ns + 3,
-            "03",
-        ),
+    let expected = vec![
+        Want {
+            span_id: root_span_id,
+            parent_span_id: None,
+            name: "GET /cart",
+            end_ts_ns: event_ns + 1,
+            digest_hex: "01",
+        },
+        Want {
+            span_id: child_a_span_id,
+            parent_span_id: Some(root_span_id),
+            name: "db.query",
+            end_ts_ns: event_ns + 2,
+            digest_hex: "02",
+        },
+        Want {
+            span_id: child_b_span_id,
+            parent_span_id: Some(root_span_id),
+            name: "db.query",
+            end_ts_ns: event_ns + 3,
+            digest_hex: "03",
+        },
     ];
-    for (got, (span_id, parent, name, end_ns, digest)) in records.iter().zip(expected) {
+    for (got, want) in records.iter().zip(expected) {
         assert_eq!(got.trace_id, trace_id, "the hex trace id decodes to bytes");
-        assert_eq!(got.span_id, *span_id, "the hex span id decodes to bytes");
         assert_eq!(
-            got.parent_span_id, parent,
+            got.span_id, want.span_id,
+            "the hex span id decodes to bytes"
+        );
+        assert_eq!(
+            got.parent_span_id, want.parent_span_id,
             "the empty-string parent is a root and a repeated hex parent decodes to bytes"
         );
-        assert_eq!(got.name, name);
+        assert_eq!(got.name, want.name);
         assert_eq!(got.start_ts_ns, event_ns);
-        assert_eq!(got.end_ts_ns, end_ns);
+        assert_eq!(got.end_ts_ns, want.end_ts_ns);
         assert_eq!(got.status_code, StatusCode::Ok);
         assert_eq!(got.status_message.as_deref(), Some("fine"));
-        let mut want = attrs.clone();
-        want[4].1 = digest.to_string();
-        assert_eq!(got.attrs, want);
+        let mut want_attrs = attrs.clone();
+        want_attrs[4].1 = want.digest_hex.to_string();
+        assert_eq!(got.attrs, want_attrs);
     }
+}
+
+/// Over-cap attribute values are dropped from the stored span and COUNTED on
+/// the report, across rows and across both precedence sets.
+///
+/// OTLP reports the same drop as `AttributeValueTooLong` in its
+/// partial-success message; a load has no partial-success channel, so the
+/// count on the report (printed in the load summary) is where the
+/// approximation becomes visible. The count is exact, not a flag.
+#[tokio::test]
+async fn over_cap_attribute_values_are_dropped_and_counted() {
+    let load_ns = now_ns();
+    let event_ns = load_ns - 60 * NS_PER_SEC;
+    let cap = SpanIngestLimits::default().max_attribute_value_len;
+    let big = "x".repeat(cap + 1);
+    let at_cap = "x".repeat(cap);
+
+    // Row 0 loses its span attribute AND its resource attribute; row 1 loses
+    // its span attribute only; row 2 loses nothing, with a value exactly at
+    // the cap, so the total is 3 and not "one per row that had a long value".
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "trace_id".to_string(),
+            bin_col(vec![vec![7u8; 16], vec![7u8; 16], vec![7u8; 16]]),
+        ),
+        (
+            "span_id".to_string(),
+            bin_col(vec![vec![1u8; 8], vec![2u8; 8], vec![3u8; 8]]),
+        ),
+        (
+            "parent_span_id".to_string(),
+            opt_bin_col(vec![None, None, None]),
+        ),
+        ("name".to_string(), str_col(vec!["op", "op", "op"])),
+        (
+            "start_ns".to_string(),
+            i64_col(vec![event_ns, event_ns, event_ns]),
+        ),
+        (
+            "end_ns".to_string(),
+            i64_col(vec![event_ns, event_ns, event_ns]),
+        ),
+        (
+            "status_code".to_string(),
+            opt_i64_col(vec![None, None, None]),
+        ),
+        (
+            "status_message".to_string(),
+            opt_str_col(vec![None, None, None]),
+        ),
+        (
+            "svc".to_string(),
+            opt_str_col(vec![Some(big.as_str()), Some("api"), Some("api")]),
+        ),
+        (
+            "method".to_string(),
+            opt_str_col(vec![
+                Some(big.as_str()),
+                Some(big.as_str()),
+                Some(at_cap.as_str()),
+            ]),
+        ),
+        (
+            "http_status".to_string(),
+            opt_i64_col(vec![None, None, None]),
+        ),
+        ("queue_seconds".to_string(), f64_col(vec![None, None, None])),
+        ("cache_hit".to_string(), bool_col(vec![None, None, None])),
+        (
+            "digest".to_string(),
+            opt_bin_col(vec![None, None, Some(vec![0xfe])]),
+        ),
+    ])
+    .expect("record batch");
+
+    let mapping = spans_mapping(FULL_MAPPING);
+    let (store, report) = load_batch(&batch, &mapping, load_ns).await;
+    assert_eq!(
+        report.rows_processed, 3,
+        "every span is kept; only the values are dropped"
+    );
+    assert_eq!(
+        report.attributes_dropped, 3,
+        "two values on the first row, one on the second, none on the third"
+    );
+
+    let tenant = TenantId::new("acme");
+    let records = read_back_spans(
+        &store,
+        &tenant,
+        TimeRange {
+            start_ns: event_ns - NS_PER_MIN,
+            end_ns: event_ns + NS_PER_MIN,
+        },
+        &report.tokens,
+        load_ns,
+    )
+    .await;
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].attrs, Vec::new(), "both values dropped");
+    assert_eq!(
+        records[1].attrs,
+        vec![("service.name".to_string(), "api".to_string())],
+        "only the over-cap span attribute is dropped"
+    );
+    assert_eq!(
+        records[2].attrs,
+        vec![
+            ("http.method".to_string(), at_cap),
+            ("request.digest".to_string(), "fe".to_string()),
+            ("service.name".to_string(), "api".to_string()),
+        ],
+        "a value exactly at the cap is stored"
+    );
 }
 
 /// The smallest legal spans mapping: every optional field omitted.

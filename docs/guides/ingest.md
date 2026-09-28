@@ -678,8 +678,12 @@ does there (including one too wide for `i64`). An empty parent cell is a root
 span, exactly as OTLP's own empty `parent_span_id` field is, so a file that
 writes roots as empty bytes or `""` loads unchanged. An attribute value longer
 than the 8192-byte cap drops that attribute and keeps the span, which is what
-the OTLP path does with it. An empty attribute value is a value and is stored,
-unlike an empty metric label.
+the OTLP path does with it; the load summary prints how many values were
+dropped that way (`attrs_dropped`), which is where the OTLP path's
+`AttributeValueTooLong` partial-success entry goes on a load. A null attribute
+cell is an attribute the row does not carry, as an OTLP `KeyValue` carrying no
+value is dropped as `MissingAttributeValue`. An empty attribute value is a
+value and is stored, unlike an empty metric label.
 
 **What still differs from OTLP**, and this is the complete list: for the same
 input, nothing else about the stored record differs between a Parquet load and
@@ -701,9 +705,6 @@ an OTLP export.
   field is one record of a live stream; a mapped column producing unusable ids
   is a mapping mistake the whole file shares, and a silently re-rooted span
   tree is not visible in the data.
-- **A null attribute cell is an attribute the row does not carry**, the same
-  as an OTLP span that omits the key. OTLP has no null attribute to compare
-  against.
 - **Attribute keys and the two attribute-count caps are checked against the
   `--mapping`, not per span.** A key that is empty, longer than the 256-byte
   OTLP cap, reserved for a span field this version does not map, or declared
@@ -1163,9 +1164,10 @@ ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
 **Logs only.** `--signal` has no default, and today it accepts only `logs`.
 `--signal metrics` and `--signal spans` are refused by name. Both bulk imports
 have landed (`load --signal metrics` and `load --signal spans` above), so what
-each export now waits on is the export work itself: that signal's read path
-and the column layout its `--mapping` describes. Each refusal message says so
-and names the decision record that sequences it.
+each export now waits on is the export work itself. The output columns are not
+part of what it decides: the decision record already settles them, and the same
+`--mapping` TOML names them. Each refusal message says so and names the
+decision record that sequences it.
 
 ### What the window means
 

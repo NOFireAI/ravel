@@ -362,17 +362,23 @@ enum Command {
     /// as the same record the same span sent over OTLP produces: the same
     /// attribute coercion, the same resource-over-span merge, the same status
     /// mapping (anything outside `0..=2` is unset), an empty or null parent
-    /// cell is a root span, and an attribute value over the cap drops that
-    /// attribute and keeps the span. The complete list of what still differs
+    /// cell is a root span, an attribute value over the cap drops that
+    /// attribute and keeps the span (the load summary prints how many values
+    /// were dropped that way), and a null attribute cell is an attribute the
+    /// row does not carry, as an OTLP `KeyValue` with no value is. The
+    /// complete list of what still differs
     /// for the same input: a null `start_ts`, `end_ts` or `name` cell is
     /// refused (OTLP has no null for any of them); a negative timestamp is
     /// refused (OTLP's are unsigned); a non-empty parent id of the wrong width
-    /// is refused rather than dropped; a null attribute cell is an attribute
-    /// the row does not carry; and the attribute keys and the two
-    /// attribute-count caps (1024 span columns, 128 resource columns) are
-    /// checked against the `--mapping` before the load rather than per span,
-    /// so an empty, over-long, reserved or duplicated key refuses the load
-    /// where OTLP would drop or admit that one attribute. A row that fails a
+    /// is refused rather than dropped; and the attribute keys and the two
+    /// attribute-count caps are checked against the `--mapping` before the
+    /// load rather than per span, so an empty, over-long, reserved or
+    /// duplicated key refuses the load where OTLP would drop or admit that one
+    /// attribute, and so does a mapping declaring more than 1024
+    /// `[[spans.attribute]]` columns (the loader per-record cap, standing in
+    /// for OTLP's per-span cap of 128) or more than 128
+    /// `[[spans.resource_attribute]]` columns (OTLP's own
+    /// `max_resource_attributes`). A row that fails a
     /// kept check is
     /// rejected fail-fast: the run stops at the first bad row and exits
     /// nonzero. `--skip-rows` (issue #1713) drops that many leading rows by
@@ -614,9 +620,9 @@ enum Command {
     /// several narrower windows.
     ///
     /// Only `--signal logs` works today. Metrics and spans are refused by
-    /// name: both bulk imports have landed, so what their exports wait on is
-    /// ADR-1751 follow-up task 3, which decides each signal's read path and
-    /// the column layout its `--mapping` describes.
+    /// name: both bulk imports have landed, so each export is now just
+    /// ADR-1751 follow-up task 3. The output columns are already settled by
+    /// decision 4 -- the same `--mapping` TOML names them.
     Export {
         /// Signal to export. Only `logs` is supported; `metrics` and `spans`
         /// are refused with the follow-up each one waits on. No default: a

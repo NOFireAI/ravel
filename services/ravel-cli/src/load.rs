@@ -1623,7 +1623,13 @@ async fn run_spans(
         warnings,
     )?;
 
-    match load_spans(
+    // The report is owned here rather than returned, so a FAILED load can still
+    // print the attributes it dropped: that figure is not one `LoadError`
+    // carries, and a failure does not undo the approximation in the batches
+    // that did land.
+    let mut report = SpansLoadReport::default();
+    match load_spans_into(
+        &mut report,
         store,
         parquet_path,
         tenant,
@@ -1640,7 +1646,7 @@ async fn run_spans(
     )
     .await
     {
-        Ok(report) => {
+        Ok(()) => {
             print_spans_summary(&report);
             if let Some(warning) =
                 skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
@@ -1651,6 +1657,7 @@ async fn run_spans(
         }
         Err(err) => {
             print_durable_tokens(&err, SEQUENTIAL_RESUMABLE_SETTINGS);
+            print_spans_attrs_dropped(&report);
             if let Some(hint) = sequential_resume_hint(&err, pipeline_depth) {
                 let _ = writeln!(warnings, "{hint}");
             }
@@ -1784,7 +1791,26 @@ fn print_spans_summary(report: &SpansLoadReport) {
     println!("  rows_written     : {}", report.rows_processed);
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
+    print_spans_attrs_dropped(report);
     println!("  elapsed          : {secs:.3}s");
+}
+
+/// Print the attribute values a spans load dropped for being over the OTLP
+/// value-length cap.
+///
+/// Printed on the success path and beside the durable-token banner on the
+/// failure path, because a nonzero count means the records that landed are an
+/// approximation of the source rows and nothing else in either output says so.
+/// The OTLP path reports the same drop as `AttributeValueTooLong` in its
+/// partial-success message; a load has no partial-success channel, so the
+/// summary is where it goes. Zero prints too: an operator reading the line as
+/// evidence that nothing was dropped needs it to be there when nothing was.
+fn print_spans_attrs_dropped(report: &SpansLoadReport) {
+    println!(
+        "  attrs_dropped    : {} (attribute values over the OTLP value-length cap; each span was \
+         stored without them)",
+        report.attributes_dropped
+    );
 }
 
 /// The warning for a `--skip-rows` past the end of the file, or `None` when the
@@ -6462,6 +6488,16 @@ pub struct SpansLoadReport {
     pub file_total_rows: u64,
     /// One token per shard acked, across every batch, in submission order.
     pub tokens: Vec<CommitToken>,
+    /// Attribute values dropped for being over the OTLP value-length cap. The
+    /// span itself is kept, so a nonzero count means the stored record is an
+    /// approximation of the source row and nothing else in the load says so.
+    ///
+    /// Counted where the row is BUILT, not where it acks: an attribute dropped
+    /// from a span whose batch later failed to flush is counted here and its
+    /// span is in no object. That is the direction to be wrong in, since the
+    /// figure exists to make an approximation visible rather than to be
+    /// reconciled against the stored records.
+    pub attributes_dropped: u64,
     pub elapsed: Duration,
 }
 
@@ -6636,6 +6672,8 @@ fn read_status_code(arr: &ArrayRef, row: usize) -> Result<StatusCode, String> {
 /// lag bound (ADR-0089's relaxation, widened to every signal by ADR-1751
 /// decision 1); the future-skew bound is kept, and anchors on the span's end
 /// exactly as `checked_span_interval` does.
+/// `dropped` accumulates this row's over-cap attribute drops; see
+/// [`read_span_attrs`].
 fn build_span(
     batch: &RecordBatch,
     cols: &SpansColumnIndex,
@@ -6643,6 +6681,7 @@ fn build_span(
     limits: &SpanIngestLimits,
     now_ns: i64,
     row: usize,
+    dropped: &mut u64,
 ) -> Result<NormalizedSpan, String> {
     let name = read_string(batch.column(cols.name), row)?
         .ok_or_else(|| format!("name column {:?} is null", mapping.name_column))?;
@@ -6775,8 +6814,16 @@ fn build_span(
         &mapping.resource_attributes,
         limits,
         row,
+        dropped,
     )?;
-    let span_attrs = read_span_attrs(batch, &cols.attributes, &mapping.attributes, limits, row)?;
+    let span_attrs = read_span_attrs(
+        batch,
+        &cols.attributes,
+        &mapping.attributes,
+        limits,
+        row,
+        dropped,
+    )?;
     // The same merge the OTLP path runs, with an empty scope set: this loader
     // maps no instrumentation scope, so there is nothing between resource and
     // span precedence. The reserved-key strip `normalize_span` applies is not
@@ -6799,12 +6846,17 @@ fn build_span(
 
 /// Read one row's mapped attributes for one precedence set, coerced to the
 /// `Map<Utf8, Utf8>` strings RSPAN stores.
+///
+/// `dropped` counts the values this row lost to the value-length cap, so the
+/// summary can say the stored record is an approximation. OTLP reports the
+/// same drop as `AttributeValueTooLong` in its partial-success message.
 fn read_span_attrs(
     batch: &RecordBatch,
     indices: &[usize],
     maps: &[AttrMap],
     limits: &SpanIngestLimits,
     row: usize,
+    dropped: &mut u64,
 ) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::with_capacity(indices.len());
     for (col, map) in indices.iter().zip(maps) {
@@ -6821,6 +6873,7 @@ fn read_span_attrs(
         // feeds an identity here, so one unstorable value never has to reject
         // its neighbours or the record they sit on.
         if value.len() > limits.max_attribute_value_len {
+            *dropped += 1;
             continue;
         }
         out.push((map.key.clone(), value));
@@ -6862,10 +6915,12 @@ struct SpansDecodeState {
 /// One batch's decode outcome.
 enum SpansDecoded {
     /// Spans built from this batch, the source rows they came from (one per
-    /// span here), and whether the input is exhausted.
+    /// span here), the attribute values this batch lost to the value-length
+    /// cap, and whether the input is exhausted.
     Batch {
         spans: Vec<NormalizedSpan>,
         rows: u64,
+        attrs_dropped: u64,
         done: bool,
     },
     /// The batch failed to read from Parquet or to resolve against the
@@ -6891,6 +6946,7 @@ fn decode_spans_batch(
         return SpansDecoded::Batch {
             spans: Vec::new(),
             rows: 0,
+            attrs_dropped: 0,
             done: true,
         };
     };
@@ -6902,6 +6958,7 @@ fn decode_spans_batch(
             return SpansDecoded::Batch {
                 spans: Vec::new(),
                 rows: 0,
+                attrs_dropped: 0,
                 done: false,
             };
         }
@@ -6922,8 +6979,17 @@ fn decode_spans_batch(
     };
 
     let mut spans = Vec::with_capacity(batch.num_rows());
+    let mut attrs_dropped = 0u64;
     for row in 0..batch.num_rows() {
-        match build_span(&batch, &cols, mapping, limits, now_ns, row) {
+        match build_span(
+            &batch,
+            &cols,
+            mapping,
+            limits,
+            now_ns,
+            row,
+            &mut attrs_dropped,
+        ) {
             Ok(span) => spans.push(span),
             Err(reason) => {
                 return SpansDecoded::Rejected {
@@ -6937,6 +7003,7 @@ fn decode_spans_batch(
     SpansDecoded::Batch {
         spans,
         rows,
+        attrs_dropped,
         done: false,
     }
 }
@@ -6971,6 +7038,49 @@ pub async fn load_spans(
     now_ns: i64,
     clock: Arc<dyn Clock>,
 ) -> Result<SpansLoadReport, LoadError> {
+    let mut report = SpansLoadReport::default();
+    load_spans_into(
+        &mut report,
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        skip_rows,
+        pipeline_depth,
+        max_inflight_flushes,
+        target_bytes,
+        max_flush_delay,
+        now_ns,
+        clock,
+    )
+    .await?;
+    Ok(report)
+}
+
+/// [`load_spans`] writing into a caller-owned report, so a FAILED load still
+/// leaves the figures [`LoadError`] does not carry where the caller can read
+/// them. Today that is [`SpansLoadReport::attributes_dropped`]: an
+/// approximation the operator has to be told about, and one a failure does not
+/// undo for the batches that did land.
+#[allow(clippy::too_many_arguments)]
+async fn load_spans_into(
+    report: &mut SpansLoadReport,
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &SpansMapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+) -> Result<(), LoadError> {
     // Same operator-facing lever guards as the other paths: a value that
     // cannot express what the flag means is rejected, never silently clamped.
     if batch_rows == 0 {
@@ -7048,7 +7158,6 @@ pub async fn load_spans(
     };
 
     let started = Instant::now();
-    let mut report = SpansLoadReport::default();
     let total_rows: u64 = row_group_lens.iter().sum();
     report.rows_skipped = skip_rows.min(total_rows);
     report.skip_rows_requested = skip_rows;
@@ -7085,7 +7194,7 @@ pub async fn load_spans(
         let (spans, rows, done) = match decoded {
             SpansDecoded::Failed(reason) => {
                 let (durable, reason) =
-                    drain_sequential_before_refusal(&mut inflight, &mut report, reason).await;
+                    drain_sequential_before_refusal(&mut inflight, report, reason).await;
                 return Err(LoadError::BatchFailed {
                     reason,
                     durable,
@@ -7094,7 +7203,7 @@ pub async fn load_spans(
             }
             SpansDecoded::Rejected { row, reason } => {
                 let (durable, reason) =
-                    drain_sequential_before_refusal(&mut inflight, &mut report, reason).await;
+                    drain_sequential_before_refusal(&mut inflight, report, reason).await;
                 return Err(LoadError::RowRejected {
                     row,
                     reason,
@@ -7102,7 +7211,15 @@ pub async fn load_spans(
                     resume: report.resume(),
                 });
             }
-            SpansDecoded::Batch { spans, rows, done } => (spans, rows, done),
+            SpansDecoded::Batch {
+                spans,
+                rows,
+                attrs_dropped,
+                done,
+            } => {
+                report.attributes_dropped += attrs_dropped;
+                (spans, rows, done)
+            }
         };
 
         if spans.is_empty() {
@@ -7130,7 +7247,7 @@ pub async fn load_spans(
             let Some(entry) = inflight.pop_front() else {
                 break;
             };
-            if let Err(mut e) = resolve_sequential_write(entry, &mut report).await {
+            if let Err(mut e) = resolve_sequential_write(entry, report).await {
                 harvest_sequential_after_failure(&mut inflight, &mut e).await;
                 return Err(e);
             }
@@ -7160,7 +7277,7 @@ pub async fn load_spans(
                 }
             }
         });
-        let result = drain_sequential_inflight(&mut inflight, &mut report).await;
+        let result = drain_sequential_inflight(&mut inflight, report).await;
         let _ = stop_tx.send(());
         let _ = ticker.await;
         result
@@ -7168,7 +7285,7 @@ pub async fn load_spans(
     drain_result?;
 
     report.elapsed = started.elapsed();
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -13799,7 +13916,7 @@ type = "str"
                     ("method", str_col(vec!["GET"])),
                 ]);
                 let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
-                build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
+                build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0, &mut 0)
             };
 
             // The start stays well inside the bound in both cases, so only the
@@ -13840,7 +13957,7 @@ type = "str"
                 ("method", str_col(vec!["GET"])),
             ]);
             let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
-            let err = build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
+            let err = build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0, &mut 0)
                 .expect_err("end before start");
             assert_eq!(
                 err,
@@ -13911,8 +14028,15 @@ type = "str"
         }
 
         /// Build the single row `row` describes through the real
-        /// [`build_span`], under [`FULL_MAPPING_TOML`].
-        fn build_one(row: Row) -> Result<NormalizedSpan, String> {
+        /// [`build_span`], under [`FULL_MAPPING_TOML`], with the count of
+        /// attribute values it dropped for being over the cap.
+        fn build_one_counting(row: Row) -> (Result<NormalizedSpan, String>, u64) {
+            let mut dropped = 0u64;
+            let span = build_one_into(row, &mut dropped);
+            (span, dropped)
+        }
+
+        fn build_one_into(row: Row, dropped: &mut u64) -> Result<NormalizedSpan, String> {
             let limits = SpanIngestLimits::default();
             let mapping = parse_spans_mapping(FULL_MAPPING_TOML).expect("valid mapping");
             let batch = batch(vec![
@@ -13927,7 +14051,13 @@ type = "str"
                 ("method", row.method),
             ]);
             let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
-            build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
+            build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0, dropped)
+        }
+
+        /// [`build_one_counting`] for the tests that do not care how many
+        /// attribute values the row lost to the cap.
+        fn build_one(row: Row) -> Result<NormalizedSpan, String> {
+            build_one_counting(row).0
         }
 
         /// A zero start takes the load time and a zero end takes the resolved
@@ -14010,6 +14140,36 @@ type = "str"
                 assert_eq!(span.parent_span_id, None, "{label} is a root span");
             }
 
+            // A `FixedSizeBinary(0)` parent column: the schema itself says
+            // every row is a root, and `check_id_column` accepts it only
+            // BECAUSE it is the parent column (`empty_is_root`). Any other id
+            // column of that width is refused for having no width to give.
+            let zero_width: ArrayRef = Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    vec![Some::<&[u8]>(&[])].into_iter(),
+                    0,
+                )
+                .expect("a zero-width fixed-size column"),
+            );
+            assert_eq!(
+                zero_width.data_type(),
+                &DataType::FixedSizeBinary(0),
+                "the fixture really is the zero-width arm"
+            );
+            let span = build_one(Row {
+                parent: zero_width,
+                ..Row::default()
+            })
+            .expect("a zero-width fixed-size parent column is a file of root spans");
+            assert_eq!(span.parent_span_id, None, "every row is a root span");
+            let err = check_id_column(&DataType::FixedSizeBinary(0), "span_id", 8, false)
+                .expect_err("a zero-width span_id column can produce no id");
+            assert_eq!(
+                err,
+                "id column \"span_id\" is FixedSizeBinary(0), but this id is 8 bytes. Ravel never \
+                 pads or truncates an id, so no row of this column can produce one."
+            );
+
             // A hex string of the right width is a parent, so the empty-string
             // case above is emptiness and not "strings are never parents".
             let span = build_one(Row {
@@ -14083,27 +14243,90 @@ type = "str"
         }
 
         /// An attribute value over the OTLP cap drops THAT attribute and keeps
-        /// the span, which is `convert_attrs_lossy`'s rule on the OTLP path.
+        /// the span, which is `convert_attrs_lossy`'s rule on the OTLP path,
+        /// and the drop is COUNTED so the load summary can say the stored
+        /// record is an approximation.
         #[test]
         fn an_over_cap_attribute_value_is_dropped_and_the_span_kept() {
             let limits = SpanIngestLimits::default();
             let big = "x".repeat(limits.max_attribute_value_len + 1);
-            let span = build_one(Row {
+            let (span, dropped) = build_one_counting(Row {
                 method: str_col(vec![big.as_str()]),
                 ..Row::default()
-            })
-            .expect("an over-cap attribute value does not reject the span");
+            });
+            let span = span.expect("an over-cap attribute value does not reject the span");
             assert_eq!(span.attrs, Vec::new(), "the attribute itself is dropped");
+            assert_eq!(dropped, 1, "the drop is counted, exactly once");
 
             // Exactly at the cap is kept, so the case above is the cap and not
-            // the column going missing.
+            // the column going missing, and it counts nothing.
             let at_cap = "x".repeat(limits.max_attribute_value_len);
-            let span = build_one(Row {
+            let (span, dropped) = build_one_counting(Row {
                 method: str_col(vec![at_cap.as_str()]),
                 ..Row::default()
-            })
-            .expect("exactly at the cap is admitted");
+            });
+            let span = span.expect("exactly at the cap is admitted");
             assert_eq!(span.attrs, vec![("http.method".to_string(), at_cap)]);
+            assert_eq!(dropped, 0, "nothing was dropped");
+        }
+
+        /// The cap applies to the STORED string, so a bytes attribute is
+        /// measured as its lowercase hex: a value of `cap / 2 + 1` raw bytes
+        /// is under the cap as bytes and over it as hex, and is dropped.
+        #[test]
+        fn a_bytes_attribute_is_measured_as_its_hex_form() {
+            let limits = SpanIngestLimits::default();
+            let cap = limits.max_attribute_value_len;
+            let mapping_toml = format!(
+                "{FULL_MAPPING_TOML}\n[[spans.attribute]]\nkey = \"request.digest\"\ncolumn = \
+                 \"digest\"\ntype = \"bytes\"\n"
+            );
+            let mapping = parse_spans_mapping(&mapping_toml).expect("valid mapping");
+            let build = |raw: Vec<u8>| {
+                let batch = batch(vec![
+                    ("trace_id", bin_col(vec![vec![1u8; 16]])),
+                    ("span_id", bin_col(vec![vec![2u8; 8]])),
+                    ("parent", opt_bin_col(vec![None])),
+                    ("name", str_col(vec!["op"])),
+                    ("start_ns", i64_col(vec![NOW_NS])),
+                    ("end_ns", i64_col(vec![NOW_NS])),
+                    ("status", opt_i64_col(vec![None])),
+                    ("status_msg", opt_str_col(vec![None])),
+                    ("method", str_col(vec!["GET"])),
+                    ("digest", bin_col(vec![raw])),
+                ]);
+                let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+                let mut dropped = 0u64;
+                let span = build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0, &mut dropped)
+                    .expect("an over-cap attribute value does not reject the span");
+                (span, dropped)
+            };
+
+            // cap/2 + 1 raw bytes: under the cap as bytes, two characters over
+            // it as hex. Measuring the raw bytes would keep this attribute and
+            // this assertion would fail.
+            let raw_len = cap / 2 + 1;
+            assert!(raw_len <= cap, "the raw value is itself under the cap");
+            assert_eq!(raw_len * 2, cap + 2, "its hex form is over the cap");
+            let (span, dropped) = build(vec![0xABu8; raw_len]);
+            assert_eq!(
+                span.attrs,
+                vec![("http.method".to_string(), "GET".to_string())],
+                "the digest is dropped and its neighbour is kept"
+            );
+            assert_eq!(dropped, 1, "the drop is counted");
+
+            // cap/2 raw bytes hexes to exactly the cap and is kept, so the case
+            // above is the hex length and not the column going missing.
+            let (span, dropped) = build(vec![0xABu8; cap / 2]);
+            assert_eq!(
+                span.attrs,
+                vec![
+                    ("http.method".to_string(), "GET".to_string()),
+                    ("request.digest".to_string(), "ab".repeat(cap / 2)),
+                ]
+            );
+            assert_eq!(dropped, 0, "nothing was dropped");
         }
 
         /// A negative start or end is refused, naming both declared units: a

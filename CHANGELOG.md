@@ -273,8 +273,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refusals said bulk import for that signal does not exist yet. Both imports
   have since landed, so each message now names ADR-1751 follow-up task 3, the
   export work itself, and says the import half of the round trip is already
-  there. The `export` help text and the ingest guide's bulk-export section say
+  there. Neither message claims that follow-up decides the output columns:
+  ADR-1751 decision 4 already settles them, the same mapping TOML names them.
+  The `export` help text and the ingest guide's bulk-export section say
   the same.
+
+- **A spans load reports the attribute values it dropped for being over the
+  cap** (ADR-1751 follow-up task 2 review, issues #1751 and #1712). An
+  over-cap value drops that attribute and keeps the span, which is the OTLP
+  path's own rule, but the OTLP path reports the drop as
+  `AttributeValueTooLong` in its partial-success message and a load said
+  nothing at all, so the stored record was an approximation with no way to
+  tell. `SpansLoadReport::attributes_dropped` counts them and the load summary
+  prints the count as `attrs_dropped`, on the success path and beside the
+  durable-token banner when the load fails. The count is taken where the row
+  is built, so it covers the batches a later failure abandoned.
 
 ### Added
 
@@ -307,11 +320,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   this caller with no change to its body. An empty parent cell (empty binary,
   empty string, or a zero-width fixed-size value) is a root span, exactly as
   OTLP's own empty `parent_span_id` field is; a status outside `0..=2` is
-  unset, including one too wide for `i64`; and an attribute value over the
+  unset, including one too wide for `i64`; an attribute value over the
   8192-byte cap drops that attribute and keeps the span, as
-  `convert_attrs_lossy` does on the OTLP path.
+  `convert_attrs_lossy` does on the OTLP path, with the number of values
+  dropped that way printed in the load summary as `attrs_dropped`; and a null
+  attribute cell is an attribute the row does not carry, as an OTLP `KeyValue`
+  carrying no value is dropped as `MissingAttributeValue`.
 
-  Five differences remain, and this is the complete list of what the stored
+  Four differences remain, and this is the complete list of what the stored
   record can differ on for the same input. A null `start_ts`, `end_ts` or
   `name` cell is refused: OTLP has no null for any of them, its absent
   timestamp is a zero (a zero takes the same fallbacks here) and its absent
@@ -321,14 +337,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   declared units, since a unit that does not match the column is the usual
   cause. A `parent_span_id` cell that is non-empty and of the wrong width is
   refused rather than dropped, because a mapped column producing unusable ids
-  is a mapping mistake the whole file shares. A null attribute cell is an
-  attribute the row does not carry. And attribute keys and both
+  is a mapping mistake the whole file shares. And attribute keys and both
   attribute-count caps are checked against the `--mapping` rather than per
   span: an empty, over-long, reserved or twice-declared key refuses the load,
   as does a mapping with more than 1024 `[[spans.attribute]]` columns (the
-  loader per-record cap) or more than 128 `[[spans.resource_attribute]]`
-  columns (OTLP's own `max_resource_attributes`, which the loader had no
-  counterpart for before).
+  loader per-record cap, standing in for OTLP's per-span cap of 128) or more
+  than 128 `[[spans.resource_attribute]]` columns (OTLP's own
+  `max_resource_attributes`, which the loader had no counterpart for before).
 
   Span events and span links are not mappable in this version, and a mapping
   naming them is refused by name rather than as a typo. The same refusal covers
