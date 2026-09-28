@@ -1747,10 +1747,26 @@ async fn metrics_invalid_reading_arm_counts_dropped_exemplars() {
 /// literal.
 const RECEDING_STEP_NS: i64 = 2 * MAX_FLUSH_CLOCK_HOLD_NS;
 
+/// Flush attempts a TEARDOWN drain makes against a tenant it can never stamp:
+/// the `MAX_FLUSH_ALL_PASSES` enforced passes, plus the `MAX_FLUSH_ALL_PASSES`
+/// bypass passes a teardown adds with the ADR-1685 store-clock lag check
+/// bypassed. Those passes exist so a lagging clock cannot strand acknowledged
+/// rows (a lag refusal re-anchors nothing, so it would refuse every enforced
+/// pass), and they are a bounded loop rather than a single pass because the
+/// ADR-1307 floor rules stay in force on them: a backwards step the lag check
+/// kept the floor from seeing is refused on the first bypass pass, which
+/// re-anchors the floor, and published on the next. A clock that recedes on
+/// every reading is refused on all of them. A `FlushNow` drain adds no bypass
+/// pass and makes `MAX_FLUSH_ALL_PASSES` attempts.
+const TEARDOWN_DRAIN_ATTEMPTS: u64 = 2 * MAX_FLUSH_ALL_PASSES as u64;
+
 /// F1 (metrics, teardown): a drain whose refusals outlive the pass cap. The
-/// clock steps back beyond the hold bound on *every* reading, so each of the
-/// `MAX_FLUSH_ALL_PASSES` passes is refused and the tenant is still buffered
-/// when the drain gives up. On `Shutdown` the actor breaks straight after the
+/// clock steps back beyond the hold bound on *every* reading, so every pass is
+/// refused and the tenant is still buffered when the drain gives up, including
+/// on every teardown bypass pass, whose bypass covers only the lag check. This
+/// receding clock is what teardown residue now takes: one backwards step is
+/// absorbed or re-anchored and published by a later bypass pass. On
+/// `Shutdown` the actor breaks straight after the
 /// drain, so nothing retries that residue: it is an acknowledged buffered-mode
 /// row lost on a graceful teardown, which is what the ERROR log and
 /// `flush_all_residue_tenants` report. Flipping the `Shutdown` arm's
@@ -1821,8 +1837,8 @@ async fn metrics_teardown_drain_reports_residue_after_the_pass_cap() {
 
     let snap = metrics.snapshot();
     assert_eq!(
-        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
-        "every drain pass is refused, once per pass, so the cap is what ends the drain"
+        snap.clock_regressions_refused, TEARDOWN_DRAIN_ATTEMPTS,
+        "every enforced drain pass is refused, and so is every teardown bypass pass, whose bypass covers only the lag check"
     );
     assert_eq!(
         snap.clock_regressions, 0,
@@ -1985,8 +2001,8 @@ async fn logs_teardown_drain_reports_residue_after_the_pass_cap() {
 
     let snap = metrics.snapshot();
     assert_eq!(
-        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
-        "every drain pass is refused, once per pass"
+        snap.clock_regressions_refused, TEARDOWN_DRAIN_ATTEMPTS,
+        "every enforced drain pass is refused, and so is every teardown bypass pass"
     );
     assert_eq!(
         snap.flush_all_residue_tenants, 1,
@@ -2105,8 +2121,8 @@ async fn spans_teardown_drain_reports_residue_after_the_pass_cap() {
 
     let snap = metrics.snapshot();
     assert_eq!(
-        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
-        "every drain pass is refused, once per pass"
+        snap.clock_regressions_refused, TEARDOWN_DRAIN_ATTEMPTS,
+        "every enforced drain pass is refused, and so is every teardown bypass pass"
     );
     assert_eq!(
         snap.flush_all_residue_tenants, 1,
