@@ -174,7 +174,31 @@ pub(crate) enum StoreClockLag {
     /// The store has not been observed yet, so nothing was checked (decision 4).
     Unobserved,
     /// The reading lags the store's observed time by more than the allowance.
-    Refused(String),
+    /// `lag_ns` is that lag, so a caller that bypasses the refusal can still
+    /// name the figure it bypassed.
+    Refused { lag_ns: i64, msg: String },
+}
+
+/// Whether the ADR-1685 store-clock lag check may refuse this flush attempt.
+///
+/// A lag refusal is not self-clearing the way an over-bound regression is: it
+/// changes neither the monotonic floor nor the store's observation, so every
+/// pass of a drain reads the same lag and refuses again. On a teardown drain
+/// there is no later tick, so enforcing it on every pass would lose the
+/// buffered rows the drain exists to save.
+#[derive(Clone, Copy)]
+pub(crate) enum LagCheck {
+    /// The normal path: a reading lagging the store's observed clock beyond
+    /// the allowance is refused, retryably.
+    Enforced,
+    /// The final pass of a teardown drain (`Shutdown` or the channel-close arm)
+    /// after the bounded retry passes left the buffer still refused. The lag is
+    /// still measured, counted as `clock_lag_bypassed_at_shutdown`, and logged,
+    /// but the flush proceeds: publishing acknowledged rows into a possibly
+    /// sealed hour (recoverable by a HEAD rebuild) beats dropping them on a
+    /// graceful path. The ADR-1307 floor rules are unchanged, so a regression
+    /// refusal still applies here.
+    BypassedAtTeardown,
 }
 
 /// Checks the raw flush-open reading `raw_ns` against `observed_store_ns`, a
@@ -188,12 +212,15 @@ pub(crate) fn store_clock_lag(raw_ns: i64, observed_store_ns: Option<i64>) -> St
     };
     let lag_ns = observed_ns.saturating_sub(raw_ns);
     if lag_ns > ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS {
-        StoreClockLag::Refused(format!(
-            "flush clock lags the object store's observed clock by {lag_ns} ns, beyond the \
-             clock-skew allowance of {} ns; refusing the flush so it cannot publish into an \
-             ingest hour the fold may already have sealed (ADR-1685)",
-            ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
-        ))
+        StoreClockLag::Refused {
+            lag_ns,
+            msg: format!(
+                "flush clock lags the object store's observed clock by {lag_ns} ns, beyond the \
+                 clock-skew allowance of {} ns; refusing the flush so it cannot publish into an \
+                 ingest hour the fold may already have sealed (ADR-1685)",
+                ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            ),
+        }
     } else {
         StoreClockLag::WithinAllowance
     }
@@ -205,17 +232,25 @@ pub(crate) fn store_clock_lag(raw_ns: i64, observed_store_ns: Option<i64>) -> St
 /// `flush_all` re-buffers a clock-refused flush and must retry it in the same
 /// call, because on a graceful teardown there is no later actor tick to retry
 /// it (the map is snapshotted per pass, and a refusal re-inserts a key the
-/// snapshot already consumed). A refusal re-anchors the monotonic floor to the
-/// raw reading, so with any clock that does not keep stepping backwards the
-/// very next pass stamps that reading and proceeds: a normal drain finishes in
-/// one pass, and a single absorbed regression in two. The bound exists only so
-/// a pathological clock that steps back on *every* reading cannot spin the
-/// drain forever; `4` leaves generous headroom above the two passes the
-/// ADR-guaranteed "at most one flush refused per backwards step" needs while
-/// still terminating such a clock in a handful of iterations. Residue that
-/// survives all passes is never dropped silently: how it is reported depends on
-/// whether the caller can still retry it, which is what [`DrainIntent`]
-/// carries.
+/// snapshot already consumed). A *regression* refusal (ADR-1307) re-anchors the
+/// monotonic floor to the raw reading, so with any clock that does not keep
+/// stepping backwards the very next pass stamps that reading and proceeds: a
+/// normal drain finishes in one pass, and a single absorbed regression in two.
+/// The bound exists only so a pathological clock that steps back on *every*
+/// reading cannot spin the drain forever; `4` leaves generous headroom above
+/// the two passes the ADR-guaranteed "at most one flush refused per backwards
+/// step" needs while still terminating such a clock in a handful of iterations.
+///
+/// A *lag* refusal (ADR-1685) re-anchors nothing: it changes neither the floor
+/// nor the store's observation, so every pass reads the same lag and refuses
+/// again. This bound is what ends the drain for it, and on a
+/// [`DrainIntent::Teardown`] the final pass then runs with
+/// [`LagCheck::BypassedAtTeardown`] so those rows publish rather than becoming
+/// residue.
+///
+/// Residue that survives all passes is never dropped silently: how it is
+/// reported depends on whether the caller can still retry it, which is what
+/// [`DrainIntent`] carries.
 pub const MAX_FLUSH_ALL_PASSES: usize = 4;
 
 /// What the caller of a shard actor's `flush_all` does after the drain returns,
@@ -269,6 +304,10 @@ pub(crate) enum FlushClockError {
     /// acknowledged and the flush succeeds once the host clock converges, so it
     /// is surfaced exactly as `RegressionRefused` is, as the retryable
     /// `Abandoned`, and counted as `clock_lag_refused`.
+    ///
+    /// Never produced under [`LagCheck::BypassedAtTeardown`], where a lagging
+    /// reading publishes instead of stranding acknowledged rows on a graceful
+    /// drain.
     LagRefused(String),
 }
 
@@ -677,7 +716,7 @@ mod tests {
         ));
         assert!(matches!(
             store_clock_lag(raw, Some(raw + allowance + 1)),
-            StoreClockLag::Refused(_)
+            StoreClockLag::Refused { lag_ns, .. } if lag_ns == allowance + 1
         ));
         assert!(matches!(
             store_clock_lag(raw, Some(raw - 10 * NS_PER_HOUR)),
@@ -685,7 +724,7 @@ mod tests {
         ));
         assert!(matches!(
             store_clock_lag(raw, Some(i64::MAX)),
-            StoreClockLag::Refused(_)
+            StoreClockLag::Refused { .. }
         ));
         assert!(matches!(
             store_clock_lag(raw, Some(i64::MIN)),
