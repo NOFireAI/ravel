@@ -142,7 +142,7 @@ the reservation commit that used to work around it.
 | [0954](0954-bounded-ephemeral-spill.md) | Bounded ephemeral spill for eligible SQL operators | Accepted (2026-08-30) |
 | [0979](0979-bounded-memory-rlog-compaction-merge.md) | Bounded-memory RLOG compaction merge | Proposed |
 | [0996](0996-request-cost-aware-fetching.md) | request-cost-aware fetching and the S3 request ledger | Proposed |
-| [1029](1029-advisory-compaction-claims.md) | advisory compaction claims over object-store CAS | Proposed |
+| [1029](1029-advisory-compaction-claims.md) | advisory compaction claims over object-store CAS | Accepted (2026-09-01) |
 | [1040](1040-documentation-architecture.md) | Documentation architecture, canonical vocabulary, and a docs gate | Proposed |
 | [1101](1101-alerts-and-audit-sql-tables.md) | Register the `alerts` and `audit` SQL tables | Accepted (2026-09-03) |
 | [1103](1103-promql-over-logs.md) | PromQL over logs: `ravel_log_lines` and `ravel_log_bytes` | Accepted |

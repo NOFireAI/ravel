@@ -1,6 +1,6 @@
 # ADR-1029: advisory compaction claims over object-store CAS
 
-Status: Proposed
+Status: Accepted (2026-09-01, PR #1031; see the 2026-09-28 amendment)
 
 ## Context
 
@@ -91,7 +91,8 @@ which merges are paid for. Deliberately excluded from the identity:
 - `input_set_hash`. Two nodes whose listings diverge on a sealed bucket
   must collide on one claim, run once, and surface the divergence through
   the existing `InputSetHashDivergence` machinery, not run twice under
-  two claims.
+  two claims. (The surfacing mechanism moved; see the 2026-09-28
+  amendment.)
 - A compaction policy version. None exists in the repo; the record key
   itself embeds only `input_set_hash16`, and geometry knobs
   (`max_l1_part_bytes`, `l1_part_memory_target_bytes`) already change
@@ -221,8 +222,8 @@ Both callers of `compact_bucket` participate:
 - the background supervisor's per-unit tick, inside its existing
   ownership gate;
 - `ravel-cli maintain compact-tenant`, which is exactly the actor the
-  rendezvous hash cannot see. The bucket walk (sequential today, with
-  bucket-level concurrency arriving under #1028's stage 1) claims each
+  rendezvous hash cannot see. The bucket walk (sequential when written;
+  concurrent since #1028's stage 1, see the 2026-09-28 amendment) claims each
   bucket before merging it and reports skipped-because-claimed buckets
   in the walk summary, per the no-silent-defaults rule.
 
@@ -288,7 +289,8 @@ sequenceDiagram
    being protected.
 3. **`input_set_hash` in the work id.** Divergent input views must
    collide on one claim so one run executes and the divergence surfaces
-   as the existing typed invariant breach; hashing the view into the key
+   as the existing typed invariant breach (that mechanism moved; see the
+   2026-09-28 amendment); hashing the view into the key
    would let both run and publish two records under two claims.
 4. **Unconditional claim deletion on completion.** A stale worker's
    DELETE after a steal would destroy the newer owner's claim; `If-Match`
@@ -339,10 +341,58 @@ sequenceDiagram
   claim HEAD after DELETE-by-sweep; divergent input hashes colliding on
   one claim; and a two-supervisor MemoryStore test asserting via
   request counters that exactly one merge runs where today's test
-  observes two. Every count is an exact figure, not `> 0`.
+  observes two (corrected in the 2026-09-28 amendment). Every count is an
+  exact figure, not `> 0`.
 - **Wave preview** (Stage 2 decomposes properly): W1 claim primitive +
   contract/key-layout docs (ravel-fleet, docs); W2 checkpoints + claim
   participation (ravel-maintain, serialized behind the in-flight #872
   chain on rlog.rs); W3 CLI participation + flags (ravel-cli, behind
   #1028 stage 1); W4 metrics + operations guide. Reuse for
   retention/sweep/fold/erasure is explicitly follow-up work.
+
+## Amendment (2026-09-28): status, and four facts that moved
+
+<!-- amendment-applies: sections="Decision|Rejected alternatives|Consequences" pointer="2026-09-28 amendment" -->
+
+This ADR passed its approval gate on 2026-09-01 (epic #1029 ledger; PR #1031
+merged that day) and the claim primitive landed with #1032 (PR #1062), but the
+status line still read Proposed. It now reads Accepted. The decisions stand;
+four statements they rest on no longer describe main, and are corrected here.
+
+1. **How a divergent listing surfaces.** Since #1070, two runs over the same
+   bucket with different input sets publish two separate compaction records,
+   and readers pick one with `select_authoritative_compaction_records`
+   (`crates/ravel-catalog/src/catalog.rs`). `InputSetHashDivergence` now fires
+   only when two different input-set hashes share the record key's 16-hex
+   prefix. Leaving `input_set_hash` out of the work id still makes divergent
+   views collide on one claim, so one merge is paid, which is the purpose of
+   this ADR. The claim path must not turn a divergent listing into a silent
+   success: the run that is refused the claim reports the bucket as skipped,
+   never as compacted.
+2. **The CLI bucket walk is concurrent.** `--bucket-concurrency` landed with
+   #1028's stage 1 (`services/ravel-cli/src/maintain.rs`), so decision 5
+   applies per bucket per concurrency slot, not to one sequential walk.
+3. **Today's two-replica test observes one merge, not two.** With a shared
+   live set, `two_replicas_partition_units_without_double_pay`
+   (`services/ravel-server/src/maintain.rs`) sees exactly one merge, because
+   rendezvous ownership already partitions the steady state. The duplicate
+   this ADR removes happens where ownership overlaps: an operator's
+   `ravel-cli maintain compact-*` run, which the rendezvous hash cannot see,
+   and a membership change during a merge, since the ownership check is taken
+   at discovery and a running merge continues after its shard moves. The
+   acceptance test therefore has to force the overlap (two replicas with
+   solo live sets, or the owner changing while a merge runs), observe two
+   merges without claims and exactly one with them.
+4. **Code references drifted.** The seams this ADR names are on main at
+   different lines than it cites: the supervisor ownership gate at
+   `services/ravel-server/src/maintain.rs` around line 1737, the CLI merge
+   calls at `services/ravel-cli/src/maintain.rs` around lines 161 and 781,
+   the discovery check at `crates/ravel-maintain/src/compact.rs` around line
+   102, and the part PUT at `crates/ravel-maintain/src/rlog.rs` around line
+   2742. The implementing task locates each seam by name, not by line.
+
+A duplicate compaction is a cost, not a correctness, problem: converging and
+authoritative-record selection keep reads correct either way. The leak of a
+losing record's parts (#1155) is separate work that claims make rarer but do
+not fix.
+
