@@ -144,6 +144,17 @@ const NS_PER_MS: i64 = 1_000_000;
 /// how long a genuinely dead holder blocks failover to roughly three intervals.
 const LEASE_TTL_TICKS: u32 = 3;
 
+/// Fraction of one evaluation interval that sink delivery may consume in a
+/// single tick, as `(numerator, denominator)`. Strictly less than one so the
+/// delivery phase always returns before the next tick is due: an unbounded pass
+/// against a slow or failing sink could outlast the interval, and every tick it
+/// overran would push the next tick's rule evaluation later, so one bad sink
+/// would degrade evaluation for every rule. Half the interval leaves the other
+/// half for the rule evaluation and repeat pass that precede delivery in the
+/// same tick. Notifications not attempted before the deadline stay in the
+/// undelivered map and are retried next tick (oldest first).
+const SINK_DELIVERY_DEADLINE_FRACTION: (u32, u32) = (1, 2);
+
 /// The per-tenant alert lease object body: who holds it and until when.
 /// Small JSON, mirroring how the rules file is already JSON; the value is
 /// advisory coordination state, not a frozen persistent format.
@@ -335,6 +346,7 @@ async fn run_loop(
             repeats_queued = report.repeats_queued,
             notifications_delivered = report.notifications_delivered,
             notifications_failed = report.notifications_failed,
+            notifications_deferred = report.notifications_deferred,
             "alert evaluation tick complete"
         );
     }
@@ -370,8 +382,14 @@ pub struct AlertEvalReport {
     /// Notifications this tick delivered to every configured sink, including
     /// ones carried over from an earlier tick's failure.
     pub notifications_delivered: u32,
-    /// Notifications still undelivered after this tick's attempt.
+    /// Notifications this tick attempted but that at least one sink did not
+    /// accept, counted once per tick per notification while they are retried.
     pub notifications_failed: u32,
+    /// Notifications this tick did not attempt because the per-tick delivery
+    /// deadline ([`SINK_DELIVERY_DEADLINE_FRACTION`] of the interval) elapsed
+    /// first. They stay in the undelivered map, oldest first, and are retried
+    /// next tick, so one failing sink cannot stall a whole tick.
+    pub notifications_deferred: u32,
     /// `true` when the alert history could not be read, so no rule was
     /// evaluated at all. Never acts on a partial history: doing so would
     /// re-fire an alert that is already firing.
@@ -471,6 +489,9 @@ pub struct AlertMetrics {
     repeats_queued: AtomicU64,
     notifications_delivered: AtomicU64,
     notifications_failed: AtomicU64,
+    /// Notifications deferred to a later tick because the per-tick delivery
+    /// deadline elapsed. Cumulative across ticks and tenants.
+    notifications_deferred: AtomicU64,
     /// The sum of every live evaluator's undelivered map size. A gauge, kept
     /// by each evaluator adding the change in its own size after every tick
     /// and taking its share back out when it is dropped.
@@ -507,6 +528,7 @@ impl AlertMetrics {
             report.notifications_delivered,
         );
         add(&self.notifications_failed, report.notifications_failed);
+        add(&self.notifications_deferred, report.notifications_deferred);
 
         let outcome = report.outcome();
         self.tick_counter(outcome).fetch_add(1, Ordering::Relaxed);
@@ -547,6 +569,10 @@ impl AlertMetrics {
 
     pub fn notifications_failed(&self) -> u64 {
         self.notifications_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn notifications_deferred(&self) -> u64 {
+        self.notifications_deferred.load(Ordering::Relaxed)
     }
 
     /// Replace one evaluator's share of the undelivered gauge, `previous`,
@@ -610,6 +636,11 @@ pub struct AlertEvaluator {
     /// take it over. Derived from the evaluation interval at construction
     /// ([`LEASE_TTL_TICKS`] times it).
     lease_ttl: Duration,
+    /// How long [`Self::flush_sinks`] may spend delivering notifications in one
+    /// tick, on the injected clock. Derived from the evaluation interval at
+    /// construction ([`SINK_DELIVERY_DEADLINE_FRACTION`] of it), so one failing
+    /// sink cannot stall a tick past its own interval.
+    sink_delivery_budget: Duration,
     /// Only read by the `sql` feature's [`AlertEvaluator::run_sql`]; a build
     /// without that feature rejects SQL rules before it would be needed.
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
@@ -683,6 +714,8 @@ impl AlertEvaluator {
             http,
             query_deadline: config.query_deadline,
             lease_ttl: config.interval * LEASE_TTL_TICKS,
+            sink_delivery_budget: config.interval * SINK_DELIVERY_DEADLINE_FRACTION.0
+                / SINK_DELIVERY_DEADLINE_FRACTION.1,
             sql_lookback: config.sql_lookback,
             writer_id: Uuid::new_v4(),
             next_seq: 1,
@@ -785,7 +818,7 @@ impl AlertEvaluator {
                 report.history_unavailable = true;
                 // Still attempt delivery: a notification stuck from an earlier
                 // tick does not depend on this tick's history read.
-                self.flush_sinks(&mut report).await;
+                self.flush_sinks(now_ns, &mut report).await;
                 return report;
             }
         };
@@ -917,7 +950,7 @@ impl AlertEvaluator {
             );
         }
 
-        self.flush_sinks(&mut report).await;
+        self.flush_sinks(now_ns, &mut report).await;
         report
     }
 
@@ -1604,23 +1637,57 @@ impl AlertEvaluator {
     }
 
     /// Attempt delivery of every undelivered notification to every sink,
-    /// dropping an entry only once all sinks accepted it.
+    /// dropping an entry only once all sinks accepted it, and bounded to a
+    /// fraction of one interval on the injected clock.
     ///
     /// A sink that fails leaves its notification in place, so the next tick
     /// retries it from the latest record (ADR-0043 decision 6) without needing
     /// a new transition to occur. A partial success re-sends to the sinks that
     /// already accepted, which is inside the at-least-once contract.
-    async fn flush_sinks(&mut self, report: &mut AlertEvalReport) {
+    ///
+    /// # The per-tick deadline
+    ///
+    /// Delivery is bounded to `now_ns + sink_delivery_budget`
+    /// ([`SINK_DELIVERY_DEADLINE_FRACTION`] of the interval), measured on the
+    /// injected clock. Without it, a slow or unresponsive sink could hold the
+    /// tick well past its own interval: each delivery is bounded by the sink's
+    /// HTTP timeout, but the number of deliveries in one pass is not, so a rule
+    /// over many series behind a timing-out sink could take
+    /// `notifications * timeout` per tick and push every later tick's rule
+    /// evaluation late. Notifications not attempted before the deadline stay in
+    /// the undelivered map and are counted in
+    /// [`AlertEvalReport::notifications_deferred`].
+    ///
+    /// # Oldest first
+    ///
+    /// The undelivered map is a `HashMap`, whose iteration order is not stable,
+    /// so a persistently slow sink that only clears a prefix of the map each
+    /// tick could starve an arbitrary notification indefinitely. Delivering in
+    /// `(ts_ns, alert_id)` order makes the oldest transition the first one
+    /// attempted every tick, so a notification carried across ticks reaches the
+    /// front and is not starved.
+    async fn flush_sinks(&mut self, now_ns: i64, report: &mut AlertEvalReport) {
         if self.sinks.is_empty() {
             self.undelivered.clear();
             return;
         }
-        let pending: Vec<(AlertId, AlertNotification)> = self
+        let deadline_ns = now_ns.saturating_add(
+            i64::try_from(self.sink_delivery_budget.as_nanos()).unwrap_or(i64::MAX),
+        );
+        let mut pending: Vec<(AlertId, AlertNotification)> = self
             .undelivered
             .iter()
             .map(|(id, n)| (*id, n.clone()))
             .collect();
+        pending.sort_by_key(|(id, n)| (n.record.ts_ns, *id));
         for (alert_id, notification) in pending {
+            if self.clock.now_ns() >= deadline_ns {
+                // Past the per-tick deadline: leave this and every later
+                // notification in the undelivered map for the next tick, where
+                // the oldest-first order will reach them first.
+                report.notifications_deferred += 1;
+                continue;
+            }
             let mut all_ok = true;
             for sink in self.sinks.iter() {
                 if let Err(err) = deliver(&self.http, sink, &notification).await {
@@ -2436,6 +2503,10 @@ mod tick_tests {
 
         fn set(&self, now_ns: i64) {
             self.0.store(now_ns, Ordering::SeqCst);
+        }
+
+        fn advance(&self, delta_ns: i64) {
+            self.0.fetch_add(delta_ns, Ordering::SeqCst);
         }
     }
 
@@ -5100,6 +5171,7 @@ mod tick_tests {
                 repeats_queued: 0,
                 notifications_delivered: 0,
                 notifications_failed: 1,
+                notifications_deferred: 0,
                 history_unavailable: false,
                 lease_not_held: false,
                 lease_unavailable: false,
@@ -5158,6 +5230,7 @@ mod tick_tests {
                 repeats_queued: 1,
                 notifications_delivered: 1,
                 notifications_failed: 0,
+                notifications_deferred: 0,
                 history_unavailable: false,
                 lease_not_held: false,
                 lease_unavailable: false,
