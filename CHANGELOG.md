@@ -15,8 +15,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bucket; a claimed run then consults it at the merge's quiescent points and
   cancels without publishing once the claim is gone, leaving the parts it had
   already written where they are. A supervisor refused a claim reports the
-  bucket skipped, with the holder and the reason, and holds it until that
-  holder's lease can have expired rather than re-requesting it every tick.
+  bucket skipped, with the holder and the reason, and holds its compaction
+  until that holder's lease can have expired rather than re-requesting the
+  claim every tick; retention and zone classification still run for a held
+  bucket. An uncontended claim is taken with no wait: the deterministic
+  jitter, up to 10% of the lease, is waited out only before stealing an
+  expired claim or retrying a create whose claim vanished before it could be
+  read. A supervisor tick's claim decisions read the tick's own clock.
   Coordination is on by default and claims are taken only at or above 64 MiB
   of listed input bytes (`claim_min_input_bytes`), so a small bucket is merged
   exactly as before. The switch that turns claiming off is the
