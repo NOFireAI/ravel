@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::memory::MemoryStore;
+use ravel_server::health_listener::{HEARTBEAT_INTERVAL, HealthListener, Heartbeat};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
@@ -20,6 +21,18 @@ async fn start_test_server(
     mode: Mode,
     process_memory_budget_bytes: u64,
     fold_enabled: bool,
+) -> ravel_server::Running {
+    start_test_server_with(mode, process_memory_budget_bytes, fold_enabled, None).await
+}
+
+/// [`start_test_server`], started through `start_with_heartbeat` with the
+/// caller's heartbeat when one is given, the way `main` starts a
+/// `--listen-health` process.
+async fn start_test_server_with(
+    mode: Mode,
+    process_memory_budget_bytes: u64,
+    fold_enabled: bool,
+    heartbeat: Option<Heartbeat>,
 ) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
@@ -82,15 +95,22 @@ async fn start_test_server(
             1024,
         ),
     };
-    ravel_server::start(
-        config,
-        store.clone(),
-        store.clone(),
-        Arc::new(StoreMetrics::default()),
-        None,
-    )
-    .await
-    .expect("server starts")
+    let store_metrics = Arc::new(StoreMetrics::default());
+    match heartbeat {
+        Some(heartbeat) => ravel_server::start_with_heartbeat(
+            config,
+            store.clone(),
+            store.clone(),
+            store_metrics,
+            None,
+            heartbeat,
+        )
+        .await
+        .expect("server starts"),
+        None => ravel_server::start(config, store.clone(), store.clone(), store_metrics, None)
+            .await
+            .expect("server starts"),
+    }
 }
 
 /// `/metrics` must be served in every mode, maintain included, alongside
@@ -492,6 +512,86 @@ async fn metrics_render_cpu_gate_and_runtime_families_once() {
         );
 
         running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// Scrapes `/metrics` once and returns the body.
+async fn scrape(running: &ravel_server::Running) -> String {
+    reqwest::Client::new()
+        .get(format!("http://{}/metrics", running.http_addr))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text")
+}
+
+/// Asserts `ravel_health_heartbeat_age_seconds` renders exactly once and that
+/// its value is under one heartbeat interval plus one more tick: an idle main
+/// runtime beats every [`HEARTBEAT_INTERVAL`], so a larger age means the
+/// heartbeat task is not running.
+fn assert_heartbeat_age_rendered(body: &str, context: &str) {
+    let header = "# TYPE ravel_health_heartbeat_age_seconds gauge\n";
+    assert_eq!(
+        body.matches(header).count(),
+        1,
+        "{context}: {header:?} must appear exactly once:\n{body}"
+    );
+    let samples: Vec<&str> = body
+        .lines()
+        .filter(|line| line.starts_with("ravel_health_heartbeat_age_seconds{"))
+        .collect();
+    assert_eq!(samples.len(), 1, "{context}: one sample:\n{body}");
+    let age: f64 = samples[0]
+        .rsplit(' ')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .expect("heartbeat age value");
+    let bound = (HEARTBEAT_INTERVAL * 2).as_secs_f64();
+    assert!(
+        (0.0..bound).contains(&age),
+        "{context}: heartbeat age {age} s on an idle server, want under {bound} s"
+    );
+}
+
+/// ADR-1702 decision 11: the heartbeat age renders in every mode without
+/// `--listen-health`, from the heartbeat `start` builds and beats itself.
+#[tokio::test]
+async fn metrics_render_heartbeat_age_without_listen_health() {
+    for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let body = scrape(&running).await;
+        assert_heartbeat_age_rendered(&body, &format!("mode {mode:?}"));
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// With `--listen-health`, `main` builds the heartbeat, spawns its task and
+/// binds the listener before `start_with_heartbeat`; `/metrics` renders the
+/// age of that same heartbeat, once.
+#[tokio::test]
+async fn metrics_render_heartbeat_age_with_listen_health() {
+    for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
+        let heartbeat = Heartbeat::new(Arc::new(ravel_ingest::SystemClock));
+        let heartbeat_task = heartbeat.spawn();
+        let listener = HealthListener::bind(
+            "127.0.0.1:0".parse().expect("valid loopback addr"),
+            heartbeat.clone(),
+        )
+        .expect("health listener binds");
+        let running = start_test_server_with(mode, u64::MAX, false, Some(heartbeat)).await;
+        listener.attach_readiness(running.readiness());
+
+        let body = scrape(&running).await;
+        assert_heartbeat_age_rendered(&body, &format!("mode {mode:?} with --listen-health"));
+
+        running.shutdown().await.expect("graceful shutdown");
+        heartbeat_task.abort();
+        tokio::task::spawn_blocking(move || listener.shutdown())
+            .await
+            .expect("health listener shutdown task")
+            .expect("health listener stops");
     }
 }
 
