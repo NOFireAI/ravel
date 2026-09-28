@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 3603296f59a2323cb6070a2b46a2e9333d3ec1e6c9ca7877732b90450085606f # shrinks to m = Manifest { table: "_", version: 1, dropped: false, location: "s3://b/data/", grant: "s3://b/data", files: [ParquetFile { profile: "a", bucket: "0", key: [128], size: 1, etag: "A", version: "", row_count: 0, footer_len: 0 }], options: {}, created_by: "", created_unix_ns: 0, statement: "", apply_nonce: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+cc c1fb9f9df192898011575a2883a29dc9063448c3d65c57362e13e02dcc5d97a8 # shrinks to s = "~"

@@ -72,8 +72,11 @@ message ParquetFile {
   string profile = 1;
   // Bucket or container holding the file.
   string bucket = 2;
-  // Object key, raw bytes exactly as the listing returned them. Never a URL,
-  // and never re-parsed: a key may hold any byte sequence the store accepts.
+  // Object key, the bytes the listing returned, not a URL. Only a key that
+  // object_store's Path addresses unchanged is carried: printable ASCII
+  // without the bytes Path percent-encodes, no leading or trailing "/", and
+  // no empty, "." or ".." segment (ravel-pqtable's key_is_addressable, which
+  // its encoder and decoder both apply).
   bytes key = 3;
   // Object size in bytes, nonzero.
   uint64 size = 4;

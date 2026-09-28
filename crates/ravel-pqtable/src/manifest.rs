@@ -11,9 +11,10 @@
 //! Ravel does not own the files a manifest lists. Each one is identified by
 //! the tuple (profile, bucket, key) and pinned by its ETag, plus the backend
 //! version or generation where the store reports one. The key is carried as
-//! the raw bytes the listing returned, never as a URL: a URL would have to be
-//! re-parsed to address the object again, and a key may hold bytes no URL
-//! round trips.
+//! the bytes the listing returned, not as a URL, and only a key that
+//! [`key_is_addressable`] accepts is carried at all: the store is read through
+//! object_store's `Path`, which percent-encodes or drops some bytes, and a key
+//! it would rewrite would read a different object than the one listed.
 //!
 //! A body records the tenant it was encoded for, and [`decode_manifest`]
 //! refuses it as [`ManifestError::Misfiled`] under a key of any other tenant,
@@ -23,6 +24,8 @@
 //! encodes or decodes has a valid table name, a version of at least 1, a
 //! 16-byte apply nonce, a location, grant and file list consistent with
 //! `dropped`, and files that are individually addressable and distinct.
+//! A decoded manifest whose file key fails [`key_is_addressable`] is refused
+//! as [`ManifestDefect::UnaddressableKey`] rather than read.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,6 +50,27 @@ pub const PARQUET_TABLE_MAX_READ_VERSION: u32 = PARQUET_TABLE_FORMAT_VERSION;
 /// Bytes in a manifest's per-apply nonce.
 pub const APPLY_NONCE_LEN: usize = 16;
 
+/// ASCII bytes object_store's `Path` percent-encodes inside a segment, on top
+/// of the control characters and every non-ASCII byte.
+const PATH_ENCODED: &[u8] = b"\\{^}%`]\">[~<#|*?";
+
+/// True when object_store's `Path` built from `key` addresses exactly `key`:
+/// valid UTF-8, printable ASCII with none of the bytes `Path` percent-encodes,
+/// no leading or trailing `/`, and no empty, `.` or `..` segment (`Path` drops
+/// an empty segment and encodes a dot segment).
+pub fn key_is_addressable(key: &[u8]) -> bool {
+    let Ok(key) = std::str::from_utf8(key) else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| (0x20..0x7f).contains(&b) && !PATH_ENCODED.contains(&b))
+        && key
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
 /// One external Parquet file a manifest pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetFile {
@@ -54,7 +78,8 @@ pub struct ParquetFile {
     pub profile: String,
     /// Bucket or container holding it.
     pub bucket: String,
-    /// Object key, the raw bytes the listing returned.
+    /// Object key, the bytes the listing returned; [`key_is_addressable`]
+    /// holds for it in any manifest that validates.
     pub key: Vec<u8>,
     pub size: u64,
     /// ETag the footer read reported.
@@ -108,6 +133,10 @@ pub enum ManifestDefect {
     UnaddressableFile {
         index: usize,
         field: &'static str,
+    },
+    /// A file key that [`key_is_addressable`] refuses.
+    UnaddressableKey {
+        index: usize,
     },
     /// A file with no ETag, which nothing could pin a read to.
     NoEtag {
@@ -212,6 +241,9 @@ impl Manifest {
             };
             if let Some(field) = missing {
                 return invalid(ManifestDefect::UnaddressableFile { index, field });
+            }
+            if !key_is_addressable(&file.key) {
+                return invalid(ManifestDefect::UnaddressableKey { index });
             }
             if file.etag.is_empty() {
                 return invalid(ManifestDefect::NoEtag { index });
@@ -504,15 +536,58 @@ mod tests {
     }
 
     #[test]
-    fn a_raw_key_survives_the_round_trip_byte_for_byte() {
-        // Bytes a URL would not round trip: an empty path segment, a percent
-        // escape, a space, and a non-ASCII sequence that is not valid UTF-8.
-        let raw: Vec<Vec<u8>> = vec![
+    fn a_key_the_store_path_would_rewrite_is_refused_in_both_directions() {
+        // Each of these reaches a different object, or none, once
+        // object_store's Path has dropped the empty segment or encoded the
+        // byte, so a manifest carrying it would not read what was listed.
+        let unaddressable: Vec<Vec<u8>> = vec![
             b"data//double/slash.parquet".to_vec(),
             b"data/100%25 done/x.parquet".to_vec(),
-            b"data/a b c.parquet".to_vec(),
             vec![b'd', b'a', b't', b'a', b'/', 0xff, 0xfe, b'.', b'p'],
             "data/\u{e9}\u{4e2d}.parquet".as_bytes().to_vec(),
+            b"/data/x.parquet".to_vec(),
+            b"data/".to_vec(),
+            b"data/./x.parquet".to_vec(),
+            b"data/../x.parquet".to_vec(),
+            b"data/x*.parquet".to_vec(),
+            b"data/x\t.parquet".to_vec(),
+        ];
+        let key = manifest_key(&TENANT, "hits", 1).expect("key");
+        for raw in unaddressable {
+            let mut m = live(1);
+            m.files[1].key = raw.clone();
+            let refused = ManifestError::Invalid {
+                table: "hits".into(),
+                version: 1,
+                defect: ManifestDefect::UnaddressableKey { index: 1 },
+            };
+            assert_eq!(
+                encode_manifest(&TENANT, &m),
+                Err(refused.clone()),
+                "{raw:?}"
+            );
+            let mut body = pb::ParquetTableManifest::decode(
+                encode_manifest(&TENANT, &live(1))
+                    .expect("encode")
+                    .as_slice(),
+            )
+            .expect("decode");
+            body.files[1].key = raw.clone();
+            assert_eq!(
+                decode_manifest(&key, &body.encode_to_vec()),
+                Err(refused),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_addressable_key_survives_the_round_trip_byte_for_byte() {
+        let raw: Vec<Vec<u8>> = vec![
+            b"data/a b c.parquet".to_vec(),
+            b"data/part=1/x-y_z.parquet".to_vec(),
+            b"data/!$&'()+,;=@.parquet".to_vec(),
+            b"x".to_vec(),
         ];
         let mut m = live(1);
         m.files = raw
@@ -628,7 +703,7 @@ mod tests {
     fn truncation_inside_the_last_field_is_a_decode_error() {
         let key = manifest_key(&TENANT, "hits", 1).expect("key");
         let bytes = encode_manifest(&TENANT, &live(1)).expect("encode");
-        // `apply_nonce` is the highest field number, so it is encoded last and
+        // `tenant_hash` is the highest field number, so it is encoded last and
         // dropping the final byte cuts it mid-value.
         assert!(matches!(
             decode_manifest(&key, &bytes[..bytes.len() - 1]),
@@ -656,11 +731,82 @@ mod tests {
         assert_eq!(decode_manifest(&key, &bytes), Ok(m));
     }
 
+    fn arb_addressable_key() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec("[a-zA-Z0-9 !$&'()+,;=@_.-]{1,8}", 1..4)
+            .prop_map(|segments| segments.join("/").into_bytes())
+            .prop_filter("dot segment", |key| key_is_addressable(key))
+    }
+
+    /// Characters around every rule of [`key_is_addressable`], so a random
+    /// string hits the edges far more often than an unbiased one would.
+    fn arb_edge_string() -> impl Strategy<Value = String> {
+        let chars = prop::sample::select(vec![
+            'a', 'Z', '0', '-', '_', '=', ' ', '.', '/', '%', '*', '?', '#', '~', '\\', '"', '\t',
+            '\r', '\u{7f}', '\u{e9}', '\u{4e2d}',
+        ]);
+        prop_oneof![
+            prop::collection::vec(chars, 0..10).prop_map(|c| c.into_iter().collect()),
+            any::<String>(),
+        ]
+    }
+
+    #[test]
+    fn key_is_addressable_follows_each_rule() {
+        for (key, want) in [
+            (&b"data/x.parquet"[..], true),
+            (b"a b/c", true),
+            (b"", false),
+            (b"/a", false),
+            (b"a/", false),
+            (b"a//b", false),
+            (b".", false),
+            (b"a/../b", false),
+            (b"a/./b", false),
+            (b"a/.../b", true),
+            (b"a/.x", true),
+            (b"a%2Fb", false),
+            (b"a\nb", false),
+            (&[b'a', 0xff], false),
+            ("\u{e9}".as_bytes(), false),
+        ] {
+            assert_eq!(key_is_addressable(key), want, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn every_ascii_byte_inside_a_segment_agrees_with_the_object_store_path() {
+        for b in 0u8..0x80 {
+            let key = [b'a', b, b'b'];
+            let s = std::str::from_utf8(&key).expect("ascii");
+            let path = object_store::path::Path::from(s);
+            assert_eq!(
+                key_is_addressable(&key),
+                path.as_ref() == s,
+                "byte {b:#04x}: {s:?} became {:?}",
+                path.as_ref()
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn key_is_addressable_matches_the_object_store_path(s in arb_edge_string()) {
+            let path = object_store::path::Path::from(s.as_str());
+            prop_assert_eq!(
+                key_is_addressable(s.as_bytes()),
+                !s.is_empty() && path.as_ref() == s,
+                "{:?} became {:?}",
+                s,
+                path.as_ref()
+            );
+        }
+    }
+
     prop_compose! {
         fn arb_file()(
             profile in "[a-z]{1,8}",
             bucket in "[a-z0-9-]{1,12}",
-            key in prop::collection::vec(any::<u8>(), 1..24),
+            key in arb_addressable_key(),
             size in 1u64..=u64::MAX,
             etag in "[!-~]{1,10}",
             version in "[a-z0-9]{0,8}",

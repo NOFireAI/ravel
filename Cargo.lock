@@ -5085,6 +5085,7 @@ dependencies = [
  "blake3",
  "bytes",
  "hex",
+ "object_store 0.14.1",
  "proptest",
  "prost",
  "rand 0.10.2",
