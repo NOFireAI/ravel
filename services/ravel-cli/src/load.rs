@@ -267,6 +267,17 @@ impl TsUnit {
             TsUnit::Nanos => 1,
         }
     }
+
+    /// The spelling a mapping writes this unit as, for a rejection that has to
+    /// point the operator back at the line that declared it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            TsUnit::Seconds => "seconds",
+            TsUnit::Millis => "millis",
+            TsUnit::Micros => "micros",
+            TsUnit::Nanos => "nanos",
+        }
+    }
 }
 
 /// Declared type for a mapped attribute column, one of the scalar
@@ -953,8 +964,9 @@ const RESERVED_SPAN_ATTR_KEYS: [&str; 5] = [
 /// status_code_column    = "status"     # optional, OTLP's 0/1/2 integer enum
 /// status_message_column = "status_msg" # optional
 ///
-/// # Resource attributes: merged into every span's one attrs map, winning
-/// # over a span attribute of the same key, exactly as OTLP merges them.
+/// # Resource attributes: merged into every span's one attrs map. A key may
+/// # not appear in both attribute lists (such a mapping is refused), so this
+/// # merge never has a collision to resolve.
 /// [[spans.resource_attribute]]
 /// key = "service.name"
 /// column = "svc"
@@ -977,8 +989,9 @@ pub struct SpansMapping {
     pub trace_id_column: String,
     /// Source column carrying the 8-byte span id.
     pub span_id_column: String,
-    /// Source column carrying the parent's 8-byte span id. A null cell is a
-    /// root span.
+    /// Source column carrying the parent's 8-byte span id. A null cell and an
+    /// EMPTY cell (empty binary, empty string, or a zero-width fixed-size
+    /// value) are both a root span, as OTLP's own empty `parent_span_id` is.
     #[serde(default)]
     pub parent_span_id_column: Option<String>,
     /// Source column carrying the span name.
@@ -1007,8 +1020,9 @@ pub struct SpansMapping {
     /// an empty `message` does.
     #[serde(default)]
     pub status_message_column: Option<String>,
-    /// Columns merged into the span's `attrs` map with resource precedence
-    /// (they win over a span attribute of the same key, as in OTLP).
+    /// Columns merged into the span's `attrs` map with resource precedence.
+    /// A key may not appear in both attribute lists, so that precedence never
+    /// decides anything here; see [`SpansMapping::validate`].
     #[serde(default, rename = "resource_attribute")]
     pub resource_attributes: Vec<AttrMap>,
     /// Columns merged into the span's `attrs` map at span precedence.
@@ -1037,10 +1051,35 @@ impl SpansMapping {
     /// Which column reached the record is exactly the kind of thing a mapping
     /// must not decide invisibly.
     ///
+    /// Both attribute-count caps are here for the same reason: the mapping
+    /// bounds every row, since a row carries at most one attribute per list
+    /// entry, so a mapping within a cap can never produce a span over it. The
+    /// span cap is the loader per-record cap standing in for OTLP's
+    /// `max_attributes_per_span`; the resource cap is OTLP's own
+    /// `max_resource_attributes`, which bounds how much gets merged into every
+    /// span under the resource and which the OTLP path enforces by rejecting
+    /// those spans.
+    ///
     /// Attribute VALUE lengths, the span name length and the status message
     /// length are per-row and are checked as rows are decoded.
     pub fn validate(&self) -> Result<(), LoadError> {
         let limits = SpanIngestLimits::default();
+        if self.attributes.len() > LOADER_MAX_ATTRIBUTES_PER_RECORD {
+            return Err(LoadError::Setup(format!(
+                "--mapping [spans] declares {} attribute columns, more than the loader per-record \
+                 cap of {}",
+                self.attributes.len(),
+                LOADER_MAX_ATTRIBUTES_PER_RECORD
+            )));
+        }
+        if self.resource_attributes.len() > limits.max_resource_attributes {
+            return Err(LoadError::Setup(format!(
+                "--mapping [spans] declares {} resource_attribute columns, more than the OTLP \
+                 per-resource cap of {}",
+                self.resource_attributes.len(),
+                limits.max_resource_attributes
+            )));
+        }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (attr, scope) in self.mapped_attributes() {
             let list = scope.list_name();
@@ -1067,9 +1106,8 @@ impl SpansMapping {
             if !seen.insert(attr.key.as_str()) {
                 return Err(LoadError::Setup(format!(
                     "--mapping [spans] declares the attribute key {:?} twice. A span carries one \
-                     merged attrs map with unique keys, and a resource attribute wins over a span \
-                     attribute of the same key, so the second column would never reach the \
-                     record.",
+                     merged attrs map with unique keys, so one of the two columns would never \
+                     reach the record.",
                     attr.key
                 )));
             }
@@ -6445,16 +6483,16 @@ impl SpansColumnIndex {
                 .index_of(name)
                 .map_err(|_| format!("mapped column {name:?} is not present in the Parquet file"))
         };
-        let id_idx = |name: &str, width: usize| -> Result<usize, String> {
+        let id_idx = |name: &str, width: usize, empty_is_root: bool| -> Result<usize, String> {
             let i = idx(name)?;
-            check_id_column(schema.field(i).data_type(), name, width)?;
+            check_id_column(schema.field(i).data_type(), name, width, empty_is_root)?;
             Ok(i)
         };
         Ok(SpansColumnIndex {
-            trace_id: id_idx(&mapping.trace_id_column, 16)?,
-            span_id: id_idx(&mapping.span_id_column, 8)?,
+            trace_id: id_idx(&mapping.trace_id_column, 16, false)?,
+            span_id: id_idx(&mapping.span_id_column, 8, false)?,
             parent_span_id: match &mapping.parent_span_id_column {
-                Some(c) => Some(id_idx(c, 8)?),
+                Some(c) => Some(id_idx(c, 8, true)?),
                 None => None,
             },
             name: idx(&mapping.name_column)?,
@@ -6485,10 +6523,20 @@ impl SpansColumnIndex {
 /// Check that an id column can supply an exact-width id, by the same rule
 /// [`read_id`] reads one: a binary or hex-string column. A
 /// `FixedSizeBinary(n)` whose `n` is not the id's width can never produce one,
-/// and says so in the schema, so it is refused before any row is read rather
-/// than once per row.
-fn check_id_column(data_type: &DataType, column: &str, width: usize) -> Result<(), String> {
+/// and says so in the schema, so it is refused when the batch's columns are
+/// resolved, before any row of it is built or written.
+///
+/// `empty_is_root` is set for the parent column, where an empty value names no
+/// parent rather than a malformed id: a `FixedSizeBinary(0)` column then says
+/// every row is a root span, which is a file this loader can read.
+fn check_id_column(
+    data_type: &DataType,
+    column: &str,
+    width: usize,
+    empty_is_root: bool,
+) -> Result<(), String> {
     match data_type {
+        DataType::FixedSizeBinary(0) if empty_is_root => Ok(()),
         DataType::FixedSizeBinary(n) if *n as usize != width => Err(format!(
             "id column {column:?} is FixedSizeBinary({n}), but this id is {width} bytes. Ravel \
              never pads or truncates an id, so no row of this column can produce one."
@@ -6504,6 +6552,39 @@ fn check_id_column(data_type: &DataType, column: &str, width: usize) -> Result<(
             width * 2
         )),
     }
+}
+
+/// Whether an id cell carries no value at all: a null cell, an empty binary
+/// value, an empty string, or a zero-width fixed-size value. On the parent
+/// column this is OTLP's own root-span test, which reads the `parent_span_id`
+/// field's emptiness and nothing else.
+fn id_cell_is_empty(arr: &ArrayRef, row: usize) -> Result<bool, String> {
+    if arr.is_null(row) {
+        return Ok(true);
+    }
+    Ok(match arr.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => read_string(arr, row)?.is_none_or(|s| s.is_empty()),
+        _ => read_bytes(arr, row)?.is_none_or(|b| b.is_empty()),
+    })
+}
+
+/// Read the status column through `ravel-otlp`'s own enum mapping.
+///
+/// Every value outside `0..=2` is `Unset` there, so a value too wide for `i64`
+/// (a `UInt64` cell above `i64::MAX`) is `Unset` here too rather than a
+/// refusal: it is outside the enum by more, not by a different kind.
+fn read_status_code(arr: &ArrayRef, row: usize) -> Result<StatusCode, String> {
+    if arr.is_null(row) {
+        return Ok(StatusCode::Unset);
+    }
+    let code = match arr.data_type() {
+        DataType::UInt64 => i64::try_from(downcast::<UInt64Array>(arr)?.value(row)).ok(),
+        _ => read_i64(arr, row)?,
+    };
+    Ok(match code {
+        None => StatusCode::Unset,
+        Some(code) => status_code_from_i32(i32::try_from(code).unwrap_or(i32::MAX)),
+    })
 }
 
 /// Decode one source row against the mapping into a [`NormalizedSpan`].
@@ -6550,23 +6631,25 @@ fn build_span(
             mapping.span_id_column
         )
     })?;
-    // A null parent cell is a root span. A present but wrong-width one is a
-    // rejection here, where the OTLP path drops it and admits the span: an
-    // OTLP sender's malformed field is one record of a live stream, while a
+    // A null parent cell and an EMPTY one are both a root span: OTLP reads an
+    // empty `parent_span_id` field as a root, and empty bytes or "" is how
+    // common trace exports write one. A present, non-empty, wrong-width value
+    // is a rejection here, where the OTLP path drops it and admits the span:
+    // an OTLP sender's malformed field is one record of a live stream, while a
     // mapped column producing unusable ids is a mapping mistake the whole file
     // shares, and a silently-rerooted span tree is not visible in the data.
     let parent_span_id = match cols.parent_span_id {
         None => None,
         Some(i) => {
             let column = batch.column(i);
-            if column.is_null(row) {
+            if id_cell_is_empty(column, row)? {
                 None
             } else {
                 Some(read_id::<8>(column, row)?.ok_or_else(|| {
                     format!(
                         "parent_span_id column {:?} is not an 8-byte value (or a 16-character hex \
-                         string). Ravel never pads or truncates an id; leave the cell null for a \
-                         root span.",
+                         string). Ravel never pads or truncates an id; leave the cell null or \
+                         empty for a root span.",
                         mapping.parent_span_id_column.as_deref().unwrap_or_default()
                     )
                 })?)
@@ -6591,6 +6674,19 @@ fn build_span(
         0 => start_ts_ns,
         v => v,
     };
+    // A negative timestamp has no OTLP counterpart (its two are `u64`), and a
+    // negative start beside a positive end stores a span whose interval
+    // overlaps nearly every query window. The usual cause is a declared unit
+    // that does not match the column, so the refusal names both.
+    if start_ts_ns < 0 || end_ts_ns < 0 {
+        return Err(format!(
+            "span timestamps are before the Unix epoch (start {start_ts_ns} ns, end {end_ts_ns} \
+             ns, read as start_ts_unit = {}, end_ts_unit = {}); check the declared units against \
+             the columns",
+            mapping.start_ts_unit.as_str(),
+            mapping.end_ts_unit.as_str()
+        ));
+    }
     if end_ts_ns < start_ts_ns {
         return Err(format!(
             "span ends at {end_ts_ns} ns, before it starts at {start_ts_ns} ns"
@@ -6608,10 +6704,7 @@ fn build_span(
 
     let status_code = match cols.status_code {
         None => StatusCode::Unset,
-        Some(i) => match read_i64(batch.column(i), row)? {
-            None => StatusCode::Unset,
-            Some(code) => status_code_from_i32(i32::try_from(code).unwrap_or(i32::MAX)),
-        },
+        Some(i) => read_status_code(batch.column(i), row)?,
     };
     let status_message = match cols.status_message {
         None => None,
@@ -6639,18 +6732,10 @@ fn build_span(
         batch,
         &cols.resource_attributes,
         &mapping.resource_attributes,
-        AttrScope::Resource,
         limits,
         row,
     )?;
-    let span_attrs = read_span_attrs(
-        batch,
-        &cols.attributes,
-        &mapping.attributes,
-        AttrScope::Span,
-        limits,
-        row,
-    )?;
+    let span_attrs = read_span_attrs(batch, &cols.attributes, &mapping.attributes, limits, row)?;
     // The same merge the OTLP path runs, with an empty scope set: this loader
     // maps no instrumentation scope, so there is nothing between resource and
     // span precedence. The reserved-key strip `normalize_span` applies is not
@@ -6677,7 +6762,6 @@ fn read_span_attrs(
     batch: &RecordBatch,
     indices: &[usize],
     maps: &[AttrMap],
-    scope: AttrScope,
     limits: &SpanIngestLimits,
     row: usize,
 ) -> Result<Vec<(String, String)>, String> {
@@ -6691,14 +6775,12 @@ fn read_span_attrs(
             continue;
         };
         let value = span_attr_string(&map.key, &value)?;
+        // An over-cap value drops THAT attribute and keeps the span, which is
+        // `convert_attrs_lossy`'s rule on the OTLP path: no span attribute
+        // feeds an identity here, so one unstorable value never has to reject
+        // its neighbours or the record they sit on.
         if value.len() > limits.max_attribute_value_len {
-            return Err(format!(
-                "[[spans.{}]] {:?} value is {} bytes, more than the limit of {}",
-                scope.list_name(),
-                map.key,
-                value.len(),
-                limits.max_attribute_value_len
-            ));
+            continue;
         }
         out.push((map.key.clone(), value));
     }
@@ -6879,20 +6961,9 @@ pub async fn load_spans(
                 .to_string(),
         ));
     }
+    // Both attribute-count caps live in `validate`, which also runs at mapping
+    // parse: they are properties of the mapping alone.
     mapping.validate()?;
-    // The loader per-record attribute cap stands in for OTLP's
-    // `max_attributes_per_span` (ADR-1751 decision 1). It is checked here
-    // rather than per row because the mapping bounds every row: a row can
-    // carry at most one attribute per `[[spans.attribute]]` entry, so a
-    // mapping within the cap can never produce a span over it.
-    if mapping.attributes.len() > LOADER_MAX_ATTRIBUTES_PER_RECORD {
-        return Err(LoadError::Setup(format!(
-            "--mapping [spans] declares {} attribute columns, more than the loader per-record cap \
-             of {}",
-            mapping.attributes.len(),
-            LOADER_MAX_ATTRIBUTES_PER_RECORD
-        )));
-    }
 
     let limits = SpanIngestLimits::default();
     let tenant_id = TenantId::new(tenant);
