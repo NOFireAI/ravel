@@ -790,6 +790,11 @@ Parquet file not written by Arrow, including a dictionary-page-encoded one whose
 file carries no Arrow schema) decodes to a plain Arrow string column and stays on
 the per-row string path; both produce identical output.
 
+A mapped `trace_id` or `span_id` column loads whether it is plain or
+dictionary-encoded: a hex id column that a default Parquet writer
+dictionary-encoded stores the same ids as its plain copy, and a null cell stores
+no id in either form.
+
 ### The `--mapping` TOML
 
 The mapping declares how source Parquet columns become record fields. It
@@ -983,6 +988,12 @@ costs every later query the bulk objects' fetch.
   while every later query lists from `query_range.start - max_ingest_lag`, which
   does not reach today's bucket, so the record would be permanently
   undiscoverable.
+- **A negative timestamp: refused, for all three signals.** OTLP's timestamps
+  are unsigned and have no negative to express. A logs or metrics row whose
+  `ts`, read in the declared `ts_unit`, falls before the Unix epoch is a row
+  rejection that names `ts_unit`, as the spans load's refusal of a negative
+  start or end names both of its units. The usual cause is a declared unit that
+  does not match the column.
 - **Length caps (attribute key length, attribute value length, body length):
   kept**, identical to the OTLP path's. These
   bound field sizes regardless of who is sending; the offline/trusted framing

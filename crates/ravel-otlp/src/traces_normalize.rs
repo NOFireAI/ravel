@@ -72,8 +72,9 @@ pub const ATTR_LINKS_RAW: &str = "_links_raw";
 
 /// Every reserved `attrs` key, in one place so stripping a sender's own
 /// attribute of the same name (see [`normalize_span`]) cannot drift from the
-/// set [`reserved_attrs`] actually populates.
-const RESERVED_ATTR_KEYS: [&str; 5] = [
+/// set [`reserved_attrs`] actually populates. Public so a caller refusing
+/// these keys (the bulk loader's spans mapping) reads the same set.
+pub const RESERVED_ATTR_KEYS: [&str; 5] = [
     ATTR_SPAN_KIND,
     ATTR_TRACE_STATE,
     ATTR_SPAN_FLAGS,
@@ -81,7 +82,8 @@ const RESERVED_ATTR_KEYS: [&str; 5] = [
     ATTR_LINKS_RAW,
 ];
 
-fn is_reserved_key(key: &str) -> bool {
+/// Whether `key` is one of [`RESERVED_ATTR_KEYS`].
+pub fn is_reserved_key(key: &str) -> bool {
     RESERVED_ATTR_KEYS.contains(&key)
 }
 
