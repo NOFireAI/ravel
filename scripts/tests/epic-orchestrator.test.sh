@@ -86,8 +86,18 @@ case "${sub}" in
     action="${1:-}"; shift || true
     case "${action}" in
       list)
+        # prs.txt rows are branch<TAB>number<TAB>state<TAB>head. Only a
+        # query naming its branch with --head gets an answer: an unfiltered
+        # listing returns nothing, the way a windowed listing misses an old
+        # PR, so a script that still sweeps instead of asking fails here.
         [[ -f "${STUB_DIR}/prs.txt" ]] || exit 1
-        cat "${STUB_DIR}/prs.txt"
+        head_ref=""
+        while [[ $# -gt 0 ]]; do
+          [[ "$1" == "--head" ]] && head_ref="${2:-}"
+          shift
+        done
+        [[ -n "${head_ref}" ]] || exit 0
+        awk -F'\t' -v b="${head_ref}" '$1 == b {print $2 "\t" $3}' "${STUB_DIR}/prs.txt"
         ;;
       view)
         [[ -f "${STUB_DIR}/pr-view.txt" ]] || exit 1
@@ -119,21 +129,61 @@ STUB
   chmod +x "${dir}/git"
 }
 
+# A curl stub standing in for the fleet control plane's GET /v1/tasks/<id>.
+# ${STUB_DIR}/cp/<task>.code holds the HTTP status and cp/<task>.json the
+# body; a missing .code file means the host is unreachable (curl exit 7).
+# It also records whether the bearer token ever reached its argv, which it
+# must not.
+write_curl_stub() {
+  local dir="$1"
+  cat >"${dir}/curl" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+out="" url=""
+for a in "$@"; do
+  [[ "${a}" == *"stub-token"* ]] && touch "${STUB_DIR}/token-in-argv"
+done
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="${2:-}"; shift 2 ;;
+    -w | -H | --max-time) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+cat >/dev/null
+task="${url##*/}"
+[[ -f "${STUB_DIR}/cp/${task}.code" ]] || exit 7
+[[ -n "${out}" && -f "${STUB_DIR}/cp/${task}.json" ]] && cp "${STUB_DIR}/cp/${task}.json" "${out}"
+cat "${STUB_DIR}/cp/${task}.code"
+STUB
+  chmod +x "${dir}/curl"
+}
+
 new_case() {
   local name="$1"
   local dir="${work}/${name}"
-  mkdir -p "${dir}/bin" "${dir}/state"
+  mkdir -p "${dir}/bin" "${dir}/state" "${dir}/cp"
   write_gh_stub "${dir}/bin"
   write_git_stub "${dir}/bin"
+  write_curl_stub "${dir}/bin"
   printf '%s\n' "${dir}"
 }
 
+# Control-plane settings are cleared and pointed at a file that does not
+# exist, so no case ever reads the operator's real ~/.fleet/cp.env. A case
+# that wants the control plane sets CP=1.
 run_in() {
   local dir="$1"
   shift
-  ( export STUB_DIR="${dir}" \
+  ( unset FLEET_CP_URL FLEET_PUBLIC_URL FLEET_ENQUEUE_TOKEN
+    export STUB_DIR="${dir}" \
            PATH="${dir}/bin:${PATH}" \
-           RAVEL_EPIC_STATE_DIR="${dir}/state"
+           RAVEL_EPIC_STATE_DIR="${dir}/state" \
+           RAVEL_FLEET_CP_ENV="${dir}/no-such-cp.env"
+    if [[ "${CP:-0}" == "1" ]]; then
+      export FLEET_CP_URL="http://cp.invalid:8080" FLEET_ENQUEUE_TOKEN="stub-token"
+    fi
     "$@" ) 2>&1
 }
 
@@ -266,9 +316,10 @@ check_contains "and says so" "EXHAUSTED" "${out}"
 task_a="11111111-2222-3333-4444-555555555555"
 task_b="66666666-7777-8888-9999-aaaaaaaaaaaa"
 
-# A task with a start ref and no result ref is RUNNING or LOST, and only
-# fleet_status can say which. Reporting either one is the failure that
-# leaves a dead task's ticket unfixed for a session.
+# A task with a start ref and no result ref is RUNNING or dead, and only the
+# control plane can say which. With no control plane to ask, reporting
+# either one is the failure that leaves a dead task's ticket unfixed for a
+# session.
 # Mutation: report it as "running" and exit 0.
 d="$(new_case reconcile_unresolved)"
 run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
@@ -291,6 +342,120 @@ printf 'task/%s/merge\t77\tMERGED\tcafe\n' "${task_b}" >"${d}/prs.txt"
 out="$(run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
 check_eq "a landed task reconciles clean (0)" "0" "${rc}"
 check_contains "and is reported merged" "merged as #77" "${out}"
+
+# A task that landed long ago has had its task refs cleaned, and its merge
+# PR sits outside any recent window. Found by its branch, it is LANDED.
+# Mutation: restore one `gh pr list --limit 200` sweep read by branch name
+# (the stub answers an unfiltered listing with nothing, as a window that
+# has moved past the PR does).
+d="$(new_case reconcile_landed_old)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s done\n' "${task_b}" >"${d}/issue-body.txt"
+: >"${d}/task-refs.txt"
+{ printf 'feat/unrelated\t2001\tOPEN\tbeef\n'
+  printf 'task/%s/merge\t1062\tMERGED\tcafe\n' "${task_b}"; } >"${d}/prs.txt"
+out="$(run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "an old landed task with cleaned refs reconciles clean (0)" "0" "${rc}"
+check_contains "and is reported merged, not LOST" "merged as #1062" "${out}"
+
+# The control plane settles start-without-result. Running is not a block.
+# Mutation: map every control-plane answer to DEAD.
+d="$(new_case reconcile_cp_running)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s dispatched\n' "${task_a}" >"${d}/issue-body.txt"
+printf '1111 refs/heads/task/%s/start\n' "${task_a}" >"${d}/task-refs.txt"
+: >"${d}/prs.txt"
+printf '200' >"${d}/cp/${task_a}.code"
+printf '{"status":"running","result_ref":""}' >"${d}/cp/${task_a}.json"
+out="$(CP=1 run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "a task the control plane reports running does not block (0)" "0" "${rc}"
+check_contains "and is reported running" "running (control plane: running)" "${out}"
+check_eq "the bearer token never reached curl's argv" "no" \
+  "$([[ -f "${d}/token-in-argv" ]] && echo yes || echo no)"
+
+# Failed, with nothing else serving its ticket: DEAD, and it blocks.
+# Mutation: treat a failed task as SUPERSEDED without finding a successor.
+d="$(new_case reconcile_cp_dead)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s dispatched\n' "${task_a}" >"${d}/issue-body.txt"
+printf '1111 refs/heads/task/%s/start\n' "${task_a}" >"${d}/task-refs.txt"
+: >"${d}/prs.txt"
+printf '200' >"${d}/cp/${task_a}.code"
+printf '{"status":"failed","result_ref":""}' >"${d}/cp/${task_a}.json"
+out="$(CP=1 run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "a failed task with no successor blocks (65)" "65" "${rc}"
+check_contains "and names the ticket to re-dispatch" "Re-dispatch #101" "${out}"
+check_eq "state records DEAD" "DEAD" \
+  "$(jq -r --arg t "${task_a}" '.tasks[$t].state' "${d}/state/900.json")"
+
+# Done at the control plane but with no result ref on origin is a lost
+# final push, not a success.
+# Mutation: map status "done" to RUNNING or COMPLETE.
+d="$(new_case reconcile_cp_done_no_ref)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s dispatched\n' "${task_a}" >"${d}/issue-body.txt"
+printf '1111 refs/heads/task/%s/start\n' "${task_a}" >"${d}/task-refs.txt"
+: >"${d}/prs.txt"
+printf '200' >"${d}/cp/${task_a}.code"
+printf '{"status":"done","result_ref":"refs/heads/task/%s/result"}' "${task_a}" >"${d}/cp/${task_a}.json"
+out="$(CP=1 run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "done with no result ref on origin blocks (65)" "65" "${rc}"
+check_contains "and says the ref is missing" "is not on origin" "${out}"
+
+# Failed, but a later task on the same ticket landed: SUPERSEDED, no block.
+# This is a failed dispatch that was re-dispatched and merged.
+# Mutation: drop pass 2's successor lookup.
+d="$(new_case reconcile_cp_superseded)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s FAILED\n- #101 task=%s done (redispatch)\n' \
+  "${task_a}" "${task_b}" >"${d}/issue-body.txt"
+printf '1111 refs/heads/task/%s/start\n' "${task_a}" >"${d}/task-refs.txt"
+printf 'task/%s/merge\t1062\tMERGED\tcafe\n' "${task_b}" >"${d}/prs.txt"
+printf '200' >"${d}/cp/${task_a}.code"
+printf '{"status":"failed","result_ref":""}' >"${d}/cp/${task_a}.json"
+out="$(CP=1 run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "a failed task whose ticket landed through another task is clean (0)" "0" "${rc}"
+check_contains "and names its successor" "#101 is served by task ${task_b}" "${out}"
+check_eq "state records SUPERSEDED" "SUPERSEDED" \
+  "$(jq -r --arg t "${task_a}" '.tasks[$t].state' "${d}/state/900.json")"
+
+# A successor on a DIFFERENT ticket supersedes nothing.
+# Mutation: match any other live task instead of one on the same ticket.
+d="$(new_case reconcile_cp_other_ticket)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s FAILED\n- #102 task=%s done\n' \
+  "${task_a}" "${task_b}" >"${d}/issue-body.txt"
+printf '1111 refs/heads/task/%s/start\n' "${task_a}" >"${d}/task-refs.txt"
+printf 'task/%s/merge\t1063\tMERGED\tcafe\n' "${task_b}" >"${d}/prs.txt"
+printf '200' >"${d}/cp/${task_a}.code"
+printf '{"status":"failed","result_ref":""}' >"${d}/cp/${task_a}.json"
+out="$(CP=1 run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "a landed task on another ticket does not supersede (65)" "65" "${rc}"
+
+# Could-not-ask stays distinct from asked-and-got-nothing: an unreachable
+# control plane leaves the task UNRESOLVED, not DEAD or RUNNING.
+# Mutation: map a curl failure to DEAD.
+d="$(new_case reconcile_cp_unreachable)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s dispatched\n' "${task_a}" >"${d}/issue-body.txt"
+printf '1111 refs/heads/task/%s/start\n' "${task_a}" >"${d}/task-refs.txt"
+: >"${d}/prs.txt"
+out="$(CP=1 run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "an unreachable control plane blocks (65)" "65" "${rc}"
+check_contains "and reports UNRESOLVED with the reason" "unreachable (curl exit 7)" "${out}"
+check_eq "state records UNRESOLVED" "UNRESOLVED" \
+  "$(jq -r --arg t "${task_a}" '.tasks[$t].state' "${d}/state/900.json")"
+
+# A PR query that fails is UNKNOWN, never "no PR".
+# Mutation: restore `|| true` on the per-task gh pr list.
+d="$(new_case reconcile_unknown_prs)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s done\n' "${task_b}" >"${d}/issue-body.txt"
+: >"${d}/task-refs.txt"
+rm -f "${d}/prs.txt"   # gh pr list now exits 1
+out="$(run_in "${d}" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "an unreadable PR query exits 65" "65" "${rc}"
+check_contains "and says UNKNOWN rather than LOST" "UNKNOWN" "${out}"
 
 # A task the local index knows about that never reached the issue body is
 # invisible to epic-status.sh: it cannot be reported dead, because it is
