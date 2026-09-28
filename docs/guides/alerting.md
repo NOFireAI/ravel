@@ -541,7 +541,14 @@ is not swept at all that tick rather than swept without that protection, and
 
 Set `--alert-retention` to a longer window before upgrading if you need more
 history, or `--alert-retention 0` to keep every transition forever, which is
-what deployments did before the sweep existed. A nonzero window shorter than one
+what deployments did before the sweep existed. `0` turns off the retention
+sweep and its memo read only. The alerts shard's orphan sweep still runs on the
+same tick whatever the window: the evaluator abandons a transition whose write
+outlived the ingest writers' `max_flush_lifetime`, and that sweep is what
+reclaims the data object it leaves behind. A mass-orphan breaker trip on the
+alerts shard counts under
+`ravel_maintain_orphan_breaker_tripped_total{signal="alerts"}`, the same family
+and alert as every other signal's trips. A nonzero window shorter than one
 hour plus the memo's seal margin (three evaluation intervals plus the query
 deadline, so 1 h 3 m 30 s at the defaults) is refused at startup: the sweep could
 never run under it, and every tick would report a skip.

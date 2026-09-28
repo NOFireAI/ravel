@@ -1207,7 +1207,7 @@ and `kind` and no `signal`. These carry no `tenant_hash` label.
 | `ravel_maintain_bytes_reclaimed_total` | Bytes of deleted objects reclaimed by the sweep, by signal. Counts only the quarantine reaper and the unreferenced-part delete, whose object sizes the sweep already listed; superseded and retention deletions are excluded because they delete by key without a listed size, so this is a lower bound. Per process. |
 | `ravel_maintain_retention_lag_seconds` | Gauge. How far past its retention deadline the oldest still-present expired bucket is, by signal, from this process's most recent completed cycle. 0 when none. A per-cycle maximum over the process's units, so it names the single worst bucket. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
-| `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. |
+| `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. Also carries `signal="alerts"` and `signal="audit"` for the alerts shard's orphan sweep and the query-audit shard's input-cleanup sweep, which run outside the maintained signals; the other per-signal series here cover only metrics, logs and spans. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the last completed orphan pass, by signal. |
 | `ravel_maintain_orphans_present` | Gauge. Orphan candidates the last completed orphan pass found, by signal, whether or not the breaker tripped. |
 | `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |
@@ -1306,7 +1306,9 @@ because the maintenance tick is what records it, not the alert evaluator.
 The maintenance tick sweeps alert transitions older than `--alert-retention`,
 and it reads the tenant's alert state memo first to learn which record is each
 alert identity's current state. Without a memo it can trust, it does not sweep
-that tenant on that tick, and counts why here.
+that tenant on that tick, and counts why here. Under `--alert-retention 0` it
+reads no memo and counts nothing here; the alerts shard's orphan sweep still
+runs.
 
 | `reason` | Meaning |
 |---|---|

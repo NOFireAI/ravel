@@ -286,8 +286,8 @@ pub enum Label {
     /// key with `RejectReason` and `ScrubReason`.
     ScrubUnreadableReason(UnreadableReason),
     /// Why the alert retention driver skipped a tenant (ADR-1688 decision 3):
-    /// `absent`, `undecodable`, `unsupported_version`, or
-    /// `watermark_below_floor`. Shares the `reason` key with `RejectReason`,
+    /// `absent`, `undecodable`, `unsupported_version`, `watermark_below_floor`,
+    /// or `store_error`. Shares the `reason` key with `RejectReason`,
     /// `ScrubReason` and `ScrubUnreadableReason`.
     AlertRetentionSkipReason(crate::maintain::AlertRetentionSkipReason),
     Cache(CacheFamily),
@@ -3451,6 +3451,11 @@ pub struct MaintenanceSafetySnapshot {
     /// process start (ADR-1688 decision 3). One entry per
     /// [`crate::maintain::AlertRetentionSkipReason::ALL`] member, in that order.
     pub alert_retention_skipped: Vec<(crate::maintain::AlertRetentionSkipReason, u64)>,
+    /// Mass-orphan breaker trips on the shards swept outside the maintained
+    /// signals, one entry per [`crate::maintain::UNMAINTAINED_SWEPT_SIGNALS`]
+    /// member, in that order. Rendered as further `signal` samples of
+    /// `ravel_maintain_orphan_breaker_tripped_total`, after `signals`' own.
+    pub unmaintained_orphan_breaker_trips: Vec<(Signal, u64)>,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -3474,6 +3479,10 @@ impl MaintenanceSafetySnapshot {
             alert_retention_skipped: crate::maintain::AlertRetentionSkipReason::ALL
                 .iter()
                 .map(|&reason| (reason, metrics.alert_retention_skipped(reason)))
+                .collect(),
+            unmaintained_orphan_breaker_trips: crate::maintain::UNMAINTAINED_SWEPT_SIGNALS
+                .iter()
+                .map(|&signal| (signal, metrics.unmaintained_orphan_breaker_trips(signal)))
                 .collect(),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
@@ -3528,8 +3537,10 @@ fn render_maintain_safety_family(
          state memo that was absent while that tenant had alert records, undecodable, of an \
          unsupported version, carrying a watermark below the expiry floor, or unreadable for a \
          store reason (ADR-1688 decision 3). Summed over every tenant this process maintains, \
-         with no tenant dimension: a sustained nonzero rate says some tenant's alert evaluator \
-         is not running or cannot write its memo, not which one; the remedy is on the evaluator.",
+         with no tenant dimension: a sustained nonzero rate says some tenant's alert history is \
+         not being swept, not which one. For store_error the remedy is object-storage access \
+         from this process; for every other reason it is on the alert evaluator, which is not \
+         running or cannot write its memo.",
         "counter",
     );
     for &(reason, value) in &snapshot.alert_retention_skipped {
@@ -3563,8 +3574,9 @@ fn render_maintain_safety_family(
     write_header(
         out,
         "ravel_maintain_orphan_breaker_tripped_total",
-        "Orphan-GC mass-orphan circuit breaker trips, by signal. Alert on increase() > 0, not \
-         on sustained state: the condition can clear itself while the withheld data loss \
+        "Orphan-GC mass-orphan circuit breaker trips, by signal, including the alerts and \
+         query-audit shards (signal alerts and audit). Alert on increase() > 0, not on \
+         sustained state: the condition can clear itself while the withheld data loss \
          persists.",
         "counter",
     );
@@ -3574,6 +3586,14 @@ fn render_maintain_safety_family(
             "ravel_maintain_orphan_breaker_tripped_total",
             &labels(mode, signal.signal),
             signal.orphan_breaker_trips,
+        );
+    }
+    for &(signal, value) in &snapshot.unmaintained_orphan_breaker_trips {
+        write_sample(
+            out,
+            "ravel_maintain_orphan_breaker_tripped_total",
+            &labels(mode, signal),
+            value,
         );
     }
 
@@ -9426,6 +9446,7 @@ mod tests {
             objects_deleted_superseded_data_deleted: 12,
             objects_deleted_unreferenced_parts_deleted: 13,
             alert_retention_skipped: Vec::new(),
+            unmaintained_orphan_breaker_trips: vec![(Signal::Alerts, 14), (Signal::Audit, 0)],
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -9524,6 +9545,20 @@ mod tests {
                 "ravel_maintain_orphan_breaker_tripped_total{mode=\"maintain\",signal=\"logs\"} 0"
             ),
             "a zero-valued signal must still render:\n{body}"
+        );
+        // The alerts and query-audit shards' trips share the family, so the one
+        // alert rule over it pages on them too.
+        assert!(
+            body.contains(
+                "ravel_maintain_orphan_breaker_tripped_total{mode=\"maintain\",signal=\"alerts\"} 14"
+            ),
+            "missing the alerts shard's orphan_breaker_tripped sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_orphan_breaker_tripped_total{mode=\"maintain\",signal=\"audit\"} 0"
+            ),
+            "missing the query-audit shard's orphan_breaker_tripped sample:\n{body}"
         );
         assert!(
             body.contains(
@@ -10251,6 +10286,7 @@ mod tests {
             objects_deleted_superseded_data_deleted: 1,
             objects_deleted_unreferenced_parts_deleted: 1,
             alert_retention_skipped: Vec::new(),
+            unmaintained_orphan_breaker_trips: vec![(Signal::Alerts, 1), (Signal::Audit, 1)],
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
@@ -10364,14 +10400,18 @@ mod tests {
             .find(|line| line.starts_with(&format!("# HELP {family} ")))
             .expect("help line");
         // The family carries no tenant label, so the help text must not read as
-        // a statement about one tenant.
+        // a statement about one tenant, and its remedy must be true for every
+        // reason: store_error is an object-storage problem, not the evaluator's.
         assert!(
             help.contains(
-                "a sustained nonzero rate says some tenant's alert evaluator is not running or \
-                 cannot write its memo, not which one"
+                "a sustained nonzero rate says some tenant's alert history is not being swept, \
+                 not which one. For store_error the remedy is object-storage access from this \
+                 process; for every other reason it is on the alert evaluator, which is not \
+                 running or cannot write its memo."
             ),
             "{help}"
         );
+        assert!(!help.contains("the remedy is on the evaluator"), "{help}");
         let samples: Vec<&str> = body
             .lines()
             .filter(|line| line.starts_with(&format!("{family}{{")))

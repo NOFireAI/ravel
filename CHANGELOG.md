@@ -482,7 +482,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   alert identity's current-state record, so the `alerts` SQL table then
   answers for the window plus current states rather than for all history. Set
   `--alert-retention` before upgrading to keep more, or `--alert-retention 0`
-  to keep every record as before. The worker that owns a tenant's
+  to keep every record as before; `0` turns off the retention sweep and its
+  memo read only, and the alerts shard's orphan sweep described below still
+  runs. The worker that owns a tenant's
   `(alerts, 0)` unit reads the tenant's alert state memo, keeps the `ts_ns` of
   every record it names together with its watermark hour, and runs
   `ravel_maintain::sweep_alert_retention`, clamping the memo's watermark to the
@@ -493,17 +495,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ravel_alert_retention_skipped_total{reason}` family, whose `reason` is one of
   `absent`, `undecodable`, `unsupported_version`, `watermark_below_floor` and
   `store_error`. The family carries no tenant label, so a sustained nonzero rate
-  says some tenant's alert evaluator is not running or cannot write its memo,
-  not which one. A tenant that has never written an alert transition is neither
+  says some tenant's alert history is not being swept, not which one; the
+  remedy is object-storage access for `store_error` and the alert evaluator for
+  every other reason. A tenant that has never written an alert transition is neither
   logged nor counted. A nonzero `--alert-retention` shorter than one hour plus
   the memo's seal margin (1 h 3 m 30 s at the default evaluation interval) is
   refused at startup, since every tick would skip under it. The same tick runs
-  the shard sweep over the alerts shard, so a data object left behind by a crash
-  between the retention sweep's record delete and its data delete is moved to
-  quarantine by orphan GC like any other signal's; the alert evaluator now
-  abandons a transition whose data PUT has been in flight longer than the ingest
-  writers' `max_flush_lifetime` rather than publishing its commit record, which
-  is the interlock that orphan age gate rests on.
+  the shard sweep over the alerts shard whatever the window, so a data object
+  left behind by a crash between the retention sweep's record delete and its
+  data delete, or by an abandoned evaluator write, is moved to quarantine by
+  orphan GC like any other signal's; the alert evaluator now abandons a
+  transition once its write, the data PUT and the commit publish together, has
+  been in flight longer than the ingest writers' `max_flush_lifetime`: it
+  checks the bound before every commit attempt and drops an attempt still in
+  flight when it passes, which is the interlock that orphan age gate rests on.
+  A mass-orphan breaker trip on the alerts shard, or on the query-audit shard's
+  input-cleanup sweep, is logged at error with the breaker runbook wording and
+  counted as `ravel_maintain_orphan_breaker_tripped_total{signal="alerts"}` or
+  `{signal="audit"}`, so the existing alert on that family pages on it.
 - **`ravel-cli load --signal spans` loads the spans signal** (ADR-1751
   decisions 1 and 2, follow-up task 2, issues #1751 and #1712). The load
   provisions or validates the tenant's spans signal, builds a
