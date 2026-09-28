@@ -155,8 +155,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A metrics load reads one sequential cursor rather than the logs path's K
   stride cursors, because a classic histogram's data point is a contiguous
   run of rows a stride read would split, and it warns when `--read-cursors`
-  or `--decode-queue-batches` was set to a value it therefore ignores.
-  Everything that shapes the objects (`--shards`, `--batch-rows`,
+  or `--decode-queue-batches` was set to a value it therefore ignores (0 is
+  still rejected for either, as on the logs path). A failed metrics load's
+  resume verdict names only `--pipeline-depth`, and its durable token list
+  equals what landed at any pipeline depth: a write that fails in the
+  end-of-load drain still collects every later write's tokens, and a row
+  rejection or batch failure that meets a failed earlier write keeps its own
+  reason and carries the drained tokens. A classic-histogram data point with
+  more explicit bounds than `max_histogram_buckets` (160) is refused as its
+  rows arrive rather than after the whole group is buffered, and a schema
+  error in a `--mapping` section names its line and column. Everything that shapes the objects (`--shards`, `--batch-rows`,
   `--target-bytes`, `--max-inflight-flushes`, `--max-flush-delay`,
   `--pipeline-depth`) applies unchanged. A data point may span a batch
   boundary; its rows are credited to the write that carries its points, so

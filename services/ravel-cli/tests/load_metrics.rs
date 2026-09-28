@@ -1415,3 +1415,43 @@ no_such_key = "x"
         "a written section is named: {message}"
     );
 }
+
+/// A schema error in a mapping names the line it is on, in both the
+/// pre-ADR-1751 top-level form and a section. The unknown key sits on line 4
+/// of each document (the raw string opens with a newline).
+///
+/// Non-vacuity: with the section deserialized through
+/// `toml::Value::try_into`, which has no source text and so no spans, every
+/// assertion on "line 4" fails.
+#[test]
+fn a_mapping_schema_error_names_its_line() {
+    for (text, signal) in [
+        (
+            "\nts_column = \"ts\"\nts_unit = \"nanos\"\nno_such_key = \"x\"\n",
+            SignalArg::Logs,
+        ),
+        (
+            "\n[logs]\nts_column = \"ts\"\nno_such_key = \"x\"\nts_unit = \"nanos\"\n",
+            SignalArg::Logs,
+        ),
+        (
+            "\n[metrics]\nname = \"m\"\nno_such_key = \"x\"\nvalue_column = \"v\"\n\
+             ts_column = \"ts\"\nts_unit = \"nanos\"\n",
+            SignalArg::Metrics,
+        ),
+    ] {
+        let err =
+            load::parse_mapping_document(text, signal).expect_err("an unknown key is refused");
+        let LoadError::Setup(message) = err else {
+            panic!("expected a setup error");
+        };
+        assert!(
+            message.contains("line 4"),
+            "the error names the offending line: {message}"
+        );
+        assert!(
+            message.contains("no_such_key"),
+            "and the offending key: {message}"
+        );
+    }
+}

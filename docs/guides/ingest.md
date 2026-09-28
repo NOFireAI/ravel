@@ -805,7 +805,11 @@ and `ts`:
 - `le` is that bucket's explicit upper bound and must be finite. The `+Inf`
   bucket is **not a row**: it is synthesized from the `count` column, matching
   OTLP, where `explicit_bounds` carries only the finite bounds. Bounds must
-  strictly increase in row order;
+  strictly increase in row order, and a data point may carry at most 160 of
+  them (the OTLP `max_histogram_buckets` limit). The limit is checked as rows
+  arrive, so a mapping that mistakenly makes a whole file one data point (a
+  `ts_column` naming a constant, or a missing `[[metrics.label]]`) is refused
+  at the 161st row of that group, naming its first row;
 - `sum` and `count` describe the whole data point, so every row of one group
   must repeat the same values; a row that disagrees is refused, naming the
   first row of its group. A null `sum` cell emits no `_sum` series, matching an
@@ -828,7 +832,8 @@ A metrics load therefore reads **one sequential cursor**, not the logs path's
 K stride cursors: a stride read interleaves far-apart file regions inside one
 batch, which would split every contiguous run. `--read-cursors` and
 `--decode-queue-batches` change nothing here and the loader warns when either
-was set to a value it ignores. Everything that shapes the objects
+was set to a value it ignores. A value of 0 for either is still rejected, as
+on the logs path. Everything that shapes the objects
 (`--shards`, `--batch-rows`, `--target-bytes`, `--max-inflight-flushes`,
 `--max-flush-delay`, `--pipeline-depth`) applies unchanged.
 
