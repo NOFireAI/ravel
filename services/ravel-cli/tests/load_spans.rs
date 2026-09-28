@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array,
     StringArray,
 };
 use arrow::record_batch::RecordBatch;
@@ -203,10 +203,45 @@ type = "bytes"
 /// One fixture span, in the shape both sides of the differential test build
 /// from: the Parquet row and the OTLP `Span` are generated from this, so
 /// neither side can drift from the other by hand.
+/// How a fixture row spells its parent. The two spellings of "no parent" are
+/// both fixtures because OTLP has only one: `normalize_span` reads an empty
+/// `parent_span_id` field as a root span, and a Parquet export writes that
+/// either as a NULL cell or as an EMPTY value, so both have to arrive here as
+/// the same root.
+#[derive(Clone, Copy)]
+enum ParentCell {
+    /// A NULL cell.
+    Null,
+    /// A present but empty value.
+    Empty,
+    /// An 8-byte parent id.
+    Id([u8; 8]),
+}
+
+impl ParentCell {
+    /// The Parquet cell: `None` is NULL, `Some(vec![])` is a present empty
+    /// value.
+    fn cell(self) -> Option<Vec<u8>> {
+        match self {
+            ParentCell::Null => None,
+            ParentCell::Empty => Some(Vec::new()),
+            ParentCell::Id(id) => Some(id.to_vec()),
+        }
+    }
+
+    /// The OTLP field, whose only spelling for a root is empty bytes.
+    fn otlp(self) -> Vec<u8> {
+        match self {
+            ParentCell::Null | ParentCell::Empty => Vec::new(),
+            ParentCell::Id(id) => id.to_vec(),
+        }
+    }
+}
+
 struct Fixture {
     trace_id: [u8; 16],
     span_id: [u8; 8],
-    parent_span_id: Option<[u8; 8]>,
+    parent_span_id: ParentCell,
     name: &'static str,
     start_ns: i64,
     end_ns: i64,
@@ -221,16 +256,18 @@ struct Fixture {
 }
 
 /// Fixtures that vary every mapped field, including an empty attribute value,
-/// the non-string attribute columns, and a span with no parent.
+/// the non-string attribute columns, and a span with no parent in each of the
+/// two spellings a Parquet export writes one (EMPTY and NULL).
 fn fixtures(base_ns: i64) -> Vec<Fixture> {
     vec![
-        // A root span: no parent, status ok, every attribute column set, and
-        // an EMPTY string attribute value (which, unlike a metric label, is a
-        // value OTLP stores rather than dropping).
+        // A root span whose parent cell is present but EMPTY, which is how a
+        // common trace export writes a root. Status ok, every attribute column
+        // set, and an EMPTY string attribute value (which, unlike a metric
+        // label, is a value OTLP stores rather than dropping).
         Fixture {
             trace_id: [1u8; 16],
             span_id: [0x11u8; 8],
-            parent_span_id: None,
+            parent_span_id: ParentCell::Empty,
             name: "GET /checkout",
             start_ns: base_ns,
             end_ns: base_ns + 250 * 1_000_000,
@@ -251,7 +288,7 @@ fn fixtures(base_ns: i64) -> Vec<Fixture> {
         Fixture {
             trace_id: [1u8; 16],
             span_id: [0x22u8; 8],
-            parent_span_id: Some([0x11u8; 8]),
+            parent_span_id: ParentCell::Id([0x11u8; 8]),
             name: "SELECT orders",
             start_ns: base_ns + 1_000_000,
             end_ns: base_ns + 9_000_000,
@@ -264,14 +301,14 @@ fn fixtures(base_ns: i64) -> Vec<Fixture> {
             cache_hit: Some(false),
             digest: Some(vec![]),
         },
-        // A span with nothing optional set: no parent, a null status column
-        // (which is Unset, as an OTLP span with no status is), a null status
-        // message, and every attribute cell null (an attribute the row does
-        // not carry, as an OTLP span that omits the key).
+        // A span with nothing optional set: a NULL parent cell, a null status
+        // column (which is Unset, as an OTLP span with no status is), a null
+        // status message, and every attribute cell null (an attribute the row
+        // does not carry, as an OTLP span that omits the key).
         Fixture {
             trace_id: [2u8; 16],
             span_id: [0x33u8; 8],
-            parent_span_id: None,
+            parent_span_id: ParentCell::Null,
             name: "background sweep",
             start_ns: base_ns + 2_000_000,
             end_ns: base_ns + 2_000_000,
@@ -300,12 +337,7 @@ fn fixture_batch(fixtures: &[Fixture]) -> RecordBatch {
         ),
         (
             "parent_span_id".to_string(),
-            opt_bin_col(
-                fixtures
-                    .iter()
-                    .map(|f| f.parent_span_id.map(|p| p.to_vec()))
-                    .collect(),
-            ),
+            opt_bin_col(fixtures.iter().map(|f| f.parent_span_id.cell()).collect()),
         ),
         (
             "name".to_string(),
@@ -395,7 +427,7 @@ fn fixture_request(fixtures: &[Fixture]) -> ExportTraceServiceRequest {
             let span = Span {
                 trace_id: f.trace_id.to_vec(),
                 span_id: f.span_id.to_vec(),
-                parent_span_id: f.parent_span_id.map(|p| p.to_vec()).unwrap_or_default(),
+                parent_span_id: f.parent_span_id.otlp(),
                 name: f.name.to_string(),
                 start_time_unix_nano: f.start_ns as u64,
                 end_time_unix_nano: f.end_ns as u64,
@@ -651,6 +683,25 @@ async fn loaded_spans_match_normalize_traces_field_for_field() {
             && expected.iter().any(|s| s.parent_span_id.is_some()),
         "the fixtures carry both a root span and a child span"
     );
+    // The two spellings of "no parent" are both really in the Parquet the
+    // loader read: one row's parent cell is NULL, another's is present and
+    // empty. OTLP has a single spelling (an empty field), so without this the
+    // parity claim could hold while only the NULL spelling was ever exercised.
+    let read_batch = fixture_batch(&fixtures);
+    let parents = read_batch
+        .column_by_name("parent_span_id")
+        .expect("the parent column is mapped")
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("a Binary parent column");
+    assert!(
+        (0..parents.len()).any(|i| parents.is_null(i)),
+        "one fixture row spells its root parent as a NULL cell"
+    );
+    assert!(
+        (0..parents.len()).any(|i| !parents.is_null(i) && parents.value(i).is_empty()),
+        "one fixture row spells its root parent as a present EMPTY value"
+    );
     assert!(
         expected.iter().any(|s| s.status_code == StatusCode::Unset)
             && expected.iter().any(|s| s.status_code == StatusCode::Error),
@@ -828,8 +879,12 @@ fn a_metrics_section_with_signal_spans_is_refused() {
 /// write fails, the tokens the earlier batches committed are reported with the
 /// error rather than dropped with the report.
 ///
-/// Driven by a scripted fault on the Nth data-object PUT, so the failure lands
-/// after at least one batch has acked durable.
+/// Driven by a scripted fault on the LAST of four data-object PUTs at
+/// `--pipeline-depth 2`, so the failing write is one the steady-state loop
+/// never awaits: it is still in flight when the input is exhausted, and only
+/// the final drain and its harvest can see it. At depth 1 the same fixture
+/// catches the failure inside the steady-state loop instead and proves nothing
+/// about the drain.
 #[tokio::test]
 async fn a_failed_spans_load_reports_the_tokens_that_landed() {
     let load_ns = now_ns();
@@ -841,7 +896,7 @@ async fn a_failed_spans_load_reports_the_tokens_that_landed() {
         fixtures.push(Fixture {
             trace_id: [9u8; 16],
             span_id: [i + 1; 8],
-            parent_span_id: None,
+            parent_span_id: ParentCell::Null,
             name: "op",
             start_ns: base_ns,
             end_ns: base_ns,
@@ -859,14 +914,15 @@ async fn a_failed_spans_load_reports_the_tokens_that_landed() {
     let pq = dir.path().join("spans.parquet");
     write_parquet(&pq, &fixture_batch(&fixtures));
 
-    // Fail the SECOND span data-object PUT and every retry of it, so the first
-    // batch is durable and the second batch's flush is abandoned. The key
-    // filter `/s/l0/` matches only span data objects, not the provisioning
-    // record or commit records, so the first data PUT passes through.
+    // Fail the FOURTH span data-object PUT and every retry of it, so the first
+    // three batches are durable and the last batch's flush is abandoned. The
+    // key filter `/s/l0/` matches only span data objects, not the provisioning
+    // record or commit records, so the first three data PUTs pass through.
     let fault = ScriptedFault::Transient("injected PUT failure".into());
-    let mut seq = Sequence::new(Op::Put)
-        .with_key_contains("/s/l0/")
-        .then_passthrough();
+    let mut seq = Sequence::new(Op::Put).with_key_contains("/s/l0/");
+    for _ in 0..3 {
+        seq = seq.then_passthrough();
+    }
     for _ in 0..8 {
         seq = seq.then_fault(fault.clone());
     }
@@ -884,7 +940,9 @@ async fn a_failed_spans_load_reports_the_tokens_that_landed() {
         1,
         1,
         0,
-        1,
+        // --pipeline-depth 2: the failing fourth write is never awaited by the
+        // steady-state loop, so the final drain is what surfaces it.
+        2,
         1,
         1,
         None,
@@ -900,8 +958,8 @@ async fn a_failed_spans_load_reports_the_tokens_that_landed() {
     );
     assert_eq!(
         err.durable_tokens().len(),
-        1,
-        "exactly the first batch was durable before the failure, and its token is reported with \
+        3,
+        "the three batches that acked durable before the failure have their tokens reported with \
          the error rather than dropped with the report: {err}"
     );
     let resume = err
@@ -909,12 +967,12 @@ async fn a_failed_spans_load_reports_the_tokens_that_landed() {
         .expect("a flush failure carries figures");
     assert_eq!(
         (resume.rows_skipped, resume.rows_written),
-        (0, 1),
-        "one source row landed, so the resume offset is that row boundary"
+        (0, 3),
+        "three source rows landed, so the resume offset is that row boundary"
     );
     assert_eq!(
         resume.next_skip_rows(),
-        1,
+        3,
         "the resume offset lands on a row boundary"
     );
 }

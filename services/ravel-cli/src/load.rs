@@ -13761,10 +13761,14 @@ type = "str"
                 build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
             };
 
+            // The start stays well inside the bound in both cases, so only the
+            // END decides: a start-anchored check would admit the second span
+            // and this assertion would fail.
             let at_bound = NOW_NS + limits.max_future_skew_ns;
-            let span = build(at_bound, at_bound).expect("exactly at the bound is admitted");
+            let span = build(NOW_NS, at_bound).expect("an end exactly at the bound is admitted");
             assert_eq!(span.end_ts_ns, at_bound);
-            let over = build(at_bound + 1, at_bound + 1).expect_err("one ns past it is rejected");
+            let over = build(NOW_NS, at_bound + 1)
+                .expect_err("an end one ns past the bound is rejected, with its start in window");
             assert!(
                 over.contains("more than the max future skew"),
                 "the rejection names the bound: {over}"
@@ -13802,6 +13806,350 @@ type = "str"
                 format!(
                     "span ends at {} ns, before it starts at {NOW_NS} ns",
                     NOW_NS - 1
+                )
+            );
+        }
+
+        /// [`MAPPING_TOML`] plus the parent, status code and status message
+        /// columns, so one fixture shape can drive every optional field.
+        const FULL_MAPPING_TOML: &str = r#"
+[spans]
+trace_id_column       = "trace_id"
+span_id_column        = "span_id"
+parent_span_id_column = "parent"
+name_column           = "name"
+start_ts_column       = "start_ns"
+start_ts_unit         = "nanos"
+end_ts_column         = "end_ns"
+end_ts_unit           = "nanos"
+status_code_column    = "status"
+status_message_column = "status_msg"
+
+[[spans.attribute]]
+key = "http.method"
+column = "method"
+type = "str"
+"#;
+
+        fn opt_bin_col(vals: Vec<Option<Vec<u8>>>) -> ArrayRef {
+            let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
+            Arc::new(BinaryArray::from(refs))
+        }
+
+        fn opt_str_col(vals: Vec<Option<&str>>) -> ArrayRef {
+            Arc::new(StringArray::from(vals))
+        }
+
+        fn opt_i64_col(vals: Vec<Option<i64>>) -> ArrayRef {
+            Arc::new(Int64Array::from(vals))
+        }
+
+        /// One row over [`FULL_MAPPING_TOML`], every column overridable.
+        struct Row {
+            parent: ArrayRef,
+            name: ArrayRef,
+            start: ArrayRef,
+            end: ArrayRef,
+            status: ArrayRef,
+            status_msg: ArrayRef,
+            method: ArrayRef,
+        }
+
+        impl Default for Row {
+            fn default() -> Self {
+                Row {
+                    parent: opt_bin_col(vec![None]),
+                    name: str_col(vec!["op"]),
+                    start: i64_col(vec![NOW_NS]),
+                    end: i64_col(vec![NOW_NS]),
+                    status: opt_i64_col(vec![None]),
+                    status_msg: opt_str_col(vec![None]),
+                    method: str_col(vec!["GET"]),
+                }
+            }
+        }
+
+        /// Build the single row `row` describes through the real
+        /// [`build_span`], under [`FULL_MAPPING_TOML`].
+        fn build_one(row: Row) -> Result<NormalizedSpan, String> {
+            let limits = SpanIngestLimits::default();
+            let mapping = parse_spans_mapping(FULL_MAPPING_TOML).expect("valid mapping");
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]])),
+                ("span_id", bin_col(vec![vec![2u8; 8]])),
+                ("parent", row.parent),
+                ("name", row.name),
+                ("start_ns", row.start),
+                ("end_ns", row.end),
+                ("status", row.status),
+                ("status_msg", row.status_msg),
+                ("method", row.method),
+            ]);
+            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
+        }
+
+        /// A zero start takes the load time and a zero end takes the resolved
+        /// start, the two fallbacks `normalize_span` applies to the zeros an
+        /// under-instrumented OTLP sender emits.
+        #[test]
+        fn a_zero_start_takes_load_time_and_a_zero_end_takes_the_start() {
+            let span = build_one(Row {
+                start: i64_col(vec![0]),
+                end: i64_col(vec![0]),
+                ..Row::default()
+            })
+            .expect("two zeros are admitted");
+            assert_eq!(span.start_ts_ns, NOW_NS, "a zero start takes the load time");
+            assert_eq!(span.end_ts_ns, NOW_NS, "a zero end takes the start");
+
+            // A zero end beside a REAL start takes that start, not the load
+            // time: the two fallbacks are distinguishable only here.
+            let earlier = NOW_NS - 5 * 60 * 1_000_000_000;
+            let span = build_one(Row {
+                start: i64_col(vec![earlier]),
+                end: i64_col(vec![0]),
+                ..Row::default()
+            })
+            .expect("a zero end beside a real start is admitted");
+            assert_eq!(span.start_ts_ns, earlier);
+            assert_eq!(
+                span.end_ts_ns, earlier,
+                "a zero end takes the span's own start, not the load time"
+            );
+        }
+
+        /// A status outside OTLP's `0..=2` enum is `Unset`, including a value
+        /// too wide for `i64`: `status_code_from_i32` maps everything outside
+        /// the enum to `Unset`, and a `UInt64` cell above `i64::MAX` is
+        /// outside it by more, not by a different kind.
+        #[test]
+        fn a_status_outside_the_otlp_enum_is_unset() {
+            for (code, want) in [
+                (0i64, StatusCode::Unset),
+                (1, StatusCode::Ok),
+                (2, StatusCode::Error),
+                (3, StatusCode::Unset),
+                (-1, StatusCode::Unset),
+                (i64::MAX, StatusCode::Unset),
+            ] {
+                let span = build_one(Row {
+                    status: opt_i64_col(vec![Some(code)]),
+                    ..Row::default()
+                })
+                .unwrap_or_else(|e| panic!("status {code} is admitted: {e}"));
+                assert_eq!(span.status_code, want, "status {code}");
+            }
+
+            // A UInt64 column carrying a value above i64::MAX.
+            let wide: ArrayRef = Arc::new(UInt64Array::from(vec![u64::MAX]));
+            let span = build_one(Row {
+                status: wide,
+                ..Row::default()
+            })
+            .expect("a status above i64::MAX is admitted, not refused");
+            assert_eq!(span.status_code, StatusCode::Unset);
+        }
+
+        /// An empty parent value is a root span, in each spelling a Parquet
+        /// column can carry one; a present, non-empty value of the wrong width
+        /// is still refused.
+        #[test]
+        fn an_empty_parent_is_a_root_and_a_wrong_width_one_is_refused() {
+            for (label, cell) in [
+                ("a null cell", opt_bin_col(vec![None])),
+                ("an empty binary value", opt_bin_col(vec![Some(Vec::new())])),
+                ("an empty string", opt_str_col(vec![Some("")])),
+            ] {
+                let span = build_one(Row {
+                    parent: cell,
+                    ..Row::default()
+                })
+                .unwrap_or_else(|e| panic!("{label} is a root span: {e}"));
+                assert_eq!(span.parent_span_id, None, "{label} is a root span");
+            }
+
+            // A hex string of the right width is a parent, so the empty-string
+            // case above is emptiness and not "strings are never parents".
+            let span = build_one(Row {
+                parent: opt_str_col(vec![Some("0202020202020202")]),
+                ..Row::default()
+            })
+            .expect("a 16-character hex parent is read");
+            assert_eq!(span.parent_span_id, Some([2u8; 8]));
+
+            let err = build_one(Row {
+                parent: opt_bin_col(vec![Some(vec![3u8; 4])]),
+                ..Row::default()
+            })
+            .expect_err("a non-empty 4-byte parent is refused");
+            assert!(
+                err.contains("is not an 8-byte value"),
+                "the refusal names the width: {err}"
+            );
+        }
+
+        /// A null timestamp cell and a null name cell are both refused. OTLP
+        /// has no null for either, so neither has a reading to match; giving
+        /// one a load-time default would hide a mapping mistake.
+        #[test]
+        fn a_null_timestamp_or_name_cell_is_refused() {
+            for (want, row) in [
+                (
+                    "start_ts column \"start_ns\" is null",
+                    Row {
+                        start: opt_i64_col(vec![None]),
+                        ..Row::default()
+                    },
+                ),
+                (
+                    "end_ts column \"end_ns\" is null",
+                    Row {
+                        end: opt_i64_col(vec![None]),
+                        ..Row::default()
+                    },
+                ),
+                (
+                    "name column \"name\" is null",
+                    Row {
+                        name: opt_str_col(vec![None]),
+                        ..Row::default()
+                    },
+                ),
+            ] {
+                let err = build_one(row).expect_err("a null cell is refused");
+                assert_eq!(err, want, "the refusal names the mapped column");
+            }
+        }
+
+        /// An empty status message is no message, as an OTLP status with an
+        /// empty `message` field is.
+        #[test]
+        fn an_empty_status_message_is_stored_as_no_message() {
+            let span = build_one(Row {
+                status_msg: opt_str_col(vec![Some("")]),
+                ..Row::default()
+            })
+            .expect("an empty status message is admitted");
+            assert_eq!(span.status_message, None);
+
+            let span = build_one(Row {
+                status_msg: opt_str_col(vec![Some("deadlock")]),
+                ..Row::default()
+            })
+            .expect("a real status message is admitted");
+            assert_eq!(span.status_message.as_deref(), Some("deadlock"));
+        }
+
+        /// An attribute value over the OTLP cap drops THAT attribute and keeps
+        /// the span, which is `convert_attrs_lossy`'s rule on the OTLP path.
+        #[test]
+        fn an_over_cap_attribute_value_is_dropped_and_the_span_kept() {
+            let limits = SpanIngestLimits::default();
+            let big = "x".repeat(limits.max_attribute_value_len + 1);
+            let span = build_one(Row {
+                method: str_col(vec![big.as_str()]),
+                ..Row::default()
+            })
+            .expect("an over-cap attribute value does not reject the span");
+            assert_eq!(span.attrs, Vec::new(), "the attribute itself is dropped");
+
+            // Exactly at the cap is kept, so the case above is the cap and not
+            // the column going missing.
+            let at_cap = "x".repeat(limits.max_attribute_value_len);
+            let span = build_one(Row {
+                method: str_col(vec![at_cap.as_str()]),
+                ..Row::default()
+            })
+            .expect("exactly at the cap is admitted");
+            assert_eq!(span.attrs, vec![("http.method".to_string(), at_cap)]);
+        }
+
+        /// A negative start or end is refused, naming both declared units: a
+        /// mapping that calls a seconds column nanos is the usual cause, and
+        /// OTLP's two `u64` timestamps have no negative to match against.
+        #[test]
+        fn a_negative_timestamp_is_refused() {
+            let err = build_one(Row {
+                start: i64_col(vec![-1]),
+                ..Row::default()
+            })
+            .expect_err("a negative start is refused");
+            assert_eq!(
+                err,
+                format!(
+                    "span timestamps are before the Unix epoch (start -1 ns, end {NOW_NS} ns, \
+                     read as start_ts_unit = nanos, end_ts_unit = nanos); check the declared \
+                     units against the columns"
+                )
+            );
+
+            let err = build_one(Row {
+                start: i64_col(vec![-2]),
+                end: i64_col(vec![-1]),
+                ..Row::default()
+            })
+            .expect_err("a wholly negative interval is refused too");
+            assert!(err.contains("before the Unix epoch"), "{err}");
+
+            // Zero is the epoch, not a negative, and it takes the zero
+            // fallbacks rather than this refusal.
+            build_one(Row {
+                start: i64_col(vec![0]),
+                end: i64_col(vec![0]),
+                ..Row::default()
+            })
+            .expect("zero is the fallback case, not a negative one");
+        }
+
+        /// Both attribute-count caps are properties of the mapping, so both
+        /// are refused at mapping parse rather than per row.
+        #[test]
+        fn the_attribute_count_caps_are_checked_against_the_mapping() {
+            let attr_list = |list: &str, key_prefix: &str, n: usize| {
+                let mut text = MAPPING_TOML.to_string();
+                for i in 0..n {
+                    text.push_str(&format!(
+                        "\n[[spans.{list}]]\nkey = \"{key_prefix}{i}\"\ncolumn = \
+                         \"c{key_prefix}{i}\"\ntype = \"str\"\n"
+                    ));
+                }
+                text
+            };
+
+            // MAPPING_TOML already declares one [[spans.attribute]], so the
+            // cap is reached at `cap - 1` more.
+            let cap = LOADER_MAX_ATTRIBUTES_PER_RECORD;
+            parse_spans_mapping(&attr_list("attribute", "a", cap - 1))
+                .expect("exactly at the loader per-record cap is accepted");
+            let err = parse_spans_mapping(&attr_list("attribute", "a", cap))
+                .expect_err("one column past the loader per-record cap");
+            let LoadError::Setup(message) = err else {
+                panic!("expected a setup error");
+            };
+            assert_eq!(
+                message,
+                format!(
+                    "--mapping [spans] declares {} attribute columns, more than the loader \
+                     per-record cap of {cap}",
+                    cap + 1
+                )
+            );
+
+            let resource_cap = SpanIngestLimits::default().max_resource_attributes;
+            parse_spans_mapping(&attr_list("resource_attribute", "r", resource_cap))
+                .expect("exactly at the OTLP per-resource cap is accepted");
+            let err = parse_spans_mapping(&attr_list("resource_attribute", "r", resource_cap + 1))
+                .expect_err("one column past OTLP's max_resource_attributes");
+            let LoadError::Setup(message) = err else {
+                panic!("expected a setup error");
+            };
+            assert_eq!(
+                message,
+                format!(
+                    "--mapping [spans] declares {} resource_attribute columns, more than the OTLP \
+                     per-resource cap of {resource_cap}",
+                    resource_cap + 1
                 )
             );
         }
