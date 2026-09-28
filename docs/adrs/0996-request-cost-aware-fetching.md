@@ -743,7 +743,9 @@ Step 5 (chunk-run GETs) and the "no covering-GET mode" claim right after the
 list: chunk-run GETs are now capped at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`
 (4) per L0 object -- the same constant `fetcher.rs` already used for the
 metrics RSEG format's per-object GET ceiling, now shared with the log
-format. When a projection's coalesced candidate runs exceed the cap,
+format. L1 segments (compaction and rewrite outputs) are exempt, as they
+are on the metrics path, and still issue one GET per coalesced run. When a
+projection's coalesced candidate runs exceed the cap,
 `bounded_chunk_runs` (`log_fetcher.rs` ~line 5463) bridges the smallest gaps
 between them down to it, so "runs separated by more than the [coalescing]
 gap stay separate requests" no longer holds once the candidate count clears
