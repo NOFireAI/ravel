@@ -411,8 +411,114 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deployment context falls back to, and a test pins `ravel-query`'s hand copy
   of the fold interval against the server's own default so the two cannot drift
   apart unnoticed.
+- **`ravel-cli export --signal metrics|spans` now names what it actually waits
+  on** (ADR-1751 follow-up task 2 review, issues #1751 and #1712). Both
+  refusals said bulk import for that signal does not exist yet. Both imports
+  have since landed, so each message now names ADR-1751 follow-up task 3, the
+  export work itself, and says the import half of the round trip is already
+  there. Neither message claims that follow-up decides the output columns:
+  ADR-1751 decision 4 already settles them, the same mapping TOML names them.
+  The `export` help text and the ingest guide's bulk-export section say
+  the same.
+
+- **A Parquet load resolves each dictionary-encoded column once per batch
+  instead of once per cell** (issues #1751 and #1712). The per-row readers
+  resolved a dictionary cell through `DictionaryArray::normalized_keys`, which
+  builds a key vector the size of the whole batch on every call, so every
+  dictionary column cost time quadratic in the batch's row count. Each column
+  index now resolves its mapped dictionary columns to their value type once,
+  when the batch's columns are resolved, and the row readers index the result.
+  This covers the spans load (whose row path is its only path, and whose name,
+  id and string attribute columns arrive dictionary encoded from an ordinary
+  trace export), the metrics load's name and label columns, and the logs row
+  path. The columnar logs path is unchanged: it keys its own fast path on the
+  dictionary itself. Every value, admission decision and rejection message is
+  the same as before. A dictionary chunk whose dictionary is empty under a
+  non-null key is now a typed error rather than an abort inside Arrow's own
+  assertion; an all-null chunk with an empty dictionary still resolves to an
+  all-null column.
 
 ### Added
+
+- **`ravel-cli load --signal spans` loads the spans signal** (ADR-1751
+  decisions 1 and 2, follow-up task 2, issues #1751 and #1712). The load
+  provisions or validates the tenant's spans signal, builds a
+  `SpanIngestRouter` from the same `build_ingest_config` the other loads use,
+  and writes every batch in `WriteMode::Strict`. ADR-0089's admission
+  decisions apply with the spans OTLP limits: the past event-time lag bound is
+  relaxed, the future-skew bound is kept (anchored on the span's end, as the
+  OTLP path anchors it), the span-name, status-message and attribute length
+  caps are kept, the loader per-record cap of 1024 stands in for OTLP's
+  `max_attributes_per_span`, and the server's admission controller is bypassed
+  by construction. The refusal `--signal spans` used to get is gone.
+
+  The `[spans]` mapping section names `trace_id_column`, `span_id_column`, an
+  optional `parent_span_id_column`, `name_column`, `start_ts_column` and
+  `end_ts_column` with their units, an optional `status_code_column` (OTLP's
+  0/1/2 integer enum) and `status_message_column`, and
+  `[[spans.resource_attribute]]` and `[[spans.attribute]]` columns coerced to
+  strings. One input row is one span.
+
+  **A span loaded from Parquet is stored as the same record the same span sent
+  over OTLP produces**, field for field. The loader reuses `ravel-otlp`'s own
+  normalization rather than reimplementing it: the attribute value coercion is
+  `convert_value`'s mapping (integer and boolean verbatim, float through the
+  shared `format_float`, bytes as lowercase hex), the resource-over-span merge
+  is `ravel_rspan::merge_attrs`, and the status column goes through
+  `ravel_otlp::traces_normalize::status_code_from_i32`, which is now public for
+  this caller with no change to its body. An empty parent cell (empty binary,
+  empty string, or a zero-width fixed-size value) is a root span, exactly as
+  OTLP's own empty `parent_span_id` field is; a status outside `0..=2` is
+  unset, including one too wide for `i64`; an attribute value over the
+  8192-byte cap drops that attribute and keeps the span, as
+  `convert_attrs_lossy` does on the OTLP path; and a null attribute cell is an
+  attribute the row does not carry, as an OTLP `KeyValue` carrying no value is
+  dropped as `MissingAttributeValue`.
+
+  A dropped attribute value is reported, because the stored span is then an
+  approximation of the source row and nothing else in the output says so; the
+  OTLP path reports the same drop as `AttributeValueTooLong` in its
+  partial-success message, and a load has no partial-success channel.
+  `SpansLoadReport::attributes_dropped` counts them and the load summary prints
+  the count as `attrs_dropped`, on the success path and beside the
+  durable-token banner when the load fails. Zero prints too. The count is taken
+  where each span is built rather than where its batch acks, so on a failed
+  load it also covers batches the failure abandoned, whose spans are in no
+  object; the line printed there says that, rather than claiming stored spans.
+
+  Four differences remain, and this is the complete list of what the stored
+  record can differ on for the same input. A null `start_ts`, `end_ts` or
+  `name` cell is refused: OTLP has no null for any of them, its absent
+  timestamp is a zero (a zero takes the same fallbacks here) and its absent
+  name is the empty string. A negative timestamp is refused: OTLP's two are
+  unsigned, and a negative start beside a positive end would store a span whose
+  interval overlaps nearly every query window, so the refusal names both
+  declared units, since a unit that does not match the column is the usual
+  cause. A `parent_span_id` cell that is non-empty and of the wrong width is
+  refused rather than dropped, because a mapped column producing unusable ids
+  is a mapping mistake the whole file shares. And attribute keys and both
+  attribute-count caps are checked against the `--mapping` rather than per
+  span: an empty, over-long, reserved or twice-declared key refuses the load,
+  as does a mapping with more than 1024 `[[spans.attribute]]` columns (the
+  loader per-record cap, standing in for OTLP's per-span cap of 128) or more
+  than 128 `[[spans.resource_attribute]]` columns (OTLP's own
+  `max_resource_attributes`, which the loader had no counterpart for before).
+
+  Span events and span links are not mappable in this version, and a mapping
+  naming them is refused by name rather than as a typo. The same refusal covers
+  the reserved `attrs` keys the OTLP path stores span kind, trace state, span
+  flags, events and links under. Two mapped attributes sharing one key are
+  refused at mapping parse, and an id column that cannot carry an id of the
+  right width is refused when the batch's columns are resolved, before any row
+  is built or written. A hex id column loads whether the Parquet writer stored
+  it plain or dictionary-encoded.
+
+  A spans load reads one sequential cursor and has no decode/encode queue, so
+  `--read-cursors` and `--decode-queue-batches` are warned about when set to a
+  value it ignores, and `0` for either is still rejected. It reports the same
+  operator surface a metrics load does: the durable-token banner, the resume
+  figures on a row boundary, and the resume hint naming only
+  `--pipeline-depth`.
 
 - **`/metrics` renders `ravel_health_heartbeat_age_seconds`** (ADR-1702
   decision 11, issue #2048). The gauge is the time since the main runtime's
@@ -441,9 +547,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the metrics OTLP limits (past event-time lag relaxed, future skew kept,
   metric-name and label length caps kept, the loader per-record cap of 1024
   in place of OTLP's `max_attributes_per_point`, the server's admission
-  controller bypassed by construction). `--signal spans` is refused with a
-  message naming ADR-1751 follow-up task 2 and never falls back to another
-  signal.
+  controller bypassed by construction). The spans half of the same flag
+  shipped in the entry below.
 
   The `--mapping` TOML gains per-signal sections: exactly one of `[logs]`,
   `[metrics]` and `[spans]` may be present and it must match `--signal`. A
