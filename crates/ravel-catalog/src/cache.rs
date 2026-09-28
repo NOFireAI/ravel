@@ -724,11 +724,13 @@ impl<V> DecodedTenantCache<V> {
 ///   [`PartCache`], `postings_cache_entries` for [`PostingsCache`]), applied
 ///   on insert.
 /// - Across every tenant of BOTH caches, on memory pressure:
-///   [`DecodedCaches::evict_until_fits`] drops entries oldest-first until the
-///   refused reservation would fit. Without it, a finite
+///   [`DecodedCaches::evict_until_fits`] drops entries least-recently-used
+///   first until the refused reservation would fit. Without it, a finite
 ///   [`ravel_memory::MemoryBudget`] wired into the catalog could be held
 ///   entirely by other tenants' cached entries, and every later decode would
-///   be refused with nothing able to give the memory back.
+///   be refused with nothing able to give the memory back. A reservation
+///   larger than the whole budget takes no such pass: see
+///   [`crate::Catalog::reserve_decoded`].
 ///
 /// An entry evicted by either bound releases its reservation only when the
 /// last `Arc` to it drops. A resolve that is still holding the value keeps it
@@ -816,8 +818,12 @@ impl<V> DecodedCache<V> {
 
     /// Drop the least-recently-used entry across every tenant, returning
     /// whether one was dropped. The evicted value is dropped after the map
-    /// lock is released, so the reservation it holds is returned to the budget
-    /// outside the lock and a caller can read the budget immediately after.
+    /// lock is released: dropping it frees a whole decoded part or postings
+    /// object, and running a deallocation that size under the mutex would
+    /// hold off every concurrent `get` and `insert` on this cache for its
+    /// duration. It is not what returns the memory to the budget -- the
+    /// reservation goes back only when the last `Arc` to the value drops,
+    /// which is here when no reader holds it and later when one does.
     fn evict_lru(&self) -> bool {
         let mut tenants = self.tenants.lock();
         let oldest = tenants
@@ -917,10 +923,19 @@ impl DecodedCaches {
     /// The loop is bounded by the number of cached entries, not by the bytes
     /// it frees: an entry a live resolve still holds an `Arc` to stays charged
     /// to the budget after this drops it, so a pass can remove every entry and
-    /// free nothing. That is what keeps a caller's retry from spinning. A
-    /// `want` larger than the whole budget empties both caches and still does
-    /// not fit, which is the correct answer for an object no budget could ever
-    /// admit.
+    /// free nothing. That is what keeps a caller's retry from spinning.
+    ///
+    /// It terminates because every step removes one entry and stops as soon as
+    /// there is none left to remove, whether or not the budget moved. It is
+    /// not bounded by the number of entries present when it started: a
+    /// concurrent resolve inserting into either cache lengthens the pass, and
+    /// under enough concurrent inserts it ends only when `want` fits.
+    ///
+    /// A caller whose `want` exceeds the budget's whole limit must not call
+    /// this at all ([`crate::Catalog::reserve_decoded`] returns its first
+    /// refusal instead): the condition below can never become false, so the
+    /// pass would empty both caches, across every tenant, for a decode no
+    /// eviction could ever admit.
     pub(crate) fn evict_until_fits(&self, budget: &ravel_memory::MemoryBudget, want: u64) -> u64 {
         let mut dropped = 0;
         while budget.limit().saturating_sub(budget.reserved()) < want {

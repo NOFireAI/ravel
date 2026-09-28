@@ -801,27 +801,49 @@ impl Catalog {
     /// least-recently-used across every tenant of both caches
     /// ([`DecodedCaches::evict_until_fits`]) and retries the reservation
     /// EXACTLY once. The retry cannot spin: the eviction pass is bounded by
-    /// the entries it removes, and one refused retry is the answer, so a
-    /// decode larger than the whole budget still fails after one pass rather
-    /// than looping against caches it has already emptied.
+    /// the entries it removes, and one refused retry is the answer.
+    ///
+    /// Every resolve-path decode reserves here: parts, postings, and
+    /// column-statistics objects, the last through
+    /// [`crate::charged::DecodeReserver`]. A site holding the budget directly
+    /// instead would fail while these caches still held memory it could have
+    /// had (issue #2107).
     ///
     /// The refusal the caller sees is the one the retry produced, so its
     /// figures describe the budget as it stands after eviction. An entry a
     /// live resolve still holds an `Arc` to is charged in those figures even
     /// though the cache has dropped it: eviction only ends a cache's claim on
     /// a value, never a reader's.
+    ///
+    /// A decode wanting more than the budget's whole limit skips the pass
+    /// entirely and keeps its first refusal: no eviction could ever admit it,
+    /// and evicting anyway flushes every tenant's decoded caches on each such
+    /// query. That refusal is a refusal like any other, counted in neither
+    /// [`Catalog::decoded_cache_memory_evictions`] nor
+    /// [`Catalog::decode_reserve_retries`].
+    ///
+    /// Eviction and retry are NOT atomic against each other or against other
+    /// resolves. Another task can take the freed bytes between the two, so a
+    /// retry can be refused against a budget this pass did make room in; and
+    /// two refusals evicting concurrently each stop at their own need, so
+    /// together they can free less than either then reserves. Both cases end
+    /// in the ordinary typed refusal, which the caller's resolve already
+    /// handles; neither is retried a second time.
     pub(crate) fn reserve_decoded(
         &self,
         declared: u64,
         ceiling: u64,
     ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
-        match crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling) {
+        let refusal = match crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
+        {
             Ok(reservation) => return Ok(reservation),
-            Err(_) => {
-                self.decoded
-                    .evict_until_fits(&self.memory_budget, declared.min(ceiling));
-            }
+            Err(refusal) => refusal,
+        };
+        let want = declared.min(ceiling);
+        if want > self.memory_budget.limit() {
+            return Err(refusal);
         }
+        self.decoded.evict_until_fits(&self.memory_budget, want);
         self.decode_reserve_retries.fetch_add(1, Ordering::Relaxed);
         crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
     }
@@ -1539,7 +1561,7 @@ impl Catalog {
                     &getter,
                     tenant,
                     &resolved,
-                    &self.memory_budget,
+                    self,
                     self.read_gate(),
                 )
                 .await?
@@ -4544,6 +4566,23 @@ pub fn resolve_rewrite_supersession(
         // Named predecessor is not live in this bucket (already swept): its
         // inputs and parts are gone, so nothing more to exclude. Stop cleanly.
         return Ok(());
+    }
+}
+
+/// Every resolve-path decode reserves through the catalog, so a refusal takes
+/// the decoded-output caches' evict-then-retry pass wherever it is raised. The
+/// part and postings paths call the inherent
+/// [`Catalog::reserve_decoded`] directly; the column-statistics path
+/// ([`crate::column_stats_resolve::fetch_stats_object`]) reaches it through
+/// this trait, since it is a free function with no `Catalog` of its own
+/// (issue #2107).
+impl crate::charged::DecodeReserver for Catalog {
+    fn reserve_decoded(
+        &self,
+        declared: u64,
+        ceiling: u64,
+    ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+        Catalog::reserve_decoded(self, declared, ceiling)
     }
 }
 
@@ -11381,11 +11420,12 @@ mod tests {
     /// nothing. The retry is still exactly one, which is what stops it
     /// spinning against memory it cannot reclaim.
     ///
-    /// FLIP: have `DecodedTenantCache::remove_lru` (cache.rs) return the key
-    /// instead of the entry, dropping the value under the map lock; the
-    /// reservation would then be released while a live `Arc` still points at
-    /// the decoded part, and `budget.reserved()` below would read 0 rather
-    /// than `held`.
+    /// FLIP: make `DecodedTenantCache::remove_lru` (cache.rs) skip an entry a
+    /// reader still holds -- put the entry back and return `None` when
+    /// `Arc::strong_count(&entry.value) > 1` -- the "do not evict what frees
+    /// nothing" rule this test rejects. The pass then drops nothing, and
+    /// `part_cache().total_entries()` below reads 1 instead of 0 with
+    /// `decoded_cache_memory_evictions()` 0 instead of 1.
     #[tokio::test]
     async fn an_evicted_entry_stays_charged_while_a_reader_holds_it() {
         let store = Arc::new(MemoryStore::new());
@@ -11455,16 +11495,20 @@ mod tests {
         assert_eq!(budget.reserved(), arriving);
     }
 
-    /// A decode no budget could ever admit still fails, after exactly one
-    /// eviction pass and exactly one retry. The pass empties the caches
-    /// because nothing it can drop will ever be enough; the retry does not
-    /// loop against caches it has already emptied.
+    /// A decode no budget could ever admit fails on its FIRST refusal, with no
+    /// eviction pass and no retry: nothing the caches could give back would
+    /// make a part larger than the whole limit fit, so a pass would flush
+    /// every tenant's decoded entries on each such query and still refuse.
     ///
-    /// FLIP: make `Catalog::reserve_decoded` (catalog.rs) retry in a loop
-    /// while the eviction pass drops anything, and
-    /// `decode_reserve_retries()` below reads 2 instead of 1.
+    /// FLIP: drop the `want > self.memory_budget.limit()` early return from
+    /// `Catalog::reserve_decoded` (catalog.rs) and the pass runs anyway: the
+    /// small tenant's cached part is evicted, so
+    /// `decoded_cache_memory_evictions()` and `decode_reserve_retries()` below
+    /// read 1 instead of 0, `part_cache().total_entries()` reads 0 instead of
+    /// 1, and the refusal reports `reserved` 0 instead of the cached part's
+    /// bytes.
     #[tokio::test]
-    async fn a_decode_larger_than_the_budget_fails_after_one_retry() {
+    async fn a_decode_larger_than_the_budget_fails_without_evicting() {
         let store = Arc::new(MemoryStore::new());
         let sealed_hour = 500_000u32;
         let now_ns = fold_now_ns(sealed_hour);
@@ -11497,21 +11541,29 @@ mod tests {
             CatalogError::MemoryExhausted(exhausted) => {
                 assert_eq!(exhausted.requested, oversized_len);
                 assert_eq!(
-                    exhausted.reserved, 0,
-                    "the eviction pass released everything it held, and it still did not fit"
+                    exhausted.reserved, small_len,
+                    "the first refusal, reported while the small tenant's part is still cached"
                 );
                 assert_eq!(exhausted.limit, small_len);
             }
             other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
         }
-        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        assert_eq!(
+            catalog.decoded_cache_memory_evictions(),
+            0,
+            "no eviction pass: no amount of eviction admits a part larger than the limit"
+        );
         assert_eq!(
             catalog.decode_reserve_retries(),
-            1,
-            "exactly one retry: the refusal is final, not retried per evicted entry"
+            0,
+            "and so nothing to retry: the first refusal is the answer"
         );
-        assert_eq!(catalog.part_cache().total_entries(), 0);
-        assert_eq!(budget.reserved(), 0);
+        assert_eq!(
+            catalog.part_cache().total_entries(),
+            1,
+            "the unrelated tenant's cached part survives the refusal"
+        );
+        assert_eq!(budget.reserved(), small_len);
     }
 
     /// The declared `body_uncompressed_len` of the one-segment, one-column v3
@@ -11558,6 +11610,87 @@ mod tests {
             other => panic!("expected LoadColumnStatsError::MemoryExhausted, got {other:?}"),
         }
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #2107. A column-statistics decode is charged against the same
+    /// process budget the decoded part and postings caches hold, so a refusal
+    /// must take the same evict-then-retry pass the part and postings decodes
+    /// take. Reserved against the bare budget it did not: the load failed with
+    /// `LoadColumnStatsError::MemoryExhausted` while cached decoded parts held
+    /// memory an eviction would have handed straight back.
+    ///
+    /// FLIP: make the `DecodeReserver` impl for `Catalog` (catalog.rs) call
+    /// `crate::charged::reserve_decoded(&self.memory_budget, declared,
+    /// ceiling)`, the bare-budget reservation this replaced. Nothing is then
+    /// evicted, and the `expect` below panics with "the caches must give
+    /// memory back to a column-statistics decode".
+    #[tokio::test]
+    async fn a_column_stats_load_makes_the_caches_give_memory_back() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let holder = TenantHash([0x71; 16]);
+        let part_len = fold_one_part_for(&store, holder, sealed_hour, 8).await;
+        let declared =
+            install_logs_stats(&store, *blake3::hash(b"part-cstat-evict").as_bytes(), 1).await;
+        assert!(
+            part_len >= declared,
+            "the cached part must be worth at least the stats body, so dropping it is enough: \
+             {part_len} vs {declared}"
+        );
+
+        // Room for exactly the holding tenant's decoded part: the statistics
+        // body fits only once the part cache gives that part back.
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(part_len));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        catalog
+            .resolve(
+                &holder,
+                Signal::Metrics,
+                sealed_hour_range(sealed_hour),
+                &[],
+                fold_now_ns(sealed_hour),
+            )
+            .await
+            .expect("the holding tenant resolves within the budget");
+        assert_eq!(
+            budget.reserved(),
+            part_len,
+            "the cached decoded part holds the whole budget"
+        );
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+
+        let (range, now_ns) = full_window();
+        let loaded = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("the caches must give memory back to a column-statistics decode")
+            .expect("the fixture's one part carries statistics");
+        assert_eq!(loaded_value(&loaded), 1);
+
+        assert_eq!(
+            catalog.decoded_cache_memory_evictions(),
+            1,
+            "exactly the one cached part, and nothing more than the load needed"
+        );
+        assert_eq!(catalog.part_cache().total_entries(), 0);
+        assert_eq!(
+            catalog.decode_reserve_retries(),
+            1,
+            "one refusal, one pass, one retry"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the load's own reservation is released once the merged result is built"
+        );
     }
 
     /// Installs the default logs fixture for [`tenant`], then replaces its
