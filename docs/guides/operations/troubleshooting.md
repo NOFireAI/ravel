@@ -27,6 +27,7 @@ record you removed as garbage to reclaim.
 - [Maintenance is not running, or not finishing](#maintenance-is-not-running-or-not-finishing)
 - [Data integrity and correctness alarms](#data-integrity-and-correctness-alarms)
 - [Query cost and results](#query-cost-and-results)
+- [Attributing server memory with a heap profile](#attributing-server-memory-with-a-heap-profile)
 
 ## The mass-orphan circuit breaker tripped
 
@@ -363,8 +364,14 @@ memory three ways:
    `target/release/ravel-server`:
 
    ```sh
-   cargo build --release -p ravel-server --features "sql heap-profiling"
+   cargo build --release --locked -p ravel-server --features "sql,flight-sql,otap,heap-profiling"
    ```
+
+   That is the published image's feature set (the Dockerfile builds `sql`,
+   `flight-sql` and `otap` with `--locked`) plus `heap-profiling`. To profile
+   a different deployment, add `heap-profiling` to the feature list that
+   deployment was built with, or allocation sites under a surface the profile
+   lacks cannot appear in the dump.
 
 2. Start that binary with profiling turned on, fresh for each reproduction.
    The vendored jemalloc is built with an `_rjem_` symbol prefix, so it
