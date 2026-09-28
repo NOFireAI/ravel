@@ -13,11 +13,22 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     async fn put(&self, key: &str, data: Bytes, opts: PutOptions) -> Result<PutOutcome, StoreError>;
     /// Read whole object or a byte range. Suffix(n) = last n bytes, n > 0.
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError>;
-    /// As get, but only if the object still has the pinned identity. The
-    /// default implementation refuses with `Unsupported`, never falling back
-    /// to an unconditional get. See "Conditional reads" below.
+    /// As get, but reading the version the pin selects and only if that
+    /// object still has the pinned ETag. The default implementation refuses
+    /// with `Unsupported`, never falling back to an unconditional get.
+    /// `PinnedRead` is the outcome plus the pin for the bytes served. See
+    /// "Conditional reads" below.
     async fn get_pinned(&self, key: &str, range: GetRange, pin: &Pin)
-        -> Result<GetOutcome, StoreError>;
+        -> Result<PinnedRead, StoreError>;
+    /// An unconditional get that also reports the pin for the bytes it read,
+    /// for a first read taken before any pin exists. The default
+    /// implementation reads through `get` and reports an ETag-only pin.
+    async fn get_with_pin(&self, key: &str, range: GetRange)
+        -> Result<PinnedRead, StoreError>;
+    /// A HEAD returning the object's metadata and its pin. The default
+    /// implementation reports an ETag-only pin; a versioned backend
+    /// overrides it to fill in the version.
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError>;
     /// Begin a multipart upload. Only backends reporting `multipart` provide
     /// it; the default implementation refuses. See "Multipart upload" below.
     async fn put_multipart<'a>(&'a self, key: &str)
@@ -242,13 +253,24 @@ already pinned by construction. A Parquet file Ravel did not write is not:
 the operator granted a bucket and a key, and whoever owns that bucket may
 overwrite the key at any time. `get_pinned(key, range, pin)` is the read for
 that case. `Pin` carries the identity the catalog recorded when the object
-was granted: an `etag`, plus the backend's own `version`/generation when the
-store issues one distinct from the ETag. Both halves are asserted when
-`version` is `Some`; the ETag alone when it is `None`, since not every store
-versions objects.
+was granted, and its two halves do different jobs:
 
-The precondition travels on the wire, not in the client: the S3 adapter
-sends `If-Match` and, for a pin carrying one, a `versionId`, so a replaced
+- `etag` is a **precondition**. The store compares it against the object it
+  is about to read and refuses the read when it does not match. On the wire
+  it is `If-Match`.
+- `version` is a **selector**. It names which version of the object to read,
+  and the store reads that one. On the wire it is S3's `versionId`, GCS's
+  `generation`, or Azure's `versionid`. It is `Some` only when the store
+  issues a version id distinct from the ETag; a store without versioning
+  reports none and the pin is then an ETag alone.
+
+A pin carrying both selects the named version and applies `If-Match` to it.
+Selecting is not a second precondition, and the difference shows in the
+outcome: an ETag that does not match is a failed condition on an object that
+is there, while a version the store does not have is an object that is not
+there.
+
+The precondition travels on the wire, not in the client, so a replaced
 object costs one refused request rather than a transferred body that the
 caller then has to reject.
 
@@ -257,8 +279,33 @@ Outcomes, in the order they are decided:
 | Object state | Result |
 |---|---|
 | No object at `key` | `NotFound`, never `PreconditionFailed` |
-| Present, identity differs from `pin` | `PreconditionFailed` |
-| Present, identity matches | the `GetOutcome` `get` would return, whose `etag` is the pinned one |
+| `pin.version` is `Some` and that version is unknown or deleted | `NotFound` |
+| The selected object's ETag differs from `pin.etag` | `PreconditionFailed` |
+| The selected object matches | `PinnedRead`: the `GetOutcome` `get` would return, whose `etag` is the pinned one, plus the `Pin` identifying the bytes served |
+
+Per backend, the same three rules:
+
+| Backend | Version selector | Unknown or deleted version | ETag mismatch |
+|---|---|---|---|
+| `S3Store` | `versionId` query parameter | `NotFound` | `PreconditionFailed` |
+| `ExternalStore` GCS | `generation` | `NotFound` | `PreconditionFailed` |
+| `ExternalStore` Azure | `versionid` | `NotFound` | `PreconditionFailed` |
+| `MemoryStore` | keeps only the current object, so any pinned version that is not the current one is gone | `NotFound` | `PreconditionFailed` |
+
+The three real backends report an absent version as a 404 and a failed
+`If-Match` as a 412 (ADR-2040's pinning amendment states this; nothing in
+this crate can verify it against a live endpoint). Both reach the rows above
+through `map_get_error`, which defers to `map_error_common` for everything
+but a 416: that maps `object_store`'s `NotFound` to `StoreError::NotFound`
+and its `Precondition` to `StoreError::PreconditionFailed`.
+
+`MemoryStore` is the oracle for this, and it models the rule rather than the
+storage: it does not retain superseded versions, so a pin naming one is
+answered `NotFound`, which is what a real backend answers once that version
+is deleted or expired. The conformance case
+`an_old_version_is_not_found_while_an_old_etag_is_a_precondition_failure`
+overwrites one object and spends two stale pins on it, the version pin and
+the ETag-only pin, and asserts the two different answers.
 
 The first row is a distinct answer, not a detail: a caller acts differently
 on a grant target that vanished and one that changed. `PreconditionFailed`
@@ -269,13 +316,58 @@ A backend that cannot evaluate preconditions MUST refuse with `Unsupported`,
 which is what the default trait implementation does. It does not fall back
 to an unconditional `get`: silently dropping the precondition serves bytes
 from a replaced file, which is the exact failure the method exists to
-prevent. `MemoryStore` and `S3Store` implement it, and every decorator
-forwards it with the pin intact: `InstrumentedStore` and the per-class
-scheduled handle bill it as one `StoreOp::Get`, with its bytes and its
-refused preconditions, because it is one GET on the wire and a caller's GET
-count must not depend on which read path it took; `KmsRoutingStore`
-delegates it to the default store like every other read; `FaultStore` runs
-it against the same `Op::Get` rules and counters as `get`.
+prevent. `MemoryStore`, `S3Store` and `ExternalStore` implement it.
+
+#### Learning the version of the bytes you read
+
+`get_pinned` returns `PinnedRead`, which is the read outcome plus the `Pin`
+identifying the bytes served, so a caller that has just read a Parquet
+footer can record the identity of what it read without a second request.
+`get_with_pin(key, range)` is the same thing for an unconditional first
+read, which is what `CREATE EXTERNAL TABLE` does before any pin exists.
+`pin_of(key)` is a HEAD that returns the object's metadata and its pin.
+
+`ObjectMeta.version` is NOT that pin's version. It is the compare-and-swap
+token a conditional write compares, which on S3 is the ETag. The two are
+different values with different jobs, which is why the version is reported
+through `Pin` and no field was added to `ObjectMeta`.
+
+Every pin is built from store metadata through one constructor,
+`Pin::from_store(etag, version)`, which drops a version equal to the ETag:
+that is an unversioned store reporting its ETag twice, not a selector.
+`S3Store::pin_of` fills the version from `object_store`'s `ObjectMeta`
+(`None` on an unversioned bucket), the external GCS and Azure path does the
+same, and the default implementations of `pin_of` and `get_with_pin` report
+an ETag-only pin, so a backend on an unversioned store needs no override.
+
+#### Which implementations forward these
+
+`get_pinned`, `get_with_pin` and `pin_of` are forwarded, with the pin
+intact, by every implementation in `ravel-object-store`:
+
+| Implementation | How it forwards |
+|---|---|
+| `impl ObjectStoreBackend for Arc<T>` | straight delegation |
+| `InstrumentedStore` | delegates, billing `get_pinned` and `get_with_pin` as one `StoreOp::Get` with their bytes and refused preconditions, and `pin_of` as one `StoreOp::Head` |
+| `ClassedStore`'s per-class handle | delegates, taking a scheduler permit of the same class and billing the same ops |
+| `FaultStore` | delegates, resolving `get_pinned` and `get_with_pin` against the same `Op::Get` rules and counters as `get`, and `pin_of` against `Op::Head` |
+| `KmsRoutingStore` | delegates all three to the default store, like every other read: reads never select a KMS key |
+| `ExternalStore` | delegates to `S3Store` on the S3 arm and to the `object_store` generic path on the GCS and Azure arms |
+
+`InstrumentedStore` and the scheduled handle bill a pinned read as a GET
+because it is one GET on the wire, and a caller's GET count must not depend
+on which read path it took.
+
+Wrappers OUTSIDE this crate do not forward them: `ravel-server`'s
+`SharedKmsStore`, `ravel-sim`'s store, and the `ravel-bench` wrappers
+implement the trait without overriding any of the three, so each falls
+through to the default implementation. `get_pinned` there is `Unsupported`,
+and `pin_of` and `get_with_pin` report an ETag-only pin from the wrapper's
+own `head`/`get`. That is a deliberate consequence of failing closed rather
+than an oversight: a pinned read through a wrapper that has not been
+qualified refuses instead of silently dropping the pin. An external table
+read must not be routed through one.
+
 `ScriptedFault::FailedPrecondition` is the one fault kind that applies to
 `get_pinned` and not to `get`, and it is scriptable only, never generated in
 random mode.
@@ -1237,7 +1329,12 @@ are deployment facts, and printing them beside "redacted" hands a reader with
 log access the place to look. The `ProfileError::SecretUnavailable` message
 names only the kind of source for the same reason. Every `SecretSource`
 resolves once, at `open`, so an unreadable one fails there rather than on the
-first read.
+first read. A builder or credential failure inside `ExternalStore::open`
+becomes one fixed message per store kind,
+`ProfileError::CredentialsRejected` ("gcs credentials could not be loaded for
+profile <name>"), and the underlying `object_store` error is dropped rather
+than carried as a source: it quotes what the builder was handed, and for GCS
+that is the service-account file path.
 
 **Read-only is enforced locally, in the type.** `put`, `put_multipart` and
 `delete` refuse with `StoreError::ReadOnly` without touching the network, so
@@ -1254,30 +1351,62 @@ Two probes qualify a grant before anything reads through it, both in
 than on the request path:
 
 - `probe_preconditions(store, key)` qualifies the store for `get_pinned`. It
-  HEADs `key`, then issues two 1-byte ranged reads, one pinned to the
-  identity the HEAD reported and one pinned to a wrong ETag. It qualifies
-  only if the first is served and the second is refused with
-  `PreconditionFailed`. The failure it returns says which half failed: a
-  store that serves the wrong pin ignores preconditions
-  (`WrongPinAccepted`), a store that refuses the matching pin implements
-  them incorrectly (`MatchingPinRefused`), a store that refuses the wrong
-  pin with some other error cannot be read through either
+  takes the object's pin with `pin_of(key)` (the same HEAD-based constructor
+  a caller would record, so the probe asserts the identity a caller would
+  use), then issues two 1-byte ranged reads, one pinned to that identity and
+  one pinned to a wrong ETag. It qualifies only if the first is served and
+  the second is refused with `PreconditionFailed`. The failure it returns
+  says which half failed: a store that serves the wrong pin ignores
+  preconditions (`WrongPinAccepted`), a store that refuses the matching pin
+  implements them incorrectly (`MatchingPinRefused`), a store that refuses
+  the wrong pin with some other error cannot be read through either
   (`WrongPinWrongError`), and a HEAD that failed means the question was
   never asked (`Head`). Only the object's own identity is pinned, and only
-  1 byte is read, because what is being measured is the header. The probe
-  writes nothing to the store it is qualifying.
+  1 byte is read, because what is being measured is the header. The wrong
+  ETag is 16 random bytes rendered as quoted hex, drawn afresh on every
+  call, rather than a fixed literal: a store could refuse one known-bad
+  string and serve every other pinned read unconditionally, and the probe
+  would record that as precondition support. It is quoted because S3 ETags
+  are quoted strings, so an unquoted value could be rejected as malformed
+  instead of evaluated as a precondition, which would pass the probe for the
+  wrong reason. The probe writes nothing to the store it is qualifying.
 - `probe_not_ravel_bucket(ravel_store, candidate_store)` refuses a candidate
-  that is Ravel's own bucket reached under another name, which would let an
-  external table read Ravel's objects across tenants. It writes a random key
-  under `sys/pq-probe/` with random contents to Ravel's own bucket and reads
-  that key from the candidate: `NotFound` is the pass, the probe bytes are
-  `SameBucket`, and anything else (an access denial, a timeout, different
-  bytes) is `Inconclusive`, which is a refusal. Passing an inconclusive
-  candidate would qualify a grant on the strength of an error message. The
-  key is random so no candidate holds it by coincidence and the contents are
-  random so a store answering every key with one placeholder cannot be
-  mistaken for Ravel's own. The probe object is deleted before returning on
-  every path; a failed delete is logged and does not change the verdict.
+  that is a Ravel bucket, which would let an external table read Ravel's
+  objects across tenants. It reads two keys from the candidate and both must
+  come back a clean `NotFound`.
+  - The identity read catches Ravel's own live bucket reached under another
+    name. The probe writes a random key under `sys/pq-probe/` with random
+    contents to Ravel's own bucket and reads that key from the candidate:
+    the probe bytes are `SameBucket`. The key is random so no candidate
+    holds it by coincidence and the contents are random so a store
+    answering every key with one placeholder cannot be mistaken for
+    Ravel's own.
+  - The tenancy-marker read catches what the identity read cannot: a copy,
+    a restore, or a replication target of a Ravel bucket is a different
+    bucket that still holds Ravel's objects, and the probe object written
+    after the copy was taken is not in it. The probe reads `sys/tenancy`
+    (the marker key of ADR-0050) from the candidate, and a candidate that
+    serves it at all is refused with `TenancyMarkerPresent`, whatever the
+    bytes are: the marker is not parsed, because holding the key is
+    already the answer.
+
+  Anything other than a clean `NotFound` or, for the identity read, the
+  exact probe payload (an access denial, a timeout, different bytes) is
+  `Inconclusive`, which is a refusal. Passing an inconclusive candidate
+  would qualify a grant on the strength of an error message. One
+  consequence is worth stating plainly: credentials scoped so tightly that
+  they cannot read `sys/` answer the marker read with an access denial
+  rather than a `NotFound`, so a grant offered under least-privilege
+  credentials of that shape is refused. That is the intended trade, because
+  the probe cannot tell "you may not ask" from "there is nothing there".
+  The probe issues a delete for its own object before returning, on every
+  path it returns through; a failed delete is logged and does not change the
+  verdict. Two paths never reach that delete and can leave an object behind:
+  a probe put that timed out after the object had landed, and a cancelled
+  probe (the future dropped before the delete is issued). Nothing in Ravel
+  reaps `sys/pq-probe/`, so what bounds the leak is whatever lifecycle rule
+  the operator sets on that prefix in the bucket itself. Each leaked object
+  is 32 bytes.
 
 Nothing in a shipping binary constructs an `ExternalStore` or calls either
 probe yet. The callers are the ravel-parquet reader (#2052) and the grant

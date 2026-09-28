@@ -273,7 +273,10 @@ pub async fn probe_not_ravel_bucket(
 async fn tenancy_marker_verdict(
     candidate_store: &dyn ObjectStoreBackend,
 ) -> Result<(), RavelBucketProbeFailure> {
-    match candidate_store.get(TENANCY_MARKER_KEY, GetRange::Full).await {
+    match candidate_store
+        .get(TENANCY_MARKER_KEY, GetRange::Full)
+        .await
+    {
         // Any bytes at all. The marker's contents are not parsed here: a
         // candidate carrying the key is a Ravel bucket whatever it holds.
         Ok(_) => Err(RavelBucketProbeFailure::TenancyMarkerPresent {
