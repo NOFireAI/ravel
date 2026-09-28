@@ -175,7 +175,9 @@ rule on thread placement.
    uncompressed length is known from the descriptor before decode, so the
    caller reserves it and moves the `Reservation` into the gate closure.
    That is task 5 in the list below. (What is reserved, and when it
-   shrinks, is refined by the decoded-output charge amendment below.)
+   shrinks, is refined by the decoded-output charge amendment below; what a
+   declared length over the decoder's own ceiling costs, and what a refused
+   reservation does, by the decode-refusal amendment.)
 
 7. **The logs and spans scans get a decode state.** Their decode runs
    inside `poll_next`, so a wrap in place is not possible. Each scan's state
@@ -510,9 +512,10 @@ descriptor's uncompressed length". None changes where decode runs.
   about a tenth of what its decode allocates on a sparse catalog. The charge
   sums each chunk frame's uncompressed length from the already-fetched and
   crc-verified `SERIES_IDX` directory, clamped per frame to the reader
-  ceiling, and falls back to the footer figure when that directory is absent,
-  not among the fetched regions, compressed, fails its crc or does not
-  parse.
+  ceiling (retired by the decode-refusal amendment, which charges 0 for a
+  frame over that ceiling), and falls back to the footer figure when that
+  directory is absent, not among the fetched regions, compressed, fails its
+  crc or does not parse.
 - **The PromQL reservation shrinks after the matcher filter.** Once the filter
   has kept the entries a query needs, the reservation is replaced by one sized
   to those entries, reserving the smaller amount before releasing the larger
@@ -525,6 +528,39 @@ descriptor's uncompressed length". None changes where decode runs.
   before the body is reserved, so memory
   pressure never turns a tenant breach or a stale binding into a retryable
   refusal.
+
+## Amendment (2026-09-28): the decode-refusal amendment
+
+<!-- amendment-applies: sections="Decision" pointer="decode-refusal amendment" -->
+<!-- amendment-supersedes: phrase="clamped per frame to the reader ceiling" pointer="decode-refusal amendment" -->
+
+A review of task 5 (issue #2081) found the same fact read two ways at two
+reservation sites. Both readings are settled here.
+
+- **A declared length over the decoder's own ceiling is charged 0, not the
+  ceiling.** A decoder refuses an oversized unit before it allocates anything,
+  so the ceiling is a charge for memory nobody asks for. Charging it turns
+  that refusal into a budget refusal on every budget with less than the
+  ceiling free, which reports memory pressure where an oversized object was
+  and takes the caller down a different path than the decoder's own refusal
+  would: a snapshot part that should fall back to listing fails the query
+  instead. Charging 0 leaves the outcome to the decoder. This covers the
+  snapshot part, postings and column statistics reservations, the per-frame
+  `SERIES_META_CHUNKS` charge, and the per-section catalog charge.
+- **A refused reservation fails the operation, on the resolve path and on the
+  fold path alike.** Both paths could instead degrade: the resolve by
+  disabling pruning, the fold by rebuilding its postings from scratch. Both
+  fallbacks cost MORE memory than the decode that was just refused -- an
+  unpruned scan holds more than the postings that would have pruned it, and a
+  rebuild fetches and decodes every segment's names instead of one postings
+  object. Answering memory pressure by taking the more expensive path is the
+  wrong direction, and a failed fold is retried by the next one. The
+  exception is a previous postings object larger than the budget's whole
+  limit: `Catalog::reserve_decoded` skips the eviction pass for it, so it is
+  refused on every tick and that tenant's fold stays failed where the old code
+  rebuilt, and an operator sees the fold's typed budget error logged every
+  tick. The shipped server cannot reach it today, since ravel-server never
+  calls `Catalog::with_memory_budget`.
 
 ## Amendment (2026-09-28): where the heartbeat age comes from
 

@@ -2118,7 +2118,7 @@ impl Catalog {
                                 &mut counters,
                                 &accounting,
                             )
-                            .await
+                            .await?
                         {
                             Some(names) => (names, previous_entries_len),
                             None => (Vec::new(), 0),
@@ -2374,18 +2374,26 @@ impl Catalog {
 
     /// Load and verify the previous fold's postings object before trusting
     /// it as a merge baseline: same
-    /// hash/part-binding/decode checks `snapshot_resolve`'s
+    /// hash/tenant/part-binding/decode checks `snapshot_resolve`'s
     /// `load_snapshot_postings` applies at query time, plus an
     /// `entry_count` check against `previous_entry_count` -- the ordinal
     /// boundary this fold's merge carries forward, not the post-fold total.
-    /// Any failure (no postings ref, cache miss, a `NotFound` GET, hash
-    /// mismatch, decode error, entry_count mismatch) returns `None`, so the
+    /// Most failures (no postings ref, cache miss, a `NotFound` GET, hash
+    /// mismatch, decode error, entry_count mismatch) return `Ok(None)`, so the
     /// caller decodes every current entry from scratch instead of merging.
     /// A GET failure other than `NotFound` (issue #1964, most commonly
-    /// AccessDenied on a missing idx/* read grant) also returns `None` --
+    /// AccessDenied on a missing idx/* read grant) also returns `Ok(None)` --
     /// merging is an optimization, never a correctness gate -- but is logged
     /// at `error!`, not `warn!`, since it recurs on every fold and silently
     /// turns postings reuse into a permanent full rebuild.
+    ///
+    /// Two failures are errors instead, both for the same reason the resolve
+    /// path treats them as errors (ADR-0050 §2, ADR-1702 decision 6 and the
+    /// decode-refusal amendment): a postings object whose header names another
+    /// tenant is an isolation breach, which a silent rebuild would leave
+    /// unreported; and a refused decode reservation is memory pressure, which
+    /// the rebuild would answer by fetching and decoding every segment's names
+    /// instead of one postings object, holding more memory rather than less.
     async fn load_previous_postings(
         &self,
         tenant: &TenantHash,
@@ -2393,27 +2401,32 @@ impl Catalog {
         previous_entry_count: u64,
         counters: &mut RequestCounters,
         accounting: &QueryAccounting,
-    ) -> Option<Vec<NamePostings>> {
-        let postings_ref = head.postings.as_ref()?;
-        let expected_part_blake3: Vec<[u8; 32]> = head
+    ) -> Result<Option<Vec<NamePostings>>, CatalogError> {
+        let Some(postings_ref) = head.postings.as_ref() else {
+            return Ok(None);
+        };
+        let expected_part_blake3: Vec<[u8; 32]> = match head
             .parts
             .iter()
             .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
             .collect::<Result<_, _>>()
-            .ok()?;
+        {
+            Ok(hashes) => hashes,
+            Err(_) => return Ok(None),
+        };
 
         if let Some(cached) = self
             .postings_cache()
             .get(tenant, &postings_ref.key, accounting)
         {
             if cached.header.entry_count == previous_entry_count {
-                return Some(cached.names.clone());
+                return Ok(Some(cached.names.clone()));
             }
             tracing::warn!(
                 key = %postings_ref.key,
                 "cached previous postings entry_count mismatch, rebuilding postings from scratch"
             );
-            return None;
+            return Ok(None);
         }
 
         let got = match self.store().get(&postings_ref.key, GetRange::Full).await {
@@ -2431,7 +2444,7 @@ impl Catalog {
                     tenant = %tenant.to_hex(),
                     "previous postings not found, rebuilding postings from scratch"
                 );
-                return None;
+                return Ok(None);
             }
             Err(err) => {
                 tracing::error!(
@@ -2440,7 +2453,7 @@ impl Catalog {
                     tenant = %tenant.to_hex(),
                     "previous postings GET failed, rebuilding postings from scratch"
                 );
-                return None;
+                return Ok(None);
             }
         };
         counters.get_requests += 1;
@@ -2450,7 +2463,7 @@ impl Catalog {
                 key = %postings_ref.key,
                 "previous postings hash mismatch, rebuilding postings from scratch"
             );
-            return None;
+            return Ok(None);
         }
         let limits = snapshot_format::PostingsLimits {
             max_postings_bytes: self.config().max_postings_bytes,
@@ -2458,28 +2471,51 @@ impl Catalog {
         // The decoded postings go into the same postings cache the resolve
         // path reads, so they carry a decode reservation the same way
         // (ADR-1702 decision 6).
-        let declared = match snapshot_format::decode_postings_header(&got.data) {
-            Ok(header) => header.body_uncompressed_len,
+        let header = match snapshot_format::decode_postings_header(&got.data) {
+            Ok(header) => header,
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     key = %postings_ref.key,
                     "previous postings header unreadable, rebuilding postings from scratch"
                 );
-                return None;
+                return Ok(None);
             }
         };
-        let reservation = match self.reserve_decoded(declared, limits.max_postings_bytes) {
-            Ok(reservation) => reservation,
-            Err(err) => {
+        // ADR-0050 §2, read off the already hash-verified bytes and before the
+        // reservation below, exactly as `load_snapshot_postings` does it on the
+        // resolve path. `decode_postings` only binds the object to this HEAD's
+        // part hashes, and that mismatch degrades to a rebuild, so a foreign
+        // tenant_hash checked any later would be masked by the degrade; and a
+        // budget with no room would otherwise refuse first, reporting memory
+        // pressure where a cross-tenant object was.
+        match <[u8; 16]>::try_from(header.tenant_hash.as_slice()) {
+            Ok(declared) if declared != tenant.0 => {
+                self.record_isolation_breach();
+                return Err(CatalogError::FieldMismatch {
+                    key: postings_ref.key.clone(),
+                    field: "tenant_hash",
+                    expected: tenant.to_hex(),
+                    actual: hex::encode(declared),
+                });
+            }
+            Ok(_) => {}
+            Err(_) => {
                 tracing::warn!(
-                    error = %err,
                     key = %postings_ref.key,
-                    "memory budget refused the previous postings decode, rebuilding postings from scratch"
+                    "previous postings header tenant_hash malformed, rebuilding postings from scratch"
                 );
-                return None;
+                return Ok(None);
             }
-        };
+        }
+        // A refusal fails the fold rather than rebuilding: the rebuild fetches
+        // and decodes every segment's names, holding more memory than the one
+        // postings decode just refused. The resolve path answers the same
+        // refusal the same way (ADR-1702, the decode-refusal amendment). An
+        // object larger than the budget's whole limit skips the eviction pass
+        // and is refused on every fold, so that tenant's fold stays failed.
+        let reservation =
+            self.reserve_decoded(header.body_uncompressed_len, limits.max_postings_bytes)?;
         let decoded =
             match snapshot_format::decode_postings(&got.data, &limits, &expected_part_blake3) {
                 Ok(decoded) => crate::charged::Charged::new(decoded, reservation),
@@ -2489,7 +2525,7 @@ impl Catalog {
                         key = %postings_ref.key,
                         "previous postings failed to decode, rebuilding postings from scratch"
                     );
-                    return None;
+                    return Ok(None);
                 }
             };
         if decoded.header.entry_count != previous_entry_count {
@@ -2499,7 +2535,7 @@ impl Catalog {
                 actual = decoded.header.entry_count,
                 "previous postings entry_count mismatch, rebuilding postings from scratch"
             );
-            return None;
+            return Ok(None);
         }
 
         let decoded = Arc::new(decoded);
@@ -2510,7 +2546,7 @@ impl Catalog {
             got.data.len() as u64,
             self.config().postings_cache_entries,
         );
-        Some(decoded.names.clone())
+        Ok(Some(decoded.names.clone()))
     }
 
     /// Build the name-postings index for `entries`, merging forward from `baseline` rather than re-decoding every
@@ -4161,6 +4197,257 @@ mod tests {
             capture.count_at(tracing::Level::ERROR, "previous postings GET failed"),
             0,
             "a genuine absence must never log at error!"
+        );
+    }
+
+    /// One fold over hour 10, then the HEAD and the `.npost` object it wrote,
+    /// for the reuse-path tests below. Returns the catalog, the HEAD, and the
+    /// postings object's bytes.
+    async fn folded_postings_baseline(store: &Arc<MemoryStore>) -> (Catalog, SnapshotHead, Bytes) {
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_real_segment(
+            store,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - NS_PER_HOUR,
+            &["cpu", "mem"],
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(
+            first.postings_built,
+            "the second fold's reuse baseline is what these tests exercise"
+        );
+
+        let head_bytes = store
+            .get(&head_object_key(&tenant(), Signal::Metrics), GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+        let head = snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
+        let postings_key = head
+            .postings
+            .as_ref()
+            .expect("the first fold wrote a postings ref")
+            .key
+            .clone();
+        let postings = store
+            .get(&postings_key, GetRange::Full)
+            .await
+            .expect("postings present")
+            .data;
+        (catalog, head, postings)
+    }
+
+    /// Rewrite the postings object `head` already points at, re-stamping the
+    /// ref's blake3 and size, and PUT both. The blake3 gate runs before every
+    /// header check, so this is what lets a reader reach the header checks at
+    /// all.
+    async fn repoint_head_at_postings(
+        store: &Arc<MemoryStore>,
+        head: &mut SnapshotHead,
+        postings: Vec<u8>,
+    ) {
+        let key = head
+            .postings
+            .as_ref()
+            .expect("a postings ref to re-point")
+            .key
+            .clone();
+        let postings_ref = head.postings.as_mut().expect("a postings ref to re-point");
+        postings_ref.blake3 = blake3::hash(&postings).as_bytes().to_vec();
+        postings_ref.size = postings.len() as u64;
+        store
+            .put(&key, Bytes::from(postings), PutOptions::default())
+            .await
+            .expect("put the rewritten postings");
+        let head_bytes = snapshot_format::encode_head(head).expect("encode head");
+        store
+            .put(
+                &head_object_key(&tenant(), Signal::Metrics),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put the re-pointed HEAD");
+    }
+
+    /// Issue #2081 item 1, ADR-0050 §2: the fold's previous-postings reuse path
+    /// checks the object's declared `tenant_hash` before it reuses it, exactly
+    /// as `snapshot_resolve::load_snapshot_postings` does at query time, and a
+    /// foreign one is an isolation breach that fails the fold rather than a
+    /// quiet rebuild. The re-encoded object still binds to this HEAD's part
+    /// hashes, so nothing but the tenant check can reject it.
+    ///
+    /// FLIP: drop the `tenant_hash` match in `load_previous_postings` and the
+    /// second fold succeeds, so `expect_err` panics with "a previous postings
+    /// object naming another tenant must fail the fold: FoldReport { ... }"
+    /// and `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_on_the_previous_postings_fails_the_fold() {
+        assert_foreign_previous_postings_fail_the_fold(None, true).await;
+    }
+
+    /// The tenant check runs before the decode reservation: under a budget
+    /// with no room at all the fold still reports the breach, not memory
+    /// pressure.
+    ///
+    /// FLIP: move the `tenant_hash` match below the `reserve_decoded` call in
+    /// `load_previous_postings` and the fold fails with `MemoryExhausted`
+    /// instead.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_is_reported_before_the_postings_reservation() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        assert_foreign_previous_postings_fail_the_fold(Some(budget), true).await;
+    }
+
+    /// The tenant check runs before the part-binding check: a foreign object
+    /// that is also bound to other part hashes still fails the fold instead of
+    /// degrading to a rebuild.
+    ///
+    /// FLIP: move the `tenant_hash` match below the `decode_postings` call in
+    /// `load_previous_postings` and the fold rebuilds and succeeds, so
+    /// `expect_err` panics.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_is_reported_before_the_part_binding_degrade() {
+        assert_foreign_previous_postings_fail_the_fold(None, false).await;
+    }
+
+    /// Re-point the fixture HEAD at a copy of its postings naming another
+    /// tenant, bound to the HEAD's own part hashes or to hashes it does not
+    /// carry, then fold again under `budget` (unlimited when `None`) and assert
+    /// the fold fails with the `tenant_hash` mismatch and one counted breach.
+    async fn assert_foreign_previous_postings_fail_the_fold(
+        budget: Option<Arc<ravel_memory::MemoryBudget>>,
+        bind_to_head_parts: bool,
+    ) {
+        let store = Arc::new(MemoryStore::new());
+        let (catalog, mut head, postings) = folded_postings_baseline(&store).await;
+        let catalog = match budget {
+            Some(budget) => catalog.with_memory_budget(budget),
+            None => catalog,
+        };
+        let part_blake3: Vec<[u8; 32]> = head
+            .parts
+            .iter()
+            .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()).expect("32-byte part hash"))
+            .collect();
+        let decoded = snapshot_format::decode_postings(
+            &postings,
+            &snapshot_format::PostingsLimits::default(),
+            &part_blake3,
+        )
+        .expect("the fixture postings decode");
+        let bound_parts = if bind_to_head_parts {
+            part_blake3.clone()
+        } else {
+            vec![[0xee; 32]; part_blake3.len()]
+        };
+        assert_eq!(
+            bound_parts == part_blake3,
+            bind_to_head_parts,
+            "the fixture binds the foreign object as the case asks"
+        );
+        let foreign = snapshot_format::encode_postings(
+            [0xff; 16],
+            decoded.header.signal,
+            &bound_parts,
+            decoded.header.entry_count,
+            &decoded.names,
+        )
+        .expect("re-encode the fixture postings for a foreign tenant");
+        let postings_key = head.postings.as_ref().expect("a postings ref").key.clone();
+        repoint_head_at_postings(&store, &mut head, foreign).await;
+
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect_err("a previous postings object naming another tenant must fail the fold");
+        match err {
+            CatalogError::FieldMismatch { field, key, .. } => {
+                assert_eq!(field, "tenant_hash");
+                assert_eq!(key, postings_key);
+            }
+            other => panic!("expected a tenant_hash FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            catalog.isolation_breaches(),
+            1,
+            "the breach is counted, not swallowed by a rebuild"
+        );
+    }
+
+    /// Issue #2081 item 4: a refused decode reservation on the previous
+    /// postings object fails the fold, the same answer
+    /// `snapshot_resolve::load_snapshot_postings` gives the same refusal
+    /// (pinned by `catalog::tests::postings_decode_reserves_its_output`).
+    /// Rebuilding instead answers memory pressure by fetching and decoding
+    /// every segment's names, which holds more memory than the one postings
+    /// decode that was just refused.
+    ///
+    /// FLIP: restore the `Err(err) => { warn!(...); return Ok(None) }` arm
+    /// around `reserve_decoded` in `load_previous_postings` and the second fold
+    /// succeeds, so `expect_err` panics.
+    #[tokio::test]
+    async fn a_refused_postings_reservation_fails_the_fold() {
+        let store = Arc::new(MemoryStore::new());
+        let (catalog, head, postings) = folded_postings_baseline(&store).await;
+        let declared = snapshot_format::decode_postings_header(&postings)
+            .expect("postings header decodes")
+            .body_uncompressed_len;
+        assert!(declared > 0, "the fixture postings have a body to charge");
+        assert!(
+            declared <= config(1).max_postings_bytes,
+            "the decoder would admit this body, so only the budget can refuse it"
+        );
+        drop(head);
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let catalog = catalog.with_memory_budget(budget.clone());
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect_err("a refused postings reservation must fail the fold");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, declared);
+                assert_eq!(exhausted.reserved, 0);
+                assert_eq!(exhausted.limit, declared - 1);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a refused reservation charges nothing"
         );
     }
 

@@ -465,8 +465,8 @@ async fn fetch_reservation_steps(
     metric: &str,
     query_time_s: i64,
     now: i64,
-) -> Vec<u64> {
-    let mut steps = Vec::new();
+) -> Vec<ReservationStep> {
+    let mut steps: Vec<ReservationStep> = Vec::new();
     let mut limit = 1;
     for _ in 0..16 {
         let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
@@ -498,12 +498,24 @@ async fn fetch_reservation_steps(
             })) => {
                 assert_eq!(refused_at, limit);
                 limit = reserved + requested;
-                steps.push(limit);
+                steps.push(ReservationStep {
+                    held: reserved,
+                    total: limit,
+                });
             }
             Err(other) => panic!("expected FetchMemoryExhausted from the oracle, got {other:?}"),
         }
     }
     panic!("the oracle did not converge in 16 budget steps: {steps:?}");
+}
+
+/// One refusal from the [`fetch_reservation_steps`] oracle: what the query
+/// already held when the fetcher made that reservation, and the running total
+/// once the reservation is admitted (`held` plus what it asked for).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReservationStep {
+    held: u64,
+    total: u64,
 }
 
 /// Splits [`fetch_reservation_steps`] for the one-segment instant query these
@@ -513,13 +525,32 @@ async fn fetch_reservation_steps(
 /// read. The decode reserves between GETs, so no held GET sees its own running
 /// total, and it charges decoded output rather than cache-bound bytes, so it is
 /// never marked handed off.
-fn split_decode_step(steps: &[u64]) -> (Vec<u64>, u64) {
+///
+/// The decode figure is the decode step's own total less the range read, which
+/// is the pre-shrink charge. That is only the figure a held GET observes while
+/// `shrink_to_retained` leaves the reservation alone, and nothing here can
+/// check it: under the full budget the oracle run builds, the shrink's reserve
+/// is refused whatever its order. The callers' `seen == observable` assertion
+/// under an unlimited budget is what fails if the fixture ever shrinks.
+fn split_decode_step(steps: &[ReservationStep]) -> (Vec<u64>, u64) {
     assert_eq!(
         steps.len(),
         3,
         "range read, catalog decode, page read: {steps:?}"
     );
-    (vec![steps[0], steps[2]], steps[1] - steps[0])
+    let range_read = steps[0].total;
+    assert_eq!(
+        steps[1].held, range_read,
+        "the catalog decode reserves on top of the range read alone: {steps:?}"
+    );
+    assert!(
+        steps[2].held >= range_read,
+        "the range read is still held when the page read reserves: {steps:?}"
+    );
+    (
+        vec![range_read, steps[2].total],
+        steps[1].total - range_read,
+    )
 }
 
 fn sql_body(query: &str) -> String {
@@ -830,11 +861,14 @@ async fn a_promql_fetch_over_the_process_budget_is_refused_and_the_process_keeps
     let steps =
         fetch_reservation_steps(&store, &tenant, "big_gauge_budget", query_time_s, now).await;
     assert!(
-        steps.contains(&(reserved + requested)),
+        steps.iter().any(|step| step.total == reserved + requested),
         "the refusal ({reserved} held + {requested} requested) must be one of the \
          fetcher's reservation steps {steps:?}"
     );
-    let peak = *steps.last().expect("oracle returns at least one step");
+    let peak = steps
+        .last()
+        .expect("oracle returns at least one step")
+        .total;
     for (limit, admitted) in [(peak, true), (peak - 1, false)] {
         let exact = Arc::new(ravel_memory::MemoryBudget::new(limit));
         let (exact_state, _exact_promql, _exact_metrics) =
@@ -947,7 +981,8 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
                 assert_eq!(
                     seen, observable,
                     "every reservation step a GET follows must be observed held, in \
-                     order, at its exact total"
+                     order, at its exact total; a mismatch at the page read means \
+                     the catalog decode's reservation shrank"
                 );
                 let (_value, _coverage) = result.expect("query must succeed");
                 break;
@@ -958,7 +993,7 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
                 let reserved = budget.fetch_reserved();
                 if reserved > 0 {
                     assert!(
-                        steps.contains(&reserved),
+                        steps.iter().any(|step| step.total == reserved),
                         "the fetch counter ({reserved}) must hold exactly one of the \
                          fetcher's reservation totals {steps:?}"
                     );
@@ -1056,7 +1091,8 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
                 assert_eq!(
                     seen, observable,
                     "every reservation step a GET follows must be observed held, in \
-                     order, at its exact total"
+                     order, at its exact total; a mismatch at the page read means \
+                     the catalog decode's reservation shrank"
                 );
                 let (_value, _coverage) = result.expect("query must succeed");
                 break;
@@ -1067,7 +1103,7 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
                 let reserved = budget.fetch_reserved();
                 if reserved > 0 {
                     assert!(
-                        steps.contains(&reserved),
+                        steps.iter().any(|step| step.total == reserved),
                         "the fetch counter ({reserved}) must hold exactly one of the \
                          fetcher's reservation totals {steps:?}"
                     );
