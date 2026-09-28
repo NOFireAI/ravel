@@ -3102,6 +3102,7 @@ mod tests {
                 declared_column_stats: Vec::new(),
             }],
             created_unix_ns,
+            superseded_record_key: String::new(),
         };
         let hash16: String = input_set_hash[..8]
             .iter()

@@ -1503,6 +1503,7 @@ mod tests {
             input_set_hash: vec![0; 32],
             parts: Vec::new(),
             created_unix_ns: 0,
+            superseded_record_key: String::new(),
         }
     }
 

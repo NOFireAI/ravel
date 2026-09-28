@@ -460,6 +460,7 @@ mod tests {
             input_set_hash: vec![0x44; 32],
             parts: Vec::new(),
             created_unix_ns: 495_734 * NS_PER_HOUR,
+            superseded_record_key: String::new(),
         }
     }
 

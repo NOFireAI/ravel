@@ -124,6 +124,7 @@ async fn put_compaction_record(
         input_set_hash: input_set_hash.to_vec(),
         parts,
         created_unix_ns,
+        superseded_record_key: String::new(),
     };
     for p in &record.parts {
         let part_key = keys::reconstruct_l1_part_key(&record, p).expect("part key");

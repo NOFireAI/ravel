@@ -1803,6 +1803,7 @@ mod tests {
                 declared_column_stats: Vec::new(),
             }],
             created_unix_ns: 0,
+            superseded_record_key: String::new(),
         }
     }
 

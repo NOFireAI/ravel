@@ -131,6 +131,13 @@ message CompactionRecord {
   bytes input_set_hash = 8;    // blake3 over the sorted inputs, 32 bytes
   repeated CompactionPart parts = 9;
   sfixed64 created_unix_ns = 10;
+  // Set only on a format_version 2 record (ADR-0066, force 2 amendment):
+  // the key of the compaction record this one re-encodes, which it
+  // supersedes. A v2 record copies its predecessor's inputs verbatim, and its
+  // input_set_hash is taken over (inputs, superseded_record_key) under the
+  // version-2 domain (ravel-commit::erasure::
+  // compute_superseding_compaction_input_set_hash). A v1 record never sets it.
+  string superseded_record_key = 11;
 }
 
 // Age-based retention tombstone for one sealed ingest-hour bucket

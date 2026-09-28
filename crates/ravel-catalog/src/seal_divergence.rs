@@ -557,6 +557,7 @@ mod tests {
             input_set_hash: input_set_hash.to_vec(),
             parts: vec![part],
             created_unix_ns,
+            superseded_record_key: String::new(),
         };
         let key = keys::compaction_record_key_for(&record).expect("compaction key");
         store
