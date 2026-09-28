@@ -75,9 +75,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FetchMemoryExhausted`, `MetricsMetaError::MemoryExhausted`); a catalog
   refusal never falls back to a listing pass, and a column-statistics refusal
   reaches a SQL client as the same transient 503 a store fault does, never as
-  corrupt data. **The PromQL reservations are live in a running server now**:
-  the fetch path already receives the process budget, so a query whose catalog
-  decode does not fit is refused with 503 rather than decoding uncharged. The
+  corrupt data. **The segment fetcher's reservations are live in a running
+  server now** wherever it runs under the process budget: PromQL evaluation,
+  the SQL samples scan, cache warming and distributed query fragments, so a
+  read whose catalog decode does not fit is refused with 503 rather than
+  decoding uncharged. The
   catalog and the metadata cache take the budget through the new
   `Catalog::with_memory_budget` and `MetadataCache::with_memory_budget`, and
   both still default to an unlimited budget, so the part, postings,
@@ -91,9 +93,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead sums the SERIES_IDX chunk directory's `frame_uncompressed_len`. Once
   the matchers have run, the whole-catalog reservation is exchanged for one
   sized to the entries that survived, so a selective query does not hold the
-  whole catalog's charge through its page fetches. A snapshot part's tenant
-  check now runs before its reservation, so a cross-tenant part is still
-  reported as an isolation breach under a budget too small to decode it.
+  whole catalog's charge through its page fetches; the exchange never fails a
+  read, and a refused one keeps the whole-catalog reservation. A snapshot
+  part's tenant check, and a column-statistics object's tenant, version and
+  part-binding checks, now run before the reservation, so a cross-tenant object
+  is still reported as an isolation breach, and a stale-bound statistics object
+  still degrades to no statistics, under a budget too small to decode it.
 
 - **An end-to-end proof that a stalled fold pages before it refuses a query**
   (issue #1306, ADR-1306 follow-up task 3). ADR-1306 decision 2 states the

@@ -774,13 +774,20 @@ structs, label strings and runs. A selective query on a large object therefore
 holds a few hundred bytes through its page fetches rather than the whole
 catalog's charge. The exchange only ever shrinks: on an object small enough
 that the decoded entries measure more than the sections they came from, the
-original reservation stands rather than growing into a new refusal point.
+original reservation stands rather than growing into a new refusal point. The
+exchange never fails the query either, since the decode it follows already
+succeeded: the retained reservation is taken before the whole-catalog one is
+released, and a refusal keeps the whole-catalog one. A decode that retained no
+entries releases its reservation and holds none.
 
-**Where these are live.** The PromQL fetch path already receives the process
-budget (`QueryEngine::with_memory_budget`, wired in `ravel-server`), so these
-catalog-decode reservations are enforced in a running server today and a query
-whose decode does not fit is refused with the 503 `FetchMemoryExhausted` maps
-to. The catalog resolve charges its own decodes the same way
+**Where these are live.** These catalog-decode reservations are enforced in a
+running server today wherever the segment fetcher runs under the process
+budget: PromQL evaluation (`QueryEngine::with_memory_budget`, wired in
+`ravel-server`), the SQL samples scan (`ravel-sql`'s `scan.rs`, through
+`fetch_soa_phase_accounted`, `fetch_runs` and `decode_selected`), cache warming
+(`ravel-server`'s `cache_warm.rs`) and distributed query fragments
+(`ravel-server`'s `distrib.rs`). A read whose decode does not fit is refused
+with the 503 `FetchMemoryExhausted` maps to. The catalog resolve charges its own decodes the same way
 (`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), as does the
 `/api/v1/metadata` cache (`MetadataCache::with_memory_budget`), but both still
 default to an unlimited budget and the server does not yet pass them the real
