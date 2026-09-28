@@ -1471,6 +1471,14 @@ fn claim_key(shard: u32, hour: u32) -> String {
     compaction_claim_key(&WorkIdentity::new(tenant_hash(), Signal::Logs, shard, hour).work_id())
 }
 
+/// The work id of `(shard, hour)`, as the skip line prints it: the last path
+/// segment of its claim key.
+fn work_id_hex(shard: u32, hour: u32) -> String {
+    WorkIdentity::new(tenant_hash(), Signal::Logs, shard, hour)
+        .work_id()
+        .hex()
+}
+
 /// Every claim object in the store, decoded.
 async fn claim_objects(store: &dyn ObjectStoreBackend) -> BTreeMap<String, CompactionClaim> {
     let mut claims = BTreeMap::new();
@@ -1588,7 +1596,8 @@ async fn compact_tenant_skips_a_bucket_a_foreign_process_has_claimed() {
         lines[2],
         format!(
             "shard={CLAIMED_SHARD} hour={HOUR_OLD} outcome=ClaimSkipped reason=held_by_another \
-             holder={foreign} claim_expiry_unix_ms={} retry_after_unix_ms={}",
+             work_id={} holder={foreign} claim_expiry_unix_ms={} retry_after_unix_ms={}",
+            work_id_hex(CLAIMED_SHARD, HOUR_OLD),
             wall_ms + 300_000,
             wall_ms + 300_001
         ),
@@ -1920,7 +1929,7 @@ async fn a_bucket_whose_claim_is_taken_over_mid_merge_is_reported_cancelled() {
     assert_eq!(
         lines,
         vec![
-            format!("shard=0 hour={HOUR_OLD} outcome=ClaimCancelled checkpoint=merge_loop parts=0"),
+            format!("shard=0 hour={HOUR_OLD} outcome=ClaimCancelled checkpoint=merge_loop"),
             format!("shard=1 hour={HOUR_OLD} outcome=Compacted parts=1 publish=Published"),
         ],
         "{text}"
@@ -1995,8 +2004,9 @@ async fn compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it() {
     assert!(
         text.contains(&format!(
             "\noutcome: ClaimSkipped (another process holds this bucket's compaction claim; \
-             nothing was merged) reason=held_by_another holder={foreign} \
+             nothing was merged) reason=held_by_another work_id={} holder={foreign} \
              claim_expiry_unix_ms={} retry_after_unix_ms={}\n",
+            work_id_hex(CLAIMED_SHARD, HOUR_OLD),
             wall_ms + 300_000,
             wall_ms + 300_001
         )),
@@ -2147,7 +2157,7 @@ async fn compact_bucket_reports_a_claim_lost_mid_merge_and_exits_zero() {
     assert!(
         text.contains(
             "\noutcome: ClaimCancelled (the claim was lost mid-merge; nothing was \
-             published) checkpoint=merge_loop parts=0\n"
+             published) checkpoint=merge_loop\n"
         ),
         "the cancelled outcome line: {text}"
     );
