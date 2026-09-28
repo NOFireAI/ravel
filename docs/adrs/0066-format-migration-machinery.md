@@ -545,11 +545,14 @@ under ADR-1331. So a compaction record gains its own supersession.
    record with its existing typed unsupported-version error rather than
    misreading it (the Class C rule). This is a version bump of the compaction
    record, recorded here as the ADR the frozen-format rule requires. Decoding
-   validates the field as `validate_rewrite` validates its twin: a v2 record's
-   `superseded_record_key` must be non-empty and must parse as a compaction or
-   rewrite record key in the same tenant, signal, shard and hour bucket, and
-   its stored `input_set_hash` must equal the version-2 hash of item 2; a v1
-   record that sets the field is rejected. Without these checks a malformed or
+   validates the field as `validate_rewrite` validates its twin, narrowed to
+   compaction records: a v2 record's `superseded_record_key` must be non-empty
+   and must parse as a compaction record key in the same tenant, signal, shard
+   and hour bucket, and its stored `input_set_hash` must equal the version-2
+   hash of item 2; a v1 record that sets the field is rejected. A rewrite
+   record key there is rejected too: force 2 never re-encodes a bucket that
+   holds a rewrite record (item 4), and the selector sees only compaction
+   records, so it could not exclude one. Without these checks a malformed or
    wrong-bucket value would exclude a live record in the selector with nothing
    to catch it.
 2. **Key and hash.** A v2 record's inputs are copied verbatim from its
@@ -598,14 +601,23 @@ under ADR-1331. So a compaction record gains its own supersession.
    so each signal gets a differential exact-contents test.
 8. **Rollout.** Readers first: the format, resolution and sweep changes ship in
    a release before any v2 record is written. The writer is behind a switch
-   that defaults to off until every node runs a reading build.
+   that defaults to off until every node runs a reading build. A build that
+   cannot read v2 fails every resolve and `migrate` walk over a bucket that
+   holds one, and the record is immutable, so there is no rollback past a
+   reading build once the switch has been on; recovery is rolling forward.
+   The switch is therefore turned on only when the release before the running
+   one also reads v2, so a one-release rollback stays safe. Turning the switch
+   off stops new v2 records and leaves the existing ones in place.
 9. **Losing records and the floor.** A losing compaction record's parts keep
    counting toward the below-target figure. A build that predates the
    authoritative-selection rule may still serve them (the sweep keeps them for
    the same reason), and the reachability gate answers "nothing blocked" when
    no HEAD exists, so neither is a safe basis for raising the floor over them.
    `migrate` instead names a bucket blocked only by a losing record's parts
-   with its own reason, so the report says what holds the floor. Reclaiming
+   with its own reason, so the report says what holds the floor. That reason
+   covers a bucket whose authoritative records are all at target; a bucket
+   item 4 refuses is reported with item 4's reason, since its winner has not
+   converged either. Reclaiming
    loser parts is a recorded follow-up.
 
 `docs/catalog-and-mvcc.md` (the record-kind and supersession sections) and the
