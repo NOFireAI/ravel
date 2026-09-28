@@ -99,10 +99,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   since which one wins would otherwise be an invisible precedence rule.
 
   The `[metrics]` section names the metric (a literal `name` or a
-  `name_column`), `value_column`, `ts_column` and `ts_unit`,
-  `[[metrics.label]]` columns, an optional `kind` of `gauge` or `counter`
-  that sets `is_monotonic_sum`, and an optional `[metrics.histogram]` classic
-  shape (`le_column` plus `sum_column` and `count_column`). With the
+  `name_column`), `value_column`, `ts_column` and `ts_unit`, an optional
+  `unit`, `[[metrics.label]]` columns, an optional `kind` of `gauge` or
+  `counter` that sets `is_monotonic_sum`, and an optional
+  `[metrics.histogram]` classic shape (`le_column` plus `sum_column` and
+  `count_column`). A loaded metric lands on the same `SeriesId` as the same
+  metric admitted over OTLP: the metric name and every label name go through
+  the same sanitizers `ravel_otlp::normalize` applies, then the same
+  `prometheus_family_name` suffix pass, so `unit = "s"` stores `_seconds` and
+  `kind = "counter"` stores `_total` exactly as a monotonic OTLP `Sum` does.
+  A label cell holding the empty string is dropped from the series, as OTLP
+  drops an empty attribute value, so `{job=""}` and `{}` are one series on
+  both paths. `kind` may not be set together with `[metrics.histogram]`:
+  OTLP has no monotonic histogram, and the key would otherwise name a
+  behaviour the load cannot produce. With the
   histogram shape one input row is one bucket, and its `value` column is that
   bucket's own count (the OTLP `bucket_counts` convention, not an
   already-cumulative Prometheus `_bucket` value): the loader groups a
@@ -122,9 +132,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or `--decode-queue-batches` was set to a value it therefore ignores.
   Everything that shapes the objects (`--shards`, `--batch-rows`,
   `--target-bytes`, `--max-inflight-flushes`, `--max-flush-delay`,
-  `--pipeline-depth`) applies unchanged. As for logs, a historical sample
-  buckets by load time, so retention runs from the load hour and a query
-  needs a window that reaches it.
+  `--pipeline-depth`) applies unchanged. A data point may span a batch
+  boundary; its rows are credited to the write that carries its points, so
+  `rows_written` and the `next --skip-rows` offset a failed load prints
+  always land on a data-point boundary and a resume loads the next data point
+  whole rather than a truncated one. As for logs, a historical sample buckets
+  by load time, so retention runs from the load hour and a query needs a
+  window that reaches it.
 - **Catalog and PromQL decodes reserve their decoded output against the
   process memory budget before they run** (ADR-1702 decision 6, issue #1702).
   The catalog resolve reserves each snapshot part's, postings object's and

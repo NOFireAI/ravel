@@ -353,7 +353,13 @@ enum Command {
     /// check is deliberately NOT enforced, so
     /// historical timestamps are admitted (they bucket by load time, so query
     /// with a window that reaches now). A per-record attribute cap of 1024
-    /// applies (relaxed from OTLP's 128). A row that fails a kept check is
+    /// applies, relaxed from the OTLP cap of the signal it stands in for: 64
+    /// attributes per metric data point, 128 per log record, 128 per span. A
+    /// metric's name and label names are rewritten exactly as OTLP rewrites
+    /// them (the Prometheus character set, then the `[metrics] unit` suffix
+    /// and `_total` for `kind = "counter"`), so a loaded metric lands on the
+    /// same series as the same metric sent over OTLP. A row that fails a kept
+    /// check is
     /// rejected fail-fast: the run stops at the first bad row and exits
     /// nonzero. `--skip-rows` (issue #1713) drops that many leading rows by
     /// file-absolute position; a failed run prints the figures a resume would

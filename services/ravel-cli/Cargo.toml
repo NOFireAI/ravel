@@ -145,6 +145,13 @@ tower = { workspace = true }
 # collisions, type mix, null density). Workspace pin; adds no new external
 # crate.
 proptest = { workspace = true }
+# The metrics loader's series-identity parity test builds the same gauge,
+# counter and histogram as OTLP messages and runs them through
+# `ravel_otlp::normalize_metrics`, then asserts the loader's own SeriesIds
+# equal the ones that path produced. Comparing against the loader's own
+# normalization helpers instead would assert nothing. Workspace pin, already
+# in the lock through ravel-otlp; test-only here.
+opentelemetry-proto = { workspace = true }
 # A real deployment-key file on disk for the `tenant_token` CLI tests (they
 # exercise `--deployment-key-file`, not an in-memory key). Already a
 # workspace pin; adds no new external crate.

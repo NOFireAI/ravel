@@ -519,15 +519,34 @@ fn mapping_naming_a_native_histogram_is_refused() {
         [metrics.native_histogram]
         scale_column = "scale"
         "#,
+        r#"
+        [metrics]
+        name = "m"
+        value_column = "v"
+        ts_column = "ts"
+        ts_unit = "nanos"
+
+        [metrics.exponential_histogram]
+        scale_column = "scale"
+        "#,
     ] {
         let err =
             load::parse_metrics_mapping(text).expect_err("a native histogram mapping is refused");
         let LoadError::Setup(message) = err else {
             panic!("expected a setup error");
         };
+        // Asserting on the word "native" alone would pass on serde's own
+        // unknown-field error, which quotes the offending key and therefore
+        // contains "native" too: the section-key cases would then pass
+        // whether or not anything refuses them by name. This phrase appears
+        // only in the named refusal.
         assert!(
-            message.contains("native"),
-            "the refusal names what it refuses: {message}"
+            message.contains("which this version does not map"),
+            "the named refusal, not a generic unknown-field error: {message}"
+        );
+        assert!(
+            !message.contains("unknown field"),
+            "a native histogram is refused by name, not as a typo: {message}"
         );
     }
 }
@@ -682,5 +701,717 @@ async fn interleaved_histogram_rows_are_refused() {
     assert!(
         reason.contains("not contiguous"),
         "the rejection names the problem: {reason}"
+    );
+}
+
+/// A range query over a span of steps, for the cases that need more than one
+/// sample of the same series.
+async fn query_range_span(
+    app: &Router,
+    query: &str,
+    start_ns: i64,
+    end_ns: i64,
+    min_tokens: &[CommitToken],
+) -> Value {
+    let start = start_ns / NS_PER_SEC;
+    let end = end_ns / NS_PER_SEC;
+    let mut uri = format!("/api/v1/query_range?query={query}&start={start}&end={end}&step=1s");
+    for token in min_tokens {
+        uri.push_str("&min_commit_token=");
+        uri.push_str(&token.encode());
+    }
+    let request = Request::builder()
+        .method("GET")
+        .uri(&uri)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("build request");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("oneshot is infallible");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse response json");
+    assert_eq!(status, StatusCode::OK, "query_range failed: {json}");
+    json
+}
+
+/// The `[metrics]` mapping the ladder tests share: the metric name comes from
+/// a column, so two adjacent data points can carry different names and each
+/// can be queried on its own without a label matcher.
+const LADDER_MAPPING: &str = r#"
+[metrics]
+name_column = "metric"
+value_column = "bucket_count"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[metrics.histogram]
+le_column = "le"
+sum_column = "sum"
+count_column = "count"
+"#;
+
+/// Six rows: two three-bucket data points, `ladder_a` on rows 0-2 and
+/// `ladder_b` on rows 3-5. `poison_last_row` makes row 5's bucket count
+/// fractional, which the loader refuses when it reads that row.
+fn ladder_batch(event_ns: i64, poison_last_row: bool) -> RecordBatch {
+    let last = if poison_last_row { 6.5 } else { 6.0 };
+    RecordBatch::try_from_iter(vec![
+        (
+            "metric".to_string(),
+            str_col(vec![
+                "ladder_a", "ladder_a", "ladder_a", "ladder_b", "ladder_b", "ladder_b",
+            ]),
+        ),
+        ("ts".to_string(), i64_col(vec![event_ns; 6])),
+        (
+            "le".to_string(),
+            f64_col(vec![0.1, 1.0, 10.0, 0.1, 1.0, 10.0]),
+        ),
+        (
+            "bucket_count".to_string(),
+            f64_col(vec![1.0, 2.0, 3.0, 4.0, 5.0, last]),
+        ),
+        (
+            "sum".to_string(),
+            f64_col(vec![6.0, 6.0, 6.0, 21.0, 21.0, 21.0]),
+        ),
+        ("count".to_string(), i64_col(vec![9, 9, 9, 20, 20, 20])),
+    ])
+    .expect("record batch")
+}
+
+/// `ladder_b`'s exploded series: cumulative 4, 9, 15 over the three bounds,
+/// a `+Inf` bucket carrying the data point's own count, `_sum` and `_count`.
+fn expected_ladder_b() -> Vec<(String, Option<String>, f64)> {
+    let mut want = vec![
+        ("ladder_b_bucket", Some("+Inf"), 20.0),
+        ("ladder_b_bucket", Some("0.1"), 4.0),
+        ("ladder_b_bucket", Some("1"), 9.0),
+        ("ladder_b_bucket", Some("10"), 15.0),
+        ("ladder_b_count", None, 20.0),
+        ("ladder_b_sum", None, 21.0),
+    ]
+    .into_iter()
+    .map(|(n, le, v): (&str, Option<&str>, f64)| (n.to_string(), le.map(str::to_string), v))
+    .collect::<Vec<_>>();
+    want.sort_by(|a, b| (a.0.as_str(), a.1.as_deref()).cmp(&(b.0.as_str(), b.1.as_deref())));
+    want
+}
+
+fn assert_series_eq(got: &[(String, Option<String>, f64)], want: &[(String, Option<String>, f64)]) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "exactly the exploded series, no more and no fewer: got {got:?}, want {want:?}"
+    );
+    for (got, want) in got.iter().zip(want) {
+        assert_eq!((&got.0, &got.1), (&want.0, &want.1), "series identity");
+        assert_eq!(
+            got.2.to_bits(),
+            want.2.to_bits(),
+            "value of {} le={:?}: got {}, want {}",
+            got.0,
+            got.1,
+            got.2,
+            want.2
+        );
+    }
+}
+
+/// A batch that closes one histogram data point and opens the next credits
+/// only the CLOSED point's rows to its write, so the resume offset a failed
+/// load prints lands on a data-point boundary.
+///
+/// Rows 0-2 are one data point and rows 3-5 are the next. At
+/// `--batch-rows 4` the first batch reads rows 0-3: rows 0-2 close the first
+/// data point, row 3 only opens the second. Crediting the write with the
+/// batch's four rows would report three durable rows plus one that is still
+/// buffered, and a resume at that offset would load rows 4-5 as a data point
+/// of two buckets instead of three -- a silently truncated ladder, since a
+/// two-bucket group is perfectly well-formed.
+#[tokio::test]
+async fn a_failed_histogram_load_resumes_on_a_data_point_boundary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let poisoned = dir.path().join("poisoned.parquet");
+    let clean = dir.path().join("clean.parquet");
+
+    let load_ns = now_ns();
+    let event_ns = load_ns - 60 * NS_PER_SEC;
+    write_parquet(&poisoned, &ladder_batch(event_ns, true));
+    write_parquet(&clean, &ladder_batch(event_ns, false));
+
+    let mapping = metrics_mapping(LADDER_MAPPING);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme");
+
+    let err = load::load_metrics(
+        Arc::clone(&store),
+        &poisoned,
+        "acme",
+        &mapping,
+        1,
+        // --batch-rows 4, so the first batch straddles the boundary between
+        // the two data points; --pipeline-depth 1, the only geometry whose
+        // resume offset means anything.
+        4,
+        0,
+        1,
+        1,
+        1,
+        None,
+        load_ns,
+        Arc::new(SystemClock),
+    )
+    .await
+    .expect_err("row 5's fractional bucket count is refused");
+
+    let LoadError::RowRejected { row, resume, .. } = &err else {
+        panic!("expected a per-row rejection, got {err:?}");
+    };
+    assert_eq!(*row, 5, "the refusal names the row it read");
+    let resume = resume.clone();
+    assert_eq!(
+        resume.rows_written, 3,
+        "only the rows of the data point whose write acked are durable; row 3 opened the \
+         second data point and is not one of them"
+    );
+    assert_eq!(resume.rows_skipped, 0);
+    assert_eq!(
+        resume.next_skip_rows(),
+        3,
+        "the resume offset is the boundary between the two data points"
+    );
+
+    // Resuming at that offset over a clean file loads the second data point
+    // whole: three bounds, not the two a truncated group would have.
+    let resumed = load::load_metrics(
+        Arc::clone(&store),
+        &clean,
+        "acme",
+        &mapping,
+        1,
+        4,
+        resume.next_skip_rows(),
+        1,
+        1,
+        1,
+        None,
+        load_ns,
+        Arc::new(SystemClock),
+    )
+    .await
+    .expect("the resumed load succeeds");
+    assert_eq!(resumed.rows_skipped, 3);
+    assert_eq!(resumed.rows_processed, 3, "the second data point's rows");
+    assert_eq!(
+        resumed.histogram_points_exploded, 1,
+        "exactly one data point was exploded by the resumed load"
+    );
+    assert_eq!(
+        resumed.points_written, 6,
+        "three bounds explode into 3 buckets + the +Inf bucket + _sum + _count"
+    );
+
+    let app = query_app(Arc::clone(&store), &tenant);
+    let mut series: Vec<(String, Option<String>, f64)> = Vec::new();
+    for name in ["ladder_b_bucket", "ladder_b_sum", "ladder_b_count"] {
+        series.extend(histogram_series(
+            &query_range_at(&app, name, event_ns, &resumed.tokens).await,
+        ));
+    }
+    series.sort_by(|a, b| (a.0.as_str(), a.1.as_deref()).cmp(&(b.0.as_str(), b.1.as_deref())));
+    assert_series_eq(&series, &expected_ladder_b());
+}
+
+/// One data point whose bucket rows straddle a batch boundary is still one
+/// data point: the open group is carried into the next batch and closed
+/// there, and its rows are credited to the write that carries its points.
+#[tokio::test]
+async fn a_data_point_split_across_batches_explodes_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("split.parquet");
+
+    let load_ns = now_ns();
+    let event_ns = load_ns - 60 * NS_PER_SEC;
+    write_parquet(&pq, &ladder_batch(event_ns, false));
+
+    let mapping = metrics_mapping(LADDER_MAPPING);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme");
+
+    // --batch-rows 2 cuts both data points: rows 0-1, 2-3, 4-5.
+    let report = load::load_metrics(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping,
+        1,
+        2,
+        0,
+        1,
+        1,
+        1,
+        None,
+        load_ns,
+        Arc::new(SystemClock),
+    )
+    .await
+    .expect("a data point split across batches loads");
+
+    assert_eq!(
+        report.rows_processed, 6,
+        "every source row is credited once"
+    );
+    assert_eq!(
+        report.histogram_points_exploded, 2,
+        "two data points, not four halves"
+    );
+    assert_eq!(report.points_written, 12, "six exploded series each");
+
+    let app = query_app(Arc::clone(&store), &tenant);
+    let mut series: Vec<(String, Option<String>, f64)> = Vec::new();
+    for name in ["ladder_b_bucket", "ladder_b_sum", "ladder_b_count"] {
+        series.extend(histogram_series(
+            &query_range_at(&app, name, event_ns, &report.tokens).await,
+        ));
+    }
+    series.sort_by(|a, b| (a.0.as_str(), a.1.as_deref()).cmp(&(b.0.as_str(), b.1.as_deref())));
+    assert_series_eq(&series, &expected_ladder_b());
+}
+
+/// An empty label cell is dropped from the series exactly as a null one is,
+/// and exactly as OTLP drops an empty attribute value: the two rows below are
+/// ONE series carrying both samples, not `{job=""}` beside `{}`.
+#[tokio::test]
+async fn an_empty_label_cell_is_the_same_series_as_a_missing_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("empty_label.parquet");
+
+    let load_ns = now_ns();
+    let first_ns = load_ns - 120 * NS_PER_SEC;
+    let second_ns = first_ns + NS_PER_SEC;
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("ts".to_string(), i64_col(vec![first_ns, second_ns])),
+        ("value".to_string(), f64_col(vec![1.0, 2.0])),
+        (
+            "svc".to_string(),
+            Arc::new(StringArray::from(vec![Some(""), None])) as ArrayRef,
+        ),
+    ])
+    .expect("record batch");
+    write_parquet(&pq, &batch);
+
+    let mapping = metrics_mapping(
+        r#"
+        [metrics]
+        name = "empty_label_demo"
+        value_column = "value"
+        ts_column = "ts"
+        ts_unit = "nanos"
+
+        [[metrics.label]]
+        name = "job"
+        column = "svc"
+        "#,
+    );
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme");
+    let report = load::load_metrics(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping,
+        1,
+        10_000,
+        0,
+        1,
+        1,
+        1,
+        None,
+        load_ns,
+        Arc::new(SystemClock),
+    )
+    .await
+    .expect("both rows load");
+    assert_eq!(report.points_written, 2);
+
+    let app = query_app(Arc::clone(&store), &tenant);
+    let body = query_range_span(
+        &app,
+        "empty_label_demo",
+        first_ns,
+        second_ns,
+        &report.tokens,
+    )
+    .await;
+    let results = range_results(&body);
+    assert_eq!(
+        results.len(),
+        1,
+        "the empty cell and the null cell are one series, got {body}"
+    );
+    assert!(
+        results[0]["metric"]["job"].is_null(),
+        "the empty label value is absent from the series, got {}",
+        results[0]["metric"]
+    );
+    let values = results[0]["values"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no values array in {}", results[0]));
+    assert_eq!(values.len(), 2, "both samples are on that one series");
+    assert_eq!(values[0][1], "1", "the first step carries the first sample");
+    assert_eq!(values[1][1], "2", "the second step carries the second");
+}
+
+/// A null `sum` cell emits no `_sum` series, matching an OTLP histogram data
+/// point with no `sum` field. The `_bucket` and `_count` series are unaffected.
+#[tokio::test]
+async fn a_null_sum_emits_no_sum_series() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("no_sum.parquet");
+
+    let load_ns = now_ns();
+    let event_ns = load_ns - 60 * NS_PER_SEC;
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("ts".to_string(), i64_col(vec![event_ns, event_ns])),
+        ("le".to_string(), f64_col(vec![0.5, 2.0])),
+        ("bucket_count".to_string(), f64_col(vec![1.0, 2.0])),
+        ("sum".to_string(), opt_f64_col(vec![None, None])),
+        ("count".to_string(), i64_col(vec![4, 4])),
+    ])
+    .expect("record batch");
+    write_parquet(&pq, &batch);
+
+    let mapping = metrics_mapping(
+        r#"
+        [metrics]
+        name = "no_sum"
+        value_column = "bucket_count"
+        ts_column = "ts"
+        ts_unit = "nanos"
+
+        [metrics.histogram]
+        le_column = "le"
+        sum_column = "sum"
+        count_column = "count"
+        "#,
+    );
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme");
+    let report = load::load_metrics(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping,
+        1,
+        10_000,
+        0,
+        1,
+        1,
+        1,
+        None,
+        load_ns,
+        Arc::new(SystemClock),
+    )
+    .await
+    .expect("a data point with no sum loads");
+    assert_eq!(
+        report.points_written, 4,
+        "two buckets + the +Inf bucket + _count, and NO _sum"
+    );
+
+    let app = query_app(Arc::clone(&store), &tenant);
+    assert!(
+        range_results(&query_range_at(&app, "no_sum_sum", event_ns, &report.tokens).await)
+            .is_empty(),
+        "no _sum series exists for a data point whose sum column was null"
+    );
+    let mut series =
+        histogram_series(&query_range_at(&app, "no_sum_bucket", event_ns, &report.tokens).await);
+    series.extend(histogram_series(
+        &query_range_at(&app, "no_sum_count", event_ns, &report.tokens).await,
+    ));
+    series.sort_by(|a, b| (a.0.as_str(), a.1.as_deref()).cmp(&(b.0.as_str(), b.1.as_deref())));
+    let mut want: Vec<(String, Option<String>, f64)> = vec![
+        ("no_sum_bucket", Some("+Inf"), 4.0),
+        ("no_sum_bucket", Some("0.5"), 1.0),
+        ("no_sum_bucket", Some("2"), 3.0),
+        ("no_sum_count", None, 4.0),
+    ]
+    .into_iter()
+    .map(|(n, le, v): (&str, Option<&str>, f64)| (n.to_string(), le.map(str::to_string), v))
+    .collect();
+    want.sort_by(|a, b| (a.0.as_str(), a.1.as_deref()).cmp(&(b.0.as_str(), b.1.as_deref())));
+    assert_series_eq(&series, &want);
+}
+
+/// A histogram shape whose rows disagree about the data point's own figures
+/// is refused, naming the first row of the group. `sum` and `count` describe
+/// the data point, not the bucket, so a row that changes one of them is
+/// either a mis-sorted file or a mis-declared mapping, and exploding it would
+/// write a ladder whose `_count` contradicts its `+Inf` bucket.
+#[tokio::test]
+async fn rows_of_one_data_point_that_disagree_on_sum_or_count_are_refused() {
+    let load_ns = now_ns();
+    let event_ns = load_ns - 60 * NS_PER_SEC;
+    let mapping = metrics_mapping(
+        r#"
+        [metrics]
+        name = "disagree"
+        value_column = "bucket_count"
+        ts_column = "ts"
+        ts_unit = "nanos"
+
+        [metrics.histogram]
+        le_column = "le"
+        sum_column = "sum"
+        count_column = "count"
+        "#,
+    );
+
+    for (case, sums, counts, wanted) in [
+        (
+            "count",
+            vec![3.0, 3.0],
+            vec![5_i64, 6],
+            "the count column carries the DATA POINT's total",
+        ),
+        (
+            "sum",
+            vec![3.0, 4.0],
+            vec![5_i64, 5],
+            "the sum column carries the DATA POINT's sum",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join(format!("{case}.parquet"));
+        let batch = RecordBatch::try_from_iter(vec![
+            ("ts".to_string(), i64_col(vec![event_ns, event_ns])),
+            ("le".to_string(), f64_col(vec![0.5, 2.0])),
+            ("bucket_count".to_string(), f64_col(vec![1.0, 2.0])),
+            ("sum".to_string(), f64_col(sums)),
+            ("count".to_string(), i64_col(counts)),
+        ])
+        .expect("record batch");
+        write_parquet(&pq, &batch);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let err = load::load_metrics(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &mapping,
+            1,
+            10_000,
+            0,
+            1,
+            1,
+            1,
+            None,
+            load_ns,
+            Arc::new(SystemClock),
+        )
+        .await
+        .expect_err("a disagreeing row is refused");
+        let LoadError::RowRejected { row, reason, .. } = &err else {
+            panic!("expected a per-row rejection for the {case} case, got {err:?}");
+        };
+        assert_eq!(*row, 1, "the refusal names the row that disagreed");
+        assert!(
+            reason.contains(wanted),
+            "the {case} refusal states the rule: {reason}"
+        );
+        assert!(
+            reason.contains("row 0"),
+            "the {case} refusal points at the first row of the group: {reason}"
+        );
+    }
+}
+
+/// A `le` that is not finite, and bounds that do not strictly increase, are
+/// each refused. The `+Inf` bucket is synthesized from the count column and
+/// must never be a row of its own, and a ladder built from unsorted bounds
+/// would accumulate counts into the wrong buckets.
+#[tokio::test]
+async fn a_non_finite_le_and_non_increasing_bounds_are_refused() {
+    let load_ns = now_ns();
+    let event_ns = load_ns - 60 * NS_PER_SEC;
+    let mapping = metrics_mapping(
+        r#"
+        [metrics]
+        name = "bounds"
+        value_column = "bucket_count"
+        ts_column = "ts"
+        ts_unit = "nanos"
+
+        [metrics.histogram]
+        le_column = "le"
+        sum_column = "sum"
+        count_column = "count"
+        "#,
+    );
+
+    for (case, les, wanted) in [
+        (
+            "infinite",
+            vec![0.5, f64::INFINITY],
+            "not a finite bucket bound",
+        ),
+        (
+            "unsorted",
+            vec![2.0, 0.5],
+            "do not strictly increase in row order",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join(format!("{case}.parquet"));
+        let batch = RecordBatch::try_from_iter(vec![
+            ("ts".to_string(), i64_col(vec![event_ns, event_ns])),
+            ("le".to_string(), f64_col(les)),
+            ("bucket_count".to_string(), f64_col(vec![1.0, 2.0])),
+            ("sum".to_string(), f64_col(vec![3.0, 3.0])),
+            ("count".to_string(), i64_col(vec![5, 5])),
+        ])
+        .expect("record batch");
+        write_parquet(&pq, &batch);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let err = load::load_metrics(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &mapping,
+            1,
+            10_000,
+            0,
+            1,
+            1,
+            1,
+            None,
+            load_ns,
+            Arc::new(SystemClock),
+        )
+        .await
+        .expect_err("the bad bound is refused");
+        let LoadError::RowRejected { reason, .. } = &err else {
+            panic!("expected a per-row rejection for the {case} case, got {err:?}");
+        };
+        assert!(
+            reason.contains(wanted),
+            "the {case} refusal names the problem: {reason}"
+        );
+    }
+}
+
+/// `kind` alongside `[metrics.histogram]` is refused rather than ignored:
+/// OTLP has no monotonic histogram, so nothing the loader could do with it
+/// would match the OTLP path, and a silently ignored mapping key reads as a
+/// setting that took effect.
+#[test]
+fn a_counter_kind_on_a_histogram_mapping_is_refused() {
+    let err = load::parse_metrics_mapping(
+        r#"
+        [metrics]
+        name = "m"
+        value_column = "v"
+        ts_column = "ts"
+        ts_unit = "nanos"
+        kind = "counter"
+
+        [metrics.histogram]
+        le_column = "le"
+        sum_column = "sum"
+        count_column = "count"
+        "#,
+    )
+    .expect_err("kind and a histogram shape cannot both be set");
+    let LoadError::Setup(message) = err else {
+        panic!("expected a setup error");
+    };
+    assert!(
+        message.contains("kind") && message.contains("_total"),
+        "the refusal names the key and what it would have meant: {message}"
+    );
+}
+
+/// Two mapped label names that differ only in characters the OTLP sanitizer
+/// rewrites are ONE label name, and declaring both is refused at setup rather
+/// than discovered as a duplicate-label rejection on the first row.
+#[test]
+fn label_names_that_sanitize_to_the_same_name_are_refused() {
+    let err = load::parse_metrics_mapping(
+        r#"
+        [metrics]
+        name = "m"
+        value_column = "v"
+        ts_column = "ts"
+        ts_unit = "nanos"
+
+        [[metrics.label]]
+        name = "http.method"
+        column = "a"
+
+        [[metrics.label]]
+        name = "http_method"
+        column = "b"
+        "#,
+    )
+    .expect_err("two labels that sanitize to one name are refused");
+    let LoadError::Setup(message) = err else {
+        panic!("expected a setup error");
+    };
+    assert!(
+        message.contains("http_method"),
+        "the refusal names the name they collide on: {message}"
+    );
+}
+
+/// A pre-ADR-1751 logs mapping keeps the error prefix it has always had. Its
+/// author never wrote a section, so a message naming one would point at
+/// nothing in the file.
+#[test]
+fn a_pre_adr_1751_logs_mapping_keeps_its_original_error_prefix() {
+    let err = load::parse_mapping(
+        r#"
+ts_column = "ts"
+ts_unit = "nanos"
+no_such_key = "x"
+"#,
+    )
+    .expect_err("an unknown key is still refused");
+    let LoadError::Setup(message) = err else {
+        panic!("expected a setup error");
+    };
+    assert!(
+        message.starts_with("invalid --mapping TOML:"),
+        "the top-level form keeps its original prefix: {message}"
+    );
+
+    // The sectioned spelling names the section, since that one is in the file.
+    let err = load::parse_mapping(
+        r#"
+[logs]
+ts_column = "ts"
+ts_unit = "nanos"
+no_such_key = "x"
+"#,
+    )
+    .expect_err("an unknown key is still refused");
+    let LoadError::Setup(message) = err else {
+        panic!("expected a setup error");
+    };
+    assert!(
+        message.starts_with("invalid --mapping [logs] section:"),
+        "a written section is named: {message}"
     );
 }
