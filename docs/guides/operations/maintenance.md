@@ -247,21 +247,23 @@ To compact by hand, one bucket or one whole tenant and signal:
 
 ```sh
 ravel-cli maintain compact-bucket --tenant <t> --signal <metrics|logs|spans> \
-  --shard <n> --hour <n> [--dry-run]
+  --shard <n> --hour <n> [--dry-run] [--no-claim]
 
 ravel-cli maintain compact-tenant --tenant <t> --signal <metrics|logs|spans> \
-  [--shards <n>] [--from-hour <n>] [--to-hour <n>] [--bucket-concurrency <n>] [--dry-run]
+  [--shards <n>] [--from-hour <n>] [--to-hour <n>] [--bucket-concurrency <n>] \
+  [--dry-run] [--no-claim]
 ```
 
 `compact-tenant` discovers the hours itself, walking each shard's ingest hours
 ascending and stopping at the first unsealed one, because every later hour is
 unsealed too. It streams one line per bucket as each completes, then a summary
-of compacted, already-compacted, not-sealed, below-minimum and tombstoned
-counts, segments written, wall time, the failure count and the concurrency it
-used. A bucket whose compaction errors does not abort its siblings: the walk
-completes, prints each failed bucket's own outcome line, and exits nonzero with
-an aggregate naming how many failed and how many succeeded. A clean run exits
-zero, and a not-sealed bucket is a reported outcome rather than a failure.
+of compacted, already-compacted, not-sealed, below-minimum, tombstoned,
+claim-skipped and claim-cancelled counts, segments written, wall time, the
+failure count and the concurrency it used. A bucket whose compaction errors
+does not abort its siblings: the walk completes, prints each failed bucket's
+own outcome line, and exits nonzero with an aggregate naming how many failed
+and how many succeeded. A clean run exits zero, and a not-sealed bucket is a
+reported outcome rather than a failure.
 
 `--bucket-concurrency N` runs up to N buckets at once and is refused at 0. Each
 concurrent bucket gets a per-bucket share of the merge cursor budget, the whole
@@ -283,6 +285,59 @@ path's real flush lifetime: a bucket a writer is still flushing into can then be
 sealed and compacted, and that writer's later-published object is missed by the
 compaction. Use the override only for a tenant known to be quiescent, such as
 one whose bulk load has finished.
+
+### Running compact-tenant beside a live cluster
+
+The background supervisor and a `compact-bucket` or `compact-tenant` run can
+reach the same sealed bucket at the same time. Both ask for an advisory
+compaction claim first, and the one refused the claim does not merge. The CLI
+asks for a claim on every bucket with at least 64 MiB of input before merging
+it, one claim per bucket at any `--bucket-concurrency`, all under one process
+id per invocation. The report header prints that id on its `claims:` line, and
+it is the holder a supervisor names when it skips a bucket the CLI holds. A
+smaller bucket is merged unclaimed, because duplicating a small merge costs
+less than the claim requests that would prevent it.
+
+A bucket refused its claim is not merged. It prints `outcome=ClaimSkipped`
+with the reason, the holder's process id (`unknown` when there is no readable
+claim to name one), the claim's expiry as `claim_expiry_unix_ms` and the
+earliest useful retry point as `retry_after_unix_ms`, and is counted in
+`claim_skipped`. A bucket that loses its claim mid-merge, because another
+process took it over or the claim object is gone, stops without publishing,
+prints `outcome=ClaimCancelled` with the checkpoint it stopped at, and is
+counted in `claim_cancelled`. Neither counts as a failure: the walk carries on
+and exits zero unless some other bucket failed, the same as for a not-sealed
+bucket. `compact-bucket` prints the same two outcomes and also exits zero.
+
+To compact a skipped bucket yourself, rerun at `retry_after_unix_ms`, not at
+`claim_expiry_unix_ms`: the retry point tracks the printed expiry only for
+`held_by_another`, and for the other three reasons the printed expiry is the
+wrong instant to wait for. If the holder finished its merge by then, the rerun
+reports the bucket as already compacted. The four reasons are:
+
+- `held_by_another`: a live claim, held by the process id printed. The retry
+  point is one millisecond past the printed expiry.
+- `steal_lost`: the claim had expired and this run tried to steal it, but
+  another contender's steal won the compare-and-swap first. The printed expiry
+  is the one already in the past, and the winner has just written a fresh
+  lease, so the retry point is a full lease from the moment of the loss.
+- `unreadable_claim`: the claim object does not decode, so it is never stolen
+  (never overwrite what you cannot read) and never deleted programmatically.
+  The retry point is one lease plus this run's own deterministic jitter past
+  the claim's `last_modified`, which is the instant a run is allowed to proceed
+  unclaimed. The lease used is the observer's configured one, since an
+  unreadable payload declares none.
+  If a bucket stays wedged past that, the operator repair is a plain
+  manual delete of that one key; it is safe because the claim is advisory and
+  the worst cost of deleting any claim is one duplicated merge.
+- `vanished_twice`: the claim key disappeared between the create and the read
+  that followed it, twice in a row. Nothing is held, so the printed expiry is
+  `0` and the retry point is immediate.
+
+`--dry-run` takes no claims. `--no-claim` takes none either, for repair work
+when a claim is in the way. It is safe for correctness, because the compaction
+record's create-if-absent still decides which output is published, but the
+merge may duplicate one another maintainer is running.
 
 ## Garbage collection and retention
 

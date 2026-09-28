@@ -80,6 +80,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer holds its bucket back: the bucket is compacted unclaimed. Claim
   traffic is counted under a new `coordinate` phase in the compaction request
   ledger, never pooled into the merge's own phases.
+- **`ravel-cli maintain compact-bucket` and `compact-tenant` take the same
+  advisory compaction claims, so an operator's run and a background supervisor
+  no longer both merge one large bucket** (ADR-1029 decision 5, issue #1034).
+  Every bucket at or above the 64 MiB claim threshold asks for a claim before
+  its merge, one independent claim per bucket at any `--bucket-concurrency`,
+  all under one fresh process id per invocation that the new `claims:` report
+  line prints. The claim renews on the wall clock rather than on the fixed
+  instant the walk judges sealing at, so a long merge keeps its claim. A
+  bucket refused its claim prints `outcome=ClaimSkipped` with the reason, the
+  holder and the claim expiry, a bucket that loses its claim mid-merge stops
+  without publishing and prints `outcome=ClaimCancelled`, and the
+  `compact-tenant` summary counts both (`claim_skipped`, `claim_cancelled`)
+  apart from `compacted`. Neither is a failure: the walk carries on and exits
+  zero unless another bucket failed.
+  `--dry-run` takes no claims. The new `--no-claim` flag on both commands takes
+  none either, for repair work: correctness is unchanged, since the compaction
+  record's create-if-absent still decides the published output, but the merge
+  may duplicate one another maintainer is running. The claim clock is injected:
+  `ravel_cli::maintain::ClaimOptions` carries an optional `clock`, which the
+  binary leaves unset to get the live wall clock and a test sets to drive
+  renewal and expiry deterministically. The skip line's
+  `retry_after_unix_ms` field, not its `claim_expiry_unix_ms`, is the point to
+  rerun from; the maintenance guide says what each of the four skip reasons
+  means and why the two differ for three of them.
 
 - **A ranged RLOG read holds only the bytes it placed, not a buffer the size
   of the object** (issue #2066). The reader now reads through a byte source,

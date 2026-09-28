@@ -12,8 +12,8 @@ use bytes::Bytes;
 use prost::Message;
 use ravel_cli::hold;
 use ravel_cli::maintain::{
-    SignalArg, audit_versions, compact, decode_compaction_record, decode_retention_tombstone,
-    migrate, status, sweep, verify_custody,
+    ClaimOptions, SignalArg, audit_versions, compact, decode_compaction_record,
+    decode_retention_tombstone, migrate, status, sweep, verify_custody,
 };
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
@@ -256,6 +256,7 @@ async fn compact_empty_bucket_is_below_min() {
         0,
         true,
         None,
+        &ClaimOptions::fresh(),
     )
     .await
     .expect("compact dry-run runs");
@@ -366,10 +367,12 @@ async fn seed_two_l0_logs(store: &MemoryStore, tenant: &str, shard: u32, hour: u
     }
 }
 
-/// The CLI `compact-bucket` path publishes a compaction record straight
-/// through `ravel_maintain::compact_bucket`, with no worker-ownership check
-/// and no heartbeat write: `sys/maintain/workers/` (the worker-set liveness
-/// prefix, docs/catalog-and-mvcc.md) stays empty across the whole run.
+/// The CLI `compact-bucket` path publishes a compaction record with no
+/// worker-ownership check and no heartbeat write: `sys/maintain/workers/` (the
+/// worker-set liveness prefix, docs/catalog-and-mvcc.md) stays empty across the
+/// whole run. The advisory compaction claim the path now takes above the cost
+/// gate (#1034) is a different keyspace and says nothing about worker
+/// membership, which is exactly the separation this pins.
 #[tokio::test]
 async fn cli_compact_bucket_publishes_without_holding_ownership() {
     let store = MemoryStore::new();
@@ -386,6 +389,7 @@ async fn cli_compact_bucket_publishes_without_holding_ownership() {
         100,
         false,
         None,
+        &ClaimOptions::fresh(),
     )
     .await
     .expect("compaction runs");
@@ -410,15 +414,18 @@ async fn cli_compact_bucket_publishes_without_holding_ownership() {
     );
 }
 
-/// The same CLI `compact-bucket` run takes no advisory compaction claim
-/// either (`sys/maintain/claims/compaction/`, ADR-1029 Proposed): grepping the
-/// workspace for a caller of `ravel_fleet::claim` (`acquire`/`renew`/`steal`/
-/// `mark_completed`) outside `crates/ravel-fleet` finds none, matching
-/// docs/catalog-and-mvcc.md's "the primitive is landed... but has no callers
-/// today". The CLI path is ungated: it publishes with no claim participation
-/// at all.
+/// A `compact-bucket` run BELOW the claim cost gate writes no advisory
+/// compaction claim (`sys/maintain/claims/compaction/`, ADR-1029): claiming
+/// with a default `ClaimOptions` is on, but the two-record fixture here is a
+/// few hundred bytes, far under the 64 MiB `claim_min_input_bytes` default, so
+/// the bucket is merged unclaimed and the claim prefix stays empty.
+///
+/// This is the below-gate half of the CLI claim behaviour. The claimed half
+/// lives in `tests/compact_tenant.rs`, which lowers the gate to one byte:
+/// `compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it` covers the
+/// same `compact-bucket` entry point with a claim actually taken.
 #[tokio::test]
-async fn cli_compact_bucket_publishes_with_no_claim_taken() {
+async fn cli_compact_bucket_below_the_claim_gate_takes_no_claim() {
     let store = MemoryStore::new();
     let tenant = "acme";
     seed_two_l0_logs(&store, tenant, 0, 100).await;
@@ -433,6 +440,7 @@ async fn cli_compact_bucket_publishes_with_no_claim_taken() {
         100,
         false,
         None,
+        &ClaimOptions::fresh(),
     )
     .await
     .expect("compaction runs");
@@ -453,7 +461,7 @@ async fn cli_compact_bucket_publishes_with_no_claim_taken() {
         .expect("list claims prefix");
     assert!(
         claims.is_empty(),
-        "the CLI compaction path wrote no compaction claim: {claims:?}"
+        "a bucket below the claim cost gate wrote no compaction claim: {claims:?}"
     );
 }
 

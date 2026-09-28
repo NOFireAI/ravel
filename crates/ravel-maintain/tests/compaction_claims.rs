@@ -268,10 +268,11 @@ async fn coordination_off_runs_the_same_pipeline_unclaimed() {
     assert_eq!(record_keys(&store).await.len(), 1);
 }
 
-/// [`compact_bucket`], the entry point every caller outside the supervisor
-/// still uses, takes no claim even under a config that would claim: claiming is
-/// a property of the coordinated entry point, not of the config alone (the CLI
-/// adopts it in wave 3, #1034).
+/// [`compact_bucket`], the uncoordinated entry point, takes no claim even under
+/// a config that would claim: claiming is a property of the coordinated entry
+/// point, not of the config alone. Both in-tree drivers that do claim, the
+/// supervisor tick and `ravel-cli`'s `compact-bucket`/`compact-tenant` (#1034),
+/// go through [`compact_bucket_claimed`] instead.
 #[tokio::test]
 async fn the_unclaimed_entry_point_never_claims() {
     let store = MemoryStore::new();

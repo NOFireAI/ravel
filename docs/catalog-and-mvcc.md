@@ -122,15 +122,19 @@ most a rescan of the affected units, never correctness (the ADR-0003
 HEAD-pointer precedent). Nothing deletes these snapshots (staleness detection
 replaces a sweep; a bounded cleanup sweep is a future step if it ever matters).
 
-`sys/maintain/claims/compaction/<work_id_hex>` (ADR-1029 §1, Proposed) is the
+`sys/maintain/claims/compaction/<work_id_hex>` (ADR-1029 §1, Accepted) is the
 maintain role's advisory work-claim keyspace, the third root-level prefix
-beside the heartbeat and memo prefixes above. The primitive is landed in
-`ravel_fleet::claim` (`acquire`, `renew`, `steal`, `mark_completed`) but has
-no callers today: nothing in the compaction path acquires this key, so two
-processes can still both pay for compacting the same sealed bucket until a
-caller is wired in. The rest of this section describes the mechanism as
-designed, for when that lands. One small mutable object per unit of
-expensive merge work is meant to stop that double payment. `work_id` is
+beside the heartbeat and memo prefixes above. The primitive lives in
+`ravel_fleet::claim` (`acquire`, `renew`, `steal`, `mark_completed`) and two
+drivers call it: the background maintenance supervisor's compaction tick, and
+`ravel-cli maintain compact-bucket` / `compact-tenant`. Both reach it through
+`ravel_maintain::compact_bucket_claimed`, so an operator's run and a supervisor
+no longer both pay for merging the same sealed bucket. One small mutable object
+per unit of expensive merge work is what stops that double payment. Claiming is
+skipped, and the bucket merged unclaimed, when the input set is below
+`claim_min_input_bytes` (64 MiB by default), when coordination is switched off,
+or when the driver installs no participant at all, which is what
+`ravel-cli`'s `--dry-run` and `--no-claim` do. `work_id` is
 `blake3::derive_key("ravel-compaction-claim-v1", tenant_hash || signal ||
 shard || ingest_hour_bucket)`, hex-encoded, where `tenant_hash` is the raw 16
 bytes, `signal` is the one-byte signal key prefix (`l`, `m`, `s`, ...), and

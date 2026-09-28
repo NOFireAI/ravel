@@ -4734,6 +4734,7 @@ dependencies = [
  "ravel-cache",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-fleet",
  "ravel-ingest",
  "ravel-logseg",
  "ravel-maintain",
