@@ -89,7 +89,7 @@ defaults in place.
 
 ## Turning it on
 
-Distribution is enabled per query node, and the two flags below are a pair:
+Distribution is enabled per query node, and the first two flags below are a pair:
 either without the other fails startup rather than exposing an
 unauthenticated fetch surface or leaving a configured secret inert.
 
@@ -99,7 +99,8 @@ ravel-server --mode all \
   --listen-http 0.0.0.0:4318 \
   --listen-grpc 10.0.0.11:4317 \
   --distributed-query \
-  --fragment-key-file /etc/ravel/fragment.keys
+  --fragment-key-file /etc/ravel/fragment.keys \
+  --sql-ticket-key-file /etc/ravel/sql-ticket.keys
 ```
 
 - `--distributed-query` opts this process in. In `--mode all` or
@@ -115,6 +116,20 @@ ravel-server --mode all \
   key into place. A file, never an inline value or an environment variable, so
   the key never appears in a process listing. **Every node in one cluster must
   read the same key set.**
+- `--sql-ticket-key-file` names the SQL ticket key file, which signs the
+  Flight SQL tickets: the whole-set ticket a client redeems and the slice
+  ticket a coordinator hands a worker, each under its own key derived from
+  every file key. Same file shape and rotation rule as
+  `--fragment-key-file` (the first key mints, every key verifies), but a
+  separate file: one key file no longer covers both lanes. **Every node in one
+  cluster must read the same SQL ticket key set**, or every SQL slice ticket
+  fails the worker's MAC and its slice falls back to the coordinator. Setting
+  it without `--distributed-query` fails startup. In this release it is
+  optional: without it the SQL ticket key is derived from the first fragment
+  key, as before, and startup logs one warning naming the flags the next
+  release requires with `--distributed-query` (`--fragment-listener` and
+  `--sql-ticket-key-file`). The same warning fires when only
+  `--fragment-listener` is missing.
 - `--listen-grpc` is required in practice. By default the fragment surface is
   bound only on the cluster-internal gRPC listener, never on the client HTTP
   listener and never on the mTLS listener. A node with no gRPC listener never

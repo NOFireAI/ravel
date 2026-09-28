@@ -54,6 +54,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   old and a new process fail with `invalid_argument` until the rollout
   completes, and the query has to be run again.
 
+- **The Flight SQL ticket keys come from `--sql-ticket-key-file`, not from
+  the fragment key** (ADR-1689 decision 2, issues #1689 and #1690). The new
+  flag takes the `--fragment-key-file` shape and rotation rule (the first
+  key mints, every key verifies) and requires `--distributed-query`. With it
+  set, the Flight SQL service keys every client and slice ticket off the
+  file's keys and nothing is derived from the fragment key file, so one key
+  file no longer covers both lanes. Without it, this release keeps deriving
+  the SQL ticket key from the first fragment key so a rolling upgrade keeps
+  working, and a `--distributed-query` process missing `--sql-ticket-key-file`
+  or `--fragment-listener` logs one startup warning that the next release
+  requires both. Every node in a cluster must read the same SQL ticket key
+  set; while a fleet rolls onto the file, SQL slices between a node on the
+  file and a node on the derived key run on the coordinator instead.
+
 ### Fixed
 
 - **A query's fold-lag refusal threshold is now sized from the fold and the

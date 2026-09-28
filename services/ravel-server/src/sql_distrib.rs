@@ -47,8 +47,10 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::RwLock;
 use ravel_fleet::query_workers::QueryWorkerRecord;
 use ravel_query::distrib::codec::PROTOCOL_VERSION;
-use ravel_sql::{DistributedFlightConfig, WorkerEndpoints};
+use ravel_sql::{DistributedFlightConfig, SqlTicketKeys, WorkerEndpoints};
 use uuid::Uuid;
+
+use crate::config::DistribSettings;
 
 /// The shared live query-worker set, refreshed by the heartbeat loop. The same
 /// handle [`crate::distrib::RoutingSliceFetcher`] reads for the PromQL lane.
@@ -136,21 +138,55 @@ impl WorkerEndpoints for FleetWorkerEndpoints {
 /// one the PromQL router reads to recognize a self-mapped slice). It is what
 /// keeps the coordinator out of its own SQL roster.
 ///
-/// `auth_token` is the cluster-internal fragment secret every process in the
-/// deployment already shares (`DistribSettings::auth_token`). The Flight ticket
-/// MAC key is derived from it (ADR-0071) so a coordinator's slice
-/// ticket verifies on the worker process that redeems it; without a shared key,
-/// cross-process slice fan-out would fail every ticket MAC.
+/// `legacy_secret` is the release A fallback (ADR-1689 decision 4) for a
+/// process without `--sql-ticket-key-file`: the cluster secret every process
+/// already shares ([`DistribSettings::sql_ticket_secret`], derived from the
+/// first fragment key), from which the Flight ticket MAC key is derived so a
+/// coordinator's slice ticket verifies on the worker that redeems it. `None`
+/// derives nothing: the caller installs keys from the SQL ticket key file
+/// instead (see [`distributed_flight_setup`]).
 pub fn distributed_flight_config(
     live_workers: LiveWorkers,
     self_id: SelfId,
     thresholds: ravel_query::distrib::partition::DistribThresholds,
-    auth_token: &str,
+    legacy_secret: Option<&str>,
 ) -> DistributedFlightConfig {
     DistributedFlightConfig {
         workers: Arc::new(FleetWorkerEndpoints::new(live_workers, self_id)),
         thresholds,
-        shared_ticket_key: Some(ravel_sql::derive_ticket_key(auth_token.as_bytes())),
+        shared_ticket_key: legacy_secret
+            .map(|secret| ravel_sql::derive_ticket_key(secret.as_bytes())),
+    }
+}
+
+/// The SQL lane's distributed config plus the ticket keys to install on the
+/// Flight SQL service, from this process's [`DistribSettings`].
+///
+/// With `--sql-ticket-key-file` (ADR-1689 decision 2) the keys are
+/// [`SqlTicketKeys::from_file_keys`] over every key in the file and nothing is
+/// derived from the fragment keys. Without it (release A only) the keys are
+/// `None` and the config carries the key derived from
+/// [`DistribSettings::sql_ticket_secret`], so a fleet rolling onto this release
+/// keeps agreeing on one ticket key.
+pub fn distributed_flight_setup(
+    live_workers: LiveWorkers,
+    self_id: SelfId,
+    settings: &DistribSettings,
+) -> (DistributedFlightConfig, Option<SqlTicketKeys>) {
+    match settings.sql_ticket_keys.as_deref() {
+        Some(file_keys) => (
+            distributed_flight_config(live_workers, self_id, settings.thresholds, None),
+            SqlTicketKeys::from_file_keys(file_keys),
+        ),
+        None => (
+            distributed_flight_config(
+                live_workers,
+                self_id,
+                settings.thresholds,
+                Some(&settings.sql_ticket_secret()),
+            ),
+            None,
+        ),
     }
 }
 
@@ -326,7 +362,7 @@ mod tests {
             min_segments: 0,
             max_parallel_slices: 4,
         };
-        let config = distributed_flight_config(live, no_self(), thresholds, "cluster-secret");
+        let config = distributed_flight_config(live, no_self(), thresholds, Some("cluster-secret"));
         assert_eq!(
             config.workers.endpoints(),
             vec!["http://10.0.0.1:9000".to_string()]
@@ -337,6 +373,98 @@ mod tests {
             config.shared_ticket_key,
             Some(ravel_sql::derive_ticket_key(b"cluster-secret")),
             "distributed config must carry the derived shared ticket key"
+        );
+    }
+
+    const FRAGMENT_KEY: [u8; 32] = [0xab; 32];
+    const OLD_KEY: [u8; 32] = [0x01; 32];
+    const NEW_KEY: [u8; 32] = [0x02; 32];
+
+    fn settings(sql_ticket_keys: Option<Vec<[u8; 32]>>) -> DistribSettings {
+        DistribSettings {
+            fragment_keys: vec![FRAGMENT_KEY],
+            sql_ticket_keys,
+            max_inflight_fragments: 1,
+            max_inflight_federated_resolves: 1,
+            thresholds: ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 4,
+            },
+            fragment_listener: None,
+            advertise_endpoint: None,
+        }
+    }
+
+    fn slice_ticket() -> ravel_sql::FlightTicket {
+        ravel_sql::FlightTicket {
+            tenant: ravel_types::TenantId::new("acme").hash(),
+            statement: "SELECT 1".to_string(),
+            segments: Vec::new(),
+            min_commit_tokens: Vec::new(),
+            now_ns: 1,
+            deadline_ns: 2,
+            slice_index: 0,
+            slice_count: 2,
+            pending_erasure: Vec::new(),
+            declared_columns: Vec::new(),
+        }
+    }
+
+    /// With `--sql-ticket-key-file` the service gets keys over every file key
+    /// and the config derives nothing from the fragment secret (ADR-1689
+    /// decision 2); a `[new, old]` file mints under new and verifies a ticket
+    /// minted under `[old]`, which `[new]` alone refuses.
+    #[test]
+    fn setup_takes_ticket_keys_from_the_sql_ticket_key_file() {
+        use ravel_sql::TicketSurface;
+
+        let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(Vec::new())));
+        let (config, keys) = distributed_flight_setup(
+            live.clone(),
+            no_self(),
+            &settings(Some(vec![NEW_KEY, OLD_KEY])),
+        );
+        assert_eq!(
+            config.shared_ticket_key, None,
+            "nothing derived from the fragment secret"
+        );
+        assert_eq!(config.thresholds.max_parallel_slices, 4);
+        let keys = keys.expect("keys from the SQL ticket key file");
+        assert_eq!(
+            keys.mint_key(TicketSurface::Slice),
+            &ravel_sql::derive_surface_key(&NEW_KEY, TicketSurface::Slice),
+            "the first file key mints"
+        );
+
+        let minted_under_old = SqlTicketKeys::from_file_key(&OLD_KEY)
+            .encode(&slice_ticket(), TicketSurface::Slice)
+            .expect("encode");
+        assert_eq!(
+            keys.decode(&minted_under_old, TicketSurface::Slice)
+                .expect("[new, old] verifies a ticket minted under old"),
+            slice_ticket()
+        );
+        assert!(
+            SqlTicketKeys::from_file_key(&NEW_KEY)
+                .decode(&minted_under_old, TicketSurface::Slice)
+                .is_err(),
+            "[new] alone refuses it, so the old key is what verified it"
+        );
+    }
+
+    /// Without the flag (release A) the service keeps its keys and the config
+    /// carries the key derived from the first fragment key, as before.
+    #[test]
+    fn setup_without_the_sql_ticket_key_file_keeps_the_release_a_derivation() {
+        let live: LiveWorkers = Arc::new(RwLock::new(Arc::new(Vec::new())));
+        let (config, keys) = distributed_flight_setup(live, no_self(), &settings(None));
+        assert!(keys.is_none());
+        assert_eq!(
+            config.shared_ticket_key,
+            Some(ravel_sql::derive_ticket_key(
+                hex::encode(FRAGMENT_KEY).as_bytes()
+            ))
         );
     }
 }
