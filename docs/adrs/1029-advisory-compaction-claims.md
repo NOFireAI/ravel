@@ -372,24 +372,30 @@ four statements they rest on no longer describe main, and are corrected here.
 2. **The CLI bucket walk is concurrent.** `--bucket-concurrency` landed with
    #1028's stage 1 (`services/ravel-cli/src/maintain.rs`), so decision 5
    applies per bucket per concurrency slot, not to one sequential walk.
-3. **Today's two-replica test observes one merge, not two.** With a shared
-   live set, `two_replicas_partition_units_without_double_pay`
-   (`services/ravel-server/src/maintain.rs`) sees exactly one merge, because
-   rendezvous ownership already partitions the steady state. The duplicate
-   this ADR removes happens where ownership overlaps: an operator's
+3. **Today's two-replica test runs no merge at all.** With a shared live set,
+   `two_replicas_partition_units_without_double_pay`
+   (`services/ravel-server/src/maintain.rs`) seeds one below-threshold bucket
+   per shard and asserts that each unit is evaluated exactly once and
+   classified `already_done`. It never reads `MaintainReport::compacted`, so it
+   cannot show a duplicate merge either way. In the steady state rendezvous
+   ownership already gives each unit one evaluator. The duplicate this ADR
+   removes happens where ownership overlaps: an operator's
    `ravel-cli maintain compact-*` run, which the rendezvous hash cannot see,
    and a membership change during a merge, since the ownership check is taken
    at discovery and a running merge continues after its shard moves. The
-   acceptance test therefore has to force the overlap (two replicas with
-   solo live sets, or the owner changing while a merge runs), observe two
-   merges without claims and exactly one with them.
+   acceptance test therefore needs a bucket at or above the merge threshold,
+   has to force the overlap (two replicas with solo live sets, or the owner
+   changing while a merge runs), and asserts on `compacted` or the request
+   counters: two merges without claims, exactly one with them.
 4. **Code references drifted.** The seams this ADR names are on main at
    different lines than it cites: the supervisor ownership gate at
    `services/ravel-server/src/maintain.rs` around line 1737, the CLI merge
    calls at `services/ravel-cli/src/maintain.rs` around lines 161 and 781,
    the discovery check at `crates/ravel-maintain/src/compact.rs` around line
    102, and the part PUT at `crates/ravel-maintain/src/rlog.rs` around line
-   2742. The implementing task locates each seam by name, not by line.
+   2742. Every other line number in this document also predates this
+   amendment and may no longer point at the code it describes. The
+   implementing task locates each seam by name, not by line.
 
 A duplicate compaction is a cost, not a correctness, problem: converging and
 authoritative-record selection keep reads correct either way. The leak of a
