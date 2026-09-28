@@ -262,13 +262,16 @@ Two carriers feed it, unioned per segment and per column (ADR-0873 decision
 **Which records carry a stamp.** The logs flush stamps each commit record
 with the extrema it accumulated for the tenant's typed attribute columns
 (`run_flush` in `ravel_ingest::log_shard`, stamps built by
-`DeclaredStatAccum::build_stamps`), and RLOG compaction stamps each part it
-writes (`finalize_part` in `ravel_maintain::rlog`). A flush for a tenant with
-no typed attribute columns, or whose stream attributes could not be decoded,
-writes no stamp, and records written before the stamp writer shipped carry an
-empty list; for those segments the answer comes from `.cstat` alone. The
-metrics and span paths write no stamps, which does not affect this rule, since
-it reads only logs segments.
+`DeclaredStatAccum::build_stamps`). RLOG compaction re-stamps each part it
+writes over the columns its input records already carry stamps for
+(`finalize_part` in `ravel_maintain::rlog`). These records carry no stamp: a
+flush for a tenant with no typed attribute columns, or whose stream
+attributes could not be decoded; a compaction part whose inputs carry no
+stamps, or where a stream's attribute blob does not decode; every part an
+erasure rewrite writes, which stamps an empty list by design; and records
+written before the stamp writer shipped. For those segments the answer comes
+from `.cstat` alone. The metrics and span paths write no stamps, which does
+not affect this rule, since it reads only logs segments.
 
 Stamp eligibility is an allowlist, `I64` and `BOOL`
 (`ravel_types::declared_stats`). `Str`/`Bytes` are excluded because a stamped
@@ -3429,9 +3432,11 @@ Two consequences an operator and a plan reader both see:
   Because `attrs` is one merged map column, a query that uses the whole map
   -- `SELECT *` included -- resolves to every dynamic column plus the
   `attrs_raw` overflow. A query that reads `attrs` only through literal
-  subscripts (`attrs['k']`) decodes only those keys' columns plus `attrs_raw`:
-  the `AttrsPerKeyProjection` rule rewrites the scan to one per-key column
-  each, through `LogsScanExec::reproject_attr_keys`.
+  subscripts (`attrs['k']`) decodes only those keys' columns plus `attrs_raw`
+  when the `AttrsPerKeyProjection` rule applies: the rule rewrites the scan to
+  one per-key column each, through `LogsScanExec::reproject_attr_keys`, for a
+  single-scan plan with no pending erasure. Any other shape keeps the whole
+  map.
   Skip-index, POSTINGS, and bloom pruning are unchanged: they read stored
   statistics, not decoded pages.
 

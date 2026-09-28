@@ -86,7 +86,7 @@
     - crates/ravel-commit/src/declared_stats.rs::stamp_commit_record
     - crates/ravel-commit/src/declared_stats.rs::stamp_compaction_part
   status: verified
-  note: "run_flush calls stamp_commit_record with the stamps build_stamps returns when the tenant declares columns; finalize_part calls stamp_compaction_part with real stamps. The span compaction codec and the RSEG part builder stamp an empty list, and the metrics and span flushes call neither. Corrected by #2082."
+  note: "run_flush calls stamp_commit_record with the stamps build_stamps returns when the tenant declares columns; finalize_part calls stamp_compaction_part with real stamps. The span compaction codec, the RSEG part builder and the logs erasure rewrite (erasure_rewrite.rs) stamp an empty list, compaction stamps only the columns its inputs carry stamps for, and the metrics and span flushes call neither. Corrected by #2082."
 
 # --- NEGATIVE marker lines -------------------------------------------------
 
@@ -204,13 +204,13 @@
 
 - id: query-engine-attrs-per-key-projection
   doc: docs/query-engine.md
-  quote: "the `AttrsPerKeyProjection` rule rewrites the scan to one per-key column"
+  quote: "when the `AttrsPerKeyProjection` rule applies"
   kind: positive
   binds:
     - crates/ravel-sql/src/attrs_per_key.rs::AttrsPerKeyProjection
     - crates/ravel-sql/src/logs_scan.rs::reproject_attr_keys
   status: verified
-  note: "Issue #1768 shipped AttrsPerKeyProjection, a physical optimizer rule session.rs installs on every session: a query that reads attrs only through literal subscripts decodes only those keys' FIELD_DIR columns plus attrs_raw via LogsScanExec::reproject_attr_keys. Corrected by #2082."
+  note: "Issue #1768 shipped AttrsPerKeyProjection, a physical optimizer rule session.rs installs on every session: a query that reads attrs only through literal subscripts, in a single-scan plan with no pending erasure, decodes only those keys' FIELD_DIR columns plus attrs_raw via LogsScanExec::reproject_attr_keys. Corrected by #2082."
 
 - id: troubleshooting-breaker-guarantee
   doc: docs/guides/operations/troubleshooting.md
