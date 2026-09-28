@@ -257,13 +257,14 @@ and then the absent Pending/Firing instances with `condition_met = false`
   `AlertError::TooManyAlerts` when a rule matches more than
   `MAX_ALERTS_PER_RULE` series (`crates/ravel-alerting/src/instance.rs`), so the
   rule fails the tick before any write above the cap.
-- The absent set is bounded transitively. After any tick that ran to the end,
-  the only Pending or Firing entries left for the rule are those in that tick's
-  matched set (an absent entry is fed `condition_met = false` and resolves to a
-  terminal state), so the live Pending/Firing count for a rule never exceeds
-  `MAX_ALERTS_PER_RULE`. The next tick's absent set is a subset of that live
-  count, hence also at most `MAX_ALERTS_PER_RULE`. A tick that fails leaves
-  prior state untouched, so it cannot grow the live set past the cap either.
+- The absent set is bounded transitively, for every tick after the first. After
+  any tick that ran to the end, the only Pending or Firing entries left for the
+  rule are those in that tick's matched set (an absent entry is fed
+  `condition_met = false` and resolves to a terminal state), so the live
+  Pending/Firing count for a rule never exceeds `MAX_ALERTS_PER_RULE`. The next
+  tick's absent set is a subset of that live count, hence also at most
+  `MAX_ALERTS_PER_RULE`. A tick that fails leaves prior state untouched, so it
+  cannot grow the live set past the cap either.
 
 Both groups can be disjoint in one tick: 1000 previously-firing series all stop
 matching while 1000 new series start matching. That tick writes up to 1000
@@ -272,6 +273,25 @@ pairs and up to 2000 notifications per sink. The lease TTL and query deadline
 (`alerting.rs` `seal_bound_hour`) still have to cover this doubled worst case,
 not the halved figure the original text implied.
 
+The transitive half of the argument has one gap, and the code allows more than
+`2 x MAX_ALERTS_PER_RULE` in exactly that case. `absent` is built from the
+folded `latest` map, which is whatever history holds, not from anything this
+version wrote. Nothing bounds how many Pending or Firing identities of one
+`rule_id` a pre-per-series history left behind: before decision 4 existed no
+walk resolved an identity a rule label change had orphaned, so each rule label
+revision could leave a Firing entry that is still Firing at upgrade time. The
+Consequences bullet above already names this ("Identities left behind by a rule
+label change were never resolved before; decision 4's walk resolves them once").
+On that first tick the absent set is the number of such orphaned identities,
+which can exceed the cap, and the tick writes one resolution for each. It is a
+one-off: every one of them reaches a terminal state in that tick, and from the
+next tick on the bound above holds. Bounding it is memo pruning's problem
+(#1438), not this amendment's; a deployment upgrading a rule set with a long
+label-change history should expect one oversized tick.
+
 This corrects the stated bound only; the code already publishes resolutions
 this way, and this amendment changes no publish behaviour. The cap, the
-identity preimage, and the storage format are unchanged.
+identity preimage, and the storage format are unchanged. The bound is on what
+one tick publishes and queues, not on what one tick delivers: sink delivery
+carries notifications across ticks and is bounded separately, by the per-tick
+delivery deadline in `flush_sinks` (issue #2063).

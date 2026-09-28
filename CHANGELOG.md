@@ -36,6 +36,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--distributed-query` a `GetFlightInfo` and its `DoGet` that land on an
   old and a new process fail with `invalid_argument` until the rollout
   completes, and the query has to be run again.
+
 ### Fixed
 
 - **Alert sink delivery is bounded per evaluation tick, and ADR-0117's stated

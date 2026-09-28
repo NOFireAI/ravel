@@ -1658,6 +1658,18 @@ impl AlertEvaluator {
     /// the undelivered map and are counted in
     /// [`AlertEvalReport::notifications_deferred`].
     ///
+    /// `now_ns` is the tick's own reading, taken before rule evaluation, so the
+    /// deadline bounds the delivery phase against the start of the tick rather
+    /// than against the start of delivery. The check is made before a delivery
+    /// starts, not during one, so the pass can overshoot the deadline by the
+    /// last attempt: at most `sinks * sink_timeout`, which with the defaults
+    /// leaves the whole tick inside one interval.
+    ///
+    /// The first notification is always attempted, deadline or not. A tick
+    /// whose rule evaluation alone consumed the budget would otherwise defer
+    /// every notification, every tick, and deliver nothing at all while the
+    /// sinks were healthy.
+    ///
     /// # Oldest first
     ///
     /// The undelivered map is a `HashMap`, whose iteration order is not stable,
@@ -1680,14 +1692,16 @@ impl AlertEvaluator {
             .map(|(id, n)| (*id, n.clone()))
             .collect();
         pending.sort_by_key(|(id, n)| (n.record.ts_ns, *id));
+        let mut attempted = false;
         for (alert_id, notification) in pending {
-            if self.clock.now_ns() >= deadline_ns {
+            if attempted && self.clock.now_ns() >= deadline_ns {
                 // Past the per-tick deadline: leave this and every later
                 // notification in the undelivered map for the next tick, where
                 // the oldest-first order will reach them first.
                 report.notifications_deferred += 1;
                 continue;
             }
+            attempted = true;
             let mut all_ok = true;
             for sink in self.sinks.iter() {
                 if let Err(err) = deliver(&self.http, sink, &notification).await {
@@ -5098,8 +5112,38 @@ mod tick_tests {
         }
     }
 
+    /// Read one whole HTTP request off `socket` (headers, then `content-length`
+    /// bytes) and return its body. Answering while the client is still writing
+    /// its body would surface as a broken pipe and read as a delivery failure,
+    /// which is the opposite of what the sinks below exist to produce.
+    async fn read_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return Vec::new(),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = head_end + 4;
+            if buf.len() >= body_start + body_len {
+                return buf[body_start..body_start + body_len].to_vec();
+            }
+        }
+    }
+
     async fn ok_sink() -> OkSink {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -5107,32 +5151,7 @@ mod tick_tests {
         let addr = listener.local_addr().expect("ok sink addr");
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                // Drain the whole request (headers, then `content-length`
-                // bytes) before answering. Replying while the client is still
-                // writing its body would surface as a broken pipe and read as
-                // a delivery failure, which is the opposite of what this sink
-                // exists to produce.
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 1024];
-                loop {
-                    let read = socket.read(&mut chunk).await;
-                    match read {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    }
-                    let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-                        continue;
-                    };
-                    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
-                    let body_len = head
-                        .lines()
-                        .find_map(|line| line.strip_prefix("content-length:"))
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    if buf.len() >= head_end + 4 + body_len {
-                        break;
-                    }
-                }
+                let _ = read_request_body(&mut socket).await;
                 let _ = socket
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
                     .await;
@@ -5141,6 +5160,63 @@ mod tick_tests {
         });
         OkSink {
             url: format!("http://{addr}/hook"),
+            task,
+        }
+    }
+
+    /// A webhook endpoint that advances the injected clock before it answers,
+    /// and answers `500`. One delivery therefore costs injected time exactly as
+    /// a slow sink costs wall time, with no wall-clock wait anywhere, and the
+    /// failure keeps the notification in the undelivered map so the next tick's
+    /// delivery order can be read off [`SlowSink::seen`]. Aborted on drop.
+    struct SlowSink {
+        url: String,
+        /// The hex `alert_id` of every POST this sink saw, in arrival order.
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for SlowSink {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl SlowSink {
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().expect("seen").clone()
+        }
+    }
+
+    async fn slow_sink(clock: Arc<TestClock>, delta_ns: i64) -> SlowSink {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow sink");
+        let addr = listener.local_addr().expect("slow sink addr");
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = read_request_body(&mut socket).await;
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body)
+                    && let Some(id) = json["alert_id"].as_str()
+                {
+                    recorded.lock().expect("seen").push(id.to_string());
+                }
+                // The clock moves before the answer, so the caller's next
+                // deadline check already sees this delivery's cost.
+                clock.advance(delta_ns);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+        SlowSink {
+            url: format!("http://{addr}/hook"),
+            seen,
             task,
         }
     }
@@ -5285,6 +5361,193 @@ mod tick_tests {
 
         drop(ev);
         assert_eq!(metrics.undelivered_notifications(), 0);
+    }
+
+    /// The per-tick delivery budget in nanoseconds, as
+    /// [`AlertEvaluator::new`] derives it from the default interval.
+    fn sink_delivery_budget_ns() -> i64 {
+        let interval = DEFAULT_ALERT_EVAL_INTERVAL * SINK_DELIVERY_DEADLINE_FRACTION.0
+            / SINK_DELIVERY_DEADLINE_FRACTION.1;
+        i64::try_from(interval.as_nanos()).expect("budget fits i64")
+    }
+
+    /// One slow sink cannot hold a tick past its delivery budget (issue #2063).
+    /// Each delivery costs the whole budget on the injected clock, so a tick
+    /// attempts one notification and defers the rest: the deferred counter moves
+    /// by exactly the number not attempted, the tick's delivery phase ends at
+    /// the deadline, and the undelivered gauge is the whole carried remainder.
+    /// The second tick attempts the oldest carried notification, not one of the
+    /// four newer ones queued in the meantime.
+    #[tokio::test]
+    async fn alert_sink_delivery_is_bounded_per_tick() {
+        let budget_ns = sink_delivery_budget_ns();
+        let later = NOW_NS + 10 * 60 * NS_PER_SEC;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT);
+        // One series is hot for the first tick.
+        publish_series(
+            store.as_ref(),
+            &tenant,
+            vec![(
+                instance_label_set("host-0000"),
+                vec![(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+            )],
+        )
+        .await;
+
+        let clock = TestClock::at(NOW_NS);
+        let sink = slow_sink(Arc::clone(&clock), budget_ns).await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let mut ev = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::clone(&metrics),
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, 1, "the one hot series fires");
+        assert_eq!(first.notifications_failed, 1, "the sink answers 500");
+        assert_eq!(
+            first.notifications_deferred, 0,
+            "the only notification is attempted, so nothing is deferred"
+        );
+        assert_eq!(
+            clock.now_ns(),
+            NOW_NS + budget_ns,
+            "the one delivery consumed the whole budget"
+        );
+        let oldest = compute_alert_id("high-cpu", &instance_alert_labels("host-0000")).to_hex();
+        assert_eq!(sink.seen(), vec![oldest.clone()]);
+
+        // Four more series turn hot ten minutes on, in a second segment. The
+        // first series is in it too, so it keeps matching rather than resolving.
+        let late = later - 30 * NS_PER_SEC;
+        publish_series_at_seq(
+            store.as_ref(),
+            &tenant,
+            (0..5)
+                .map(|i| {
+                    (
+                        instance_label_set(&format!("host-{i:04}")),
+                        vec![(late, 1.0)],
+                    )
+                })
+                .collect(),
+            2,
+        )
+        .await;
+
+        clock.set(later);
+        let second = ev.run_tick().await;
+        assert_eq!(
+            second.records_written, 4,
+            "the four new series fire; the first is already Firing"
+        );
+        assert_eq!(
+            second.notifications_failed, 1,
+            "one delivery is attempted before the deadline"
+        );
+        assert_eq!(
+            second.notifications_deferred, 4,
+            "the four not attempted are deferred, counted exactly"
+        );
+        assert_eq!(
+            clock.now_ns(),
+            later + budget_ns,
+            "the delivery phase ends at the deadline, not after five sink calls"
+        );
+        assert_eq!(
+            metrics.notifications_deferred(),
+            4,
+            "the deferrals reach ravel_alert_notifications_deferred_total"
+        );
+        assert_eq!(
+            metrics.undelivered_notifications(),
+            5,
+            "the gauge is the carried remainder: the deferred four plus the failed one"
+        );
+        assert_eq!(
+            sink.seen(),
+            vec![oldest.clone(), oldest],
+            "the oldest notification is the one attempted, not one of the four newer"
+        );
+    }
+
+    /// The healthy case the bound must not touch: five notifications and a sink
+    /// that answers at once all clear in one tick, with nothing deferred.
+    #[tokio::test]
+    async fn a_healthy_sink_delivers_every_notification_in_one_tick() {
+        let store = store_with_hot_instances(5).await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = ok_sink().await;
+        let mut ev = evaluator_with(
+            store,
+            TestClock::at(NOW_NS),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::clone(&metrics),
+        );
+
+        let report = ev.run_tick().await;
+        assert_eq!(report.records_written, 5);
+        assert_eq!(report.notifications_delivered, 5);
+        assert_eq!(report.notifications_failed, 0);
+        assert_eq!(report.notifications_deferred, 0);
+        assert_eq!(metrics.notifications_deferred(), 0);
+        assert_eq!(
+            metrics.undelivered_notifications(),
+            0,
+            "every notification left the map"
+        );
+    }
+
+    /// The resolution term of ADR-0117's amended per-tick publish bound (issue
+    /// #2064). A rule matching exactly `MAX_ALERTS_PER_RULE` series in one tick
+    /// and none in the next writes exactly `MAX_ALERTS_PER_RULE` resolutions on
+    /// that next tick, so one rule's worst case over a tick is the matched set
+    /// plus the resolutions, not the matched set alone.
+    #[tokio::test]
+    async fn a_tick_resolves_the_whole_cap_when_the_matched_set_empties() {
+        let cap = ravel_alerting::MAX_ALERTS_PER_RULE;
+        let store = store_with_hot_instances(cap).await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        let first = evaluator.run_tick().await;
+        assert_eq!(first.rules_failed, 0, "the cap itself is not over the cap");
+        assert_eq!(
+            first.records_written, cap as u32,
+            "the matched-set term of the bound"
+        );
+
+        // Ten minutes on every sample is outside the PromQL lookback, so the
+        // rule matches nothing and every open alert resolves by absence.
+        clock.set(NOW_NS + 10 * 60 * NS_PER_SEC);
+        let second = evaluator.run_tick().await;
+        assert_eq!(second.rules_failed, 0);
+        assert_eq!(
+            second.records_written, cap as u32,
+            "the resolution term of the bound: one per alert open at the end of \
+             the previous tick and now absent"
+        );
+
+        let records = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(
+            records.len(),
+            2 * cap,
+            "2 x MAX_ALERTS_PER_RULE records over the two ticks"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.state == AlertState::Resolved)
+                .count(),
+            cap
+        );
+
+        // Nothing is resolved twice.
+        assert_eq!(evaluator.run_tick().await.records_written, 0);
     }
 
     /// The liveness gauge is the only figure that separates a dead loop from a

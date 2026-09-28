@@ -152,6 +152,8 @@ pending, firing, and resolved on its own.
   Notifications not attempted before the deadline stay queued, oldest first, and
   are retried next tick; `ravel_alert_notifications_deferred_total` counts them,
   and a rising value means a sink is too slow to drain the queue within a tick.
+  The oldest queued notification is always attempted, even on a tick whose rule
+  evaluation alone used the budget, so delivery never stops entirely.
   Because a tick both raises new alerts and resolves alerts that stopped
   matching, the per-tick publish worst case for one rule is twice the cap: up to
   1000 new transitions plus up to 1000 resolutions, so up to 2000 records and
