@@ -247,7 +247,7 @@ pub async fn sweep_audit_retention(
 /// `expiry_floor`, the record's exact event time could fall on either side,
 /// so this returns `false` and the caller must GET, decode, and run the
 /// authoritative per-record check.
-fn hour_certainly_not_expired(ingest_hour_bucket: u32, expiry_floor: i64) -> bool {
+pub(crate) fn hour_certainly_not_expired(ingest_hour_bucket: u32, expiry_floor: i64) -> bool {
     let bucket_start_ns = i64::from(ingest_hour_bucket).saturating_mul(NS_PER_HOUR);
     bucket_start_ns >= expiry_floor
 }
@@ -256,7 +256,7 @@ fn hour_certainly_not_expired(ingest_hour_bucket: u32, expiry_floor: i64) -> boo
 /// strictly older than `expiry_floor`) AND past the protection horizon
 /// (`now >= created_unix_ns + horizon`). Both gates, both anchored on durable
 /// record fields; see the module docs for why each is needed.
-fn expired_and_past_horizon(
+pub(crate) fn expired_and_past_horizon(
     max_event_ts_ns: i64,
     created_unix_ns: i64,
     expiry_floor: i64,
