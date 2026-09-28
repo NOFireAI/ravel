@@ -127,6 +127,7 @@ async fn seed_compaction(store: &MemoryStore, tenant: &str, inputs: &[(Uuid, u64
         input_set_hash: vec![7u8; 32],
         parts: vec![part.clone()],
         created_unix_ns: 999,
+        superseded_record_key: String::new(),
     };
     let part_key = keys::reconstruct_l1_part_key(&record, &part).expect("part key");
     store
@@ -756,6 +757,7 @@ fn decode_compaction_record_prints_fields() {
             declared_column_stats: Vec::new(),
         }],
         created_unix_ns: 999,
+        superseded_record_key: String::new(),
     };
     decode_compaction_record(&record.encode_to_vec()).expect("decode + print");
 }

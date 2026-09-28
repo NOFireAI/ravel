@@ -494,6 +494,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Readers accept and validate a version 2 compaction record** (ADR-0066,
+  force 2 amendment, issue #2093). `CompactionRecord` gains
+  `superseded_record_key`, naming the compaction record a version 2 record
+  re-encodes. Decoding accepts `format_version` 1 or 2 and checks that a
+  version 2 record names a compaction record in its own tenant, signal, shard
+  and hour and carries the version 2 input-set hash over its inputs and that
+  key; a version 1 record that sets the field is refused. Nothing writes a
+  version 2 record yet, and resolution does not yet honour one. A build
+  without this change refuses a version 2 record with its unsupported
+  `format_version` error. Version 1 records encode and decode byte for byte
+  as before.
 - **The maintenance loop sweeps alert history older than `--alert-retention`,
   default 90 days** (ADR-1688 follow-up task 2, issue #1688). After upgrade
   the first tick deletes every alert transition older than 90 days except each

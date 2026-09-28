@@ -175,6 +175,7 @@ async fn put_compaction_record(
         input_set_hash: input_set_hash.to_vec(),
         parts,
         created_unix_ns: i64::from(hour) * NS_PER_HOUR + 120_000_000_000,
+        superseded_record_key: String::new(),
     };
     let hash16: String = input_set_hash[..8]
         .iter()

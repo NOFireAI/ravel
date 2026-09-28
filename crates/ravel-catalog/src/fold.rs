@@ -4946,6 +4946,7 @@ mod tests {
             input_set_hash: input_set_hash.to_vec(),
             parts: compaction_parts,
             created_unix_ns: max_ts_all,
+            superseded_record_key: String::new(),
         };
         for (part, bytes) in record.parts.iter().zip(part_bytes) {
             let key = keys::reconstruct_l1_part_key(&record, part).expect("l1 part key");
@@ -6894,6 +6895,7 @@ mod tests {
             input_set_hash: input_set_hash.to_vec(),
             parts: vec![part],
             created_unix_ns,
+            superseded_record_key: String::new(),
         };
         let key = keys::compaction_record_key_for(&record).expect("compaction key");
         store
@@ -6982,6 +6984,7 @@ mod tests {
             input_set_hash: input_set_hash.to_vec(),
             parts: vec![part],
             created_unix_ns,
+            superseded_record_key: String::new(),
         };
         let data_key =
             keys::reconstruct_l1_part_key(&record, &record.parts[0]).expect("l1 part key");

@@ -277,6 +277,45 @@ pub fn compute_compaction_input_set_hash(inputs: &[CompactionInputIdentity]) -> 
     *hasher.finalize().as_bytes()
 }
 
+/// Domain-separation prefix for
+/// [`compute_superseding_compaction_input_set_hash`]. Distinct from both
+/// [`COMPACTION_INPUT_SET_HASH_DOMAIN`] and [`REWRITE_INPUT_SET_HASH_DOMAIN`],
+/// so a version 2 record never hashes to its predecessor's key.
+pub const SUPERSEDING_COMPACTION_INPUT_SET_HASH_DOMAIN: &[u8] =
+    b"ravel-compaction-input-set-v2-superseding\0";
+
+/// Canonical `input_set_hash` for a `format_version` 2 `CompactionRecord`
+/// (ADR-0066, force 2 amendment, item 2): blake3 over
+/// `(inputs, superseded_record_key)`.
+///
+/// The preimage is [`SUPERSEDING_COMPACTION_INPUT_SET_HASH_DOMAIN`], then the
+/// inputs framed exactly as [`compute_compaction_input_set_hash`] frames them
+/// (a little-endian `u64` count, then per input its length-prefixed
+/// `writer_id`, `writer_epoch` and `writer_seq`), then the UTF-8 bytes of
+/// `superseded_record_key` prefixed by their length as a little-endian `u64`.
+/// Like the version 1 hash it does not sort `inputs`.
+///
+/// The one preimage shared by the writer of a version 2 record and the
+/// decode-time check in [`crate::record::validate_compaction`].
+pub fn compute_superseding_compaction_input_set_hash(
+    inputs: &[CompactionInputIdentity],
+    superseded_record_key: &str,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SUPERSEDING_COMPACTION_INPUT_SET_HASH_DOMAIN);
+    hasher.update(&(inputs.len() as u64).to_le_bytes());
+    for input in inputs {
+        let wid = input.writer_id.as_bytes();
+        hasher.update(&(wid.len() as u64).to_le_bytes());
+        hasher.update(wid);
+        hasher.update(&input.writer_epoch.to_le_bytes());
+        hasher.update(&input.writer_seq.to_le_bytes());
+    }
+    hasher.update(&(superseded_record_key.len() as u64).to_le_bytes());
+    hasher.update(superseded_record_key.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 // --- RewriteRecord ---
 
 /// Domain-separation prefix for [`compute_rewrite_input_set_hash`]. Distinct
@@ -1272,6 +1311,83 @@ mod tests {
                 .try_into()
                 .expect("32 bytes");
         assert_eq!(compute_compaction_input_set_hash(&inputs), expected);
+    }
+
+    fn two_inputs() -> Vec<CompactionInputIdentity> {
+        vec![
+            CompactionInputIdentity {
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            CompactionInputIdentity {
+                writer_id: Uuid::from_u128(2).to_string(),
+                writer_epoch: 2,
+                writer_seq: 5,
+            },
+        ]
+    }
+
+    const PREDECESSOR_KEY: &str =
+        "t/00000000000000000000000000000000/m/c/0001/20260928T10/l1.0123456789abcdef.cmt";
+
+    /// The preimage spelled out byte by byte, independently of the function,
+    /// so a change to the framing fails here rather than silently rekeying
+    /// every version 2 record.
+    #[test]
+    fn superseding_compaction_hash_matches_its_documented_preimage() {
+        let inputs = two_inputs();
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"ravel-compaction-input-set-v2-superseding\0");
+        preimage.extend_from_slice(&2u64.to_le_bytes());
+        for input in &inputs {
+            preimage.extend_from_slice(&36u64.to_le_bytes());
+            preimage.extend_from_slice(input.writer_id.as_bytes());
+            preimage.extend_from_slice(&input.writer_epoch.to_le_bytes());
+            preimage.extend_from_slice(&input.writer_seq.to_le_bytes());
+        }
+        preimage.extend_from_slice(&(PREDECESSOR_KEY.len() as u64).to_le_bytes());
+        preimage.extend_from_slice(PREDECESSOR_KEY.as_bytes());
+        let hash = compute_superseding_compaction_input_set_hash(&inputs, PREDECESSOR_KEY);
+        assert_eq!(hash, *blake3::hash(&preimage).as_bytes());
+        assert_eq!(
+            hex::encode(hash),
+            "3247ea62e0bb822b7e5bf3cf6a38b316b46b7b3b0fc889d597546fe691a5e315"
+        );
+    }
+
+    #[test]
+    fn superseding_compaction_hash_differs_from_the_version_one_and_rewrite_hashes() {
+        let inputs = two_inputs();
+        let v2 = compute_superseding_compaction_input_set_hash(&inputs, PREDECESSOR_KEY);
+        assert_ne!(v2, compute_compaction_input_set_hash(&inputs));
+        assert_ne!(v2, compute_rewrite_input_set_hash(&inputs, None, &[]));
+        assert_ne!(
+            v2,
+            compute_rewrite_input_set_hash(&[], Some(PREDECESSOR_KEY), &[])
+        );
+        // An empty key still hashes under its own domain, never to version 1.
+        assert_ne!(
+            compute_superseding_compaction_input_set_hash(&inputs, ""),
+            compute_compaction_input_set_hash(&inputs)
+        );
+        let other_key = PREDECESSOR_KEY.replace("0123456789abcdef", "fedcba9876543210");
+        assert_ne!(
+            v2,
+            compute_superseding_compaction_input_set_hash(&inputs, &other_key)
+        );
+    }
+
+    #[test]
+    fn superseding_compaction_hash_domain_is_distinct() {
+        assert_ne!(
+            SUPERSEDING_COMPACTION_INPUT_SET_HASH_DOMAIN,
+            COMPACTION_INPUT_SET_HASH_DOMAIN
+        );
+        assert_ne!(
+            SUPERSEDING_COMPACTION_INPUT_SET_HASH_DOMAIN,
+            REWRITE_INPUT_SET_HASH_DOMAIN
+        );
     }
 
     #[test]
