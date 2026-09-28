@@ -2233,7 +2233,7 @@
           "id": 33,
           "type": "timeseries",
           "title": "Notification delivery",
-          "description": "Deliveries against failures and deferrals. Either failures or deferrals rising while deliveries sit at zero is the shape RavelAlertNotificationsAllFailing pages on; a deferral is a notification the tick never attempted, because the per-tick delivery deadline elapsed first.",
+          "description": "Deliveries against failures and deferrals. Failures rising while deliveries sit at zero is the shape RavelAlertNotificationsAllFailing pages on. A deferral is a notification the tick never attempted because the per-tick delivery deadline elapsed first; deferrals rising while deliveries continue mean the queue is draining slower than it fills, which no shipped rule pages on.",
           "gridPos": {
             "h": 8,
             "w": 12,
