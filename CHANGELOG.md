@@ -192,6 +192,45 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   can sit in memory for up to an hour before its flush opens, and a crash in
   that window loses it. Strict mode is unaffected at any setting. The
   ravel-bench PUT-count estimates count the new trigger too.
+- **`ObjectStoreBackend::get_pinned` reads exactly the bytes a recorded pin
+  names, and `ravel-object-store` gains read-only external stores per
+  credential profile** (ADR-2040, issue #2065).
+  - A pin's ETag is sent as `If-Match`, so a replaced object is refused with
+    `PreconditionFailed`. A pin's version, when the store reported one, is
+    sent as a version selector, so the pinned version keeps being served
+    after an overwrite, and a deleted version is `NotFound`. A caller's pin
+    rides every request of a split whole-object read, the unranged first
+    one included, and such a read is still verified against the store's
+    upload checksum when the endpoint returns one.
+  - `get_pinned` returns a `PinnedRead` carrying the pin of the bytes
+    served. `pin_of` and `get_with_pin` report an object's pin, including
+    S3's `x-amz-version-id` when the bucket has versioning on. The default
+    implementation refuses with the new `Unsupported` error rather than
+    falling back to an unconditional read.
+  - `external::ExternalStore` opens one granted bucket per `ExternalProfile`
+    and refuses every write with the new `ReadOnly` error. A profile names
+    where its secrets live and never holds their values, and a credential
+    failure is reported as `CredentialsRejected` without the path or secret.
+  - `external::probe` qualifies a candidate bucket: it must honour
+    preconditions, and it must not be Ravel's own bucket, whether under
+    another name or as a copy that holds Ravel's `sys/tenancy` marker.
+  - `ravel_cache::CacheKey::pinned` keys such an object by profile, bucket,
+    key, ETag, version and size.
+
+  No shipping binary reaches any of it yet; the callers are #2052, #2051
+  and #2054.
+- **Parquet table location grants and in-place manifest format** (ADR-2040,
+  issue #2050): the new `ravel-pqtable` crate and
+  `proto/ravel/parquet_table.proto`. A per-tenant grants record at
+  `t/<tenant_hash>/pq/grants` holds the locations an operator admitted, each
+  with the credential profile to read it under, and resolves a `LOCATION` URL
+  to exactly one grant. A table manifest version pins the tenant's own
+  Parquet files in place, by bucket and object key with the ETag and store
+  version read at the time, rather than copying them into Ravel's bucket; a
+  key that object_store's `Path` would rewrite is refused. Both records carry
+  the tenant hash they were written for, and a grants record or manifest read
+  under another tenant's key is refused as `Misfiled` rather than read as that
+  tenant's. No shipping binary calls it yet.
 
 ## [0.19.0] - 2026-09-27
 
