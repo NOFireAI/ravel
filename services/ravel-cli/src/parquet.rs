@@ -19,6 +19,16 @@
 //! a default: a bucket with no `sys/gc` has never been started by a server, so
 //! there is no deployment minimum to read and the sweep refuses instead of
 //! inventing one.
+//!
+//! What the floor protects is a writer's resolve-to-put window, not a running
+//! query, which reads a table's manifest once, when it resolves.
+//! [`ravel_pqtable::writer::apply`] finishes its put within half of the same
+//! floor after its resolve, and a sweep deletes a version only once the version
+//! after it is older than the grace. Every version committed after a writer's
+//! resolve is younger than that, so no sweep frees the version key the
+//! writer's create-if-absent put targets while the writer is in flight. The
+//! stored value is at least every process's `--gc-max-query-duration`, the
+//! floor ADR-2040 names, so taking it is the stricter choice.
 
 use std::sync::Arc;
 

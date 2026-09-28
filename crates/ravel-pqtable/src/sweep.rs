@@ -5,13 +5,16 @@
 //! delete them. The only objects a sweep touches are manifest versions under
 //! `t/<tenant_hash>/pq/t/`, which is also the only prefix it lists.
 //!
-//! The grace period is what keeps a query that resolved an older version
-//! readable, so it is measured from when a version stopped being needed: a
-//! manifest version other than its table's newest is deleted once the version
-//! that superseded it (the next one present) is older than the grace plus
-//! [`SKEW_MS`]. [`plan`] only ever selects a version that has a successor in
-//! the same listing, so it does not select a table's newest version, dropped
-//! or live, which the next writer numbers from.
+//! The grace is measured from when a version stopped being its table's newest:
+//! a manifest version other than the newest is deleted once the version that
+//! superseded it (the next one present) is older than the grace plus
+//! [`SKEW_MS`]. What that protects is a writer's resolve-to-put window, not a
+//! query, which reads a manifest once, when it resolves: [`crate::writer`]
+//! finishes a put within half of the minimum grace after its resolve, so every
+//! version committed after that resolve is too young for a sweep to free the
+//! key the put targets. [`plan`] only ever selects a version that has a
+//! successor in the same listing, so it does not select a table's newest
+//! version, dropped or live, which the next writer numbers from.
 //!
 //! [`plan`] refuses a grace below the deployment's minimum (its
 //! `--gc-max-query-duration`). Ages come from the store's

@@ -969,10 +969,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_45_s_sweep_floor_leaves_a_usable_put_budget() {
-        // 45 s is the smallest grace floor `sweep` accepts. The budget is
-        // measured end to end on this call's own clock, so nothing is taken
-        // off it for the difference between that clock and the store's.
+    async fn a_45_s_grace_floor_leaves_a_usable_put_budget() {
+        // A 45 s floor leaves a 22.5 s resolve-to-put budget, and a put on a
+        // clock that does not move commits inside it. The budget is measured
+        // end to end on this call's own clock, so nothing is taken off it for
+        // the difference between that clock and the store's.
         let store = MemoryStore::new();
         assert_eq!(
             apply(
