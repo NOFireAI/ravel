@@ -6206,12 +6206,16 @@ impl BlockRangeFetcher {
             // by block, so the block-range GET count stays proportional to the
             // blocks the probe did NOT already carry.
             if asm.covers(ext.abs_start, ext.abs_end()) {
-                let block = Bytes::copy_from_slice(&asm.slice(key, ext.abs_start, ext.len)?);
+                let block = asm.slice(key, ext.abs_start, ext.len)?;
                 verify_block_crc(key, &block, ext)?;
+                // Copy only for the cache: without one the verified block is
+                // read in place from its placed region.
                 if let Some(cache) = &self.cache {
                     let cache_key =
                         CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-                    cache.insert(cache_key, block).await;
+                    cache
+                        .insert(cache_key, Bytes::copy_from_slice(&block))
+                        .await;
                 }
                 continue;
             }
