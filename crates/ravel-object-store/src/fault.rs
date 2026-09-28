@@ -1812,7 +1812,7 @@ mod tests {
             .get_pinned("k", GetRange::Full, &stale)
             .await
             .expect("the matching pin is served");
-        assert_eq!(&got.data[..], b"v1");
+        assert_eq!(&got.outcome.data[..], b"v1");
 
         store
             .put("k", Bytes::from_static(b"v2"), PutOptions::default())

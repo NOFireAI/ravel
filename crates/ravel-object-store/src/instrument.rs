@@ -892,7 +892,7 @@ mod tests {
             .get_pinned("pinned/k", GetRange::Range(0, 4), &pin)
             .await
             .expect("a matching pin is served");
-        assert_eq!(&got.data[..], b"0123");
+        assert_eq!(&got.outcome.data[..], b"0123");
 
         let err = store
             .get_pinned("pinned/k", GetRange::Range(0, 4), &Pin::etag("\"0\""))

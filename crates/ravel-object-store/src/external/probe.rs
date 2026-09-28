@@ -16,16 +16,47 @@ use rand::RngExt;
 
 use crate::{GetRange, ObjectStoreBackend, Pin, PutOptions, StoreError};
 
-/// Prefix for the objects [`probe_not_ravel_bucket`] writes. Everything under
-/// it is transient: the probe deletes its object before returning, on every
-/// path.
+/// Prefix for the objects [`probe_not_ravel_bucket`] writes.
+///
+/// Objects under it are meant to be transient: the probe issues a delete for
+/// its own object on every path it returns through. Two paths can still leave
+/// one behind, because neither reaches that delete: a probe put that timed out
+/// after the object had landed (the write is reported as failed and the key is
+/// not deleted), and a cancelled probe (the future dropped before the delete is
+/// issued). Nothing in Ravel reaps this prefix, so what bounds the leak is
+/// whatever lifecycle rule the operator sets on `sys/pq-probe/` in the bucket
+/// itself. Each leaked object is 32 bytes.
 pub const PROBE_PREFIX: &str = "sys/pq-probe/";
 
+/// The key Ravel's own buckets carry a tenancy marker under (ADR-0050).
+///
+/// Spelled out here rather than imported: the constant it mirrors lives in
+/// `ravel-server`, which depends on this crate, so importing it would invert
+/// the dependency.
+const TENANCY_MARKER_KEY: &str = "sys/tenancy";
+
 /// An ETag no store issues, used as the wrong half of the precondition probe.
+///
+/// Random per call, so a store cannot pass the refusing half by special-casing
+/// one literal: a fixed value is a string an endpoint can learn to reject, and
+/// the probe would then record "refuses a wrong ETag" for a store that refuses
+/// exactly that ETag and serves every other pinned read unconditionally.
 /// Quoted because S3 ETags are quoted strings and an unquoted value could be
 /// rejected as malformed rather than evaluated as a precondition, which would
 /// make the probe pass for the wrong reason.
-const WRONG_ETAG: &str = "\"0\"";
+fn wrong_etag() -> String {
+    use std::fmt::Write;
+
+    let bytes: [u8; 16] = rand::rng().random();
+    let mut etag = String::with_capacity(34);
+    etag.push('"');
+    for byte in bytes {
+        // Infallible: `String`'s `Write` never fails.
+        let _ = write!(etag, "{byte:02x}");
+    }
+    etag.push('"');
+    etag
+}
 
 /// Why [`probe_preconditions`] refused a store, by half.
 ///
@@ -78,7 +109,7 @@ pub struct PreconditionProbe {
 ///
 /// Three requests: a HEAD to learn the object's identity, then two 1-byte
 /// ranged reads, one carrying that identity and one carrying an ETag no store
-/// issues.
+/// issues, drawn afresh on every call (see [`wrong_etag`]).
 /// The store qualifies only if the first is served and the second is refused
 /// with [`StoreError::PreconditionFailed`]. One byte, because what is being
 /// measured is the header, not the body.
@@ -89,21 +120,20 @@ pub async fn probe_preconditions(
     store: &dyn ObjectStoreBackend,
     key: &str,
 ) -> Result<PreconditionProbe, PreconditionProbeFailure> {
-    let meta = store
-        .head(key)
-        .await
-        .map_err(|source| PreconditionProbeFailure::Head {
-            key: key.to_string(),
-            source,
-        })?;
-    // The version half of the pin is only asserted when the store reports one
-    // distinct from the ETag: sending the ETag back as a `versionId` would fail
-    // for a reason that says nothing about precondition support.
-    let version = (meta.version.0 != meta.etag.0).then(|| meta.version.0.clone());
-    let matching = Pin {
-        etag: meta.etag.0.clone(),
-        version: version.clone(),
-    };
+    // `pin_of` is the one path that turns store metadata into a pin, so the
+    // probe asserts the same identity a caller would record. It reports a
+    // version only when the store has one distinct from the ETag: sending the
+    // ETag back as a `versionId` would fail for a reason that says nothing
+    // about precondition support.
+    let (meta, matching) =
+        store
+            .pin_of(key)
+            .await
+            .map_err(|source| PreconditionProbeFailure::Head {
+                key: key.to_string(),
+                source,
+            })?;
+    let version = matching.version.clone();
 
     store
         .get_pinned(key, GetRange::Range(0, 1), &matching)
@@ -114,7 +144,7 @@ pub async fn probe_preconditions(
         })?;
 
     let wrong = Pin {
-        etag: WRONG_ETAG.to_string(),
+        etag: wrong_etag(),
         version: version.clone(),
     };
     match store.get_pinned(key, GetRange::Range(0, 1), &wrong).await {
@@ -146,6 +176,12 @@ pub enum RavelBucketProbeFailure {
     /// The probe object could not be written, so the question was never asked.
     #[error("the probe object {key:?} could not be written to Ravel's own bucket: {source}")]
     ProbeWriteFailed { key: String, source: StoreError },
+    /// The candidate holds a Ravel tenancy marker, so it is a Ravel bucket:
+    /// either Ravel's own reached under a name the probe object could not
+    /// detect, or a copy or restore of one. Neither may back an external
+    /// table.
+    #[error("the candidate store holds {key:?}: candidate holds a Ravel tenancy marker")]
+    TenancyMarkerPresent { key: String },
     /// The candidate's read neither returned the probe bytes nor reported the
     /// object absent, so the probe has no answer.
     ///
@@ -158,19 +194,39 @@ pub enum RavelBucketProbeFailure {
     Inconclusive { key: String, detail: String },
 }
 
-/// Refuse a candidate bucket that is Ravel's own bucket reached under another
-/// name.
+/// Refuse a candidate bucket that is Ravel's own bucket, reached under another
+/// name or copied.
 ///
-/// Writes an object with a random key under [`PROBE_PREFIX`] and random
-/// contents to `ravel_store`, then reads that key from `candidate_store`. The
-/// key is random so no candidate can hold it by coincidence, and the contents
-/// are random so a store that answers every key with the same placeholder
-/// cannot be mistaken for Ravel's own.
+/// Two reads of the candidate, and both must come back clean.
 ///
-/// The probe object is deleted before returning, on every path including the
-/// error paths. A delete that itself fails is logged and does not change the
-/// verdict: the verdict is the answer the caller asked for, and losing it to
-/// report a leaked probe object would be the worse trade.
+/// The first is the identity read. The probe writes an object with a random
+/// key under [`PROBE_PREFIX`] and random contents to `ravel_store`, then reads
+/// that key from `candidate_store`. The key is random so no candidate can hold
+/// it by coincidence, and the contents are random so a store that answers every
+/// key with the same placeholder cannot be mistaken for Ravel's own.
+///
+/// The second reads [`TENANCY_MARKER_KEY`] from the candidate. The identity
+/// read only catches one live bucket reached twice; a copy, a restore, or a
+/// replication target of a Ravel bucket is a different bucket that still holds
+/// Ravel's objects, and the probe object written after the copy was taken is
+/// not in it. A candidate that serves the marker at all is refused, whatever
+/// the bytes are.
+///
+/// A read of either key that returns anything other than a clean `NotFound`
+/// (or, for the identity read, the exact probe payload) is inconclusive, and
+/// inconclusive refuses. One consequence is worth stating plainly: credentials
+/// scoped so tightly that they cannot read `sys/` answer the marker read with
+/// an access denial rather than a `NotFound`, so a grant offered under them is
+/// refused. That is the intended trade. The probe cannot tell "you may not ask"
+/// from "there is nothing there", and qualifying a bucket on an error message
+/// is how a Ravel bucket gets granted to an external table.
+///
+/// The probe issues a delete for its own object before returning, on every
+/// path it returns through, including the error paths. A delete that itself
+/// fails is logged and does not change the verdict: the verdict is the answer
+/// the caller asked for, and losing it to report a leaked probe object would be
+/// the worse trade. [`PROBE_PREFIX`] describes the two paths that never reach
+/// the delete at all.
 pub async fn probe_not_ravel_bucket(
     ravel_store: &dyn ObjectStoreBackend,
     candidate_store: &dyn ObjectStoreBackend,
@@ -198,8 +254,8 @@ pub async fn probe_not_ravel_bucket(
             ),
         }),
         // The one error that is a positive answer: the candidate does not have
-        // Ravel's object.
-        Err(StoreError::NotFound) => Ok(()),
+        // Ravel's object. It still has to clear the tenancy marker.
+        Err(StoreError::NotFound) => tenancy_marker_verdict(candidate_store).await,
         Err(other) => Err(RavelBucketProbeFailure::Inconclusive {
             key: key.clone(),
             detail: other.to_string(),
@@ -210,6 +266,25 @@ pub async fn probe_not_ravel_bucket(
         tracing::warn!(key = %key, error = %e, "the bucket probe object could not be deleted");
     }
     verdict
+}
+
+/// Refuse a candidate that holds Ravel's tenancy marker, and refuse one whose
+/// answer about the marker is anything other than a clean absence.
+async fn tenancy_marker_verdict(
+    candidate_store: &dyn ObjectStoreBackend,
+) -> Result<(), RavelBucketProbeFailure> {
+    match candidate_store.get(TENANCY_MARKER_KEY, GetRange::Full).await {
+        // Any bytes at all. The marker's contents are not parsed here: a
+        // candidate carrying the key is a Ravel bucket whatever it holds.
+        Ok(_) => Err(RavelBucketProbeFailure::TenancyMarkerPresent {
+            key: TENANCY_MARKER_KEY.to_string(),
+        }),
+        Err(StoreError::NotFound) => Ok(()),
+        Err(other) => Err(RavelBucketProbeFailure::Inconclusive {
+            key: TENANCY_MARKER_KEY.to_string(),
+            detail: other.to_string(),
+        }),
+    }
 }
 
 /// `sys/pq-probe/<32 random hex chars>`.
@@ -269,6 +344,10 @@ mod tests {
     /// A store that refuses a wrong pin, but with the wrong error.
     struct RefusesWithTheWrongError(Arc<MemoryStore>);
 
+    /// A store that evaluates preconditions correctly and records the ETag of
+    /// every pin it was handed, in order.
+    struct RecordsPinEtags(Arc<MemoryStore>, std::sync::Mutex<Vec<String>>);
+
     macro_rules! delegate_reads {
         ($ty:ty) => {
             #[async_trait::async_trait]
@@ -314,8 +393,11 @@ mod tests {
                     key: &str,
                     range: GetRange,
                     pin: &Pin,
-                ) -> Result<GetOutcome, StoreError> {
+                ) -> Result<crate::PinnedRead, StoreError> {
                     self.pinned(key, range, pin).await
+                }
+                async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+                    self.0.pin_of(key).await
                 }
             }
         };
@@ -327,8 +409,8 @@ mod tests {
             key: &str,
             range: GetRange,
             _pin: &Pin,
-        ) -> Result<GetOutcome, StoreError> {
-            self.0.get(key, range).await
+        ) -> Result<crate::PinnedRead, StoreError> {
+            self.0.get_with_pin(key, range).await
         }
     }
     impl RefusesEveryPin {
@@ -337,7 +419,7 @@ mod tests {
             _key: &str,
             _range: GetRange,
             _pin: &Pin,
-        ) -> Result<GetOutcome, StoreError> {
+        ) -> Result<crate::PinnedRead, StoreError> {
             Err(StoreError::PreconditionFailed)
         }
     }
@@ -347,7 +429,7 @@ mod tests {
             key: &str,
             range: GetRange,
             pin: &Pin,
-        ) -> Result<GetOutcome, StoreError> {
+        ) -> Result<crate::PinnedRead, StoreError> {
             match self.0.get_pinned(key, range, pin).await {
                 Err(StoreError::PreconditionFailed) => {
                     Err(StoreError::AccessDenied("no conditional reads".into()))
@@ -357,9 +439,25 @@ mod tests {
         }
     }
 
+    impl RecordsPinEtags {
+        async fn pinned(
+            &self,
+            key: &str,
+            range: GetRange,
+            pin: &Pin,
+        ) -> Result<crate::PinnedRead, StoreError> {
+            self.1
+                .lock()
+                .expect("the recorder lock is never poisoned")
+                .push(pin.etag.clone());
+            self.0.get_pinned(key, range, pin).await
+        }
+    }
+
     delegate_reads!(IgnoresPreconditions);
     delegate_reads!(RefusesEveryPin);
     delegate_reads!(RefusesWithTheWrongError);
+    delegate_reads!(RecordsPinEtags);
 
     #[tokio::test]
     async fn a_store_with_real_preconditions_qualifies() {
@@ -412,6 +510,37 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// The refusing half must not rest on one literal ETag. A store that
+    /// special-cases the value the probe always sent would pass the refusing
+    /// half while serving every other pinned read unconditionally, so the
+    /// value has to be drawn afresh per call.
+    #[tokio::test]
+    async fn the_wrong_etag_is_drawn_afresh_on_every_call() {
+        let store = RecordsPinEtags(seeded().await, std::sync::Mutex::new(Vec::new()));
+        probe_preconditions(&store, SUBJECT)
+            .await
+            .expect("the first probe qualifies");
+        probe_preconditions(&store, SUBJECT)
+            .await
+            .expect("the second probe qualifies");
+
+        let seen = store.1.lock().expect("the recorder lock");
+        // Two calls, each sending the matching pin then the wrong one.
+        assert_eq!(seen.len(), 4, "got {seen:?}");
+        let (first, second) = (&seen[1], &seen[3]);
+        assert_ne!(
+            first, second,
+            "the wrong ETag must differ between calls, not be a constant"
+        );
+        for wrong in [first, second] {
+            assert!(
+                wrong.starts_with('"') && wrong.ends_with('"'),
+                "the wrong ETag must stay a quoted string: {wrong}"
+            );
+            assert_eq!(wrong.len(), 34, "16 random bytes in hex, quoted: {wrong}");
+        }
     }
 
     #[tokio::test]
@@ -500,6 +629,75 @@ mod tests {
         assert!(
             probe_objects_left(&ravel).await.is_empty(),
             "the probe object must be deleted when the candidate read errors"
+        );
+    }
+
+    /// A copy, restore or replication target of a Ravel bucket is a different
+    /// bucket that still holds Ravel's objects. The probe object is written
+    /// after the copy was taken, so the identity read reports it absent and
+    /// only the tenancy marker is left to catch it.
+    #[tokio::test]
+    async fn a_candidate_that_is_a_copy_of_a_ravel_bucket_is_refused() {
+        let ravel = MemoryStore::new();
+        let candidate = MemoryStore::new();
+        candidate
+            .put(
+                TENANCY_MARKER_KEY,
+                Bytes::from_static(b"{\"tenant\":\"acme\"}"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the candidate's tenancy marker");
+
+        let err = probe_not_ravel_bucket(&ravel, &candidate)
+            .await
+            .expect_err("a bucket carrying a Ravel tenancy marker must not qualify");
+        assert!(
+            matches!(
+                err,
+                RavelBucketProbeFailure::TenancyMarkerPresent { ref key }
+                    if key == TENANCY_MARKER_KEY
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            probe_objects_left(&ravel).await.is_empty(),
+            "the probe object must be deleted on the marker path too"
+        );
+    }
+
+    /// The marker read is subject to the same rule as the identity read: only
+    /// a clean absence is an answer. Credentials that cannot read `sys/`
+    /// answer with a refusal, and a refusal is not evidence of anything.
+    #[tokio::test]
+    async fn a_candidate_that_refuses_the_tenancy_read_is_inconclusive() {
+        let ravel = MemoryStore::new();
+        let candidate = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Permanent(
+                        "403 Forbidden: s3:GetObject is not granted on sys/".into(),
+                    ),
+                )
+                .with_key_contains(TENANCY_MARKER_KEY),
+            ),
+        );
+
+        let err = probe_not_ravel_bucket(&ravel, &candidate)
+            .await
+            .expect_err("a candidate that will not answer about the marker must not qualify");
+        assert!(
+            matches!(
+                err,
+                RavelBucketProbeFailure::Inconclusive { ref key, .. } if key == TENANCY_MARKER_KEY
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            probe_objects_left(&ravel).await.is_empty(),
+            "the probe object must be deleted when the marker read errors"
         );
     }
 

@@ -887,7 +887,7 @@ mod tests {
             .get_pinned("a", GetRange::Range(0, 3), &pin)
             .await
             .expect("a matching pin is served through the handle");
-        assert_eq!(&got.data[..], b"012");
+        assert_eq!(&got.outcome.data[..], b"012");
         let err = bg
             .get_pinned("a", GetRange::Range(0, 3), &crate::Pin::etag("\"0\""))
             .await
