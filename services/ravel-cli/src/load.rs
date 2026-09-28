@@ -3835,14 +3835,31 @@ struct ColumnIndex {
     /// `(index, &AttrMap)` for each record attribute column.
     record: Vec<(usize, usize)>,
     /// The batch's columns with every mapped dictionary column resolved once.
-    /// Read by the row path ([`build_record`]); the columnar path keys its
-    /// `StrColumnDict` fast path on the dictionary itself and reads the
-    /// batch's own columns.
+    /// Read by the row path ([`build_record`]). Empty for an index built by
+    /// [`ColumnIndex::locate`], whose columnar caller keys its `StrColumnDict`
+    /// fast path on the dictionary itself and reads the batch's own columns.
     columns: ResolvedColumns,
 }
 
 impl ColumnIndex {
+    /// The index for the row path: [`ColumnIndex::locate`] plus every mapped
+    /// dictionary column resolved once for [`build_record`].
     fn resolve(batch: &RecordBatch, mapping: &Mapping) -> Result<ColumnIndex, String> {
+        let mut cols = Self::locate(batch, mapping)?;
+        // Every column the row path reads a string, a byte string or an id out
+        // of. The ts and severity-number columns are numeric.
+        let dictionary_candidates = [cols.body, cols.severity_text, cols.trace_id, cols.span_id]
+            .into_iter()
+            .flatten()
+            .chain(cols.resource.iter().map(|(i, _)| *i))
+            .chain(cols.record.iter().map(|(i, _)| *i));
+        cols.columns = ResolvedColumns::resolve(batch, dictionary_candidates)?;
+        Ok(cols)
+    }
+
+    /// The column indices alone, with no dictionary column resolved: the
+    /// columnar path ([`build_columnar_batch`]) reads dictionaries in place.
+    fn locate(batch: &RecordBatch, mapping: &Mapping) -> Result<ColumnIndex, String> {
         let schema = batch.schema();
         let idx = |name: &str| -> Result<usize, String> {
             schema
@@ -3873,14 +3890,6 @@ impl ColumnIndex {
         let severity_text = opt(&mapping.severity_text_column)?;
         let trace_id = opt(&mapping.trace_id_column)?;
         let span_id = opt(&mapping.span_id_column)?;
-        // Every column the row path reads a string, a byte string or an id out
-        // of. The ts and severity-number columns are numeric.
-        let dictionary_candidates = [body, severity_text, trace_id, span_id]
-            .into_iter()
-            .flatten()
-            .chain(resource.iter().map(|(i, _)| *i))
-            .chain(record.iter().map(|(i, _)| *i));
-        let columns = ResolvedColumns::resolve(batch, dictionary_candidates)?;
         Ok(ColumnIndex {
             ts,
             body,
@@ -3890,7 +3899,7 @@ impl ColumnIndex {
             span_id,
             resource,
             record,
-            columns,
+            columns: ResolvedColumns::none(),
         })
     }
 
@@ -4220,6 +4229,14 @@ impl ResolvedColumns {
         Ok(ResolvedColumns { columns })
     }
 
+    /// No column resolved: [`ResolvedColumns::col`] answers every index with
+    /// the batch's own column.
+    fn none() -> ResolvedColumns {
+        ResolvedColumns {
+            columns: Vec::new(),
+        }
+    }
+
     /// Column `i` of the batch these columns were resolved from.
     fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
         self.columns.get(i).unwrap_or_else(|| batch.column(i))
@@ -4389,10 +4406,11 @@ fn read_id<const N: usize>(arr: &ArrayRef, row: usize) -> Result<Option<[u8; N]>
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             read_bytes(arr, row)?.unwrap_or_default()
         }
-        // A dictionary-encoded id column: resolve the row's key and read the
-        // value it names, by this same rule. A hex id column loads in both
-        // forms: `Dictionary(_, Utf8)` when the file's every chunk for it is
-        // dictionary encoded, and plain `Utf8` otherwise.
+        // The fallback for a dictionary id column [`ResolvedColumns`] did not
+        // resolve: resolve the row's key and read the value it names, by this
+        // same rule. Every production caller reads a resolved column, so a
+        // load (`dictionary_encoded_hex_id_columns_load`) never reaches this
+        // arm; `unresolved_dictionary_id_cells_read_by_value` covers it.
         DataType::Dictionary(_, _) => {
             let dict = arr.as_any_dictionary();
             return read_id::<N>(dict.values(), dictionary_key(arr, row)?);
@@ -5011,7 +5029,7 @@ fn build_columnar_batch(
 
     let mut grow = 0usize;
     for (span, file_base) in spans {
-        let cols = ColumnIndex::resolve(span, mapping).map_err(ColBuildError::Batch)?;
+        let cols = ColumnIndex::locate(span, mapping).map_err(ColBuildError::Batch)?;
 
         // Prepare every reader once per span (downcast resolved here, not per
         // cell).
@@ -6876,10 +6894,11 @@ fn id_cell_is_empty(arr: &ArrayRef, row: usize) -> Result<bool, String> {
         DataType::Utf8 | DataType::LargeUtf8 => {
             Ok(read_string(arr, row)?.is_none_or(|s| s.is_empty()))
         }
-        // Resolve the key first: the emptiness that decides a root span is the
-        // VALUE's, and a dictionary key is never empty. Without this arm a
-        // dictionary-encoded hex parent column would take the binary branch
-        // below and fail on its own `Utf8` values.
+        // The fallback for a dictionary parent column [`ResolvedColumns`] did
+        // not resolve, as in [`read_id`]: the emptiness that decides a root
+        // span is the VALUE's, so the key is resolved first rather than the
+        // column falling to the binary branch below. A load never reaches this
+        // arm; `unresolved_dictionary_id_cells_read_by_value` covers it.
         DataType::Dictionary(_, _) => {
             let dict = arr.as_any_dictionary();
             id_cell_is_empty(dict.values(), dictionary_key(arr, row)?)
@@ -7174,7 +7193,12 @@ enum SpansDecoded {
     /// mapping.
     Failed(String),
     /// A row failed a kept admission check, at its FILE-absolute index.
-    Rejected { row: u64, reason: String },
+    /// `attrs_dropped` is what the rows built before it lost to the cap.
+    Rejected {
+        row: u64,
+        reason: String,
+        attrs_dropped: u64,
+    },
 }
 
 /// Decode and build one spans batch from the sequential cursor.
@@ -7228,6 +7252,9 @@ fn decode_spans_batch(
     let mut spans = Vec::with_capacity(batch.num_rows());
     let mut attrs_dropped = 0u64;
     for row in 0..batch.num_rows() {
+        // Counted per row so a rejected row's own drops are not folded in: the
+        // count covers the spans that were built.
+        let mut row_dropped = 0u64;
         match build_span(
             &batch,
             &cols,
@@ -7235,13 +7262,17 @@ fn decode_spans_batch(
             limits,
             now_ns,
             row,
-            &mut attrs_dropped,
+            &mut row_dropped,
         ) {
-            Ok(span) => spans.push(span),
+            Ok(span) => {
+                attrs_dropped += row_dropped;
+                spans.push(span);
+            }
             Err(reason) => {
                 return SpansDecoded::Rejected {
                     row: file_base + row as u64,
                     reason,
+                    attrs_dropped,
                 };
             }
         }
@@ -7448,7 +7479,12 @@ async fn load_spans_into(
                     resume: report.resume(),
                 });
             }
-            SpansDecoded::Rejected { row, reason } => {
+            SpansDecoded::Rejected {
+                row,
+                reason,
+                attrs_dropped,
+            } => {
+                report.attributes_dropped += attrs_dropped;
                 let (durable, reason) =
                     drain_sequential_before_refusal(&mut inflight, report, reason).await;
                 return Err(LoadError::RowRejected {
@@ -11683,6 +11719,80 @@ type = "i64"
         }
     }
 
+    /// The columnar path reads its mapped dictionary columns in place: none is
+    /// flattened ahead of it, and a dictionary attribute still reaches the
+    /// `StrColumnDict` fast path. The row path resolves the same batch's
+    /// dictionary columns once each, and the two build the same batch.
+    ///
+    /// An all-null chunk over an empty dictionary is part of the batch, so the
+    /// columnar path's per-cell answer for it (`str_src`'s all-null path) is
+    /// what this load exercises too.
+    #[test]
+    fn the_columnar_path_resolves_no_dictionary_column() {
+        const ROWS: usize = 64;
+        let dict = |vals: Vec<&str>| -> ArrayRef {
+            Arc::new(
+                vals.into_iter()
+                    .map(Some)
+                    .collect::<DictionaryArray<Int32Type>>(),
+            )
+        };
+        let empty_dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![None::<i32>; ROWS]),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ));
+        let ts: Vec<i64> = (0..ROWS as i64).map(|i| NOW_NS + i).collect();
+        let b = batch(vec![
+            ("ts", i64_col(ts)),
+            ("body", dict(vec!["hello"; ROWS])),
+            ("svc", dict(vec!["api"; ROWS])),
+            ("cat", dict(vec!["alpha"; ROWS])),
+            ("gone", empty_dict),
+        ]);
+        let mut m = base_mapping();
+        m.body_column = Some("body".to_string());
+        m.resource_attributes = vec![attr("service.name", "svc", ColType::Str)];
+        m.attributes = vec![
+            attr("cat", "cat", ColType::Str),
+            attr("gone", "gone", ColType::Str),
+        ];
+
+        let counters = dict_counters();
+        let col = build_columnar_or_panic(&b, &m);
+        assert_eq!(
+            counters.columns(),
+            0,
+            "the columnar path flattens none of the four mapped dictionary columns"
+        );
+        assert_eq!(
+            counters.cell_keys(),
+            0,
+            "nor resolves a dictionary key per cell"
+        );
+        assert_eq!(col.num_rows, ROWS, "every row is built");
+        let pos = col
+            .dyn_columns
+            .iter()
+            .position(|c| c.name == "cat")
+            .expect("cat column");
+        assert!(
+            col_dict(&col, pos).is_some(),
+            "the dictionary attribute keeps its StrColumnDict"
+        );
+
+        let counters = dict_counters();
+        let matched = assert_paths_match(&b, &m);
+        assert_eq!(
+            matched, col,
+            "the columnar build is the same on a second run"
+        );
+        assert_eq!(
+            counters.columns(),
+            4,
+            "the row reference resolves each mapped dictionary column once"
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn load_row(
         store: Arc<dyn ObjectStoreBackend>,
@@ -12559,7 +12669,7 @@ type = "i64"
 
         let mut grow = 0usize;
         for (span, file_base) in spans {
-            let cols = ColumnIndex::resolve(span, mapping).map_err(ColBuildError::Batch)?;
+            let cols = ColumnIndex::locate(span, mapping).map_err(ColBuildError::Batch)?;
 
             // Prepare every reader once per span (downcast resolved here, not
             // per cell).
@@ -14298,6 +14408,24 @@ type = "str"
             assert_eq!(err, EMPTY_DICTIONARY);
         }
 
+        /// The `Dictionary` fallback arms of [`read_id`] and
+        /// [`id_cell_is_empty`], which no load reaches because every row path
+        /// reads resolved columns: a column handed to them unresolved reads by
+        /// the value its key names.
+        #[test]
+        fn unresolved_dictionary_id_cells_read_by_value() {
+            let span_hex = hex::encode([2u8; 8]);
+            let ids = dict_str_col(vec![span_hex.as_str(), ""]);
+
+            assert_eq!(read_id::<8>(&ids, 0).expect("reads"), Some([2u8; 8]));
+            assert_eq!(read_id::<8>(&ids, 1).expect("reads"), None);
+            assert!(!id_cell_is_empty(&ids, 0).expect("reads"));
+            assert!(
+                id_cell_is_empty(&ids, 1).expect("reads"),
+                "an empty VALUE is an empty parent, though its key is not"
+            );
+        }
+
         /// A span that ends before it starts is rejected rather than stored
         /// with an interval no query window can mean anything against.
         #[test]
@@ -14712,6 +14840,78 @@ type = "str"
                 "  attrs_dropped    : 2 (attribute values over the OTLP value-length cap; each \
                  span was stored without them)",
                 "a load that completed still says the spans were stored without them"
+            );
+        }
+
+        /// A row rejection mid-batch still counts the drops of the rows built
+        /// before it, which the failure-path line claims to cover, and not the
+        /// rejected row's own.
+        #[tokio::test]
+        async fn a_row_rejected_spans_load_counts_the_drops_built_before_it() {
+            use ravel_object_store::memory::MemoryStore;
+
+            let limits = SpanIngestLimits::default();
+            let big = "x".repeat(limits.max_attribute_value_len + 1);
+            // Every row drops its over-cap `method` value. Row 2 is then
+            // rejected by the attribute after it, an integer attribute whose
+            // cell there is a string, so its own drop is counted before the
+            // rejection and must not reach the report.
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]; 3])),
+                (
+                    "span_id",
+                    bin_col(vec![vec![2u8; 8], vec![3u8; 8], vec![4u8; 8]]),
+                ),
+                ("name", str_col(vec!["op"; 3])),
+                ("start_ns", i64_col(vec![NOW_NS; 3])),
+                ("end_ns", i64_col(vec![NOW_NS; 3])),
+                ("method", str_col(vec![big.as_str(); 3])),
+                (
+                    "code",
+                    Arc::new(StringArray::from(vec![None, None, Some("x")])) as ArrayRef,
+                ),
+            ]);
+            let mapping_toml = format!(
+                "{MAPPING_TOML}\n[[spans.attribute]]\nkey = \"code\"\ncolumn = \"code\"\ntype = \
+                 \"i64\"\n"
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("spans.parquet");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+                .expect("arrow writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let mapping = parse_spans_mapping(&mapping_toml).expect("valid mapping");
+            let mut report = SpansLoadReport::default();
+            let err = load_spans_into(
+                &mut report,
+                store,
+                &pq,
+                "acme",
+                &mapping,
+                1,
+                10_000,
+                0,
+                1,
+                1,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(SystemClock),
+            )
+            .await
+            .expect_err("row 2 is rejected");
+
+            assert!(
+                matches!(err, LoadError::RowRejected { row: 2, .. }),
+                "expected row 2 rejected, got: {err}"
+            );
+            assert_eq!(
+                report.attributes_dropped, 2,
+                "the two rows built before the rejection are counted, the rejected row is not"
             );
         }
 
