@@ -79,13 +79,18 @@ bytes = "1"
 
 [dev-dependencies]
 # Parses `deploy/k8s/operator/operator.yaml` in the render-parity test
-# (`shipped_deployment_security_context_matches_rendered`) so the test
+# (`shipped_operator_deployment_security_context_matches_rendered`) so the test
 # compares the checked-in manifest against the render functions rather than
 # comparing the render functions against themselves. Test-only: never links
 # into the shipped binary. Not a workspace dependency because no other crate
 # needs a YAML parser and this task's scope excludes the workspace root
 # Cargo.toml.
-serde_yaml = "0.9"
+#
+# serde_yaml_ng is the maintained fork of the deprecated serde_yaml, which
+# cargo-deny flags as unmaintained (RUSTSEC-2024-0320). It keeps the same
+# `Deserializer`/`Value`/`from_value` API, so the multi-document parse above is
+# unchanged.
+serde_yaml_ng = "0.10"
 
 [lints]
 workspace = true
