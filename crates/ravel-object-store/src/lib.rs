@@ -6,6 +6,7 @@
 //! is the semantics oracle used by tests.
 
 pub mod conformance;
+pub mod external;
 pub mod fault;
 pub mod instrument;
 pub mod kms_routing;
@@ -46,6 +47,65 @@ pub struct Etag(pub String);
 /// etag. Only the backend that issued it can interpret it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version(pub String);
+
+/// The recorded identity of an object Ravel did not write (ADR-2040
+/// decision 1, as corrected by its pinning amendment): what the catalog
+/// recorded about the object when the grant was created.
+///
+/// The two halves are asserted differently, and the difference is the whole
+/// point of the type:
+///
+/// - `etag` is a **precondition**. It travels as `If-Match`, so an object
+///   whose current identity differs is refused with
+///   [`StoreError::PreconditionFailed`] rather than served.
+/// - `version` is a **selector**, not a precondition. It travels as the
+///   backend's own version parameter (S3 `versionId`, GCS `generation`, Azure
+///   `versionid`), which asks for *that* version of the object. A newer
+///   version existing does not make the read fail: it keeps returning the
+///   pinned bytes. A version that no longer exists is
+///   [`StoreError::NotFound`].
+///
+/// So a pin carrying a version reads the pinned bytes for as long as that
+/// version is retained, and a pin without one (an unversioned bucket) fails
+/// with `PreconditionFailed` as soon as the owner overwrites the key. Either
+/// way, no read ever mixes bytes of two versions.
+///
+/// `version` is optional because not every store versions objects, and because
+/// a store whose CAS [`Version`] is just the ETag again (S3 without
+/// versioning) has no selector to send. [`Pin::from_store`] is the one place
+/// that decision is made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub etag: String,
+    pub version: Option<String>,
+}
+
+impl Pin {
+    /// Pin on an ETag alone: a precondition and no selector.
+    pub fn etag(etag: impl Into<String>) -> Self {
+        Pin {
+            etag: etag.into(),
+            version: None,
+        }
+    }
+
+    /// The one constructor for a pin built from what a store reported about an
+    /// object ([`ObjectStoreBackend::pin_of`], the external-store adapters, and
+    /// the probes all go through it).
+    ///
+    /// `etag` is taken verbatim, quotes included: it is sent back as `If-Match`
+    /// and normalizing it here would compare a string the store never issued.
+    /// `version` is recorded only when it is a selector the store can act on: a
+    /// reported version equal to the ETag is *not* one (that is what
+    /// [`ObjectMeta::version`] degrades to on an unversioned S3 bucket, where
+    /// the CAS token is the ETag), and sending it as a `versionId` would ask
+    /// for a version that does not exist.
+    pub fn from_store(etag: impl Into<String>, version: Option<String>) -> Self {
+        let etag = etag.into();
+        let version = version.filter(|version| *version != etag);
+        Pin { etag, version }
+    }
+}
 
 /// Checksum the caller computed locally and the backend verifies on upload.
 /// Transport-integrity only; blake3 identity lives in commit records.
@@ -116,6 +176,20 @@ pub struct GetOutcome {
     pub version: Version,
     /// Total object size, regardless of the range requested.
     pub total_size: u64,
+}
+
+/// A read plus the [`Pin`] that names exactly the bytes it returned.
+///
+/// [`GetOutcome`] cannot carry this itself: its `version` is the CAS
+/// [`Version`], which on S3 is the ETag again, so it cannot express "this
+/// object's `x-amz-version-id`". A caller recording a grant needs the
+/// selector, not the CAS token, and needs it for the bytes it actually read
+/// rather than for whatever a later HEAD reports.
+#[derive(Debug, Clone)]
+pub struct PinnedRead {
+    pub outcome: GetOutcome,
+    /// The identity to record so a later read returns these same bytes.
+    pub pin: Pin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,6 +479,17 @@ pub enum StoreError {
     Transient(String),
     #[error("permanent error: {0}")]
     Permanent(String),
+    /// The backend does not implement this operation at all, so no retry and no
+    /// alternative argument can make it succeed. Distinct from
+    /// [`StoreError::Permanent`], which reports a request the backend
+    /// understood and rejected. Never retryable.
+    #[error("{operation}: unsupported by this backend")]
+    Unsupported { operation: String },
+    /// The store was opened read-only and the call would have mutated it. Every
+    /// [`crate::external::ExternalStore`] refuses `put`, `put_multipart` and
+    /// `delete` this way. Never retryable.
+    #[error("{operation}: {store} is open read-only")]
+    ReadOnly { operation: String, store: String },
     /// A paged listing drain saw the same continuation token twice: the backend
     /// reports "another page" while making no progress. Draining returns this
     /// rather than spinning forever. Never retryable.
@@ -447,6 +532,84 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     -> Result<PutOutcome, StoreError>;
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError>;
+
+    /// Read `range` of the object `pin` names.
+    ///
+    /// This is the read path for objects Ravel did not write (ADR-2040
+    /// decision 1 and its pinning amendment). The pin is evaluated by the
+    /// backend, on the wire, not by comparing ETags after the fact: a backend
+    /// that cannot evaluate it must not implement this method, because a local
+    /// comparison would read and pay for the wrong bytes before noticing.
+    ///
+    /// The two halves of a [`Pin`] do different things, so the outcomes split
+    /// by which half the pin carries. In the order they are decided:
+    ///
+    /// - No object at `key`: [`StoreError::NotFound`], never
+    ///   `PreconditionFailed`. The two are distinct answers and callers act on
+    ///   them differently (a missing grant target versus a changed one).
+    /// - `pin.version` is `Some` and that version no longer exists (deleted, or
+    ///   never existed): [`StoreError::NotFound`]. The version is a selector,
+    ///   so an unknown one names no object rather than failing a precondition.
+    ///   A version that does still exist is served even when the object has
+    ///   since been overwritten: that is what a selector means.
+    /// - The selected object's ETag differs from `pin.etag`:
+    ///   [`StoreError::PreconditionFailed`], which is not retryable
+    ///   ([`StoreError::is_retryable`]) because a retry reads the same changed
+    ///   object. For a pin with no version this is the overwrite case.
+    /// - Otherwise the bytes, in a [`PinnedRead`] whose `outcome.etag` is the
+    ///   pinned one and whose `pin` names the version actually read.
+    ///
+    /// The default implementation refuses with [`StoreError::Unsupported`]
+    /// rather than falling back to an unconditional `get`: silently dropping
+    /// the pin would serve bytes from a replaced file.
+    /// [`crate::external::probe::probe_preconditions`] is how a candidate store
+    /// is qualified for this before any grant relies on it.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        let _ = (range, pin);
+        Err(StoreError::Unsupported {
+            operation: format!("conditional get of {key}"),
+        })
+    }
+
+    /// [`get`](Self::get), reporting the [`Pin`] for the bytes it returned.
+    ///
+    /// The read that records a grant (a Parquet footer read at
+    /// `CREATE EXTERNAL TABLE` time) needs the object's identity *for the bytes
+    /// it just read*, not for whatever a separate HEAD finds. A store that
+    /// versions objects reports its version selector here, so the recorded pin
+    /// survives the owner overwriting the key a moment later.
+    ///
+    /// The default implementation reads through `get` and reports an ETag-only
+    /// pin, which is what a backend with no version selector to give can
+    /// honestly say.
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        let outcome = self.get(key, range).await?;
+        let pin = Pin::etag(outcome.etag.0.clone());
+        Ok(PinnedRead { outcome, pin })
+    }
+
+    /// The object's metadata and the [`Pin`] that names it, from one HEAD.
+    ///
+    /// [`ObjectMeta::version`] cannot answer this: it is the CAS [`Version`],
+    /// which on S3 is the ETag again, so a caller building a pin out of it
+    /// would record a `versionId` no bucket has. This method is the only
+    /// supported way to learn a backend's real version selector for an object.
+    ///
+    /// The default implementation reports an ETag-only pin. A backend whose
+    /// store versions objects overrides it ([`crate::s3::S3Store`] fills the
+    /// `x-amz-version-id`, `None` on an unversioned bucket;
+    /// [`crate::memory::MemoryStore`] reports its own version), and every
+    /// decorator in this crate forwards it.
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        let meta = self.head(key).await?;
+        let pin = Pin::etag(meta.etag.0.clone());
+        Ok((meta, pin))
+    }
 
     /// Begin a multipart upload of `key`. See [`MultipartUpload`] for the part
     /// sequence rules and the visibility guarantee.
@@ -546,9 +709,11 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
 /// `S: ObjectStoreBackend` (for example [`InstrumentedStore`]) wrap an
 /// already-type-erased `Arc<dyn ObjectStoreBackend>`: without this impl the
 /// erased handle is not itself a backend and cannot be a decorator's `S`. Every
-/// method delegates to the pointee, `put_multipart` and `capabilities`
-/// included, so a `multipart: true` backend keeps that capability through the
-/// `Arc` rather than falling back to the refusing default.
+/// method delegates to the pointee, `put_multipart`, `get_pinned`,
+/// `get_with_pin`, `pin_of` and `capabilities` included, so a `multipart: true`
+/// backend keeps that capability through the `Arc`, and a backend that
+/// evaluates pins and reports its version selector keeps that too, rather than
+/// falling back to the refusing and ETag-only defaults.
 #[async_trait::async_trait]
 impl<T: ObjectStoreBackend + ?Sized> ObjectStoreBackend for Arc<T> {
     async fn put(
@@ -562,6 +727,23 @@ impl<T: ObjectStoreBackend + ?Sized> ObjectStoreBackend for Arc<T> {
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         (**self).get(key, range).await
+    }
+
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        (**self).get_pinned(key, range, pin).await
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        (**self).get_with_pin(key, range).await
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        (**self).pin_of(key).await
     }
 
     async fn put_multipart<'a>(

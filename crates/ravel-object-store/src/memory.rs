@@ -158,6 +158,32 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Read-side verification (ADR-1696 decision 5), the oracle's form of what
+    /// the S3 adapter does with the checksum S3 stored at upload: a full-object
+    /// read is checked against the checksum recorded when the object was
+    /// written, so bytes that changed at rest are refused with `Corrupted`
+    /// instead of handed to a decoder. A ranged read is not checked, matching
+    /// decision 4: the stored checksum covers the whole object and a slice
+    /// cannot be compared against it.
+    ///
+    /// Every read path runs it, pinned or not: a pin decides *which* bytes are
+    /// served, never whether they are checked.
+    fn verify_full_read(key: &str, entry: &Entry, range: GetRange) -> Result<(), StoreError> {
+        if range != GetRange::Full {
+            return Ok(());
+        }
+        let actual = crc32c(&entry.data);
+        if actual != entry.stored_checksum {
+            return Err(StoreError::Corrupted(format!(
+                "get of {key}: stored crc32c {:08x} does not match {actual:08x} computed over \
+                 the {} stored bytes",
+                entry.stored_checksum,
+                entry.data.len()
+            )));
+        }
+        Ok(())
+    }
+
     fn slice(data: &Bytes, range: GetRange) -> Result<Bytes, StoreError> {
         let len = data.len() as u64;
         match range {
@@ -328,30 +354,87 @@ impl ObjectStoreBackend for MemoryStore {
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
-        // Read-side verification (ADR-1696 decision 5), the oracle's form of
-        // what the S3 adapter does with the checksum S3 stored at upload: a
-        // full-object read is checked against the checksum recorded when the
-        // object was written, so bytes that changed at rest are refused with
-        // `Corrupted` instead of handed to a decoder. A ranged read is not
-        // checked, matching decision 4: the stored checksum covers the whole
-        // object and a slice cannot be compared against it.
-        if range == GetRange::Full {
-            let actual = crc32c(&entry.data);
-            if actual != entry.stored_checksum {
-                return Err(StoreError::Corrupted(format!(
-                    "get of {key}: stored crc32c {:08x} does not match {actual:08x} computed \
-                     over the {} stored bytes",
-                    entry.stored_checksum,
-                    entry.data.len()
-                )));
-            }
-        }
+        Self::verify_full_read(key, entry, range)?;
         Ok(GetOutcome {
             data: Self::slice(&entry.data, range)?,
             etag: entry.etag.clone(),
             version: entry.version.clone(),
             total_size: entry.data.len() as u64,
         })
+    }
+
+    /// Evaluates the pin under the same lock that serves the bytes, so an
+    /// overwrite cannot land between the check and the read.
+    ///
+    /// The order is the contract's, and the two halves answer differently
+    /// (docs/object-store-contract.md, "Conditional reads"; the ADR-2040
+    /// pinning amendment):
+    ///
+    /// - A missing key is `NotFound` whatever the pin says.
+    /// - `pin.version` is a *selector*. This store keeps only the current
+    ///   object, so any version but the current one has been replaced and is
+    ///   gone: the answer is `NotFound`, the same answer a versioned store
+    ///   gives for a version that has been deleted. It is never
+    ///   `PreconditionFailed`, which would say the object is there and
+    ///   different.
+    /// - `pin.etag` is a *precondition*, evaluated on the object the selector
+    ///   chose. A mismatch is `PreconditionFailed`, which for a pin with no
+    ///   version is the overwrite case the pinning model rests on.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        if let Some(version) = pin.version.as_deref()
+            && entry.version.0 != version
+        {
+            return Err(StoreError::NotFound);
+        }
+        if entry.etag.0 != pin.etag {
+            return Err(StoreError::PreconditionFailed);
+        }
+        Self::verify_full_read(key, entry, range)?;
+        Ok(crate::PinnedRead {
+            outcome: GetOutcome {
+                data: Self::slice(&entry.data, range)?,
+                etag: entry.etag.clone(),
+                version: entry.version.clone(),
+                total_size: entry.data.len() as u64,
+            },
+            pin: crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone())),
+        })
+    }
+
+    /// This store models a versioned one: its `version` is a distinct value per
+    /// `put`, not the ETag again, so the pin it reports carries a selector and
+    /// the selector case above is reachable from the conformance suite.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        Self::verify_full_read(key, entry, range)?;
+        Ok(crate::PinnedRead {
+            outcome: GetOutcome {
+                data: Self::slice(&entry.data, range)?,
+                etag: entry.etag.clone(),
+                version: entry.version.clone(),
+                total_size: entry.data.len() as u64,
+            },
+            pin: crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone())),
+        })
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        let pin = crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone()));
+        Ok((entry.meta(key), pin))
     }
 
     async fn put_multipart<'a>(
