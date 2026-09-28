@@ -2511,7 +2511,9 @@ impl Catalog {
         // A refusal fails the fold rather than rebuilding: the rebuild fetches
         // and decodes every segment's names, holding more memory than the one
         // postings decode just refused. The resolve path answers the same
-        // refusal the same way (ADR-1702, the decode-refusal amendment).
+        // refusal the same way (ADR-1702, the decode-refusal amendment). An
+        // object larger than the budget's whole limit skips the eviction pass
+        // and is refused on every fold, so that tenant's fold stays failed.
         let reservation =
             self.reserve_decoded(header.body_uncompressed_len, limits.max_postings_bytes)?;
         let decoded =
@@ -4289,8 +4291,48 @@ mod tests {
     /// and `isolation_breaches()` reads 0.
     #[tokio::test]
     async fn a_foreign_tenant_hash_on_the_previous_postings_fails_the_fold() {
+        assert_foreign_previous_postings_fail_the_fold(None, true).await;
+    }
+
+    /// The tenant check runs before the decode reservation: under a budget
+    /// with no room at all the fold still reports the breach, not memory
+    /// pressure.
+    ///
+    /// FLIP: move the `tenant_hash` match below the `reserve_decoded` call in
+    /// `load_previous_postings` and the fold fails with `MemoryExhausted`
+    /// instead.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_is_reported_before_the_postings_reservation() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        assert_foreign_previous_postings_fail_the_fold(Some(budget), true).await;
+    }
+
+    /// The tenant check runs before the part-binding check: a foreign object
+    /// that is also bound to other part hashes still fails the fold instead of
+    /// degrading to a rebuild.
+    ///
+    /// FLIP: move the `tenant_hash` match below the `decode_postings` call in
+    /// `load_previous_postings` and the fold rebuilds and succeeds, so
+    /// `expect_err` panics.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_is_reported_before_the_part_binding_degrade() {
+        assert_foreign_previous_postings_fail_the_fold(None, false).await;
+    }
+
+    /// Re-point the fixture HEAD at a copy of its postings naming another
+    /// tenant, bound to the HEAD's own part hashes or to hashes it does not
+    /// carry, then fold again under `budget` (unlimited when `None`) and assert
+    /// the fold fails with the `tenant_hash` mismatch and one counted breach.
+    async fn assert_foreign_previous_postings_fail_the_fold(
+        budget: Option<Arc<ravel_memory::MemoryBudget>>,
+        bind_to_head_parts: bool,
+    ) {
         let store = Arc::new(MemoryStore::new());
         let (catalog, mut head, postings) = folded_postings_baseline(&store).await;
+        let catalog = match budget {
+            Some(budget) => catalog.with_memory_budget(budget),
+            None => catalog,
+        };
         let part_blake3: Vec<[u8; 32]> = head
             .parts
             .iter()
@@ -4302,10 +4344,20 @@ mod tests {
             &part_blake3,
         )
         .expect("the fixture postings decode");
+        let bound_parts = if bind_to_head_parts {
+            part_blake3.clone()
+        } else {
+            vec![[0xee; 32]; part_blake3.len()]
+        };
+        assert_eq!(
+            bound_parts == part_blake3,
+            bind_to_head_parts,
+            "the fixture binds the foreign object as the case asks"
+        );
         let foreign = snapshot_format::encode_postings(
             [0xff; 16],
             decoded.header.signal,
-            &part_blake3,
+            &bound_parts,
             decoded.header.entry_count,
             &decoded.names,
         )

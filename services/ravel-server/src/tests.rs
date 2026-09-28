@@ -526,13 +526,10 @@ struct ReservationStep {
 /// total, and it charges decoded output rather than cache-bound bytes, so it is
 /// never marked handed off.
 ///
-/// The decode figure is read from what the query still HELD when it reserved
-/// the page read, not from the decode step's own total. `shrink_to_retained`
-/// runs between the two, exchanging the pre-decode reservation for one sized to
-/// the entries the matchers kept, so only the later reading describes what a
-/// GET held after the decode actually observes. The two agree exactly when the
-/// fixture's retained entries measure at least the pre-decode reservation,
-/// which is a property of the fixture and not of the code under test.
+/// The fixture never shrinks the decode's reservation: `shrink_to_retained`
+/// reserves the retained size before it releases the held one, so it cannot
+/// run under the full budget this oracle builds, and the pre-decode
+/// reservation is still held when the page read reserves.
 fn split_decode_step(steps: &[ReservationStep]) -> (Vec<u64>, u64) {
     assert_eq!(
         steps.len(),
@@ -544,11 +541,14 @@ fn split_decode_step(steps: &[ReservationStep]) -> (Vec<u64>, u64) {
         steps[1].held, range_read,
         "the catalog decode reserves on top of the range read alone: {steps:?}"
     );
-    assert!(
-        steps[2].held >= range_read,
-        "the range read is still held when the page read reserves: {steps:?}"
+    assert_eq!(
+        steps[2].held, steps[1].total,
+        "the unshrunk catalog decode is still held when the page read reserves: {steps:?}"
     );
-    (vec![range_read, steps[2].total], steps[2].held - range_read)
+    (
+        vec![range_read, steps[2].total],
+        steps[1].total - range_read,
+    )
 }
 
 fn sql_body(query: &str) -> String {

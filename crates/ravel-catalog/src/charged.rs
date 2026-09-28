@@ -30,7 +30,9 @@ pub(crate) type ChargedPostings = Charged<DecodedPostings>;
 /// free, which reports memory pressure where an oversized object was, and
 /// takes the caller down a different path (a resolve fails instead of falling
 /// back to listing) than the decoder's own refusal would. Charging 0 leaves
-/// the outcome to the decoder.
+/// the outcome to the decoder, except on a budget already over its limit (a
+/// `reserve_unchecked` caller can put it there), which refuses even a 0-byte
+/// reservation.
 pub(crate) fn decoded_charge(declared: u64, ceiling: u64) -> u64 {
     if declared > ceiling { 0 } else { declared }
 }

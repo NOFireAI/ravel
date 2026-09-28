@@ -72,7 +72,10 @@ struct GetCost {
 /// allocates anything. Charging the ceiling instead turns that refusal into a
 /// budget refusal whenever the budget has less than the ceiling free, which
 /// reports memory pressure where an oversized section was and replaces the
-/// decoder's own typed error with a retryable one.
+/// decoder's own typed error with a retryable one. Charging 0 leaves the
+/// outcome to the decoder only while the budget is within its limit: a budget
+/// already over it (a `reserve_unchecked` caller can put it there) refuses
+/// even a 0-byte reservation.
 fn decoded_charge(declared: u64, ceiling: u64) -> u64 {
     if declared > ceiling { 0 } else { declared }
 }
@@ -5108,8 +5111,9 @@ mod tests {
     /// walk over it would call `chunk_for` 4_294_967_295 times to find the one
     /// frame this asserts on.
     ///
-    /// FLIP: restore the `for series_index in 0..u64::from(index.series_count())`
-    /// loop and this test runs 4_294_967_295 iterations instead of 1.
+    /// This pins the input shape, not a failure of the old code: the
+    /// per-series loop returns the same value here, only after about 4.3e9
+    /// iterations, so no assertion below fails against it.
     #[test]
     fn a_huge_series_count_costs_one_iteration_per_chunk_directory_entry() {
         const FRAME_LEN: u64 = 4_096;

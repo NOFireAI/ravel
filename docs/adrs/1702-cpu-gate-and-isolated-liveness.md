@@ -545,8 +545,8 @@ reservation sites. Both readings are settled here.
   and takes the caller down a different path than the decoder's own refusal
   would: a snapshot part that should fall back to listing fails the query
   instead. Charging 0 leaves the outcome to the decoder. This covers the
-  snapshot part and postings reservations, the per-frame `SERIES_META_CHUNKS`
-  charge, and the per-section catalog charge.
+  snapshot part, postings and column statistics reservations, the per-frame
+  `SERIES_META_CHUNKS` charge, and the per-section catalog charge.
 - **A refused reservation fails the operation, on the resolve path and on the
   fold path alike.** Both paths could instead degrade: the resolve by
   disabling pruning, the fold by rebuilding its postings from scratch. Both
@@ -554,7 +554,13 @@ reservation sites. Both readings are settled here.
   unpruned scan holds more than the postings that would have pruned it, and a
   rebuild fetches and decodes every segment's names instead of one postings
   object. Answering memory pressure by taking the more expensive path is the
-  wrong direction, and a failed fold is retried by the next one.
+  wrong direction, and a failed fold is retried by the next one. The
+  exception is a previous postings object larger than the budget's whole
+  limit: `Catalog::reserve_decoded` skips the eviction pass for it, so it is
+  refused on every tick and that tenant's fold stays failed where the old code
+  rebuilt, and an operator sees the fold's typed budget error logged every
+  tick. The shipped server cannot reach it today, since ravel-server never
+  calls `Catalog::with_memory_budget`.
 
 ## Amendment (2026-09-28): where the heartbeat age comes from
 

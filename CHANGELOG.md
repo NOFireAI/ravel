@@ -273,10 +273,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   into a budget refusal on any budget with less than the ceiling free: a
   snapshot part that should fall back to listing failed the query with a
   memory error instead, and a PromQL catalog section or chunk frame lost its
-  own typed error the same way. Every decode reservation (snapshot parts and
-  postings, PromQL catalog sections, and per-frame `SERIES_META_CHUNKS`) now
-  charges 0 for a declared length over its decoder's ceiling and lets the
-  decoder's refusal decide the outcome.
+  own typed error the same way. Every decode reservation (snapshot parts,
+  postings and column statistics, PromQL catalog sections, and per-frame
+  `SERIES_META_CHUNKS`) now charges 0 for a declared length over its decoder's
+  ceiling and lets the decoder's refusal decide the outcome. Only the PromQL
+  fetcher half is visible in the shipped server, whose catalog budget is
+  unlimited.
 - **A refused decode reservation fails the fold instead of rebuilding its
   postings from scratch** (ADR-1702, the decode-refusal amendment, issue
   #2081). The fold answered a refused previous-postings reservation by
@@ -284,7 +286,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   far more than the one postings object the budget had just refused, so the
   reaction to memory pressure took the more expensive path. It now fails with
   the typed budget error, matching what the resolve path already did with the
-  same refusal; the next fold retries.
+  same refusal; the next fold retries. The shipped server cannot reach this,
+  because its catalog budget is unlimited.
 - **The catalog's decoded-part and postings caches give memory back to a
   refused decode** (ADR-1702 decision 6, issue #2088). Both caches hold each
   decoded value together with its memory reservation and were bounded only by
