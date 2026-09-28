@@ -39,6 +39,13 @@ pub mod sys {
     }
 }
 
+/// Parquet table manifest versions (ADR-2040 decision D1).
+pub mod parquet_table {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/ravel.parquet_table.v1.rs"));
+    }
+}
+
 /// Distributed read fan-out fragment protocol (ADR-0071). Unlike every other
 /// module here, this is a TRANSIENT wire contract between query processes, not
 /// a persistent stored format: no byte defined here is ever written to object
