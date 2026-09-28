@@ -651,7 +651,9 @@ pub struct Cli {
     /// identity's current-state record is kept whatever its age. A tenant
     /// whose alert state memo is missing, unreadable, or carries a watermark
     /// below this window's expiry floor is not swept that tick. `0` disables
-    /// the sweep and keeps every alert record. A nonzero window shorter than
+    /// the retention sweep and its memo read and keeps every alert record; the
+    /// alerts shard's orphan sweep, which reclaims data objects no commit
+    /// record names, runs whatever the window. A nonzero window shorter than
     /// one hour plus the memo's seal margin (three evaluation intervals plus
     /// the query deadline) is refused at startup: it would put the expiry
     /// floor above every watermark the evaluator can write, so every tick
