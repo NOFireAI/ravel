@@ -641,8 +641,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
         return Err(err);
     }
-    // Stopped after the drain so its `/readyz` reports 503 throughout it.
     heartbeat_task.abort();
+    // Stopped after the drain so its `/readyz` reports 503 throughout it.
     if let Some(listener) = health_listener {
         tokio::task::spawn_blocking(move || listener.shutdown())
             .await
