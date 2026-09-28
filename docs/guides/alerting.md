@@ -151,18 +151,29 @@ pending, firing, and resolved on its own.
   make the delivery phase grow with the queue behind it. The deadline is
   checked before each attempt, not during one, and the first attempt of a tick
   is unconditional, so the delivery phase ends at the latest at
-  `max(tick start + half the interval, end of rule evaluation)` plus one whole
+  `max(tick start + half the interval, start of delivery)` plus one whole
   attempt, which is the number of configured sinks times the 10-second sink
-  HTTP timeout. What it does not bound is rule evaluation, which runs as long as
-  its queries take, and so it does not bound the tick as a whole either. A tick
-  that overruns its interval delays the next tick rather than overlapping it,
-  because the evaluator sleeps for an interval after a tick returns rather than
-  running on a fixed schedule.
+  HTTP timeout. The half interval is measured from the start of the tick, not
+  from the start of delivery, so everything that precedes delivery in the same
+  tick spends it too: the history read, the lease acquire, and on the lease
+  holder rule evaluation, the repeat pass and the alert state memo write. On a
+  tick whose history read failed, or where another replica holds the lease,
+  delivery follows that store read or lease acquire directly, with no rule
+  evaluation. What the deadline does not bound is any of that earlier work,
+  which runs as long as its queries and store calls take, and so it does not
+  bound the tick as a whole either. A tick that overruns its interval delays
+  the next tick rather than overlapping it, because the evaluator sleeps for a
+  jittered interval, up to 10% longer than the configured one, after a tick
+  returns rather than running on a fixed schedule.
   Notifications not attempted before the deadline stay queued and keep
   their place at the front; `ravel_alert_notifications_deferred_total` counts
   them once per notification per tick, so a notification deferred on several
-  consecutive ticks is counted on each, and a rising value means a sink is too
-  slow to drain the queue within a tick.
+  consecutive ticks is counted on each. A rising value has two causes: a sink
+  too slow to drain the queue within a tick, or a tick whose work before
+  delivery already ran past the deadline. In the second case every
+  notification after the first is deferred even when every sink answers at
+  once, so even healthy sinks receive one notification per tick until the
+  ticks get faster; a slow rule query or store looks like a slow sink here.
   Because a tick both raises new alerts and resolves alerts that stopped
   matching, the per-tick publish worst case for one rule is twice the cap: up to
   1000 new transitions plus up to 1000 resolutions, so up to 2000 records and

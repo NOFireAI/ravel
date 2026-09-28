@@ -4037,7 +4037,7 @@ fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
     write_header(
         out,
         "ravel_alert_notifications_deferred_total",
-        "Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first, counted once per notification per tick: a notification deferred again on the next tick is counted again. They keep their place at the front of the queue; a rising value means a sink is too slow to drain the queue within a tick.",
+        "Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first, counted once per notification per tick: a notification deferred again on the next tick is counted again. They keep their place at the front of the queue. A rising value has two causes: a sink too slow to drain the queue within a tick, or a tick whose work before delivery (history fold, rule evaluation, memo write) already ran past the deadline, in which case every notification after the first is deferred even when every sink answers at once.",
         "counter",
     );
     write_sample(

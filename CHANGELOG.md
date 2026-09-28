@@ -65,20 +65,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evaluator's injected clock from the tick's own reading. The deadline is
   checked before each attempt and the first attempt of a tick is unconditional,
   so the delivery phase ends at the latest at `max(tick start + half the
-  interval, end of rule evaluation)` plus the number of sinks times the sink
-  HTTP timeout; rule evaluation itself is still unbounded, and a tick that
-  overruns delays the next tick rather than overlapping it. The queue is served
-  in the order notifications were queued rather than by the age of the
-  transition they carry: an attempt some sink refused moves to the back of the
-  queue, and one the deadline never reached keeps its place, so a sink that
-  drains only a few notifications per tick reaches every alert in turn instead
-  of the same oldest few, whose repeats re-queued them at the same timestamp
-  forever. A notification still leaves the queue only once every configured sink
-  has accepted it, so one blackholed sink throttles delivery for every sink to
-  what fits in one tick's budget; what the rotation guarantees is that a healthy
-  sink receives all of them eventually. The new
+  interval, start of delivery)` plus the number of sinks times the sink HTTP
+  timeout. Delivery starts after whatever precedes it in the tick: the history
+  read, the lease acquire, and on the lease holder rule evaluation, the repeat
+  pass and the alert state memo write. None of that earlier work is bounded,
+  and a tick that overruns delays the next tick rather than overlapping it.
+  Previously every tick tried every queued notification in no defined order;
+  the pass now serves the oldest-queued notification first, an attempt some
+  sink refused moves to the back of the queue, and one the deadline never
+  reached keeps its place, so a sink that drains only a few notifications per
+  tick reaches every alert in turn. A notification still leaves the queue only
+  once every configured sink has accepted it, so one blackholed sink throttles
+  delivery for every sink to what fits in one tick's budget; what the rotation
+  guarantees is that a healthy sink receives all of them eventually. The new
   `ravel_alert_notifications_deferred_total` counter reports how many were
-  deferred, once per notification per tick. Separately, ADR-0117 stated the
+  deferred, once per notification per tick; it also rises when the work before
+  delivery alone runs past the deadline, since every notification after the
+  first is then deferred however fast the sinks answer. Separately, ADR-0117 stated the
   per-tick publish worst case for one rule as `MAX_ALERTS_PER_RULE` (1000); the
   true worst case is `2 x MAX_ALERTS_PER_RULE`, because one tick also writes a
   resolution for each previously-open alert that stopped matching, and that

@@ -295,10 +295,11 @@ Pending or Firing identities in it for one `rule_id`:
   rather than the tick rolling anything back. The live Pending/Firing set for
   that rule can then exceed `MAX_ALERTS_PER_RULE`, and the next tick's absent
   set with it, so that next tick can write more than
-  `2 x MAX_ALERTS_PER_RULE` records. The earlier statement that "a tick that
-  fails leaves prior state untouched" holds only for a rule that fails *before*
-  its first write, which is what decision 3's `TooManyAlerts` and a failed
-  query do; it is not true of a failure inside the write loop.
+  `2 x MAX_ALERTS_PER_RULE` records. A failed rule leaving prior state as it
+  was, which the Context section states for rule failures in general and
+  decision 3 states for `TooManyAlerts`, holds only for a rule that fails
+  *before* its first write, which is what `TooManyAlerts` and a failed query
+  do; it is not true of a failure inside the write loop.
 - **Overlapping lease holders.** `acquire_lease` permits a two-holder overlap
   during a handover (`alerting.rs`, `acquire_lease` and `seal_bound_hour`), and
   the lease is advisory rather than a fencing token. Each holder's own tick is
@@ -306,16 +307,28 @@ Pending or Firing identities in it for one `rule_id`:
   holder that folded before the other's writes landed walks an absent set the
   other has already resolved and writes a second resolution for each. Over one
   interval the keyspace can take up to twice what one tick's bound allows. The
-  duplicates are what ADR-0043 decision 6 already tolerates, and the fold's
-  `(ts_ns, epoch, seq)` tie-break converges on one of them; the bound above is
-  still per tick, not per interval.
+  duplicates are what ADR-0043 decision 6 already tolerates. The fold
+  (`fold_commit_entries`) keeps, per identity, the record with the greatest
+  `(ts_ns, epoch, seq)`, taking `ts_ns` from the record and `epoch` and `seq`
+  from its commit key, and on an exact tie keeps the one it folded first; the
+  commit key's `writer_id`, which is what keeps two holders' keys distinct, is
+  not part of that order. Every replica folding the same history therefore
+  converges on one of the duplicates. The bound above is still per tick, not
+  per interval.
 
-Each of the three is a transient the code already tolerates elsewhere: every
-identity in an oversized absent set reaches a terminal state in the tick that
-walks it, so the excess does not compound. Bounding the live set itself is memo
-pruning's problem (#1438), not this amendment's; a deployment upgrading a rule
-set with a long label-change history, or one whose object store is failing
-writes mid-rule, should expect ticks above the bound.
+For pre-upgrade history and overlapping lease holders the excess is a
+transient: a tick that walks the oversized absent set to the end writes a
+resolution for every identity in it, so the excess does not compound. A tick
+that fails partway does not have that property. It never walks the rest of the
+absent set, so those identities stay open, and while the write path keeps
+failing after the matched instances are written, each tick can open up to
+`MAX_ALERTS_PER_RULE` new identities for a rule whose matched series change
+while resolving none of the old ones. The open set, and the next successful
+tick's absent set with it, grows by up to the cap per failing tick until a
+tick's writes succeed through the end of the rule. Bounding the live set
+itself is memo pruning's problem (#1438), not this amendment's; a deployment
+upgrading a rule set with a long label-change history, or one whose object
+store is failing writes mid-rule, should expect ticks above the bound.
 
 This corrects the stated bound only; the code already publishes resolutions
 this way, and this amendment changes no publish behaviour. The cap, the

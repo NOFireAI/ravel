@@ -148,32 +148,42 @@ const LEASE_TTL_TICKS: u32 = 3;
 /// single tick, as `(numerator, denominator)`. Without it a pass against a slow
 /// or failing sink costs `notifications * sinks * sink_timeout`, which grows
 /// with the undelivered queue and is bounded by nothing the operator chose.
-/// Half the interval leaves the other half for the rule evaluation and repeat
-/// pass that precede delivery in the same tick. Notifications not attempted
-/// before the deadline stay in the undelivered map and keep their place in the
-/// queue for the next tick.
+/// The deadline is an offset from the tick's start, not from the start of
+/// delivery, so the work that precedes delivery in the same tick (the memo
+/// read, the history fold, the lease acquire, rule evaluation, the repeat pass
+/// and the memo write) spends the same first half of the interval that
+/// delivery does; the fraction reserves no share for either. Notifications not
+/// attempted before the deadline stay in the undelivered map and keep their
+/// place in the queue for the next tick.
 ///
 /// # What this bounds, exactly
 ///
 /// [`AlertEvaluator::flush_sinks`] returns at the latest at
 ///
 /// ```text
-/// max(tick start + interval * fraction, end of rule evaluation)
+/// max(tick start + interval * fraction, start of delivery)
 ///     + sinks * sink_timeout
 /// ```
+///
+/// where the start of delivery is wherever the work before it ended. On the
+/// lease holder that is after rule evaluation, the repeat pass and the
+/// `write_alert_state_memo` PUT; on a tick whose history read failed it is
+/// after the memo read and the failed fold, with no rule evaluation; on a tick
+/// where another replica holds the lease, or the lease acquire failed, it is
+/// after `acquire_lease`, again with no rule evaluation.
 ///
 /// The deadline is checked before each attempt rather than during one, and the
 /// first attempt of a tick is unconditional, so the pass can overshoot by one
 /// whole attempt: every sink of the one notification in flight, each bounded by
-/// `sink_timeout`. When rule evaluation alone already ran past the deadline,
-/// that unconditional attempt is the whole of the delivery phase, and it starts
-/// wherever evaluation ended.
+/// `sink_timeout`. When the work before delivery already ran past the deadline,
+/// that unconditional attempt is the whole of the delivery phase.
 ///
-/// Rule evaluation itself is not bounded by this constant, and this change does
-/// not bound it: a tick whose queries are slow still runs as long as its rules
-/// take, so a tick can exceed one interval through evaluation alone.
-/// [`run_loop`] sleeps for a jittered interval *after* a tick returns, so an
-/// overrunning tick delays the next tick rather than overlapping it.
+/// Nothing before delivery is bounded by this constant: a tick whose queries or
+/// store calls are slow still runs as long as they take, so a tick can exceed
+/// one interval without any delivery at all. [`run_loop`] sleeps for a
+/// jittered interval, up to 10% longer than the configured one, *after* a tick
+/// returns, so an overrunning tick delays the next tick rather than
+/// overlapping it.
 const SINK_DELIVERY_DEADLINE_FRACTION: (u32, u32) = (1, 2);
 
 /// The per-tenant alert lease object body: who holds it and until when.
@@ -674,11 +684,12 @@ pub struct AlertEvaluator {
     /// take it over. Derived from the evaluation interval at construction
     /// ([`LEASE_TTL_TICKS`] times it).
     lease_ttl: Duration,
-    /// How long [`Self::flush_sinks`] may spend starting deliveries in one
-    /// tick, on the injected clock. Derived from the evaluation interval at
-    /// construction ([`SINK_DELIVERY_DEADLINE_FRACTION`] of it); see that
-    /// constant for the bound the budget actually buys, which is not the whole
-    /// tick.
+    /// Offset from the tick's start, on the injected clock, after which
+    /// [`Self::flush_sinks`] starts no further delivery attempt beyond its
+    /// first. Measured from the tick's own reading, so the work before delivery
+    /// consumes it too. Derived from the evaluation interval at construction
+    /// ([`SINK_DELIVERY_DEADLINE_FRACTION`] of it); see that constant for the
+    /// bound the budget actually buys, which is not the whole tick.
     sink_delivery_budget: Duration,
     /// Only read by the `sql` feature's [`AlertEvaluator::run_sql`]; a build
     /// without that feature rejects SQL rules before it would be needed.
@@ -1747,21 +1758,22 @@ impl AlertEvaluator {
     /// map and are counted in
     /// [`AlertEvalReport::notifications_deferred`].
     ///
-    /// `now_ns` is the tick's own reading, taken before rule evaluation, so the
-    /// deadline bounds the delivery phase against the start of the tick rather
-    /// than against the start of delivery. See
+    /// `now_ns` is the tick's own reading, taken before the memo read that opens
+    /// the tick, so the deadline bounds the delivery phase against the start of
+    /// the tick rather than against the start of delivery. See
     /// [`SINK_DELIVERY_DEADLINE_FRACTION`] for the bound that yields, which is
     /// not "before the next tick is due".
     ///
     /// The first notification is always attempted, deadline or not. A tick
-    /// whose rule evaluation alone consumed the budget would otherwise defer
-    /// every notification, every tick, and deliver nothing at all while the
-    /// sinks were healthy.
+    /// whose work before delivery alone consumed the budget would otherwise
+    /// defer every notification, every tick, and deliver nothing at all while
+    /// the sinks were healthy. In that regime a tick attempts exactly one
+    /// notification, however healthy the sinks are.
     ///
     /// # Round-robin over the queue, not oldest transition first
     ///
     /// The pass runs in [`QueuedNotification::seq`] order: queue position, not
-    /// record age. Age is the wrong key and starves outright (issue #2063).
+    /// record age. Age is the wrong key because it starves outright.
     /// `queue_repeat_for_alert` re-queues a repeat carrying the firing record's
     /// original `ts_ns`, and [`DEFAULT_REPEAT_INTERVAL`] equals the default
     /// evaluation interval, so with a sink that drains `k` notifications per
@@ -5820,6 +5832,96 @@ mod tick_tests {
             ev.undelivered.len(),
             queued,
             "and none of them left the map, because the dead sink never accepted"
+        );
+    }
+
+    /// A transition that supersedes a queued, undelivered notification keeps the
+    /// replaced entry's queue place (`write_transition`), so an alert that
+    /// changes state on every tick is still attempted behind a dead sink.
+    ///
+    /// The sink costs the whole budget and answers `500`, so each tick attempts
+    /// exactly the front of the queue and moves it to the back. Three alerts
+    /// fire on tick one; a fourth fires on tick two, behind them, and then
+    /// resolves and re-fires on every later tick, superseding its own queued
+    /// notification each time. Keeping its place, it reaches the front on
+    /// tick five, ahead of the entry tick two moved to the back after it was
+    /// first queued. Sent to the back on every supersede instead, it would stay
+    /// behind the rotating three and never be attempted at all.
+    #[tokio::test]
+    async fn a_superseding_transition_keeps_the_queue_place_of_the_one_it_replaces() {
+        let budget_ns = sink_delivery_budget_ns();
+        // Ten minutes apart, so a series not hot on a tick has fallen out of the
+        // PromQL lookback and its alert resolves.
+        let tick_at = |t: i64| NOW_NS + t * 10 * 60 * NS_PER_SEC;
+        let ticks = 5;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT);
+        let clock = TestClock::at(tick_at(0));
+        let dead = slow_sink(Arc::clone(&clock), budget_ns).await;
+        let mut ev = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(dead.url.clone())],
+            Arc::new(AlertMetrics::default()),
+        );
+        let flapper = compute_alert_id("high-cpu", &instance_alert_labels("host-0003"));
+
+        let mut written = Vec::new();
+        for t in 0..ticks {
+            // Three series hot on every tick; the fourth on ticks two and four
+            // only (indices 1 and 3).
+            let hot = if t % 2 == 1 { 4 } else { 3 };
+            publish_series_at_seq(
+                store.as_ref(),
+                &tenant,
+                (0..hot)
+                    .map(|i| {
+                        (
+                            instance_label_set(&format!("host-{i:04}")),
+                            vec![(tick_at(t) - 30 * NS_PER_SEC, 1.0)],
+                        )
+                    })
+                    .collect(),
+                t as u64 + 1,
+            )
+            .await;
+            clock.set(tick_at(t));
+            let report = ev.run_tick().await;
+            written.push(report.records_written);
+            assert_eq!(
+                report.notifications_failed, 1,
+                "tick {t}: exactly one attempt, refused; {report:?}"
+            );
+        }
+        assert_eq!(
+            written,
+            vec![3, 1, 1, 1, 1],
+            "three fire on tick one; from tick two the fourth alert transitions \
+             on every tick (Firing, Resolved, Firing, Resolved)"
+        );
+        assert!(
+            ev.undelivered.contains_key(&flapper),
+            "the dead sink never accepted, so the flapping alert stayed queued and \
+             every transition after its first superseded a queued notification"
+        );
+
+        let seen = dead.seen();
+        let flapper = flapper.to_hex();
+        assert_eq!(seen.len(), ticks as usize, "one attempt per tick");
+        assert!(
+            !seen[..4].contains(&flapper),
+            "the three queued ahead of it are attempted first; seen: {seen:?}"
+        );
+        assert_eq!(
+            seen[3], seen[0],
+            "tick one's attempt went to the back before the fourth alert was \
+             queued, so it is ahead of it; seen: {seen:?}"
+        );
+        assert_eq!(
+            seen[4], flapper,
+            "after three supersedes the flapping alert still holds the place it \
+             was first queued at, so tick five attempts it ahead of tick two's \
+             attempt, which went to the back after it; seen: {seen:?}"
         );
     }
 
