@@ -42,12 +42,12 @@
 
 use std::sync::Arc;
 
-use crate::fetcher::{ReadCache, gate_store_error};
+use crate::fetcher::{ReadCache, gate_not_run};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
-use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
+use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_rspan::block::{DEFAULT_MAX_UNCOMP, DecodedBlock, read_block, read_block_projected};
 use ravel_rspan::footer::kind;
@@ -600,6 +600,7 @@ impl SpanSegmentFetcher {
             pages_skipped: 0,
             finished: false,
             read_gate: self.read_gate.clone(),
+            lost: false,
         })
     }
 
@@ -824,6 +825,10 @@ pub struct SpanColumnarScan {
     /// The read CPU gate [`next_block_on_gate`](Self::next_block_on_gate)
     /// decodes on; `None` decodes inline.
     read_gate: Option<Arc<ReadGate>>,
+    /// Set once a gated block decode failed or was abandoned. The cursor had
+    /// already moved past that block, so every later call fails rather than
+    /// hand out the next block of a partial segment.
+    lost: bool,
 }
 
 impl SpanColumnarScan {
@@ -880,21 +885,25 @@ impl SpanColumnarScan {
         let size = JobSize::Bytes(block_uncompressed_len(&block_bytes));
         let projection = self.projection.clone();
         let query = self.query;
+        // Cleared only once the job returns: a failed job, or this future
+        // dropped while the job is queued or running, leaves the scan lost.
+        self.lost = true;
         let decoded = gate
             .run(ReadSite::SpanBlock, size, move || {
                 decode_block_rows(&block_bytes, crc, &projection, &query)
             })
             .await
-            .map_err(|err| SpanFetchError::Store {
-                key: self.key.clone(),
-                source: gate_store_error(err),
-            })?;
+            .map_err(|err| span_gate_failed(&self.key, err))?;
+        self.lost = false;
         self.record_block(decoded).map(Some)
     }
 
     /// Advances to the next candidate block and returns its bytes, or `None`
     /// (after the accounting fold) once every candidate has been taken.
     fn next_candidate(&mut self) -> Result<Option<(Bytes, u32)>, SpanFetchError> {
+        if self.lost {
+            return Err(span_scan_lost(&self.key));
+        }
         let Some(&(start, end, crc)) = self.candidates.get(self.cursor) else {
             self.finish();
             return Ok(None);
@@ -1269,6 +1278,33 @@ fn corrupt(key: &str, source: SpanSegError) -> SpanFetchError {
     SpanFetchError::Corrupt {
         key: key.to_string(),
         source,
+    }
+}
+
+/// A failed block decode job (ADR-1702 decision 2): a panic is the decode's
+/// own error, a job that never ran is transient.
+fn span_gate_failed(key: &str, err: CpuGateError) -> SpanFetchError {
+    match err {
+        CpuGateError::Panicked => corrupt(
+            key,
+            SpanSegError::Corrupted(format!("read CPU gate: {err}")),
+        ),
+        CpuGateError::Cancelled | CpuGateError::Closed => SpanFetchError::Store {
+            key: key.to_string(),
+            source: gate_not_run(err),
+        },
+    }
+}
+
+/// A [`SpanColumnarScan`] read again after a gated block decode failed.
+/// Permanent: that block cannot be read through this scan, and moving on to
+/// the next one would return a partial segment.
+fn span_scan_lost(key: &str) -> SpanFetchError {
+    SpanFetchError::Store {
+        key: key.to_string(),
+        source: StoreError::Permanent(
+            "read CPU gate: the scan lost a block with a failed block decode".to_string(),
+        ),
     }
 }
 
@@ -2082,11 +2118,23 @@ mod tests {
         assert_eq!(total_inline(&gate), 0);
     }
 
-    /// A block's job size is the uncompressed lengths its header lists, and a
-    /// header that does not parse sizes the block as unbounded.
+    /// A block's job size is the sum of its pages' uncompressed lengths, and a
+    /// header that does not parse sizes the block as unbounded. The expected
+    /// sum is measured independently: each page's stored bytes are
+    /// decompressed here and their lengths added, which is what `read_block`
+    /// checks every page's `uncomp_len` against. Long, repetitive span names
+    /// make the name page compress, so summing stored lengths would not pass.
+    ///
+    /// FLIP: summing each page's stored `len` instead of its `uncomp_len` in
+    /// `block_uncompressed_len` reads `left: 323, right: 11321`.
     #[test]
     fn span_block_job_size_reads_the_header() {
-        let records = [bare_span(trace(1), span(1), 100, 200)];
+        let records: Vec<SpanRecord> = (0..64)
+            .map(|i| SpanRecord {
+                name: format!("operation-{i}-{}", "abcdefgh".repeat(20)),
+                ..bare_span(trace(1), span(1), 100 + i, 200 + i)
+            })
+            .collect();
         let mut writer = RspanWriter::new(
             RspanConfig::default(),
             ObjectIdentity {
@@ -2106,11 +2154,139 @@ mod tests {
         let footer = open(&bytes).expect("footer");
         let blocks = footer.section(kind::BLOCKS).expect("BLOCKS");
         let (start, end) = abs_block_range(blocks.offset, blocks.len, &entry).expect("range");
+        let block_bytes = &bytes[start..end];
         let block =
-            read_block(&bytes[start..end], entry.block_crc32c, DEFAULT_MAX_UNCOMP).expect("decode");
-        let sized = block_uncompressed_len(&bytes[start..end]);
-        assert!(sized > 0 && sized < u64::MAX, "{sized}");
-        assert_eq!(block.record_count(), 1);
+            read_block(block_bytes, entry.block_crc32c, DEFAULT_MAX_UNCOMP).expect("decode");
+        assert_eq!(block.record_count(), 64);
+
+        let mut pos = 0usize;
+        let _records = get_uvarint(block_bytes, &mut pos).expect("record count");
+        let page_count = get_uvarint(block_bytes, &mut pos).expect("page count");
+        let mut pages = Vec::new();
+        for _ in 0..page_count {
+            let _column = get_uvarint(block_bytes, &mut pos).expect("column id");
+            let comp = block_bytes[pos + 1];
+            pos += 2;
+            let len = get_uvarint(block_bytes, &mut pos).expect("len");
+            let _uncomp = get_uvarint(block_bytes, &mut pos).expect("uncomp_len");
+            pages.push((comp, len as usize));
+        }
+        let dynamic = get_uvarint(block_bytes, &mut pos).expect("dynamic columns");
+        for _ in 0..dynamic {
+            let _column = get_uvarint(block_bytes, &mut pos).expect("column id");
+            let name_len = get_uvarint(block_bytes, &mut pos).expect("name len");
+            pos += name_len as usize;
+        }
+        let (mut stored, mut decoded) = (0u64, 0u64);
+        for (comp, len) in pages {
+            let page = &block_bytes[pos..pos + len];
+            pos += len;
+            stored += len as u64;
+            decoded += match comp {
+                0 => len as u64,
+                _ => zstd::bulk::decompress(page, 1 << 26)
+                    .expect("zstd page")
+                    .len() as u64,
+            };
+        }
+        assert_eq!(pos, block_bytes.len(), "every payload byte is a page");
+        assert!(decoded > stored, "a page compressed: {decoded} vs {stored}");
+        assert_eq!(block_uncompressed_len(block_bytes), decoded);
         assert_eq!(block_uncompressed_len(&[0x80]), u64::MAX);
+    }
+
+    /// A gated block decode that never ran leaves the scan lost: the call that
+    /// submitted it fails transient, and every later call, gated or inline,
+    /// fails instead of handing out the next block of a partial segment. The
+    /// scan is opened on a live runtime and drained on one that has shut down,
+    /// whose blocking pool cancels each job the gate dispatches.
+    ///
+    /// FLIP: drop the `lost` check from `next_candidate` and the second call
+    /// takes the next block, whose job is cancelled in turn, so the second
+    /// match panics with a transient `Store` error instead of the lost scan.
+    #[test]
+    fn a_scan_fails_after_a_cancelled_block_decode_rather_than_skip_it() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| bare_span(trace(i + 1), span(i + 1), 100, 200))
+            .collect();
+        let gate = floor_zero_gate();
+        let fetcher = SpanSegmentFetcher::new(store.clone()).with_read_gate(gate.clone());
+        let mut scan = rt.block_on(async {
+            let seg = write_object(&store, 0, &records).await;
+            fetcher
+                .fetch_accounted_columnar(
+                    &seg,
+                    TENANT,
+                    &all_query(),
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    &QueryAccounting::new(),
+                )
+                .await
+                .expect("open")
+                .expect("relevant")
+        });
+        assert_eq!(scan.remaining_blocks(), 3);
+        let handle = rt.handle().clone();
+        rt.shutdown_background();
+        let _entered = handle.enter();
+
+        match futures::executor::block_on(scan.next_block_on_gate()) {
+            Err(SpanFetchError::Store {
+                source: StoreError::Transient(message),
+                ..
+            }) => assert!(message.contains("cancelled"), "{message}"),
+            other => panic!("expected the cancelled job's transient error, got {other:?}"),
+        }
+        assert_eq!(site_counts(&gate, ReadSite::SpanBlock), (1, 0));
+        match futures::executor::block_on(scan.next_block_on_gate()) {
+            Err(SpanFetchError::Store {
+                source: StoreError::Permanent(message),
+                ..
+            }) => assert!(message.contains("lost"), "{message}"),
+            other => panic!("expected the lost scan, got {other:?}"),
+        }
+        assert!(matches!(
+            scan.next_block(),
+            Err(SpanFetchError::Store {
+                source: StoreError::Permanent(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            site_counts(&gate, ReadSite::SpanBlock),
+            (1, 0),
+            "no later block was submitted"
+        );
+    }
+
+    /// A gated block decode that panicked surfaces as the span fetcher's decode
+    /// error, the `Corrupt` class a corrupt block reports.
+    ///
+    /// FLIP: move `CpuGateError::Panicked` into the other arm of
+    /// `span_gate_failed` and the match panics with a transient `Store` error.
+    #[tokio::test]
+    async fn a_panicked_span_block_job_is_the_decode_error() {
+        let gate = crate::read_gate_test_support::floor_zero_gate();
+        let err = gate
+            .run(ReadSite::SpanBlock, JobSize::Bytes(1), || -> u8 {
+                panic!("block decode panicked")
+            })
+            .await
+            .expect_err("a panicking job fails");
+        match span_gate_failed("spans/0.rspan", err) {
+            SpanFetchError::Corrupt {
+                source: SpanSegError::Corrupted(message),
+                ..
+            } => assert!(message.contains("panicked"), "{message}"),
+            other => panic!("expected the decode error, got {other:?}"),
+        }
     }
 }

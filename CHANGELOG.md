@@ -29,16 +29,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decode (site `segment_section`, or `segment_sparse_catalog` for the chunked
   catalog probe) is one gate job the size of its decoded catalog, with the
   decode's memory reservation moved into the job and shrunk after the matcher
-  filter as before. Each RLOG block the LogQL series path drains
-  (`log_block`) and each RSPAN block the row fetch drains (`span_block`) is
-  one job covering all its pages. A PromQL evaluation whose prefetched sample
-  count is at or above the gate's evaluation floor runs on the gate
-  (`promql_eval`); a smaller one runs inline and counts as inline. A failed
-  job surfaces as the fetcher's typed store error, or as the new
-  `QueryError::CpuGate` for an evaluation. With no gate set every path runs
-  inline exactly as before, and the server does not set one yet: wiring its
-  read gate into the engine and fetchers it builds is a later step. The SQL
-  logs and spans scans still decode inside `poll_next` (task 8).
+  filter as before. On `LogSegmentFetcher`, every RLOG scan open (its
+  directory sections and the POSTINGS probe, which the reader runs inside the
+  open) is one `log_postings` job; every block `fetch_accounted` and
+  `fetch_accounted_with_tenant` decode, and every block a `LogSegmentScan`
+  hands out through `next_block_on_gate` (the LogQL series path), is one
+  `log_block` job covering all its pages; and every SKIP_IDX, PAGE_DIR,
+  FIELD_DIR and planning section the block-range path decodes on its own is
+  one `log_section` job. Each RSPAN block the span fetcher's row fetch
+  decodes, and every block a `SpanColumnarScan` hands out through
+  `next_block_on_gate`, is one `span_block` job. A PromQL evaluation whose
+  prefetched sample count is at or above the gate's evaluation floor runs on
+  the gate (`promql_eval`); a smaller one runs inline and counts as inline. A job that panicked is the fetcher's decode
+  error (`Corrupt`), a 500 on the HTTP API, and an evaluation that panicked
+  is the new `QueryError::CpuGate`, also a 500; a job the runtime dropped at
+  shutdown is a transient store error and a 503. A span scan whose gated
+  block decode failed refuses every later block rather than skip one. With no
+  gate set every path runs inline exactly as before, and the server does not
+  set one yet: wiring its read gate into the engine and fetchers it builds is
+  a later step. Still inline with a gate set: RSEG page decodes, a
+  `LogSegmentScan`'s `next_block` and `next_block_columnar` exits and a
+  `SpanColumnarScan`'s `next_block`, a direct `matching_streams` call, the
+  STREAM_DIR decode of `fetch_stream_dir`'s whole-object fallback, and the
+  RSPAN footer sections (`span_section`), which the span fetcher decodes
+  while opening a scan. The SQL logs and spans
+  scans still decode inside `poll_next` (task 8).
 
 ### Security
 

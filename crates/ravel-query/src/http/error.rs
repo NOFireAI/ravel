@@ -14,6 +14,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use ravel_catalog::CatalogError;
+use ravel_cpu_gate::CpuGateError;
 use ravel_object_store::StoreError;
 
 use crate::QueryError;
@@ -36,6 +37,10 @@ pub const MSG_CORRUPT: &str = "stored data failed integrity validation";
 /// the corruption message so a client and operator can tell a retryable
 /// outage apart from a permanent data fault without the leaked detail.
 pub const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
+
+/// Stable client message for a query whose evaluation failed on the server:
+/// it panicked on the read CPU gate. Non-retryable, like a corruption fault.
+pub const MSG_INTERNAL: &str = "query evaluation failed on the server";
 
 /// Stable client message for a query whose evidential audit event could not be
 /// made durable (ADR-0062 section 2a). Distinct from [`MSG_UNAVAILABLE`]: the
@@ -157,11 +162,16 @@ impl From<QueryError> for ApiError {
             // query fails closed on rather than keeping one of two values; its
             // message carries only a series id, redacted to the fixed message.
             | QueryError::DuplicatePushdownSeries { .. }
-            // An evaluation the read CPU gate could not run (it panicked, or
-            // the runtime dropped it at shutdown) is a server-side fault that
-            // carries nothing of the client's query.
-            | QueryError::CpuGate(_) => {
+            // An evaluation the runtime dropped at shutdown, or a closed gate,
+            // never ran: retrying elsewhere can succeed.
+            | QueryError::CpuGate(CpuGateError::Cancelled | CpuGateError::Closed) => {
                 ApiError::Unavailable(MSG_UNAVAILABLE.to_string())
+            }
+            // An evaluation that panicked on the read CPU gate panics again on
+            // the same data (ADR-1702 decision 2), so it takes the
+            // non-retryable 500 with a fixed message.
+            QueryError::CpuGate(CpuGateError::Panicked) => {
+                ApiError::Corrupt(MSG_INTERNAL.to_string())
             }
         }
     }
@@ -849,5 +859,59 @@ mod tests {
                 public.message
             );
         }
+    }
+
+    /// ADR-1702 decision 2: a gate job that panicked is the non-retryable 500
+    /// whether it was an evaluation or a catalog decode, and a job that never
+    /// ran is the retryable 503. The panic comes from a real gate job, and the
+    /// fetch error from the mapping every RSEG catalog decode site uses.
+    ///
+    /// FLIP: mapping `CpuGateError::Panicked` back into the `Unavailable` arm
+    /// of `From<QueryError>` reads `left: 503, right: 500` on the first status
+    /// assertion; mapping it to a transient `FetchError::Store` in
+    /// `fetcher::gate_failed` fails the `FetchError::Corrupt` match with that
+    /// `Store` error.
+    #[tokio::test]
+    async fn a_panicked_gate_job_is_a_500_and_a_cancelled_one_a_503() {
+        let gate = crate::read_gate_test_support::floor_zero_gate();
+        let panicked = gate
+            .run(
+                ravel_cpu_gate::ReadSite::SegmentSection,
+                ravel_cpu_gate::JobSize::Bytes(1),
+                || -> u8 { panic!("decode panicked") },
+            )
+            .await
+            .expect_err("a panicking job fails");
+        assert!(matches!(panicked, CpuGateError::Panicked), "{panicked:?}");
+
+        assert_eq!(
+            status_code(QueryError::CpuGate(CpuGateError::Panicked)),
+            500
+        );
+        let fetch = crate::fetcher::gate_failed(LEAKY_KEY, panicked);
+        assert!(matches!(fetch, FetchError::Corrupt { .. }), "{fetch:?}");
+        let message = client_message(QueryError::Fetch(crate::fetcher::gate_failed(
+            LEAKY_KEY,
+            CpuGateError::Panicked,
+        )));
+        assert_redacted(&message);
+        assert_eq!(status_code(QueryError::Fetch(fetch)), 500);
+
+        assert_eq!(
+            status_code(QueryError::CpuGate(CpuGateError::Cancelled)),
+            503
+        );
+        let cancelled = crate::fetcher::gate_failed(LEAKY_KEY, CpuGateError::Cancelled);
+        assert!(
+            matches!(
+                cancelled,
+                FetchError::Store {
+                    source: StoreError::Transient(_),
+                    ..
+                }
+            ),
+            "{cancelled:?}"
+        );
+        assert_eq!(status_code(QueryError::Fetch(cancelled)), 503);
     }
 }
