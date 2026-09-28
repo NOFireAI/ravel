@@ -66,10 +66,21 @@ struct GetCost {
     bytes: u64,
 }
 
+/// The bytes a `declared`-byte section or frame may allocate under a decoder
+/// whose ceiling is `ceiling`: the declared length itself, or 0 when it is
+/// over the ceiling, since the decoder refuses an oversized one before it
+/// allocates anything. Charging the ceiling instead turns that refusal into a
+/// budget refusal whenever the budget has less than the ceiling free, which
+/// reports memory pressure where an oversized section was and replaces the
+/// decoder's own typed error with a retryable one.
+fn decoded_charge(declared: u64, ceiling: u64) -> u64 {
+    if declared > ceiling { 0 } else { declared }
+}
+
 /// What a catalog decode is charged before it runs (ADR-1702 decision 6): the
 /// footer-declared `uncompressed_len` of every catalog section the object
-/// carries, each clamped to the reader's section ceiling, since the decoder
-/// refuses a larger section before allocating it.
+/// carries, each through [`decoded_charge`] against the reader's section
+/// ceiling.
 ///
 /// SERIES_META_CHUNKS is the exception, and `meta_chunks_inflated` is what
 /// replaces its footer figure when the chunk directory is readable. That
@@ -98,19 +109,22 @@ fn catalog_decode_len(
         })
         .map(|s| match (s.kind, meta_chunks_inflated) {
             (SECTION_SERIES_META_CHUNKS, Some(inflated)) => inflated,
-            _ => s
-                .uncompressed_len
-                .min(limits.max_section_uncompressed_bytes),
+            _ => decoded_charge(s.uncompressed_len, limits.max_section_uncompressed_bytes),
         })
         .fold(0, u64::saturating_add)
 }
 
 /// The bytes SERIES_META_CHUNKS inflates to: the sum of its chunk directory's
 /// `frame_uncompressed_len` (docs/segment-format.md "SERIES_IDX"), each
-/// clamped to the reader's section ceiling, since
+/// through [`decoded_charge`] against the reader's section ceiling, since
 /// `decode_catalog_v5_chunked` refuses a larger frame before allocating it.
 /// The directory lives in SERIES_IDX, which every chunked path has already
 /// fetched into `regions` before the decode.
+///
+/// The sum walks the chunk directory itself, so its cost is bounded by the
+/// directory's own bytes. A per-series walk would instead be bounded by the
+/// declared `series_count`, which a crc-consistent directory can set to
+/// `u32::MAX` while carrying one chunk (issue #2081).
 ///
 /// `None` means the footer figure is the only reading available: the object
 /// carries no SERIES_IDX (it is not chunked), its bytes are not in `regions`,
@@ -135,23 +149,12 @@ fn meta_chunks_inflated_len(
         return None;
     }
     let index = ravel_segment::parse_series_idx(&bytes).ok()?;
-    let mut total = 0u64;
-    for series_index in 0..u64::from(index.series_count()) {
-        // The directory is dense and `chunk_for` reports the row's offset
-        // within its frame, so `row_in_chunk == 0` walks each frame exactly
-        // once through the public lookup.
-        match index.chunk_for(series_index) {
-            Some(chunk) if chunk.row_in_chunk == 0 => {
-                total = total.saturating_add(
-                    chunk
-                        .frame_uncompressed_len
-                        .min(limits.max_section_uncompressed_bytes),
-                );
-            }
-            _ => {}
-        }
-    }
-    Some(total)
+    Some(
+        index
+            .chunk_frame_uncompressed_lens()
+            .map(|len| decoded_charge(len, limits.max_section_uncompressed_bytes))
+            .fold(0u64, u64::saturating_add),
+    )
 }
 
 /// Heap bytes one decoded catalog entry holds once the fetched section bytes
@@ -4983,6 +4986,178 @@ mod tests {
             0,
             "a failed fetch leaves nothing charged"
         );
+    }
+
+    /// Issue #2081 item 2, PromQL side: a catalog section or chunk frame
+    /// declaring more than the reader's ceiling allocates nothing, because the
+    /// decoder refuses it before allocating. It is therefore charged 0, and the
+    /// decoder's own error is what the caller sees. Charging the ceiling
+    /// instead replaces that error with a retryable budget refusal on every
+    /// budget with less than the ceiling free.
+    ///
+    /// The chunk frame is the reachable half of this. A whole SECTION over the
+    /// ceiling never reaches a reservation on the fetch path at all:
+    /// `parse_footer` (`ravel-segment/src/reader.rs`) rejects the object inside
+    /// `open_segment`, before the catalog decode exists. Nothing checks a chunk
+    /// frame's declared length before `decode_catalog_v5_chunked` does, so a
+    /// directory carrying one is exactly what `meta_chunks_inflated_len` reads.
+    /// Both are asserted here, on the charge each reader computes, rather than
+    /// end to end through a fetch that cannot reach one of them.
+    ///
+    /// FLIP: make `decoded_charge` return `declared.min(ceiling)` and the frame
+    /// assertion fails first, with `left: Some(12288), right: Some(4096)`: the
+    /// oversized frame charges the ceiling instead of nothing.
+    #[test]
+    fn a_declared_length_over_the_ceiling_is_charged_nothing() {
+        const CEILING: u64 = 8_192;
+        const SMALL_FRAME: u64 = 4_096;
+        let limits = ReaderLimits {
+            max_section_uncompressed_bytes: CEILING,
+            ..ReaderLimits::default()
+        };
+
+        let idx = two_chunk_series_idx(SMALL_FRAME, CEILING + 1);
+        let footer = series_idx_footer(&idx);
+        let mut regions = FetchedRegions::default();
+        regions.insert(0, Bytes::from(idx));
+        assert_eq!(
+            meta_chunks_inflated_len(&footer, &regions, limits),
+            Some(SMALL_FRAME),
+            "the frame over the ceiling adds nothing; only the frame that fits is charged"
+        );
+
+        let over_ceiling = Footer {
+            sections: vec![ravel_proto::segment::v1::Section {
+                kind: SECTION_SERIES_IDS,
+                offset: 0,
+                len: 1,
+                uncompressed_len: CEILING + 1,
+                comp: COMPRESSION_NONE,
+                crc32c: 0,
+            }],
+            ..Footer::default()
+        };
+        assert_eq!(
+            catalog_decode_len(&over_ceiling, limits, None),
+            0,
+            "a section the decoder will refuse is charged nothing"
+        );
+    }
+
+    /// A SERIES_IDX section body over two series and two chunks, one frame
+    /// each, declaring the given uncompressed frame lengths. Layout per
+    /// docs/segment-format.md "SERIES_IDX".
+    fn two_chunk_series_idx(first_frame_len: u64, second_frame_len: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(1u8); // version
+        buf.push(0); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        buf.extend_from_slice(&1u32.to_le_bytes()); // stride
+        buf.extend_from_slice(&2u32.to_le_bytes()); // series_count
+        buf.extend_from_slice(&2u32.to_le_bytes()); // sparse_count
+        for (p, id) in [0u8, 1].iter().enumerate() {
+            buf.extend_from_slice(&[*id; 16]);
+            buf.extend_from_slice(&(4u64 + p as u64 * 16).to_le_bytes()); // ids_offset
+            buf.extend_from_slice(&16u64.to_le_bytes()); // window_len
+            buf.extend_from_slice(&0u32.to_le_bytes()); // window_crc32c
+        }
+        buf.extend_from_slice(&1u32.to_le_bytes()); // chunk_stride
+        buf.extend_from_slice(&2u32.to_le_bytes()); // chunk_count
+        for (k, frame_len) in [first_frame_len, second_frame_len].iter().enumerate() {
+            buf.extend_from_slice(&(k as u64).to_le_bytes()); // frame_offset
+            buf.extend_from_slice(&1u64.to_le_bytes()); // frame_stored_len
+            buf.extend_from_slice(&frame_len.to_le_bytes());
+            buf.extend_from_slice(&(k as u32).to_le_bytes()); // first_index
+            buf.extend_from_slice(&1u32.to_le_bytes()); // n
+            buf.extend_from_slice(&0u32.to_le_bytes()); // frame_crc32c
+        }
+        buf
+    }
+
+    /// A footer carrying `idx` as an uncompressed SERIES_IDX at offset 0, plus
+    /// the SERIES_META_CHUNKS descriptor that makes the object chunked.
+    fn series_idx_footer(idx: &[u8]) -> Footer {
+        Footer {
+            sections: vec![
+                ravel_proto::segment::v1::Section {
+                    kind: SECTION_SERIES_IDX,
+                    offset: 0,
+                    len: idx.len() as u64,
+                    uncompressed_len: idx.len() as u64,
+                    comp: COMPRESSION_NONE,
+                    crc32c: crc32c::crc32c(idx),
+                },
+                ravel_proto::segment::v1::Section {
+                    kind: SECTION_SERIES_META_CHUNKS,
+                    offset: idx.len() as u64,
+                    len: 1,
+                    uncompressed_len: 1,
+                    comp: COMPRESSION_NONE,
+                    crc32c: 0,
+                },
+            ],
+            ..Footer::default()
+        }
+    }
+
+    /// Issue #2081 item 3: `meta_chunks_inflated_len` walks the chunk directory
+    /// itself, so its cost is bounded by the directory's entry count and not by
+    /// the declared `series_count`. `parse_series_idx` accepts a directory
+    /// declaring `u32::MAX` series over a single chunk (the stride chain is
+    /// consistent and the section crc is this test's own), and a per-series
+    /// walk over it would call `chunk_for` 4_294_967_295 times to find the one
+    /// frame this asserts on.
+    ///
+    /// FLIP: restore the `for series_index in 0..u64::from(index.series_count())`
+    /// loop and this test runs 4_294_967_295 iterations instead of 1.
+    #[test]
+    fn a_huge_series_count_costs_one_iteration_per_chunk_directory_entry() {
+        const FRAME_LEN: u64 = 4_096;
+        let idx = huge_series_count_series_idx(FRAME_LEN);
+        let index = ravel_segment::parse_series_idx(&idx).expect("the crafted directory parses");
+        assert_eq!(index.series_count(), u32::MAX, "the declared series count");
+        assert_eq!(
+            index.chunk_frame_uncompressed_lens().len(),
+            1,
+            "the whole directory is one chunk, and that is the loop bound"
+        );
+
+        let footer = series_idx_footer(&idx);
+        let mut regions = FetchedRegions::default();
+        regions.insert(0, Bytes::from(idx));
+
+        assert_eq!(
+            meta_chunks_inflated_len(&footer, &regions, ReaderLimits::default()),
+            Some(FRAME_LEN),
+            "the one chunk frame's declared uncompressed length"
+        );
+    }
+
+    /// A SERIES_IDX section body declaring `u32::MAX` series over one sparse
+    /// entry and one chunk directory entry: the largest `series_count` the
+    /// format admits in the smallest directory that can carry it. Layout per
+    /// docs/segment-format.md "SERIES_IDX".
+    fn huge_series_count_series_idx(frame_uncompressed_len: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(1u8); // version
+        buf.push(0); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // stride
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // series_count
+        buf.extend_from_slice(&1u32.to_le_bytes()); // sparse_count
+        buf.extend_from_slice(&[0u8; 16]); // entry 0: id
+        buf.extend_from_slice(&4u64.to_le_bytes()); // ids_offset: 4 + 0 * 16
+        buf.extend_from_slice(&(u64::from(u32::MAX) * 16).to_le_bytes()); // window_len
+        buf.extend_from_slice(&0u32.to_le_bytes()); // window_crc32c
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // chunk_stride
+        buf.extend_from_slice(&1u32.to_le_bytes()); // chunk_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // chunk 0: frame_offset
+        buf.extend_from_slice(&1u64.to_le_bytes()); // frame_stored_len
+        buf.extend_from_slice(&frame_uncompressed_len.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // first_index
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n
+        buf.extend_from_slice(&0u32.to_le_bytes()); // frame_crc32c
+        buf
     }
 
     /// The catalog decode's reservation is charged exactly while the decoded

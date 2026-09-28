@@ -335,6 +335,17 @@ impl SparseIdIndex {
         })
     }
 
+    /// Every meta-chunk frame's uncompressed length, in directory order.
+    ///
+    /// For a reader that needs the whole directory rather than one series'
+    /// chunk: the work is bounded by the directory's own entry count, where a
+    /// per-series walk through [`Self::chunk_for`] is bounded by the declared
+    /// `series_count`, which a crc-consistent directory can set to `u32::MAX`
+    /// while carrying a single chunk.
+    pub fn chunk_frame_uncompressed_lens(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.chunks.iter().map(|c| c.frame_uncompressed_len)
+    }
+
     /// Which chunk covers absolute series `index` (frame byte range, row
     /// offset, and crc32c). `None` when `index` is out of range.
     pub fn chunk_for(&self, index: u64) -> Option<ChunkLocation> {
