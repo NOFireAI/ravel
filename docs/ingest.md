@@ -438,6 +438,42 @@ object written) rather than defaulting to bucket 0 (ADR-0051 section 7):
 a fallback bucket would make the data undiscoverable by hour
 with no trace of the failure.
 
+After that plausibility check, and before the ADR-1307 monotonic floor is
+consulted, the actor compares the raw reading with the object store's
+observed clock, the latest response `Date` the store adapter saw
+(ADR-1685). If the reading lags that observation by more than
+`DEFAULT_CLOCK_SKEW_ALLOWANCE_NS` (five minutes), the flush is refused the
+same way an over-bound clock regression is: every strict waiter gets the
+retryable `Abandoned` (503), the buffer goes back into the tenant map for
+the next trigger, nothing is written, and `clock_lag_refused` counts it. A
+writer that far behind would otherwise stamp an ingest hour the fold,
+running on its own clock, may already have sealed. The check is one-sided:
+the observation is a lower bound on the store's clock, so a reading ahead of
+it is normal and is not checked here. It compares the raw reading, never the
+floor-raised stamp, since the floor can only hide lag. When the store has
+not been observed yet (no response so far, or `MemoryStore`), the flush
+proceeds unchecked and `clock_lag_unchecked` counts it; refusing there
+would deadlock, because the flush is itself a source of responses.
+
+A graceful shutdown is the one place the check is bypassed. Unlike an
+over-bound clock regression, a lag refusal re-anchors nothing: it leaves
+both the monotonic floor and the store's observation unchanged, so every
+pass of a drain reads the same lag and refuses again. On the `Shutdown` and
+channel-close drains there is no later tick, so enforcing it to the pass cap
+would report the buffered rows as residue and lose them, and in buffered
+mode those rows were already acknowledged. Durability wins there: once the
+bounded passes leave a tenant refused, a teardown drain makes one final pass
+with the lag check bypassed, publishing with the raw-reading stamp (the
+floor rules unchanged) and counting each such flush as
+`clock_lag_bypassed_at_shutdown`, logged at WARN with the measured lag.
+Those rows can land in an ingest hour the fold has already sealed, so a
+token-less read sees them only after a HEAD rebuild -- the same recoverable
+outcome the writer had before this check existed, rather than a drop.
+`FlushNow` and every size or age trigger keep refusing, since their actor
+keeps running to retry. A regression refusal still refuses on that final
+pass, so the residue path stays reachable for ADR-1307's case. Either way:
+fix the host clock before restarting a writer that is refusing flushes.
+
 ### Pipelined flushes (ADR-0067)
 
 The PUTs no longer run inline in the actor. At flush-open the actor pins

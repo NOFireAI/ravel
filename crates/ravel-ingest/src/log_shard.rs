@@ -63,9 +63,9 @@ use uuid::Uuid;
 use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
-    DrainIntent, FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES,
-    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket, idle_age_threshold,
-    memory_backstop_crossed, size_trigger_fires,
+    DrainIntent, FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, LagCheck,
+    MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS, StoreClockLag, checked_ingest_hour_bucket,
+    idle_age_threshold, memory_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -1224,7 +1224,8 @@ impl LogShardActor {
             })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                .await;
         }
     }
 
@@ -1290,7 +1291,8 @@ impl LogShardActor {
             })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                .await;
         }
     }
 
@@ -1332,7 +1334,8 @@ impl LogShardActor {
             .collect();
         for (tenant, trigger) in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, trigger).await;
+                self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
+                    .await;
             }
         }
     }
@@ -1352,10 +1355,23 @@ impl LogShardActor {
     /// paths there is no later actor tick to retry it, so the re-buffered
     /// tenant would drop on teardown -- the exact loss the channel-close arm
     /// forbids. Retry over fresh snapshots until the map empties, bounded by
-    /// [`MAX_FLUSH_ALL_PASSES`]. This terminates because a refusal re-anchors
+    /// [`MAX_FLUSH_ALL_PASSES`]. A *regression* refusal (ADR-1307) re-anchors
     /// the monotonic floor to the raw reading, so the next pass stamps it and
-    /// proceeds; the bound only guards a pathological clock stepping back on
-    /// every reading.
+    /// proceeds; for that refusal the bound only guards a pathological clock
+    /// stepping back on every reading.
+    ///
+    /// A *lag* refusal (ADR-1685) re-anchors nothing: it changes neither the
+    /// floor nor the store's observation, so every pass reads the same lag and
+    /// refuses again, and the pass bound is what ends the drain. That would
+    /// strand acknowledged buffered-mode rows on a teardown, so after the bound
+    /// a [`DrainIntent::Teardown`] makes one final pass with
+    /// [`LagCheck::BypassedAtTeardown`]: the lag is counted
+    /// (`clock_lag_bypassed_at_shutdown`) and logged, and the flush publishes.
+    /// Those rows may land in an ingest hour the fold has sealed, recoverable by
+    /// a HEAD rebuild, where the drop is not recoverable at all. Floor rules are
+    /// unchanged on that pass, so a regression refusal still refuses there.
+    /// [`DrainIntent::Retryable`] never bypasses: its actor keeps running, so a
+    /// later trigger retries once the host clock converges.
     ///
     /// Residue left by the bound is never dropped silently, but it is only a
     /// durability defect when nothing will retry it, so `intent` decides how it
@@ -1366,13 +1382,12 @@ impl LogShardActor {
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
-            let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
-            for tenant in tenants {
-                if let Some(buf) = self.tenants.remove(&tenant) {
-                    self.flush_tenant(tenant, buf, trigger).await;
-                }
-            }
+            self.flush_all_pass(trigger, LagCheck::Enforced).await;
             passes += 1;
+        }
+        if !self.tenants.is_empty() && matches!(intent, DrainIntent::Teardown) {
+            self.flush_all_pass(trigger, LagCheck::BypassedAtTeardown)
+                .await;
         }
         if !self.tenants.is_empty() {
             let (tenant_count, buffered_records) = self.buffered_summary();
@@ -1404,6 +1419,18 @@ impl LogShardActor {
             }
         }
         self.join_all_flushes().await;
+    }
+
+    /// One drain pass: a fresh snapshot of the buffered tenant keys, each
+    /// flushed under `lag_check`. A refused flush re-inserts its key, which the
+    /// next pass's snapshot picks up.
+    async fn flush_all_pass(&mut self, trigger: FlushTrigger, lag_check: LagCheck) {
+        let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
+        for tenant in tenants {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, trigger, lag_check).await;
+            }
+        }
     }
 
     /// Awaits every spawned flush task, not only ones triggered by this call:
@@ -1494,8 +1521,37 @@ impl LogShardActor {
     /// The floor is in-process state, never persisted, so it resets to 0 on
     /// restart by construction. The guarantee is per-process; ADR-1307 records
     /// the cross-restart limitation.
-    fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, FlushClockError> {
+    fn monotonic_flush_open_ns(
+        &mut self,
+        raw_ns: i64,
+        lag_check: LagCheck,
+    ) -> Result<i64, FlushClockError> {
         checked_ingest_hour_bucket(raw_ns).map_err(FlushClockError::InvalidReading)?;
+        match store_clock_lag(raw_ns, self.ctx.store.observed_store_time_ns()) {
+            StoreClockLag::WithinAllowance => {}
+            StoreClockLag::Unobserved => self.metrics.record_clock_lag_unchecked(),
+            StoreClockLag::Refused { lag_ns, msg } => match lag_check {
+                LagCheck::Enforced => {
+                    self.metrics.record_clock_lag_refused();
+                    tracing::warn!(
+                        shard = self.shard,
+                        raw_ns,
+                        lag_ns,
+                        "ravel-ingest: log flush clock lags the object store's observed clock beyond the clock-skew allowance; refusing the flush"
+                    );
+                    return Err(FlushClockError::LagRefused(msg));
+                }
+                LagCheck::BypassedAtTeardown => {
+                    self.metrics.record_clock_lag_bypassed_at_shutdown();
+                    tracing::warn!(
+                        shard = self.shard,
+                        raw_ns,
+                        lag_ns,
+                        "ravel-ingest: log flush clock lags the object store's observed clock beyond the clock-skew allowance, but this is a teardown drain's final pass; publishing anyway so acknowledged buffered-mode rows are not lost. The commit record may land in an ingest hour the fold has sealed, so a token-less read needs a catalog HEAD rebuild to see it"
+                    );
+                }
+            },
+        }
         if raw_ns >= self.last_flush_open_ns {
             self.last_flush_open_ns = raw_ns;
             return Ok(raw_ns);
@@ -1543,6 +1599,7 @@ impl LogShardActor {
         tenant: TenantId,
         mut buf: LogTenantBuf,
         trigger: FlushTrigger,
+        lag_check: LagCheck,
     ) {
         // `waiters` is empty on the record-less path below by construction: the
         // log router mints a strict-mode ack only for a shard that actually
@@ -1591,7 +1648,7 @@ impl LogShardActor {
         // `record_flush`: a refused flush never touched the store, so it must not
         // be counted as a flush that happened, and (on the retryable arm) its rows
         // must be re-buffered rather than dropped (ADR-1307 finding 1).
-        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
+        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns, lag_check) {
             Ok(ns) => ns,
             Err(FlushClockError::InvalidReading(msg)) => {
                 // A grossly broken raw reading is fail-loud and non-retryable
@@ -1602,13 +1659,16 @@ impl LogShardActor {
                     .ack_waiters(buf.waiters, Err(LogWriteError::SegmentBuild(msg)));
                 return;
             }
-            Err(FlushClockError::RegressionRefused(msg)) => {
-                // Already counted as `clock_regressions_refused` inside the
-                // helper; a clock regression is a transient server condition the
-                // next flush recovers from, so it is retryable (`Abandoned`, 503),
-                // not a client `SegmentBuild` (400) that would drop the buffered
-                // rows on a conformant exporter. The floor re-anchored to `raw_ns`
-                // inside the helper, so the next reading at or above `raw_ns`
+            Err(FlushClockError::RegressionRefused(msg) | FlushClockError::LagRefused(msg)) => {
+                // Both arms are already counted inside the helper
+                // (`clock_regressions_refused`, `clock_lag_refused`) and are
+                // transient server conditions a later flush recovers from, so
+                // both are retryable (`Abandoned`, 503), not a client
+                // `SegmentBuild` (400) that would drop the buffered rows on a
+                // conformant exporter. What recovers them differs.
+                //
+                // A REGRESSION refusal re-anchored the floor to `raw_ns` inside
+                // the helper, so the next reading at or above `raw_ns`
                 // proceeds: the bound is per backwards step, not global, and a
                 // single backwards step refuses exactly one flush. It is not a
                 // guarantee that only one flush is refused over the process
@@ -1617,7 +1677,18 @@ impl LogShardActor {
                 // continues, and within one drain the absorb path returns the held
                 // stamp without advancing the floor, so a receding clock can refuse
                 // one tenant, absorb the next few against the re-anchored value,
-                // and refuse again. Re-buffer the rows
+                // and refuse again.
+                //
+                // A LAG refusal (ADR-1685) re-anchors nothing: the floor was
+                // never consulted and the store's observation is unchanged, so
+                // every retry against the same clock refuses identically until
+                // the host clock converges. Inside a drain that means
+                // `MAX_FLUSH_ALL_PASSES` is what ends the loop, and on a
+                // teardown drain its final pass runs with
+                // `LagCheck::BypassedAtTeardown` so these rows publish rather
+                // than becoming residue.
+                //
+                // Re-buffer the rows
                 // so that next trigger flushes them (finding 1): `charges` ride
                 // back with the buffer (the byte budget is not refunded, the bytes
                 // are still held), and the whole buffer -- content, declared-column

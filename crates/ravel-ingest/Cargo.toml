@@ -51,6 +51,8 @@ futures = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+# MemoryStore::set_observed_store_time_ns for the ADR-1685 store-clock lag tests.
+ravel-object-store = { workspace = true, features = ["test-support"] }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
 # ADR-0873 wave 5a end-to-end reachability test only: load a tenant through the

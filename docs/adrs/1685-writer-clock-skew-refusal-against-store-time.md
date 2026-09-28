@@ -187,7 +187,9 @@ flowchart LR
   answers every write with a retryable error until its clock converges. In
   buffered mode the rows stay buffered and retry each tick under the
   ADR-0069 byte budget, so a host whose clock never converges eventually
-  sheds at the ceiling. That is the same operator surface as
+  sheds at the ceiling. On a graceful shutdown they are published instead,
+  with the check bypassed on the drain's final pass and counted: see the
+  teardown amendment below. That is the same operator surface as
   `clock_regressions_refused`: fix the host clock.
 - Two cases remain outside the check and are stated here rather than
   claimed closed. A process with no observation yet flushes unchecked and
@@ -257,3 +259,37 @@ The parser also clamps a leap second (`:60`) to `:59`, so a correct `Date`
 still yields a value no later than the instant the store stamped, which is
 what decision 3's lower-bound argument needs. A wrong `Date` can move the
 observation in either direction, as the Consequences already state.
+
+## Amendment (2026-09-28): teardown with a lagging clock
+
+<!-- amendment-applies: sections="Consequences" pointer="teardown amendment" -->
+
+The Consequences name shedding at the byte-budget ceiling as the end state
+for a writer whose clock never converges, but not the graceful-shutdown
+path. A lag refusal is not self-clearing the way an over-bound regression
+is: a regression refusal re-anchors the monotonic floor, so the next pass
+stamps the raw reading and publishes, while a lag refusal changes neither
+the floor nor the store's observation, so every pass of a drain reads the
+same lag and refuses again. Enforcing the check on every pass therefore
+loses the buffered rows the drain exists to save, and in buffered mode
+those rows were already acknowledged. Before this decision the slow-writer
+direction cost visibility (a commit record in a sealed hour, recoverable by
+a HEAD rebuild); the refusal must not convert that into a loss of
+acknowledged writes.
+
+Durability wins at teardown. On the `Shutdown` and channel-close drains
+only, once the bounded retry passes leave a tenant still refused, the drain
+makes one final pass with the lag check bypassed: the flush publishes with
+the raw-reading stamp, the ADR-1307 floor rules unchanged, and each such
+flush increments `clock_lag_bypassed_at_shutdown` and logs at WARN naming
+the measured lag. Those rows may land in an ingest hour the fold has
+sealed, invisible to token-less reads until a HEAD rebuild, exactly as they
+were before this ADR and recoverable in the same way. `FlushNow` and every
+size or age trigger keep refusing, because their actor keeps running and
+retries once the host clock converges. A regression refusal still refuses
+on the bypass pass, so the residue path (ERROR plus
+`flush_all_residue_tenants`) remains reachable for the ADR-1307 case and
+unreachable for this one. The operator remedy is unchanged: fix the host
+clock before restarting a writer that is refusing flushes, and rebuild the
+catalog HEAD if a token-less read is missing rows a bypassed flush
+published.

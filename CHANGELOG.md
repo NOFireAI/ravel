@@ -82,6 +82,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A writer whose clock lags the object store's clock refuses its flush
+  instead of publishing into a sealed hour** (issue #1685, ADR-1685). At flush
+  open, every metrics, log, and span shard actor compares its raw clock reading
+  with the store's observed clock (the latest response `Date`). A reading more
+  than `DEFAULT_CLOCK_SKEW_ALLOWANCE_NS` (five minutes) behind it fails the
+  flush with the retryable `Abandoned` (503), re-buffers the rows, and counts
+  `clock_lag_refused`, where before the flush was acknowledged and its commit
+  record landed in an ingest hour a fold on a correct clock may already have
+  sealed, invisible to token-less reads. A flush with no observation yet
+  proceeds and counts `clock_lag_unchecked`. Both counters are on the
+  `ravel-ingest` metrics snapshots; `/metrics` does not render them yet. A
+  graceful shutdown is the one exception, because a lag refusal re-anchors
+  nothing and so refuses every pass of a drain: on the `Shutdown` and
+  channel-close drains the final pass bypasses the check and publishes the
+  buffered rows, counting each such flush as
+  `clock_lag_bypassed_at_shutdown` and logging the lag at WARN. Those rows
+  can land in an already-sealed ingest hour, visible to token-less reads
+  after a HEAD rebuild, which is what they did before this change; enforcing
+  the refusal there would have dropped rows buffered mode had already
+  acknowledged. `FlushNow` and every size or age trigger keep refusing. Fix
+  the host clock before restarting a writer that is refusing flushes.
+
 - **A query's fold-lag refusal threshold is now sized from the fold and the
   catalog the process is actually running** (issue #1306). The threshold that
   decides whether a request-budget refusal names fold lag is the catalog's seal
