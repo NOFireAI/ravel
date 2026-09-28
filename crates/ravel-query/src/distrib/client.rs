@@ -1038,9 +1038,11 @@ mod tests {
     /// a shape that drained the stream into a `Vec` and then pushed frame by
     /// frame would still report 5 and still pass. This test therefore does not
     /// by itself prove nothing upstream of the decoder buffers; what it proves
-    /// is that no caller decodes past the cap, and the deleted
-    /// `decode_slice_frames` shape (which had no cap at all) fails it with
-    /// `Err(NoSummary)` after decoding all 64. The absence of a collecting path
+    /// is that no caller decodes past the cap, and the deleted fetch path that
+    /// collected every frame and then called `decode_slice_frames` (which
+    /// has no cap at all) fails it with `Err(NoSummary)` after decoding all 64.
+    /// `decode_slice_frames` itself remains, for frames a caller already holds
+    /// in memory. The absence of a collecting path
     /// is held by the guard on the code itself: `collect_frames` and both
     /// signal-specific decoders are gone, and `RemoteSliceFetcher::fetch` is
     /// the only fetch here.
