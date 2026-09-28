@@ -2836,6 +2836,13 @@ pub(crate) fn clone_store_error(err: &StoreError) -> StoreError {
         StoreError::InvalidRange(msg) => StoreError::InvalidRange(msg.clone()),
         StoreError::Transient(msg) => StoreError::Transient(msg.clone()),
         StoreError::Permanent(msg) => StoreError::Permanent(msg.clone()),
+        StoreError::Unsupported { operation } => StoreError::Unsupported {
+            operation: operation.clone(),
+        },
+        StoreError::ReadOnly { operation, store } => StoreError::ReadOnly {
+            operation: operation.clone(),
+            store: store.clone(),
+        },
         StoreError::ListRepeatedToken { prefix } => StoreError::ListRepeatedToken {
             prefix: prefix.clone(),
         },
