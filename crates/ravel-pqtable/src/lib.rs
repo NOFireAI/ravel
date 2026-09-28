@@ -1,10 +1,11 @@
 //! Parquet tables queried in place (ADR-2040): the persistent format and the
 //! object-storage layer, with no Arrow, DataFusion or Parquet dependency.
 //!
-//! Ravel never copies a tenant's Parquet files. A table names a LOCATION in
+//! A tenant's Parquet files are read in place, not copied: nothing in this
+//! crate writes outside `t/<tenant_hash>/pq/`. A table names a LOCATION in
 //! the tenant's own bucket, an operator's grant admits that location, and a
-//! manifest version pins each file by (profile, bucket, raw key) plus its ETag
-//! and store version.
+//! manifest version pins each file by (profile, bucket, key) plus its ETag and
+//! store version.
 //!
 //! - [`names`] validates table names (D1, D2).
 //! - [`keys`] builds and parses the two key shapes under `t/<tenant_hash>/pq/`:

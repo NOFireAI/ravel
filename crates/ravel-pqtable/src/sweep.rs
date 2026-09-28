@@ -1,8 +1,8 @@
 //! Deleting superseded manifest versions (ADR-2040, Lifecycle).
 //!
 //! Ravel stores no Parquet data of its own: the files a table names live in
-//! the tenant's bucket, under an operator's grant, and Ravel never deletes
-//! them. The only objects a sweep touches are manifest versions under
+//! the tenant's bucket, under an operator's grant, and a sweep does not
+//! delete them. The only objects a sweep touches are manifest versions under
 //! `t/<tenant_hash>/pq/t/`, which is also the only prefix it lists.
 //!
 //! The grace period is what keeps a query that resolved an older version

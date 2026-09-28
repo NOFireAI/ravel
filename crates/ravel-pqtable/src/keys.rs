@@ -11,7 +11,7 @@
 //!
 //! Ravel holds no keys for the Parquet files themselves: they stay in the
 //! tenant's own bucket under the operator-granted locations, and a manifest
-//! records each one as the tuple (profile, bucket, raw key bytes).
+//! records each one as the tuple (profile, bucket, key).
 
 use ravel_types::TenantHash;
 
