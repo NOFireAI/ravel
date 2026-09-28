@@ -176,8 +176,9 @@ pending, firing, and resolved on its own.
   ticks get faster; a slow rule query or store looks like a slow sink here.
   Because a tick both raises new alerts and resolves alerts that stopped
   matching, the per-tick publish worst case for one rule is twice the cap: up to
-  1000 new transitions plus up to 1000 resolutions, so up to 2000 records and
-  2000 notifications per sink.
+  1000 new transitions plus up to 1000 resolutions, so one tick publishes up to
+  2000 records and queues up to 2000 notifications for each sink. That bound
+  is on what one tick publishes and queues, not on what one tick delivers.
 - **Delivery order, and what one dead sink costs the others.** The queue is
   served in the order notifications were queued, not by how old the transition
   they carry is. A notification some sink refused goes to the back of the queue

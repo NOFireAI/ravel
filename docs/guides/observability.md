@@ -1564,23 +1564,6 @@ groups:
             deployment that needs it runs one tenant per process or watches
             the alert output itself.
       - alert: RavelAlertNotificationsAllFailing
-        # Two counters, not one, because a notification can fail to arrive
-        # without any sink refusing it. A tick already past its delivery
-        # deadline when delivery begins attempts exactly one notification and
-        # defers the rest, which advances deferred_total and leaves
-        # failed_total flat; a rule on failed_total alone reads that as healthy
-        # while nothing is being sent. One rule rather than two, because the
-        # operator response is the same in both cases (nothing is reaching the
-        # sinks) and the delivered_total term below is what makes either one
-        # critical; which of the two it was is the first thing the description
-        # sends the responder to look at.
-        #
-        # `or`, not `+`: arithmetic between two instant vectors matches series
-        # pairwise and yields nothing where one side has no series, so a mixed
-        # fleet still exporting the old family without deferred_total would
-        # silently stop firing on failures too. A union fires on whichever
-        # counter is there and rising.
-        #
         # Delivery failure is retried every tick, so a genuinely broken sink
         # advances the failure counter continuously while the delivered counter
         # stays flat. The last term is what keeps a partial failure (one
@@ -1588,16 +1571,16 @@ groups:
         # this critical rule; it belongs to RavelAlertRuleEvaluationFailing's
         # quieter class.
         #
+        # No term on ravel_alert_notifications_deferred_total: every pass
+        # attempts its first notification before the deadline check applies,
+        # and each attempt counts as delivered or failed in the same tick, so
+        # a window with deferrals and no deliveries already has failures.
+        #
         # Quiet on a healthy deployment with no rules configured: the family is
-        # absent, so every term is empty. Quiet on one whose rules simply never
-        # fire: nothing is ever queued, so neither the failure nor the deferral
-        # counter increases and the union is empty.
+        # absent, so both terms are empty. Quiet on one whose rules simply never
+        # fire: nothing is ever queued, so the failure counter never increases.
         expr: |
-          (
-            increase(ravel_alert_notifications_failed_total[15m]) > 0
-            or
-            increase(ravel_alert_notifications_deferred_total[15m]) > 0
-          )
+          increase(ravel_alert_notifications_failed_total[15m]) > 0
           and
           increase(ravel_alert_notifications_delivered_total[15m]) == 0
         for: 15m
@@ -1609,11 +1592,9 @@ groups:
           description: >-
             Transitions are still being written durably, so no alert history is
             lost, but nothing is reaching Alertmanager or the configured
-            webhooks. Either the sinks are refusing every attempt, or the tick
-            is spending its whole delivery deadline before it reaches them and
-            deferring instead. Check the sink URLs and credentials, the
-            evaluator logs for the per-sink delivery error, and
-            ravel_alert_notifications_deferred_total to tell the two apart.
+            webhooks: the sinks are refusing every attempt. Check the sink
+            URLs and credentials, and the evaluator logs for the per-sink
+            delivery error.
       - alert: RavelAlertRuleEvaluationFailing
         # A rule whose query, condition, or write fails is retried next tick, so
         # a persistently broken rule (a PromQL expression that no longer parses
