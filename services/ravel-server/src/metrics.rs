@@ -3875,6 +3875,10 @@ pub struct AlertSnapshot {
     pub repeats_queued: u64,
     pub notifications_delivered: u64,
     pub notifications_failed: u64,
+    /// Notifications deferred to a later tick because the per-tick delivery
+    /// deadline elapsed first. A counter, rendered as
+    /// `ravel_alert_notifications_deferred_total`.
+    pub notifications_deferred: u64,
     /// Notifications waiting for every sink to accept them right now, summed
     /// over this process's evaluators. A gauge, rendered as
     /// `ravel_alert_undelivered_notifications`.
@@ -3995,6 +3999,19 @@ fn render_alert_family(out: &mut String, mode: Mode, snapshot: &AlertSnapshot) {
         "ravel_alert_notifications_failed_total",
         &[Label::Mode(mode)],
         snapshot.notifications_failed,
+    );
+
+    write_header(
+        out,
+        "ravel_alert_notifications_deferred_total",
+        "Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first. They stay queued, oldest first, and are retried next tick; a rising value means a sink is too slow to drain the queue within a tick.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_alert_notifications_deferred_total",
+        &[Label::Mode(mode)],
+        snapshot.notifications_deferred,
     );
 
     write_header(
@@ -6025,6 +6042,7 @@ pub fn render(
                 repeats_queued: metrics.repeats_queued(),
                 notifications_delivered: metrics.notifications_delivered(),
                 notifications_failed: metrics.notifications_failed(),
+                notifications_deferred: metrics.notifications_deferred(),
                 undelivered_notifications: metrics.undelivered_notifications(),
                 ticks_evaluated: metrics.ticks(AlertTickOutcome::Evaluated),
                 ticks_lease_not_held: metrics.ticks(AlertTickOutcome::LeaseNotHeld),
@@ -8367,6 +8385,7 @@ mod tests {
             repeats_queued: 4,
             notifications_delivered: 5,
             notifications_failed: 6,
+            notifications_deferred: 13,
             undelivered_notifications: 12,
             ticks_evaluated: 7,
             ticks_lease_not_held: 8,
@@ -8385,6 +8404,7 @@ mod tests {
             "# TYPE ravel_alert_repeats_queued_total counter",
             "# TYPE ravel_alert_notifications_delivered_total counter",
             "# TYPE ravel_alert_notifications_failed_total counter",
+            "# TYPE ravel_alert_notifications_deferred_total counter",
             "# TYPE ravel_alert_undelivered_notifications gauge",
             "# TYPE ravel_alert_ticks_total counter",
             "# TYPE ravel_alert_last_tick_completed_timestamp_seconds gauge",
@@ -8403,6 +8423,7 @@ mod tests {
             "ravel_alert_repeats_queued_total{mode=\"query\"} 4",
             "ravel_alert_notifications_delivered_total{mode=\"query\"} 5",
             "ravel_alert_notifications_failed_total{mode=\"query\"} 6",
+            "ravel_alert_notifications_deferred_total{mode=\"query\"} 13",
             "ravel_alert_undelivered_notifications{mode=\"query\"} 12",
             "ravel_alert_ticks_total{mode=\"query\",outcome=\"evaluated\"} 7",
             "ravel_alert_ticks_total{mode=\"query\",outcome=\"lease_not_held\"} 8",

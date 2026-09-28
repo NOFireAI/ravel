@@ -146,6 +146,16 @@ pending, firing, and resolved on its own.
   the evaluator's in-memory retry queue the same way, one notification per
   identity that fires or resolves, until it accepts them;
   `ravel_alert_undelivered_notifications` reports that queue's size.
+- **The per-tick delivery deadline.** Delivery to the sinks is bounded to half
+  the evaluation interval on each tick, so one slow or unresponsive sink cannot
+  stall a tick past its own interval and delay every later tick's evaluation.
+  Notifications not attempted before the deadline stay queued, oldest first, and
+  are retried next tick; `ravel_alert_notifications_deferred_total` counts them,
+  and a rising value means a sink is too slow to drain the queue within a tick.
+  Because a tick both raises new alerts and resolves alerts that stopped
+  matching, the per-tick publish worst case for one rule is twice the cap: up to
+  1000 new transitions plus up to 1000 resolutions, so up to 2000 records and
+  2000 notifications per sink.
 
 The labels a rule's query returns are retained with every alert record it
 writes, alongside the rule's own labels, and no erasure path reaches alert
@@ -302,7 +312,8 @@ never arrived, which is indistinguishable from a condition that never occurred.
 | `ravel_alert_records_written_total` | Transition records durably written. |
 | `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record. |
 | `ravel_alert_notifications_delivered_total` | Notifications accepted by every configured sink. |
-| `ravel_alert_notifications_failed_total` | Notifications still undelivered after a tick's attempt, counted once per tick while they are retried. |
+| `ravel_alert_notifications_failed_total` | Notifications attempted but not accepted by every sink, counted once per tick while they are retried. |
+| `ravel_alert_notifications_deferred_total` | Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first. They stay queued, oldest first, and are retried next tick. |
 | `ravel_alert_undelivered_notifications` | Gauge. Notifications not yet accepted by every configured sink, at most one per alert identity. While a sink keeps failing it grows by one for every identity that transitions, without bound. |
 | `ravel_alert_ticks_total` | Evaluation ticks, split by an `outcome` label: `evaluated`, `lease_not_held`, `lease_unavailable`, `history_unavailable`. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Unix time this process last completed a tick. Its age is the liveness signal. |
