@@ -5104,7 +5104,6 @@ dependencies = [
  "ravel-object-store",
  "ravel-proto",
  "ravel-types",
- "tempfile",
  "thiserror",
  "tokio",
 ]

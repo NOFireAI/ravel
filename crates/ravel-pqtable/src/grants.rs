@@ -123,8 +123,10 @@ pub enum LocationDefect {
     Glob,
     /// `//` inside the key: an empty path segment.
     EmptySegment,
-    /// A `..` sequence anywhere in the key.
+    /// A `..` sequence anywhere in the bucket or the key.
     DotDot,
+    /// A `.` path segment in the bucket or the key.
+    DotSegment,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -200,8 +202,11 @@ fn store_error(key: &str, source: StoreError) -> GrantsError {
 }
 
 /// Parse and canonically check a location URL. Accepts only `s3://`, `gs://`
-/// and `az://`, and refuses a URL carrying a query, a fragment, a percent
-/// escape, a glob character, an empty path segment or a `..`.
+/// and `az://`, and refuses a query, a fragment, a percent escape, a glob
+/// character, or an empty, `.` or `..` segment. The segment rules cover the
+/// bucket as well as the key: under `force_path_style` the bucket is the first
+/// segment of the request path, so a traversal there is the same defect one
+/// level up.
 pub fn parse_location(url: &str) -> Result<ParsedLocation, GrantsError> {
     let refuse = |defect| {
         Err(GrantsError::InvalidLocation {
@@ -237,13 +242,21 @@ pub fn parse_location(url: &str) -> Result<ParsedLocation, GrantsError> {
     if bucket.is_empty() {
         return refuse(LocationDefect::NoBucket);
     }
-    if key.contains("..") {
+    if bucket.contains("..") || key.contains("..") {
         return refuse(LocationDefect::DotDot);
+    }
+    if bucket == "." {
+        return refuse(LocationDefect::DotSegment);
     }
     let directory = key.is_empty() || key.ends_with('/');
     let canonical = key.strip_suffix('/').unwrap_or(key);
-    if !key.is_empty() && canonical.split('/').any(str::is_empty) {
-        return refuse(LocationDefect::EmptySegment);
+    if !key.is_empty() {
+        if canonical.split('/').any(str::is_empty) {
+            return refuse(LocationDefect::EmptySegment);
+        }
+        if canonical.split('/').any(|segment| segment == ".") {
+            return refuse(LocationDefect::DotSegment);
+        }
     }
     Ok(ParsedLocation {
         scheme: scheme.to_string(),
@@ -665,7 +678,7 @@ mod tests {
         }
 
         // Every refused URL form is refused before containment is considered.
-        let cases: [(&str, LocationDefect); 14] = [
+        let cases: [(&str, LocationDefect); 24] = [
             ("", LocationDefect::Empty),
             ("b/data", LocationDefect::NoScheme),
             (
@@ -689,6 +702,19 @@ mod tests {
             ("s3://b//", LocationDefect::EmptySegment),
             ("s3://b//data", LocationDefect::EmptySegment),
             ("s3://b/data/../secrets", LocationDefect::DotDot),
+            // A `..` or `.` segment in the key, at every position it can take.
+            ("s3://b/..", LocationDefect::DotDot),
+            ("s3://b/../secrets", LocationDefect::DotDot),
+            ("s3://b/data/..", LocationDefect::DotDot),
+            ("s3://b/.", LocationDefect::DotSegment),
+            ("s3://b/./data", LocationDefect::DotSegment),
+            ("s3://b/data/./more", LocationDefect::DotSegment),
+            ("s3://b/data/.", LocationDefect::DotSegment),
+            ("s3://b/data/./", LocationDefect::DotSegment),
+            // The same segments as the bucket, which addresses another bucket
+            // the same way a key segment addresses another prefix.
+            ("s3://../data", LocationDefect::DotDot),
+            ("s3://./data", LocationDefect::DotSegment),
         ];
         for (url, defect) in cases {
             let got = resolve_location(&grants, url);
