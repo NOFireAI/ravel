@@ -165,6 +165,40 @@ pub(crate) fn checked_ingest_hour_bucket(flush_open_ns: i64) -> Result<u32, Stri
 /// follow-up (reported, not fixed here).
 pub const MAX_FLUSH_CLOCK_HOLD_NS: i64 = ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
 
+/// Outcome of the flush-open check of the raw clock reading against the
+/// object store's observed clock (ADR-1685 decision 2).
+pub(crate) enum StoreClockLag {
+    /// The store's observed time is at most
+    /// [`ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`] ahead of the reading.
+    WithinAllowance,
+    /// The store has not been observed yet, so nothing was checked (decision 4).
+    Unobserved,
+    /// The reading lags the store's observed time by more than the allowance.
+    Refused(String),
+}
+
+/// Checks the raw flush-open reading `raw_ns` against `observed_store_ns`, a
+/// lower bound on the store's clock. One-sided: a reading ahead of the
+/// observation is normal, since the observation only ages between responses
+/// (ADR-1685 decision 3). The caller passes the raw reading, never the
+/// floor-raised stamp, because the floor can only hide lag.
+pub(crate) fn store_clock_lag(raw_ns: i64, observed_store_ns: Option<i64>) -> StoreClockLag {
+    let Some(observed_ns) = observed_store_ns else {
+        return StoreClockLag::Unobserved;
+    };
+    let lag_ns = observed_ns.saturating_sub(raw_ns);
+    if lag_ns > ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS {
+        StoreClockLag::Refused(format!(
+            "flush clock lags the object store's observed clock by {lag_ns} ns, beyond the \
+             clock-skew allowance of {} ns; refusing the flush so it cannot publish into an \
+             ingest hour the fold may already have sealed (ADR-1685)",
+            ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+        ))
+    } else {
+        StoreClockLag::WithinAllowance
+    }
+}
+
 /// Bound on the number of drain passes a graceful `flush_all` makes before it
 /// gives up and records the residue (ADR-1307 finding F1).
 ///
@@ -208,8 +242,9 @@ pub(crate) enum DrainIntent {
     Retryable,
 }
 
-/// Why [`monotonic_flush_open_ns`] declined to produce a flush-open stamp. The
-/// two arms surface different write errors because they are different failures.
+/// Why [`monotonic_flush_open_ns`] declined to produce a flush-open stamp.
+/// `InvalidReading` is fail-loud and non-retryable; the other two arms are
+/// transient and surface the same retryable error.
 ///
 /// [`monotonic_flush_open_ns`]: crate::shard::ShardActor::monotonic_flush_open_ns
 pub(crate) enum FlushClockError {
@@ -228,6 +263,13 @@ pub(crate) enum FlushClockError {
     /// as the retryable `Abandoned` and counted as `clock_regressions_refused`,
     /// never as an `abandoned_input_rejected` client signal.
     RegressionRefused(String),
+    /// The raw reading lags the object store's observed clock by more than the
+    /// clock-skew allowance (ADR-1685): stamping it could publish into an
+    /// ingest hour the fold has already sealed. Nothing in this flush was
+    /// acknowledged and the flush succeeds once the host clock converges, so it
+    /// is surfaced exactly as `RegressionRefused` is, as the retryable
+    /// `Abandoned`, and counted as `clock_lag_refused`.
+    LagRefused(String),
 }
 
 /// Share of the process-wide ADR-0069 ceiling that one (shard, tenant) buffer
@@ -618,6 +660,38 @@ impl IngestConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ADR-1685 lag check is one-sided and inclusive at the allowance, and
+    /// an extreme observation saturates rather than overflowing into a pass.
+    #[test]
+    fn store_clock_lag_bounds() {
+        let allowance = ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+        let raw = MIN_PLAUSIBLE_INGEST_CLOCK_NS + NS_PER_HOUR;
+        assert!(matches!(
+            store_clock_lag(raw, None),
+            StoreClockLag::Unobserved
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(raw + allowance)),
+            StoreClockLag::WithinAllowance
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(raw + allowance + 1)),
+            StoreClockLag::Refused(_)
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(raw - 10 * NS_PER_HOUR)),
+            StoreClockLag::WithinAllowance
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(i64::MAX)),
+            StoreClockLag::Refused(_)
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(i64::MIN)),
+            StoreClockLag::WithinAllowance
+        ));
+    }
 
     /// The trigger reads the object-bytes estimate, and the memory backstop is
     /// the bound on the other side: a buffer whose struct headers dwarf its
