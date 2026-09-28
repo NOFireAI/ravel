@@ -216,6 +216,24 @@ pub struct MaintenanceSafetyMetrics {
     /// usable alert state memo (ADR-1688 decision 3 and its store-error
     /// amendment), indexed by [`AlertRetentionSkipReason::index`].
     alert_retention_skipped: [AtomicU64; AlertRetentionSkipReason::ALL.len()],
+    /// Mass-orphan breaker trips on the shards `sweep_shard` runs over outside
+    /// MAINTAINED_SIGNALS, indexed by position in
+    /// [`UNMAINTAINED_SWEPT_SIGNALS`]. Rendered as further `signal` samples of
+    /// the same breaker-trip family, so the one alert on that family covers
+    /// these shards too.
+    unmaintained_orphan_breaker_trips: [AtomicU64; UNMAINTAINED_SWEPT_SIGNALS.len()],
+}
+
+/// The signals whose one shard the maintain tick runs `sweep_shard` over
+/// without their being MAINTAINED_SIGNALS: the alerts shard (ADR-1688) and the
+/// query-audit shard. Their breaker trips are counted apart from the
+/// MAINTAINED_SIGNALS-sized arrays above.
+pub const UNMAINTAINED_SWEPT_SIGNALS: [Signal; 2] = [Signal::Alerts, Signal::Audit];
+
+fn unmaintained_swept_index(signal: Signal) -> Option<usize> {
+    UNMAINTAINED_SWEPT_SIGNALS
+        .iter()
+        .position(|&swept| swept == signal)
 }
 
 /// Why the alert retention driver skipped a tenant this tick (ADR-1688
@@ -284,6 +302,24 @@ impl MaintenanceSafetyMetrics {
 
     pub fn record_alert_retention_skipped(&self, reason: AlertRetentionSkipReason) {
         self.alert_retention_skipped[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mass-orphan breaker trips on `signal`'s one swept shard, for a member of
+    /// [`UNMAINTAINED_SWEPT_SIGNALS`]; `0` for any other signal, whose trips
+    /// [`orphan_breaker_trips`](Self::orphan_breaker_trips) counts.
+    pub fn unmaintained_orphan_breaker_trips(&self, signal: Signal) -> u64 {
+        unmaintained_swept_index(signal).map_or(0, |index| {
+            self.unmaintained_orphan_breaker_trips[index].load(Ordering::Relaxed)
+        })
+    }
+
+    /// Count one breaker trip on a member of [`UNMAINTAINED_SWEPT_SIGNALS`].
+    /// Any other signal is a no-op: its trips go through
+    /// [`record_sweep`](Self::record_sweep).
+    pub fn record_unmaintained_orphan_breaker_trip(&self, signal: Signal) {
+        if let Some(index) = unmaintained_swept_index(signal) {
+            self.unmaintained_orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn legal_hold_refresh_failures(&self) -> u64 {
@@ -2183,9 +2219,9 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
     // ownership of this one unit (ADR-0065 decision 2); the same `hold` snapshot
     // from above gates every delete, so a legal hold covering the query-audit
     // shard blocks it. Logged, not folded into `MaintainReport` (whose fields
-    // describe the data-signal passes), and it never touches
-    // `MaintenanceSafetyMetrics`, whose per-signal arrays cover only
-    // MAINTAINED_SIGNALS.
+    // describe the data-signal passes), and kept out of
+    // `MaintenanceSafetyMetrics`' per-signal arrays, which cover only
+    // MAINTAINED_SIGNALS; a breaker trip here is counted apart from them.
     if worker.owns_unit(live_set, tenant, Signal::Audit, QUERY_AUDIT_SHARD) {
         match sweep_audit_retention(store, clock, compactor, &hold, tenant).await {
             Ok(outcome) => tracing::info!(
@@ -2237,13 +2273,22 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
         )
         .await
         {
-            Ok(report) => tracing::info!(
-                tenant = %tenant.to_hex(),
-                superseded_records = report.superseded_records_deleted,
-                superseded_data = report.superseded_data_deleted,
-                unreferenced_parts = report.unreferenced_parts_deleted,
-                "maintenance: query-audit input-cleanup sweep complete"
-            ),
+            Ok(report) => {
+                tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    superseded_records = report.superseded_records_deleted,
+                    superseded_data = report.superseded_data_deleted,
+                    unreferenced_parts = report.unreferenced_parts_deleted,
+                    "maintenance: query-audit input-cleanup sweep complete"
+                );
+                report_unmaintained_breaker_trip(
+                    safety,
+                    tenant,
+                    Signal::Audit,
+                    QUERY_AUDIT_SHARD,
+                    &report,
+                );
+            }
             Err(err) => tracing::warn!(
                 tenant = %tenant.to_hex(),
                 error = %err,
@@ -2253,13 +2298,13 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
     }
 
     // Alert-signal retention (ADR-1688). Gated on ownership of the one alerts
-    // unit, and on a positive window: `0` is the documented opt-out and leaves
-    // the alerts shard exactly as untouched as it was before the sweep existed.
-    // Logged, not folded into `MaintainReport` or the per-signal safety arrays,
-    // for the same reasons as the query-audit block above.
-    if compactor.alert_retention_window_ns > 0
-        && worker.owns_unit(live_set, tenant, Signal::Alerts, ALERT_SHARD)
-    {
+    // unit only. A window of `0` turns off the retention sweep and its memo
+    // read inside `run_alert_retention`, not the alerts shard's orphan sweep:
+    // the evaluator's writer interlock still abandons late writes under `0`,
+    // and the orphan sweep is what reclaims them. Logged, not folded into
+    // `MaintainReport` or the per-signal safety arrays, for the same reasons as
+    // the query-audit block above.
+    if worker.owns_unit(live_set, tenant, Signal::Alerts, ALERT_SHARD) {
         run_alert_retention(store, clock, compactor, &hold, tenant, safety).await;
     }
 
@@ -2280,10 +2325,84 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
 /// neither logged nor counted, which is otherwise every tenant of a deployment
 /// that runs no alert rules, on every tick.
 ///
-/// The orphan sweep does not depend on the memo and runs either way, including
-/// for a tenant with no commit records at all: a data object whose first-ever
-/// commit record never landed is exactly the leak it exists to reclaim.
+/// A window of `0` (`--alert-retention 0`) skips the memo read and the
+/// retention sweep entirely, and counts nothing.
+///
+/// The orphan sweep does not depend on the memo or the window and runs either
+/// way, including for a tenant with no commit records at all: a data object
+/// whose first-ever commit record never landed is exactly the leak it exists to
+/// reclaim, and the evaluator's writer interlock produces those whatever the
+/// window is.
 async fn run_alert_retention(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &LegalHoldCheck,
+    tenant: &TenantHash,
+    safety: &MaintenanceSafetyMetrics,
+) {
+    if compactor.alert_retention_window_ns > 0 {
+        run_alert_retention_sweep(store, clock, compactor, hold, tenant, safety).await;
+    }
+
+    match sweep_shard(
+        store,
+        clock,
+        compactor,
+        hold,
+        tenant,
+        Signal::Alerts,
+        ALERT_SHARD,
+    )
+    .await
+    {
+        Ok(report) => {
+            tracing::info!(
+                tenant = %tenant.to_hex(),
+                orphans = report.orphans_deleted,
+                orphans_withheld = report.orphans_withheld,
+                orphan_breaker_tripped = report.orphan_breaker_tripped,
+                quarantine_reaped = report.quarantine_reaped,
+                "maintenance: alerts shard orphan sweep complete"
+            );
+            report_unmaintained_breaker_trip(safety, tenant, Signal::Alerts, ALERT_SHARD, &report);
+        }
+        Err(err) => tracing::warn!(
+            tenant = %tenant.to_hex(),
+            error = %err,
+            "maintenance: alerts shard orphan sweep failed; retried next tick"
+        ),
+    }
+}
+
+/// Log and count a mass-orphan breaker trip reported by a `sweep_shard` pass
+/// over a shard outside MAINTAINED_SIGNALS, the same event and runbook wording
+/// the maintained signals' trips carry. A pass that did not trip is a no-op.
+fn report_unmaintained_breaker_trip(
+    safety: &MaintenanceSafetyMetrics,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    report: &ravel_maintain::SweepReport,
+) {
+    if !report.orphan_breaker_tripped {
+        return;
+    }
+    tracing::error!(
+        tenant = %tenant.to_hex(),
+        signal = ?signal,
+        shard,
+        withheld = report.orphans_withheld,
+        "maintenance: orphan GC mass-orphan circuit breaker tripped; \
+         deletions withheld this pass, not self-clearing in the sense an \
+         operator expects, see the breaker runbook"
+    );
+    safety.record_unmaintained_orphan_breaker_trip(signal);
+}
+
+/// The memo-driven half of [`run_alert_retention`]: read the memo, build the
+/// keep set, and run the retention sweep, or count why it cannot run.
+async fn run_alert_retention_sweep(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     compactor: &CompactorConfig,
@@ -2334,32 +2453,6 @@ async fn run_alert_retention(
                  retried next tick"
             );
         }
-    }
-
-    match sweep_shard(
-        store,
-        clock,
-        compactor,
-        hold,
-        tenant,
-        Signal::Alerts,
-        ALERT_SHARD,
-    )
-    .await
-    {
-        Ok(report) => tracing::info!(
-            tenant = %tenant.to_hex(),
-            orphans = report.orphans_deleted,
-            orphans_withheld = report.orphans_withheld,
-            orphan_breaker_tripped = report.orphan_breaker_tripped,
-            quarantine_reaped = report.quarantine_reaped,
-            "maintenance: alerts shard orphan sweep complete"
-        ),
-        Err(err) => tracing::warn!(
-            tenant = %tenant.to_hex(),
-            error = %err,
-            "maintenance: alerts shard orphan sweep failed; retried next tick"
-        ),
     }
 }
 
@@ -8483,7 +8576,9 @@ mod alert_retention_tests {
     use ravel_logseg::{ObjectIdentity, RlogConfig};
     use ravel_maintain::FixedClock;
     use ravel_maintain::config::NS_PER_HOUR;
-    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{PutMode, list_all};
     use ravel_types::TenantId;
@@ -8934,6 +9029,12 @@ mod alert_retention_tests {
     /// `sweep_shard` ran. Watch it fail: move the `sweep_shard` call in
     /// `run_alert_retention` out to the `run_tick_with_clock` caller, outside
     /// the `worker.owns_unit` gate.
+    ///
+    /// "Reads no memo" is proven by a Get fault on the memo key whose counter
+    /// must stay at 0; the memo in place is current, so reading it would change
+    /// nothing else this test could see. Watch that fail: drop the
+    /// `worker.owns_unit` condition from the alerts block in
+    /// `run_tick_with_clock`, and the fault fires once.
     #[tokio::test]
     async fn a_worker_that_does_not_own_the_alerts_unit_sweeps_nothing() {
         let f = fixture().await;
@@ -8947,6 +9048,9 @@ mod alert_retention_tests {
             )
             .await
             .expect("put orphan");
+        let mut expected = f.all_keys();
+        expected.insert(orphan);
+        let store = FaultStore::new(f.store, memo_get_fault());
         let (worker, _) = solo();
         let peer = (2..1_000u128)
             .map(Uuid::from_u128)
@@ -8962,7 +9066,7 @@ mod alert_retention_tests {
         let live = vec![worker.process_id(), peer];
         let safety = MaintenanceSafetyMetrics::default();
         tick(
-            &f.store,
+            &store,
             &f.tenant,
             &CompactorConfig::default(),
             &safety,
@@ -8971,20 +9075,47 @@ mod alert_retention_tests {
         )
         .await;
 
-        let mut expected = f.all_keys();
-        expected.insert(orphan);
-        assert_eq!(alert_keys(&f.store, &f.tenant).await, expected);
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "a non-owner never reads the memo"
+        );
+        assert_eq!(alert_keys(&store, &f.tenant).await, expected);
         assert!(
-            quarantined(&f.store, &f.tenant).await.is_empty(),
+            quarantined(&store, &f.tenant).await.is_empty(),
             "a non-owner runs neither sweep, so the orphan the owner would quarantine stays put"
         );
         assert_eq!(skipped(&safety), no_skips());
     }
 
-    /// `--alert-retention 0` disables the sweep: the same tick that deletes two
-    /// records under the default window deletes nothing, and reads no memo.
+    /// A Get fault on the tenant's alert state memo, the latest-state object.
+    /// A test asserting its counter stayed at 0 proves no memo was read.
+    fn memo_get_fault() -> FaultPlan {
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("alert state memo read".to_string()),
+            )
+            .with_key_contains("/a/state/latest"),
+        )
+    }
+
+    /// `--alert-retention 0` disables the retention sweep and its memo read,
+    /// and nothing else: the same tick that deletes two records under the
+    /// default window deletes no record and reads no memo, while the alerts
+    /// shard's orphan sweep still reclaims an orphan older than its age gate.
+    /// The evaluator's writer interlock abandons late writes under a window of
+    /// `0` too, and this sweep is the only thing that reclaims them.
+    ///
+    /// "Reads no memo" is a Get fault on the memo key whose counter must stay
+    /// at 0: the memo here is current, so reading it would otherwise leave no
+    /// trace. Watch it fail: drop the `alert_retention_window_ns > 0` condition
+    /// in `run_alert_retention`. The fault then fires once, and the tick counts
+    /// a `store_error` skip. Put that condition back around the
+    /// `run_alert_retention` call in `run_tick_with_clock` instead, and the
+    /// orphan is never quarantined.
     #[tokio::test]
-    async fn a_zero_alert_retention_window_disables_the_sweep() {
+    async fn a_zero_alert_retention_window_disables_the_sweep_but_not_the_orphan_sweep() {
         let f = fixture().await;
         f.write_current_memo().await;
         let orphan = orphan_data_key(&f.tenant);
@@ -8996,18 +9127,32 @@ mod alert_retention_tests {
             )
             .await
             .expect("put orphan");
+        let expected = f.all_keys();
+        let store = FaultStore::new(f.store, memo_get_fault());
         let safety = MaintenanceSafetyMetrics::default();
         let (worker, live) = solo();
         let disabled = CompactorConfig {
             alert_retention_window_ns: 0,
             ..CompactorConfig::default()
         };
-        tick(&f.store, &f.tenant, &disabled, &safety, &worker, &live).await;
+        tick(&store, &f.tenant, &disabled, &safety, &worker, &live).await;
 
-        let mut expected = f.all_keys();
-        expected.insert(orphan);
-        assert_eq!(alert_keys(&f.store, &f.tenant).await, expected);
-        assert!(quarantined(&f.store, &f.tenant).await.is_empty());
+        assert_eq!(
+            alert_keys(&store, &f.tenant).await,
+            expected,
+            "no record is deleted, and the orphan left the live keyspace"
+        );
+        let moved = quarantined(&store, &f.tenant).await;
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(
+            moved[0].starts_with(&format!("quarantine/{orphan}/")),
+            "{moved:?}"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "a window of 0 reads no memo"
+        );
         assert_eq!(skipped(&safety), no_skips());
     }
 
@@ -9292,5 +9437,291 @@ mod alert_retention_tests {
             no_skips(),
             "a watermark equal to the floor hour is usable, not a skip"
         );
+    }
+
+    /// Enough record-less, old data objects in one shard to trip the
+    /// mass-orphan breaker under the default thresholds: over
+    /// `orphan_breaker_min_count`, and the whole shard, so the ratio holds too.
+    const MASS_ORPHANS: u64 = 60;
+
+    /// Seed [`MASS_ORPHANS`] record-less data objects into `(signal, shard)`,
+    /// written 100 days before `NOW_NS` so every one is past the orphan age
+    /// gate. Returns their keys.
+    async fn seed_mass_orphans(
+        store: &MemoryStore,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+    ) -> Vec<String> {
+        store.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let mut seeded = Vec::new();
+        for seq in 1..=MASS_ORPHANS {
+            let key = keys::data_key(
+                tenant,
+                signal,
+                shard,
+                Uuid::from_u128(u128::from(seq)),
+                1,
+                seq,
+                &[0u8; 32],
+            )
+            .expect("orphan data key");
+            store
+                .put(&key, Bytes::from_static(b"orphan"), PutOptions::default())
+                .await
+                .expect("seed an orphan");
+            seeded.push(key);
+        }
+        seeded
+    }
+
+    /// A breaker trip on the alerts shard's orphan sweep is counted, exactly
+    /// once, under `signal="alerts"` of the breaker-trip family, and nothing is
+    /// deleted or quarantined. The alerts shard is outside MAINTAINED_SIGNALS,
+    /// so `record_sweep` cannot count it.
+    ///
+    /// Watch it fail: delete the `record_unmaintained_orphan_breaker_trip` call
+    /// in `report_unmaintained_breaker_trip`. The count stays at 0.
+    #[tokio::test]
+    async fn an_alerts_shard_breaker_trip_is_counted_and_deletes_nothing() {
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let seeded = seed_mass_orphans(&store, &tenant, Signal::Alerts, ALERT_SHARD).await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(safety.unmaintained_orphan_breaker_trips(Signal::Alerts), 1);
+        assert_eq!(safety.unmaintained_orphan_breaker_trips(Signal::Audit), 0);
+        for key in &seeded {
+            assert!(exists(&store, key).await, "{key} was withheld, not deleted");
+        }
+        assert!(
+            list_all(&store, "quarantine/")
+                .await
+                .expect("list quarantine")
+                .is_empty(),
+            "a tripped breaker quarantines nothing"
+        );
+    }
+
+    /// The same for the query-audit shard's input-cleanup sweep: counted once
+    /// under `signal="audit"`, nothing deleted or quarantined.
+    ///
+    /// Watch it fail: delete the `record_unmaintained_orphan_breaker_trip` call
+    /// in `report_unmaintained_breaker_trip`. The count stays at 0.
+    #[tokio::test]
+    async fn a_query_audit_shard_breaker_trip_is_counted_and_deletes_nothing() {
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let seeded = seed_mass_orphans(&store, &tenant, Signal::Audit, QUERY_AUDIT_SHARD).await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(safety.unmaintained_orphan_breaker_trips(Signal::Audit), 1);
+        assert_eq!(safety.unmaintained_orphan_breaker_trips(Signal::Alerts), 0);
+        for key in &seeded {
+            assert!(exists(&store, key).await, "{key} was withheld, not deleted");
+        }
+        assert!(
+            list_all(&store, "quarantine/")
+                .await
+                .expect("list quarantine")
+                .is_empty(),
+            "a tripped breaker quarantines nothing"
+        );
+    }
+
+    /// No memo, and the one bounded listing that tells an unused alert keyspace
+    /// from a lost memo fails against the store: counted under `store_error`,
+    /// exactly once, not as `absent` and not as an unused keyspace. The
+    /// tenant does have a transition, so a skip is owed either way.
+    ///
+    /// Watch it fail: in `alert_keep_set`, replace
+    /// `alert_commit_prefix_is_empty(store, tenant).await?` with
+    /// `alert_commit_prefix_is_empty(store, tenant).await.unwrap_or(true)`. The
+    /// failed listing then reads as an empty keyspace and nothing is counted.
+    #[tokio::test]
+    async fn a_failed_absent_memo_listing_is_counted_as_store_error() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let store = FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Permanent("alert commit listing".to_string()),
+                )
+                .with_key_contains(commit_prefix)
+                .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let expired = alert_record(1, AlertState::Firing, NOW_NS - 100 * NS_PER_DAY);
+        let written = write_transition(&store, &tenant, 1, &expired).await;
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Permanent),
+            1,
+            "the absent-memo listing is the call that failed"
+        );
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::StoreError)
+        );
+        assert_eq!(alert_keys(&store, &tenant).await, keys_of(&[&written]));
+    }
+
+    /// A store whose first listing of `prefix` from the start returns an empty
+    /// page that still carries a continuation token, which the listing
+    /// contract permits. Every other call passes through.
+    struct EmptyFirstPage {
+        inner: MemoryStore,
+        prefix: String,
+        served: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for EmptyFirstPage {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            if prefix == self.prefix
+                && page.is_none()
+                && !self.served.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(ravel_object_store::ListPage {
+                    objects: Vec::new(),
+                    next: Some(ravel_object_store::PageToken("more".to_string())),
+                });
+            }
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn observed_store_time_ns(&self) -> Option<i64> {
+            self.inner.observed_store_time_ns()
+        }
+    }
+
+    /// No memo, and the absent-memo listing's first page is empty but carries a
+    /// continuation token: the keyspace may hold records, so it is counted as
+    /// `absent`, exactly once, not taken for an unused alert keyspace.
+    ///
+    /// Watch it fail: in `alert_commit_prefix_is_empty`, drop
+    /// `&& page.next.is_none()`. The empty first page then reads as an unused
+    /// keyspace and nothing is counted.
+    #[tokio::test]
+    async fn an_empty_first_page_with_a_continuation_token_is_not_an_unused_keyspace() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        let expired = alert_record(1, AlertState::Firing, NOW_NS - 100 * NS_PER_DAY);
+        let written = write_transition(&memory, &tenant, 1, &expired).await;
+        let store = EmptyFirstPage {
+            inner: memory,
+            prefix: keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD)
+                .expect("prefix"),
+            served: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert!(
+            store.served.load(std::sync::atomic::Ordering::SeqCst),
+            "the absent-memo listing saw the empty page"
+        );
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::Absent)
+        );
+        assert_eq!(alert_keys(&store, &tenant).await, keys_of(&[&written]));
     }
 }

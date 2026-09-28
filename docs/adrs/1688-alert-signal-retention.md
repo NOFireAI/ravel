@@ -312,7 +312,11 @@ and too wide in another, and decision 6 at odds with where the counter decision
   stall past the gate let the sweep quarantine the data object while the publish
   went on to write a commit record naming it. The publish now refuses the commit
   record once that bound has passed since its data PUT began, leaving one orphan
-  for the sweep and one transition for the next tick to rewrite.
+  for the sweep and one transition for the next tick to rewrite. The bound
+  covers the commit publish as well as the data PUT, as the ingest writers' one
+  flush deadline covers both: the evaluator retries the commit record itself,
+  one attempt at a time, checks the bound before every attempt, and abandons an
+  attempt still in flight when it passes.
 
 - **The skip counter lives on `MaintenanceSafetyMetrics`; decision 6 was about
   the sweep's outcome.** Decision 6 puts the sweep outside `MaintainReport` and
@@ -325,11 +329,20 @@ and too wide in another, and decision 6 at odds with where the counter decision
   `MaintenanceSafetyMetrics` and renders in the maintain-safety family. What
   decision 6's exclusion protects is untouched: nothing about `Signal::Alerts`
   enters that struct's per-signal arrays, which are sized by
-  `MAINTAINED_SIGNALS`, and the alerts signal is still not a member.
+  `MAINTAINED_SIGNALS`, and the alerts signal is still not a member. The same
+  holds for a mass-orphan breaker trip on the alerts shard's orphan sweep (and
+  on the query-audit shard's input-cleanup sweep): it is logged at error with
+  the breaker runbook wording and counted in a separate two-entry field on
+  `MaintenanceSafetyMetrics`, rendered as the `signal="alerts"` and
+  `signal="audit"` samples of `ravel_maintain_orphan_breaker_tripped_total`, so
+  the alert on that family covers both shards.
 
 - **The window has a floor.** An `--alert-retention` shorter than one hour plus
   the alert state memo's seal margin puts the expiry floor above every watermark
   the evaluator can write, so every tick would skip under
   `watermark_below_floor` and nothing would ever be swept. A nonzero window below
   that floor is refused at startup, naming the minimum. `0` is still the
-  documented opt-out.
+  documented opt-out, and it turns off the retention sweep and its memo read
+  only. The alerts shard's orphan sweep runs whatever the window, because the
+  evaluator's interlock abandons late writes under `0` too and nothing else
+  reclaims them.

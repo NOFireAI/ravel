@@ -1586,10 +1586,13 @@ impl AlertEvaluator {
     ///
     /// The commit record is refused once more than
     /// [`alert_publish_lifetime_ns`] has passed since this call read the clock
-    /// for its data PUT. That bound is the ingest writers' own
-    /// `max_flush_lifetime`, and honouring it here is what makes orphan GC over
-    /// the alerts shard safe (ADR-1688's keep-set amendment put an orphan sweep
-    /// on this shard). Orphan GC reclaims a record-less `l0/` object once it is
+    /// for its data PUT: no commit attempt starts past that point, and one in
+    /// flight when it passes is abandoned rather than waited on, so the bound
+    /// covers the whole write, data PUT and commit publish together, as the
+    /// ingest writers' single flush deadline does. That bound is the ingest
+    /// writers' own `max_flush_lifetime`, and honouring it here is what makes
+    /// orphan GC over the alerts shard safe (ADR-1688's keep-set amendment put
+    /// an orphan sweep on this shard). Orphan GC reclaims a record-less `l0/` object once it is
     /// older than `grace + max_flush_lifetime`, on the promise that no writer
     /// ever publishes a commit record for a flush that old. A publish that
     /// stalled past the bound and then wrote its commit record anyway would
@@ -1629,17 +1632,68 @@ impl AlertEvaluator {
         let data_key = keys::reconstruct_data_key(&commit)?;
         let put_started_ns = self.clock.now_ns();
         publish::put_data_object(self.store.as_ref(), &data_key, data).await?;
+        self.publish_commit_within_lifetime(&commit, &data_key, put_started_ns)
+            .await
+    }
+
+    /// The commit-record half of [`Self::publish`], retried here one attempt at
+    /// a time rather than inside `ravel_commit::publish`, so the writer
+    /// interlock is checked before every attempt and each attempt is bounded to
+    /// what is left of the lifetime, the way the ingest writers bound theirs.
+    /// No attempt starts, and none is waited on, once more than
+    /// [`alert_publish_lifetime_ns`] has passed since `put_started_ns`.
+    async fn publish_commit_within_lifetime(
+        &self,
+        commit: &ravel_proto::commit::v1::CommitRecord,
+        data_key: &str,
+        put_started_ns: i64,
+    ) -> anyhow::Result<()> {
         let lifetime_ns = alert_publish_lifetime_ns();
-        let elapsed_ns = self.clock.now_ns().saturating_sub(put_started_ns);
-        if elapsed_ns > lifetime_ns {
-            anyhow::bail!(
-                "alert transition publish abandoned: {elapsed_ns} ns elapsed since the data PUT \
-                 for {data_key} began, past the {lifetime_ns} ns writer interlock, so the commit \
-                 record is not written and the transition is rewritten next tick"
+        let retries = RetryPolicy::default();
+        let single_attempt = RetryPolicy {
+            max_attempts: 0,
+            ..retries
+        };
+        let mut attempt: u32 = 0;
+        loop {
+            let elapsed_ns = self.clock.now_ns().saturating_sub(put_started_ns);
+            if elapsed_ns > lifetime_ns {
+                anyhow::bail!(
+                    "alert transition publish abandoned: {elapsed_ns} ns elapsed since the data \
+                     PUT for {data_key} began, past the {lifetime_ns} ns writer interlock, so the \
+                     commit record is not written and the transition is rewritten next tick"
+                );
+            }
+            let remaining = Duration::from_nanos(
+                u64::try_from(lifetime_ns.saturating_sub(elapsed_ns)).unwrap_or(0),
             );
+            let outcome = tokio::select! {
+                result = publish::publish(self.store.as_ref(), commit, &single_attempt) => result,
+                () = self.clock.sleep(remaining) => anyhow::bail!(
+                    "alert transition publish abandoned: the commit record PUT for {data_key} \
+                     was still in flight when the {lifetime_ns} ns writer interlock expired; the \
+                     transition is rewritten next tick"
+                ),
+            };
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(publish::PublishError::Store { source, .. })
+                    if source.is_retryable() && attempt < retries.max_attempts =>
+                {
+                    let shift = attempt.min(20);
+                    let delay = retries
+                        .base_delay
+                        .saturating_mul(1u32 << shift)
+                        .min(retries.max_delay);
+                    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    self.clock
+                        .sleep(Duration::from_millis(SystemRng.jitter_ms(delay_ms)))
+                        .await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
-        publish::publish(self.store.as_ref(), &commit, &RetryPolicy::default()).await?;
-        Ok(())
     }
 
     /// Fold this tenant's whole alert history to the most recent record per
@@ -3053,6 +3107,12 @@ mod tick_tests {
         data_prefix: String,
         stall_ns: AtomicI64,
         data_puts: AtomicU64,
+        commit_prefix: String,
+        /// When nonzero, the next commit-record PUT fails with a retryable
+        /// store error after moving the clock forward by this much, then
+        /// resets to zero.
+        commit_fault_stall_ns: AtomicI64,
+        commit_puts: AtomicU64,
     }
 
     impl StallingDataPut {
@@ -3064,11 +3124,19 @@ mod tick_tests {
                 data_prefix: format!("t/{}/a/l0/", tenant.to_hex()),
                 stall_ns: AtomicI64::new(stall_ns),
                 data_puts: AtomicU64::new(0),
+                commit_prefix: keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD)
+                    .expect("prefix"),
+                commit_fault_stall_ns: AtomicI64::new(0),
+                commit_puts: AtomicU64::new(0),
             }
         }
 
         fn data_puts(&self) -> u64 {
             self.data_puts.load(Ordering::SeqCst)
+        }
+
+        fn commit_puts(&self) -> u64 {
+            self.commit_puts.load(Ordering::SeqCst)
         }
     }
 
@@ -3080,6 +3148,14 @@ mod tick_tests {
             data: Bytes,
             opts: PutOptions,
         ) -> Result<PutOutcome, StoreError> {
+            if key.starts_with(&self.commit_prefix) {
+                self.commit_puts.fetch_add(1, Ordering::SeqCst);
+                let stall = self.commit_fault_stall_ns.swap(0, Ordering::SeqCst);
+                if stall != 0 {
+                    self.clock.advance(stall);
+                    return Err(StoreError::Transient("injected commit fault".into()));
+                }
+            }
             let outcome = self.inner.put(key, data, opts).await?;
             if key.starts_with(&self.data_prefix) {
                 self.data_puts.fetch_add(1, Ordering::SeqCst);
@@ -3230,6 +3306,81 @@ mod tick_tests {
         let report = evaluator.run_tick().await;
         assert_eq!(report.records_written, 1);
         assert_eq!(report.rules_failed, 0);
+        assert_eq!(alert_keyspace(memory.as_ref(), tenant).await, (1, 1));
+    }
+
+    /// The interlock bounds the commit publish too, not only the data PUT: a
+    /// commit attempt that fails retryably once the lifetime has passed is not
+    /// retried, so no commit record lands for an object older than the bound.
+    ///
+    /// The data PUT is instant here; the first commit PUT fails with a
+    /// retryable error and moves the injected clock past the lifetime.
+    ///
+    /// Watch it fail: in `AlertEvaluator::publish`, replace the
+    /// `publish_commit_within_lifetime` call with the former
+    /// `publish::publish(.., &RetryPolicy::default())`. Its internal retry then
+    /// writes the commit record on the second attempt, and the first
+    /// assertion, that the tick wrote no record, fails.
+    #[tokio::test]
+    async fn a_commit_retry_past_the_writer_interlock_is_not_attempted() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            0,
+        ));
+        store
+            .commit_fault_stall_ns
+            .store(alert_publish_lifetime_ns() + NS_PER_SEC, Ordering::SeqCst);
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "the transition was not made durable"
+        );
+        assert_eq!(report.rules_failed, 1, "the rule is on the retry path");
+        assert_eq!(
+            store.commit_puts(),
+            1,
+            "no commit attempt starts once the lifetime has passed"
+        );
+        assert_eq!(
+            alert_keyspace(memory.as_ref(), tenant).await,
+            (0, 1),
+            "one orphan data object, no commit record"
+        );
+    }
+
+    /// A retryable commit failure inside the lifetime is still retried: the
+    /// bound refuses a late publish, it does not remove the retry.
+    #[tokio::test]
+    async fn a_commit_retry_inside_the_writer_interlock_publishes() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            0,
+        ));
+        store
+            .commit_fault_stall_ns
+            .store(NS_PER_SEC, Ordering::SeqCst);
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.records_written, 1);
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(store.commit_puts(), 2, "one failed attempt, one retry");
         assert_eq!(alert_keyspace(memory.as_ref(), tenant).await, (1, 1));
     }
 
