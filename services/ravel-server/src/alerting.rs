@@ -2921,6 +2921,63 @@ mod tick_tests {
         out
     }
 
+    /// Every written transition's commit record carries `max_event_ts_ns`
+    /// equal to its RLOG record's `ts_ns`. The alert retention sweep keys its
+    /// keep set on exactly this (ADR-1688, keep-set amendment): it matches a
+    /// record's `max_event_ts_ns` against the memo's `ts_ns` values, so a
+    /// commit stamp that drifts from the record's stamp would let the sweep
+    /// delete an identity's current-state record.
+    ///
+    /// The second transition is written under a backward clock step, where the
+    /// record's `ts_ns` is the corrected `prior.ts_ns + 1` rather than the
+    /// clock reading, so a publish that took the clock instead of the stamp
+    /// fails here.
+    #[tokio::test]
+    async fn a_written_transitions_commit_max_event_ts_ns_equals_its_record_ts_ns() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert_eq!(evaluator.run_tick().await.records_written, 1, "onset fires");
+        clock.set(NOW_NS - 100 * NS_PER_SEC);
+        assert_eq!(evaluator.run_tick().await.records_written, 1, "resolves");
+
+        let prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let cfg = RlogConfig::default();
+        let mut pairs = Vec::new();
+        for meta in list_all_after(store.as_ref(), &prefix, None)
+            .await
+            .expect("list")
+        {
+            let commit = record::decode(
+                &store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get commit")
+                    .data,
+            )
+            .expect("decode commit");
+            let data_key = keys::verify_object_key(&commit).expect("object key");
+            let object = store
+                .get(&data_key, GetRange::Full)
+                .await
+                .expect("get data");
+            let reader = RlogReader::new(&object.data, &cfg).expect("open rlog");
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            assert_eq!(rows.len(), 1, "one alert record per object");
+            let alert = AlertRecord::from_log_record(&rows[0]).expect("decode alert record");
+            pairs.push((commit.max_event_ts_ns, alert.ts_ns));
+        }
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![(NOW_NS, NOW_NS), (NOW_NS + 1, NOW_NS + 1)],
+            "each commit record's max_event_ts_ns is its record's ts_ns, including the \
+             corrected stamp written under a backward clock step"
+        );
+    }
+
     /// a backward wall-clock step between ticks must still produce a
     /// strictly-increasing `ts_ns`, and the evaluator must converge rather than
     /// re-transition from stale state every tick. The instant query sees the
