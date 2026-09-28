@@ -342,6 +342,48 @@ the row says which counters corroborate it.
 | `ravel_typed_attr_columns_stale_fallback_total` climbing steadily. | The tenant config object is unreadable, so the typed attribute column declarations in effect are not the ones written. | The counter, labeled by mode, on `/metrics`. `ravel-cli typed-attr-column show <tenant>` reads the durable record directly and shows whether it is present, empty or absent. | A brief rise right after a config write is expected, because resolution is cache-aside on a 60 second horizon. A counter that keeps climbing is a read failure to fix. |
 | Two replicas answer the same query against different typed attribute columns. | A `typed-attr-column set` is propagating. Resolution is per tenant on a 60 second staleness horizon. | `ravel-cli typed-attr-column show <tenant>` shows the durable state; the divergence closes within the horizon. | Wait out the horizon. If it does not close, treat it as the row above. |
 
+## Attributing server memory with a heap profile
+
+When a server's resident memory runs well above what its ledgers account for
+(`ravel_memory_reserved_bytes` plus `ravel_cache_resident_bytes`), first read
+`ravel_process_allocator_bytes` on `/metrics`. If `stat="resident"` sits far
+above `stat="allocated"`, the allocator is holding freed memory and no buffer
+is to blame. If the two are close, live buffers hold the memory, and a heap
+profile names the allocation sites.
+
+1. Build the server with jemalloc's profiler compiled in. It is off by
+   default and not in the published image:
+
+   ```sh
+   cargo build --release -p ravel-server --features "sql heap-profiling"
+   ```
+
+2. Start that binary with profiling turned on. On Linux the vendored
+   jemalloc reads `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`. `prof_gdump`
+   writes a dump at every new memory peak, and `lg_prof_sample:17` samples
+   about every 128 KiB allocated:
+
+   ```sh
+   _RJEM_MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:17,prof_gdump:true,prof_prefix:/tmp/ravel-heap/g \
+     ravel-server ...
+   ```
+
+3. Reproduce the workload, then read the last dump, which is the highest
+   peak, with `jeprof` (Debian and Ubuntu ship it in `libjemalloc-dev`):
+
+   ```sh
+   jeprof --text --inuse_space ./ravel-server "$(ls -1v /tmp/ravel-heap/g.*.heap | tail -1)"
+   jeprof --collapsed --inuse_space ./ravel-server "$(ls -1v /tmp/ravel-heap/g.*.heap | tail -1)"
+   ```
+
+   `--collapsed` gives full stacks for grouping by the innermost Ravel frame.
+   Compare the dump's in-use total with `ravel_process_allocator_bytes`
+   `stat="allocated"` sampled at the same time: a large gap means the sample
+   interval is too coarse to attribute from.
+
+Profiling with a dump at every peak slows allocation-heavy statements, so
+measure timings on a build without it.
+
 ## Background
 
 Decision records behind this page:

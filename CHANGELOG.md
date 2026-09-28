@@ -376,6 +376,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a value that keeps growing means the main runtime is not scheduling it.
   Embedders get `ravel_server::start_with_heartbeat` to pass in a heartbeat
   they built; `ravel_server::start` builds and beats its own.
+
+- **`ravel-server` has an off-by-default `heap-profiling` cargo feature**
+  that compiles jemalloc's profiler in, so live memory can be attributed to
+  allocation sites with `_RJEM_MALLOC_CONF` and `jeprof` instead of a
+  one-off diagnostic branch (issue #2066, where it located the ranged-read
+  assembly buffer). The published image does not enable it. The
+  troubleshooting guide's "Attributing server memory with a heap profile"
+  section gives the build, the runtime settings and how to read a dump.
+
 - **`ravel-cli load` takes `--signal {metrics,logs,spans}` and loads the
   metrics signal** (ADR-1751 decisions 1 and 2, follow-up task 1, issues
   #1751 and #1712). The flag defaults to `logs`, so an invocation written
