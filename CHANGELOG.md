@@ -77,6 +77,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The `ravel-operator` Deployment itself now has a securityContext, a
+  metrics/health HTTP surface, and liveness/readiness probes** (issues #1731
+  and #1923). Its own Pod and container now carry the same hardened
+  `securityContext` every server container it renders already carries
+  (non-root, no privilege escalation, read-only root filesystem, every Linux
+  capability dropped), admitted under the `restricted` Pod Security Standard,
+  where it was previously rejected. A new `health` container port serves
+  `/healthz`, `/readyz`, and a hand-written `/metrics` Prometheus exposition
+  (`ravel_operator_reconciles_total`,
+  `ravel_operator_reconcile_duration_seconds`,
+  `ravel_operator_last_successful_reconcile_timestamp_seconds`,
+  `ravel_operator_watched_clusters`); `deploy/k8s/operator/operator.yaml`
+  wires liveness and readiness probes at those paths and a
+  `prometheus.io/scrape` annotation. `operator.yaml`'s header comment and
+  `docs/guides/kubernetes.md` now point real (non-`kind`) clusters at a
+  digest-pinned image rather than a moving tag. The listener binds before
+  the controller starts, so an address `--listen-health` cannot bind stops
+  the operator with an error naming both; `/readyz` answers `200` once the
+  initial `RavelCluster` list has arrived.
+
 - **An end-to-end proof that a stalled fold pages before it refuses a query**
   (issue #1306, ADR-1306 follow-up task 3). ADR-1306 decision 2 states the
   ordering as arithmetic over spans;
@@ -301,26 +321,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     one. Raise `repeat_interval`, or set it to `0s`, on rules that match many
     series.
 ### Added
-
-- **The `ravel-operator` Deployment itself now has a securityContext, a
-  metrics/health HTTP surface, and liveness/readiness probes** (issues #1731
-  and #1923). Its own Pod and container now carry the same hardened
-  `securityContext` every server container it renders already carries
-  (non-root, no privilege escalation, read-only root filesystem, every Linux
-  capability dropped), admitted under the `restricted` Pod Security Standard,
-  where it was previously rejected. A new `health` container port serves
-  `/healthz`, `/readyz`, and a hand-written `/metrics` Prometheus exposition
-  (`ravel_operator_reconciles_total`,
-  `ravel_operator_reconcile_duration_seconds`,
-  `ravel_operator_last_successful_reconcile_timestamp_seconds`,
-  `ravel_operator_watched_clusters`); `deploy/k8s/operator/operator.yaml`
-  wires liveness and readiness probes at those paths and a
-  `prometheus.io/scrape` annotation. `operator.yaml`'s header comment and
-  `docs/guides/kubernetes.md` now point real (non-`kind`) clusters at a
-  digest-pinned image rather than a moving tag. The listener binds before
-  the controller starts, so an address `--listen-health` cannot bind stops
-  the operator with an error naming both; `/readyz` answers `200` once the
-  initial `RavelCluster` list has arrived.
 
 - **`ravel-server` builds a read and a write CPU gate and reports their
   queueing on `/metrics`** (ADR-1702, issue #1702). A new crate,
