@@ -3548,7 +3548,8 @@ pub async fn start(
                 );
             // ADR-1689 decision 1: the Flight service in the `SliceOnly` role,
             // beside `SeriesFetch`. It answers `DoGet` for a slice ticket and
-            // `permission_denied` for every other Flight and Flight SQL method.
+            // refuses every other Flight and Flight SQL method; no other method
+            // returns data.
             #[cfg(feature = "flight-sql")]
             let server = server.add_optional_service(sql_slice_service);
             let listener = tokio::net::TcpListener::bind(fl.addr).await?;

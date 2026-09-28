@@ -37,22 +37,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   against the injected clock, `slice_count > 1`, listener role) and runs the
   slice under the ticket's tenant. Refusals are typed and counted in-process
   under a closed reason (`missing`, `bad_mac`, `expired`, `wrong_surface`);
-  the counters are not exported at `/metrics` yet, and on the combined
-  listener every deployment uses until follow-up task 2, a ticket that fails
-  the slice MAC falls through to the client path, which still requires the
-  client credential, so only `expired` and `wrong_surface` can fire there.
-  The slice still travels over the public gRPC listener, in plaintext,
-  until the server mounts the Flight service on the dedicated fragment
-  listener (ADR-1689 follow-up task 2), and both keys derive from the first
-  fragment key unless `--sql-ticket-key-file` is set (next entry). During a rolling
-  upgrade an old and a new process do not verify each other's slice
-  tickets, so those slices run on the coordinator through the existing
-  fallback sequence after up to two failed round trips each: parallelism
-  drops for the rollout, results do not change. Client whole-set tickets are
-  now signed under a key derived from the shared one, so with
-  `--distributed-query` a `GetFlightInfo` and its `DoGet` that land on an
-  old and a new process fail with `invalid_argument` until the rollout
-  completes, and the query has to be run again.
+  the counters are not exported at `/metrics` yet. On the combined listener
+  a node without `--fragment-listener` runs, a ticket that fails the slice
+  MAC falls through to the client path, which still requires the client
+  credential, so only `expired` and `wrong_surface` can fire there. Without
+  `--fragment-listener` the slice travels over the public gRPC listener in
+  plaintext; with it, the slice rides the dedicated TLS listener (the entry
+  after next). Both keys derive from the first fragment key unless
+  `--sql-ticket-key-file` is set (next entry). During the rolling upgrade
+  onto this release a coordinator drops workers on the other `queryfrag`
+  protocol version at routing time, with no round trip, and runs their
+  slices on the coordinator: parallelism drops for the rollout, results do
+  not change. Client whole-set tickets are now signed under a key derived
+  from the shared one, so with `--distributed-query` a `GetFlightInfo` and
+  its `DoGet` that land on an old and a new process fail with
+  `invalid_argument` until the rollout completes, and the query has to be
+  run again.
 
 - **The Flight SQL ticket keys come from `--sql-ticket-key-file`, not from the
   fragment key** (ADR-1689 decision 2, issues #1689 and #1690). The new flag
@@ -84,15 +84,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (ADR-1689 decisions 1 and 3, issues #1689 and #1690). With
   `--fragment-listener`, the dedicated listener mounts the Flight service
   beside `SeriesFetch` in a slice-only role: it serves `DoGet` for a slice
-  ticket and answers every other Flight and Flight SQL method with
-  `permission_denied`. The public gRPC listener keeps the client Flight SQL
-  surface and refuses a slice ticket outright with `permission_denied`,
+  ticket and refuses every other Flight and Flight SQL method, and no method
+  other than a slice `DoGet` returns data. The client Flight SQL methods the
+  service implements answer `permission_denied`; the methods it does not
+  (prepared statements, `Handshake`, `ListFlights`, `PollFlightInfo`,
+  `GetSchema`, `DoPut`, `DoExchange`) answer `unimplemented`, as they do on
+  the public listener; `ListActions` returns its static list; a `DoGet` that is
+  not a valid slice capability answers `unauthenticated` (`missing`,
+  `bad_mac` or `expired`, where a handle too short to be a ticket is
+  `missing`) or, for a client ticket, `permission_denied` (`wrong_surface`),
+  counted on the same counters as the public listener. The public gRPC
+  listener keeps the client Flight SQL surface and refuses a slice ticket
+  whose MAC verifies under this node's slice keys with `permission_denied`,
   counted as `wrong_surface`, the mirror of it refusing pinned fragment
-  fetches. The SQL lane dials each worker's `fragment_endpoint` over the same
-  pinned-CA mutual TLS the PromQL lane uses, with the same certificate, so a
-  peer without a client certificate from `--fragment-tls-ca` fails the
-  handshake; it no longer dials `flight_sql_endpoint` for slices, and a
-  worker whose record has no fragment endpoint gets none. Without
+  fetches; a forged ticket, or one under a key this node lacks, takes the
+  client path and is refused there uncounted. The SQL lane dials each
+  worker's `fragment_endpoint` over the same pinned-CA mutual TLS the PromQL
+  lane uses, with the same certificate, so a peer without a client
+  certificate from `--fragment-tls-ca` fails the handshake; it no longer
+  dials `flight_sql_endpoint` for slices, and a worker whose record has no
+  fragment endpoint gets none. Without
   `--fragment-listener` nothing changes: the public listener serves both
   surfaces and slices travel there in plaintext, and the startup line saying
   so is now logged only in that case (and only where Flight SQL is served).
@@ -101,8 +112,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so during the one rolling deploy onto this release a coordinator drops
   workers on the other version at routing time and runs their PromQL and SQL
   slices coordinator-local: parallelism drops for the deploy, results do not
-  change. A slice handle too short to be a ticket is now counted as
-  `missing` rather than `bad_mac`.
+  change. Federation requests carry the same protocol version and a remote
+  refuses a mismatch, so a cluster on this release and a remote cluster on
+  an earlier one fail federated queries with a `Federation` error (or, for a
+  remote with `skip-unavailable`, skip it with a partial-coverage warning)
+  until both run the same release.
 
 ### Fixed
 

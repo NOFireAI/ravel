@@ -231,11 +231,21 @@ in-process and serves nothing else. When it is set:
   `Resolve` (federation, under ordinary tenant credentials) stays there, and
   the dedicated listener rejects `Resolve` outright.
 - SQL slices move with it. The dedicated listener mounts the Flight service
-  in a slice-only role: it serves `DoGet` for a slice ticket and answers every
-  other Flight and Flight SQL method with `permission_denied`. The public gRPC
-  listener keeps the client Flight SQL surface and refuses a slice ticket
-  outright with `permission_denied` ("slice fetch rejected: wrong_surface"),
-  valid or not. A coordinator dials each worker's `fragment_endpoint` over
+  in a slice-only role: it serves `DoGet` for a slice ticket and refuses every
+  other Flight and Flight SQL method, and no method other than a slice `DoGet`
+  returns data. The client Flight SQL methods answer `permission_denied`,
+  methods the service does not implement (prepared statements, `Handshake`,
+  `DoPut` and the like) answer `unimplemented`, `ListActions` returns its
+  static list, and a `DoGet` that is not a valid slice capability answers
+  `unauthenticated`, or `permission_denied` ("slice fetch rejected:
+  wrong_surface") for a client ticket. The public gRPC listener keeps the
+  client Flight SQL surface and refuses a slice ticket whose MAC verifies
+  under this node's slice keys with `permission_denied` ("slice fetch
+  rejected: wrong_surface"). A forged slice ticket, or one minted under a key
+  this node does not hold, is not recognised as a slice ticket: it takes the
+  client path and is refused there (`unauthenticated` without a credential,
+  `invalid_argument` "malformed flight ticket" with one), uncounted. A
+  coordinator dials each worker's `fragment_endpoint` over
   `https` with the same pinned CA, server name and client certificate as a
   fragment fetch, and no client credential travels with the slice: the slice
   ticket is the capability.
@@ -276,8 +286,8 @@ in-process and serves nothing else. When it is set:
 Without the flag the fragment surface and SQL slice `DoGet` stay on the public
 gRPC listener, so distribution keeps working through a rolling deploy that
 adds it. During that deploy a slice between a node with the flag and a node
-without it fails its first dial and runs coordinator-local; results do not
-change.
+without it fails its first dial, is re-dispatched once to another worker, and
+runs coordinator-local only if that attempt fails too; results do not change.
 
 Adding capacity is adding processes. A new node with the same flags and the
 same bucket appears in the live worker set within one heartbeat interval and

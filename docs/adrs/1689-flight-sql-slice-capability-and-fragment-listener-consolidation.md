@@ -66,9 +66,11 @@ builds on both.
    dedicated listener mounts the Flight service beside `SeriesFetch`, in a
    `SliceOnly` role: it accepts `DoGet` carrying a slice ticket
    (`slice_count > 1`) and answers every other Flight and Flight SQL method
-   with `permission_denied`. The public gRPC listener keeps the client
-   Flight SQL surface and, once a dedicated listener is configured,
-   rejects a slice ticket outright, the mirror of `PublicFederation`
+   with `permission_denied` (see the refusal-codes amendment below for the
+   codes each method actually returns). The public gRPC listener keeps the
+   client Flight SQL surface and, once a dedicated listener is configured,
+   rejects a slice ticket outright (a ticket it recognises as one; see the
+   same amendment), the mirror of `PublicFederation`
    rejecting `Pinned` (`services/ravel-server/src/distrib.rs:878-896`).
    The SQL lane dials `fragment_endpoint` over the same pinned-CA TLS
    channel configuration the PromQL lane builds. `FlightWorkerSliceClient`
@@ -225,3 +227,28 @@ flowchart LR
   4. Release B: delete `Combined`, add the `Cli::validate` refusals, and
      delete the plaintext dial path, with the guide's "without the flag"
      paragraph removed in the same commit.
+
+## Amendment (2026-09-28): the refusal codes on each listener
+
+<!-- amendment-applies: sections="Decision" pointer="refusal-codes amendment" -->
+
+Decision 1 said the `SliceOnly` listener answers every method other than a
+slice `DoGet` with `permission_denied`. As implemented in follow-up task 2 it
+refuses every such method, and no method other than a slice `DoGet` returns
+data, but not all with that code. The client Flight SQL methods the service
+implements answer `permission_denied`. The methods it does not implement
+(prepared statements, `Handshake`, `ListFlights`, `PollFlightInfo`,
+`GetSchema`, `DoPut`, `DoExchange`) answer `unimplemented`, as they do on
+the public listener. `ListActions` returns its static action list. A `DoGet`
+that is not a valid slice capability answers `unauthenticated` (`missing`,
+`bad_mac`, `expired`), or `permission_denied` (`wrong_surface`) for a client
+whole-set ticket. The security property the decision rests on, that the
+dedicated listener serves no client data, holds under every one of these.
+
+Decision 1 also said the public listener rejects a slice ticket outright. It
+recognises a slice ticket only when the ticket's MAC verifies under this
+node's slice keys; that ticket is refused as `wrong_surface` and counted. A
+forged ticket, or one minted under a key this node does not hold, is not
+recognised as a slice ticket: it takes the client path and is refused there
+(`unauthenticated` without a client credential, `invalid_argument` with
+one), uncounted. It reads nothing either way.

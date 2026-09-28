@@ -5,7 +5,9 @@
 //! `sys/query/workers/`.
 //!
 //! Both processes run `--fragment-listener` with the test CA and a
-//! `ravel-fragment` leaf certificate, and share one `--sql-ticket-key-file`.
+//! `ravel-fragment` leaf certificate, and share one `--sql-ticket-key-file`
+//! (or, in one variant, derive the SQL ticket keys from the shared
+//! `--fragment-key-file`).
 //! The coordinator's store refuses every GET of a published data object, so it
 //! cannot answer any part of the query itself: the query succeeds only when the
 //! worker, in the other process, served the slices. With `--fragment-listener`
@@ -143,8 +145,20 @@ impl Material {
     /// `--listen-grpc` name fixed ports only so validation sees distinct
     /// listeners; the server binds the ephemeral ones in [`ServerConfig`].
     fn distrib_settings(&self) -> DistribSettings {
+        self.distrib_settings_with(true)
+    }
+
+    /// [`Self::distrib_settings`], passing `--sql-ticket-key-file` only when
+    /// `sql_key_file` is set. Without it every SQL ticket key derives from the
+    /// fragment key file.
+    fn distrib_settings_with(&self, sql_key_file: bool) -> DistribSettings {
         let path = |file: &tempfile::NamedTempFile| file.path().to_str().expect("utf8").to_owned();
-        let cli = Cli::try_parse_from([
+        let sql_key_flags = if sql_key_file {
+            vec!["--sql-ticket-key-file".to_owned(), path(&self.sql_keys)]
+        } else {
+            Vec::new()
+        };
+        let flags = [
             "ravel-server".to_owned(),
             "--mode".to_owned(),
             "all".to_owned(),
@@ -155,8 +169,6 @@ impl Material {
             "--distributed-query".to_owned(),
             "--fragment-key-file".to_owned(),
             path(&self.fragment_keys),
-            "--sql-ticket-key-file".to_owned(),
-            path(&self.sql_keys),
             "--fragment-listener".to_owned(),
             "127.0.0.1:0".to_owned(),
             "--fragment-tls-cert".to_owned(),
@@ -169,8 +181,8 @@ impl Material {
             "0".to_owned(),
             "--distribute-segments-threshold".to_owned(),
             "0".to_owned(),
-        ])
-        .expect("flags parse");
+        ];
+        let cli = Cli::try_parse_from(flags.into_iter().chain(sql_key_flags)).expect("flags parse");
         cli.validate().expect("flags validate");
         let settings = cli
             .parse_distrib_settings()
@@ -620,18 +632,32 @@ fn slice_do_get(handle: Vec<u8>) -> Request<Ticket> {
 /// single-process result bit for bit; the worker read the segments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_slice_fetch_rides_the_dedicated_tls_listener() {
+    cross_process_query_over_the_dedicated_listener(true).await;
+}
+
+/// The same acceptance without `--sql-ticket-key-file`: the dedicated
+/// listener verifies slices under the key both processes derive from the
+/// fragment key file. A dedicated listener holding any other key refuses
+/// every slice as `bad_mac`, and the coordinator, which may not read the
+/// segments, then fails the query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_slice_fetch_without_a_sql_ticket_key_file_uses_the_derived_key() {
+    cross_process_query_over_the_dedicated_listener(false).await;
+}
+
+async fn cross_process_query_over_the_dedicated_listener(sql_key_file: bool) {
     let material = Material::new();
     let shared = Arc::new(MemoryStore::new());
     let (data_keys, start_ns, end_ns) = publish_fixture(&shared).await;
 
+    let settings = || material.distrib_settings_with(sql_key_file);
     let worker_store = DataStore::new(shared.clone(), data_keys.clone(), false);
-    let worker = start_server(worker_store.clone(), Some(material.distrib_settings())).await;
+    let worker = start_server(worker_store.clone(), Some(settings())).await;
     let worker_fragment = worker.fragment_addr.expect("the dedicated listener binds");
     let worker_grpc = worker.grpc_addr.expect("gRPC binds in All mode");
     await_heartbeat_records(&shared, 1).await;
     let coordinator_store = DataStore::new(shared.clone(), data_keys, true);
-    let coordinator =
-        start_server(coordinator_store.clone(), Some(material.distrib_settings())).await;
+    let coordinator = start_server(coordinator_store.clone(), Some(settings())).await;
     let coordinator_grpc = coordinator.grpc_addr.expect("gRPC binds in All mode");
     await_heartbeat_records(&shared, 2).await;
 
@@ -686,6 +712,16 @@ async fn sql_slice_fetch_rides_the_dedicated_tls_listener() {
         worker_rejects.get(SliceReject::WrongSurface),
         0,
         "no slice reached the worker's public listener"
+    );
+    assert_eq!(
+        worker_rejects
+            .by_reason()
+            .iter()
+            .map(|(_, n)| n)
+            .sum::<u64>(),
+        0,
+        "the worker verified every slice it was sent: {:?}",
+        worker_rejects.by_reason()
     );
 
     let local = start_server(shared.clone(), None).await;
@@ -763,13 +799,15 @@ async fn a_slice_ticket_on_the_public_listener_is_refused_once_a_fragment_listen
 
 /// The dedicated listener serves slice `DoGet` only: a client Flight SQL
 /// method is refused with `permission_denied`, credential or not, and so is a
-/// client whole-set ticket presented there.
+/// client whole-set ticket presented there. That refusal is counted as
+/// `wrong_surface` on the counters the public listener shares.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_flight_sql_method_on_the_dedicated_listener_is_permission_denied() {
     let material = Material::new();
     let shared = Arc::new(MemoryStore::new());
     let (_, start_ns, end_ns) = publish_fixture(&shared).await;
     let node = start_server(shared, Some(material.distrib_settings())).await;
+    let rejects = node.sql_slice_rejects.clone().expect("Flight SQL served");
     let mut dedicated = dedicated_client(node.fragment_addr.expect("listener binds"), true)
         .await
         .expect("a client presenting the fragment identity completes the handshake");
@@ -778,6 +816,11 @@ async fn a_client_flight_sql_method_on_the_dedicated_listener_is_permission_deni
         .get_flight_info(authed(statement_descriptor(), start_ns, end_ns))
         .await
         .expect_err("GetFlightInfo is a client method");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
+    let status = dedicated
+        .get_flight_info(Request::new(statement_descriptor()))
+        .await
+        .expect_err("GetFlightInfo without a credential is a client method too");
     assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
 
     // A whole-set ticket, minted by the public listener for the same tenant.
@@ -794,6 +837,15 @@ async fn a_client_flight_sql_method_on_the_dedicated_listener_is_permission_deni
         .expect_err("a client ticket is not a slice capability");
     assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
     assert_eq!(status.message(), "slice fetch rejected: wrong_surface");
+    for (reason, count) in rejects.by_reason() {
+        let expected = u64::from(reason == SliceReject::WrongSurface.reason());
+        assert_eq!(
+            count,
+            expected,
+            "the dedicated listener's refusals land on the shared counters: {:?}",
+            rejects.by_reason()
+        );
+    }
 
     node.shutdown().await.expect("node shuts down");
 }

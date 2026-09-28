@@ -129,10 +129,11 @@ impl SliceRejectCounters {
 
 /// Verify `handle` as a slice capability at `now_ns`. The checks run in a
 /// fixed order (present, MAC, expiry, slice count) so a ticket that fails
-/// several ways is attributed to the first. A handle that fails structurally
-/// before its MAC can be checked (shorter than the smallest ticket) is counted
-/// as missing, not as a bad MAC. The role is checked by the caller, which
-/// decides whether a `DoGet` is a slice fetch at all.
+/// several ways is attributed to the first. A handle the decoder reports as
+/// truncated is counted as missing, not as a bad MAC: before the MAC is
+/// checked that means shorter than the smallest ticket, and after it only a
+/// payload that verified yet ends early. The role is checked by the caller,
+/// which decides whether a `DoGet` is a slice fetch at all.
 pub(super) fn verify_slice(
     keys: &SqlTicketKeys,
     handle: &[u8],
@@ -203,7 +204,11 @@ mod tests {
             slice_ticket()
         );
 
-        for len in [1, 4, 16, 32] {
+        // A ticket with no statement, pins or columns is the smallest one the
+        // decoder accepts, so 97 bytes is the full handle verified above and
+        // 96 is the longest length the guard still refuses.
+        assert_eq!(encoded.len(), 97, "the fixture sits on the length guard");
+        for len in [1, 4, 16, 32, 96] {
             assert_eq!(
                 verify_slice(&keys, &encoded[..len], NOW_NS),
                 Err(SliceReject::Missing),
@@ -217,7 +222,7 @@ mod tests {
         assert_eq!(
             verify_slice(&keys, &forged, NOW_NS),
             Err(SliceReject::BadMac),
-            "a full-length handle whose MAC does not verify"
+            "a 97-byte handle clears the length guard, so its MAC is checked"
         );
     }
 }

@@ -414,12 +414,20 @@ and `--fragment-tls-ca`. Both distributed lanes move onto it:
   refuses pinned fetches; the dedicated listener serves pinned fetches and
   refuses federation.
 - The SQL lane's slice `DoGet`. The dedicated listener serves `DoGet` for a
-  slice ticket and answers every other Flight and Flight SQL method with
-  `permission_denied`. The public gRPC listener keeps the client Flight SQL
-  surface and refuses a slice ticket outright, valid or not, with
-  `permission_denied` ("slice fetch rejected: wrong_surface"). A coordinator
-  dials each worker's advertised `fragment_endpoint` over TLS, never its
-  public gRPC address.
+  slice ticket and refuses every other Flight and Flight SQL method; no method
+  other than a slice `DoGet` returns data there. Client Flight SQL methods
+  answer `permission_denied`, methods the service does not implement answer
+  `unimplemented`, and a `DoGet` that is not a valid slice capability answers
+  `unauthenticated` (or `permission_denied` for a client ticket). The public
+  gRPC listener keeps the client Flight SQL surface and refuses, with
+  `permission_denied` ("slice fetch rejected: wrong_surface"), a slice ticket
+  whose MAC verifies under this node's slice keys. A forged slice ticket, or
+  one under a key this node lacks, takes the client path and is refused there,
+  uncounted. A coordinator dials each worker's advertised `fragment_endpoint`
+  over TLS. A worker with the flag advertises its dedicated listener there; a
+  worker without it advertises its public gRPC address, so during a rolling
+  deploy a coordinator with the flag dials that address over `https` and the
+  TLS handshake fails before any request is sent.
 
 Startup refuses a `--fragment-listener` address equal to `--listen-http`,
 `--listen-grpc` or `--mtls-listener`, so the separation holds by construction.
@@ -578,7 +586,8 @@ flag advertise their TLS fragment endpoint and refuse pinned fetches and SQL
 slice tickets on the public port, while nodes that do not keep serving them
 there. A slice between a node with the flag and a node without it fails its
 first dial (a TLS dial to a plaintext port, or a slice ticket the public
-listener refuses) and runs coordinator-local. Results stay identical
+listener refuses), is re-dispatched once to another worker, and runs
+coordinator-local only if that attempt fails too. Results stay identical
 throughout. Only which nodes a slice can fan out to changes during the roll.
 
 The release that moves SQL slices onto the dedicated listener also moves the
@@ -606,6 +615,13 @@ are optional. `--remote-cluster-soft-timeout` sets the default soft timeout for
 every remote that does not name its own; a remote that does not answer within
 its bound is treated as unavailable, which fails the query unless that remote
 has `skip-unavailable`.
+
+Federation requests carry the `queryfrag` protocol version, and a remote
+refuses a request on another version. The release that moved it from 4 to 5
+therefore splits federation: a cluster on that release and a remote on an
+earlier one fail every federated query with a `Federation` error naming the
+remote, or, for a remote with `skip-unavailable`, skip it with a
+partial-coverage warning, until both run the same release.
 
 The credential is an operator secret read from a file, never an inline value. It
 is the principal the remote sees. A federated query never forwards the calling
