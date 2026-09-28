@@ -186,18 +186,25 @@ pub(crate) enum StoreClockLag {
 /// pass of a drain reads the same lag and refuses again. On a teardown drain
 /// there is no later tick, so enforcing it on every pass would lose the
 /// buffered rows the drain exists to save.
+///
+/// The choice is per pass, not per drain: a teardown drain runs its bounded
+/// enforced passes first and only then bypasses, so the counters still show
+/// every refusal the clock earned.
 #[derive(Clone, Copy)]
 pub(crate) enum LagCheck {
     /// The normal path: a reading lagging the store's observed clock beyond
     /// the allowance is refused, retryably.
     Enforced,
-    /// The final pass of a teardown drain (`Shutdown` or the channel-close arm)
-    /// after the bounded retry passes left the buffer still refused. The lag is
-    /// still measured, counted as `clock_lag_bypassed_at_shutdown`, and logged,
-    /// but the flush proceeds: publishing acknowledged rows into a possibly
-    /// sealed hour (recoverable by a HEAD rebuild) beats dropping them on a
-    /// graceful path. The ADR-1307 floor rules are unchanged, so a regression
-    /// refusal still applies here.
+    /// A bypass pass of a teardown drain (`Shutdown` or the channel-close arm),
+    /// made after the bounded enforced passes left the buffer still refused.
+    /// The lag is still measured, counted as `clock_lag_bypassed_at_shutdown`,
+    /// and logged, but the flush proceeds: publishing acknowledged rows into a
+    /// possibly sealed hour (recoverable by a HEAD rebuild) beats dropping them
+    /// on a graceful path. The ADR-1307 floor rules are unchanged, so a
+    /// regression refusal still applies here, which is why the drain makes
+    /// bypass passes under the same bound rather than one: the enforced passes
+    /// never reached the floor, so the first bypass pass is where an over-bound
+    /// backwards step surfaces, and it re-anchors the floor for the next one.
     BypassedAtTeardown,
 }
 
@@ -243,10 +250,13 @@ pub(crate) fn store_clock_lag(raw_ns: i64, observed_store_ns: Option<i64>) -> St
 ///
 /// A *lag* refusal (ADR-1685) re-anchors nothing: it changes neither the floor
 /// nor the store's observation, so every pass reads the same lag and refuses
-/// again. This bound is what ends the drain for it, and on a
-/// [`DrainIntent::Teardown`] the final pass then runs with
-/// [`LagCheck::BypassedAtTeardown`] so those rows publish rather than becoming
-/// residue.
+/// again. This bound is what ends the enforced loop for it, and on a
+/// [`DrainIntent::Teardown`] the drain then makes passes with
+/// [`LagCheck::BypassedAtTeardown`], bounded by this same value, so those rows
+/// publish rather than becoming residue. More than one bypass pass can be
+/// needed: the enforced passes never consulted the floor, so an over-bound
+/// backwards step hidden behind the lag check refuses the first bypass pass and
+/// re-anchors the floor, and the pass after it publishes.
 ///
 /// Residue that survives all passes is never dropped silently: how it is
 /// reported depends on whether the caller can still retry it, which is what
@@ -306,8 +316,9 @@ pub(crate) enum FlushClockError {
     /// `Abandoned`, and counted as `clock_lag_refused`.
     ///
     /// Never produced under [`LagCheck::BypassedAtTeardown`], where a lagging
-    /// reading publishes instead of stranding acknowledged rows on a graceful
-    /// drain.
+    /// reading goes on to the floor rules instead of stranding acknowledged
+    /// rows on a graceful drain. The floor can still refuse it there, as
+    /// [`RegressionRefused`](FlushClockError::RegressionRefused).
     LagRefused(String),
 }
 

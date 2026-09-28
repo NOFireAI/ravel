@@ -1291,32 +1291,46 @@ impl ShardActor {
     ///
     /// A *lag* refusal (ADR-1685) re-anchors nothing: it changes neither the
     /// floor nor the store's observation, so every pass reads the same lag and
-    /// refuses again, and the pass bound is what ends the drain. That would
-    /// strand acknowledged buffered-mode rows on a teardown, so after the bound
-    /// a [`DrainIntent::Teardown`] makes one final pass with
-    /// [`LagCheck::BypassedAtTeardown`]: the lag is counted
-    /// (`clock_lag_bypassed_at_shutdown`) and logged, and the flush publishes.
-    /// Those rows may land in an ingest hour the fold has sealed, recoverable by
-    /// a HEAD rebuild, where the drop is not recoverable at all. Floor rules are
-    /// unchanged on that pass, so a regression refusal still refuses there.
+    /// refuses again, and the pass bound is what ends the enforced loop. That
+    /// would strand acknowledged buffered-mode rows on a teardown, so after the
+    /// bound a [`DrainIntent::Teardown`] keeps making passes with
+    /// [`LagCheck::BypassedAtTeardown`] while tenants remain, under the same
+    /// bound: the lag is counted (`clock_lag_bypassed_at_shutdown`) and logged,
+    /// and the flush publishes. Those rows may land in an ingest hour the fold
+    /// has sealed, recoverable by a HEAD rebuild, where the drop is not
+    /// recoverable at all.
+    ///
+    /// Floor rules are unchanged on a bypass pass, which is why it is a loop
+    /// and not a single pass. A lag refusal never consults the floor, so a
+    /// backwards step big enough to cross [`MAX_FLUSH_CLOCK_HOLD_NS`] stays
+    /// hidden behind the lag check until the first bypass pass reaches the
+    /// floor and refuses there. That refusal re-anchors the floor to the raw
+    /// reading, so the next bypass pass stamps it and publishes. A single
+    /// bypass pass would have reported those rows as residue and lost them.
     /// [`DrainIntent::Retryable`] never bypasses: its actor keeps running, so a
     /// later trigger retries once the host clock converges.
     ///
-    /// Residue left by the bound is never dropped silently, but it is only a
+    /// Residue left by the bounds is never dropped silently, but it is only a
     /// durability defect when nothing will retry it, so `intent` decides how it
     /// is reported: an ERROR and the `flush_all_residue_tenants` bump on a
     /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
     /// the residue is still in the tenant map with its arrival bookkeeping and
-    /// the actor is still running to flush it.
+    /// the actor is still running to flush it. On a teardown that residue now
+    /// needs the floor to refuse every bypass pass too, which takes a clock
+    /// stepping backwards beyond the hold bound on every reading.
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
             self.flush_all_pass(trigger, LagCheck::Enforced).await;
             passes += 1;
         }
-        if !self.tenants.is_empty() && matches!(intent, DrainIntent::Teardown) {
-            self.flush_all_pass(trigger, LagCheck::BypassedAtTeardown)
-                .await;
+        let mut bypass_passes = 0;
+        if matches!(intent, DrainIntent::Teardown) {
+            while !self.tenants.is_empty() && bypass_passes < MAX_FLUSH_ALL_PASSES {
+                self.flush_all_pass(trigger, LagCheck::BypassedAtTeardown)
+                    .await;
+                bypass_passes += 1;
+            }
         }
         if !self.tenants.is_empty() {
             let (tenant_count, buffered_points) = self.buffered_summary();
@@ -1328,6 +1342,7 @@ impl ShardActor {
                         tenant_count,
                         buffered_points,
                         passes,
+                        bypass_passes,
                         "ravel-ingest: flush_all left buffered tenants unflushed after \
                          exhausting retry passes; acknowledged buffered-mode rows lost \
                          on this graceful drain"
@@ -1640,8 +1655,8 @@ impl ShardActor {
                 // never consulted and the store's observation is unchanged, so
                 // every retry against the same clock refuses identically until
                 // the host clock converges. Inside a drain that means
-                // `MAX_FLUSH_ALL_PASSES` is what ends the loop, and on a
-                // teardown drain its final pass runs with
+                // `MAX_FLUSH_ALL_PASSES` is what ends the enforced loop, and a
+                // teardown drain then makes bypass passes with
                 // `LagCheck::BypassedAtTeardown` so these rows publish rather
                 // than becoming residue.
                 //
