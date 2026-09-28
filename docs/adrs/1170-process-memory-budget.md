@@ -744,12 +744,14 @@ combination whose caps exceed `memory_budget_bytes` is unchanged.
 <!-- amendment-applies: sections="2. A fetch byte reservation at the points where the unit is known|Amendment (2026-09-06, Refs: #1254)|Amendment (2026-09-13, second pass, Refs: #1170)|3. A static carve under one number" pointer="2026-09-28 ranged-read amendment" -->
 <!-- amendment-supersedes: phrase="the object size at `ObjectAssembler` construction" pointer="2026-09-28 ranged-read amendment" -->
 
-Issue #2066 measured what decision 2's object-sized reservation stood for. On a
-tenant of roughly 16 MB log objects read byte-minimal on S3, 2,948 MiB of the
-4,011 MiB live at q29's peak sat in the assembly buffers of about 180 ranged
-reads in flight across 32 partitions, each buffer the length of the whole
-object however few bytes the read placed in it. None of it was cache, and ten
-concurrent queries pushed the server into swap.
+Issue #2066 measured what decision 2's object-sized reservation stood for. As
+measured in that issue's heap profile, on a tenant of roughly 16 MB log objects
+read byte-minimal on S3, 2,948 MiB of the 4,011 MiB live at q29's peak sat in
+the assembly buffers of about 180 ranged reads in flight across 32 partitions,
+each buffer the length of the whole object however few bytes the read placed in
+it. None of it was cache, and ten concurrent queries pushed the server into
+swap. That profile is not in this repository: the figures above are its report,
+not something a checked-in fixture reproduces.
 
 A ranged RLOG read now holds only the regions it placed. `ObjectAssembler`
 keeps each placed region as the `Bytes` it was given, at its absolute offset,
@@ -780,11 +782,15 @@ them. The RLOG block-range bullet of decision 2 becomes:
   whole-object reservation, since a covering read holds every byte, but keeps
   each sub-range as fetched instead of copying it into an object-sized buffer.
 
-With a cache configured the placed regions are the cache's own entries (a
-hit, or the entry a miss just admitted), no longer copies, so every assembler
-guard is marked handed off. That closes the `ObjectAssembler`-based class the
-2026-09-13 second amendment left unmarked; the SQL cross-boundary overlap is
-the residual that remains.
+With a cache configured every placed region is offered to the cache, so every
+assembler guard is marked handed off whether or not the cache admitted it,
+the same convention the whole-object funnel already follows. A hit and an
+admitted miss really are the cache's own entry held under both ledgers; a
+value the cache refused (over its single-entry cap) and a disk-tier hit that
+allocated afresh are not, so `handoff_overlap` bounds the overlap from above
+rather than counting it exactly. That closes the `ObjectAssembler`-based class
+the 2026-09-13 second amendment left unmarked; the SQL cross-boundary overlap
+is the residual that remains.
 
 `BlockRangeFetcher::assembly_buffer_stats` keeps its gauge with the new
 meaning: `live_bytes` is the placed bytes assembled reads hold, and

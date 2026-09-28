@@ -4428,9 +4428,13 @@ impl BlockRangeFetcher {
     }
 
     /// Hands `asm` a reservation for bytes it places. With a cache wired those
-    /// bytes are a cache entry too (a hit, or the entry a miss just admitted),
-    /// so the cache cap and this guard cover the same allocation: marked
-    /// handed off, as the whole-object funnels mark theirs.
+    /// bytes were offered to the cache, which has its own byte ledger, so the
+    /// reservation is marked handed off whether or not the cache admitted
+    /// them, exactly as the whole-object funnel marks its own. A hit and an
+    /// admitted miss really do put the same allocation under both ledgers; a
+    /// value the cache refused (over its single-entry cap) or a disk-tier hit
+    /// that allocated afresh is marked too, so the figure is an upper bound on
+    /// the overlap rather than an exact count of it.
     fn hold_placement(
         &self,
         asm: &mut ObjectAssembler,

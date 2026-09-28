@@ -3429,8 +3429,9 @@ unchanged by ADR-0102. Raw bytes behave differently on the two read shapes: at
 or below the threshold every partition shares one cached whole-object `Bytes`
 (a cheap clone), while above it each partition holds only the regions its own
 ranged read placed, so resident raw bytes are at most `n ×` the placed bytes
-rather than `n × object_size`; with the cache wired, those regions are the
-cache's own entries, shared by the partitions that read them. The per-query
+rather than `n × object_size`; with the cache wired, each region is offered to
+the cache, and the ones it admits are shared by the partitions that read them
+rather than copied per partition. The per-query
 DataFusion pool enforces the decoded bound either
 way: a partition count that would exceed the budget fails the query rather than
 spilling (ADR-0013).

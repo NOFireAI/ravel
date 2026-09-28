@@ -14,10 +14,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them into an object-sized buffer; its fetch reservation (ADR-1170 decision
   2) covers those regions instead of the object size, and the object-sized
   assembly buffer pool is gone, with `AssemblyBufferStats` keeping only its
-  live and peak gauge. On a tenant of
-  roughly 16 MB log objects, 2,948 MiB of the 4,011 MiB live at q29's peak had
-  sat in those object-sized buffers, which pushed the server into swap under
-  ten concurrent queries.
+  live and peak gauge. As measured in issue #2066's heap profile, on a tenant
+  of roughly 16 MB log objects, 2,948 MiB of the 4,011 MiB live at q29's peak
+  had sat in those object-sized buffers, across about 180 ranged reads in
+  flight over 32 partitions, which pushed the server into swap under ten
+  concurrent queries.
 - **This release reads provisioning record format 3 and still writes 2, and
   `ravel-cli maintain audit-versions` now classifies every recorded format
   floor** (ADR-1746 Release A, issue #1746). `FormatFloor` gains three basis

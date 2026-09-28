@@ -2,9 +2,10 @@
 //! [`ravel_query::BlockRangeFetcher`]).
 //!
 //! The fetcher reads only the sections and blocks skip-index pruning proved
-//! relevant instead of one whole-object GET per segment, assembling an
-//! object-sized buffer with only the parts it fetched populated. These tests pin
-//! the acceptance properties of the ADR that survive ADR-0892:
+//! relevant instead of one whole-object GET per segment, and hands the reader a
+//! source over exactly the regions it placed: a read of any other range inside
+//! the object fails typed rather than returning bytes (issue #2066). These tests
+//! pin the acceptance properties of the ADR that survive ADR-0892:
 //!
 //! 1. Differential: over a candidate subset, the block-range path's decoded rows
 //!    are byte-identical to the whole-object path's.

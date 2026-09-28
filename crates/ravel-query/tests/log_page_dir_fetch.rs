@@ -687,7 +687,11 @@ async fn version_4_projected_read_bridges_chunk_runs_to_the_four_get_cap() {
         acc.snapshot().total_s3_bytes() < object,
         "including the probe and the front sections, still under one whole-object read"
     );
-    assert_eq!(got.len(), bytes.len(), "an object-sized decode buffer");
+    assert_eq!(
+        got.len(),
+        bytes.len(),
+        "the source spans the whole object, however few of its bytes are placed"
+    );
 }
 
 // ---- 1c. the chunk-run cap binds L0 only -----------------------------------
@@ -2488,11 +2492,17 @@ fn narrow_projection_placed_bytes(bytes: &[u8]) -> (u64, ColumnSelection) {
 /// 46 = 7,046 of an 81,321-byte object -- while the reader holds the bytes,
 /// and both return to zero when it drops them.
 ///
+/// With no cache wired nothing is offered to a second byte ledger, so the
+/// placed regions are this read's alone and `handoff_overlap` stays 0.
+///
 /// Prove-the-test: against the object-sized pooled buffer this replaced, the
 /// gauge and `fetch_reserved` both read 81,321 at the first figure asserted
 /// after the fetch. A sparse assembler that still reserved the object size
 /// fails the `fetch_reserved` assertion; one that kept a pooled object-sized
-/// buffer beside its regions and charged it fails the gauge assertion.
+/// buffer beside its regions and charged it fails the gauge assertion. Making
+/// `hold_placement` mark every reservation handed off unconditionally, instead
+/// of only when a cache is wired, fails the `handoff_overlap` assertion below
+/// with 7,046 against 0.
 #[tokio::test]
 async fn version_4_narrow_projection_holds_exactly_its_placed_bytes() {
     let recs = records();
@@ -2536,6 +2546,11 @@ async fn version_4_narrow_projection_holds_exactly_its_placed_bytes() {
         budget.fetch_reserved(),
         placed,
         "the fetch reservation covers the placed bytes, not the object"
+    );
+    assert_eq!(
+        budget.handoff_overlap(),
+        0,
+        "with no cache wired the regions are offered to no second ledger"
     );
 
     drop(got);
@@ -2603,4 +2618,157 @@ async fn version_4_ranged_read_reserves_its_placed_bytes_while_a_get_is_in_fligh
     assert_eq!(budget.fetch_reserved(), placed);
     drop(got);
     assert_eq!(budget.fetch_reserved(), 0);
+}
+
+/// Issue #2066, ADR-1170 decision 2: each placement reserves its own length
+/// BEFORE the GET that fetches it, so a refused placement issues no request at
+/// all. The budget here is exactly the suffix probe's length, which admits the
+/// probe and nothing after it; the next placement on this read is the 84-byte
+/// STREAM_DIR+FIELD_DIR front span, and it is refused.
+///
+/// Prove-the-test: moving `self.reserve_fetch(len)?` in `place_extent` below
+/// the `cached_extent` call it precedes leaves the read failing with the same
+/// `FetchMemoryExhausted`, because the reservation is refused either way --
+/// but the front-span GET has gone out to the store by then, so `gets()` reads
+/// 2 and the GET-count assertion below fails. That assertion, not the error
+/// class, is what pins the ordering.
+#[tokio::test]
+async fn version_4_ranged_read_refuses_a_placement_before_issuing_its_get() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let object_size = bytes.len() as u64;
+    let (_, sel) = narrow_projection_placed_bytes(&bytes);
+    let probe = tail_len(&bytes);
+
+    let recording = RecordingStore::new(store_with(&bytes).await);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(probe));
+    let br = ranged(store, &bytes).with_memory_budget(Arc::clone(&budget));
+    let seg = seg_ref(object_size, &recs);
+
+    let err = br
+        .fetch_object_projected(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &sel,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect_err("the placement after the probe must be refused");
+    match err {
+        LogFetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+        } => {
+            assert_eq!(requested, 84, "the refused placement is the front span");
+            assert_eq!(
+                reserved, probe,
+                "the probe's own reservation is the held one"
+            );
+            assert_eq!(limit, probe);
+        }
+        other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+    }
+    assert_eq!(recording.suffix_gets(), 1, "the probe GET was issued");
+    assert_eq!(
+        recording.gets(),
+        1,
+        "the probe is the ONLY GET: the refused placement never reached the store"
+    );
+    assert_eq!(
+        budget.fetch_reserved(),
+        0,
+        "the refusal drops the assembler, releasing what it had placed"
+    );
+}
+
+/// Issue #2066, ADR-1170 decision 2's handoff rule: with a cache wired every
+/// placed region is offered to the cache, so every assembler guard is marked
+/// handed off and `handoff_overlap` equals the read's placed bytes -- on the
+/// cold read that admits them and on the warm read that hits them. The same
+/// read with no cache reports 0
+/// (`version_4_narrow_projection_holds_exactly_its_placed_bytes`).
+///
+/// The figure bounds the overlap from above rather than counting it exactly:
+/// the mark is made per placement, not per admission, so a value the cache
+/// refused over its single-entry cap still counts. This fixture's cache admits
+/// every region (64 MiB single-entry cap against a 7,046-byte read), so the
+/// bound is tight here.
+///
+/// Prove-the-test: dropping the `reservation.mark_handed_off()` call from
+/// `hold_placement` leaves `handoff_overlap()` at 0 on both reads below, so
+/// the first cached assertion fails with 0 against 7,046.
+#[tokio::test]
+async fn version_4_cached_ranged_read_marks_its_placements_handed_off() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let object_size = bytes.len() as u64;
+    let (placed, sel) = narrow_projection_placed_bytes(&bytes);
+
+    let store: Arc<dyn ObjectStoreBackend> = store_with(&bytes).await;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * object_size));
+    let br = ranged(store, &bytes)
+        .with_cache(read_cache())
+        .with_memory_budget(Arc::clone(&budget));
+    let seg = seg_ref(object_size, &recs);
+
+    let (cold, stats) = br
+        .fetch_object_projected(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &sel,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("cold projected fetch");
+    assert!(!stats.whole_object, "the object is not read whole");
+    assert_eq!(
+        budget.fetch_reserved(),
+        placed,
+        "the cold read reserves its placed bytes"
+    );
+    assert_eq!(
+        budget.handoff_overlap(),
+        placed,
+        "every region the cold read admitted is under the cache's ledger too"
+    );
+    drop(cold);
+    assert_eq!(
+        budget.handoff_overlap(),
+        0,
+        "the cold read's overlap clears before the warm read is measured"
+    );
+
+    let accounting = QueryAccounting::new();
+    let (warm, stats) = br
+        .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &accounting)
+        .await
+        .expect("warm projected fetch");
+    assert!(!stats.whole_object);
+    assert_eq!(
+        (
+            stats.probe_gets,
+            stats.block_range_gets,
+            stats.metadata_gets
+        ),
+        (0, 0, 0),
+        "the warm read crosses no network: every extent is cache-resident"
+    );
+    assert_eq!(
+        budget.handoff_overlap(),
+        placed,
+        "a hit holds the cache entry's own bytes under both ledgers"
+    );
+    drop(warm);
+    assert_eq!(budget.handoff_overlap(), 0, "the overlap clears on drop");
+    assert_eq!(
+        budget.fetch_reserved(),
+        0,
+        "the reservations release with it"
+    );
 }

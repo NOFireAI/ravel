@@ -169,8 +169,12 @@ impl SparseObject {
 
     /// Stitches `[start, end)` from several regions, or `None` when some byte
     /// of it is held by none.
+    ///
+    /// The covering slices are resolved before anything is allocated: an
+    /// uncovered range is the common case on a sparse read, and `end - start`
+    /// is object-sized on the reads that reach here.
     fn stitch(&self, start: u64, end: u64) -> Option<Vec<u8>> {
-        let mut out = Vec::with_capacity(usize::try_from(end - start).ok()?);
+        let mut pieces: Vec<&[u8]> = Vec::new();
         let mut at = start;
         while at < end {
             // Of the regions holding byte `at`, the one reaching furthest.
@@ -182,8 +186,12 @@ impl SparseObject {
             let region_end = s.saturating_add(b.len() as u64).min(end);
             let from = usize::try_from(at - s).ok()?;
             let to = usize::try_from(region_end - s).ok()?;
-            out.extend_from_slice(b.get(from..to)?);
+            pieces.push(b.get(from..to)?);
             at = region_end;
+        }
+        let mut out = Vec::with_capacity(pieces.iter().map(|p| p.len()).sum());
+        for piece in pieces {
+            out.extend_from_slice(piece);
         }
         Some(out)
     }
