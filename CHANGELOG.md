@@ -41,10 +41,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   listener every deployment uses until follow-up task 2, a ticket that fails
   the slice MAC falls through to the client path, which still requires the
   client credential, so only `expired` and `wrong_surface` can fire there.
-  The slice still travels over the public gRPC listener, in plaintext, and
-  both keys still derive from the first fragment key, until the server
-  mounts the Flight service on the dedicated fragment listener and reads
-  `--sql-ticket-key-file` (ADR-1689 follow-up task 2). During a rolling
+  The slice still travels over the public gRPC listener, in plaintext,
+  until the server mounts the Flight service on the dedicated fragment
+  listener (ADR-1689 follow-up task 2), and both keys derive from the first
+  fragment key unless `--sql-ticket-key-file` is set (next entry). During a rolling
   upgrade an old and a new process do not verify each other's slice
   tickets, so those slices run on the coordinator through the existing
   fallback sequence after up to two failed round trips each: parallelism
@@ -53,6 +53,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--distributed-query` a `GetFlightInfo` and its `DoGet` that land on an
   old and a new process fail with `invalid_argument` until the rollout
   completes, and the query has to be run again.
+
+- **The Flight SQL ticket keys come from `--sql-ticket-key-file`, not from
+  the fragment key** (ADR-1689 decision 2, issues #1689 and #1690). The new
+  flag takes the `--fragment-key-file` shape and rotation rule (the first
+  key mints, every key verifies) and requires `--distributed-query`. With it
+  set, the Flight SQL service keys every client and slice ticket off the
+  file's keys and nothing is derived from the fragment key file, so one key
+  file no longer covers both lanes. Without it, a node derives the SQL
+  ticket secret from the first fragment key as earlier releases did; the
+  upgrade from an earlier release still has the client-ticket window the
+  previous entry describes, because this release turns that secret into
+  separate client and slice keys. A `--distributed-query` process in `all` or
+  `query` mode missing `--sql-ticket-key-file` or `--fragment-listener` logs
+  a startup warning that release B (ADR-1689 decision 4) requires both. Every `--distributed-query` process in `all` or
+  `query` mode also logs, with any flags, that SQL slice tickets still travel
+  in plaintext on the public gRPC listener and are a replayable read
+  capability until their deadline: the SQL lane moves to the dedicated
+  listener in a later change. Every node in a cluster must read the same SQL
+  ticket key set. A rolling switch straight onto a new key file has a mixed
+  window: a client ticket that `GetFlightInfo` minted on a node on the file
+  and that `DoGet` redeems on a node still on the derived key (or the
+  reverse) fails with `invalid_argument`, a client-visible query failure,
+  since a client ticket can be redeemed on any node behind a balancer, and
+  SQL slices between two such nodes run on the coordinator instead. The
+  deployment guide describes a switch without that window: first ship a key
+  file holding the key each node derives today, then rotate.
 
 ### Fixed
 

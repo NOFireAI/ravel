@@ -326,6 +326,81 @@ These keys mint and verify a per-tenant, per-query capability. A fragment fetch
 is authorized by that capability and by nothing else. There is no shared
 cluster-internal bearer token.
 
+The Flight SQL lane signs its tickets with a key file of its own,
+`--sql-ticket-key-file`: the same shape and rotation rule as
+`--fragment-key-file`, read by every node in the cluster, and kept with the
+same care as the fragment key file. Give it different keys from the fragment key file. It
+requires `--distributed-query`; setting it alone fails startup. It is optional
+in this release. A node without it derives its SQL ticket secret from the
+first fragment key, as earlier releases did, but this release turns that
+secret into separate client and slice keys, so upgrading from an earlier
+release has the same client-ticket window described below until every node
+runs this release. A node in `all` or `query` mode without it logs a startup
+warning naming what release B, the release after the operator renders the
+dedicated listener, requires: with `--distributed-query`, both
+`--fragment-listener` and `--sql-ticket-key-file`. A node missing only
+`--fragment-listener` logs the same warning.
+
+Two nodes that do not share a SQL ticket key disagree on every ticket, and a
+rolling deploy is exactly the window in which they coexist. Rolling a brand
+new key file straight onto a fleet on the derived key causes two failures
+until the roll finishes:
+
+- A client query fails. `GetFlightInfo` returns one endpoint with no location,
+  so a client behind a balancer may send `DoGet` to any node. A ticket minted
+  on a node on the file and redeemed on a node still on the derived key, or
+  the reverse, fails with `invalid_argument` ("malformed flight ticket").
+- SQL slices between two such nodes fail the worker's MAC and run on the
+  coordinator instead, so the query loses parallelism.
+
+Once every node runs this release, switch without that window: make the
+first key file equal to the key the nodes already use, then rotate. Doing
+this in the same roll as the upgrade does not avoid the window, because the
+upgrade itself changes the keys an older node uses.
+
+1. Compute the key each node derives today. `ravel-server` does not print it
+   and has no flag that does. It is the BLAKE3 derive-key of the first key in
+   the fragment key file, as its 64 lowercase hex characters, under the
+   fixed context string the command below passes to `--derive-key`.
+   [`b3sum`](https://github.com/BLAKE3-team/BLAKE3) (`cargo install b3sum`)
+   computes it:
+
+   ```sh
+   first=$(grep -v '^[[:space:]]*#' fragment.keys | grep -m1 '[^[:space:]]' \
+     | tr -d '[:space:]' | tr 'A-F' 'a-f')
+   printf '%s' "$first" \
+     | b3sum --derive-key 'ravel-sql flight ticket MAC key 2026-08 (RFT1 v4, ADR-0071)' \
+       --no-names > sql-ticket.keys
+   ```
+
+   Run it where the fragment key file already lives. The output line is a
+   secret with the same custody as the fragment key file. `ravel-server`'s
+   `sql_distrib` unit tests pin the context string, the lowercase-hex input
+   and the resulting key; nothing checks this page's copy of the command.
+2. Roll `--sql-ticket-key-file` pointing at that one-line file onto every
+   node. A node on the file and a node on the derived key now hold the same
+   key, so nothing fails while the roll is in progress.
+3. Rotate off the derived key, which anyone holding the fragment key file can
+   recompute. Add a freshly generated key (`openssl rand -hex 32`) as the
+   *second* line and roll, so every node verifies it before any node mints
+   with it. Then move it to the first line and roll again: every node now
+   mints under it and still verifies the old key. Once the longest Flight SQL
+   ticket TTL has passed since that roll finished, delete the old line and
+   roll a last time.
+
+Adding the new key as the first line in a single roll, the way the fragment
+key file is rotated, reopens the mixed window for client tickets: a node
+already on `[new, old]` mints under the new key, and a node still on `[old]`
+cannot verify that ticket.
+
+In this release SQL slice tickets travel in plaintext on the public gRPC
+listener whatever the flags say, `--fragment-listener` included: the SQL lane
+dials each worker's `--listen-grpc` address. A slice ticket read off that
+network is a replayable read capability for its tenant and segment set until
+its deadline. Every `--distributed-query` process in `--mode all` or
+`--mode query` logs this once at startup. Keep the public gRPC port on a
+network you trust until the SQL lane moves to the dedicated listener.
+
 With the key file in place, the cluster-internal fragment surface, where one
 query worker fetches a slice for another, can be moved off the public gRPC
 listener onto a dedicated listener that terminates TLS in-process:
@@ -407,6 +482,7 @@ Mount the Secret and point the flags at the projected paths:
 ravel-server --mode all --distributed-query \
   --listen-grpc 0.0.0.0:4317 \
   --fragment-key-file /etc/ravel/fragment-keys \
+  --sql-ticket-key-file /etc/ravel/sql-ticket-keys \
   --fragment-listener 0.0.0.0:4319 \
   --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
   --fragment-tls-key  /etc/ravel/fragment-tls/tls.key \

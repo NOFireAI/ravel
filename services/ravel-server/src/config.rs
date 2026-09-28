@@ -1832,6 +1832,21 @@ pub struct Cli {
     #[arg(long = "fragment-key-file", value_name = "PATH")]
     pub fragment_key_file: Option<PathBuf>,
 
+    /// Path to the SQL ticket key file that mints and verifies Flight SQL
+    /// tickets (ADR-1689 decision 2): the whole-set ticket a client redeems and
+    /// the slice ticket a coordinator hands a worker, each under its own MAC key
+    /// derived from every file key. Same file shape and rotation rule as
+    /// `--fragment-key-file`: one 64-hex-character key per non-empty line, `#`
+    /// comments and blank lines ignored, the FIRST key mints and ALL keys verify.
+    /// Every coordinator and worker in one cluster reads the same file. Keep it
+    /// separate from the fragment key file: one key file no longer covers both
+    /// lanes. Meaningful only with `--distributed-query`. Optional in this
+    /// release, where a process without it derives the SQL ticket key from the
+    /// first fragment key and logs a startup warning; release B (ADR-1689
+    /// decision 4) requires it with `--distributed-query`.
+    #[arg(long = "sql-ticket-key-file", value_name = "PATH")]
+    pub sql_ticket_key_file: Option<PathBuf>,
+
     /// The dedicated TLS fragment listener address (ADR-0071 amendment decision
     /// 1): a fourth listener, alongside `--listen-http`, `--listen-grpc`, and
     /// `--mtls-listener`, that terminates TLS in-process and serves `Pinned`
@@ -3718,13 +3733,19 @@ pub struct AuthResolverSettings {
 /// `Some` only when `--distributed-query` is set. Carries the cluster fragment
 /// keys (read from `--fragment-key-file`), the fragment admission cap, and the
 /// cost gate/fan-out thresholds.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DistribSettings {
     /// The cluster fragment keys guarding the fragment surface (ADR-0071
     /// amendment, decision 2), read from `--fragment-key-file`. The first mints
     /// capabilities; all verify. Never empty when this struct exists (startup
     /// rejects an empty key file).
     pub fragment_keys: Vec<[u8; 32]>,
+    /// The Flight SQL ticket keys (ADR-1689 decision 2), read from
+    /// `--sql-ticket-key-file`. The first mints; all verify. `None` when the
+    /// flag is unset, in which case the SQL lane falls back to
+    /// [`DistribSettings::sql_ticket_secret`]; never `Some` of an empty list
+    /// (startup rejects an empty key file).
+    pub sql_ticket_keys: Option<Vec<[u8; 32]>>,
     /// The `Pinned` (intra-cluster) fragment (`SeriesFetch`) admission cap, a
     /// distinct workload class from client-query admission
     /// (`--max-inflight-fragments`, clamped `>= 1`).
@@ -3746,6 +3767,28 @@ pub struct DistribSettings {
     /// the bound addresses verbatim, which `Cli::validate` has proven are not
     /// wildcards.
     pub advertise_endpoint: Option<AdvertisedEndpoint>,
+}
+
+impl std::fmt::Debug for DistribSettings {
+    /// Redacts the fragment and SQL ticket keys, printing only how many of
+    /// each are configured.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistribSettings")
+            .field("fragment_keys", &self.fragment_keys.len())
+            .field(
+                "sql_ticket_keys",
+                &self.sql_ticket_keys.as_ref().map(Vec::len),
+            )
+            .field("max_inflight_fragments", &self.max_inflight_fragments)
+            .field(
+                "max_inflight_federated_resolves",
+                &self.max_inflight_federated_resolves,
+            )
+            .field("thresholds", &self.thresholds)
+            .field("fragment_listener", &self.fragment_listener)
+            .field("advertise_endpoint", &self.advertise_endpoint)
+            .finish()
+    }
 }
 
 /// A parsed `--advertise-fragment-endpoint` (issue #1724): the host sibling
@@ -3905,11 +3948,12 @@ impl std::fmt::Debug for FragmentListenerSettings {
 
 impl DistribSettings {
     /// The stable shared secret the Flight SQL distributed lane derives its
-    /// ticket-signing key from (`ravel_sql::derive_ticket_key`). Derived from the
-    /// first fragment key so the whole cluster, reading the same key file, agrees
-    /// on one ticket key. The SQL lane needs an opaque cluster secret, not the
-    /// fragment capability itself; this bridges the two without a second key
-    /// file. Empty only if `fragment_keys` is empty, which startup forbids.
+    /// ticket-signing key from (`ravel_sql::derive_ticket_key`) when
+    /// `--sql-ticket-key-file` is unset. Derived from the first fragment key so
+    /// the whole cluster, reading the same key file, agrees on one ticket key.
+    /// This is the release A fallback only (ADR-1689 decision 4): with
+    /// [`DistribSettings::sql_ticket_keys`] set it is never read. Empty only if
+    /// `fragment_keys` is empty, which startup forbids.
     pub fn sql_ticket_secret(&self) -> String {
         self.fragment_keys
             .first()
@@ -4901,6 +4945,20 @@ impl Cli {
         })?;
         let fragment_keys = parse_fragment_keys(&raw)
             .map_err(|e| anyhow::anyhow!("invalid --fragment-key-file {}: {e}", path.display()))?;
+        let sql_ticket_keys = match &self.sql_ticket_key_file {
+            Some(path) => {
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to read --sql-ticket-key-file {}: {e}",
+                        path.display()
+                    )
+                })?;
+                Some(parse_fragment_keys(&raw).map_err(|e| {
+                    anyhow::anyhow!("invalid --sql-ticket-key-file {}: {e}", path.display())
+                })?)
+            }
+            None => None,
+        };
         // The dedicated TLS fragment listener (ADR-0071 amendment decision 1).
         // `validate()` already guaranteed that whenever `--fragment-listener` is
         // set all three PEM paths are present and `--distributed-query` is on, so
@@ -4948,6 +5006,7 @@ impl Cli {
         };
         Ok(Some(DistribSettings {
             fragment_keys,
+            sql_ticket_keys,
             max_inflight_fragments: self.max_inflight_fragments.max(1) as usize,
             max_inflight_federated_resolves: self.max_inflight_federated_resolves.max(1) as usize,
             thresholds: ravel_query::distrib::partition::DistribThresholds {
@@ -5621,6 +5680,13 @@ impl Cli {
                 "--fragment-key-file was set but --distributed-query was not: the fragment \
                  surface is only registered under --distributed-query, so the key file would be \
                  inert. Set --distributed-query, or drop --fragment-key-file."
+            );
+        }
+        if self.sql_ticket_key_file.is_some() && !self.distributed_query {
+            anyhow::bail!(
+                "--sql-ticket-key-file was set but --distributed-query was not: the SQL ticket \
+                 key file is only read under --distributed-query, so the key file would be \
+                 inert. Set --distributed-query, or drop --sql-ticket-key-file."
             );
         }
         // The dedicated TLS fragment listener (ADR-0071 amendment decision 1).
@@ -6346,7 +6412,8 @@ fn parse_deployment_key(raw: &[u8]) -> anyhow::Result<[u8; 32]> {
 /// first key is the minting key, the rest are additional verify keys for
 /// rotation. A file with no key line, or any line that is not exactly 64 hex
 /// characters, fails rather than truncating or padding a wrong-length key into
-/// place.
+/// place. `--sql-ticket-key-file` is parsed here too, so no error names the
+/// kind of key; the caller prefixes the flag.
 fn parse_fragment_keys(raw: &str) -> anyhow::Result<Vec<[u8; 32]>> {
     let mut keys = Vec::new();
     for (i, line) in raw.lines().enumerate() {
@@ -6368,9 +6435,7 @@ fn parse_fragment_keys(raw: &str) -> anyhow::Result<Vec<[u8; 32]>> {
         keys.push(arr);
     }
     if keys.is_empty() {
-        anyhow::bail!(
-            "must contain at least one 32-byte fragment key (64 hex characters on its own line)"
-        );
+        anyhow::bail!("must contain at least one 32-byte key (64 hex characters on its own line)");
     }
     Ok(keys)
 }
@@ -12257,6 +12322,132 @@ mod tests {
         let key = tempfile::NamedTempFile::new().expect("temp key file");
         std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
         key
+    }
+
+    #[test]
+    fn sql_ticket_key_file_without_distributed_query_fails_validate() {
+        let key = fragment_key_tmp();
+        let err = cli(&["--sql-ticket-key-file", key.path().to_str().expect("utf8")])
+            .validate()
+            .expect_err("--sql-ticket-key-file without --distributed-query must refuse startup");
+        assert_eq!(
+            err.to_string(),
+            "--sql-ticket-key-file was set but --distributed-query was not: the SQL ticket key \
+             file is only read under --distributed-query, so the key file would be inert. Set \
+             --distributed-query, or drop --sql-ticket-key-file."
+        );
+    }
+
+    /// The SQL ticket key file is read with the fragment key file's parser, in
+    /// file order (first mints), and is `None` when the flag is unset.
+    #[test]
+    fn sql_ticket_key_file_is_read_into_distrib_settings() {
+        let fragment = fragment_key_tmp();
+        let fragment_path = fragment.path().to_str().expect("utf8");
+        let sql = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(
+            sql.path(),
+            format!("# new first\n{}\n\n{}\n", "cd".repeat(32), "ef".repeat(32)),
+        )
+        .expect("write key");
+        let sql_path = sql.path().to_str().expect("utf8");
+
+        let settings = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            fragment_path,
+            "--sql-ticket-key-file",
+            sql_path,
+        ])
+        .parse_distrib_settings()
+        .expect("settings parse")
+        .expect("--distributed-query yields settings");
+        assert_eq!(settings.sql_ticket_keys, Some(vec![[0xcd; 32], [0xef; 32]]));
+        assert_eq!(settings.fragment_keys, vec![[0xab; 32]]);
+
+        let without = cli(&["--distributed-query", "--fragment-key-file", fragment_path])
+            .parse_distrib_settings()
+            .expect("settings parse")
+            .expect("--distributed-query yields settings");
+        assert_eq!(without.sql_ticket_keys, None);
+
+        std::fs::write(sql.path(), "not a key\n").expect("write key");
+        let err = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            fragment_path,
+            "--sql-ticket-key-file",
+            sql_path,
+        ])
+        .parse_distrib_settings()
+        .expect_err("a malformed SQL ticket key file fails startup");
+        assert!(
+            err.to_string().starts_with("invalid --sql-ticket-key-file"),
+            "names the flag: {err}"
+        );
+
+        std::fs::write(sql.path(), "# comments only\n\n").expect("write key");
+        let err = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            fragment_path,
+            "--sql-ticket-key-file",
+            sql_path,
+        ])
+        .parse_distrib_settings()
+        .expect_err("an SQL ticket key file with no key line fails startup");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("invalid --sql-ticket-key-file")
+                && msg.contains("must contain at least one 32-byte key"),
+            "names the flag and the missing key: {msg}"
+        );
+        assert!(
+            !msg.contains("fragment"),
+            "an SQL ticket key file error does not call its key a fragment key: {msg}"
+        );
+    }
+
+    /// `DistribSettings` holds raw fragment and SQL ticket keys, so its `Debug`
+    /// prints how many there are and never their bytes.
+    #[test]
+    fn distrib_settings_debug_redacts_every_key() {
+        let fragment = fragment_key_tmp();
+        let sql = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(
+            sql.path(),
+            format!("{}\n{}\n", "cd".repeat(32), "ef".repeat(32)),
+        )
+        .expect("write key");
+        let settings = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            fragment.path().to_str().expect("utf8"),
+            "--sql-ticket-key-file",
+            sql.path().to_str().expect("utf8"),
+        ])
+        .parse_distrib_settings()
+        .expect("settings parse")
+        .expect("--distributed-query yields settings");
+        let debug = format!("{settings:?}");
+        let pretty = format!("{settings:#?}");
+        for key in [[0xab_u8; 32], [0xcd; 32], [0xef; 32]] {
+            for rendering in [&debug, &pretty] {
+                assert!(
+                    !rendering.contains(&hex::encode(key)),
+                    "no hex key bytes: {rendering}"
+                );
+                assert!(
+                    !rendering.contains(&format!("{key:?}"))
+                        && !rendering.contains(&format!("{key:#?}")),
+                    "no decimal key bytes: {rendering}"
+                );
+            }
+        }
+        assert!(
+            debug.contains("fragment_keys: 1") && debug.contains("sql_ticket_keys: Some(2)"),
+            "prints the key counts: {debug}"
+        );
     }
 
     /// The `--fragment-listener` flags shared by the collision tests: a full,

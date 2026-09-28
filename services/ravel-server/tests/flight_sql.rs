@@ -1197,7 +1197,8 @@ async fn distributed_flight_sql_reachable_end_to_end() {
     // own, so nothing is excluded from the roster. The coordinator's
     // self-exclusion has its own cases in `sql_distrib`.
     let self_id = Arc::new(std::sync::OnceLock::new());
-    let config = distributed_flight_config(live_workers, self_id, thresholds, "cluster-secret");
+    let config =
+        distributed_flight_config(live_workers, self_id, thresholds, Some("cluster-secret"));
     assert_eq!(
         config.workers.endpoints(),
         vec![format!("http://{worker_endpoint}")],
@@ -1470,7 +1471,7 @@ async fn distributed_flight_sql_fetches_from_flight_endpoint_under_fragment_list
     };
     let live = Arc::new(parking_lot::RwLock::new(Arc::new(vec![record])));
     let self_id = Arc::new(std::sync::OnceLock::new());
-    let config = distributed_flight_config(live, self_id, thresholds, secret);
+    let config = distributed_flight_config(live, self_id, thresholds, Some(secret));
     // The real roster surface must resolve the worker to its Flight SQL endpoint,
     // never the fragment listener. This is the crux of the #1296 fix.
     assert_eq!(
