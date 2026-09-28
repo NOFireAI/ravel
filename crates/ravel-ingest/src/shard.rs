@@ -1289,39 +1289,21 @@ impl ShardActor {
     /// proceeds; for that refusal the bound only guards a pathological clock
     /// stepping back on every reading.
     ///
-    /// A *lag* refusal (ADR-1685) re-anchors nothing: it changes neither the
-    /// floor nor the store's observation, so every pass reads the same lag and
-    /// refuses again, and the pass bound is what ends the enforced loop. That
-    /// would strand acknowledged buffered-mode rows on a teardown, so after the
-    /// bound a [`DrainIntent::Teardown`] keeps making passes with
-    /// [`LagCheck::BypassedAtTeardown`] while tenants remain, under the same
-    /// bound: the lag is counted (`clock_lag_bypassed_at_shutdown`) and logged,
-    /// and the flush publishes. Those rows may land in an ingest hour the fold
-    /// has sealed, recoverable by a HEAD rebuild, where the drop is not
-    /// recoverable at all.
-    ///
-    /// Floor rules are unchanged on a bypass pass, which is why it is a loop
-    /// and not a single pass. A lag refusal never consults the floor, so a
-    /// backwards step big enough to cross [`MAX_FLUSH_CLOCK_HOLD_NS`] stays
-    /// hidden behind the lag check until the first bypass pass reaches the
-    /// floor and refuses there. That refusal re-anchors the floor to the raw
-    /// reading, so the next bypass pass stamps it and publishes. A single
-    /// bypass pass would have reported those rows as residue and lost them.
-    /// [`DrainIntent::Retryable`] never bypasses: its actor keeps running, so a
-    /// later trigger retries once the host clock converges.
+    /// A *lag* refusal (ADR-1685) re-anchors nothing, so the bound is what ends
+    /// the enforced loop and a [`DrainIntent::Teardown`] then keeps making
+    /// passes with [`LagCheck::BypassedAtTeardown`] while tenants remain, under
+    /// the same bound, rather than strand acknowledged buffered-mode rows; see
+    /// [`MAX_FLUSH_ALL_PASSES`] for why those passes are a loop and what
+    /// teardown residue takes. [`DrainIntent::Retryable`] never bypasses: its
+    /// actor keeps running, so a later trigger retries once the host clock
+    /// converges.
     ///
     /// Residue left by the bounds is never dropped silently, but it is only a
     /// durability defect when nothing will retry it, so `intent` decides how it
     /// is reported: an ERROR and the `flush_all_residue_tenants` bump on a
     /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
     /// the residue is still in the tenant map with its arrival bookkeeping and
-    /// the actor is still running to flush it. On a teardown that residue now
-    /// needs every enforced pass refused, by the lag check or by the floor, and
-    /// every bypass pass refused by the floor. A lag refusal never consults the
-    /// floor, so what the bypass passes need is [`MAX_FLUSH_ALL_PASSES`]
-    /// consecutive backwards steps past the hold bound on their own readings,
-    /// the same count the floor alone needed for residue before the lag check
-    /// existed.
+    /// the actor is still running to flush it.
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
@@ -1464,7 +1446,7 @@ impl ShardActor {
                         shard = self.shard,
                         raw_ns,
                         lag_ns,
-                        "ravel-ingest: flush clock lags the object store's observed clock beyond the clock-skew allowance, but this is a teardown bypass pass; not refusing on the lag, so the flush proceeds to the monotonic floor check and publishes unless the floor refuses it, rather than dropping acknowledged buffered-mode rows. The commit record may land in an ingest hour the fold has sealed, so a token-less read needs a catalog HEAD rebuild to see it"
+                        "ravel-ingest: teardown bypass pass: publishing despite store-clock lag; the commit may land in a sealed hour"
                     );
                 }
             },
@@ -1655,14 +1637,10 @@ impl ShardActor {
                 // one tenant, absorb the next few against the re-anchored value,
                 // and refuse again.
                 //
-                // A LAG refusal (ADR-1685) re-anchors nothing: the floor was
-                // never consulted and the store's observation is unchanged, so
-                // every retry against the same clock refuses identically until
-                // the host clock converges. Inside a drain that means
-                // `MAX_FLUSH_ALL_PASSES` is what ends the enforced loop, and a
-                // teardown drain then makes bypass passes with
-                // `LagCheck::BypassedAtTeardown` so these rows publish rather
-                // than becoming residue.
+                // A LAG refusal (ADR-1685) re-anchors nothing, so every retry
+                // against the same clock refuses identically until the host
+                // clock converges. `MAX_FLUSH_ALL_PASSES` carries what that
+                // means inside a drain, including the teardown bypass passes.
                 //
                 // Re-buffer the rows
                 // so that next trigger flushes them (finding 1): `charges` ride

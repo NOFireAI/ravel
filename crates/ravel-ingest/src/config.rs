@@ -182,10 +182,10 @@ pub(crate) enum StoreClockLag {
 /// Whether the ADR-1685 store-clock lag check may refuse this flush attempt.
 ///
 /// A lag refusal is not self-clearing the way an over-bound regression is: it
-/// changes neither the monotonic floor nor the store's observation, so every
-/// pass of a drain reads the same lag and refuses again. On a teardown drain
-/// there is no later tick, so enforcing it on every pass would lose the
-/// buffered rows the drain exists to save.
+/// re-anchors nothing, so every pass of a drain reads the same lag and refuses
+/// again, and on a teardown drain there is no later tick to retry the buffered
+/// rows; see [`MAX_FLUSH_ALL_PASSES`] for what that costs and why the drain
+/// bypasses.
 ///
 /// The choice is per pass, not per drain: a teardown drain runs its bounded
 /// enforced passes first and only then bypasses, so the counters still show
@@ -201,10 +201,8 @@ pub(crate) enum LagCheck {
     /// and logged, but the flush proceeds: publishing acknowledged rows into a
     /// possibly sealed hour (recoverable by a HEAD rebuild) beats dropping them
     /// on a graceful path. The ADR-1307 floor rules are unchanged, so a
-    /// regression refusal still applies here, which is why the drain makes
-    /// bypass passes under the same bound rather than one: the enforced passes
-    /// never reached the floor, so the first bypass pass is where an over-bound
-    /// backwards step surfaces, and it re-anchors the floor for the next one.
+    /// regression refusal still applies here; see [`MAX_FLUSH_ALL_PASSES`] for
+    /// why that makes the bypass passes a bounded loop rather than one pass.
     BypassedAtTeardown,
 }
 
