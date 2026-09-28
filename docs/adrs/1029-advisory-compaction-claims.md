@@ -223,7 +223,8 @@ Both callers of `compact_bucket` participate:
   ownership gate;
 - `ravel-cli maintain compact-tenant`, which is exactly the actor the
   rendezvous hash cannot see. The bucket walk (sequential when written;
-  concurrent since #1028's stage 1, see the 2026-09-28 amendment) claims each
+  optionally concurrent since #1028's stage 1, see the 2026-09-28 amendment)
+  claims each
   bucket before merging it and reports skipped-because-claimed buckets
   in the walk summary, per the no-silent-defaults rule.
 
@@ -369,9 +370,11 @@ four statements they rest on no longer describe main, and are corrected here.
    this ADR. The claim path must not turn a divergent listing into a silent
    success: the run that is refused the claim reports the bucket as skipped,
    never as compacted.
-2. **The CLI bucket walk is concurrent.** `--bucket-concurrency` landed with
-   #1028's stage 1 (`services/ravel-cli/src/maintain.rs`), so decision 5
-   applies per bucket per concurrency slot, not to one sequential walk.
+2. **The CLI bucket walk can run buckets concurrently.** Since #1028's stage 1
+   `--bucket-concurrency` (default 1, `services/ravel-cli/src/maintain.rs`)
+   lets an operator run several buckets at once, so decision 5 applies per
+   bucket per concurrency slot. A test that never raises the flag covers only
+   the one-bucket-at-a-time walk.
 3. **Today's two-replica test runs no merge at all.** With a shared live set,
    `two_replicas_partition_units_without_double_pay`
    (`services/ravel-server/src/maintain.rs`) seeds one below-threshold bucket
