@@ -601,6 +601,7 @@ impl SpanSegmentFetcher {
             finished: false,
             read_gate: self.read_gate.clone(),
             lost: false,
+            lost_to: None,
         })
     }
 
@@ -829,6 +830,12 @@ pub struct SpanColumnarScan {
     /// already moved past that block, so every later call fails rather than
     /// hand out the next block of a partial segment.
     lost: bool,
+    /// The gate failure that lost the block, so a later call reports the same
+    /// class the losing call reported (a panicked decode stays a `Corrupt`,
+    /// not a redacted permanent store error). `None` when the block was
+    /// abandoned instead: a caller dropped the future while the job was queued
+    /// or running, and no classified failure exists to repeat.
+    lost_to: Option<CpuGateError>,
 }
 
 impl SpanColumnarScan {
@@ -888,12 +895,20 @@ impl SpanColumnarScan {
         // Cleared only once the job returns: a failed job, or this future
         // dropped while the job is queued or running, leaves the scan lost.
         self.lost = true;
-        let decoded = gate
+        let decoded = match gate
             .run(ReadSite::SpanBlock, size, move || {
                 decode_block_rows(&block_bytes, crc, &projection, &query)
             })
             .await
-            .map_err(|err| span_gate_failed(&self.key, err))?;
+        {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                // Keep the failure so a later call repeats its class rather
+                // than degrading to a permanent store error.
+                self.lost_to = Some(err);
+                return Err(span_gate_failed(&self.key, err));
+            }
+        };
         self.lost = false;
         self.record_block(decoded).map(Some)
     }
@@ -902,7 +917,10 @@ impl SpanColumnarScan {
     /// (after the accounting fold) once every candidate has been taken.
     fn next_candidate(&mut self) -> Result<Option<(Bytes, u32)>, SpanFetchError> {
         if self.lost {
-            return Err(span_scan_lost(&self.key));
+            return Err(match self.lost_to {
+                Some(err) => span_gate_failed(&self.key, err),
+                None => span_scan_lost(&self.key),
+            });
         }
         let Some(&(start, end, crc)) = self.candidates.get(self.cursor) else {
             self.finish();
@@ -1296,9 +1314,13 @@ fn span_gate_failed(key: &str, err: CpuGateError) -> SpanFetchError {
     }
 }
 
-/// A [`SpanColumnarScan`] read again after a gated block decode failed.
-/// Permanent: that block cannot be read through this scan, and moving on to
-/// the next one would return a partial segment.
+/// A [`SpanColumnarScan`] read again after a gated block decode was abandoned:
+/// the caller dropped the future while the job was queued or running, so no
+/// classified failure exists to repeat. Permanent: that block cannot be read
+/// through this scan, and moving on to the next one would return a partial
+/// segment. A block lost to a gate failure reports that failure's own class
+/// instead, so a panicked decode does not turn into a permanent store error the
+/// HTTP layer redacts.
 fn span_scan_lost(key: &str) -> SpanFetchError {
     SpanFetchError::Store {
         key: key.to_string(),
@@ -2197,13 +2219,14 @@ mod tests {
 
     /// A gated block decode that never ran leaves the scan lost: the call that
     /// submitted it fails transient, and every later call, gated or inline,
-    /// fails instead of handing out the next block of a partial segment. The
-    /// scan is opened on a live runtime and drained on one that has shut down,
-    /// whose blocking pool cancels each job the gate dispatches.
+    /// fails with that same class instead of handing out the next block of a
+    /// partial segment. The scan is opened on a live runtime and drained on one
+    /// that has shut down, whose blocking pool cancels each job the gate
+    /// dispatches.
     ///
     /// FLIP: drop the `lost` check from `next_candidate` and the second call
-    /// takes the next block, whose job is cancelled in turn, so the second
-    /// match panics with a transient `Store` error instead of the lost scan.
+    /// takes the next block and submits its own job, so the submitted-job
+    /// assertion reads `left: (2, 0), right: (1, 0)`.
     #[test]
     fn a_scan_fails_after_a_cancelled_block_decode_rather_than_skip_it() {
         use crate::read_gate_test_support::{floor_zero_gate, site_counts};
@@ -2246,25 +2269,28 @@ mod tests {
             other => panic!("expected the cancelled job's transient error, got {other:?}"),
         }
         assert_eq!(site_counts(&gate, ReadSite::SpanBlock), (1, 0));
+        // The lost scan keeps the class of the failure that lost it, so a
+        // later call repeats the transient error rather than reporting a
+        // permanent one the HTTP layer redacts to a 503.
         match futures::executor::block_on(scan.next_block_on_gate()) {
             Err(SpanFetchError::Store {
-                source: StoreError::Permanent(message),
+                source: StoreError::Transient(message),
                 ..
-            }) => assert!(message.contains("lost"), "{message}"),
-            other => panic!("expected the lost scan, got {other:?}"),
+            }) => assert!(message.contains("cancelled"), "{message}"),
+            other => panic!("expected the same transient class, got {other:?}"),
         }
-        assert!(matches!(
-            scan.next_block(),
-            Err(SpanFetchError::Store {
-                source: StoreError::Permanent(_),
-                ..
-            })
-        ));
         assert_eq!(
             site_counts(&gate, ReadSite::SpanBlock),
             (1, 0),
             "no later block was submitted"
         );
+        match scan.next_block() {
+            Err(SpanFetchError::Store {
+                source: StoreError::Transient(message),
+                ..
+            }) => assert!(message.contains("cancelled"), "{message}"),
+            other => panic!("the inline exit reports that class too, got {other:?}"),
+        }
     }
 
     /// A gated block decode that panicked surfaces as the span fetcher's decode

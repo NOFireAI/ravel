@@ -43,9 +43,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the gate (`promql_eval`); a smaller one runs inline and counts as inline. A job that panicked is the fetcher's decode
   error (`Corrupt`), a 500 on the HTTP API, and an evaluation that panicked
   is the new `QueryError::CpuGate`, also a 500; a job the runtime dropped at
-  shutdown is a transient store error and a 503. A span scan whose gated
-  block decode failed refuses every later block rather than skip one. With no
-  gate set every path runs inline exactly as before, and the server does not
+  shutdown is a transient store error and a 503. A log or span scan whose
+  gated block decode failed refuses every later block rather than skip one,
+  and every later call reports the same error class the failed call reported,
+  so a panicked decode stays a 500 instead of degrading to a 503. Sizing an
+  object's `log_block` jobs reads its PAGE_DIR a second time, after the scan
+  open's own decode of it; that read is charged to the query's accounting
+  like every other, so a gated fetch reports the decompressed bytes it
+  actually produced. With no gate set every path runs inline exactly as
+  before, and the server does not
   set one yet: wiring its read gate into the engine and fetchers it builds is
   a later step. Still inline with a gate set: RSEG page decodes, a
   `LogSegmentScan`'s `next_block` and `next_block_columnar` exits and a
