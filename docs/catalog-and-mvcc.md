@@ -378,9 +378,12 @@ and the CAS read/write helpers.
   what it would delete without calling `delete`.
 - Marker body byte layout and checksum coverage: see "Idempotency marker
   body layout" below.
-- `input_set_hash16`: first 16 hex chars of the blake3 digest over the
-  compaction record's sorted `inputs` list (canonical encoding, sorted by
-  `(writer_id, writer_epoch, writer_seq)`). `hash16` on an L1 segment is the
+- `input_set_hash16`: first 16 hex chars of the compaction record's
+  `input_set_hash`. For a version 1 record that is the blake3 digest over its
+  sorted `inputs` list (canonical encoding, sorted by
+  `(writer_id, writer_epoch, writer_seq)`); for a version 2 record it is the
+  superseding-record hash described under "Version 2 compaction record"
+  below. `hash16` on an L1 segment is the
   part object's own blake3, same convention as an L0 data key. `part` is
   zero-padded 4 digits.
 - Compaction records, rewrite records, and the retention tombstone live in
@@ -415,16 +418,32 @@ and the CAS read/write helpers.
   holding a live rewrite record -- so a retention pass blind to that shape
   retains erased-and-rewritten data past `R` with no path to deletion, and a
   sweep blind to it can never see the bucket empty.
-- Format-version gate on read (ADR-0066 decision 2). A compaction record and a
-  retention tombstone each carry a `format_version` (= 1), and every production
-  reader decodes them through `ravel_commit::record::decode_compaction` and
-  `decode_tombstone`, which validate that version against the supported set {1}
-  and return a typed `RecordError::UnsupportedRecordFormatVersion` naming the
-  record kind and the version seen. A record a future writer stamps at a version
-  this build does not know is refused, never read as version 1: supersession is
-  the load-bearing consumer, so a misread compaction record would let the sweeper
-  delete a live L0 input or the resolver skip one. The raw `prost` decode, which
-  skips this gate, is confined to test helpers.
+- Format-version gate on read (ADR-0066 decision 2). A compaction record
+  carries a `format_version` in {1, 2} and a retention tombstone one of 1, and
+  every production reader decodes them through
+  `ravel_commit::record::decode_compaction` and `decode_tombstone`, which
+  validate that version against the supported set and return a typed
+  `RecordError::UnsupportedRecordFormatVersion` naming the record kind and the
+  version seen. A record a future writer stamps at a version this build does
+  not know is refused, never read as a known version: supersession is the
+  load-bearing consumer, so a misread compaction record would let the sweeper
+  delete a live L0 input or the resolver skip one. The raw `prost` decode,
+  which skips this gate, is confined to test helpers.
+- Version 2 compaction record (ADR-0066, "force 2 for compaction parts, a
+  superseding compaction record" amendment). A `format_version = 2`
+  `CompactionRecord` re-encodes an existing compaction record: it copies that
+  record's `inputs` verbatim and names it in `superseded_record_key`, and it
+  supersedes the record it names. Its `input_set_hash` is
+  `ravel_commit::erasure::compute_superseding_compaction_input_set_hash` over
+  `(inputs, superseded_record_key)`, a domain distinct from the version 1 and
+  rewrite hashes, so its key keeps the `l1.<input_set_hash16>.cmt` shape and
+  differs from its predecessor's. Decoding refuses a version 2 record whose
+  `superseded_record_key` is empty, is not a compaction record key (a rewrite
+  record key included), names a different tenant, signal, shard or hour
+  bucket, or whose `input_set_hash` is not that hash, and refuses a version 1
+  record that sets the field. No writer produces a version 2 record yet, and
+  resolution does not yet honour its supersession; both are later steps of
+  the amendment's task list.
 - Selective-erasure request and completion records (ADR-0064 decision 1) live
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
@@ -1193,6 +1212,12 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      reached (a bounded, cycle-checked walk; an over-deep or cyclic chain is
      a typed error, never a hang). Every record a rewrite supersedes as a
      whole is added to `superseded_records`.
+   - A **version 2 compaction record** names, in `superseded_record_key`, the
+     compaction record it re-encodes and supersedes (ADR-0066 force 2
+     amendment). Decoding validates that key, but resolution does not yet
+     exclude the named record, and until it does no writer produces a
+     version 2 record (the amendment orders the selector change before the
+     writer).
    - Include each compaction record's parts and each rewrite record's output
      parts as segment refs, filtered by per-part event bounds, UNLESS that
      record's key is in `superseded_records`. A superseded record's parts are

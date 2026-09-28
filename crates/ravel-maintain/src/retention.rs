@@ -1025,7 +1025,7 @@ mod tests {
         let tenant = tenant();
         let signal = Signal::Metrics;
         let record = CompactionRecord {
-            format_version: 2,
+            format_version: 3,
             tenant_hash: tenant.0.to_vec(),
             signal: ravel_commit::signal::to_proto(signal) as i32,
             shard: 0,
@@ -1045,10 +1045,10 @@ mod tests {
 
         let err = get_compaction_record(&store, &key)
             .await
-            .expect_err("a version-2 compaction record must be refused, not read as v1");
+            .expect_err("a version-3 compaction record must be refused, not read as v1");
         match &err {
             MaintainError::Invariant(msg) => assert!(
-                msg.contains("format_version") && msg.contains("2"),
+                msg.contains("format_version") && msg.contains("3"),
                 "the failure names the version gate and the version seen: {msg}"
             ),
             other => panic!("expected Invariant from the version gate, got {other:?}"),

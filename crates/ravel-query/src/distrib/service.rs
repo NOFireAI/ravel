@@ -2002,6 +2002,7 @@ mod reconstruct_tests {
             input_set_hash: INPUT_SET_HASH.to_vec(),
             parts: vec![part(0, [0x11; 32]), part(2, PART_HASH)],
             created_unix_ns: 1_700_000_900_000_000_000,
+            superseded_record_key: String::new(),
         }
     }
 
