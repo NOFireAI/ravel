@@ -114,8 +114,11 @@ fn catalog_decode_len(
 /// `None` means the footer figure is the only reading available: the object
 /// carries no SERIES_IDX (it is not chunked), its bytes are not in `regions`,
 /// the section is stored compressed (this parse reads stored bytes, and the
-/// writer always stores it uncompressed), or the directory does not parse, in
-/// which case the decode that follows fails on the same bytes.
+/// writer always stores it uncompressed), its stored bytes fail the section
+/// crc32c, or the directory does not parse. In the last two cases the decode
+/// that follows fails on the same bytes. The crc is checked before the parse
+/// so a corrupt directory cannot set the charge and turn a corrupt-data error
+/// into a budget refusal.
 fn meta_chunks_inflated_len(
     footer: &Footer,
     regions: &FetchedRegions,
@@ -127,6 +130,9 @@ fn meta_chunks_inflated_len(
         .find(|s| s.kind == SECTION_SERIES_IDX)
         .filter(|s| s.comp == COMPRESSION_NONE)?;
     let bytes = regions.slice(idx.offset, idx.len)?;
+    if crc32c::crc32c(&bytes) != idx.crc32c {
+        return None;
+    }
     let index = ravel_segment::parse_series_idx(&bytes).ok()?;
     let mut total = 0u64;
     for series_index in 0..u64::from(index.series_count()) {
@@ -4424,6 +4430,81 @@ mod tests {
              {chunks_inflated} against {chunks_stored}"
         );
         drop(decoded);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A SERIES_IDX whose bytes fail their section crc32c does not set the
+    /// catalog charge: the reservation falls back to the footer figure and the
+    /// decode reports the corruption, rather than an inflated charge read from
+    /// the corrupt directory refusing the read as a retryable budget error.
+    ///
+    /// The flipped byte is the high byte of chunk 0's `frame_uncompressed_len`,
+    /// so the corrupt directory still parses and claims a frame at the section
+    /// ceiling, far over the 1 MiB budget that fits the honest charge.
+    ///
+    /// FLIP: drop the crc32c check in `meta_chunks_inflated_len` and the read
+    /// fails with `FetchMemoryExhausted { requested: 1073963752, .. }` instead.
+    #[tokio::test]
+    async fn corrupt_series_idx_is_corrupt_data_not_a_budget_refusal() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (clean, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let (footer, _total, _etag, _regions) = clean
+            .open_segment(tenant_hash, &seg_ref, &QueryAccounting::new())
+            .await
+            .expect("open the clean segment");
+        let idx = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == SECTION_SERIES_IDX)
+            .expect("the fixture is chunked");
+        assert_eq!(idx.comp, COMPRESSION_NONE);
+        let idx_start = usize::try_from(idx.offset).expect("offset fits");
+        let at = |pos: usize| idx_start + pos;
+        let sparse_count =
+            u32::from_le_bytes(bytes[at(12)..at(16)].try_into().expect("four bytes")) as usize;
+        // version, flags and reserved (4), stride, series_count and
+        // sparse_count (12), 36 bytes per sparse entry, chunk_stride and
+        // chunk_count (8), then chunk 0's frame_offset and frame_stored_len
+        // (16) before its frame_uncompressed_len.
+        let high_byte = at(16 + sparse_count * 36 + 8 + 16 + 7);
+        let mut corrupted = bytes.to_vec();
+        corrupted[high_byte] ^= 0x01;
+
+        let (fetcher, _metrics) =
+            metered_fetcher(&seg_ref.data_object_key, Bytes::from(corrupted)).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        assert!(SPARSE_INFLATED_CATALOG_LEN < budget.limit());
+        let fetcher = fetcher
+            .with_whole_object_threshold(0)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("the footer is intact");
+        let err = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &matchers,
+                &accounting,
+            )
+            .await
+            .err()
+            .expect("a corrupt SERIES_IDX fails the decode");
+        match err {
+            FetchError::Corrupt {
+                source: ravel_segment::SegmentError::SectionCrcMismatch,
+                ..
+            } => {}
+            other => panic!("expected FetchError::Corrupt(SectionCrcMismatch), got {other:?}"),
+        }
+        drop(regions);
         assert_eq!(budget.reserved(), 0);
     }
 
