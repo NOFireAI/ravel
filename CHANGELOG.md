@@ -36,6 +36,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--distributed-query` a `GetFlightInfo` and its `DoGet` that land on an
   old and a new process fail with `invalid_argument` until the rollout
   completes, and the query has to be run again.
+
 ### Fixed
 
 - **A query's fold-lag refusal threshold is now sized from the fold and the
@@ -58,6 +59,41 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   apart unnoticed.
 
 ### Added
+
+- **Catalog and PromQL decodes reserve their decoded output against the
+  process memory budget before they run** (ADR-1702 decision 6, issue #1702).
+  The catalog resolve reserves each snapshot part's, postings object's and
+  column-statistics object's header-declared uncompressed length, and the
+  reservation stays with the decoded value, in the decoded-part and postings
+  caches included, until it is dropped; the column-statistics reservation is
+  released when `load_column_stats` returns, since the loaded statistics do
+  not carry it. The PromQL fetcher reserves a segment's catalog sections
+  before `decode_selected` or `decode_sparse_catalog` decodes them, and the
+  `/api/v1/metadata` cache reserves a record's declared decompressed size. A
+  reservation that does not fit fails the read with a typed error
+  (`CatalogError::MemoryExhausted`, `LoadColumnStatsError::MemoryExhausted`,
+  `FetchMemoryExhausted`, `MetricsMetaError::MemoryExhausted`); a catalog
+  refusal never falls back to a listing pass, and a column-statistics refusal
+  reaches a SQL client as the same transient 503 a store fault does, never as
+  corrupt data. **The PromQL reservations are live in a running server now**:
+  the fetch path already receives the process budget, so a query whose catalog
+  decode does not fit is refused with 503 rather than decoding uncharged. The
+  catalog and the metadata cache take the budget through the new
+  `Catalog::with_memory_budget` and `MetadataCache::with_memory_budget`, and
+  both still default to an unlimited budget, so the part, postings,
+  column-statistics and metadata reservations refuse nothing until the server
+  wires the real budget into them. `read_metrics_meta_for_serve` now takes the
+  budget and returns the reservation alongside the entries.
+
+  A chunked (sparse) segment's catalog is charged what it inflates to, not
+  what it stores: SERIES_META_CHUNKS carries no section-level compression, so
+  its footer `uncompressed_len` is the stored zstd frames, and the reservation
+  instead sums the SERIES_IDX chunk directory's `frame_uncompressed_len`. Once
+  the matchers have run, the whole-catalog reservation is exchanged for one
+  sized to the entries that survived, so a selective query does not hold the
+  whole catalog's charge through its page fetches. A snapshot part's tenant
+  check now runs before its reservation, so a cross-tenant part is still
+  reported as an isolation breach under a budget too small to decode it.
 
 - **An end-to-end proof that a stalled fold pages before it refuses a query**
   (issue #1306, ADR-1306 follow-up task 3). ADR-1306 decision 2 states the

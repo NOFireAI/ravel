@@ -257,6 +257,17 @@ pub fn decode_postings(
 /// typed error, never a panic. `decode_postings` re-reads and fully
 /// validates the same header, so this never widens what is accepted.
 pub fn postings_declared_tenant_hash(bytes: &[u8]) -> Result<[u8; 16], SnapshotFormatError> {
+    let header = decode_postings_header(bytes)?;
+    <[u8; 16]>::try_from(header.tenant_hash.as_slice())
+        .map_err(|_| SnapshotFormatError::BadTenantHashLen(header.tenant_hash.len()))
+}
+
+/// Reads only a postings object's header, under the same trust assumption as
+/// [`postings_declared_tenant_hash`]: the caller has already verified `bytes`
+/// against the postings ref's blake3. The resolve path reads the declared
+/// `tenant_hash` and `body_uncompressed_len` from it before
+/// [`decode_postings`] runs, which re-reads and fully validates the header.
+pub fn decode_postings_header(bytes: &[u8]) -> Result<SnapshotPostingsHeader, SnapshotFormatError> {
     if bytes.len() < MIN_POSTINGS_ENVELOPE_LEN {
         return Err(SnapshotFormatError::PostingsTooSmall { size: bytes.len() });
     }
@@ -275,10 +286,8 @@ pub fn postings_declared_tenant_hash(bytes: &[u8]) -> Result<[u8; 16], SnapshotF
     }
     let header_len = take_u32_le(bytes, &mut pos)?;
     let header_bytes = take_bytes(bytes, &mut pos, to_usize(header_len)?)?;
-    let header = SnapshotPostingsHeader::decode(header_bytes)
-        .map_err(|e| SnapshotFormatError::PostingsHeaderDecode(e.to_string()))?;
-    <[u8; 16]>::try_from(header.tenant_hash.as_slice())
-        .map_err(|_| SnapshotFormatError::BadTenantHashLen(header.tenant_hash.len()))
+    SnapshotPostingsHeader::decode(header_bytes)
+        .map_err(|e| SnapshotFormatError::PostingsHeaderDecode(e.to_string()))
 }
 
 /// Sort/uniqueness/bound validation shared by `encode_postings` (defensive

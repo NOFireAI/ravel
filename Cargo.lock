@@ -4615,6 +4615,7 @@ dependencies = [
  "ravel-cache",
  "ravel-commit",
  "ravel-logseg",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-proto",
  "ravel-segment",
