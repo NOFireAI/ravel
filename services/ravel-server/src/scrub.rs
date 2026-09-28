@@ -3100,6 +3100,7 @@ mod tests {
             inputs: shared_inputs,
             parts: vec![loser_part.clone()],
             created_unix_ns,
+            superseded_record_key: String::new(),
         };
         let loser_record_key = keys::compaction_record_key_for(&loser).expect("loser record key");
         assert_ne!(
@@ -3369,6 +3370,7 @@ mod tests {
             inputs: live_inputs,
             parts: vec![live_part.clone()],
             created_unix_ns: live_created_unix_ns,
+            superseded_record_key: String::new(),
         };
         let live_record_key = keys::compaction_record_key_for(&live).expect("live record key");
         let live_part_key =
@@ -5223,6 +5225,7 @@ mod tests {
             inputs,
             parts: vec![late_part.clone()],
             created_unix_ns,
+            superseded_record_key: String::new(),
         };
         // The record key is ordered by the input set's hash, and the walk only
         // ever reaches a key that sorts after the marker. Either single-input

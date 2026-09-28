@@ -330,6 +330,7 @@ async fn row11_already_exists_different_hash_alarms() {
         input_set_hash: foreign.to_vec(),
         parts: vec![],
         created_unix_ns: 0,
+        superseded_record_key: String::new(),
     };
     store
         .put(

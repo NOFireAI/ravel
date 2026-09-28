@@ -9590,7 +9590,7 @@ mod tests {
         let signal = Signal::Metrics;
 
         let record = ravel_proto::commit::v1::CompactionRecord {
-            format_version: 2,
+            format_version: 3,
             tenant_hash: tenant.0.to_vec(),
             signal: signal::to_proto(signal).into(),
             shard: 0,
@@ -9611,7 +9611,7 @@ mod tests {
         let err = catalog
             .load_and_validate_compaction(&tenant, signal, 0, &key, &accounting)
             .await
-            .expect_err("a version-2 compaction record must be refused, not read as v1");
+            .expect_err("a version-3 compaction record must be refused, not read as v1");
         assert!(
             err.to_string().contains("compaction record"),
             "the error names the record kind: {err}"
@@ -9621,7 +9621,7 @@ mod tests {
                 ravel_commit::record::RecordError::UnsupportedRecordFormatVersion {
                     actual,
                     ..
-                } => assert_eq!(actual, 2, "the error carries the version seen"),
+                } => assert_eq!(actual, 3, "the error carries the version seen"),
                 other => panic!("expected UnsupportedRecordFormatVersion, got {other:?}"),
             },
             other => panic!("expected CompactionRecordDecode, got {other:?}"),

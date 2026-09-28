@@ -5486,7 +5486,7 @@ mod tests {
         let store = MemoryStore::new();
 
         let mut record = CompactionRecord {
-            format_version: 2,
+            format_version: 3,
             tenant_hash: tenant.0.to_vec(),
             signal: ravel_commit::signal::to_proto(signal).into(),
             shard,
@@ -5509,10 +5509,10 @@ mod tests {
         let clock = FixedClock::new(config.orphan_age_gate_ns() + 1);
         let err = sweep_superseded(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
             .await
-            .expect_err("a version-2 compaction record must fail the pass, not read as v1");
+            .expect_err("a version-3 compaction record must fail the pass, not read as v1");
         match &err {
             MaintainError::Invariant(msg) => assert!(
-                msg.contains("format_version") && msg.contains("2"),
+                msg.contains("format_version") && msg.contains("3"),
                 "the failure names the version gate and the version seen: {msg}"
             ),
             other => panic!("expected Invariant from the version gate, got {other:?}"),

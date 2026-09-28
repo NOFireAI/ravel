@@ -184,6 +184,7 @@ pub async fn publish_record_with_conservation(
         input_set_hash: input_set_hash.to_vec(),
         parts: parts.iter().map(|p| p.part.clone()).collect(),
         created_unix_ns: now,
+        superseded_record_key: String::new(),
     };
 
     let record_key = keys::compaction_record_key_for(&record)?;
