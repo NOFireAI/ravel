@@ -358,8 +358,22 @@ enum Command {
     /// metric's name and label names are rewritten exactly as OTLP rewrites
     /// them (the Prometheus character set, then the `[metrics] unit` suffix
     /// and `_total` for `kind = "counter"`), so a loaded metric lands on the
-    /// same series as the same metric sent over OTLP. A row that fails a kept
-    /// check is
+    /// same series as the same metric sent over OTLP. A loaded span is stored
+    /// as the same record the same span sent over OTLP produces: the same
+    /// attribute coercion, the same resource-over-span merge, the same status
+    /// mapping (anything outside `0..=2` is unset), an empty or null parent
+    /// cell is a root span, and an attribute value over the cap drops that
+    /// attribute and keeps the span. The complete list of what still differs
+    /// for the same input: a null `start_ts`, `end_ts` or `name` cell is
+    /// refused (OTLP has no null for any of them); a negative timestamp is
+    /// refused (OTLP's are unsigned); a non-empty parent id of the wrong width
+    /// is refused rather than dropped; a null attribute cell is an attribute
+    /// the row does not carry; and the attribute keys and the two
+    /// attribute-count caps (1024 span columns, 128 resource columns) are
+    /// checked against the `--mapping` before the load rather than per span,
+    /// so an empty, over-long, reserved or duplicated key refuses the load
+    /// where OTLP would drop or admit that one attribute. A row that fails a
+    /// kept check is
     /// rejected fail-fast: the run stops at the first bad row and exits
     /// nonzero. `--skip-rows` (issue #1713) drops that many leading rows by
     /// file-absolute position; a failed run prints the figures a resume would
@@ -385,9 +399,12 @@ enum Command {
         /// bypassed by construction) applies per signal. The `--mapping` file
         /// must carry exactly one signal section and it must match this flag;
         /// a mapping written before ADR-1751, whose logs keys sit at the top
-        /// level, is still read as the `[logs]` section. `spans` is refused
-        /// until ADR-1751 follow-up task 2 lands, and never falls back to
-        /// another signal. Defaults to `logs`.
+        /// level, is still read as the `[logs]` section. A `[spans]` mapping
+        /// names the span's ids, name, start and end timestamps with their
+        /// units, optional status code and message, and its resource and span
+        /// attribute columns; span events and span links are not mappable in
+        /// this version and a mapping naming them is refused. Defaults to
+        /// `logs`.
         #[arg(long, value_enum, default_value_t = ravel_cli::maintain::SignalArg::Logs)]
         signal: ravel_cli::maintain::SignalArg,
         /// Configured shard count. Validated against (or, for a fresh signal,
@@ -597,8 +614,9 @@ enum Command {
     /// several narrower windows.
     ///
     /// Only `--signal logs` works today. Metrics and spans are refused by
-    /// name: ADR-1751 sequences bulk import for each of them ahead of export
-    /// for that signal, and neither import path exists yet.
+    /// name: both bulk imports have landed, so what their exports wait on is
+    /// ADR-1751 follow-up task 3, which decides each signal's read path and
+    /// the column layout its `--mapping` describes.
     Export {
         /// Signal to export. Only `logs` is supported; `metrics` and `spans`
         /// are refused with the follow-up each one waits on. No default: a

@@ -629,12 +629,114 @@ historical backfill), `ravel-cli load` imports a Parquet file into the signal
 ravel-cli load --parquet events.parquet --tenant acme --mapping map.toml --shards 4
 ravel-cli load --signal metrics --parquet samples.parquet --tenant acme \
   --mapping metrics.toml --shards 4
+ravel-cli load --signal spans --parquet traces.parquet --tenant acme \
+  --mapping spans.toml --shards 4
 ```
 
 `--signal` defaults to `logs`, so an invocation written before the flag
 existed is unaffected. `--signal metrics` loads the metrics signal ([Loading
-metrics](#loading-metrics) below). `--signal spans` is refused by name until
-the spans loader lands, and never falls back to another signal.
+metrics](#loading-metrics) below).
+
+`--signal spans` provisions or validates the tenant's spans signal, builds a
+`SpanIngestRouter` from the same configuration, and writes every batch with
+strict acknowledgement. One input row is one span:
+
+```toml
+[spans]
+trace_id_column       = "trace_id"   # 16-byte binary or 32-character hex string
+span_id_column        = "span_id"    # 8-byte binary or 16-character hex string
+parent_span_id_column = "parent"     # optional; a null or empty cell is a root
+name_column           = "name"
+start_ts_column       = "start"
+start_ts_unit         = "nanos"      # seconds | millis | micros | nanos
+end_ts_column         = "end"
+end_ts_unit           = "nanos"
+status_code_column    = "status"     # optional; OTLP's 0 unset / 1 ok / 2 error
+status_message_column = "status_msg" # optional
+
+# Merged into the span's one attrs map. A key may not appear in both attribute
+# lists; such a mapping is refused, so this merge never resolves a collision.
+[[spans.resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+[[spans.attribute]]
+key = "http.method"
+column = "method"
+type = "str"                         # str | i64 | f64 | bool | bytes
+```
+
+**A span loaded here is stored as the same record the same span sent over OTLP
+produces.** Attribute values are coerced to the strings RSPAN's
+`Map<Utf8, Utf8>` holds by OTLP's own rules -- an integer and a boolean
+verbatim, a float through the same Go-compatible formatter the `le` label
+uses, bytes as lowercase hex -- the resource-over-span merge is
+`ravel_rspan::merge_attrs`, and the status column goes through `ravel-otlp`'s
+own enum mapping, so a value outside `0..=2` normalizes to unset here as it
+does there (including one too wide for `i64`). An empty parent cell is a root
+span, exactly as OTLP's own empty `parent_span_id` field is, so a file that
+writes roots as empty bytes or `""` loads unchanged. An attribute value longer
+than the 8192-byte cap drops that attribute and keeps the span, which is what
+the OTLP path does with it. An empty attribute value is a value and is stored,
+unlike an empty metric label.
+
+**What still differs from OTLP**, and this is the complete list: for the same
+input, nothing else about the stored record differs between a Parquet load and
+an OTLP export.
+
+- **A null `start_ts`, `end_ts` or `name` cell is refused.** OTLP has no null
+  for any of the three: a timestamp it omits is a zero (and a zero takes the
+  same fallbacks here, load time for the start and the start for the end), a
+  name it omits is the empty string. In a file the operator controls, a null
+  there is a mapping or export mistake, and giving it a load-time default
+  would hide the span rather than report it.
+- **A negative timestamp is refused.** OTLP's two timestamps are unsigned and
+  have no negative to express. A negative start beside a positive end would
+  store a span whose interval overlaps nearly every query window; the usual
+  cause is a declared `start_ts_unit`/`end_ts_unit` that does not match the
+  column, and the refusal names both.
+- **A non-empty `parent_span_id` of the wrong width is refused**, where OTLP
+  drops the field and admits the span as a root. An OTLP sender's malformed
+  field is one record of a live stream; a mapped column producing unusable ids
+  is a mapping mistake the whole file shares, and a silently re-rooted span
+  tree is not visible in the data.
+- **A null attribute cell is an attribute the row does not carry**, the same
+  as an OTLP span that omits the key. OTLP has no null attribute to compare
+  against.
+- **Attribute keys and the two attribute-count caps are checked against the
+  `--mapping`, not per span.** A key that is empty, longer than the 256-byte
+  OTLP cap, reserved for a span field this version does not map, or declared
+  in both attribute lists refuses the load before any row is built; OTLP drops
+  the over-long key's attribute and admits an empty one. So do a mapping with
+  more than 1024 `[[spans.attribute]]` columns (the loader per-record cap,
+  standing in for OTLP's 128 `max_attributes_per_span`) or more than 128
+  `[[spans.resource_attribute]]` columns (OTLP's own `max_resource_attributes`,
+  which rejects the spans under an over-cap resource). A key and a column count
+  are properties of the mapping, so a bad one is wrong for every row in the
+  file.
+
+Separately from the record itself, the past-event-time lag bound is relaxed on
+every load path, which is what admits a historical backfill at all; the
+future-skew bound is kept and anchored on the span's end, as OTLP anchors it.
+
+Span events and span links are not mappable in this version, and a mapping
+that names them is refused by name rather than as a typo. The same refusal
+covers the reserved `attrs` keys the OTLP path stores span kind, trace state,
+span flags, events and links under (`_kind`,
+`_trace_state`, `_flags`, `_events_raw`, `_links_raw`): a mapped column there
+could only fabricate a field this version does not map. An id column that
+cannot carry an id of the right width is refused when the batch's columns are
+resolved, before any row is built or written -- Ravel never pads or truncates
+an id.
+
+Like a metrics load, a spans load reads **one sequential cursor** and has no
+decode/encode queue, so `--read-cursors` and `--decode-queue-batches` change
+nothing and the loader warns when either was set to a value it ignores. A
+value of 0 for either is still rejected. Everything that shapes the objects
+(`--shards`, `--batch-rows`, `--target-bytes`, `--max-inflight-flushes`,
+`--max-flush-delay`, `--pipeline-depth`) applies unchanged, and spans bucket
+by load time exactly as logs and metrics do.
 
 The loader is an in-process caller of the same log ingest router OTLP uses --
 the same shard actors, flush cadence, and commit protocol, not a parallel write
@@ -1059,13 +1161,11 @@ ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
 ```
 
 **Logs only.** `--signal` has no default, and today it accepts only `logs`.
-`--signal metrics` and `--signal spans` are refused by name: bulk export for a
-signal is sequenced behind bulk import for that signal, and an exported file
-that no command can load back is not an export. `load --signal metrics` has
-landed ([Loading metrics](#loading-metrics)); metrics export is the next piece
-of the sequence, and spans have neither half yet. The spans refusal names
-the missing import. The metrics refusal still names bulk import for metrics as
-the missing piece, which is out of date until metrics export lands.
+`--signal metrics` and `--signal spans` are refused by name. Both bulk imports
+have landed (`load --signal metrics` and `load --signal spans` above), so what
+each export now waits on is the export work itself: that signal's read path
+and the column layout its `--mapping` describes. Each refusal message says so
+and names the decision record that sequences it.
 
 ### What the window means
 
