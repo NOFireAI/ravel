@@ -680,7 +680,10 @@ writes roots as empty bytes or `""` loads unchanged. An attribute value longer
 than the 8192-byte cap drops that attribute and keeps the span, which is what
 the OTLP path does with it; the load summary prints how many values were
 dropped that way (`attrs_dropped`), which is where the OTLP path's
-`AttributeValueTooLong` partial-success entry goes on a load. A null attribute
+`AttributeValueTooLong` partial-success entry goes on a load. The count is
+taken where each span is built, so a FAILED load's `attrs_dropped` also covers
+the batches the failure abandoned, whose spans are in no object; the line
+printed there says so rather than claiming stored spans. A null attribute
 cell is an attribute the row does not carry, as an OTLP `KeyValue` carrying no
 value is dropped as `MissingAttributeValue`. An empty attribute value is a
 value and is stored, unlike an empty metric label.
@@ -720,6 +723,21 @@ an OTLP export.
 Separately from the record itself, the past-event-time lag bound is relaxed on
 every load path, which is what admits a historical backfill at all; the
 future-skew bound is kept and anchored on the span's end, as OTLP anchors it.
+
+**The mapping reads one flat row per span**, so a trace export shaped any
+other way is converted before it is loaded. Four shapes need it, and none of
+them is a mapping this version can express: a file that nests a trace's spans
+in one row (a list or struct column per trace) has to be flattened to one row
+per span; attributes held in a `Map` or `Struct` column have to be pivoted to
+one scalar column per attribute key, since `[[spans.attribute]]` names a
+column and a value type; a duration column has to be turned into an absolute
+`end_ts` in a unit `end_ts_unit` names; and a status written as a string
+(`"OK"`, `"ERROR"`) has to become OTLP's 0/1/2 integer, since
+`status_code_column` reads that enum and nothing else. Pointing a mapping at
+an unconverted column of any of these shapes fails the load rather than
+importing part of the file: a column whose type cannot supply the field is
+refused with both the field and the type it found, and a duration read as an
+`end_ts` is refused for ending before its span starts.
 
 Span events and span links are not mappable in this version, and a mapping
 that names them is refused by name rather than as a typo. The same refusal
@@ -1166,8 +1184,9 @@ ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
 have landed (`load --signal metrics` and `load --signal spans` above), so what
 each export now waits on is the export work itself. The output columns are not
 part of what it decides: the decision record already settles them, and the same
-`--mapping` TOML names them. Each refusal message says so and names the
-decision record that sequences it.
+`--mapping` TOML names them. Each refusal names the follow-up task the export
+work is, says that bulk import for that signal has landed and gives the `load`
+invocation that does it, and repeats that only `--signal logs` is supported.
 
 ### What the window means
 

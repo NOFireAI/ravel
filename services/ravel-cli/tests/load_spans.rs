@@ -833,12 +833,14 @@ async fn an_id_column_of_the_wrong_width_is_refused() {
 /// Hex-string id columns written by a DEFAULT `ArrowWriter` load, including
 /// the empty-string root parent and a parent repeated across rows.
 ///
-/// The writer dictionary-encodes a string column until its dictionary passes
-/// about 1 MiB, so a hex `trace_id`/`span_id`/`parent_span_id` column in any
-/// ordinary trace export arrives at the loader as `Dictionary(Int32, Utf8)`,
-/// not as `Utf8`. The `reader_schema_for_path` assertion below is what makes
-/// this test about that: without it the whole case would pass on a plain
-/// `Utf8` file and assert nothing about the dictionary path.
+/// A hex `trace_id`/`span_id`/`parent_span_id` column loads in either form.
+/// The loader retypes one to `Dictionary(Int32, Utf8)` only when every chunk
+/// of it is dictionary encoded on every data page, which is what a low-
+/// cardinality id column written by a default `ArrowWriter` looks like; a
+/// column whose dictionary outgrew the writer's page limit stays plain `Utf8`.
+/// This case is the dictionary form, and the `reader_schema_for_path`
+/// assertion below is what makes it so: without it the whole case would pass
+/// on a plain `Utf8` file and assert nothing about the dictionary path.
 #[tokio::test]
 async fn dictionary_encoded_hex_id_columns_load() {
     let load_ns = now_ns();

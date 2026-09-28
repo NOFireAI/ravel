@@ -14189,6 +14189,115 @@ type = "str"
             );
         }
 
+        /// One dictionary-encoded `Utf8` column over `vals`, the shape a
+        /// Parquet trace export's name, id and string attribute columns reach
+        /// the loader as.
+        fn dict_str_col(vals: Vec<&str>) -> ArrayRef {
+            let arr: DictionaryArray<Int32Type> = vals.into_iter().map(Some).collect();
+            Arc::new(arr)
+        }
+
+        /// Each mapped dictionary column is resolved ONCE per batch, and the
+        /// row loop resolves no dictionary key of its own.
+        ///
+        /// `normalized_keys` builds a key vector the size of the whole batch on
+        /// every call, so a per-cell resolution costs O(rows^2) per dictionary
+        /// column. Counting both resolutions pins the shape rather than a
+        /// duration: one per dictionary column, none per cell, whatever the row
+        /// count is.
+        #[test]
+        fn dictionary_columns_are_resolved_once_per_batch() {
+            const ROWS: usize = 256;
+            let limits = SpanIngestLimits::default();
+            let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+            let trace_hex = hex::encode([1u8; 16]);
+            let span_hex = hex::encode([2u8; 8]);
+            // Four dictionary columns (both ids, the name, the one mapped
+            // attribute) beside two plain integer columns.
+            let batch = batch(vec![
+                ("trace_id", dict_str_col(vec![trace_hex.as_str(); ROWS])),
+                ("span_id", dict_str_col(vec![span_hex.as_str(); ROWS])),
+                ("name", dict_str_col(vec!["op"; ROWS])),
+                ("start_ns", i64_col(vec![NOW_NS; ROWS])),
+                ("end_ns", i64_col(vec![NOW_NS; ROWS])),
+                ("method", dict_str_col(vec!["GET"; ROWS])),
+            ]);
+
+            let counters = dict_counters();
+            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            assert_eq!(
+                counters.columns(),
+                4,
+                "each of the four dictionary columns is resolved exactly once"
+            );
+            assert!(
+                !matches!(
+                    cols.col(&batch, cols.name).data_type(),
+                    DataType::Dictionary(_, _)
+                ),
+                "the row readers index a resolved column, not the dictionary: {:?}",
+                cols.col(&batch, cols.name).data_type()
+            );
+
+            for row in 0..ROWS {
+                let span = build_span(&batch, &cols, &mapping, &limits, NOW_NS, row, &mut 0)
+                    .expect("every row builds");
+                assert_eq!(span.name, "op", "the resolved column reads the same values");
+                assert_eq!(span.trace_id, [1u8; 16]);
+                assert_eq!(span.span_id, [2u8; 8]);
+                assert_eq!(
+                    span.attrs,
+                    vec![("http.method".to_string(), "GET".to_string())]
+                );
+            }
+            assert_eq!(
+                counters.cell_keys(),
+                0,
+                "no row reader resolves a dictionary key of its own, over {ROWS} rows"
+            );
+            assert_eq!(
+                counters.columns(),
+                4,
+                "the row loop resolves no further columns"
+            );
+        }
+
+        /// A dictionary chunk whose dictionary is empty is answered rather than
+        /// aborting inside arrow's `normalized_keys`, which asserts the values
+        /// array is non-empty: an all-null chunk resolves to an all-null column
+        /// of the value type (#708's shape, which a Parquet writer emits), and
+        /// a key that names a value in an empty dictionary is corrupt input and
+        /// a typed error.
+        #[test]
+        fn an_empty_dictionary_chunk_is_a_typed_error_not_a_panic() {
+            let keys = Int32Array::from(vec![None, None]);
+            let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+            let arr: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(keys, values));
+
+            let resolved = resolve_dictionary_column(&arr)
+                .expect("an all-null chunk is answered, not refused")
+                .expect("a dictionary column resolves");
+            assert_eq!(
+                resolved.data_type(),
+                &DataType::Utf8,
+                "the column resolves to its value type"
+            );
+            assert_eq!(resolved.len(), arr.len());
+            for row in 0..resolved.len() {
+                assert_eq!(
+                    read_string(&resolved, row).expect("no error"),
+                    None,
+                    "every row of an empty-dictionary column is null"
+                );
+            }
+
+            // The per-cell path reaches the same guard. Arrow asserts on the
+            // empty values array whatever the key's nullness is, so this is
+            // where the abort was.
+            let err = dictionary_key(&arr, 0).expect_err("an empty dictionary names no value");
+            assert_eq!(err, EMPTY_DICTIONARY);
+        }
+
         /// A span that ends before it starts is rejected rather than stored
         /// with an interval no query window can mean anything against.
         #[test]
@@ -14515,6 +14624,95 @@ type = "str"
             let span = span.expect("exactly at the cap is admitted");
             assert_eq!(span.attrs, vec![("http.method".to_string(), at_cap)]);
             assert_eq!(dropped, 0, "nothing was dropped");
+        }
+
+        /// On a FAILED load the `attrs_dropped` line says what the count
+        /// covers, because the count is taken where each span is BUILT: two
+        /// values were dropped from a batch whose write never landed, so no
+        /// stored span is missing them and the success path's wording would be
+        /// false. The success path keeps that wording.
+        #[tokio::test]
+        async fn a_failed_spans_load_says_attrs_dropped_covers_abandoned_batches() {
+            use ravel_object_store::fault::{FaultPlan, FaultStore, Op, ScriptedFault, Sequence};
+            use ravel_object_store::memory::MemoryStore;
+
+            let limits = SpanIngestLimits::default();
+            let big = "x".repeat(limits.max_attribute_value_len + 1);
+            // Two rows in one batch, each carrying one over-cap attribute
+            // value: two drops counted before any write is attempted.
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16], vec![1u8; 16]])),
+                ("span_id", bin_col(vec![vec![2u8; 8], vec![3u8; 8]])),
+                ("name", str_col(vec!["op", "op"])),
+                ("start_ns", i64_col(vec![NOW_NS, NOW_NS])),
+                ("end_ns", i64_col(vec![NOW_NS, NOW_NS])),
+                ("method", str_col(vec![big.as_str(), big.as_str()])),
+            ]);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("spans.parquet");
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+                .expect("arrow writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+
+            // Fail every span data-object PUT, so the one batch that was
+            // decoded is the one the failure abandons and nothing lands.
+            let fault = ScriptedFault::Transient("injected PUT failure".into());
+            let mut seq = Sequence::new(Op::Put).with_key_contains("/s/l0/");
+            for _ in 0..8 {
+                seq = seq.then_fault(fault.clone());
+            }
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(
+                MemoryStore::new(),
+                FaultPlan::empty().with_sequence(seq),
+            ));
+
+            let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+            let mut report = SpansLoadReport::default();
+            let err = load_spans_into(
+                &mut report,
+                store,
+                &pq,
+                "acme",
+                &mapping,
+                1,
+                10_000,
+                0,
+                1,
+                1,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(SystemClock),
+            )
+            .await
+            .expect_err("the scripted PUT fault fails the load");
+
+            assert!(
+                matches!(err, LoadError::Flush { .. }),
+                "expected a flush failure, got: {err}"
+            );
+            assert_eq!(
+                report.attributes_dropped, 2,
+                "both drops are counted, though neither span landed"
+            );
+            assert_eq!(
+                report.rows_processed, 0,
+                "no row acked durable, so the count covers spans in no object"
+            );
+            assert_eq!(
+                spans_attrs_dropped_line(&report, AttrsDroppedScope::Failed),
+                "  attrs_dropped    : 2 (attribute values over the OTLP value-length cap; counted \
+                 where each span was built, so this includes batches the failure abandoned, whose \
+                 spans are in no object)"
+            );
+            assert_eq!(
+                spans_attrs_dropped_line(&report, AttrsDroppedScope::Complete),
+                "  attrs_dropped    : 2 (attribute values over the OTLP value-length cap; each \
+                 span was stored without them)",
+                "a load that completed still says the spans were stored without them"
+            );
         }
 
         /// The cap applies to the STORED string, so a bytes attribute is

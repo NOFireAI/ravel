@@ -296,16 +296,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The `export` help text and the ingest guide's bulk-export section say
   the same.
 
-- **A spans load reports the attribute values it dropped for being over the
-  cap** (ADR-1751 follow-up task 2 review, issues #1751 and #1712). An
-  over-cap value drops that attribute and keeps the span, which is the OTLP
-  path's own rule, but the OTLP path reports the drop as
-  `AttributeValueTooLong` in its partial-success message and a load said
-  nothing at all, so the stored record was an approximation with no way to
-  tell. `SpansLoadReport::attributes_dropped` counts them and the load summary
-  prints the count as `attrs_dropped`, on the success path and beside the
-  durable-token banner when the load fails. The count is taken where the row
-  is built, so it covers the batches a later failure abandoned.
+- **A Parquet load resolves each dictionary-encoded column once per batch
+  instead of once per cell** (issues #1751 and #1712). The per-row readers
+  resolved a dictionary cell through `DictionaryArray::normalized_keys`, which
+  builds a key vector the size of the whole batch on every call, so every
+  dictionary column cost time quadratic in the batch's row count. Each column
+  index now resolves its mapped dictionary columns to their value type once,
+  when the batch's columns are resolved, and the row readers index the result.
+  This covers the spans load (whose row path is its only path, and whose name,
+  id and string attribute columns arrive dictionary encoded from an ordinary
+  trace export), the metrics load's name and label columns, and the logs row
+  path. The columnar logs path is unchanged: it keys its own fast path on the
+  dictionary itself. Every value, admission decision and rejection message is
+  the same as before. A dictionary chunk whose dictionary is empty under a
+  non-null key is now a typed error rather than an abort inside Arrow's own
+  assertion; an all-null chunk with an empty dictionary still resolves to an
+  all-null column.
 
 ### Added
 
@@ -340,10 +346,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   OTLP's own empty `parent_span_id` field is; a status outside `0..=2` is
   unset, including one too wide for `i64`; an attribute value over the
   8192-byte cap drops that attribute and keeps the span, as
-  `convert_attrs_lossy` does on the OTLP path, with the number of values
-  dropped that way printed in the load summary as `attrs_dropped`; and a null
-  attribute cell is an attribute the row does not carry, as an OTLP `KeyValue`
-  carrying no value is dropped as `MissingAttributeValue`.
+  `convert_attrs_lossy` does on the OTLP path; and a null attribute cell is an
+  attribute the row does not carry, as an OTLP `KeyValue` carrying no value is
+  dropped as `MissingAttributeValue`.
+
+  A dropped attribute value is reported, because the stored span is then an
+  approximation of the source row and nothing else in the output says so; the
+  OTLP path reports the same drop as `AttributeValueTooLong` in its
+  partial-success message, and a load has no partial-success channel.
+  `SpansLoadReport::attributes_dropped` counts them and the load summary prints
+  the count as `attrs_dropped`, on the success path and beside the
+  durable-token banner when the load fails. Zero prints too. The count is taken
+  where each span is built rather than where its batch acks, so on a failed
+  load it also covers batches the failure abandoned, whose spans are in no
+  object; the line printed there says that, rather than claiming stored spans.
 
   Four differences remain, and this is the complete list of what the stored
   record can differ on for the same input. A null `start_ts`, `end_ts` or
