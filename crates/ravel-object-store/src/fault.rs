@@ -93,6 +93,7 @@ pub enum FaultKind {
     CorruptRange,
     CorruptBody,
     EtagChange,
+    FailedPrecondition,
     Transient,
     Permanent,
 }
@@ -147,6 +148,16 @@ pub enum ScriptedFault {
     /// the only way to drive that guard deterministically, since a real
     /// re-`put` cannot be interleaved inside a single in-memory fetch.
     EtagChange,
+    /// `get_pinned` only: the backend refuses the precondition, as it would if
+    /// the object had been replaced since the pin was recorded. The wrapped
+    /// backend is not called, so no bytes are paid for.
+    ///
+    /// Deliberately absent from [`applicable_kinds`] for every op, so random
+    /// mode never emits it: it is only meaningful on the pinned read path, and
+    /// a random-mode `FaultStore` wrapping a store whose `get_pinned` is never
+    /// called would otherwise spend its budget on a fault nothing observes.
+    /// Script it with a [`Rule`] or a [`Sequence`] on [`Op::Get`].
+    FailedPrecondition,
     Transient(String),
     Permanent(String),
 }
@@ -163,6 +174,7 @@ impl ScriptedFault {
             ScriptedFault::CorruptRange => FaultKind::CorruptRange,
             ScriptedFault::CorruptBody => FaultKind::CorruptBody,
             ScriptedFault::EtagChange => FaultKind::EtagChange,
+            ScriptedFault::FailedPrecondition => FaultKind::FailedPrecondition,
             ScriptedFault::Transient(_) => FaultKind::Transient,
             ScriptedFault::Permanent(_) => FaultKind::Permanent,
         }
@@ -573,6 +585,7 @@ fn default_fault(kind: FaultKind) -> ScriptedFault {
         FaultKind::CorruptRange => ScriptedFault::CorruptRange,
         FaultKind::CorruptBody => ScriptedFault::CorruptBody,
         FaultKind::EtagChange => ScriptedFault::EtagChange,
+        FaultKind::FailedPrecondition => ScriptedFault::FailedPrecondition,
         FaultKind::Transient => ScriptedFault::Transient("fault: random transient".into()),
         FaultKind::Permanent => ScriptedFault::Permanent("fault: random permanent".into()),
     }
@@ -868,9 +881,11 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
                 let flipped: Vec<u8> = data.iter().map(|b| b ^ 0xFF).collect();
                 self.inner.put(key, Bytes::from(flipped), opts).await
             }
-            Some(ScriptedFault::CorruptRange | ScriptedFault::EtagChange) => {
-                Err(not_applicable("put"))
-            }
+            Some(
+                ScriptedFault::CorruptRange
+                | ScriptedFault::EtagChange
+                | ScriptedFault::FailedPrecondition,
+            ) => Err(not_applicable("put")),
         }
     }
 
@@ -903,8 +918,128 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
             Some(
                 ScriptedFault::PartialWriteThenError
                 | ScriptedFault::FailedConditionalWrite
-                | ScriptedFault::CorruptBody,
+                | ScriptedFault::CorruptBody
+                | ScriptedFault::FailedPrecondition,
             ) => Err(not_applicable("get")),
+        }
+    }
+
+    /// Same fault plan as [`Self::get`], on the same [`Op::Get`] counters: a
+    /// pinned read is a GET, and a test that scripts "the second GET of this
+    /// key times out" must see that whichever read path the caller took.
+    ///
+    /// [`ScriptedFault::FailedPrecondition`] is the one kind that applies here
+    /// and not to `get`; `CorruptRange` and `EtagChange` still call the wrapped
+    /// `get_pinned`, so a store that refuses the pin refuses before either can
+    /// corrupt anything.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        self.gate_hold(Op::Get, key).await;
+        match self.resolve(Op::Get, key) {
+            None => self.inner.get_pinned(key, range, pin).await,
+            Some(ScriptedFault::FailedPrecondition) => Err(StoreError::PreconditionFailed),
+            Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
+            Some(ScriptedFault::CorruptRange) => {
+                let mut read = self.inner.get_pinned(key, range, pin).await?;
+                let flipped: Vec<u8> = read.outcome.data.iter().map(|b| b ^ 0xFF).collect();
+                read.outcome.data = Bytes::from(flipped);
+                Ok(read)
+            }
+            Some(ScriptedFault::EtagChange) => {
+                let mut read = self.inner.get_pinned(key, range, pin).await?;
+                read.outcome.etag = crate::Etag("fault: etag changed between reads".into());
+                Ok(read)
+            }
+            Some(ScriptedFault::DuplicateDelivery) => {
+                self.inner.get_pinned(key, range, pin).await?;
+                Err(duplicate_delivery_error())
+            }
+            Some(ScriptedFault::Timeout) => Err(StoreError::Timeout),
+            Some(ScriptedFault::Throttled { retry_after_ms }) => {
+                Err(StoreError::Throttled { retry_after_ms })
+            }
+            Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
+            Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
+            Some(
+                ScriptedFault::PartialWriteThenError
+                | ScriptedFault::FailedConditionalWrite
+                | ScriptedFault::CorruptBody,
+            ) => Err(not_applicable("get_pinned")),
+        }
+    }
+
+    /// The same [`Op::Get`] plan as [`Self::get`], so a scripted GET fault
+    /// fires on this path too, with the wrapped store's pin passed through
+    /// untouched.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        self.gate_hold(Op::Get, key).await;
+        match self.resolve(Op::Get, key) {
+            None => self.inner.get_with_pin(key, range).await,
+            Some(ScriptedFault::CorruptRange) => {
+                let mut read = self.inner.get_with_pin(key, range).await?;
+                let flipped: Vec<u8> = read.outcome.data.iter().map(|b| b ^ 0xFF).collect();
+                read.outcome.data = Bytes::from(flipped);
+                Ok(read)
+            }
+            Some(ScriptedFault::EtagChange) => {
+                let mut read = self.inner.get_with_pin(key, range).await?;
+                read.outcome.etag = crate::Etag("fault: etag changed between reads".into());
+                Ok(read)
+            }
+            Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
+            Some(ScriptedFault::DuplicateDelivery) => {
+                self.inner.get_with_pin(key, range).await?;
+                Err(duplicate_delivery_error())
+            }
+            Some(ScriptedFault::Timeout) => Err(StoreError::Timeout),
+            Some(ScriptedFault::Throttled { retry_after_ms }) => {
+                Err(StoreError::Throttled { retry_after_ms })
+            }
+            Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
+            Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
+            Some(
+                ScriptedFault::PartialWriteThenError
+                | ScriptedFault::FailedConditionalWrite
+                | ScriptedFault::CorruptBody
+                | ScriptedFault::FailedPrecondition,
+            ) => Err(not_applicable("get_with_pin")),
+        }
+    }
+
+    /// One HEAD, on the same [`Op::Head`] plan as [`Self::head`], forwarding
+    /// the wrapped store's pin so a decorated versioned store still reports its
+    /// selector.
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        self.gate_hold(Op::Head, key).await;
+        match self.resolve(Op::Head, key) {
+            None => self.inner.pin_of(key).await,
+            Some(ScriptedFault::NotFoundBlip) => Err(StoreError::NotFound),
+            Some(ScriptedFault::DuplicateDelivery) => {
+                self.inner.pin_of(key).await?;
+                Err(duplicate_delivery_error())
+            }
+            Some(ScriptedFault::Timeout) => Err(StoreError::Timeout),
+            Some(ScriptedFault::Throttled { retry_after_ms }) => {
+                Err(StoreError::Throttled { retry_after_ms })
+            }
+            Some(ScriptedFault::Transient(msg)) => Err(StoreError::Transient(msg)),
+            Some(ScriptedFault::Permanent(msg)) => Err(StoreError::Permanent(msg)),
+            Some(
+                ScriptedFault::PartialWriteThenError
+                | ScriptedFault::FailedConditionalWrite
+                | ScriptedFault::CorruptBody
+                | ScriptedFault::CorruptRange
+                | ScriptedFault::EtagChange
+                | ScriptedFault::FailedPrecondition,
+            ) => Err(not_applicable("pin_of")),
         }
     }
 
@@ -950,7 +1085,8 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
                 | ScriptedFault::FailedConditionalWrite
                 | ScriptedFault::CorruptRange
                 | ScriptedFault::CorruptBody
-                | ScriptedFault::EtagChange,
+                | ScriptedFault::EtagChange
+                | ScriptedFault::FailedPrecondition,
             ) => Err(not_applicable("head")),
         }
     }
@@ -1658,5 +1794,83 @@ mod tests {
         assert!(gate.release(ids[0]));
         held.await.expect("join").expect("second get after release");
         assert_eq!(gate.held_count(), 0);
+    }
+
+    /// With no rule armed, `get_pinned` reaches the wrapped store with the pin
+    /// intact: the wrapped `MemoryStore` serves the matching pin and refuses
+    /// the stale one, and the decorator counts no fault for either.
+    #[tokio::test]
+    async fn get_pinned_passes_through_an_empty_plan_with_the_pin_intact() {
+        let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        store
+            .put("k", Bytes::from_static(b"v1"), PutOptions::default())
+            .await
+            .expect("put");
+        let stale = crate::Pin::etag(store.head("k").await.expect("head").etag.0);
+
+        let got = store
+            .get_pinned("k", GetRange::Full, &stale)
+            .await
+            .expect("the matching pin is served");
+        assert_eq!(&got.outcome.data[..], b"v1");
+
+        store
+            .put("k", Bytes::from_static(b"v2"), PutOptions::default())
+            .await
+            .expect("overwrite");
+        let err = store
+            .get_pinned("k", GetRange::Full, &stale)
+            .await
+            .expect_err("the stale pin is refused by the wrapped store");
+        assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+        assert_eq!(
+            store.counters_snapshot().len(),
+            0,
+            "an empty plan injects nothing, so neither read is a counted fault"
+        );
+    }
+
+    /// The scripted precondition failure fires on `get_pinned`, is counted
+    /// under `Op::Get`, and applies exactly once, so the retry after it reaches
+    /// the wrapped store.
+    #[tokio::test]
+    async fn scripted_failed_precondition_fires_once_on_get_pinned_and_is_counted() {
+        let plan =
+            FaultPlan::empty().with_rule(Rule::new(Op::Get, ScriptedFault::FailedPrecondition));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        store
+            .put("k", Bytes::from_static(b"v1"), PutOptions::default())
+            .await
+            .expect("put");
+        let pin = crate::Pin::etag(store.head("k").await.expect("head").etag.0);
+
+        let err = store
+            .get_pinned("k", GetRange::Full, &pin)
+            .await
+            .expect_err("the scripted fault must surface");
+        assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::FailedPrecondition),
+            1,
+            "the fault must be counted, not just returned"
+        );
+    }
+
+    /// `FailedPrecondition` is scriptable but never randomly generated: it is
+    /// meaningless on any op but a pinned read, and random mode would spend its
+    /// budget on a fault nothing observes.
+    #[test]
+    fn failed_precondition_is_never_a_randomly_generated_kind() {
+        for op in [Op::Put, Op::Get, Op::Head, Op::List, Op::Delete] {
+            assert!(
+                !applicable_kinds(op).contains(&FaultKind::FailedPrecondition),
+                "{op:?} would emit FailedPrecondition in random mode"
+            );
+        }
+        assert_eq!(
+            ScriptedFault::FailedPrecondition.kind(),
+            FaultKind::FailedPrecondition,
+            "it must still be scriptable and countable"
+        );
     }
 }

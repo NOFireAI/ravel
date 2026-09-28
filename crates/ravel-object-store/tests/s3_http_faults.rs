@@ -198,6 +198,13 @@ struct Seen {
     /// The request carried an `x-amz-*` header missing from its SigV4
     /// `SignedHeaders`, and was refused 403 for it.
     unsigned_amz_header: bool,
+    /// The `If-Match` request header's value, which is the precondition half of
+    /// a [`Pin`] on the wire (ADR-2040 decision 1).
+    if_match: Option<String>,
+    /// The `versionId` query parameter, which is the selector half of a `Pin`
+    /// on the wire. Ravel's own reads never send it; an external pinned read
+    /// does when the grant recorded a version.
+    version_id: Option<String>,
 }
 
 impl Seen {
@@ -241,7 +248,14 @@ impl FakeState {
     }
 
     /// Log one request as the server saw it, stamped with the time it arrived.
-    fn record(&self, op: Op, key: &str, fault: Option<Fault>, headers: &HeaderMap) {
+    fn record(
+        &self,
+        op: Op,
+        key: &str,
+        fault: Option<Fault>,
+        headers: &HeaderMap,
+        query: &HashMap<String, String>,
+    ) {
         self.log.lock().push(Seen {
             op,
             key: key.to_string(),
@@ -254,6 +268,11 @@ impl FakeState {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
             unsigned_amz_header: has_unsigned_amz_header(headers),
+            if_match: headers
+                .get(header::IF_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            version_id: query.get("versionId").cloned(),
         });
     }
 }
@@ -621,7 +640,7 @@ async fn handle(
         .unwrap_or_default();
 
     let fault = state.take_fault(op);
-    state.record(op, &key, fault, &headers);
+    state.record(op, &key, fault, &headers, &query);
     if has_unsigned_amz_header(&headers) {
         return error_response(
             StatusCode::FORBIDDEN,
@@ -738,6 +757,18 @@ fn serve(
                 );
             };
             let etag = etag_of(&object);
+            // `If-Match` is evaluated by the endpoint, before any body is sent,
+            // so a pin the adapter attached to the wrong request or to none at
+            // all is visible here and not only in the request log.
+            if let Some(expected) = headers.get(header::IF_MATCH)
+                && expected.as_bytes() != etag.as_bytes()
+            {
+                return error_response(
+                    StatusCode::PRECONDITION_FAILED,
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold",
+                );
+            }
             let Some((body, content_range)) = apply_range(&object, headers) else {
                 return error_response(
                     StatusCode::RANGE_NOT_SATISFIABLE,
@@ -1908,6 +1939,103 @@ async fn whole_object_read_is_split_into_requests_the_timeout_can_carry() {
         1,
         "a whole-object read split across responses is one unverified read"
     );
+    // Unpinned: the continuation requests pin by ETag alone. A `versionId` would
+    // need `s3:GetObjectVersion` on Ravel's own versioned bucket, which the
+    // shipped IAM templates do not grant.
+    for seen in &gets {
+        assert_eq!(
+            seen.version_id, None,
+            "an unpinned whole-object read must send no versionId, saw {seen:?}"
+        );
+    }
+    assert_eq!(
+        gets[0].if_match, None,
+        "the first request of an unpinned read has no ETag to pin to yet, saw {gets:?}"
+    );
+    let etag = etag_of(&object);
+    for seen in &gets[1..] {
+        assert_eq!(
+            seen.if_match.as_deref(),
+            Some(etag.as_str()),
+            "every continuation request pins the first response's ETag, saw {seen:?}"
+        );
+    }
+}
+
+/// Pinning and checksum verification are two independent conditions on one
+/// request, not two read paths. So the `get_pinned` form of the split read
+/// above must put the caller's pin on *every* request it issues, the unranged
+/// first one included: that request pays for a body, and a read whose first
+/// request carried no `If-Match` would transfer bytes from whatever version the
+/// key holds now and could only compare afterwards. The endpoint here evaluates
+/// `If-Match` itself, so a dropped or wrong pin is a 412 on the wire, and the
+/// request log pins which requests carried it.
+///
+/// Mutation that fails it: passing `None` instead of `pin` for the first
+/// request in `S3Store::get_whole_object` (`self.get_one(key, None, None,
+/// Some(self.max_get_chunk))`) leaves `gets[0].if_match` at `None`, which the
+/// first assertion below rejects.
+#[tokio::test]
+async fn a_caller_pinned_whole_object_read_pins_every_request_including_the_first() {
+    let fake = FakeS3::start().await;
+    let http = small_chunk_http();
+    let bound = http.max_request_body_bytes();
+    let store = fake.store_with_http(http);
+
+    // Three requests: the truncated unranged first plus two ranged ones, so the
+    // assertion covers a continuation set with more than one member.
+    let size = 2 * bound + 77;
+    let object = patterned(size);
+    fake.seed("fault/pinned-read", &object);
+
+    let (_, pin) = store
+        .pin_of("fault/pinned-read")
+        .await
+        .expect("the pin of a seeded object");
+    let etag = etag_of(&object);
+    assert_eq!(
+        pin.etag, etag,
+        "the pin must carry the endpoint's own ETag verbatim"
+    );
+
+    let read = store
+        .get_pinned("fault/pinned-read", GetRange::Full, &pin)
+        .await
+        .expect("a matching pin serves the whole object");
+    assert_eq!(
+        &read.outcome.data[..],
+        &object[..],
+        "a pinned whole-object read returns every byte, in order"
+    );
+
+    let gets = fake.requests(Op::Get);
+    assert_eq!(
+        gets.len(),
+        size.div_ceil(bound),
+        "the pinned read is split the same way an unpinned one is, saw {gets:?}"
+    );
+    assert_eq!(
+        gets[0].range, None,
+        "the first request stays unranged, so the endpoint can return its stored \
+         checksum, saw {gets:?}"
+    );
+    for seen in &gets {
+        assert_eq!(
+            seen.if_match.as_deref(),
+            Some(etag.as_str()),
+            "every request of a caller-pinned read carries the pin as If-Match, \
+             saw {seen:?}"
+        );
+    }
+    // The pin carries no version (the fake returns no `x-amz-version-id`), so
+    // nothing selects one; `Pin::from_store` drops a version equal to the ETag.
+    assert_eq!(pin.version, None);
+    for seen in &gets {
+        assert_eq!(
+            seen.version_id, None,
+            "a pin with no version selects none, saw {seen:?}"
+        );
+    }
 }
 
 /// The cost of the fix is bounded to objects that need it: an object at or
