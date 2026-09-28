@@ -381,17 +381,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `delete-marker-replication`, `object-lock`, `object-retention`); `Unknown`
   covers no API, access denied, and an unparseable response, and is never
   `Fail`. A condition is `Pass` only when a response proves it: lifecycle and
-  replication conditions count only enabled rules whose filter covers every key
-  under `t/` (a tag- or object-size-narrowed rule never does, and an
-  unrecognised filter or a day count that does not parse is `Unknown`), and a
-  404 is "not configured" only when its `<Error><Code>` is that call's own code
-  (`NoSuchLifecycleConfiguration`, `ReplicationConfigurationNotFoundError`,
+  replication conditions are proven only by enabled rules whose filter covers
+  every key under `t/` (a tag- or object-size-narrowed rule never does, and an
+  unrecognised filter or status, or a day count that does not parse, is
+  `Unknown`), while any enabled rule that reaches only part of `t/`, or `sys/`,
+  can still fail them: a `NoncurrentDays` shorter than the expected value fails
+  both `noncurrent-expiration` and `no-foreign-rule`, and
+  `DeleteMarkerReplication` `Disabled` on a rule over part of `t/` fails
+  `delete-marker-replication`. A 404 is "not configured" only when its
+  `<Error><Code>` is that call's own code (`NoSuchLifecycleConfiguration`,
+  `ReplicationConfigurationNotFoundError`,
   `ObjectLockConfigurationNotFoundError`, or `NoSuchObjectLockConfiguration`
-  for retention); any other 404, redirect, or body over 1 MiB is `Unknown`.
-  `object-retention` samples the newest current and noncurrent version under
-  each protected prefix and requires compliance mode with a `RetainUntilDate`
-  still in the future. `MemoryStore` and every backend reached only through the
-  `ObjectStoreBackend` contract report every condition `Unknown`; `S3Store` also
+  for retention); any other 404, redirect, body over 1 MiB (with or without a
+  `Content-Length`), or `ObjectLockConfiguration` without an
+  `ObjectLockEnabled` element is `Unknown`. `object-retention` samples the
+  newest (by `LastModified`) current and noncurrent version under each
+  protected prefix and requires compliance mode with a `RetainUntilDate` still
+  in the future; the `?versions` listing is followed for at most 10 pages, and
+  a listing still truncated at that cap yields `Unknown` whatever the samples
+  show, since the newest object may be unlisted. `MemoryStore` and every
+  backend reached only through the `ObjectStoreBackend` contract report every
+  condition `Unknown`; `S3Store` also
   gains `ObjectLockProbeSource`/`BucketConfigProbeSource` impls derived from the
   same report. Two new direct dependencies for the crate: `ring` (SigV4
   HMAC-SHA256 and SHA-256) and `quick-xml` 0.41 (reading the S3 XML responses),

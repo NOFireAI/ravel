@@ -97,6 +97,70 @@ fn sigv4_known_answer_fails_with_one_byte_flipped() {
     );
 }
 
+// AWS's published examples for a GET with a query string, from the same page
+// and credentials: GET Bucket Lifecycle (`GET /?lifecycle`) and GET Bucket, or
+// List Objects (`GET /?max-keys=2&prefix=J`). Each signs host,
+// x-amz-content-sha256, and x-amz-date only.
+const KAT_LIFECYCLE_SIGNATURE: &str =
+    "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543";
+const KAT_LIST_OBJECTS_SIGNATURE: &str =
+    "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7";
+
+/// The two query-string examples as (query pairs, published signature).
+fn kat_query_examples() -> [(Vec<(String, String)>, &'static str); 2] {
+    [
+        (
+            vec![("lifecycle".to_string(), String::new())],
+            KAT_LIFECYCLE_SIGNATURE,
+        ),
+        (
+            vec![
+                ("prefix".to_string(), "J".to_string()),
+                ("max-keys".to_string(), "2".to_string()),
+            ],
+            KAT_LIST_OBJECTS_SIGNATURE,
+        ),
+    ]
+}
+
+/// The module's signer reproduces AWS's published signatures for a GET whose
+/// canonical query string is non-empty (an empty-valued subresource, and two
+/// parameters given out of order).
+#[test]
+fn sigv4_known_answer_with_a_query_string_matches_aws() {
+    for (pairs, published) in kat_query_examples() {
+        let headers = vec![
+            SignedHeader {
+                name: "x-amz-date".to_string(),
+                value: KAT_AMZ_DATE.to_string(),
+            },
+            SignedHeader {
+                name: "host".to_string(),
+                value: "examplebucket.s3.amazonaws.com".to_string(),
+            },
+            SignedHeader {
+                name: "x-amz-content-sha256".to_string(),
+                value: EMPTY_SHA256_HEX.to_string(),
+            },
+        ];
+        let (request, signed_headers) = canonical_request(
+            "GET",
+            "/",
+            &canonical_query(&pairs),
+            &headers,
+            EMPTY_SHA256_HEX,
+        );
+        assert_eq!(signed_headers, "host;x-amz-content-sha256;x-amz-date");
+        let scope = format!("{KAT_DATE_STAMP}/{KAT_REGION}/{SERVICE}/aws4_request");
+        let sts = string_to_sign(KAT_AMZ_DATE, &scope, &request);
+        let sig = signature(KAT_SECRET_KEY, KAT_DATE_STAMP, KAT_REGION, SERVICE, &sts);
+        assert_eq!(
+            sig, published,
+            "{pairs:?}: canonical request was {request:?}"
+        );
+    }
+}
+
 #[test]
 fn amz_time_formats_the_kat_instant() {
     let (amz, stamp) = format_amz_time(KAT_UNIX_SECS);
@@ -367,7 +431,7 @@ fn parses_replication_rules() {
 #[test]
 fn parses_object_lock_enabled() {
     let body = br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"#;
-    assert!(parse_object_lock(body).expect("parse").enabled);
+    assert_eq!(parse_object_lock(body).expect("parse").enabled, Some(true));
 }
 
 #[test]
@@ -756,6 +820,145 @@ fn absent_lifecycle_fails_sanctioned_rules_and_passes_no_foreign() {
     assert!(v.no_foreign.is_pass());
 }
 
+/// S3 applies the shortest of overlapping expirations, so a rule on part of t/
+/// or on sys/ with a NoncurrentDays below E_v deletes old versions early even
+/// beside a covering rule that carries E_v exactly: both conditions fail. A
+/// longer count on the same rule deletes nothing early.
+#[test]
+fn shorter_noncurrent_days_on_a_partial_or_sys_rule_fails() {
+    let covering = rule(
+        "ravel",
+        "<Filter/>",
+        &format!("{}{MARKER}{ABORT_7}", noncurrent("30")),
+    );
+    for filter in [
+        "<Filter><Prefix>t/x/</Prefix></Filter>",
+        "<Filter><Prefix>sys/</Prefix></Filter>",
+        "<Filter><Tag><Key>tier</Key><Value>hot</Value></Tag></Filter>",
+        "<Filter><And><Prefix>t/</Prefix><ObjectSizeGreaterThan>0</ObjectSizeGreaterThan></And></Filter>",
+    ] {
+        let early = rule("early", filter, &noncurrent("1"));
+        for rules in [format!("{covering}{early}"), format!("{early}{covering}")] {
+            let v = evaluate(&rules);
+            for (name, state) in [("noncurrent", &v.noncurrent), ("no-foreign", &v.no_foreign)] {
+                assert!(state.is_fail(), "{filter} {name}: {state:?}");
+                assert!(
+                    state.detail().contains("after 1 days, sooner than 30"),
+                    "{filter} {name}: {state:?}"
+                );
+            }
+        }
+        let late = evaluate(&format!(
+            "{covering}{}",
+            rule("late", filter, &noncurrent("60"))
+        ));
+        assert!(late.noncurrent.is_pass(), "{filter}: {:?}", late.noncurrent);
+        assert!(late.no_foreign.is_pass(), "{filter}: {:?}", late.no_foreign);
+    }
+
+    // Scoped entirely away from t/ and sys/: not Ravel's concern.
+    let v = evaluate(&format!(
+        "{covering}{}",
+        rule(
+            "logs",
+            "<Filter><Prefix>logs/</Prefix></Filter>",
+            &noncurrent("1")
+        )
+    ));
+    assert!(v.noncurrent.is_pass() && v.no_foreign.is_pass(), "{v:?}");
+}
+
+/// With no E_v given (the server path), the day count every covering rule
+/// agrees on is the reference an early expiry is measured against.
+#[test]
+fn shorter_noncurrent_days_fail_against_the_covering_value_without_e_v() {
+    let body = format!(
+        "<LifecycleConfiguration>{}{}</LifecycleConfiguration>",
+        rule("ravel", "<Filter/>", &noncurrent("30")),
+        rule(
+            "early",
+            "<Filter><Prefix>t/x/</Prefix></Filter>",
+            &noncurrent("1")
+        ),
+    );
+    let config = parse_lifecycle(body.as_bytes()).expect("parse");
+    let v = lifecycle_conditions(&FetchOutcome::Present(config), None);
+    assert!(v.noncurrent.is_fail(), "{:?}", v.noncurrent);
+    assert!(v.no_foreign.is_fail(), "{:?}", v.no_foreign);
+}
+
+/// An early expiry on a rule whose scope or status cannot be classified, or
+/// whose day count does not parse, is Unknown on both conditions, never Pass.
+#[test]
+fn unclassifiable_early_noncurrent_rule_is_unknown() {
+    let covering = rule(
+        "ravel",
+        "<Filter/>",
+        &format!("{}{MARKER}{ABORT_7}", noncurrent("30")),
+    );
+    for extra in [
+        rule("odd", "<Filter><Frobnicate/></Filter>", &noncurrent("1")),
+        format!(
+            "<Rule><ID>paused</ID><Status>Paused</Status><Filter><Prefix>t/x/</Prefix></Filter>{}</Rule>",
+            noncurrent("1")
+        ),
+        rule(
+            "garbled",
+            "<Filter><Prefix>t/x/</Prefix></Filter>",
+            &noncurrent("soon"),
+        ),
+    ] {
+        let v = evaluate(&format!("{covering}{extra}"));
+        assert!(v.noncurrent.is_unknown(), "{extra}: {:?}", v.noncurrent);
+        assert!(v.no_foreign.is_unknown(), "{extra}: {:?}", v.no_foreign);
+    }
+}
+
+/// A rule Status that is neither Enabled nor Disabled might apply or might not,
+/// so it can make a condition Unknown and never Pass.
+#[test]
+fn unrecognised_rule_status_is_unknown_never_pass() {
+    let body = format!(
+        "<LifecycleConfiguration><Rule><Status>Paused</Status><Filter/>{}{MARKER}{ABORT_7}</Rule>\
+         </LifecycleConfiguration>",
+        noncurrent("30")
+    );
+    let config = parse_lifecycle(body.as_bytes()).expect("parse");
+    let v = lifecycle_conditions(&FetchOutcome::Present(config), Some(30));
+    for (name, state) in [
+        ("noncurrent", &v.noncurrent),
+        ("marker", &v.expired_marker),
+        ("abort", &v.abort),
+        ("rule-scope", &v.rule_scope),
+    ] {
+        assert!(state.is_unknown(), "{name}: {state:?}");
+    }
+    let state = dmr_state(&replication_rule("Paused", "<Filter/>", "Enabled"));
+    assert!(state.is_unknown(), "{state:?}");
+}
+
+/// A tag- or size-narrowed rule still applies to some keys under the prefix it
+/// names, so one on a Ravel prefix is a foreign rule; one narrowed elsewhere is
+/// not.
+#[test]
+fn narrowed_rules_on_a_ravel_prefix_are_foreign() {
+    let expire = "<Expiration><Days>1</Days></Expiration>";
+    for filter in [
+        "<Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter>",
+        "<Filter><ObjectSizeLessThan>1024</ObjectSizeLessThan></Filter>",
+        "<Filter><And><Prefix>sys/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></And></Filter>",
+    ] {
+        let v = evaluate(&rule("narrow", filter, expire));
+        assert!(v.no_foreign.is_fail(), "{filter}: {:?}", v.no_foreign);
+    }
+    let v = evaluate(&rule(
+        "narrow-logs",
+        "<Filter><And><Prefix>logs/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></And></Filter>",
+        expire,
+    ));
+    assert!(v.no_foreign.is_pass(), "{:?}", v.no_foreign);
+}
+
 // --- Replication evaluation ---
 
 fn dmr_state(rules: &str) -> ConditionState {
@@ -818,6 +1021,135 @@ fn conflicting_covering_replication_rules_fail() {
     assert!(dmr_state(&format!("{enabled}{odd}")).is_unknown());
 }
 
+/// An enabled rule on part of t/ can outrank the covering rule for the keys it
+/// matches, so one that does not replicate delete markers fails the condition
+/// beside a covering rule that does.
+#[test]
+fn partial_replication_rule_without_delete_markers_fails() {
+    let covering = replication_rule("Enabled", "<Filter/>", "Enabled");
+    for filter in [
+        "<Filter><Prefix>t/x/</Prefix></Filter>",
+        "<Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter>",
+        "<Filter><And><Prefix>t/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></And></Filter>",
+    ] {
+        let partial = replication_rule("Enabled", filter, "Disabled");
+        for rules in [
+            format!("{covering}{partial}"),
+            format!("{partial}{covering}"),
+        ] {
+            let state = dmr_state(&rules);
+            assert!(state.is_fail(), "{filter}: {state:?}");
+            assert!(state.detail().contains("part of t/"), "{filter}: {state:?}");
+        }
+        let replicating = replication_rule("Enabled", filter, "Enabled");
+        let state = dmr_state(&format!("{covering}{replicating}"));
+        assert!(state.is_pass(), "{filter}: {state:?}");
+        let unstated = replication_rule("Enabled", filter, "Sometimes");
+        let state = dmr_state(&format!("{covering}{unstated}"));
+        assert!(state.is_unknown(), "{filter}: {state:?}");
+    }
+    // A rule on sys/ only, or a disabled one, touches no key under t/.
+    for other in [
+        replication_rule(
+            "Enabled",
+            "<Filter><Prefix>sys/</Prefix></Filter>",
+            "Disabled",
+        ),
+        replication_rule(
+            "Disabled",
+            "<Filter><Prefix>t/x/</Prefix></Filter>",
+            "Disabled",
+        ),
+    ] {
+        let state = dmr_state(&format!("{covering}{other}"));
+        assert!(state.is_pass(), "{other}: {state:?}");
+    }
+}
+
+/// Only an explicit `Enabled` proves delete markers replicate: an unrecognised
+/// or missing DeleteMarkerReplication status on the covering rule is Unknown.
+#[test]
+fn missing_or_unrecognised_delete_marker_status_is_unknown() {
+    let state = dmr_state(&replication_rule("Enabled", "<Filter/>", "Sometimes"));
+    assert!(state.is_unknown(), "{state:?}");
+    let state = dmr_state(
+        "<Rule><Status>Enabled</Status><Filter/><Destination><Bucket>b</Bucket></Destination></Rule>",
+    );
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(
+        state
+            .detail()
+            .contains("no DeleteMarkerReplication element"),
+        "{state:?}"
+    );
+}
+
+// --- Versioning and Object Lock evaluation ---
+
+fn assembled(
+    versioning: FetchOutcome<VersioningConfig>,
+    object_lock: FetchOutcome<ObjectLockConfig>,
+) -> BucketProtectionReport {
+    let unknown = || "not under test".to_string();
+    assemble_report(
+        &versioning,
+        &FetchOutcome::Unknown(unknown()),
+        &FetchOutcome::Unknown(unknown()),
+        &object_lock,
+        &RetentionSample::NotSampled,
+        &full_params(),
+    )
+    .0
+}
+
+/// Only `Enabled` passes versioning: a suspended or never-enabled bucket
+/// fails.
+#[test]
+fn versioning_passes_only_when_enabled() {
+    let state_for = |status: Option<&str>| {
+        assembled(
+            FetchOutcome::Present(VersioningConfig {
+                status: status.map(str::to_string),
+            }),
+            FetchOutcome::Unknown("not under test".to_string()),
+        )
+        .state(ProtectionConditionId::Versioning)
+        .expect("present")
+        .clone()
+    };
+    assert!(state_for(Some("Enabled")).is_pass());
+    assert!(state_for(Some("Suspended")).is_fail());
+    assert!(state_for(None).is_fail());
+}
+
+/// `ObjectLockEnabled` `Enabled` passes and any other value fails; a document
+/// without the element states nothing, so it is Unknown.
+#[test]
+fn object_lock_reads_the_enabled_element_three_ways() {
+    let state_for = |body: &str| {
+        assembled(
+            FetchOutcome::Unknown("not under test".to_string()),
+            FetchOutcome::Present(parse_object_lock(body.as_bytes()).expect("parse")),
+        )
+        .state(ProtectionConditionId::ObjectLock)
+        .expect("present")
+        .clone()
+    };
+    let enabled = state_for(
+        "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+    );
+    assert!(enabled.is_pass(), "{enabled:?}");
+    let other = state_for(
+        "<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled></ObjectLockConfiguration>",
+    );
+    assert!(other.is_fail(), "{other:?}");
+    let silent = state_for(
+        "<ObjectLockConfiguration><Rule><DefaultRetention><Mode>COMPLIANCE</Mode></DefaultRetention>\
+         </Rule></ObjectLockConfiguration>",
+    );
+    assert!(silent.is_unknown(), "{silent:?}");
+}
+
 // --- Retention verdicts ---
 
 fn retention(mode: &str, until: &str) -> FetchOutcome<RetentionConfig> {
@@ -846,9 +1178,14 @@ fn lapsed_retention_does_not_protect() {
         retention_verdict(&retention("COMPLIANCE", "soon"), now, false),
         SampleVerdict::Unknown(_)
     ));
-    // Drawn from a listing cut off at the page cap, a lapsed lock is not proof.
+    // Drawn from a listing cut off at the page cap, neither a lapsed lock nor
+    // a held one is proof about the family's newest object.
     assert!(matches!(
         retention_verdict(&retention("COMPLIANCE", "2012-01-01T00:00:00Z"), now, true),
+        SampleVerdict::Unknown(_)
+    ));
+    assert!(matches!(
+        retention_verdict(&retention("COMPLIANCE", "2030-01-01T00:00:00Z"), now, true),
         SampleVerdict::Unknown(_)
     ));
 }
@@ -1035,6 +1372,39 @@ fn local_verifier_reproduces_the_aws_example() {
         local_signature(KAT_SECRET_KEY, KAT_DATE_STAMP, KAT_REGION, &sts),
         KAT_PUBLISHED_SIGNATURE
     );
+}
+
+/// The verifier accepts AWS's published query-string examples as they arrive
+/// on the wire, so its query canonicalization is pinned too, not only its
+/// signing.
+#[test]
+fn local_verifier_accepts_the_aws_query_string_examples() {
+    for (pairs, published) in kat_query_examples() {
+        let mut query_parts: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        query_parts.sort();
+        let request = SeenRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: query_parts.join("&"),
+            headers: vec![
+                (
+                    "host".to_string(),
+                    "examplebucket.s3.amazonaws.com".to_string(),
+                ),
+                ("x-amz-content-sha256".to_string(), local_sha256_hex(b"")),
+                ("x-amz-date".to_string(), KAT_AMZ_DATE.to_string()),
+                (
+                    "authorization".to_string(),
+                    format!(
+                        "AWS4-HMAC-SHA256 Credential={KAT_ACCESS_KEY}/{KAT_DATE_STAMP}/{KAT_REGION}/s3/\
+                         aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date,\
+                         Signature={published}"
+                    ),
+                ),
+            ],
+        };
+        verify_authorization(&request, &UNSIGNED_TOKEN);
+    }
 }
 
 /// What a request must have been signed with, from the test's own values.
@@ -1249,26 +1619,90 @@ async fn access_denied_is_unknown_not_fail() {
 }
 
 /// An S3 `SignatureDoesNotMatch` body echoes the canonical request and the
-/// string to sign; no part of it but the error code may reach a detail.
+/// string to sign, session token included; the error code reaches every
+/// detail and no other part of the body does.
 #[tokio::test]
 async fn error_details_carry_only_the_error_code() {
+    const TOKEN: &str = "FwoGZXIvYXdzEXAMPLE/echoed+session+token==";
     let respond: Responder = Arc::new(|_sub, _path, _query| {
         (
             StatusCode::FORBIDDEN,
-            "<Error><Code>SignatureDoesNotMatch</Code><AWSAccessKeyId>AKIAIOSFODNN7EXAMPLE</AWSAccessKeyId>\
-             <CanonicalRequest>x-amz-security-token:SECRET-TOKEN</CanonicalRequest></Error>"
-                .to_string(),
+            format!(
+                "<Error><Code>SignatureDoesNotMatch</Code><AWSAccessKeyId>{KAT_ACCESS_KEY}</AWSAccessKeyId>\
+                 <CanonicalRequest>x-amz-security-token:{TOKEN}</CanonicalRequest></Error>"
+            ),
         )
     });
-    let (base, _seen) = spawn_fake(respond).await;
-    let report = test_client(&base).report(&full_params()).await;
+    let (base, seen) = spawn_fake(respond).await;
+    let report = test_client_with(&base, Some(TOKEN), true)
+        .report(&full_params())
+        .await;
+    assert_eq!(report.conditions.len(), ProtectionConditionId::ALL.len());
     for entry in &report.conditions {
         let detail = entry.state.detail();
         assert!(
-            !detail.contains("SECRET-TOKEN") && !detail.contains(KAT_ACCESS_KEY),
+            entry.state.is_unknown(),
+            "{}: {:?}",
+            entry.id.id(),
+            entry.state
+        );
+        assert!(
+            detail.contains("SignatureDoesNotMatch"),
             "{}: {detail}",
             entry.id.id()
         );
+        assert!(
+            !detail.contains(TOKEN) && !detail.contains(KAT_ACCESS_KEY),
+            "{}: {detail}",
+            entry.id.id()
+        );
+    }
+    for req in seen.lock().iter() {
+        verify_authorization(req, &ExpectedSigning { token: Some(TOKEN) });
+    }
+}
+
+/// The replication and Object Lock calls' own not-configured codes are proof
+/// of absence, so both conditions fail naming the code; each call honours
+/// only its own code, so the two swapped prove nothing.
+#[tokio::test]
+async fn replication_and_object_lock_not_configured_codes_fail() {
+    const REPLICATION: &str = "ReplicationConfigurationNotFoundError";
+    const OBJECT_LOCK: &str = "ObjectLockConfigurationNotFoundError";
+    for (replication_code, object_lock_code, expect_fail) in [
+        (REPLICATION, OBJECT_LOCK, true),
+        (OBJECT_LOCK, REPLICATION, false),
+    ] {
+        let respond: Responder = Arc::new(move |sub, _path, _query| {
+            let not_found = |code: &str| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("<Error><Code>{code}</Code></Error>"),
+                )
+            };
+            match sub {
+                "replication" => not_found(replication_code),
+                "object-lock" => not_found(object_lock_code),
+                _ => (
+                    StatusCode::FORBIDDEN,
+                    "<Error><Code>AccessDenied</Code></Error>".to_string(),
+                ),
+            }
+        });
+        let (base, _seen) = spawn_fake(respond).await;
+        let report = test_client(&base).report(&full_params()).await;
+        for (id, code) in [
+            (ProtectionConditionId::DeleteMarkerReplication, REPLICATION),
+            (ProtectionConditionId::ObjectLock, OBJECT_LOCK),
+        ] {
+            let state = report.state(id).expect("present");
+            if expect_fail {
+                assert!(state.is_fail(), "{}: {state:?}", id.id());
+                assert!(state.detail().contains(code), "{}: {state:?}", id.id());
+            } else {
+                assert!(state.is_unknown(), "swapped {}: {state:?}", id.id());
+            }
+        }
     }
 }
 
@@ -1434,6 +1868,62 @@ async fn oversized_body_is_unknown() {
     match test_client(&base).fetch_versioning().await {
         FetchOutcome::Unknown(detail) => assert!(detail.contains("exceeds"), "{detail}"),
         other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+/// A chunked body carries no Content-Length, so only the cap applied while
+/// streaming stops it. The same stream under the cap parses, so the Unknown
+/// is the cap's doing.
+#[tokio::test]
+async fn streamed_body_over_the_cap_without_content_length_is_unknown() {
+    async fn streamed(uri: Uri) -> Response {
+        let filler_chunks = if uri.path().starts_with("/big/") {
+            17
+        } else {
+            1
+        };
+        let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![Ok(
+            bytes::Bytes::from_static(b"<VersioningConfiguration><Status>Enabled</Status>"),
+        )];
+        for _ in 0..filler_chunks {
+            chunks.push(Ok(bytes::Bytes::from(vec![b' '; 64 * 1024])));
+        }
+        chunks.push(Ok(bytes::Bytes::from_static(b"</VersioningConfiguration>")));
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
+            .expect("response")
+    }
+    let app = Router::new().route("/{*rest}", get(streamed));
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let raw = http_client(true)
+        .get(format!("http://{addr}/big/probe"))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(raw.content_length(), None, "the body must be chunked");
+    const _: () = assert!(17 * 64 * 1024 > MAX_BODY_BYTES);
+
+    match test_client(&format!("http://{addr}/big"))
+        .fetch_versioning()
+        .await
+    {
+        FetchOutcome::Unknown(detail) => assert!(detail.contains("exceeds"), "{detail}"),
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+    match test_client(&format!("http://{addr}/small"))
+        .fetch_versioning()
+        .await
+    {
+        FetchOutcome::Present(config) => assert_eq!(config.status.as_deref(), Some("Enabled")),
+        other => panic!("expected Present, got {other:?}"),
     }
 }
 
@@ -1617,6 +2107,164 @@ async fn newest_object_on_a_later_page_is_sampled() {
         vec![
             "/ravel-test-bucket/t/z?retention=&versionId=z1".to_string(),
             "/ravel-test-bucket/t/z?retention=&versionId=z0".to_string(),
+        ]
+    );
+    // The second page resumes from both markers the first page returned.
+    assert_eq!(
+        listing_queries(&seen),
+        vec![
+            "max-keys=1000&prefix=t%2F&versions=".to_string(),
+            "key-marker=t%2Fa&max-keys=1000&prefix=t%2F&version-id-marker=a1&versions=".to_string(),
+        ]
+    );
+}
+
+fn listing_queries(seen: &Mutex<Vec<SeenRequest>>) -> Vec<String> {
+    seen.lock()
+        .iter()
+        .filter(|r| r.query.contains("versions="))
+        .map(|r| r.query.clone())
+        .collect()
+}
+
+/// A listing page that says it is truncated, for the capped and marker tests.
+fn truncated_page(markers: &str, versions: &[String]) -> (StatusCode, String) {
+    (
+        StatusCode::OK,
+        format!(
+            "<ListVersionsResult><IsTruncated>true</IsTruncated>{markers}{}</ListVersionsResult>",
+            versions.concat()
+        ),
+    )
+}
+
+/// A listing still truncated at the page cap may not have reached the newest
+/// object, so a sample from it is Unknown even when its lock holds.
+#[tokio::test]
+async fn capped_listing_with_a_locked_sample_is_unknown() {
+    let respond = bucket(
+        |_query| {
+            truncated_page(
+                "<NextKeyMarker>t/a</NextKeyMarker><NextVersionIdMarker>a0</NextVersionIdMarker>",
+                &[
+                    version("t/a", "a1", true, "2013-05-01T00:00:00Z"),
+                    version("t/a", "a0", false, "2013-04-01T00:00:00Z"),
+                ],
+            )
+        },
+        |_path| (StatusCode::OK, COMPLIANT_RETENTION.to_string()),
+    );
+    let (state, seen) = retention_state(respond, &["t/"]).await;
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(state.detail().contains("stopped at 10 pages"), "{state:?}");
+    assert_eq!(listing_queries(&seen).len(), LISTING_MAX_PAGES);
+    assert_eq!(
+        retention_paths(&seen).len(),
+        2,
+        "both samples are still read"
+    );
+}
+
+/// A truncated page that does not say where to resume cannot be followed, so
+/// the family is Unknown and nothing is sampled from a partial listing.
+#[tokio::test]
+async fn truncated_listing_without_next_markers_is_unknown() {
+    for markers in ["", "<NextKeyMarker>t/a</NextKeyMarker>"] {
+        let respond = bucket(
+            move |_query| {
+                truncated_page(
+                    markers,
+                    &[
+                        version("t/a", "a1", true, "2013-05-01T00:00:00Z"),
+                        version("t/a", "a0", false, "2013-04-01T00:00:00Z"),
+                    ],
+                )
+            },
+            |_path| (StatusCode::OK, COMPLIANT_RETENTION.to_string()),
+        );
+        let (state, seen) = retention_state(respond, &["t/"]).await;
+        assert!(state.is_unknown(), "{markers:?}: {state:?}");
+        assert!(
+            state.detail().contains("carries no next markers"),
+            "{markers:?}: {state:?}"
+        );
+        assert_eq!(listing_queries(&seen).len(), 1, "{markers:?}");
+        assert!(retention_paths(&seen).is_empty(), "{markers:?}");
+    }
+}
+
+/// Retention expiry is judged at the injected clock's instant (2013-05-24),
+/// not the host's: a lock held until 2020 still protects there.
+#[tokio::test]
+async fn retention_expiry_uses_the_injected_clock() {
+    let respond = bucket(
+        |_query| {
+            listing_body(&[
+                version("t/a", "a1", true, "2013-05-01T00:00:00Z"),
+                version("t/a", "a0", false, "2013-04-01T00:00:00Z"),
+            ])
+        },
+        |_path| {
+            (
+                StatusCode::OK,
+                "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2020-01-01T00:00:00Z</RetainUntilDate></Retention>"
+                    .to_string(),
+            )
+        },
+    );
+    let (state, _seen) = retention_state(respond, &["t/"]).await;
+    assert!(state.is_pass(), "{state:?}");
+}
+
+/// Current versions alone never prove the noncurrent half of the condition.
+#[tokio::test]
+async fn no_noncurrent_version_to_sample_is_unknown() {
+    let respond = bucket(
+        |_query| listing_body(&[version("t/a", "a1", true, "2013-05-01T00:00:00Z")]),
+        |_path| (StatusCode::OK, COMPLIANT_RETENTION.to_string()),
+    );
+    let (state, _seen) = retention_state(respond, &["t/"]).await;
+    assert!(state.is_unknown(), "{state:?}");
+    assert!(
+        state.detail().contains("no noncurrent version"),
+        "{state:?}"
+    );
+}
+
+/// Newest is by LastModified alone: the sampled current and noncurrent
+/// versions are neither the greatest key nor the last listed.
+#[tokio::test]
+async fn newest_sample_is_not_the_greatest_or_last_key() {
+    let respond = bucket(
+        |_query| {
+            listing_body(&[
+                version("t/a", "a1", true, "2013-01-01T00:00:00Z"),
+                version("t/a", "a0", false, "2013-04-10T00:00:00Z"),
+                version("t/b", "b1", true, "2013-05-10T00:00:00Z"),
+                version("t/b", "b0", false, "2012-12-01T00:00:00Z"),
+                version("t/c", "c1", true, "2013-02-01T00:00:00Z"),
+                version("t/c", "c0", false, "2013-03-01T00:00:00Z"),
+            ])
+        },
+        |path| {
+            if path.ends_with("/t/c") {
+                (
+                    StatusCode::OK,
+                    "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>"
+                        .to_string(),
+                )
+            } else {
+                (StatusCode::OK, COMPLIANT_RETENTION.to_string())
+            }
+        },
+    );
+    let (state, seen) = retention_state(respond, &["t/"]).await;
+    assert!(state.is_pass(), "{state:?}");
+    assert_eq!(
+        retention_paths(&seen),
+        vec![
+            "/ravel-test-bucket/t/b?retention=&versionId=b1".to_string(),
+            "/ravel-test-bucket/t/a?retention=&versionId=a0".to_string(),
         ]
     );
 }

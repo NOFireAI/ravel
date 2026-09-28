@@ -776,6 +776,17 @@ impl RuleScope {
         }
     }
 
+    /// Whether the rule can apply to any key under `t/` (`false` for an
+    /// unrecognised filter, which [`Coverage::Unknown`] already reports).
+    fn intersects_data_root(&self) -> bool {
+        match self {
+            RuleScope::Prefix(prefix) | RuleScope::Narrowed { prefix, .. } => {
+                prefix_intersects(prefix, DATA_ROOT)
+            }
+            RuleScope::Unrecognized(_) => false,
+        }
+    }
+
     fn targets_ravel(&self) -> Tri {
         match self {
             RuleScope::Prefix(prefix) | RuleScope::Narrowed { prefix, .. } => {
@@ -920,7 +931,9 @@ pub(crate) struct ReplicationConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ObjectLockConfig {
-    pub enabled: bool,
+    /// `ObjectLockEnabled` read as `Enabled` or not, `None` when the element is
+    /// missing (a document that states nothing either way).
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1036,7 +1049,7 @@ pub(crate) fn parse_object_lock(body: &[u8]) -> Result<ObjectLockConfig, Control
     Ok(ObjectLockConfig {
         enabled: root
             .child("ObjectLockEnabled")
-            .is_some_and(|e| e.value().eq_ignore_ascii_case("Enabled")),
+            .map(|e| e.value().eq_ignore_ascii_case("Enabled")),
     })
 }
 
@@ -1532,20 +1545,23 @@ enum SampleVerdict {
 }
 
 /// Whether one sampled version's retention protects it at `now`: compliance
-/// mode with a `RetainUntilDate` still in the future. A lapsed or missing lock
-/// on a sample drawn from a listing cut off at the page cap is `Unknown`, since
-/// that sample may not be the family's newest object.
+/// mode with a `RetainUntilDate` still in the future. A sample drawn from a
+/// listing cut off at the page cap is `Unknown` whichever way its lock reads,
+/// since that sample may not be the family's newest object.
 fn retention_verdict(
     outcome: &FetchOutcome<RetentionConfig>,
     now_unix_secs: i64,
     listing_truncated: bool,
 ) -> SampleVerdict {
+    let capped = |detail: &str| {
+        SampleVerdict::Unknown(format!(
+            "{detail}, but the versions listing stopped at {LISTING_MAX_PAGES} pages, so this \
+             may not be the newest object"
+        ))
+    };
     let not_protecting = |detail: String| {
         if listing_truncated {
-            SampleVerdict::Unknown(format!(
-                "{detail}, but the versions listing stopped at {LISTING_MAX_PAGES} pages, so \
-                 this may not be the newest object"
-            ))
+            capped(&detail)
         } else {
             SampleVerdict::NotProtecting(detail)
         }
@@ -1572,7 +1588,11 @@ fn retention_verdict(
         return SampleVerdict::Unknown(format!("RetainUntilDate {raw:?} does not parse"));
     };
     if until > now_unix_secs {
-        SampleVerdict::Protects
+        if listing_truncated {
+            capped(&format!("compliance retention holds until {raw}"))
+        } else {
+            SampleVerdict::Protects
+        }
     } else {
         not_protecting(format!("compliance retention lapsed at {raw}"))
     }
@@ -1695,13 +1715,13 @@ pub(crate) fn assemble_report(
     states.push((
         Id::ObjectLock,
         match object_lock {
-            FetchOutcome::Present(config) => {
-                if config.enabled {
-                    ConditionState::Pass
-                } else {
-                    ConditionState::Fail("Object Lock is not enabled".to_string())
-                }
-            }
+            FetchOutcome::Present(config) => match config.enabled {
+                Some(true) => ConditionState::Pass,
+                Some(false) => ConditionState::Fail("Object Lock is not enabled".to_string()),
+                None => ConditionState::Unknown(
+                    "ObjectLockConfiguration carries no ObjectLockEnabled element".to_string(),
+                ),
+            },
             FetchOutcome::Absent(detail) => ConditionState::Fail(detail.clone()),
             FetchOutcome::Unknown(detail) => ConditionState::Unknown(detail.clone()),
         },
@@ -1790,6 +1810,11 @@ pub(crate) fn lifecycle_conditions(
         },
         true,
     );
+    let reference_days = expected_noncurrent_days.or_else(|| covering_noncurrent_days(rules));
+    let noncurrent_state = fold_early_expiry(
+        noncurrent.state.clone(),
+        early_noncurrent_rules(rules, reference_days),
+    );
     let expired_marker = evaluate_action(
         rules,
         "ExpiredObjectDeleteMarker",
@@ -1860,13 +1885,112 @@ pub(crate) fn lifecycle_conditions(
         noncurrent_rule_covers_data: noncurrent.carried,
     };
     LifecycleVerdicts {
-        noncurrent: noncurrent.state,
+        noncurrent: noncurrent_state,
         expired_marker: expired_marker.state,
         abort: abort.state,
         rule_scope,
-        no_foreign: no_foreign_rule_state(rules),
+        no_foreign: no_foreign_rule_state(rules, reference_days),
         notes,
     }
+}
+
+/// The `NoncurrentDays` every enabled rule covering all of `t/` agrees on, the
+/// reference an early expiry is measured against when no `E_v` was given.
+fn covering_noncurrent_days(rules: &[LifecycleRule]) -> Option<u32> {
+    let values: BTreeSet<u32> = rules
+        .iter()
+        .filter(|rule| {
+            rule.status == RuleStatus::Enabled
+                && rule.scope.coverage_of_data_root() == Coverage::Full
+        })
+        .filter_map(|rule| match rule.noncurrent_days {
+            Some(Days::Value(days)) => Some(days),
+            _ => None,
+        })
+        .collect();
+    match values.len() {
+        1 => values.first().copied(),
+        _ => None,
+    }
+}
+
+/// A rule's `NoncurrentVersionExpiration` when it deletes noncurrent versions
+/// sooner than `reference` days (`Ok`) or carries a day count that does not
+/// parse (`Err`), each as a description; `None` otherwise. S3 applies the
+/// shortest of overlapping expirations, so a longer one is harmless.
+fn early_noncurrent(
+    rule: &LifecycleRule,
+    reference: Option<u32>,
+) -> Option<Result<String, String>> {
+    match rule.noncurrent_days.as_ref()? {
+        Days::Value(days) => {
+            let reference = reference?;
+            (*days < reference).then(|| {
+                Ok(format!(
+                    "noncurrent-version expiration after {days} days, sooner than {reference}"
+                ))
+            })
+        }
+        Days::Invalid(raw) => Some(Err(format!("NoncurrentDays {raw:?} that does not parse"))),
+    }
+}
+
+/// Rules that can delete a Ravel object's noncurrent versions early and that
+/// [`evaluate_action`] does not already judge by value: every rule not
+/// `Disabled` whose scope can reach `t/` or `sys/`, except an enabled rule
+/// covering all of `t/`. Returns the definite findings and the uncertain ones.
+fn early_noncurrent_rules(
+    rules: &[LifecycleRule],
+    reference: Option<u32>,
+) -> (Vec<String>, Vec<String>) {
+    let mut fails: Vec<String> = Vec::new();
+    let mut unknowns: Vec<String> = Vec::new();
+    for (index, rule) in rules.iter().enumerate() {
+        let active = rule.status.active();
+        let targets = rule.scope.targets_ravel();
+        if active == Tri::No || targets == Tri::No {
+            continue;
+        }
+        if active == Tri::Yes && rule.scope.coverage_of_data_root() == Coverage::Full {
+            continue;
+        }
+        let Some(found) = early_noncurrent(rule, reference) else {
+            continue;
+        };
+        let on = format!("{} on {}", rule.label(index), rule.scope.describe());
+        match found {
+            Ok(detail) if active == Tri::Yes && targets == Tri::Yes => {
+                fails.push(format!("{on} carries {detail}"))
+            }
+            Ok(detail) | Err(detail) => {
+                unknowns.push(format!("{on} (Status {:?}) carries {detail}", rule.status))
+            }
+        }
+    }
+    (fails, unknowns)
+}
+
+/// Fold [`early_noncurrent_rules`]' findings into a condition state: a definite
+/// one is `Fail`, and an uncertain one keeps a `Pass` from standing.
+fn fold_early_expiry(
+    state: ConditionState,
+    (fails, unknowns): (Vec<String>, Vec<String>),
+) -> ConditionState {
+    let join = |base: &str, extra: &[String]| {
+        if base.is_empty() {
+            extra.join("; ")
+        } else {
+            format!("{base}; {}", extra.join("; "))
+        }
+    };
+    if !fails.is_empty() {
+        let base = if state.is_fail() { state.detail() } else { "" };
+        return ConditionState::Fail(join(base, &fails));
+    }
+    if state.is_fail() || unknowns.is_empty() {
+        return state;
+    }
+    ConditionState::Unknown(join(state.detail(), &unknowns))
 }
 
 /// One sanctioned lifecycle action evaluated over every rule.
@@ -1980,10 +2104,14 @@ fn evaluate_action<T: Copy + fmt::Display>(
 }
 
 /// `no-foreign-rule`: no enabled rule that targets `t/` or `sys/` carries a
-/// transition or a current-version expiration (by days or by date). An
+/// transition, a current-version expiration (by days or by date), or a
+/// noncurrent-version expiration sooner than `reference_noncurrent_days`. An
 /// expiration or action the reader cannot classify, a day count that does not
 /// parse, or a rule whose filter or status is unrecognised makes it `Unknown`.
-fn no_foreign_rule_state(rules: &[LifecycleRule]) -> ConditionState {
+fn no_foreign_rule_state(
+    rules: &[LifecycleRule],
+    reference_noncurrent_days: Option<u32>,
+) -> ConditionState {
     let mut fails: Vec<String> = Vec::new();
     let mut unknowns: Vec<String> = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
@@ -2007,6 +2135,11 @@ fn no_foreign_rule_state(rules: &[LifecycleRule]) -> ConditionState {
         }
         if let Some(date) = &rule.expiration_date {
             definite.push(format!("expiration on date {date}"));
+        }
+        match early_noncurrent(rule, reference_noncurrent_days) {
+            Some(Ok(detail)) => definite.push(detail),
+            Some(Err(detail)) => unclassified.push(detail),
+            None => {}
         }
         if let Some(shape) = &rule.expiration_unrecognized {
             unclassified.push(shape.clone());
@@ -2048,11 +2181,16 @@ fn no_foreign_rule_state(rules: &[LifecycleRule]) -> ConditionState {
 }
 
 /// `delete-marker-replication`: only enabled replication rules whose filter
-/// covers every key under `t/` count. All of them must replicate delete markers;
-/// a covering rule that does not, or covering rules that disagree, is `Fail`.
+/// covers every key under `t/` can prove it. All of them must replicate delete
+/// markers; a covering rule that does not, or covering rules that disagree, is
+/// `Fail`. An enabled rule on part of `t/` (a narrower prefix, or a tag- or
+/// size-narrowed filter) may take priority over the covering rule for the keys
+/// it matches, so one with `DeleteMarkerReplication` `Disabled` is `Fail` and
+/// one with a missing or unrecognised status is `Unknown`.
 fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState {
     let mut enabled: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
+    let mut partial_disabled: Vec<String> = Vec::new();
     let mut unknowns: Vec<String> = Vec::new();
     let mut union_members: Vec<String> = Vec::new();
     for (index, rule) in config.rules.iter().enumerate() {
@@ -2064,7 +2202,28 @@ fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState
         if active == Tri::No {
             continue;
         }
-        match (active, rule.scope.coverage_of_data_root()) {
+        let coverage = rule.scope.coverage_of_data_root();
+        let partial = match coverage {
+            Coverage::UnionMember => true,
+            Coverage::None => rule.scope.intersects_data_root(),
+            Coverage::Full | Coverage::Unknown => false,
+        };
+        if active == Tri::Yes && partial {
+            let on = format!("{label} on {}", rule.scope.describe());
+            match &rule.delete_marker_replication {
+                Some(RuleStatus::Enabled) => {}
+                Some(RuleStatus::Disabled) => partial_disabled.push(on.clone()),
+                Some(RuleStatus::Other(status)) => {
+                    unknowns.push(format!("{on}: DeleteMarkerReplication Status {status:?}"))
+                }
+                None => unknowns.push(format!("{on}: no DeleteMarkerReplication element")),
+            }
+            if coverage == Coverage::UnionMember {
+                union_members.push(on);
+            }
+            continue;
+        }
+        match (active, coverage) {
             (_, Coverage::None) => {}
             (Tri::Yes, Coverage::Full) => match &rule.delete_marker_replication {
                 Some(RuleStatus::Enabled) => enabled.push(label),
@@ -2074,9 +2233,6 @@ fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState
                 )),
                 None => unknowns.push(format!("{label}: no DeleteMarkerReplication element")),
             },
-            (Tri::Yes, Coverage::UnionMember) => {
-                union_members.push(format!("{label} on {}", rule.scope.describe()))
-            }
             (_, _) => unknowns.push(format!(
                 "{label} (Status {:?}) applies to {}",
                 rule.status,
@@ -2084,7 +2240,12 @@ fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState
             )),
         }
     }
-    if !disabled.is_empty() && !enabled.is_empty() {
+    if !partial_disabled.is_empty() {
+        ConditionState::Fail(format!(
+            "DeleteMarkerReplication is Disabled on {}, which applies to part of t/",
+            partial_disabled.join(", ")
+        ))
+    } else if !disabled.is_empty() && !enabled.is_empty() {
         ConditionState::Fail(format!(
             "enabled replication rules covering t/ disagree on DeleteMarkerReplication: Enabled \
              on {}, Disabled on {}",
