@@ -213,17 +213,23 @@ pub struct MaintenanceSafetyMetrics {
     /// it and units must not add together.
     retention_lag_ns_accum: [AtomicI64; MAINTAINED_SIGNALS.len()],
     /// Tenant ticks whose alert retention sweep was skipped for want of a
-    /// usable alert state memo (ADR-1688 decision 3), indexed by
-    /// [`AlertRetentionSkipReason::index`].
+    /// usable alert state memo (ADR-1688 decision 3 and its store-error
+    /// amendment), indexed by [`AlertRetentionSkipReason::index`].
     alert_retention_skipped: [AtomicU64; AlertRetentionSkipReason::ALL.len()],
 }
 
 /// Why the alert retention driver skipped a tenant this tick (ADR-1688
-/// decision 3). A closed set: each is a state of the tenant's alert state memo
-/// under which the sweep has no keep set it can trust.
+/// decision 3, as amended on 2026-09-28). A closed set: each is a state of the
+/// tenant's alert state memo under which the sweep has no keep set it can
+/// trust.
+///
+/// A tenant whose memo is absent AND whose alert commit prefix holds nothing is
+/// not one of these: it has no alert history to sweep, so the driver does
+/// nothing and counts nothing rather than reporting a skip on every tick for
+/// every tenant of a deployment that runs no alert rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertRetentionSkipReason {
-    /// No memo object exists.
+    /// No memo object exists, and the tenant does have alert commit records.
     Absent,
     /// The memo object does not decode.
     Undecodable,
@@ -232,14 +238,21 @@ pub enum AlertRetentionSkipReason {
     /// The memo's `watermark_hour` is below the expiry floor's hour, so it
     /// names no identity's latest record for part of the expired range.
     WatermarkBelowFloor,
+    /// Reading the memo (or, on an absent memo, the one bounded listing that
+    /// tells an unused alert keyspace from a lost one) failed against object
+    /// storage with something other than not-found. Transient, and the tick
+    /// retries; counted so a store that never answers is visible as a stalled
+    /// sweep rather than as silence.
+    StoreError,
 }
 
 impl AlertRetentionSkipReason {
-    pub const ALL: [AlertRetentionSkipReason; 4] = [
+    pub const ALL: [AlertRetentionSkipReason; 5] = [
         AlertRetentionSkipReason::Absent,
         AlertRetentionSkipReason::Undecodable,
         AlertRetentionSkipReason::UnsupportedVersion,
         AlertRetentionSkipReason::WatermarkBelowFloor,
+        AlertRetentionSkipReason::StoreError,
     ];
 
     fn index(self) -> usize {
@@ -248,6 +261,7 @@ impl AlertRetentionSkipReason {
             AlertRetentionSkipReason::Undecodable => 1,
             AlertRetentionSkipReason::UnsupportedVersion => 2,
             AlertRetentionSkipReason::WatermarkBelowFloor => 3,
+            AlertRetentionSkipReason::StoreError => 4,
         }
     }
 
@@ -258,6 +272,7 @@ impl AlertRetentionSkipReason {
             AlertRetentionSkipReason::Undecodable => "undecodable",
             AlertRetentionSkipReason::UnsupportedVersion => "unsupported_version",
             AlertRetentionSkipReason::WatermarkBelowFloor => "watermark_below_floor",
+            AlertRetentionSkipReason::StoreError => "store_error",
         }
     }
 }
@@ -2257,10 +2272,17 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
 /// shard, whose orphan rule reclaims a data object left behind by a crash
 /// between the retention sweep's record delete and its data delete.
 ///
-/// A memo that is absent, undecodable, of an unsupported version, or whose
-/// watermark sits below the expiry floor's hour skips the retention sweep for
-/// this tenant this tick and counts it. The orphan sweep does not depend on the
-/// memo and runs either way.
+/// A memo that is undecodable, of an unsupported version, unreadable for a
+/// store reason, or whose watermark sits below the expiry floor's hour skips the
+/// retention sweep for this tenant this tick and counts it. An absent memo
+/// counts only when the tenant's alert commit prefix holds something: a tenant
+/// that has never written an alert transition has no history to sweep and is
+/// neither logged nor counted, which is otherwise every tenant of a deployment
+/// that runs no alert rules, on every tick.
+///
+/// The orphan sweep does not depend on the memo and runs either way, including
+/// for a tenant with no commit records at all: a data object whose first-ever
+/// commit record never landed is exactly the leak it exists to reclaim.
 async fn run_alert_retention(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -2270,7 +2292,7 @@ async fn run_alert_retention(
     safety: &MaintenanceSafetyMetrics,
 ) {
     match alert_keep_set(store, clock, compactor, tenant).await {
-        Ok(Ok(keep)) => {
+        Ok(AlertKeepSetOutcome::Ready(keep)) => {
             match sweep_alert_retention(store, clock, compactor, hold, tenant, ALERT_SHARD, &keep)
                 .await
             {
@@ -2289,7 +2311,7 @@ async fn run_alert_retention(
                 ),
             }
         }
-        Ok(Err(reason)) => {
+        Ok(AlertKeepSetOutcome::Skip(reason)) => {
             safety.record_alert_retention_skipped(reason);
             tracing::warn!(
                 tenant = %tenant.to_hex(),
@@ -2298,12 +2320,20 @@ async fn run_alert_retention(
                  alert state memo; the evaluator rewrites it every tick it runs"
             );
         }
-        Err(err) => tracing::warn!(
+        Ok(AlertKeepSetOutcome::NoAlertRecords) => tracing::debug!(
             tenant = %tenant.to_hex(),
-            error = %err,
-            "maintenance: alert state memo read failed; alert retention sweep skipped, retried \
-             next tick"
+            "maintenance: alert retention sweep has nothing to do for this tenant: no memo and no \
+             alert commit records"
         ),
+        Err(err) => {
+            safety.record_alert_retention_skipped(AlertRetentionSkipReason::StoreError);
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: alert state memo read failed; alert retention sweep skipped, \
+                 retried next tick"
+            );
+        }
     }
 
     match sweep_shard(
@@ -2333,43 +2363,86 @@ async fn run_alert_retention(
     }
 }
 
+/// What [`alert_keep_set`] found: a keep set the sweep may run under, a reason
+/// it must not run this tick, or a tenant with no alert history at all.
+enum AlertKeepSetOutcome {
+    /// A memo the sweep can trust, reduced to its keep set.
+    Ready(AlertKeepSet),
+    /// A memo state the sweep must not run under. Counted and logged.
+    Skip(AlertRetentionSkipReason),
+    /// No memo, and the tenant's alert commit prefix is empty: nothing has ever
+    /// been written for this signal, so there is nothing to sweep and nothing
+    /// an operator would want counted.
+    NoAlertRecords,
+}
+
 /// The keep set for one tenant's alert retention sweep, or why there is none.
 ///
-/// The outer `Err` is a store failure reading the memo, which is transient and
-/// not one of the skip reasons; the inner `Err` is a memo state the sweep must
-/// not run under.
+/// `Err` is a store failure reading the memo or the alert commit prefix, which
+/// is transient; the driver counts it under
+/// [`AlertRetentionSkipReason::StoreError`] and retries next tick.
 async fn alert_keep_set(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     compactor: &CompactorConfig,
     tenant: &TenantHash,
-) -> anyhow::Result<Result<AlertKeepSet, AlertRetentionSkipReason>> {
+) -> anyhow::Result<AlertKeepSetOutcome> {
     let memo = match read_alert_state_memo(store, tenant).await {
         Ok(Some(memo)) => memo,
-        Ok(None) => return Ok(Err(AlertRetentionSkipReason::Absent)),
+        Ok(None) => {
+            return if alert_commit_prefix_is_empty(store, tenant).await? {
+                Ok(AlertKeepSetOutcome::NoAlertRecords)
+            } else {
+                Ok(AlertKeepSetOutcome::Skip(AlertRetentionSkipReason::Absent))
+            };
+        }
         Err(err) => {
             return match err.downcast_ref::<MemoError>() {
-                Some(MemoError::UnsupportedVersion { .. }) => {
-                    Ok(Err(AlertRetentionSkipReason::UnsupportedVersion))
-                }
-                Some(MemoError::Decode(_) | MemoError::Encode(_)) => {
-                    Ok(Err(AlertRetentionSkipReason::Undecodable))
-                }
+                Some(MemoError::UnsupportedVersion { .. }) => Ok(AlertKeepSetOutcome::Skip(
+                    AlertRetentionSkipReason::UnsupportedVersion,
+                )),
+                Some(MemoError::Decode(_) | MemoError::Encode(_)) => Ok(AlertKeepSetOutcome::Skip(
+                    AlertRetentionSkipReason::Undecodable,
+                )),
                 None => Err(err),
             };
         }
     };
-    let expiry_floor = clock
-        .now_ns()
-        .saturating_sub(compactor.alert_retention_window_ns);
+    let now_ns = clock.now_ns();
+    // `watermark_hour` is untrusted on read: `alert_state_memo::decode` accepts
+    // any `u32`, so a writer whose clock ran ahead, or a corrupted-but-decodable
+    // field, can name an hour above this reader's own. The evaluator's fold
+    // clamps it for the same reason; the sweep needs the clamp more, because its
+    // watermark is the floor below which it DELETES. Clamping to the hour of the
+    // injected `now` can only lower it, so it can only make the sweep keep more.
+    let now_hour = now_ns.div_euclid(ravel_maintain::config::NS_PER_HOUR);
+    let watermark_hour = u32::try_from(i64::from(memo.watermark_hour).min(now_hour)).unwrap_or(0);
+    let expiry_floor = now_ns.saturating_sub(compactor.alert_retention_window_ns);
     let floor_hour = expiry_floor.div_euclid(ravel_maintain::config::NS_PER_HOUR);
-    if i64::from(memo.watermark_hour) < floor_hour {
-        return Ok(Err(AlertRetentionSkipReason::WatermarkBelowFloor));
+    if i64::from(watermark_hour) < floor_hour {
+        return Ok(AlertKeepSetOutcome::Skip(
+            AlertRetentionSkipReason::WatermarkBelowFloor,
+        ));
     }
-    Ok(Ok(AlertKeepSet::new(
-        memo.watermark_hour,
+    Ok(AlertKeepSetOutcome::Ready(AlertKeepSet::new(
+        watermark_hour,
         memo.records.values().map(|record| record.ts_ns),
     )))
+}
+
+/// Whether the tenant's alert commit prefix holds nothing, in one bounded
+/// listing.
+///
+/// A page that carries a continuation token counts as non-empty even when its
+/// own object list is empty: the store is entitled to return one, and the
+/// conservative answer here is the one that keeps the existing skip accounting.
+async fn alert_commit_prefix_is_empty(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> anyhow::Result<bool> {
+    let prefix = keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD)?;
+    let page = store.list(&prefix, None).await?;
+    Ok(page.objects.is_empty() && page.next.is_none())
 }
 
 /// Domain-separation prefix for [`erasure_predicate_hash`], following the same

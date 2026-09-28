@@ -3524,10 +3524,12 @@ fn render_maintain_safety_family(
     write_header(
         out,
         "ravel_alert_retention_skipped_total",
-        "Tenant maintenance ticks whose alert retention sweep was skipped because the tenant's \
-         alert state memo was absent, undecodable, of an unsupported version, or had a watermark \
-         below the expiry floor (ADR-1688 decision 3). A sustained nonzero rate means the alert \
-         evaluator is not running or cannot write its memo; the remedy is on the evaluator.",
+        "Tenant maintenance ticks whose alert retention sweep was skipped, by reason: an alert \
+         state memo that was absent while that tenant had alert records, undecodable, of an \
+         unsupported version, carrying a watermark below the expiry floor, or unreadable for a \
+         store reason (ADR-1688 decision 3). Summed over every tenant this process maintains, \
+         with no tenant dimension: a sustained nonzero rate says some tenant's alert evaluator \
+         is not running or cannot write its memo, not which one; the remedy is on the evaluator.",
         "counter",
     );
     for &(reason, value) in &snapshot.alert_retention_skipped {
@@ -10341,6 +10343,7 @@ mod tests {
             (Reason::Undecodable, 2),
             (Reason::UnsupportedVersion, 3),
             (Reason::WatermarkBelowFloor, 4),
+            (Reason::StoreError, 5),
         ] {
             for _ in 0..times {
                 metrics.record_alert_retention_skipped(reason);
@@ -10360,10 +10363,12 @@ mod tests {
             .lines()
             .find(|line| line.starts_with(&format!("# HELP {family} ")))
             .expect("help line");
+        // The family carries no tenant label, so the help text must not read as
+        // a statement about one tenant.
         assert!(
             help.contains(
-                "A sustained nonzero rate means the alert evaluator is not running or \
-                 cannot write its memo"
+                "a sustained nonzero rate says some tenant's alert evaluator is not running or \
+                 cannot write its memo, not which one"
             ),
             "{help}"
         );
@@ -10378,6 +10383,7 @@ mod tests {
                 "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"undecodable\"} 2",
                 "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"unsupported_version\"} 3",
                 "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"watermark_below_floor\"} 4",
+                "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"store_error\"} 5",
             ]
         );
     }

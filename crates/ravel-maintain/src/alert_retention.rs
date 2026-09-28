@@ -198,9 +198,11 @@ pub struct AlertRetentionOutcome {
 ///
 /// The commit record is deleted before its data object, so a crash between the
 /// two leaves a data object no record points at, never a record pointing at a
-/// deleted object. Nothing reclaims that object today: the orphan sweep over
-/// the alerts shard is ADR-1688 follow-up task 2, and until it lands the object
-/// leaks. No tombstone is ever written.
+/// deleted object. Orphan GC reclaims that object: the driver in
+/// `services/ravel-server` runs [`crate::sweep::sweep_shard`] over the alerts
+/// shard beside this sweep, and the alert evaluator honours the same
+/// `max_flush_lifetime` interlock the age gate rests on. No tombstone is ever
+/// written.
 ///
 /// `shard` is the alert shard to sweep. It is a parameter rather than a
 /// constant because the evaluator's `ALERT_SHARD` is defined in
