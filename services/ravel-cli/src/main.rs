@@ -369,6 +369,19 @@ enum Command {
         /// Path to the `--mapping` TOML (source columns to record fields).
         #[arg(long, value_name = "TOML")]
         mapping: std::path::PathBuf,
+        /// Which signal to load into (ADR-1751 decision 1). The loader
+        /// provisions or validates that signal, constructs its router, and
+        /// writes in `WriteMode::Strict`; every ADR-0089 admission decision
+        /// (past lag relaxed, future skew kept, length caps at that signal's
+        /// OTLP limits, the loader attribute cap, the admission controller
+        /// bypassed by construction) applies per signal. The `--mapping` file
+        /// must carry exactly one signal section and it must match this flag;
+        /// a mapping written before ADR-1751, whose logs keys sit at the top
+        /// level, is still read as the `[logs]` section. `spans` is refused
+        /// until ADR-1751 follow-up task 2 lands, and never falls back to
+        /// another signal. Defaults to `logs`.
+        #[arg(long, value_enum, default_value_t = ravel_cli::maintain::SignalArg::Logs)]
+        signal: ravel_cli::maintain::SignalArg,
         /// Configured shard count. Validated against (or, for a fresh signal,
         /// written to) the durable provisioning record, exactly as the server
         /// does at first touch; the router resolves the active generation from
@@ -1907,6 +1920,7 @@ async fn main() -> anyhow::Result<()> {
             parquet,
             tenant,
             mapping,
+            signal,
             shards,
             batch_rows,
             skip_rows,
@@ -1923,6 +1937,7 @@ async fn main() -> anyhow::Result<()> {
                 &parquet,
                 &tenant,
                 &mapping,
+                signal,
                 shards,
                 batch_rows,
                 skip_rows,
