@@ -235,10 +235,13 @@ impl PinnedParquetReader {
         }
     }
 
-    /// The decoded footer, from the metadata cache or from one Probe read.
+    /// The decoded footer, from the metadata cache or from one Probe read. A
+    /// metadata cache hit counts as a Probe cache hit and adds no cache bytes:
+    /// what it serves is a decoded footer, not a byte range.
     pub async fn metadata(&self) -> Result<Arc<ParquetMetaData>, ParquetReadError> {
         let cache_key = MetadataKey::of(&self.cache_key(0, 0));
         if let Some(metadata) = self.services.metadata.get(&cache_key) {
+            self.accounting.phase(QueryPhase::Probe).record_cache_hit();
             return Ok(metadata);
         }
         let size = self.file.file.size;
