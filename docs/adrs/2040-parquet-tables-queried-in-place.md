@@ -798,9 +798,8 @@ would fail with `FileMissing`. An S3 file therefore takes the ETag-only
 branch above. `S3Store` must report the real version id when the bucket has
 versioning on, so an S3 file is pinned by version as well as ETag; epic
 #2040's wave 1 fix round does this. Until it does, S3 pins are ETag-only,
-and
-D1's closing sentence on the cache key ("A versioned bucket, or GCS, removes
-this") holds for GCS and for Azure but not for S3.
+and D1's closing sentence on the cache key ("A versioned bucket, or GCS,
+removes this") holds for GCS and for Azure but not for S3.
 
 **The Ravel-bucket probe also reads Ravel's marker.** A random key written a
 moment earlier is not in a replica or a backup copy of Ravel's bucket, so
