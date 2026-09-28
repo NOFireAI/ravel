@@ -862,8 +862,9 @@ impl Catalog {
     }
 
     /// Decode reservations retried after such an eviction pass, cumulative.
-    /// Exactly one per refused reservation, whether or not the retry
-    /// succeeded.
+    /// One per refused reservation that ran the pass, whether or not the retry
+    /// succeeded; a refusal over the budget's whole limit skips the pass and
+    /// counts nothing.
     pub fn decode_reserve_retries(&self) -> u64 {
         self.decode_reserve_retries.load(Ordering::Relaxed)
     }

@@ -25,8 +25,9 @@ pub(crate) type ChargedPostings = Charged<DecodedPostings>;
 /// decoder refuses a declared length over its ceiling before allocating.
 ///
 /// This is the bare reservation. Every resolve-path decode reaches it through
-/// [`DecodeReserver`] instead, so that a refusal gets the decoded-output
-/// caches a chance to hand memory back first.
+/// `Catalog::reserve_decoded` instead (parts and postings directly, column
+/// statistics through [`DecodeReserver`]), so that a refusal gives the
+/// decoded-output caches a chance to hand memory back first.
 pub(crate) fn reserve_decoded(
     budget: &Arc<MemoryBudget>,
     declared: u64,
