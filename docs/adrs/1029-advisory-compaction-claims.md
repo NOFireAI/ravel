@@ -469,12 +469,15 @@ after another, so a shard with ten claimed buckets spent about half of a
 300 s maintain tick asleep. A single-replica deployment with no CLI run
 beside it has no contender, and paid it on every claimed bucket.
 
-When a steal lands moves only by the latency of the refused create and its
-two reads. Decision 1 step 2 reschedules a contender to after expiry plus its
-jitter; the skip now reports one millisecond past expiry, and the retry waits
-out the jitter before its steal instead of before its create. An unreadable claim's skip reschedules to one millisecond past
-one lease plus the contender's jitter, the instant the claim stops holding
-the bucket back, because that retry steals nothing and so waits nothing.
+The moment a steal lands shifts only by the latency of the refused create
+and its two reads. Decision 1 step 2 reschedules a contender to after expiry
+plus its jitter; the skip now reports one millisecond past expiry, and the
+retry waits out the jitter before its steal instead of before its create. A
+contender that loses a steal reschedules one full lease from the moment it
+lost, because the winner has just written a claim with a fresh lease. An
+unreadable claim's skip reschedules to one millisecond past one lease plus
+the contender's jitter, the instant the claim stops holding the bucket back,
+because that retry steals nothing and so waits nothing.
 The claim guard's tests `an_uncontended_claim_requests_no_jitter_wait`,
 `a_refused_then_retried_create_requests_the_jitter_once` and
 `a_steal_requests_the_jitter_once_and_the_reschedule_carries_none` pin the

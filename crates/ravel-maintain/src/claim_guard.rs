@@ -475,9 +475,16 @@ impl ClaimGuard {
             // so its reschedule point is the bare expiry. An unreadable claim's
             // retry steals nothing, so it is rescheduled to the observation's
             // own point, which adds the jitter: the instant `past_unreadable`
-            // lets the run proceed.
+            // lets the run proceed. A lost steal means another contender just
+            // wrote a claim with a fresh lease, and the observed expiry is
+            // already past, so its retry waits one full lease from now.
             let reschedule_after_unix_ms = match reason {
                 ClaimSkipReason::UnreadableClaim => observed.reschedule_after_unix_ms,
+                ClaimSkipReason::StealLost => {
+                    let lease_ms =
+                        i64::try_from(inner.cfg.lease_duration.as_millis()).unwrap_or(i64::MAX);
+                    now_ms.saturating_add(lease_ms)
+                }
                 _ => observed.expiry_unix_ms.saturating_add(1),
             };
             Acquire::Skipped(ClaimSkip {
@@ -1404,6 +1411,11 @@ mod tests {
             other => panic!("expected a skip, got {other:?}"),
         };
         assert_eq!(skip.reason, ClaimSkipReason::StealLost);
+        assert_eq!(
+            skip.reschedule_after_unix_ms,
+            1_700_000_004_000 + cfg().lease_duration.as_millis() as i64,
+            "a lost steal waits one full lease from now, not the lapsed expiry"
+        );
         assert!(!thief.is_held().await);
         assert_eq!(
             thief.requests().await,
