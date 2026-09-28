@@ -5096,6 +5096,20 @@ impl HistogramGrouper {
                         ),
                     ));
                 }
+                // Refused here rather than at close so a mis-declared mapping
+                // that makes the whole file one data point is not buffered
+                // whole before the limit is checked.
+                if open.bounds.len() >= limits.max_histogram_buckets {
+                    return Err((
+                        open.first_row,
+                        too_many_bounds(
+                            &open.name,
+                            open.ts_ns,
+                            open.bounds.len() + 1,
+                            limits.max_histogram_buckets,
+                        ),
+                    ));
+                }
                 open.bounds.push(bucket.le);
                 open.counts.push(bucket.own_count);
                 open.rows += 1;
@@ -5190,6 +5204,15 @@ fn exact_count(value: f64) -> Result<u64, String> {
     Ok(value as u64)
 }
 
+/// The refusal for a data point with more explicit bounds than
+/// `IngestLimits::max_histogram_buckets`.
+fn too_many_bounds(name: &str, ts_ns: i64, bounds: usize, limit: usize) -> String {
+    format!(
+        "the {name:?} data point at ts {ts_ns} has {bounds} explicit bounds, more than the limit \
+         of {limit}"
+    )
+}
+
 /// Explode one classic-histogram data point into its Prometheus-convention
 /// series: one `{name}_bucket{le=<bound>}` per explicit bound plus
 /// `{name}_bucket{le="+Inf"}` (= the point's count), `{name}_sum` when the
@@ -5225,12 +5248,11 @@ fn explode_classic_histogram(
         ));
     }
     if group.bounds.len() > limits.max_histogram_buckets {
-        return Err(format!(
-            "the {:?} data point at ts {} has {} explicit bounds, more than the limit of {}",
-            group.name,
+        return Err(too_many_bounds(
+            &group.name,
             group.ts_ns,
             group.bounds.len(),
-            limits.max_histogram_buckets
+            limits.max_histogram_buckets,
         ));
     }
 
@@ -5630,19 +5652,21 @@ pub async fn load_metrics(
 
         let (points, rows, done) = match decoded {
             MetricsDecoded::Failed(reason) => {
-                drain_metrics_inflight(&mut inflight, &mut report).await?;
+                let (durable, reason) =
+                    drain_metrics_before_refusal(&mut inflight, &mut report, reason).await;
                 return Err(LoadError::BatchFailed {
                     reason,
-                    durable: report.tokens.clone(),
+                    durable,
                     resume: metrics_resume(&report),
                 });
             }
             MetricsDecoded::Rejected { row, reason } => {
-                drain_metrics_inflight(&mut inflight, &mut report).await?;
+                let (durable, reason) =
+                    drain_metrics_before_refusal(&mut inflight, &mut report, reason).await;
                 return Err(LoadError::RowRejected {
                     row,
                     reason,
-                    durable: report.tokens.clone(),
+                    durable,
                     resume: metrics_resume(&report),
                 });
             }
@@ -5763,26 +5787,40 @@ async fn resolve_metrics_write(
     }
 }
 
-/// Resolve every remaining in-flight write, oldest-first, returning the first
-/// failure.
+/// Resolve every remaining in-flight write, oldest-first. On the first write
+/// error every later write is still resolved and whatever it committed is
+/// folded into that error's durable-token list
+/// ([`harvest_metrics_after_failure`]), as the steady-state loop does.
 async fn drain_metrics_inflight(
     inflight: &mut std::collections::VecDeque<MetricsInflight>,
     report: &mut MetricsLoadReport,
 ) -> Result<(), LoadError> {
-    let mut first_error: Option<LoadError> = None;
     while let Some(entry) = inflight.pop_front() {
-        match resolve_metrics_write(entry, report).await {
-            Ok(()) => {}
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
+        if let Err(mut e) = resolve_metrics_write(entry, report).await {
+            harvest_metrics_after_failure(inflight, &mut e).await;
+            return Err(e);
         }
     }
-    match first_error {
-        Some(e) => Err(e),
-        None => Ok(()),
+    Ok(())
+}
+
+/// Drain the window ahead of a decode refusal, returning the durable-token
+/// list the refusal reports and its reason. A write failure found by the drain
+/// does not replace the refusal: its tokens (including any it harvested from
+/// later writes) become the refusal's durable list and its cause is appended
+/// to the reason, since the resume figures then stop at that write rather than
+/// at the refused row.
+async fn drain_metrics_before_refusal(
+    inflight: &mut std::collections::VecDeque<MetricsInflight>,
+    report: &mut MetricsLoadReport,
+    reason: String,
+) -> (Vec<CommitToken>, String) {
+    match drain_metrics_inflight(inflight, report).await {
+        Ok(()) => (report.tokens.clone(), reason),
+        Err(e) => (
+            e.durable_tokens().to_vec(),
+            format!("{reason} (an earlier write had also failed: {e})"),
+        ),
     }
 }
 
@@ -12243,5 +12281,352 @@ type = "i64"
         let below = 18_446_744_073_709_549_568.0f64;
         assert!(below < two_to_64);
         assert_eq!(exact_count(below).expect("below 2^64 fits"), below as u64);
+    }
+
+    /// Fix-round regressions for the metrics submit loop and the histogram
+    /// grouper (PR #2096 review).
+    mod metrics_pipeline_review {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+        use ravel_object_store::memory::MemoryStore;
+
+        use super::*;
+
+        const DRAIN_MAPPING: &str = "[metrics]\nname = \"drain_probe\"\nvalue_column = \
+                                     \"value\"\nts_column = \"ts\"\nts_unit = \"nanos\"\nkind = \
+                                     \"gauge\"\n\n[[metrics.label]]\nname = \"host\"\ncolumn = \
+                                     \"host\"\n";
+
+        fn drain_mapping() -> MetricsMapping {
+            match parse_mapping_document(DRAIN_MAPPING, SignalArg::Metrics).expect("valid mapping")
+            {
+                MappingSection::Metrics(m) => m,
+                MappingSection::Logs(_) => panic!("a [metrics] section parses as metrics"),
+            }
+        }
+
+        fn drain_batch(hosts: &[&str]) -> RecordBatch {
+            let n = hosts.len();
+            batch(vec![
+                ("ts", i64_col(vec![NOW_NS - 60_000_000_000; n])),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(vec![1.0; n])) as ArrayRef,
+                ),
+                ("host", str_col(hosts.to_vec())),
+            ])
+        }
+
+        /// A `host` label value whose series routes to each of `shards` shards,
+        /// found through the loader's own point builder so the routing is the
+        /// one `IngestRouter::write` applies.
+        fn host_per_shard(mapping: &MetricsMapping, shards: u32) -> Vec<String> {
+            let candidates: Vec<String> = (0..256).map(|i| format!("h{i}")).collect();
+            let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+            let b = drain_batch(&refs);
+            let cols = MetricsColumnIndex::resolve(&b, mapping).expect("columns resolve");
+            let (points, _) = build_batch_points(
+                &b,
+                &cols,
+                0,
+                &TenantId::new("acme"),
+                mapping,
+                &IngestLimits::default(),
+                NOW_NS,
+                false,
+                None,
+            )
+            .expect("every candidate row is admitted");
+            (0..shards)
+                .map(|shard| {
+                    let idx = points
+                        .iter()
+                        .position(|p| ravel_types::shard_for(&p.series_id, shards) == shard)
+                        .expect("some candidate routes to every shard");
+                    candidates[idx].clone()
+                })
+                .collect()
+        }
+
+        /// Every data-object key under one metrics shard.
+        async fn shard_data_keys(store: &dyn ObjectStoreBackend, shard: u32) -> Vec<String> {
+            let needle = format!("/m/l0/{shard:04}/");
+            let mut out = Vec::new();
+            let mut page: Option<ravel_object_store::PageToken> = None;
+            loop {
+                let p = store.list("", page).await.expect("list");
+                out.extend(
+                    p.objects
+                        .into_iter()
+                        .map(|o| o.key)
+                        .filter(|k| k.contains(&needle)),
+                );
+                match p.next {
+                    Some(t) => page = Some(t),
+                    None => break,
+                }
+            }
+            out
+        }
+
+        /// A write that fails in the FINAL drain, with a later outstanding
+        /// write that succeeds, reports that later write's token in the
+        /// returned error's durable list.
+        ///
+        /// Two one-row batches at `--pipeline-depth 3` never fill the window,
+        /// so both writes are still outstanding when the loop ends and both
+        /// resolve in the end-of-load drain, oldest first. Batch 0 routes to
+        /// shard 0, whose data PUT fails permanently; batch 1 routes to shard
+        /// 1 and commits. The durable list must be exactly batch 1's one token,
+        /// and that token must name the object that actually landed on shard 1.
+        ///
+        /// Non-vacuity: against the drain that kept the first error and
+        /// resolved the rest into the report only, this fails on the
+        /// `durable.len()` assertion with 0 tokens, because the error's list
+        /// was cloned before batch 1 resolved.
+        #[tokio::test]
+        async fn a_final_drain_failure_keeps_a_later_writes_tokens() {
+            use parquet::arrow::ArrowWriter;
+
+            let shards = 2;
+            let mapping = drain_mapping();
+            let hosts = host_per_shard(&mapping, shards);
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("drain.parquet");
+            let b = drain_batch(&[hosts[0].as_str(), hosts[1].as_str()]);
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            writer.write(&b).expect("write batch");
+            writer.close().expect("close writer");
+
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Put,
+                    ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+                )
+                .with_key_contains("/m/l0/0000/")
+                .with_occurrence(Occurrence::Always),
+            );
+            let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+            let err = load_metrics(
+                fault.clone() as Arc<dyn ObjectStoreBackend>,
+                &pq,
+                "acme",
+                &mapping,
+                shards,
+                1,
+                0,
+                3,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await
+            .expect_err("batch 0's permanent PUT failure fails the load");
+            assert!(
+                fault.fault_count(Op::Put, FaultKind::Permanent) >= 1,
+                "the scripted fault must have fired"
+            );
+            let LoadError::Flush { durable, .. } = &err else {
+                panic!("expected LoadError::Flush, got {err:?}");
+            };
+            assert_eq!(
+                durable.len(),
+                1,
+                "exactly batch 1's one token is durable, and it resolved after the failure: \
+                 {durable:?}"
+            );
+            let token = &durable[0];
+            assert_eq!(token.shard, 1, "the durable token is batch 1's shard");
+            let landed = shard_data_keys(fault.inner(), 1).await;
+            let prefix = format!(
+                "/m/l0/0001/{}.{}.{:020}.",
+                token.writer_id, token.epoch, token.seq
+            );
+            assert_eq!(landed.len(), 1, "one object landed on shard 1: {landed:?}");
+            assert!(
+                landed[0].contains(&prefix),
+                "the reported token names the object that landed ({prefix} in {landed:?})"
+            );
+            assert!(
+                shard_data_keys(fault.inner(), 0).await.is_empty(),
+                "nothing landed on the failing shard"
+            );
+        }
+
+        /// A row rejection found while an earlier write is failing keeps the
+        /// rejection (its row and reason) and carries the drain's durable
+        /// list, including a later write that committed, rather than being
+        /// replaced by the write's `Flush` error.
+        ///
+        /// Three one-row batches at `--pipeline-depth 3`: batch 0 routes to
+        /// shard 0 and its PUT fails, batch 1 routes to shard 1 and commits,
+        /// and row 2 carries a far-future timestamp the decoder rejects, so
+        /// the rejection drains both writes first.
+        ///
+        /// Non-vacuity: against the `drain_metrics_inflight(..).await?` call
+        /// in the `Rejected` arm, the load returns the `Flush` error and this
+        /// fails on the `RowRejected` match.
+        #[tokio::test]
+        async fn a_row_rejection_after_a_failed_write_keeps_its_reason_and_the_drained_tokens() {
+            use parquet::arrow::ArrowWriter;
+
+            let shards = 2;
+            let mapping = drain_mapping();
+            let hosts = host_per_shard(&mapping, shards);
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("reject.parquet");
+            let b = batch(vec![
+                (
+                    "ts",
+                    i64_col(vec![
+                        NOW_NS - 60_000_000_000,
+                        NOW_NS - 60_000_000_000,
+                        NOW_NS + 86_400_000_000_000,
+                    ]),
+                ),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(vec![1.0, 1.0, 1.0])) as ArrayRef,
+                ),
+                (
+                    "host",
+                    str_col(vec![
+                        hosts[0].as_str(),
+                        hosts[1].as_str(),
+                        hosts[1].as_str(),
+                    ]),
+                ),
+            ]);
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            writer.write(&b).expect("write batch");
+            writer.close().expect("close writer");
+
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Put,
+                    ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+                )
+                .with_key_contains("/m/l0/0000/")
+                .with_occurrence(Occurrence::Always),
+            );
+            let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+            let err = load_metrics(
+                fault.clone() as Arc<dyn ObjectStoreBackend>,
+                &pq,
+                "acme",
+                &mapping,
+                shards,
+                1,
+                0,
+                3,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                1,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await
+            .expect_err("row 2 is rejected");
+            assert!(
+                fault.fault_count(Op::Put, FaultKind::Permanent) >= 1,
+                "the scripted fault must have fired"
+            );
+            let LoadError::RowRejected {
+                row,
+                reason,
+                durable,
+                ..
+            } = &err
+            else {
+                panic!("expected the row rejection to survive the drain, got {err:?}");
+            };
+            assert_eq!(*row, 2, "the rejected row is the far-future one");
+            assert!(
+                reason.contains("an earlier write had also failed: flush failed:"),
+                "the write failure is named beside the rejection: {reason}"
+            );
+            assert_eq!(durable.len(), 1, "batch 1's one token: {durable:?}");
+            let token = &durable[0];
+            let prefix = format!(
+                "/m/l0/0001/{}.{}.{:020}.",
+                token.writer_id, token.epoch, token.seq
+            );
+            let landed = shard_data_keys(fault.inner(), 1).await;
+            assert_eq!(landed.len(), 1, "one object landed on shard 1: {landed:?}");
+            assert!(
+                landed[0].contains(&prefix),
+                "the reported token names the object that landed ({prefix} in {landed:?})"
+            );
+        }
+
+        fn bucket_row(le: f64) -> MetricRow {
+            MetricRow {
+                name: "latency".to_string(),
+                labels: Vec::new(),
+                ts_ns: NOW_NS,
+                payload: RowPayload::Bucket(BucketRow {
+                    le,
+                    own_count: 1,
+                    sum: Some(10.0),
+                    count: 10,
+                }),
+            }
+        }
+
+        /// The bucket limit is enforced while a group accumulates, not only
+        /// when it closes: a ten-row data point under a limit of 4 is refused
+        /// on its fifth bucket row, with the close-time message and the
+        /// group's first row, and the open group never holds more than 4
+        /// bounds.
+        ///
+        /// Non-vacuity: with the check only at close time, the fifth push
+        /// returns `Ok` and the test fails on the `held <= 4` assertion with
+        /// "the open group holds 5 bounds after row 4".
+        #[test]
+        fn the_bucket_limit_refuses_an_open_group_at_the_first_row_past_it() {
+            let limits = IngestLimits {
+                max_histogram_buckets: 4,
+                ..IngestLimits::default()
+            };
+            let first_row = 100;
+            let mut grouper = HistogramGrouper::new(TenantId::new("acme"));
+            let mut refused = None;
+            for i in 0..10u64 {
+                let outcome = grouper.push(bucket_row(i as f64 + 1.0), first_row + i, &limits);
+                let held = grouper.pending.as_ref().map_or(0, |g| g.bounds.len());
+                assert!(
+                    held <= 4,
+                    "the open group holds {held} bounds after row {i}"
+                );
+                if let Err(e) = outcome {
+                    refused = Some((i, e));
+                    break;
+                }
+            }
+            let Some((index, (row, message))) = refused else {
+                panic!("a ten-row group over a limit of 4 must be refused");
+            };
+            assert_eq!(index, 4, "the fifth bucket row is refused");
+            assert_eq!(
+                row, first_row,
+                "the refusal points at the group's first row"
+            );
+            assert_eq!(
+                message,
+                format!(
+                    "the \"latency\" data point at ts {NOW_NS} has 5 explicit bounds, more than \
+                     the limit of 4"
+                ),
+            );
+        }
     }
 }
