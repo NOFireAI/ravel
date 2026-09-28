@@ -526,10 +526,11 @@ struct ReservationStep {
 /// total, and it charges decoded output rather than cache-bound bytes, so it is
 /// never marked handed off.
 ///
-/// The fixture never shrinks the decode's reservation: `shrink_to_retained`
-/// reserves the retained size before it releases the held one, so it cannot
-/// run under the full budget this oracle builds, and the pre-decode
-/// reservation is still held when the page read reserves.
+/// The fixture never shrinks the decode's reservation: its retained entries
+/// measure more than the pre-decode charge, which `shrink_to_retained` never
+/// exchanges upward, and a shrink could not run under the full budget this
+/// oracle builds anyway, since it reserves the retained size before it
+/// releases the held one.
 fn split_decode_step(steps: &[ReservationStep]) -> (Vec<u64>, u64) {
     assert_eq!(
         steps.len(),
