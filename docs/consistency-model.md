@@ -73,11 +73,27 @@ Buffered mode (opt-in per request, named "buffered"):
   one.
 - Loss from a stalled co-resident prefix is therefore not a buffered-mode
   outcome: a flush queued behind the stall reaches the store once the stall
-  clears. Buffered rows are dropped with no crash only when the flush's own
-  store calls, after it holds the permit, cannot complete within
-  `max_flush_lifetime` (a genuinely stuck backend, not a queue wait), and those
-  rows were already acked. `max_flush_lifetime` defaults to 3600 s and is not
-  operator-tunable from the server.
+  clears. Buffered rows are dropped with no crash in exactly three cases, and
+  those rows were already acked in all three. One: the flush's own store calls,
+  after it holds the permit, cannot complete within `max_flush_lifetime` (a
+  genuinely stuck backend, not a queue wait). `max_flush_lifetime` defaults to
+  3600 s and is not operator-tunable from the server. Two: a graceful drain
+  (`Shutdown`, channel close) whose flushes are still refused by the ADR-1307
+  monotonic-floor check after every pass it makes, enforced and bypassed alike,
+  which needs a clock stepping backwards beyond the hold bound on every
+  reading; the residue is logged at ERROR and counted
+  (`flush_all_residue_tenants`). Three: the flush-open clock reading is not a
+  usable wall-clock value at all, being non-positive, below the 2020
+  plausibility floor, or yielding no representable ingest-hour bucket. That is
+  a grossly broken host clock rather than a transient step, so it is fail-loud
+  and non-retryable: the buffer is dropped, any strict waiter is acked with
+  `SegmentBuild` (400), and `abandoned_input_rejected` counts it. The ADR-1685
+  store-clock lag check is not a case of its own: a teardown drain's bypass
+  passes disable that check precisely so it cannot drop acknowledged rows, and
+  what it costs instead is visibility until a HEAD rebuild (see "Catalog
+  snapshot staleness" below). What it does change is when the floor gets its
+  say, since a lag refusal returns before the floor is read, which is why case
+  two counts every pass of the drain and not only the enforced ones.
 - Strict mode does not share the buffered loss exposure, because a strict
   write is acked only after its flush commits and an abandoned flush returns a
   retryable error instead. A strict write co-resident with a stalled prefix
@@ -359,12 +375,20 @@ query sees. Guarantees:
   `CreateIfAbsent` does not consult the seal boundary, so the publish
   succeeds and the record is invisible to non-token queries the same way as
   the folder-fast case above, until a HEAD rebuild. ADR-1685 decides a
-  writer-side refusal for this direction: a flush whose clock lags the
-  observed store time by more than `clock_skew_allowance` is refused, counted
-  under `clock_lag_refused`, with `clock_lag_unchecked` counting flushes that
-  had no observation to check against. The shipped binary does not implement
-  that refusal or its counters yet. Until it lands, this direction has no
-  dedicated alarm and is caught only after the fact, by the scheduled
+  writer-side refusal for this direction, and it is shipped: a flush whose
+  raw clock reading lags the observed store time by more than
+  `clock_skew_allowance` is refused with the retryable `Abandoned` (503), its
+  rows re-buffer, and `clock_lag_refused` counts it, with
+  `clock_lag_unchecked` counting flush-open attempts that had no observation
+  to check against. Three paths still reach the publish above. Two are the
+  residuals the ADR states: a process with no observation yet flushes
+  unchecked, and a store (or proxy) whose own `Date` header is wrong misleads
+  the check in the direction of its error. The third is deliberate: on the
+  `Shutdown` and channel-close drains the final pass bypasses the check and
+  publishes rather than drop rows buffered mode had already acknowledged,
+  counting `clock_lag_bypassed_at_shutdown` (see docs/ingest.md and the
+  ADR-1685 teardown amendment). So this direction still needs its
+  after-the-fact detector, the scheduled
   seal-divergence scrubber (`services/ravel-server/src/scrub.rs`,
   `run_seal_divergence_tick`). That tick re-lists sealed commit records and
   diffs them against the snapshot, and a late slow-writer commit surfaces as
