@@ -32,11 +32,11 @@
 //! ADR-0873 decision 2 to split the declared-statistics drop tally across
 //! its four carriers, and `gate`, `site` and `worker` added by ADR-1702
 //! decision 11 for the CPU gate and tokio runtime families). The twenty-one
-//! keys come from twenty-six `Label` variants, because some variants share a
-//! key: `RejectReason`, `ScrubReason` and `ScrubUnreadableReason` all render
-//! `reason`, `Level` (log/tracing severity) and `ScrubLevel` (issue #1686,
-//! which part of the commit lineage -- `l0`/`l1`/`rewrite` -- a scrub target
-//! came from) both render `level`, `MergeMemoryKind` and `DeletedObjectKind`
+//! keys come from twenty-seven `Label` variants, because some variants share a
+//! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason` and
+//! `AlertRetentionSkipReason` all render `reason`, `Level` (log/tracing
+//! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
+//! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`, `MergeMemoryKind` and `DeletedObjectKind`
 //! both render `kind`, and `ReadGateSite` and `WriteGateSite` both render
 //! `site`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
 //! only constructor.
@@ -285,6 +285,11 @@ pub enum Label {
     /// `access_denied`, `permanent`, or `retry_exhausted`. Shares the `reason`
     /// key with `RejectReason` and `ScrubReason`.
     ScrubUnreadableReason(UnreadableReason),
+    /// Why the alert retention driver skipped a tenant (ADR-1688 decision 3):
+    /// `absent`, `undecodable`, `unsupported_version`, or
+    /// `watermark_below_floor`. Shares the `reason` key with `RejectReason`,
+    /// `ScrubReason` and `ScrubUnreadableReason`.
+    AlertRetentionSkipReason(crate::maintain::AlertRetentionSkipReason),
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
@@ -503,6 +508,7 @@ impl Label {
             Label::Shard(_) => "shard",
             Label::ScrubLevel(_) => "level",
             Label::ScrubUnreadableReason(_) => "reason",
+            Label::AlertRetentionSkipReason(_) => "reason",
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
@@ -534,6 +540,7 @@ impl Label {
             Label::Shard(index) => index.to_string(),
             Label::ScrubLevel(level) => level.as_str().to_string(),
             Label::ScrubUnreadableReason(reason) => reason.as_str().to_string(),
+            Label::AlertRetentionSkipReason(reason) => reason.name().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
@@ -3440,6 +3447,10 @@ pub struct MaintenanceSafetySnapshot {
     /// Unreferenced L1 parts rule 3 physically deleted, summed over every
     /// sweep pass since process start.
     pub objects_deleted_unreferenced_parts_deleted: u64,
+    /// Tenant ticks whose alert retention sweep was skipped, by reason, since
+    /// process start (ADR-1688 decision 3). One entry per
+    /// [`crate::maintain::AlertRetentionSkipReason::ALL`] member, in that order.
+    pub alert_retention_skipped: Vec<(crate::maintain::AlertRetentionSkipReason, u64)>,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -3460,6 +3471,10 @@ impl MaintenanceSafetySnapshot {
                 .objects_deleted_superseded_data_deleted(),
             objects_deleted_unreferenced_parts_deleted: metrics
                 .objects_deleted_unreferenced_parts_deleted(),
+            alert_retention_skipped: crate::maintain::AlertRetentionSkipReason::ALL
+                .iter()
+                .map(|&reason| (reason, metrics.alert_retention_skipped(reason)))
+                .collect(),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
                 .map(|&signal| MaintenanceSafetySignalSnapshot {
@@ -3505,6 +3520,26 @@ fn render_maintain_safety_family(
         &[Label::Mode(mode)],
         snapshot.legal_hold_refresh_failures,
     );
+
+    write_header(
+        out,
+        "ravel_alert_retention_skipped_total",
+        "Tenant maintenance ticks whose alert retention sweep was skipped, by reason: an alert \
+         state memo that was absent while that tenant had alert records, undecodable, of an \
+         unsupported version, carrying a watermark below the expiry floor, or unreadable for a \
+         store reason (ADR-1688 decision 3). Summed over every tenant this process maintains, \
+         with no tenant dimension: a sustained nonzero rate says some tenant's alert evaluator \
+         is not running or cannot write its memo, not which one; the remedy is on the evaluator.",
+        "counter",
+    );
+    for &(reason, value) in &snapshot.alert_retention_skipped {
+        write_sample(
+            out,
+            "ravel_alert_retention_skipped_total",
+            &[Label::Mode(mode), Label::AlertRetentionSkipReason(reason)],
+            value,
+        );
+    }
 
     fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
         [Label::Mode(mode), Label::Signal(signal)]
@@ -6828,6 +6863,7 @@ mod tests {
             Label::Shard(0),
             Label::ScrubLevel(ScrubLevel::L0),
             Label::ScrubUnreadableReason(UnreadableReason::AccessDenied),
+            Label::AlertRetentionSkipReason(crate::maintain::AlertRetentionSkipReason::Absent),
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
@@ -6858,6 +6894,7 @@ mod tests {
                 Label::Shard(_) => "shard",
                 Label::ScrubLevel(_) => "level",
                 Label::ScrubUnreadableReason(_) => "reason",
+                Label::AlertRetentionSkipReason(_) => "reason",
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
@@ -6900,6 +6937,9 @@ mod tests {
                 // ScrubUnreadableReason (ADR-1686 amendment) reuses the
                 // `reason` key, so the allowlist of distinct keys is unchanged.
                 "reason",
+                // AlertRetentionSkipReason (ADR-1688 decision 3) reuses the
+                // `reason` key too.
+                "reason",
                 "cache",
                 "tier",
                 "kind",
@@ -6931,8 +6971,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            26,
-            "exactly 26 label variants, 21 distinct keys"
+            27,
+            "exactly 27 label variants, 21 distinct keys"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
@@ -9385,6 +9425,7 @@ mod tests {
             objects_deleted_superseded_records_deleted: 11,
             objects_deleted_superseded_data_deleted: 12,
             objects_deleted_unreferenced_parts_deleted: 13,
+            alert_retention_skipped: Vec::new(),
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -10209,6 +10250,7 @@ mod tests {
             objects_deleted_superseded_records_deleted: 1,
             objects_deleted_superseded_data_deleted: 1,
             objects_deleted_unreferenced_parts_deleted: 1,
+            alert_retention_skipped: Vec::new(),
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
@@ -10287,6 +10329,63 @@ mod tests {
                 "maintain-safety sample carries an unexpected label set: {line}"
             );
         }
+    }
+
+    /// `ravel_alert_retention_skipped_total` renders one sample per member of
+    /// its closed reason set, each carrying the count recorded under that
+    /// reason and no other label than `mode` and `reason` (ADR-1688 decision 3).
+    #[test]
+    fn alert_retention_skipped_renders_each_reason_with_its_own_count() {
+        use crate::maintain::AlertRetentionSkipReason as Reason;
+        let metrics = crate::maintain::MaintenanceSafetyMetrics::default();
+        for (reason, times) in [
+            (Reason::Absent, 1),
+            (Reason::Undecodable, 2),
+            (Reason::UnsupportedVersion, 3),
+            (Reason::WatermarkBelowFloor, 4),
+            (Reason::StoreError, 5),
+        ] {
+            for _ in 0..times {
+                metrics.record_alert_retention_skipped(reason);
+            }
+        }
+        let snapshot = MaintenanceSafetySnapshot::from_metrics(&metrics);
+        let mut body = String::new();
+        render_maintain_safety_family(&mut body, Mode::Maintain, &snapshot);
+
+        let family = "ravel_alert_retention_skipped_total";
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter\n")).count(),
+            1,
+            "{body}"
+        );
+        let help = body
+            .lines()
+            .find(|line| line.starts_with(&format!("# HELP {family} ")))
+            .expect("help line");
+        // The family carries no tenant label, so the help text must not read as
+        // a statement about one tenant.
+        assert!(
+            help.contains(
+                "a sustained nonzero rate says some tenant's alert evaluator is not running or \
+                 cannot write its memo, not which one"
+            ),
+            "{help}"
+        );
+        let samples: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with(&format!("{family}{{")))
+            .collect();
+        assert_eq!(
+            samples,
+            vec![
+                "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"absent\"} 1",
+                "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"undecodable\"} 2",
+                "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"unsupported_version\"} 3",
+                "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"watermark_below_floor\"} 4",
+                "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"store_error\"} 5",
+            ]
+        );
     }
 
     /// A maintain-safety snapshot with `set` applied to every signal's entry,

@@ -89,11 +89,12 @@ use ravel_maintain::worker_set::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, run_bounded,
 };
 use ravel_maintain::{
-    Bucket, ClaimParticipant, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-    ErasureRewriteOutcome, LeaseCheck, LegalHoldCheck, MaintainError, OrphanPass,
-    PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, erasure_rewrite_bucket,
-    pending_erasure_requests, read_all_memo_snapshots, scan_and_compact, sweep_audit_retention,
-    sweep_erasure_requests, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
+    AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
+    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureRewriteOutcome, LeaseCheck, LegalHoldCheck,
+    MaintainError, OrphanPass, PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig,
+    WorkerSet, erasure_rewrite_bucket, pending_erasure_requests, read_all_memo_snapshots,
+    scan_and_compact, sweep_alert_retention, sweep_audit_retention, sweep_erasure_requests,
+    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
     sweep_unreferenced_catalog_objects, write_memo_snapshot,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
@@ -103,6 +104,8 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::alert_state_memo::{MemoError, read_alert_state_memo};
+use crate::alerting::ALERT_SHARD;
 use crate::tenant_discovery::{TenantDiscoveryMetrics, discover_and_restrict_by_lifecycle};
 
 /// Default `maintain_interval`: 5 minutes.
@@ -209,9 +212,80 @@ pub struct MaintenanceSafetyMetrics {
     /// this process observed, so a later unit with a smaller lag must not lower
     /// it and units must not add together.
     retention_lag_ns_accum: [AtomicI64; MAINTAINED_SIGNALS.len()],
+    /// Tenant ticks whose alert retention sweep was skipped for want of a
+    /// usable alert state memo (ADR-1688 decision 3 and its store-error
+    /// amendment), indexed by [`AlertRetentionSkipReason::index`].
+    alert_retention_skipped: [AtomicU64; AlertRetentionSkipReason::ALL.len()],
+}
+
+/// Why the alert retention driver skipped a tenant this tick (ADR-1688
+/// decision 3, as amended on 2026-09-28). A closed set: each is a state of the
+/// tenant's alert state memo under which the sweep has no keep set it can
+/// trust.
+///
+/// A tenant whose memo is absent AND whose alert commit prefix holds nothing is
+/// not one of these: it has no alert history to sweep, so the driver does
+/// nothing and counts nothing rather than reporting a skip on every tick for
+/// every tenant of a deployment that runs no alert rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertRetentionSkipReason {
+    /// No memo object exists, and the tenant does have alert commit records.
+    Absent,
+    /// The memo object does not decode.
+    Undecodable,
+    /// The memo decodes to a `format_version` this build does not support.
+    UnsupportedVersion,
+    /// The memo's `watermark_hour` is below the expiry floor's hour, so it
+    /// names no identity's latest record for part of the expired range.
+    WatermarkBelowFloor,
+    /// Reading the memo (or, on an absent memo, the one bounded listing that
+    /// tells an unused alert keyspace from a lost one) failed against object
+    /// storage with something other than not-found. Transient, and the tick
+    /// retries; counted so a store that never answers is visible as a stalled
+    /// sweep rather than as silence.
+    StoreError,
+}
+
+impl AlertRetentionSkipReason {
+    pub const ALL: [AlertRetentionSkipReason; 5] = [
+        AlertRetentionSkipReason::Absent,
+        AlertRetentionSkipReason::Undecodable,
+        AlertRetentionSkipReason::UnsupportedVersion,
+        AlertRetentionSkipReason::WatermarkBelowFloor,
+        AlertRetentionSkipReason::StoreError,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            AlertRetentionSkipReason::Absent => 0,
+            AlertRetentionSkipReason::Undecodable => 1,
+            AlertRetentionSkipReason::UnsupportedVersion => 2,
+            AlertRetentionSkipReason::WatermarkBelowFloor => 3,
+            AlertRetentionSkipReason::StoreError => 4,
+        }
+    }
+
+    /// The `reason` label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            AlertRetentionSkipReason::Absent => "absent",
+            AlertRetentionSkipReason::Undecodable => "undecodable",
+            AlertRetentionSkipReason::UnsupportedVersion => "unsupported_version",
+            AlertRetentionSkipReason::WatermarkBelowFloor => "watermark_below_floor",
+            AlertRetentionSkipReason::StoreError => "store_error",
+        }
+    }
 }
 
 impl MaintenanceSafetyMetrics {
+    pub fn alert_retention_skipped(&self, reason: AlertRetentionSkipReason) -> u64 {
+        self.alert_retention_skipped[reason.index()].load(Ordering::Relaxed)
+    }
+
+    pub fn record_alert_retention_skipped(&self, reason: AlertRetentionSkipReason) {
+        self.alert_retention_skipped[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn legal_hold_refresh_failures(&self) -> u64 {
         self.legal_hold_refresh_failures.load(Ordering::Relaxed)
     }
@@ -2178,7 +2252,197 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
         }
     }
 
+    // Alert-signal retention (ADR-1688). Gated on ownership of the one alerts
+    // unit, and on a positive window: `0` is the documented opt-out and leaves
+    // the alerts shard exactly as untouched as it was before the sweep existed.
+    // Logged, not folded into `MaintainReport` or the per-signal safety arrays,
+    // for the same reasons as the query-audit block above.
+    if compactor.alert_retention_window_ns > 0
+        && worker.owns_unit(live_set, tenant, Signal::Alerts, ALERT_SHARD)
+    {
+        run_alert_retention(store, clock, compactor, &hold, tenant, safety).await;
+    }
+
     total
+}
+
+/// The alert retention driver for one tenant (ADR-1688 decisions 3 and 6, and
+/// the keep-set amendment): read the alert state memo, build the keep set from
+/// it, and sweep the alerts shard; then run the shard sweep over the alerts
+/// shard, whose orphan rule reclaims a data object left behind by a crash
+/// between the retention sweep's record delete and its data delete.
+///
+/// A memo that is undecodable, of an unsupported version, unreadable for a
+/// store reason, or whose watermark sits below the expiry floor's hour skips the
+/// retention sweep for this tenant this tick and counts it. An absent memo
+/// counts only when the tenant's alert commit prefix holds something: a tenant
+/// that has never written an alert transition has no history to sweep and is
+/// neither logged nor counted, which is otherwise every tenant of a deployment
+/// that runs no alert rules, on every tick.
+///
+/// The orphan sweep does not depend on the memo and runs either way, including
+/// for a tenant with no commit records at all: a data object whose first-ever
+/// commit record never landed is exactly the leak it exists to reclaim.
+async fn run_alert_retention(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &LegalHoldCheck,
+    tenant: &TenantHash,
+    safety: &MaintenanceSafetyMetrics,
+) {
+    match alert_keep_set(store, clock, compactor, tenant).await {
+        Ok(AlertKeepSetOutcome::Ready(keep)) => {
+            match sweep_alert_retention(store, clock, compactor, hold, tenant, ALERT_SHARD, &keep)
+                .await
+            {
+                Ok(outcome) => tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    records = outcome.records_deleted,
+                    data = outcome.data_deleted,
+                    kept = outcome.kept,
+                    kept_current_state = outcome.kept_current_state,
+                    "maintenance: alert retention sweep complete"
+                ),
+                Err(err) => tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    error = %err,
+                    "maintenance: alert retention sweep failed; retried next tick"
+                ),
+            }
+        }
+        Ok(AlertKeepSetOutcome::Skip(reason)) => {
+            safety.record_alert_retention_skipped(reason);
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                reason = reason.name(),
+                "maintenance: alert retention sweep skipped for this tenant this tick: no usable \
+                 alert state memo; the evaluator rewrites it every tick it runs"
+            );
+        }
+        Ok(AlertKeepSetOutcome::NoAlertRecords) => tracing::debug!(
+            tenant = %tenant.to_hex(),
+            "maintenance: alert retention sweep has nothing to do for this tenant: no memo and no \
+             alert commit records"
+        ),
+        Err(err) => {
+            safety.record_alert_retention_skipped(AlertRetentionSkipReason::StoreError);
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: alert state memo read failed; alert retention sweep skipped, \
+                 retried next tick"
+            );
+        }
+    }
+
+    match sweep_shard(
+        store,
+        clock,
+        compactor,
+        hold,
+        tenant,
+        Signal::Alerts,
+        ALERT_SHARD,
+    )
+    .await
+    {
+        Ok(report) => tracing::info!(
+            tenant = %tenant.to_hex(),
+            orphans = report.orphans_deleted,
+            orphans_withheld = report.orphans_withheld,
+            orphan_breaker_tripped = report.orphan_breaker_tripped,
+            quarantine_reaped = report.quarantine_reaped,
+            "maintenance: alerts shard orphan sweep complete"
+        ),
+        Err(err) => tracing::warn!(
+            tenant = %tenant.to_hex(),
+            error = %err,
+            "maintenance: alerts shard orphan sweep failed; retried next tick"
+        ),
+    }
+}
+
+/// What [`alert_keep_set`] found: a keep set the sweep may run under, a reason
+/// it must not run this tick, or a tenant with no alert history at all.
+enum AlertKeepSetOutcome {
+    /// A memo the sweep can trust, reduced to its keep set.
+    Ready(AlertKeepSet),
+    /// A memo state the sweep must not run under. Counted and logged.
+    Skip(AlertRetentionSkipReason),
+    /// No memo, and the tenant's alert commit prefix is empty: nothing has ever
+    /// been written for this signal, so there is nothing to sweep and nothing
+    /// an operator would want counted.
+    NoAlertRecords,
+}
+
+/// The keep set for one tenant's alert retention sweep, or why there is none.
+///
+/// `Err` is a store failure reading the memo or the alert commit prefix, which
+/// is transient; the driver counts it under
+/// [`AlertRetentionSkipReason::StoreError`] and retries next tick.
+async fn alert_keep_set(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    tenant: &TenantHash,
+) -> anyhow::Result<AlertKeepSetOutcome> {
+    let memo = match read_alert_state_memo(store, tenant).await {
+        Ok(Some(memo)) => memo,
+        Ok(None) => {
+            return if alert_commit_prefix_is_empty(store, tenant).await? {
+                Ok(AlertKeepSetOutcome::NoAlertRecords)
+            } else {
+                Ok(AlertKeepSetOutcome::Skip(AlertRetentionSkipReason::Absent))
+            };
+        }
+        Err(err) => {
+            return match err.downcast_ref::<MemoError>() {
+                Some(MemoError::UnsupportedVersion { .. }) => Ok(AlertKeepSetOutcome::Skip(
+                    AlertRetentionSkipReason::UnsupportedVersion,
+                )),
+                Some(MemoError::Decode(_) | MemoError::Encode(_)) => Ok(AlertKeepSetOutcome::Skip(
+                    AlertRetentionSkipReason::Undecodable,
+                )),
+                None => Err(err),
+            };
+        }
+    };
+    let now_ns = clock.now_ns();
+    // `watermark_hour` is untrusted on read: `alert_state_memo::decode` accepts
+    // any `u32`, so a writer whose clock ran ahead, or a corrupted-but-decodable
+    // field, can name an hour above this reader's own. The evaluator's fold
+    // clamps it for the same reason; the sweep needs the clamp more, because its
+    // watermark is the floor below which it DELETES. Clamping to the hour of the
+    // injected `now` can only lower it, so it can only make the sweep keep more.
+    let now_hour = now_ns.div_euclid(ravel_maintain::config::NS_PER_HOUR);
+    let watermark_hour = u32::try_from(i64::from(memo.watermark_hour).min(now_hour)).unwrap_or(0);
+    let expiry_floor = now_ns.saturating_sub(compactor.alert_retention_window_ns);
+    let floor_hour = expiry_floor.div_euclid(ravel_maintain::config::NS_PER_HOUR);
+    if i64::from(watermark_hour) < floor_hour {
+        return Ok(AlertKeepSetOutcome::Skip(
+            AlertRetentionSkipReason::WatermarkBelowFloor,
+        ));
+    }
+    Ok(AlertKeepSetOutcome::Ready(AlertKeepSet::new(
+        watermark_hour,
+        memo.records.values().map(|record| record.ts_ns),
+    )))
+}
+
+/// Whether the tenant's alert commit prefix holds nothing, in one bounded
+/// listing.
+///
+/// A page that carries a continuation token counts as non-empty even when its
+/// own object list is empty: the store is entitled to return one, and the
+/// conservative answer here is the one that keeps the existing skip accounting.
+async fn alert_commit_prefix_is_empty(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> anyhow::Result<bool> {
+    let prefix = keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD)?;
+    let page = store.list(&prefix, None).await?;
+    Ok(page.objects.is_empty() && page.next.is_none())
 }
 
 /// Domain-separation prefix for [`erasure_predicate_hash`], following the same
@@ -8199,5 +8463,834 @@ mod tests {
         )
         .expect("a horizon that covers the running sweeper's skew spawns normally");
         tasks.shutdown().await;
+    }
+}
+
+/// The alert retention driver as the maintain tick runs it (ADR-1688 follow-up
+/// task 2): memo read, keep set, watermark check, skip counter, ownership gate,
+/// the `alert_retention_window_ns` opt-out, and the alerts-shard orphan sweep.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod alert_retention_tests {
+    use std::collections::{BTreeSet, HashMap};
+
+    use bytes::Bytes;
+    use ravel_alerting::{AlertId, AlertRecord, AlertState, encode_record_object};
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_ingest::LOG_SEGMENT_FORMAT_VERSION;
+    use ravel_logseg::{ObjectIdentity, RlogConfig};
+    use ravel_maintain::FixedClock;
+    use ravel_maintain::config::NS_PER_HOUR;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{PutMode, list_all};
+    use ravel_types::TenantId;
+
+    use super::*;
+    use crate::alert_state_memo::{AlertStateMemo, alert_state_memo_key, write_alert_state_memo};
+
+    const NS_PER_DAY: i64 = 24 * NS_PER_HOUR;
+    /// 2027-01-15T08:00:00Z, well clear of the epoch so every expired hour in
+    /// the fixture is a positive ingest hour.
+    const NOW_NS: i64 = 1_800_000_000 * 1_000_000_000;
+    const WRITER: Uuid = Uuid::from_u128(0xA1E7);
+    /// The evaluator's `ALERT_WRITER_EPOCH`.
+    const WRITER_EPOCH: u64 = 1;
+
+    fn hour_of(ts_ns: i64) -> u32 {
+        u32::try_from(ts_ns.div_euclid(NS_PER_HOUR)).expect("hour")
+    }
+
+    fn alert_record(id: u8, state: AlertState, ts_ns: i64) -> AlertRecord {
+        AlertRecord {
+            alert_id: AlertId([id; 16]),
+            rule_id: format!("rule-{id}"),
+            state,
+            generation: 1,
+            ts_ns,
+            labels: vec![("alertname".to_string(), format!("rule-{id}"))],
+            annotations: Vec::new(),
+            body: format!("rule-{id} {}", state.as_str()),
+        }
+    }
+
+    /// The keys one written alert transition occupies.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Written {
+        commit_key: String,
+        data_key: String,
+    }
+
+    /// Write one alert transition the way the evaluator's `publish` does: a
+    /// real one-record RLOG object, then an L0 commit record whose event,
+    /// ingest and creation stamps and `ingest_hour_bucket` all come from the
+    /// record's `ts_ns`.
+    async fn write_transition(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        seq: u64,
+        alert: &AlertRecord,
+    ) -> Written {
+        let ts = alert.ts_ns;
+        let bytes = encode_record_object(
+            alert,
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant.0,
+                shard: ALERT_SHARD,
+                writer_id: WRITER.into_bytes(),
+                writer_epoch: WRITER_EPOCH,
+                writer_seq: seq,
+            },
+        )
+        .expect("encode alert record");
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Alerts,
+            shard: ALERT_SHARD,
+            writer_id: WRITER,
+            writer_epoch: WRITER_EPOCH,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: ts,
+            max_event_ts_ns: ts,
+            min_ingest_ts_ns: ts,
+            max_ingest_ts_ns: ts,
+            segment_format_version: u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: ts,
+            ingest_hour_bucket: hour_of(ts),
+        })
+        .expect("build commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data");
+        publish::publish(store, &commit, &RetryPolicy::default())
+            .await
+            .expect("publish commit");
+        Written {
+            commit_key: keys::commit_key_for_record(&commit).expect("commit key"),
+            data_key,
+        }
+    }
+
+    async fn write_memo(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        watermark_hour: u32,
+        latest: &[&AlertRecord],
+    ) {
+        let records: HashMap<AlertId, AlertRecord> =
+            latest.iter().map(|r| (r.alert_id, (*r).clone())).collect();
+        write_alert_state_memo(
+            store,
+            tenant,
+            &AlertStateMemo {
+                watermark_hour,
+                records,
+            },
+        )
+        .await
+        .expect("write memo");
+    }
+
+    /// Every live key under the tenant's alert commit and data prefixes.
+    async fn alert_keys(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for prefix in [
+            keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD).expect("prefix"),
+            format!("t/{}/a/l0/", tenant.to_hex()),
+        ] {
+            for meta in list_all(store, &prefix).await.expect("list") {
+                out.insert(meta.key);
+            }
+        }
+        out
+    }
+
+    async fn quarantined(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> Vec<String> {
+        list_all(store, &format!("quarantine/t/{}/a/", tenant.to_hex()))
+            .await
+            .expect("list quarantine")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect()
+    }
+
+    fn keys_of(written: &[&Written]) -> BTreeSet<String> {
+        written
+            .iter()
+            .flat_map(|w| [w.commit_key.clone(), w.data_key.clone()])
+            .collect()
+    }
+
+    async fn tick(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        compactor: &CompactorConfig,
+        safety: &MaintenanceSafetyMetrics,
+        worker: &WorkerSet,
+        live_set: &[Uuid],
+    ) {
+        tick_at(NOW_NS, store, tenant, compactor, safety, worker, live_set).await;
+    }
+
+    /// [`tick`] at an explicit clock reading, for the tests whose point is where
+    /// `now` sits relative to an hour boundary or to the memo's watermark.
+    async fn tick_at(
+        now_ns: i64,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        compactor: &CompactorConfig,
+        safety: &MaintenanceSafetyMetrics,
+        worker: &WorkerSet,
+        live_set: &[Uuid],
+    ) {
+        let clock = FixedClock::new(now_ns);
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+        run_tick_with_clock(
+            &clock,
+            store,
+            tenant,
+            compactor,
+            &RetentionConfig::default(),
+            1,
+            &mut memo,
+            safety,
+            &ownership,
+            worker,
+            live_set,
+        )
+        .await;
+    }
+
+    fn skipped(safety: &MaintenanceSafetyMetrics) -> Vec<(AlertRetentionSkipReason, u64)> {
+        AlertRetentionSkipReason::ALL
+            .iter()
+            .map(|&reason| (reason, safety.alert_retention_skipped(reason)))
+            .collect()
+    }
+
+    fn no_skips() -> Vec<(AlertRetentionSkipReason, u64)> {
+        AlertRetentionSkipReason::ALL
+            .iter()
+            .map(|&r| (r, 0))
+            .collect()
+    }
+
+    async fn exists(store: &dyn ObjectStoreBackend, key: &str) -> bool {
+        match store.get(key, ravel_object_store::GetRange::Full).await {
+            Ok(_) => true,
+            Err(StoreError::NotFound) => false,
+            Err(err) => panic!("get {key}: {err}"),
+        }
+    }
+
+    fn skipped_once(reason: AlertRetentionSkipReason) -> Vec<(AlertRetentionSkipReason, u64)> {
+        AlertRetentionSkipReason::ALL
+            .iter()
+            .map(|&r| (r, u64::from(r == reason)))
+            .collect()
+    }
+
+    /// The fixture every test below starts from: a store whose objects were
+    /// all written 100 days before `NOW_NS`, and five transitions over three
+    /// identities.
+    ///
+    /// - identity 1: firing at -100d, resolved at -99d. The resolve is its
+    ///   current state, expired.
+    /// - identity 2: firing at -98d (expired, not current), resolved at -2d.
+    /// - identity 3: firing in `NOW_NS`'s own hour, at or above any watermark
+    ///   below it, and absent from the memo.
+    struct Fixture {
+        store: MemoryStore,
+        tenant: TenantHash,
+        expired_superseded: [Written; 2],
+        expired_current: Written,
+        in_window_current: Written,
+        above_watermark: Written,
+        latest: [AlertRecord; 2],
+    }
+
+    async fn fixture() -> Fixture {
+        let store = MemoryStore::new();
+        store.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+
+        let a_firing = alert_record(1, AlertState::Firing, NOW_NS - 100 * NS_PER_DAY);
+        let a_resolved = alert_record(1, AlertState::Resolved, NOW_NS - 99 * NS_PER_DAY);
+        let b_firing = alert_record(2, AlertState::Firing, NOW_NS - 98 * NS_PER_DAY);
+        let b_resolved = alert_record(2, AlertState::Resolved, NOW_NS - 2 * NS_PER_DAY);
+        let c_firing = alert_record(3, AlertState::Firing, NOW_NS - 60_000_000_000);
+
+        let w1 = write_transition(&store, &tenant, 1, &a_firing).await;
+        let w2 = write_transition(&store, &tenant, 2, &a_resolved).await;
+        let w3 = write_transition(&store, &tenant, 3, &b_firing).await;
+        let w4 = write_transition(&store, &tenant, 4, &b_resolved).await;
+        let w5 = write_transition(&store, &tenant, 5, &c_firing).await;
+        Fixture {
+            store,
+            tenant,
+            expired_superseded: [w1, w3],
+            expired_current: w2,
+            in_window_current: w4,
+            above_watermark: w5,
+            latest: [a_resolved, b_resolved],
+        }
+    }
+
+    impl Fixture {
+        fn all_keys(&self) -> BTreeSet<String> {
+            keys_of(&[
+                &self.expired_superseded[0],
+                &self.expired_current,
+                &self.expired_superseded[1],
+                &self.in_window_current,
+                &self.above_watermark,
+            ])
+        }
+
+        /// A memo as the evaluator writes it: complete below the hour before
+        /// `NOW_NS`, naming each of identities 1 and 2 by its latest record.
+        async fn write_current_memo(&self) {
+            write_memo(
+                &self.store,
+                &self.tenant,
+                hour_of(NOW_NS) - 1,
+                &[&self.latest[0], &self.latest[1]],
+            )
+            .await;
+        }
+    }
+
+    fn solo() -> (WorkerSet, Vec<Uuid>) {
+        let worker = WorkerSet::with_defaults(NOW_NS).with_process_id(Uuid::from_u128(1));
+        let live = worker.solo_live_set();
+        (worker, live)
+    }
+
+    /// The acceptance test: one maintain tick over a tenant with a memo whose
+    /// watermark is inside the window deletes exactly the two expired records
+    /// that are no identity's current state, and their data objects, and keeps
+    /// the expired current-state record, the in-window record and the record at
+    /// or above the watermark. Nothing is skipped and nothing is quarantined.
+    #[tokio::test]
+    async fn maintain_tick_sweeps_expired_alert_history_and_keeps_current_state() {
+        let f = fixture().await;
+        f.write_current_memo().await;
+        assert_eq!(alert_keys(&f.store, &f.tenant).await, f.all_keys());
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        let survivors = keys_of(&[&f.expired_current, &f.in_window_current, &f.above_watermark]);
+        assert_eq!(
+            alert_keys(&f.store, &f.tenant).await,
+            survivors,
+            "exactly the two expired non-current transitions, record and data, are deleted"
+        );
+        assert_eq!(
+            survivors.len(),
+            6,
+            "three records and three data objects remain"
+        );
+        for gone in &f.expired_superseded {
+            assert!(
+                !exists(&f.store, &gone.commit_key).await
+                    && !exists(&f.store, &gone.data_key).await,
+                "{gone:?} must be gone"
+            );
+        }
+        assert!(
+            quarantined(&f.store, &f.tenant).await.is_empty(),
+            "a swept data object is deleted with its record, never left for the orphan sweep"
+        );
+        assert_eq!(skipped(&safety), no_skips());
+        assert!(
+            exists(&f.store, &alert_state_memo_key(&f.tenant)).await,
+            "the sweep never touches the memo"
+        );
+    }
+
+    /// No memo: the tenant is skipped under `absent`, exactly once, and no
+    /// alert object is deleted.
+    #[tokio::test]
+    async fn a_tenant_with_no_memo_is_skipped_as_absent_and_nothing_is_deleted() {
+        let f = fixture().await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(alert_keys(&f.store, &f.tenant).await, f.all_keys());
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::Absent)
+        );
+    }
+
+    /// A memo whose watermark sits below the expiry floor's hour: skipped under
+    /// `watermark_below_floor`, exactly once, nothing deleted, even though the
+    /// memo names both expired identities.
+    #[tokio::test]
+    async fn a_memo_watermark_below_the_expiry_floor_is_skipped_and_nothing_is_deleted() {
+        let f = fixture().await;
+        let floor_hour = hour_of(NOW_NS - CompactorConfig::default().alert_retention_window_ns);
+        write_memo(
+            &f.store,
+            &f.tenant,
+            floor_hour - 1,
+            &[&f.latest[0], &f.latest[1]],
+        )
+        .await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(alert_keys(&f.store, &f.tenant).await, f.all_keys());
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::WatermarkBelowFloor)
+        );
+    }
+
+    /// An undecodable memo and one of an unsupported version each skip under
+    /// their own reason, exactly once, with nothing deleted.
+    #[tokio::test]
+    async fn an_unreadable_memo_is_skipped_under_its_own_reason() {
+        for (body, reason) in [
+            (&b"not json"[..], AlertRetentionSkipReason::Undecodable),
+            (
+                &br#"{"format_version":99,"watermark_hour":0,"records":[]}"#[..],
+                AlertRetentionSkipReason::UnsupportedVersion,
+            ),
+        ] {
+            let f = fixture().await;
+            f.store
+                .put(
+                    &alert_state_memo_key(&f.tenant),
+                    Bytes::copy_from_slice(body),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        checksum: None,
+                    },
+                )
+                .await
+                .expect("put memo");
+            let safety = MaintenanceSafetyMetrics::default();
+            let (worker, live) = solo();
+            tick(
+                &f.store,
+                &f.tenant,
+                &CompactorConfig::default(),
+                &safety,
+                &worker,
+                &live,
+            )
+            .await;
+
+            assert_eq!(alert_keys(&f.store, &f.tenant).await, f.all_keys());
+            assert_eq!(skipped(&safety), skipped_once(reason), "{reason:?}");
+        }
+    }
+
+    /// A worker that does not own `(tenant, Alerts, ALERT_SHARD)` under the live
+    /// set sweeps nothing and reads no memo, so it counts no skip either.
+    ///
+    /// The orphan seeded here is what makes the ownership gate load-bearing in
+    /// this test rather than decorative: the retention sweep alone would delete
+    /// nothing under the memo it is given (every expired record it names is a
+    /// current state), so without an orphan the assertions hold whether or not
+    /// `sweep_shard` ran. Watch it fail: move the `sweep_shard` call in
+    /// `run_alert_retention` out to the `run_tick_with_clock` caller, outside
+    /// the `worker.owns_unit` gate.
+    #[tokio::test]
+    async fn a_worker_that_does_not_own_the_alerts_unit_sweeps_nothing() {
+        let f = fixture().await;
+        f.write_current_memo().await;
+        let orphan = orphan_data_key(&f.tenant);
+        f.store
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let (worker, _) = solo();
+        let peer = (2..1_000u128)
+            .map(Uuid::from_u128)
+            .find(|peer| {
+                !worker.owns_unit(
+                    &[worker.process_id(), *peer],
+                    &f.tenant,
+                    Signal::Alerts,
+                    ALERT_SHARD,
+                )
+            })
+            .expect("some peer outweighs this worker for the alerts unit");
+        let live = vec![worker.process_id(), peer];
+        let safety = MaintenanceSafetyMetrics::default();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        let mut expected = f.all_keys();
+        expected.insert(orphan);
+        assert_eq!(alert_keys(&f.store, &f.tenant).await, expected);
+        assert!(
+            quarantined(&f.store, &f.tenant).await.is_empty(),
+            "a non-owner runs neither sweep, so the orphan the owner would quarantine stays put"
+        );
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// `--alert-retention 0` disables the sweep: the same tick that deletes two
+    /// records under the default window deletes nothing, and reads no memo.
+    #[tokio::test]
+    async fn a_zero_alert_retention_window_disables_the_sweep() {
+        let f = fixture().await;
+        f.write_current_memo().await;
+        let orphan = orphan_data_key(&f.tenant);
+        f.store
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        let disabled = CompactorConfig {
+            alert_retention_window_ns: 0,
+            ..CompactorConfig::default()
+        };
+        tick(&f.store, &f.tenant, &disabled, &safety, &worker, &live).await;
+
+        let mut expected = f.all_keys();
+        expected.insert(orphan);
+        assert_eq!(alert_keys(&f.store, &f.tenant).await, expected);
+        assert!(quarantined(&f.store, &f.tenant).await.is_empty());
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// A data key in the alerts shard's `l0/` space that no commit record
+    /// names: what a crash between the retention sweep's record delete and its
+    /// data delete leaves behind.
+    fn orphan_data_key(tenant: &TenantHash) -> String {
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Alerts,
+            shard: ALERT_SHARD,
+            writer_id: WRITER,
+            writer_epoch: WRITER_EPOCH,
+            writer_seq: 99,
+            object_size: 6,
+            content_hash: *blake3::hash(b"orphan").as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: NOW_NS - 100 * NS_PER_DAY,
+            max_event_ts_ns: NOW_NS - 100 * NS_PER_DAY,
+            min_ingest_ts_ns: NOW_NS - 100 * NS_PER_DAY,
+            max_ingest_ts_ns: NOW_NS - 100 * NS_PER_DAY,
+            segment_format_version: u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: NOW_NS - 100 * NS_PER_DAY,
+            ingest_hour_bucket: hour_of(NOW_NS - 100 * NS_PER_DAY),
+        })
+        .expect("build commit record");
+        keys::reconstruct_data_key(&commit).expect("data key")
+    }
+
+    /// The orphan sweep runs over the alerts shard: a data object with no
+    /// commit record, older than the orphan age gate, is moved out of the live
+    /// keyspace into quarantine, and every referenced object stays. It runs
+    /// whether or not the memo lets the retention sweep run; here there is no
+    /// memo at all.
+    #[tokio::test]
+    async fn the_alerts_shard_orphan_sweep_reclaims_a_record_less_data_object() {
+        let f = fixture().await;
+        let orphan = orphan_data_key(&f.tenant);
+        f.store
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert!(
+            !exists(&f.store, &orphan).await,
+            "the orphan left the live keyspace"
+        );
+        let moved = quarantined(&f.store, &f.tenant).await;
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(
+            moved[0].starts_with(&format!("quarantine/{orphan}/")),
+            "{moved:?}"
+        );
+        assert_eq!(
+            alert_keys(&f.store, &f.tenant).await,
+            f.all_keys(),
+            "every referenced alert object stays"
+        );
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::Absent)
+        );
+    }
+
+    /// The other half of the absent-memo pair (the first is
+    /// `a_tenant_with_no_memo_is_skipped_as_absent_and_nothing_is_deleted`): a
+    /// tenant that has never written an alert transition has no memo either, and
+    /// that is not a skip. It is the steady state of every tenant in a
+    /// deployment that configures no alert rules, so counting it would make the
+    /// counter climb forever on a healthy deployment and log a warning per
+    /// tenant per tick.
+    #[tokio::test]
+    async fn a_tenant_with_no_alert_records_and_no_memo_is_not_counted_at_all() {
+        let store = MemoryStore::new();
+        store.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("quiet").hash();
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert!(alert_keys(&store, &tenant).await.is_empty());
+        assert!(quarantined(&store, &tenant).await.is_empty());
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// A memo read that fails against object storage with something other than
+    /// not-found is counted under `store_error`, exactly once, and deletes
+    /// nothing. It is not one of the memo-state reasons: the memo may be
+    /// perfectly good and the store may be having a bad minute, so the tick
+    /// retries. Counting it is what tells a stalled sweep from a quiet one.
+    #[tokio::test]
+    async fn a_memo_read_that_fails_against_the_store_is_counted_as_store_error() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let store = FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Permanent("alert state memo unreadable".to_string()),
+                )
+                .with_key_contains("/a/state/latest"),
+            ),
+        );
+        let tenant = TenantId::new("acme").hash();
+
+        // One expired transition the sweep would delete under a readable memo,
+        // and a memo that names neither it nor anything else.
+        let expired = alert_record(1, AlertState::Firing, NOW_NS - 100 * NS_PER_DAY);
+        let written = write_transition(&store, &tenant, 1, &expired).await;
+        write_memo(&store, &tenant, hour_of(NOW_NS) - 1, &[]).await;
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(alert_keys(&store, &tenant).await, keys_of(&[&written]));
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::StoreError)
+        );
+    }
+
+    /// A memo whose `watermark_hour` is ahead of the clock cannot widen what the
+    /// sweep may delete. The driver clamps the watermark to the hour of the
+    /// injected `now`, so a record in an hour at or after `now` is kept without
+    /// a GET, exactly as a record in the watermark hour is.
+    ///
+    /// The window here is 45 minutes and `now` is 50 minutes into an hour, which
+    /// is what makes an expired record in `now`'s own hour possible at all: with
+    /// an hour-aligned `now` and a window of whole hours, every record in an
+    /// hour at or above `now`'s is younger than the expiry floor and the clamp
+    /// decides nothing. The control record two hours back proves the sweep ran.
+    ///
+    /// Watch it fail: drop `.min(now_hour)` from the `watermark_hour` binding in
+    /// `alert_keep_set`. The unclamped watermark sits three hours ahead, the
+    /// record's hour is then strictly below it, and it is deleted.
+    #[tokio::test]
+    async fn a_memo_watermark_ahead_of_now_cannot_delete_a_record_in_the_current_hour() {
+        const MINUTE_NS: i64 = 60 * 1_000_000_000;
+        let now_ns = NOW_NS + 50 * MINUTE_NS;
+
+        let store = MemoryStore::new();
+        store.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+
+        // Expired against a 45-minute window (the floor is NOW + 5 min), and in
+        // the same ingest hour as `now`.
+        let in_current_hour = alert_record(1, AlertState::Firing, NOW_NS + 2 * MINUTE_NS);
+        // Expired and two hours below the clamped watermark: the control.
+        let below = alert_record(2, AlertState::Firing, NOW_NS - 2 * NS_PER_HOUR);
+        let kept = write_transition(&store, &tenant, 1, &in_current_hour).await;
+        let swept = write_transition(&store, &tenant, 2, &below).await;
+        // A watermark three hours past `now`, naming no identity at all: a
+        // decodable memo from a replica whose clock ran ahead.
+        write_memo(&store, &tenant, hour_of(now_ns) + 3, &[]).await;
+
+        let compactor = CompactorConfig {
+            alert_retention_window_ns: 45 * MINUTE_NS,
+            // Both records are minutes old on this clock, so the horizon has to
+            // be out of the way for the expiry gate to be the one under test.
+            protection_horizon_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let worker = WorkerSet::with_defaults(now_ns).with_process_id(Uuid::from_u128(1));
+        let live = worker.solo_live_set();
+        tick_at(now_ns, &store, &tenant, &compactor, &safety, &worker, &live).await;
+
+        assert_eq!(
+            alert_keys(&store, &tenant).await,
+            keys_of(&[&kept]),
+            "the record in `now`'s own hour survives and the one below the watermark does not"
+        );
+        assert!(
+            !exists(&store, &swept.commit_key).await,
+            "the sweep really ran: the control record two hours below the watermark is gone"
+        );
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// The watermark boundary the driver's floor check sits on, which no other
+    /// driver test reaches: a memo whose `watermark_hour` is exactly the expiry
+    /// floor's hour is usable, and an expired record in that hour survives
+    /// because the sweep deletes only strictly below the watermark.
+    ///
+    /// The window is 90 days plus half an hour so that the expiry floor falls
+    /// mid-hour. With the default whole-hour window the floor hour starts
+    /// exactly at the floor, no record in it can be expired, and the hour
+    /// prefilter answers before the watermark rule is consulted at all.
+    ///
+    /// Watch it fail two ways:
+    ///
+    /// - replace `watermark_hour` with `u32::MAX` at the `AlertKeepSet::new`
+    ///   call in `alert_keep_set`: the floor-hour record is then strictly below
+    ///   the watermark, is fetched, is expired and past the horizon, is not in
+    ///   the keep set, and is deleted.
+    /// - change `if i64::from(watermark_hour) < floor_hour` to `<=` in
+    ///   `alert_keep_set`: the tenant is skipped under `watermark_below_floor`
+    ///   and nothing is deleted at all, so the two expired records below the
+    ///   watermark survive with it. The record this test is named for survives
+    ///   either way, which is why the survivor set is asserted whole rather than
+    ///   one key at a time.
+    #[tokio::test]
+    async fn a_memo_watermark_at_the_floor_hour_keeps_an_expired_record_in_that_hour() {
+        const HALF_HOUR_NS: i64 = 30 * 60 * 1_000_000_000;
+        let f = fixture().await;
+        let window_ns = 90 * NS_PER_DAY + HALF_HOUR_NS;
+        let floor_hour = hour_of(NOW_NS - window_ns);
+
+        // 45 minutes before the end of the floor hour: inside it, and older than
+        // the expiry floor 30 minutes further on.
+        let in_floor_hour = alert_record(
+            4,
+            AlertState::Firing,
+            NOW_NS - 90 * NS_PER_DAY - 45 * 60 * 1_000_000_000,
+        );
+        assert_eq!(hour_of(in_floor_hour.ts_ns), floor_hour);
+        let survivor = write_transition(&f.store, &f.tenant, 6, &in_floor_hour).await;
+        // The memo names identities 1 and 2 only, never identity 4.
+        write_memo(
+            &f.store,
+            &f.tenant,
+            floor_hour,
+            &[&f.latest[0], &f.latest[1]],
+        )
+        .await;
+
+        let compactor = CompactorConfig {
+            alert_retention_window_ns: window_ns,
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(&f.store, &f.tenant, &compactor, &safety, &worker, &live).await;
+
+        assert_eq!(
+            alert_keys(&f.store, &f.tenant).await,
+            keys_of(&[
+                &f.expired_current,
+                &f.in_window_current,
+                &f.above_watermark,
+                &survivor,
+            ]),
+            "the expired record in the watermark hour survives, and the two expired records \
+             below it do not"
+        );
+        assert_eq!(
+            skipped(&safety),
+            no_skips(),
+            "a watermark equal to the floor hour is usable, not a skip"
+        );
     }
 }
