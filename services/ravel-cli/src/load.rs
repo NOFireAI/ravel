@@ -474,7 +474,7 @@ pub fn parse_mapping_document(text: &str, signal: SignalArg) -> Result<MappingSe
         let value = doc
             .remove(section)
             .unwrap_or(toml::Value::Table(toml::Table::new()));
-        return deserialize_section(value, Some(section), signal);
+        return deserialize_section(text, &value, Some(section), signal);
     }
 
     if signal != SignalArg::Logs {
@@ -494,7 +494,7 @@ pub fn parse_mapping_document(text: &str, signal: SignalArg) -> Result<MappingSe
             }
         )));
     }
-    deserialize_section(toml::Value::Table(doc), None, signal)
+    deserialize_section(text, &toml::Value::Table(doc), None, signal)
 }
 
 /// Deserialize one already-selected section table into its typed mapping.
@@ -504,27 +504,44 @@ pub fn parse_mapping_document(text: &str, signal: SignalArg) -> Result<MappingSe
 /// prefix, and it is there so a mapping written before ADR-1751 still fails
 /// with the message it has always failed with (`invalid --mapping TOML: ...`)
 /// rather than with one naming a section its author never wrote.
+///
+/// The typed pass re-reads `text` rather than converting `value`: only a
+/// deserializer over the source text carries spans, so this is what keeps the
+/// line and column in a schema error. The caller has already checked that the
+/// document holds this one section and nothing beside it.
 fn deserialize_section(
-    value: toml::Value,
+    text: &str,
+    value: &toml::Value,
     section: Option<&str>,
     signal: SignalArg,
 ) -> Result<MappingSection, LoadError> {
+    #[derive(Deserialize)]
+    struct LogsSection {
+        logs: Mapping,
+    }
+    #[derive(Deserialize)]
+    struct MetricsSection {
+        metrics: MetricsMapping,
+    }
+
     let bad = |e: toml::de::Error| match section {
         Some(section) => LoadError::Setup(format!("invalid --mapping [{section}] section: {e}")),
         None => LoadError::Setup(format!("invalid --mapping TOML: {e}")),
     };
-    match signal {
-        SignalArg::Logs => value
-            .try_into::<Mapping>()
+    match (signal, section) {
+        (SignalArg::Logs, None) => toml::from_str::<Mapping>(text)
             .map(MappingSection::Logs)
             .map_err(bad),
-        SignalArg::Metrics => {
-            reject_native_histogram_keys(&value)?;
-            let mapping = value.try_into::<MetricsMapping>().map_err(bad)?;
+        (SignalArg::Logs, Some(_)) => toml::from_str::<LogsSection>(text)
+            .map(|doc| MappingSection::Logs(doc.logs))
+            .map_err(bad),
+        (SignalArg::Metrics, _) => {
+            reject_native_histogram_keys(value)?;
+            let mapping = toml::from_str::<MetricsSection>(text).map_err(bad)?.metrics;
             mapping.validate()?;
             Ok(MappingSection::Metrics(mapping))
         }
-        SignalArg::Spans => Err(spans_not_supported()),
+        (SignalArg::Spans, _) => Err(spans_not_supported()),
     }
 }
 
@@ -861,6 +878,15 @@ pub const ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes directly t
      docs/guides/ingest.md). Retention is measured from load time, not from the records' event \
      times.";
 
+/// [`ADMISSION_BYPASS_WARNING`] for a metrics load, which goes through the
+/// metrics ingest router and reads one sequential cursor.
+pub const METRICS_ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes directly to the \
+     metrics ingest router. The per-tenant admission control that guards the HTTP ingest path \
+     is NOT applied to loaded data. There is no deduplication: re-running after a failure \
+     re-ingests every row it is given. --skip-rows can resume a failed load positionally, but \
+     only one started with --pipeline-depth 1 (see docs/guides/ingest.md). Retention is \
+     measured from load time, not from the samples' event times.";
+
 /// Near-cap warning threshold: the loader warns when the widest single object's
 /// `dynamic_columns_used` reaches this fraction of `max_dynamic_columns`,
 /// expressed as a percentage so the comparison is exact integer arithmetic
@@ -1080,7 +1106,12 @@ pub(crate) async fn run_warning_to(
 
     // A diagnostic that cannot be written is not worth failing a durable load
     // over, here or below.
-    let _ = writeln!(warnings, "{ADMISSION_BYPASS_WARNING}");
+    let admission_warning = if signal == SignalArg::Metrics {
+        METRICS_ADMISSION_BYPASS_WARNING
+    } else {
+        ADMISSION_BYPASS_WARNING
+    };
+    let _ = writeln!(warnings, "{admission_warning}");
 
     let mapping_text = std::fs::read_to_string(mapping_path)
         .map_err(|e| anyhow::anyhow!("failed to read --mapping {}: {e}", mapping_path.display()))?;
@@ -1144,7 +1175,9 @@ pub(crate) async fn run_warning_to(
             // `rows_skipped` in the summary above cannot show that the request
             // exceeded the file, so a resume script reading only the exit code
             // would record the load as done.
-            if let Some(warning) = skip_rows_past_end_warning(&report) {
+            if let Some(warning) =
+                skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
+            {
                 let _ = writeln!(warnings, "{warning}");
             }
             // Early, so an operator watching a long load sees it as soon as it is
@@ -1171,7 +1204,7 @@ pub(crate) async fn run_warning_to(
             Ok(())
         }
         Err(err) => {
-            print_durable_tokens(&err);
+            print_durable_tokens(&err, LOGS_RESUMABLE_SETTINGS);
             // The report that held these figures is dropped with the error, and
             // they are the only thing an operator can act on to resume: print
             // them beside the error, with the settings precondition that says
@@ -1213,6 +1246,18 @@ async fn run_metrics(
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    // The logs path rejects these; a lever the metrics path ignores is still
+    // not one that may take a value its documentation calls invalid.
+    if read_cursors == Some(0) {
+        return Err(anyhow::Error::new(LoadError::Setup(
+            READ_CURSORS_ZERO.to_string(),
+        )));
+    }
+    if decode_queue_batches == 0 {
+        return Err(anyhow::Error::new(LoadError::Setup(
+            DECODE_QUEUE_BATCHES_ZERO.to_string(),
+        )));
+    }
     if let Some(warning) = metrics_unused_lever_warning(read_cursors, decode_queue_batches) {
         let _ = writeln!(warnings, "{warning}");
     }
@@ -1236,24 +1281,16 @@ async fn run_metrics(
     {
         Ok(report) => {
             print_metrics_summary(&report);
-            if report.skip_rows_requested > report.file_total_rows {
-                let _ = writeln!(
-                    warnings,
-                    "warning: --skip-rows {} is past the end of this file, which holds {} rows. \
-                     Nothing was loaded. Resuming an already-complete file takes --skip-rows equal \
-                     to the row count, so a larger value is a typo or an offset from a different \
-                     file.",
-                    report.skip_rows_requested, report.file_total_rows
-                );
+            if let Some(warning) =
+                skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
+            {
+                let _ = writeln!(warnings, "{warning}");
             }
             Ok(())
         }
         Err(err) => {
-            print_durable_tokens(&err);
-            // The metrics path always reads one cursor, so the resume hint's
-            // read-cursor precondition is satisfied by construction and the
-            // pipeline depth is the only one left to state.
-            if let Some(hint) = resume_hint(&err, Some(1), pipeline_depth) {
+            print_durable_tokens(&err, METRICS_RESUMABLE_SETTINGS);
+            if let Some(hint) = metrics_resume_hint(&err, pipeline_depth) {
                 let _ = writeln!(warnings, "{hint}");
                 if mapping.is_histogram() {
                     let _ = writeln!(
@@ -1270,6 +1307,21 @@ async fn run_metrics(
         }
     }
 }
+
+/// The flags under which a failed logs load's landed rows are a file prefix.
+const LOGS_RESUMABLE_SETTINGS: &str = "--read-cursors 1 --pipeline-depth 1";
+
+/// The same for a metrics load, which always reads one sequential cursor.
+const METRICS_RESUMABLE_SETTINGS: &str = "--pipeline-depth 1";
+
+/// `--read-cursors 0`, rejected on both signals.
+const READ_CURSORS_ZERO: &str = "--read-cursors must be at least 1, or omitted for automatic \
+                                 sizing (min(shard count, row-group count)); 0 was given";
+
+/// `--decode-queue-batches 0`, rejected on both signals.
+const DECODE_QUEUE_BATCHES_ZERO: &str = "--decode-queue-batches must be at least 1 (the number \
+                                         of decoded batches allowed to queue ahead of the shard \
+                                         writers); 0 was given";
 
 /// The warning naming the levers a metrics load does not use, or `None` when
 /// the operator left both at a value that changes nothing.
@@ -1329,14 +1381,15 @@ fn print_metrics_summary(report: &MetricsLoadReport) {
 /// Named both numbers on purpose: the summary prints the CLAMPED
 /// `rows_skipped`, so without the requested value beside the file's total an
 /// operator cannot tell a completed resume from an offset that missed the file
-/// entirely.
-fn skip_rows_past_end_warning(report: &LoadReport) -> Option<String> {
-    if report.skip_rows_requested > report.file_total_rows {
+/// entirely. Takes the two figures rather than a report so the logs and the
+/// metrics report share it.
+fn skip_rows_past_end_warning(skip_rows_requested: u64, file_total_rows: u64) -> Option<String> {
+    if skip_rows_requested > file_total_rows {
         Some(format!(
-            "warning: --skip-rows {} is past the end of this file, which holds {} rows. Nothing \
-             was loaded. Resuming an already-complete file takes --skip-rows equal to the row \
-             count, so a larger value is a typo or an offset from a different file.",
-            report.skip_rows_requested, report.file_total_rows
+            "warning: --skip-rows {skip_rows_requested} is past the end of this file, which holds \
+             {file_total_rows} rows. Nothing was loaded. Resuming an already-complete file takes \
+             --skip-rows equal to the row count, so a larger value is a typo or an offset from a \
+             different file."
         ))
     } else {
         None
@@ -1438,8 +1491,14 @@ fn print_stage_timings(report: &LoadReport) {
 /// the failing batch's ack round did not resolve at all -- an ack-deadline
 /// timeout, or a shard channel dying at send time -- because no per-shard ack
 /// is observed then. Every non-flush variant's tokens are exact: the failing
-/// row or batch never reached `LogIngestRouter::write`.
-fn print_durable_tokens(err: &LoadError) {
+/// row or batch never reached the router's `write`. The one exception is a
+/// metrics refusal whose drain of earlier writes found a write failure; its
+/// reason names that failure, and the Flush caveat applies to it.
+///
+/// `resumable_with` is the flag set under which this signal's failed load is a
+/// resumable prefix ([`LOGS_RESUMABLE_SETTINGS`] or
+/// [`METRICS_RESUMABLE_SETTINGS`]).
+fn print_durable_tokens(err: &LoadError, resumable_with: &str) {
     let tokens = err.durable_tokens();
     let is_flush = matches!(err, LoadError::Flush { .. });
     if tokens.is_empty() {
@@ -1465,9 +1524,8 @@ fn print_durable_tokens(err: &LoadError) {
     println!(
         "{} commit token(s)/segment(s) were durable before the failure (a partial load, not a \
          rollback; --skip-rows can resume it instead of re-ingesting the whole file, but only \
-         when this run used --read-cursors 1 --pipeline-depth 1 -- see the resume figures printed \
-         with the error. There is still no deduplication: nothing checks the offset a re-run is \
-         given){suffix}:",
+         when this run used {resumable_with} -- see the resume figures printed with the error. \
+         There is still no deduplication: nothing checks the offset a re-run is given){suffix}:",
         tokens.len()
     );
     for token in tokens {
@@ -1526,7 +1584,36 @@ fn resume_hint(
              resumable this way"
         )
     };
-    Some(format!(
+    Some(resume_block(resume, &verdict))
+}
+
+/// [`resume_hint`] for a metrics load. That path always reads one sequential
+/// cursor and ignores `--read-cursors`, so the pipeline depth is the only
+/// setting the verdict names.
+fn metrics_resume_hint(err: &LoadError, pipeline_depth: usize) -> Option<String> {
+    let resume = err.resume_figures()?;
+    let verdict = if pipeline_depth == 1 {
+        "this run used --pipeline-depth 1, so the rows that landed are a contiguous prefix of \
+         the file and this offset loses nothing. One batch straddles every shard it touches, \
+         though, and the failing batch can have committed on some shards and not others; those \
+         rows are in the durable token list above and are not counted in rows_written, so \
+         resuming here re-ingests them"
+            .to_string()
+    } else {
+        format!(
+            "this run used --pipeline-depth {pipeline_depth}, so the rows that landed are NOT a \
+             contiguous prefix of the file: a batch submitted after the failing one can still \
+             have committed. Resuming at this offset would both re-ingest committed rows and skip \
+             rows that never landed. Only a load started with --pipeline-depth 1 is resumable \
+             this way"
+        )
+    };
+    Some(resume_block(resume, &verdict))
+}
+
+/// The figures and verdict both resume hints print.
+fn resume_block(resume: ResumeFigures, verdict: &str) -> String {
+    format!(
         "resume figures for this failed load:\n  \
          rows_skipped     : {skipped}\n  \
          rows_written     : {written}\n  \
@@ -1536,7 +1623,7 @@ fn resume_hint(
         skipped = resume.rows_skipped,
         written = resume.rows_written,
         next = resume.next_skip_rows(),
-    ))
+    )
 }
 
 /// Result of a successful (or partially-durable) load, for the summary output.
@@ -1991,11 +2078,7 @@ async fn load_instrumented(
     // operator-facing (issue #560), so 0 is a rejected value, not a silent
     // clamp to 1.
     if read_cursors == Some(0) {
-        return Err(LoadError::Setup(
-            "--read-cursors must be at least 1, or omitted for automatic sizing \
-             (min(shard count, row-group count)); 0 was given"
-                .to_string(),
-        ));
+        return Err(LoadError::Setup(READ_CURSORS_ZERO.to_string()));
     }
     // Same shape as the guards above: `--max-inflight-flushes` is the
     // operator-facing lever bounding how many flushes one shard may run at once
@@ -2015,11 +2098,7 @@ async fn load_instrumented(
     // ahead of the encoders (issue #680). A depth of 0 is a channel that can
     // hold no batch, so it is rejected rather than silently clamped.
     if decode_queue_batches == 0 {
-        return Err(LoadError::Setup(
-            "--decode-queue-batches must be at least 1 (the number of decoded batches allowed to \
-             queue ahead of the shard writers); 0 was given"
-                .to_string(),
-        ));
+        return Err(LoadError::Setup(DECODE_QUEUE_BATCHES_ZERO.to_string()));
     }
     // Same shape as the guards above: `--target-bytes` is the operator-facing
     // flush-target lever (issue #801). A target of 0 is not a smaller target
@@ -11611,8 +11690,9 @@ type = "i64"
                 (1_000, 10),
                 "the unclamped request and the file's row count are both carried"
             );
-            let warning = skip_rows_past_end_warning(&report)
-                .expect("a request past the end of the file must warn");
+            let warning =
+                skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
+                    .expect("a request past the end of the file must warn");
             assert!(
                 warning.contains("--skip-rows 1000") && warning.contains("10 rows"),
                 "the warning names the requested offset and the file's row count: {warning}"
@@ -11641,7 +11721,8 @@ type = "i64"
                 "a skip of exactly the row count drops every row and writes none"
             );
             assert!(
-                skip_rows_past_end_warning(&report).is_none(),
+                skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
+                    .is_none(),
                 "a completed resume is not an operator error and must not warn"
             );
         }
@@ -12565,6 +12646,150 @@ type = "i64"
             assert!(
                 landed[0].contains(&prefix),
                 "the reported token names the object that landed ({prefix} in {landed:?})"
+            );
+        }
+
+        /// A two-row metrics file whose second row is far in the future, and
+        /// the mapping file beside it, for the CLI-level tests below.
+        fn rejecting_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            use parquet::arrow::ArrowWriter;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("metrics.parquet");
+            let b = batch(vec![
+                (
+                    "ts",
+                    i64_col(vec![NOW_NS - 60_000_000_000, NOW_NS + 86_400_000_000_000]),
+                ),
+                (
+                    "value",
+                    Arc::new(Float64Array::from(vec![1.0, 1.0])) as ArrayRef,
+                ),
+                ("host", str_col(vec!["a", "a"])),
+            ]);
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+            writer.write(&b).expect("write batch");
+            writer.close().expect("close writer");
+            let mapping_path = dir.path().join("mapping.toml");
+            std::fs::write(&mapping_path, DRAIN_MAPPING).expect("write mapping");
+            (dir, pq, mapping_path)
+        }
+
+        async fn run_metrics_cli(
+            pq: &Path,
+            mapping_path: &Path,
+            read_cursors: Option<usize>,
+            pipeline_depth: usize,
+            decode_queue_batches: usize,
+        ) -> (anyhow::Result<()>, String) {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let mut sink: Vec<u8> = Vec::new();
+            let outcome = run_warning_to(
+                store,
+                pq,
+                "acme",
+                mapping_path,
+                SignalArg::Metrics,
+                1,
+                1,
+                0,
+                read_cursors,
+                pipeline_depth,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                decode_queue_batches,
+                DEFAULT_TARGET_BYTES,
+                None,
+                NOW_NS,
+                &mut sink,
+            )
+            .await;
+            (
+                outcome,
+                String::from_utf8(sink).expect("warnings are utf-8"),
+            )
+        }
+
+        /// A failed metrics load above depth 1 blames the pipeline depth only
+        /// and names `--pipeline-depth 1` as the remedy, never the
+        /// `--read-cursors` flag the metrics path ignores.
+        ///
+        /// Non-vacuity: against `resume_hint(&err, Some(1), pipeline_depth)` in
+        /// `run_metrics`, the emitted-verdict assertion fails, the stream
+        /// carrying "this run used --read-cursors 1 and --pipeline-depth 2".
+        #[tokio::test]
+        async fn a_failed_metrics_load_names_only_the_pipeline_depth() {
+            let (_dir, pq, mapping_path) = rejecting_fixture();
+            let (outcome, emitted) =
+                run_metrics_cli(&pq, &mapping_path, None, 2, DEFAULT_DECODE_QUEUE_BATCHES).await;
+            let err = outcome.expect_err("row 1 is far in the future and is rejected");
+            let load_err = err
+                .downcast::<LoadError>()
+                .expect("the CLI error wraps the typed load error");
+            assert!(
+                matches!(load_err, LoadError::RowRejected { row: 1, .. }),
+                "{load_err:?}"
+            );
+
+            let verdict = "this run used --pipeline-depth 2, so the rows that landed are NOT a \
+                           contiguous prefix of the file: a batch submitted after the failing \
+                           one can still have committed. Resuming at this offset would both \
+                           re-ingest committed rows and skip rows that never landed. Only a load \
+                           started with --pipeline-depth 1 is resumable this way.";
+            assert!(
+                emitted.contains(verdict),
+                "the metrics verdict is emitted: {emitted}"
+            );
+            assert!(
+                emitted.contains(METRICS_ADMISSION_BYPASS_WARNING),
+                "the metrics admission warning is the one printed: {emitted}"
+            );
+            assert!(
+                !emitted.contains("--read-cursors"),
+                "a metrics failure never names --read-cursors: {emitted}"
+            );
+
+            let hint = metrics_resume_hint(&load_err, 2).expect("a row rejection has figures");
+            assert_eq!(
+                hint,
+                format!(
+                    "resume figures for this failed load:\n  \
+                     rows_skipped     : 0\n  \
+                     rows_written     : 1\n  \
+                     next --skip-rows : 1 (rows_skipped + rows_written)\n\
+                     {verdict} There is no deduplication and no per-file idempotency marker, so \
+                     nothing checks the offset a re-run is given; see docs/guides/ingest.md for \
+                     the procedure."
+                )
+            );
+        }
+
+        /// `--read-cursors 0` and `--decode-queue-batches 0` are rejected on a
+        /// metrics load with the logs path's messages, before the warning that
+        /// the metrics path ignores them.
+        ///
+        /// Non-vacuity: without the two guards in `run_metrics` the load runs
+        /// and fails on the fixture's far-future row instead, so the message
+        /// assertion fails with "row 1: timestamp is ... ahead of load time".
+        #[tokio::test]
+        async fn zero_read_cursors_or_decode_queue_is_rejected_on_a_metrics_load() {
+            let (_dir, pq, mapping_path) = rejecting_fixture();
+            for (read_cursors, decode_queue, message) in [
+                (Some(0), DEFAULT_DECODE_QUEUE_BATCHES, READ_CURSORS_ZERO),
+                (None, 0, DECODE_QUEUE_BATCHES_ZERO),
+            ] {
+                let (outcome, emitted) =
+                    run_metrics_cli(&pq, &mapping_path, read_cursors, 1, decode_queue).await;
+                let err = outcome.expect_err("a zero lever is rejected");
+                assert_eq!(err.to_string(), message);
+                assert!(
+                    !emitted.contains("a metrics load ignores"),
+                    "the rejection comes before the unused-lever warning: {emitted}"
+                );
+            }
+            assert!(READ_CURSORS_ZERO.starts_with("--read-cursors must be at least 1"));
+            assert!(
+                DECODE_QUEUE_BATCHES_ZERO.starts_with("--decode-queue-batches must be at least 1")
             );
         }
 
