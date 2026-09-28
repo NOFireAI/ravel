@@ -875,7 +875,7 @@ async fn a_failed_histogram_load_resumes_on_a_data_point_boundary() {
         panic!("expected a per-row rejection, got {err:?}");
     };
     assert_eq!(*row, 5, "the refusal names the row it read");
-    let resume = resume.clone();
+    let resume = *resume;
     assert_eq!(
         resume.rows_written, 3,
         "only the rows of the data point whose write acked are durable; row 3 opened the \
