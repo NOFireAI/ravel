@@ -201,6 +201,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ravel-cli load --signal spans` reads hex id columns that the writer
+  dictionary-encoded** (ADR-1751 follow-up task 2 review, issues #1751 and
+  #1712). The loader opens its Parquet reader with a dictionary-preserving
+  schema, which retypes a `Utf8` column whose pages are all dictionary encoded
+  to `Dictionary(Int32, Utf8)`. A default `ArrowWriter` dictionary-encodes a
+  string column until its dictionary outgrows the page limit, so a hex
+  `trace_id`, `span_id` or `parent_span_id` column in an ordinary trace export
+  reached the spans loader as a dictionary and was refused with "expected a
+  binary column of 16 bytes or a hex string column of 32 characters", and the
+  empty-string root parent never got as far as the root-span test. The id
+  column check now judges a dictionary column by its value type, and the id
+  and emptiness reads resolve the row's key to its value first, as the name,
+  status-message and string-attribute reads already did.
+
 - **Alert sink delivery is bounded per evaluation tick, and ADR-0117's stated
   per-tick publish bound is corrected** (issues #2063, #2064). The evaluator
   delivered every undelivered notification to every sink sequentially with no

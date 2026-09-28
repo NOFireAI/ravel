@@ -24,6 +24,7 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array,
     StringArray,
 };
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 
@@ -827,6 +828,199 @@ async fn an_id_column_of_the_wrong_width_is_refused() {
          or truncates an id, so no row of this column can produce one.",
         "the refusal names the column, the width it has, and the width it needs"
     );
+}
+
+/// Hex-string id columns written by a DEFAULT `ArrowWriter` load, including
+/// the empty-string root parent and a parent repeated across rows.
+///
+/// The writer dictionary-encodes a string column until its dictionary passes
+/// about 1 MiB, so a hex `trace_id`/`span_id`/`parent_span_id` column in any
+/// ordinary trace export arrives at the loader as `Dictionary(Int32, Utf8)`,
+/// not as `Utf8`. The `reader_schema_for_path` assertion below is what makes
+/// this test about that: without it the whole case would pass on a plain
+/// `Utf8` file and assert nothing about the dictionary path.
+#[tokio::test]
+async fn dictionary_encoded_hex_id_columns_load() {
+    let load_ns = now_ns();
+    let event_ns = load_ns - 60 * NS_PER_SEC;
+
+    let trace_id = [0xA1u8; 16];
+    let root_span_id = [0x11u8; 8];
+    let child_a_span_id = [0x22u8; 8];
+    let child_b_span_id = [0x33u8; 8];
+    let trace_hex = hex::encode(trace_id);
+    let root_hex = hex::encode(root_span_id);
+
+    // One trace, three rows: a root whose parent cell is the EMPTY STRING, and
+    // two children repeating the same parent id. Every id column holds fewer
+    // distinct values than rows, which is exactly the shape the writer's
+    // dictionary keeps.
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "trace_id".to_string(),
+            str_col(vec![
+                trace_hex.as_str(),
+                trace_hex.as_str(),
+                trace_hex.as_str(),
+            ]),
+        ),
+        (
+            "span_id".to_string(),
+            str_col(vec![
+                root_hex.as_str(),
+                hex::encode(child_a_span_id).as_str(),
+                hex::encode(child_b_span_id).as_str(),
+            ]),
+        ),
+        (
+            "parent_span_id".to_string(),
+            str_col(vec!["", root_hex.as_str(), root_hex.as_str()]),
+        ),
+        (
+            "name".to_string(),
+            str_col(vec!["GET /cart", "db.query", "db.query"]),
+        ),
+        (
+            "start_ns".to_string(),
+            i64_col(vec![event_ns, event_ns, event_ns]),
+        ),
+        (
+            "end_ns".to_string(),
+            i64_col(vec![event_ns + 1, event_ns + 2, event_ns + 3]),
+        ),
+        (
+            "status_code".to_string(),
+            opt_i64_col(vec![Some(1), Some(1), Some(1)]),
+        ),
+        (
+            "status_message".to_string(),
+            opt_str_col(vec![Some("fine"), Some("fine"), Some("fine")]),
+        ),
+        (
+            "svc".to_string(),
+            opt_str_col(vec![Some("cart"), Some("cart"), Some("cart")]),
+        ),
+        (
+            "method".to_string(),
+            opt_str_col(vec![Some("GET"), Some("GET"), Some("GET")]),
+        ),
+        (
+            "http_status".to_string(),
+            opt_i64_col(vec![Some(200), Some(200), Some(200)]),
+        ),
+        (
+            "queue_seconds".to_string(),
+            f64_col(vec![Some(0.5), Some(0.5), Some(0.5)]),
+        ),
+        (
+            "cache_hit".to_string(),
+            bool_col(vec![Some(true), Some(true), Some(true)]),
+        ),
+        (
+            "digest".to_string(),
+            opt_bin_col(vec![Some(vec![0x01]), Some(vec![0x02]), Some(vec![0x03])]),
+        ),
+    ])
+    .expect("record batch");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("dict-ids.parquet");
+    write_parquet(&pq, &batch);
+
+    // The reader really does see dictionaries: this is the precondition the
+    // rest of the test rests on, not a restatement of it.
+    let reader_schema = load::reader_schema_for_path(&pq)
+        .expect("the footer parses")
+        .expect("at least one column is retyped to a dictionary");
+    for column in ["trace_id", "span_id", "parent_span_id"] {
+        let field = reader_schema
+            .field_with_name(column)
+            .unwrap_or_else(|e| panic!("{column} is in the reader schema: {e}"));
+        assert!(
+            matches!(field.data_type(), DataType::Dictionary(_, _)),
+            "the loader opens {column} as a dictionary, not as {:?}",
+            field.data_type()
+        );
+    }
+
+    let mapping = spans_mapping(FULL_MAPPING);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load::load_spans(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &mapping,
+        1,
+        10_000,
+        0,
+        1,
+        1,
+        1,
+        None,
+        load_ns,
+        Arc::new(SystemClock),
+    )
+    .await
+    .expect("hex id columns the writer dictionary-encoded load");
+    assert_eq!(report.rows_processed, 3, "three source rows, three spans");
+
+    let tenant = TenantId::new("acme");
+    let records = read_back_spans(
+        &store,
+        &tenant,
+        TimeRange {
+            start_ns: event_ns - NS_PER_MIN,
+            end_ns: event_ns + NS_PER_MIN,
+        },
+        &report.tokens,
+        load_ns,
+    )
+    .await;
+    assert_eq!(records.len(), 3, "every span reads back");
+
+    let attrs = vec![
+        ("cache.hit".to_string(), "true".to_string()),
+        ("http.method".to_string(), "GET".to_string()),
+        ("http.status_code".to_string(), "200".to_string()),
+        ("queue.seconds".to_string(), "0.5".to_string()),
+        ("request.digest".to_string(), String::new()),
+        ("service.name".to_string(), "cart".to_string()),
+    ];
+    // `records` is sorted by (trace_id, span_id), and the three span ids are
+    // 0x11 < 0x22 < 0x33, so the root is first.
+    let expected: Vec<(&[u8; 8], Option<[u8; 8]>, &str, i64, &str)> = vec![
+        (&root_span_id, None, "GET /cart", event_ns + 1, "01"),
+        (
+            &child_a_span_id,
+            Some(root_span_id),
+            "db.query",
+            event_ns + 2,
+            "02",
+        ),
+        (
+            &child_b_span_id,
+            Some(root_span_id),
+            "db.query",
+            event_ns + 3,
+            "03",
+        ),
+    ];
+    for (got, (span_id, parent, name, end_ns, digest)) in records.iter().zip(expected) {
+        assert_eq!(got.trace_id, trace_id, "the hex trace id decodes to bytes");
+        assert_eq!(got.span_id, *span_id, "the hex span id decodes to bytes");
+        assert_eq!(
+            got.parent_span_id, parent,
+            "the empty-string parent is a root and a repeated hex parent decodes to bytes"
+        );
+        assert_eq!(got.name, name);
+        assert_eq!(got.start_ts_ns, event_ns);
+        assert_eq!(got.end_ts_ns, end_ns);
+        assert_eq!(got.status_code, StatusCode::Ok);
+        assert_eq!(got.status_message.as_deref(), Some("fine"));
+        let mut want = attrs.clone();
+        want[4].1 = digest.to_string();
+        assert_eq!(got.attrs, want);
+    }
 }
 
 /// The smallest legal spans mapping: every optional field omitted.

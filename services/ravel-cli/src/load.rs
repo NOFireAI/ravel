@@ -3686,6 +3686,19 @@ fn load_reader_schema(metadata: &ArrowReaderMetadata) -> Option<SchemaRef> {
     dictionary_preserving_schema(metadata.schema(), metadata.metadata())
 }
 
+/// The schema every load of `path` opens its readers with: the
+/// dictionary-preserving one [`load_reader_schema`] derives, or `None` when no
+/// column qualifies and the reader infers as usual.
+///
+/// Public because the types a load actually SEES are not the types the file's
+/// own schema declares, and a test asserting behaviour on a dictionary-encoded
+/// column has to be able to say that the column really reached the loader as a
+/// `Dictionary`. Parses the footer the same way the loader does.
+pub fn reader_schema_for_path(path: &Path) -> Result<Option<SchemaRef>, LoadError> {
+    let metadata = read_input_metadata(&FileInput { path })?;
+    Ok(load_reader_schema(&metadata))
+}
+
 /// Open one [`BatchReader`] per stride cursor (issue #560), each restricted to
 /// its own contiguous partition of `parquet_path`'s row groups, with
 /// `partition_base` set to that partition's first row's file-absolute index.
@@ -4156,6 +4169,16 @@ fn read_id<const N: usize>(arr: &ArrayRef, row: usize) -> Result<Option<[u8; N]>
         },
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             read_bytes(arr, row)?.unwrap_or_default()
+        }
+        // A dictionary-encoded id column: resolve the row's key and read the
+        // value it names, by this same rule. A default `ArrowWriter`
+        // dictionary-encodes a string column until its dictionary outgrows the
+        // page limit, so a hex id column in an ordinary Parquet export arrives
+        // here as `Dictionary(_, Utf8)` rather than as `Utf8`.
+        DataType::Dictionary(_, _) => {
+            let dict = arr.as_any_dictionary();
+            let key = dict.normalized_keys()[row];
+            return read_id::<N>(dict.values(), key);
         }
         other => {
             return Err(format!(
@@ -6529,6 +6552,12 @@ impl SpansColumnIndex {
 /// `empty_is_root` is set for the parent column, where an empty value names no
 /// parent rather than a malformed id: a `FixedSizeBinary(0)` column then says
 /// every row is a root span, which is a file this loader can read.
+///
+/// A dictionary column is judged by its VALUE type, which is what
+/// [`read_id`] resolves each key to. That is the common case rather than an
+/// exotic one: [`dictionary_preserving_schema`] retypes a fully
+/// dictionary-encoded `Utf8` column to `Dictionary(_, Utf8)`, and a default
+/// `ArrowWriter` dictionary-encodes hex id columns.
 fn check_id_column(
     data_type: &DataType,
     column: &str,
@@ -6536,6 +6565,7 @@ fn check_id_column(
     empty_is_root: bool,
 ) -> Result<(), String> {
     match data_type {
+        DataType::Dictionary(_, values) => check_id_column(values, column, width, empty_is_root),
         DataType::FixedSizeBinary(0) if empty_is_root => Ok(()),
         DataType::FixedSizeBinary(n) if *n as usize != width => Err(format!(
             "id column {column:?} is FixedSizeBinary({n}), but this id is {width} bytes. Ravel \
@@ -6562,10 +6592,21 @@ fn id_cell_is_empty(arr: &ArrayRef, row: usize) -> Result<bool, String> {
     if arr.is_null(row) {
         return Ok(true);
     }
-    Ok(match arr.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 => read_string(arr, row)?.is_none_or(|s| s.is_empty()),
-        _ => read_bytes(arr, row)?.is_none_or(|b| b.is_empty()),
-    })
+    match arr.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            Ok(read_string(arr, row)?.is_none_or(|s| s.is_empty()))
+        }
+        // Resolve the key first: the emptiness that decides a root span is the
+        // VALUE's, and a dictionary key is never empty. Without this arm a
+        // dictionary-encoded hex parent column would take the binary branch
+        // below and fail on its own `Utf8` values.
+        DataType::Dictionary(_, _) => {
+            let dict = arr.as_any_dictionary();
+            let key = dict.normalized_keys()[row];
+            id_cell_is_empty(dict.values(), key)
+        }
+        _ => Ok(read_bytes(arr, row)?.is_none_or(|b| b.is_empty())),
+    }
 }
 
 /// Read the status column through `ravel-otlp`'s own enum mapping.
