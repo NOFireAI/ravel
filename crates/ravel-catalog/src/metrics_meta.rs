@@ -42,12 +42,15 @@
 //! caller computed against the body it actually saw.
 
 use prost::Message;
+use ravel_cpu_gate::{ReadGate, ReadSite};
 use ravel_memory::{MemoryBudget, Reservation};
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, Version};
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::TenantHash;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+use crate::read_gate::run_decode;
 
 /// Format version written into every metadata record this build emits: the
 /// writer, including the CAS-loser re-merge rewrite, stamps exactly this. It is
@@ -255,6 +258,14 @@ pub enum MetricsMetaError {
     /// budget's three figures.
     #[error("metadata record decode refused: {0}")]
     MemoryExhausted(#[from] ravel_memory::MemoryExhausted),
+    /// The read CPU gate produced no result for the body decode (ADR-1702
+    /// decision 2): the job panicked, or the runtime dropped it.
+    #[error("metadata record {key:?} decode job on the read CPU gate failed: {source}")]
+    DecodeJob {
+        key: String,
+        #[source]
+        source: ravel_cpu_gate::CpuGateError,
+    },
     #[error(
         "metadata record {key:?} would encode to {size} bytes, past the {cap}-byte ceiling readers \
          accept: refusing to write a record no reader could open"
@@ -638,6 +649,39 @@ fn decompressed_len_bound(key: &str, body: &[u8]) -> Result<usize, MetricsMetaEr
     }
 }
 
+/// Runs a body decode on the read gate at [`ReadSite::MetricsMeta`], or inline
+/// with no gate. A job the gate cannot complete is
+/// [`MetricsMetaError::DecodeJob`] naming `key`.
+async fn run_body_decode<F, R>(
+    gate: Option<&ReadGate>,
+    key: &str,
+    size: u64,
+    job: F,
+) -> Result<R, MetricsMetaError>
+where
+    F: FnOnce() -> Result<R, MetricsMetaError> + Send + 'static,
+    R: Send + 'static,
+{
+    run_decode(gate, ReadSite::MetricsMeta, size, job)
+        .await
+        .unwrap_or_else(|source| {
+            Err(MetricsMetaError::DecodeJob {
+                key: key.to_string(),
+                source,
+            })
+        })
+}
+
+/// The size a body is submitted to the read gate at: its zstd frame's declared
+/// content size, else [`MAX_METRICS_META_DECOMPRESSED_BYTES`]. Refuses nothing;
+/// the decode itself rejects an unreadable or oversized frame.
+fn declared_len_hint(body: &[u8]) -> u64 {
+    match zstd::zstd_safe::get_frame_content_size(body) {
+        Ok(Some(declared)) => declared,
+        _ => MAX_METRICS_META_DECOMPRESSED_BYTES as u64,
+    }
+}
+
 /// Decompress a stored body, bounded by `cap`, at most
 /// [`MAX_METRICS_META_DECOMPRESSED_BYTES`]. Streams into a growing buffer rather
 /// than pre-allocating the ceiling, and refuses a body that would exceed it. A
@@ -754,10 +798,29 @@ pub async fn read_metrics_meta(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
 ) -> Result<Option<(Vec<MetricMetadataEntry>, Version)>, MetricsMetaError> {
+    read_metrics_meta_on_gate(store, tenant_hash, None).await
+}
+
+/// [`read_metrics_meta`] with the body decode on the read CPU gate (ADR-1702
+/// decision 4), submitted at the zstd frame's declared content size (the
+/// reader ceiling when the frame declares none). `None` decodes inline, which
+/// is [`read_metrics_meta`]. A job the gate cannot complete is
+/// [`MetricsMetaError::DecodeJob`].
+pub async fn read_metrics_meta_on_gate(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    gate: Option<&ReadGate>,
+) -> Result<Option<(Vec<MetricMetadataEntry>, Version)>, MetricsMetaError> {
     let key = metrics_meta_key(tenant_hash);
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
-            let record = decode_proto(outcome.data.as_ref(), &key)?;
+            let size = declared_len_hint(outcome.data.as_ref());
+            let job_key = key.clone();
+            let data = outcome.data;
+            let record = run_body_decode(gate, &key, size, move || {
+                decode_proto(data.as_ref(), &job_key)
+            })
+            .await?;
             // Rewrite refusal (ADR-0066 decision 5): the returned version is what a
             // caller CAS-writes back against after a re-merge, so this read feeds a
             // whole-record rewrite. A record a newer writer wrote may carry a field
@@ -813,13 +876,32 @@ pub async fn read_metrics_meta_for_serve(
     tenant_hash: &TenantHash,
     budget: &Arc<MemoryBudget>,
 ) -> Result<Option<(Vec<MetricMetadataEntry>, Version, Reservation)>, MetricsMetaError> {
+    read_metrics_meta_for_serve_on_gate(store, tenant_hash, budget, None).await
+}
+
+/// [`read_metrics_meta_for_serve`] with the body decode on the read CPU gate
+/// (ADR-1702 decision 4), submitted at the bound it reserved. The reservation
+/// moves into the job with the body (decision 6). `None` decodes inline, which
+/// is [`read_metrics_meta_for_serve`]. A job the gate cannot complete is
+/// [`MetricsMetaError::DecodeJob`].
+pub async fn read_metrics_meta_for_serve_on_gate(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    budget: &Arc<MemoryBudget>,
+    gate: Option<&ReadGate>,
+) -> Result<Option<(Vec<MetricMetadataEntry>, Version, Reservation)>, MetricsMetaError> {
     let key = metrics_meta_key(tenant_hash);
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
-            let body = outcome.data.as_ref();
-            let bound = decompressed_len_bound(&key, body)?;
+            let bound = decompressed_len_bound(&key, outcome.data.as_ref())?;
             let reservation = budget.reserve(bound as u64)?;
-            let record = decode_proto_within(body, &key, bound)?;
+            let job_key = key.clone();
+            let data = outcome.data;
+            let (record, reservation) = run_body_decode(gate, &key, bound as u64, move || {
+                decode_proto_within(data.as_ref(), &job_key, bound)
+                    .map(|record| (record, reservation))
+            })
+            .await?;
             let entries = decode_record(&record, &key, tenant_hash)?;
             Ok(Some((entries, outcome.version, reservation)))
         }
@@ -1538,6 +1620,68 @@ mod tests {
         drop(reservation);
         assert_eq!(budget.reserved(), 7, "back to exactly the starting figure");
         drop(starting);
+    }
+
+    /// ADR-1702 decision 2: a body-decode job that panics on the read gate is
+    /// the reader's own typed error naming the record key, never a panic.
+    #[tokio::test]
+    async fn a_panicking_metrics_meta_decode_job_is_a_typed_decode_error() {
+        let gate = crate::read_gate::test_support::gate(0);
+        let key = metrics_meta_key(&tenant());
+        let got: Result<(), MetricsMetaError> =
+            run_body_decode(Some(&gate), &key, 1, || panic!("decode job panics")).await;
+        match got {
+            Err(MetricsMetaError::DecodeJob {
+                key: got_key,
+                source: ravel_cpu_gate::CpuGateError::Panicked,
+            }) => assert_eq!(got_key, key),
+            other => panic!("expected DecodeJob(Panicked), got {other:?}"),
+        }
+        assert_eq!(
+            crate::read_gate::test_support::counts(&gate, ReadSite::MetricsMeta),
+            (1, 0)
+        );
+    }
+
+    /// The strict rewrite reader decodes on the gate too, and its version
+    /// refusal still runs on the decoded record: a version-3 record is refused
+    /// with the rewrite diagnostic after exactly one gate job.
+    #[tokio::test]
+    async fn strict_reader_decodes_on_the_gate_and_still_refuses_a_newer_record() {
+        let store = mem();
+        let entries = vec![entry("a", MetricKind::Counter, "h", "u", 1)];
+        write_metrics_meta(store.as_ref(), &tenant(), &entries, None)
+            .await
+            .expect("seed");
+        let gate = crate::read_gate::test_support::gate(0);
+        let (read, _version) = read_metrics_meta_on_gate(store.as_ref(), &tenant(), Some(&gate))
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(read, entries);
+
+        store
+            .put(
+                &metrics_meta_key(&tenant()),
+                body_at_version(3, &entries).into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed a version-3 record");
+        let err = read_metrics_meta_on_gate(store.as_ref(), &tenant(), Some(&gate))
+            .await
+            .expect_err("a version-3 record is refused");
+        assert!(
+            matches!(
+                err,
+                MetricsMetaError::RefusingToRewriteNewerRecord { got: 3, .. }
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            crate::read_gate::test_support::counts(&gate, ReadSite::MetricsMeta),
+            (2, 0)
+        );
     }
 
     /// ADR-0066 item 2: the read-only serve reader and the strict rewrite reader

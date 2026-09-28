@@ -22,6 +22,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `stale`, `contradicted` or `unknown`, and exits nonzero when a live record
   sits below a recorded floor (`contradicted`). Every floor raised so far has
   no basis and reports `unknown` unless it is contradicted.
+- **The catalog can decode snapshot parts, postings and column statistics on
+  the read CPU gate** (ADR-1702 follow-up task 6, issue #1702).
+  `Catalog::with_read_gate` sends each decode to the gate at its declared
+  uncompressed length, with the decode's memory reservation moved into the
+  job. Units below the gate's inline floor still run inline and count as
+  inline. The new `read_metrics_meta_on_gate` and
+  `read_metrics_meta_for_serve_on_gate` run the metrics-meta body decode on
+  the gate the same way; only the serve reader moves a memory reservation
+  into the job, since the strict reader takes none. A job the gate cannot complete fails that decode with
+  `SnapshotFormatError::DecodeJob` or `MetricsMetaError::DecodeJob`, and the
+  read handles it like any other decode error. Without a gate every decode
+  runs inline as before. The server does not install the gate on its catalog
+  or the metadata cache yet, so no server read path runs on it in this
+  release.
 
 ### Security
 
