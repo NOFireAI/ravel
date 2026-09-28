@@ -385,12 +385,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   This covers the spans load (whose row path is its only path, and whose name,
   id and string attribute columns arrive dictionary encoded from an ordinary
   trace export), the metrics load's name and label columns, and the logs row
-  path. The columnar logs path is unchanged: it keys its own fast path on the
-  dictionary itself. Every value, admission decision and rejection message is
-  the same as before. A dictionary chunk whose dictionary is empty under a
-  non-null key is now a typed error rather than an abort inside Arrow's own
-  assertion; an all-null chunk with an empty dictionary still resolves to an
-  all-null column.
+  path. The columnar logs path is unchanged: its column index resolves no
+  dictionary column, and its readers key their own fast path on the dictionary
+  itself and read it in place. Every value, admission decision and rejection
+  message is the same as before. On the row paths, a dictionary chunk whose
+  dictionary is empty under a non-null key is now a typed error rather than an
+  abort inside Arrow's own assertion, and an all-null chunk with an empty
+  dictionary still resolves to an all-null column. The columnar path's
+  empty-dictionary handling is unchanged: its per-cell readers answer an empty
+  dictionary chunk as they did before.
 
 ### Added
 
@@ -439,6 +442,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where each span is built rather than where its batch acks, so on a failed
   load it also covers batches the failure abandoned, whose spans are in no
   object; the line printed there says that, rather than claiming stored spans.
+  A row rejection counts the drops of the rows in its batch built before it,
+  and not the rejected row's own.
 
   Four differences remain, and this is the complete list of what the stored
   record can differ on for the same input. A null `start_ts`, `end_ts` or
