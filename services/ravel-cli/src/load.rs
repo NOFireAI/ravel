@@ -1,17 +1,25 @@
-//! `ravel-cli load --parquet` (ADR-0089): bulk-import a Parquet file into the
-//! logs signal through the existing [`ravel_ingest::LogIngestRouter`].
+//! `ravel-cli load --parquet` (ADR-0089, widened by ADR-1751): bulk-import a
+//! Parquet file into the signal named by `--signal`, through the existing
+//! [`ravel_ingest::LogIngestRouter`] (logs) or [`ravel_ingest::IngestRouter`]
+//! (metrics).
 //!
 //! This is a new *caller* of existing public APIs, not a new ingest path. The
 //! loader constructs its own router in-process against the target tenant's
 //! object store and provisioned shard count, reuses
-//! [`ravel_otlp::NormalizedLogRecord`] as the record shape, re-implements the
-//! `ravel-otlp` admission checks the ADR says to keep (future skew, length
-//! caps), relaxes the ones it says to relax (past-event-time lag, per-record
-//! attribute cap), and writes with [`WriteMode::Strict`] so every returned
-//! success has no buffered-but-unflushed data.
+//! [`ravel_otlp::NormalizedLogRecord`] / [`ravel_otlp::NormalizedPoint`] as the
+//! record shape, re-implements the `ravel-otlp` admission checks the ADR says
+//! to keep (future skew, length caps), relaxes the ones it says to relax
+//! (past-event-time lag, per-record attribute cap), and writes with
+//! [`WriteMode::Strict`] so every returned success has no buffered-but-
+//! unflushed data.
 //!
 //! Which `ravel-otlp` rules this path keeps, relaxes, or bypasses, and why, is
-//! documented in `docs/guides/ingest.md` ("Bulk import") per ADR-0089.
+//! documented in `docs/guides/ingest.md` ("Bulk import") per ADR-0089;
+//! ADR-1751 decision 1 states that the same table applies per signal, with
+//! that signal's own OTLP limits.
+//!
+//! `--signal spans` is refused until ADR-1751 follow-up task 2 lands; it never
+//! falls back to another signal.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -34,18 +42,28 @@ use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 #[cfg(feature = "stage-timing")]
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
-    Clock, FlushTriggerMix, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError,
-    LogWriteReceipt, STRICT_VISIBILITY_RESERVE_NS, SystemClock, WriteMode,
+    Clock, FlushTriggerMix, IngestConfig, IngestRouter, LogIngestMetricsSnapshot, LogIngestRouter,
+    LogWriteError, LogWriteReceipt, STRICT_VISIBILITY_RESERVE_NS, SystemClock, WriteError,
+    WriteMode, WriteReceipt,
 };
 use ravel_logseg::{
     Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict, stream_attrs_bytes,
 };
 use ravel_object_store::ObjectStoreBackend;
-use ravel_otlp::NormalizedLogRecord;
 use ravel_otlp::logs_limits::LogIngestLimits;
+use ravel_otlp::promcompat::format_float;
+use ravel_otlp::{IngestLimits, NormalizedLogRecord, NormalizedPoint};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
-use ravel_types::{CommitToken, Signal, TenantId};
+use ravel_types::{
+    CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantId,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::maintain::SignalArg;
+
+/// The label the classic-histogram explosion synthesizes per bucket, carrying
+/// that bucket's upper bound (`ravel_otlp::normalize`'s `explode_histogram`).
+const LE_LABEL: &str = "le";
 
 /// Per-record attribute cap for the loader (ADR-0089 relaxation of the
 /// `ravel-otlp` 128-per-record network cap).
@@ -330,9 +348,435 @@ pub struct Mapping {
     pub attrs_map_column: Option<String>,
 }
 
-/// Parse a `--mapping` TOML document.
+/// Parse the logs section of a `--mapping` TOML document.
+///
+/// Accepts both spellings ADR-1751 decision 2 leaves valid for logs: a
+/// document whose one signal section is `[logs]`, and the pre-ADR-1751
+/// top-level form whose logs keys sit at the document root. See
+/// [`parse_mapping_document`] for the section rules.
 pub fn parse_mapping(text: &str) -> Result<Mapping, LoadError> {
-    toml::from_str(text).map_err(|e| LoadError::Setup(format!("invalid --mapping TOML: {e}")))
+    match parse_mapping_document(text, SignalArg::Logs)? {
+        MappingSection::Logs(mapping) => Ok(mapping),
+        // `parse_mapping_document` returns the section matching the signal it
+        // was asked for, so this arm is not reachable through this call.
+        MappingSection::Metrics(_) => Err(LoadError::Setup(
+            "internal error: the logs mapping resolved to a metrics section".to_string(),
+        )),
+    }
+}
+
+/// Parse the metrics section of a `--mapping` TOML document (ADR-1751
+/// decision 2).
+pub fn parse_metrics_mapping(text: &str) -> Result<MetricsMapping, LoadError> {
+    match parse_mapping_document(text, SignalArg::Metrics)? {
+        MappingSection::Metrics(mapping) => Ok(mapping),
+        MappingSection::Logs(_) => Err(LoadError::Setup(
+            "internal error: the metrics mapping resolved to a logs section".to_string(),
+        )),
+    }
+}
+
+/// The signal section names a `--mapping` document may carry (ADR-1751
+/// decision 2). Any other top-level key is read as the pre-ADR-1751
+/// top-level logs form.
+const MAPPING_SECTION_NAMES: [&str; 3] = ["logs", "metrics", "spans"];
+
+/// The section name a `--signal` value selects.
+fn mapping_section_name(signal: SignalArg) -> &'static str {
+    match signal {
+        SignalArg::Metrics => "metrics",
+        SignalArg::Logs => "logs",
+        SignalArg::Spans => "spans",
+    }
+}
+
+/// The one refusal `--signal spans` gets until ADR-1751 follow-up task 2
+/// lands. Stated as its own error rather than as a fallback to logs: a load
+/// that silently wrote span-shaped rows into the logs signal would be a
+/// durable mistake nothing later reports.
+pub(crate) fn spans_not_supported() -> LoadError {
+    LoadError::Setup(
+        "--signal spans is not yet supported by load: ADR-1751 follow-up task 2 adds the spans \
+         mapping section and the SpanIngestRouter construction. Nothing was written, and this \
+         does not fall back to another signal."
+            .to_string(),
+    )
+}
+
+/// The resolved mapping section for one load's `--signal`.
+#[derive(Debug, Clone)]
+pub enum MappingSection {
+    Logs(Mapping),
+    Metrics(MetricsMapping),
+}
+
+/// Resolve the one signal section of a `--mapping` document and deserialize
+/// it (ADR-1751 decision 2).
+///
+/// Exactly one of `[logs]`, `[metrics]` and `[spans]` may be present, and it
+/// must match `--signal`. Two exceptions carry the pre-ADR-1751 form forward:
+///
+/// - a document with no signal section at all, whose top-level keys are the
+///   ADR-0089 logs keys, is read as the `[logs]` section (so every mapping
+///   written before this change keeps loading, unchanged, under the default
+///   `--signal logs`);
+/// - that same document under any other `--signal` is refused by name rather
+///   than by a serde "unknown field" error, since the operator's real mistake
+///   is a missing section, not a typo.
+///
+/// Mixing the two spellings (a signal section *and* top-level logs keys) is
+/// refused: which one wins would otherwise be an invisible precedence rule.
+pub fn parse_mapping_document(text: &str, signal: SignalArg) -> Result<MappingSection, LoadError> {
+    let mut doc: toml::Table = toml::from_str(text)
+        .map_err(|e| LoadError::Setup(format!("invalid --mapping TOML: {e}")))?;
+
+    let present: Vec<&'static str> = MAPPING_SECTION_NAMES
+        .iter()
+        .copied()
+        .filter(|name| doc.contains_key(*name))
+        .collect();
+    let top_level: Vec<String> = doc
+        .keys()
+        .filter(|k| !MAPPING_SECTION_NAMES.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    let wanted = mapping_section_name(signal);
+
+    if present.len() > 1 {
+        return Err(LoadError::Setup(format!(
+            "--mapping file declares {} signal sections ({}). Exactly one must be present, and it \
+             must match --signal {wanted}.",
+            present.len(),
+            present.join(", ")
+        )));
+    }
+    if !present.is_empty() && !top_level.is_empty() {
+        return Err(LoadError::Setup(format!(
+            "--mapping file mixes a [{}] signal section with top-level keys ({}). Move every \
+             mapped field inside the section: with both spellings present there is no rule \
+             saying which one a load would use.",
+            present.join(""),
+            top_level.join(", ")
+        )));
+    }
+
+    if let Some(section) = present.first().copied() {
+        if section != wanted {
+            return Err(LoadError::Setup(format!(
+                "--mapping file declares a [{section}] section but --signal is {wanted}. Exactly \
+                 one section must be present and it must match --signal (ADR-1751 decision 2)."
+            )));
+        }
+        if signal == SignalArg::Spans {
+            return Err(spans_not_supported());
+        }
+        let value = doc
+            .remove(section)
+            .unwrap_or(toml::Value::Table(toml::Table::new()));
+        return deserialize_section(value, section, signal);
+    }
+
+    if signal != SignalArg::Logs {
+        if signal == SignalArg::Spans {
+            return Err(spans_not_supported());
+        }
+        return Err(LoadError::Setup(format!(
+            "--mapping file has no [{wanted}] section, which --signal {wanted} requires \
+             (ADR-1751 decision 2). Its top-level keys are {}.",
+            if top_level.is_empty() {
+                "none (the file is empty)".to_string()
+            } else {
+                format!(
+                    "{} (the pre-ADR-1751 logs-only form, read as the [logs] section)",
+                    top_level.join(", ")
+                )
+            }
+        )));
+    }
+    deserialize_section(toml::Value::Table(doc), "logs", signal)
+}
+
+/// Deserialize one already-selected section table into its typed mapping.
+fn deserialize_section(
+    value: toml::Value,
+    section: &str,
+    signal: SignalArg,
+) -> Result<MappingSection, LoadError> {
+    match signal {
+        SignalArg::Logs => value
+            .try_into::<Mapping>()
+            .map(MappingSection::Logs)
+            .map_err(|e| LoadError::Setup(format!("invalid --mapping [{section}] section: {e}"))),
+        SignalArg::Metrics => {
+            reject_native_histogram_keys(&value)?;
+            let mapping = value.try_into::<MetricsMapping>().map_err(|e| {
+                LoadError::Setup(format!("invalid --mapping [{section}] section: {e}"))
+            })?;
+            mapping.validate()?;
+            Ok(MappingSection::Metrics(mapping))
+        }
+        SignalArg::Spans => Err(spans_not_supported()),
+    }
+}
+
+/// Keys that name a native (exponential) histogram, refused by name before
+/// `deny_unknown_fields` can report them as a generic typo (ADR-1751
+/// decision 2: native histograms are not mappable in this version).
+const NATIVE_HISTOGRAM_KEYS: [&str; 2] = ["native_histogram", "exponential_histogram"];
+
+/// Refuse a metrics section that names a native/exponential histogram at the
+/// section's top level.
+fn reject_native_histogram_keys(value: &toml::Value) -> Result<(), LoadError> {
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+    for key in NATIVE_HISTOGRAM_KEYS {
+        if table.contains_key(key) {
+            return Err(native_histogram_rejected(key));
+        }
+    }
+    Ok(())
+}
+
+/// The refusal a native/exponential histogram mapping gets (ADR-1751
+/// decision 2).
+fn native_histogram_rejected(what: &str) -> LoadError {
+    LoadError::Setup(format!(
+        "--mapping names a native (exponential) histogram ({what}), which this version does not \
+         map (ADR-1751 decision 2: native histograms, span events and span links are not \
+         mappable, and a mapping that names them is rejected). Only the classic-histogram shape \
+         (le plus sum and count columns) is supported."
+    ))
+}
+
+/// Whether a metric's exploded/scalar series behaves as a monotonic counter
+/// (`kind = "counter"`) or a gauge. Absent means gauge, which is what
+/// `ravel-otlp` reports for every non-`Sum` point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKindArg {
+    Gauge,
+    Counter,
+}
+
+/// One mapped label: the Prometheus label name it becomes and the source
+/// Parquet column. Values are read as strings (an integer, float or boolean
+/// column is stringified), since a Prometheus label value is a string.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelMap {
+    /// The label name stored on the series (e.g. `job`).
+    pub name: String,
+    /// The source Parquet column name.
+    pub column: String,
+}
+
+/// Which histogram encoding a `[metrics.histogram]` section describes. Only
+/// `classic` is mappable in this version (ADR-1751 decision 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistogramTypeArg {
+    Classic,
+    Native,
+    Exponential,
+}
+
+/// The classic-histogram shape of a metrics mapping (ADR-1751 decision 2):
+/// the `le` column plus the data point's `sum` and `count` columns.
+///
+/// One input ROW is one bucket of one data point. The rows of one data point
+/// are those sharing a metric name, a label set and a `ts`, and they must be
+/// CONTIGUOUS in the file; the loader groups a contiguous run and refuses a
+/// run it has already closed rather than exploding a data point twice (see
+/// [`MetricsLoadError`]'s non-contiguity message). Within a group:
+///
+/// - the row's `value` column is that bucket's OWN count, the OTLP
+///   `bucket_counts[i]` convention, not a running total. The loader
+///   accumulates, exactly as `ravel_otlp::normalize`'s `explode_histogram`
+///   does, so a Prometheus-style already-cumulative `_bucket` export must be
+///   de-accumulated before it is loaded;
+/// - the row's `le` column is that bucket's explicit upper bound, and must be
+///   finite. The `+Inf` bucket is NOT a row: it is synthesized from the
+///   `count` column, matching OTLP, where `explicit_bounds` carries only the
+///   finite bounds;
+/// - `sum` and `count` are the whole data point's, so every row of one group
+///   must carry the same values (compared by bit pattern for `sum`). A null
+///   `sum` cell emits no `_sum` series, matching an OTLP data point with no
+///   `sum` field.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistogramMap {
+    /// `classic` (the default) or an explicit rejection of `native` /
+    /// `exponential`.
+    #[serde(default, rename = "type")]
+    pub histogram_type: Option<HistogramTypeArg>,
+    /// Source column carrying each row's explicit bucket upper bound.
+    pub le_column: String,
+    /// Source column carrying the data point's `sum`. A null cell emits no
+    /// `_sum` series.
+    pub sum_column: String,
+    /// Source column carrying the data point's total count, which is both the
+    /// `+Inf` bucket's value and the `_count` series' value.
+    pub count_column: String,
+}
+
+/// The `[metrics]` section of a `--mapping` TOML (ADR-1751 decision 2).
+///
+/// ```toml
+/// [metrics]
+/// name_column  = "metric"      # a column, OR name = "http_requests_total"
+/// value_column = "value"
+/// ts_column    = "ts"
+/// ts_unit      = "millis"      # seconds | millis | micros | nanos
+/// kind         = "counter"     # optional: gauge (default) | counter
+///
+/// [[metrics.label]]
+/// name   = "job"
+/// column = "svc"
+///
+/// # Optional classic-histogram shape. With it, one row is one bucket.
+/// [metrics.histogram]
+/// le_column    = "le"
+/// sum_column   = "sum"
+/// count_column = "count"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsMapping {
+    /// Literal metric name, used for every row. Mutually exclusive with
+    /// [`MetricsMapping::name_column`]; exactly one is required.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Source column carrying each row's metric name. Mutually exclusive with
+    /// [`MetricsMapping::name`]; exactly one is required.
+    #[serde(default)]
+    pub name_column: Option<String>,
+    /// Source column carrying the sample value. For a classic histogram this
+    /// is the row's own bucket count (see [`HistogramMap`]).
+    pub value_column: String,
+    /// Source column carrying the event timestamp.
+    pub ts_column: String,
+    /// Unit of [`MetricsMapping::ts_column`] when it is an integer column. A
+    /// native Arrow `Timestamp` column carries its own unit and this is not
+    /// applied again (see [`read_ts`]).
+    pub ts_unit: TsUnit,
+    /// `counter` sets `is_monotonic_sum` on every point this mapping
+    /// produces, as a monotonic OTLP `Sum` does; absent or `gauge` leaves it
+    /// false. Exploded classic-histogram series are always false, matching
+    /// `ravel_otlp::normalize`.
+    #[serde(default)]
+    pub kind: Option<MetricKindArg>,
+    /// Columns that become Prometheus labels on the series.
+    #[serde(default, rename = "label")]
+    pub labels: Vec<LabelMap>,
+    /// Optional classic-histogram shape. Absent means one row is one scalar
+    /// sample.
+    #[serde(default)]
+    pub histogram: Option<HistogramMap>,
+}
+
+impl MetricsMapping {
+    /// `true` when this mapping describes a classic histogram.
+    pub fn is_histogram(&self) -> bool {
+        self.histogram.is_some()
+    }
+
+    /// The checks a metrics mapping fails before any Parquet byte is read.
+    ///
+    /// Everything here is a property of the mapping alone, so it is worth
+    /// refusing at setup: a name that is neither a column nor a literal, a
+    /// label name that would collide with a synthesized one, or a native
+    /// histogram, each of which would otherwise be discovered per row (or,
+    /// for the collision, only as a `DuplicateLabelName`-shaped rejection on
+    /// the first row).
+    pub fn validate(&self) -> Result<(), LoadError> {
+        match (&self.name, &self.name_column) {
+            (Some(_), Some(_)) => {
+                return Err(LoadError::Setup(
+                    "--mapping [metrics] sets both name and name_column. The metric name is \
+                     either a literal (name) or a column (name_column), never both."
+                        .to_string(),
+                ));
+            }
+            (None, None) => {
+                return Err(LoadError::Setup(
+                    "--mapping [metrics] sets neither name nor name_column. The metric name is \
+                     either a literal (name) or a column (name_column)."
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(literal) = &self.name {
+            let limits = IngestLimits::default();
+            if literal.is_empty() {
+                return Err(LoadError::Setup(
+                    "--mapping [metrics] name is empty; a metric name is required".to_string(),
+                ));
+            }
+            if literal.len() > limits.max_metric_name_len {
+                return Err(LoadError::Setup(format!(
+                    "--mapping [metrics] name is {} bytes, more than the metric-name limit of {}",
+                    literal.len(),
+                    limits.max_metric_name_len
+                )));
+            }
+        }
+
+        let limits = IngestLimits::default();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for label in &self.labels {
+            if label.name.is_empty() {
+                return Err(LoadError::Setup(
+                    "--mapping [[metrics.label]] has an empty name".to_string(),
+                ));
+            }
+            if label.name.len() > limits.max_label_name_len {
+                return Err(LoadError::Setup(format!(
+                    "--mapping [[metrics.label]] name {:?} is {} bytes, more than the label-name \
+                     limit of {}",
+                    label.name,
+                    label.name.len(),
+                    limits.max_label_name_len
+                )));
+            }
+            if label.name == METRIC_NAME_LABEL {
+                return Err(LoadError::Setup(format!(
+                    "--mapping [[metrics.label]] maps {METRIC_NAME_LABEL:?}, which carries the \
+                     metric name. Use name or name_column instead."
+                )));
+            }
+            if self.is_histogram() && label.name == LE_LABEL {
+                return Err(LoadError::Setup(format!(
+                    "--mapping [[metrics.label]] maps {LE_LABEL:?}, which the classic-histogram \
+                     explosion synthesizes per bucket. Two labels of the same name cannot exist \
+                     on one series."
+                )));
+            }
+            if !seen.insert(label.name.as_str()) {
+                return Err(LoadError::Setup(format!(
+                    "--mapping [[metrics.label]] declares {:?} twice; label names are unique on a \
+                     series",
+                    label.name
+                )));
+            }
+        }
+
+        if let Some(histogram) = &self.histogram {
+            match histogram.histogram_type {
+                None | Some(HistogramTypeArg::Classic) => {}
+                Some(HistogramTypeArg::Native) => {
+                    return Err(native_histogram_rejected("histogram.type = \"native\""));
+                }
+                Some(HistogramTypeArg::Exponential) => {
+                    return Err(native_histogram_rejected(
+                        "histogram.type = \"exponential\"",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Printed to stderr before a load runs: the per-tenant `AdmissionController`
@@ -497,6 +941,7 @@ pub async fn run(
     parquet_path: &Path,
     tenant: &str,
     mapping_path: &Path,
+    signal: SignalArg,
     shards: u32,
     batch_rows: usize,
     skip_rows: u64,
@@ -513,6 +958,7 @@ pub async fn run(
         parquet_path,
         tenant,
         mapping_path,
+        signal,
         shards,
         batch_rows,
         skip_rows,
@@ -541,6 +987,7 @@ pub(crate) async fn run_warning_to(
     parquet_path: &Path,
     tenant: &str,
     mapping_path: &Path,
+    signal: SignalArg,
     shards: u32,
     batch_rows: usize,
     skip_rows: u64,
@@ -553,13 +1000,43 @@ pub(crate) async fn run_warning_to(
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    // Refused before the mapping is even read, and never by falling back to
+    // another signal: a spans-shaped file written into the logs signal would
+    // be a durable mistake nothing later reports (ADR-1751 follow-up task 2).
+    if signal == SignalArg::Spans {
+        return Err(anyhow::Error::new(spans_not_supported()));
+    }
+
     // A diagnostic that cannot be written is not worth failing a durable load
     // over, here or below.
     let _ = writeln!(warnings, "{ADMISSION_BYPASS_WARNING}");
 
     let mapping_text = std::fs::read_to_string(mapping_path)
         .map_err(|e| anyhow::anyhow!("failed to read --mapping {}: {e}", mapping_path.display()))?;
-    let mapping = parse_mapping(&mapping_text)?;
+
+    let mapping = match parse_mapping_document(&mapping_text, signal)? {
+        MappingSection::Metrics(metrics) => {
+            return run_metrics(
+                store,
+                parquet_path,
+                tenant,
+                &metrics,
+                shards,
+                batch_rows,
+                skip_rows,
+                read_cursors,
+                pipeline_depth,
+                max_inflight_flushes,
+                decode_queue_batches,
+                target_bytes,
+                max_flush_delay,
+                now_ns,
+                warnings,
+            )
+            .await;
+        }
+        MappingSection::Logs(logs) => logs,
+    };
 
     // The production entry point drives the columnar fast path (ADR-0109) with
     // the operator-configured decode-queue depth; `load` keeps a stable
@@ -634,6 +1111,134 @@ pub(crate) async fn run_warning_to(
             Err(anyhow::Error::new(err))
         }
     }
+}
+
+/// The CLI-facing metrics load: run it, print the summary on success, or the
+/// durable commit tokens and the resume figures on failure.
+///
+/// Two of the logs path's levers do not reach the metrics decoder, so they are
+/// reported rather than silently dropped: `--read-cursors` (the metrics path
+/// reads one sequential cursor, because a classic histogram's data point is a
+/// contiguous run of rows) and `--decode-queue-batches` (there is no
+/// decode/encode queue here; each batch's decode is one `spawn_blocking` the
+/// submit loop awaits). Everything that shapes the objects -- `--shards`,
+/// `--batch-rows`, `--target-bytes`, `--max-inflight-flushes`,
+/// `--max-flush-delay`, `--pipeline-depth` -- applies unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn run_metrics(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &MetricsMapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    decode_queue_batches: usize,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    warnings: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    if let Some(warning) = metrics_unused_lever_warning(read_cursors, decode_queue_batches) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+
+    match load_metrics(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        skip_rows,
+        pipeline_depth,
+        max_inflight_flushes,
+        target_bytes,
+        max_flush_delay,
+        now_ns,
+        Arc::new(SystemClock),
+    )
+    .await
+    {
+        Ok(report) => {
+            print_metrics_summary(&report);
+            if report.skip_rows_requested > report.file_total_rows {
+                let _ = writeln!(
+                    warnings,
+                    "warning: --skip-rows {} is past the end of this file, which holds {} rows. \
+                     Nothing was loaded. Resuming an already-complete file takes --skip-rows equal \
+                     to the row count, so a larger value is a typo or an offset from a different \
+                     file.",
+                    report.skip_rows_requested, report.file_total_rows
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            print_durable_tokens(&err);
+            // The metrics path always reads one cursor, so the resume hint's
+            // read-cursor precondition is satisfied by construction and the
+            // pipeline depth is the only one left to state.
+            if let Some(hint) = resume_hint(&err, Some(1), pipeline_depth) {
+                let _ = writeln!(warnings, "{hint}");
+            }
+            Err(anyhow::Error::new(err))
+        }
+    }
+}
+
+/// The warning naming the levers a metrics load does not use, or `None` when
+/// the operator left both at a value that changes nothing.
+fn metrics_unused_lever_warning(
+    read_cursors: Option<usize>,
+    decode_queue_batches: usize,
+) -> Option<String> {
+    let mut unused: Vec<String> = Vec::new();
+    if let Some(k) = read_cursors
+        && k != 1
+    {
+        unused.push(format!("--read-cursors {k}"));
+    }
+    if decode_queue_batches != DEFAULT_DECODE_QUEUE_BATCHES {
+        unused.push(format!("--decode-queue-batches {decode_queue_batches}"));
+    }
+    if unused.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "warning: a metrics load ignores {}. It reads one sequential cursor (a classic \
+         histogram's data point is a contiguous run of rows, which stride reads would split) and \
+         has no decode/encode queue. --shards, --batch-rows, --target-bytes, \
+         --max-inflight-flushes, --max-flush-delay and --pipeline-depth all apply.",
+        unused.join(" and ")
+    ))
+}
+
+/// Print the metrics load's completion summary to stdout.
+fn print_metrics_summary(report: &MetricsLoadReport) {
+    let secs = report.elapsed.as_secs_f64();
+    let rows_per_sec = if secs > 0.0 {
+        report.rows_processed as f64 / secs
+    } else {
+        report.rows_processed as f64
+    };
+    println!("bulk load complete");
+    println!("  signal           : metrics");
+    println!("  rows_skipped     : {}", report.rows_skipped);
+    println!("  rows_written     : {}", report.rows_processed);
+    println!("  points_written   : {}", report.points_written);
+    if report.histogram_points_exploded > 0 {
+        println!(
+            "  histogram points : {} (exploded into _bucket/_sum/_count series)",
+            report.histogram_points_exploded
+        );
+    }
+    println!("  rows/sec         : {rows_per_sec:.0}");
+    println!("  objects written  : {}", report.objects_written());
+    println!("  elapsed          : {secs:.3}s");
 }
 
 /// The warning for a `--skip-rows` past the end of the file, or `None` when the
@@ -3828,6 +4433,1139 @@ fn build_columnar_batch(
     Ok(batch)
 }
 
+// ---------------------------------------------------------------------------
+// Metrics load (ADR-1751 decisions 1 and 2)
+//
+// The same shape as the logs load above -- provision or validate the signal,
+// build the router from the same `build_ingest_config`, write `WriteMode::
+// Strict` batches through an in-flight window -- against
+// `ravel_ingest::IngestRouter` and `ravel_otlp::NormalizedPoint`. What differs
+// is normalisation: a metric point is a series id, a label set and one `f64`
+// sample, and a classic histogram row set explodes into the
+// Prometheus-convention `_bucket`/`_sum`/`_count` series.
+//
+// It deliberately does not reuse the logs path's columnar fast path or its K
+// stride cursors. The columnar builder targets `ColumnarLogBatch`, which has
+// no metrics counterpart, and the stride cursors interleave far-apart file
+// regions inside one batch, which would break the contiguity a classic
+// histogram's row group depends on.
+// ---------------------------------------------------------------------------
+
+/// Result of a successful (or partially-durable) metrics load.
+#[derive(Debug, Clone, Default)]
+pub struct MetricsLoadReport {
+    /// Source rows whose points acked durable, in submission order.
+    pub rows_processed: u64,
+    /// `--skip-rows`, clamped to the file's total row count.
+    pub rows_skipped: u64,
+    /// `--skip-rows` as the operator gave it, before the clamp.
+    pub skip_rows_requested: u64,
+    /// The file's total row count, read from the Parquet footer.
+    pub file_total_rows: u64,
+    /// Points acked durable. This is NOT the row count: a classic-histogram
+    /// data point of `n` finite bounds explodes into `n + 2` or `n + 3`
+    /// points out of `n` rows, and it is the reachability signal a caller of
+    /// the real entry point reads to prove the explosion ran rather than that
+    /// its builder compiles.
+    pub points_written: u64,
+    /// Classic-histogram data points exploded, zero on a scalar mapping.
+    pub histogram_points_exploded: u64,
+    /// One token per shard acked, across every batch, in submission order.
+    pub tokens: Vec<CommitToken>,
+    pub elapsed: Duration,
+}
+
+impl MetricsLoadReport {
+    /// Distinct commit tokens, which is the number of RSEG objects the load
+    /// wrote. Same derivation as [`LoadReport::objects_written`].
+    pub fn objects_written(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        self.tokens
+            .iter()
+            .filter(|t| seen.insert(t.encode()))
+            .count()
+    }
+}
+
+/// Resolved column indices for the mapped fields of one metrics batch.
+struct MetricsColumnIndex {
+    /// `None` when the mapping carries a literal `name`.
+    name: Option<usize>,
+    value: usize,
+    ts: usize,
+    /// One index per `[[metrics.label]]`, in mapping order.
+    labels: Vec<usize>,
+    histogram: Option<HistogramColumnIndex>,
+}
+
+struct HistogramColumnIndex {
+    le: usize,
+    sum: usize,
+    count: usize,
+}
+
+impl MetricsColumnIndex {
+    fn resolve(
+        batch: &RecordBatch,
+        mapping: &MetricsMapping,
+    ) -> Result<MetricsColumnIndex, String> {
+        let schema = batch.schema();
+        let idx = |name: &str| -> Result<usize, String> {
+            schema
+                .index_of(name)
+                .map_err(|_| format!("mapped column {name:?} is not present in the Parquet file"))
+        };
+        let histogram = match &mapping.histogram {
+            Some(h) => Some(HistogramColumnIndex {
+                le: idx(&h.le_column)?,
+                sum: idx(&h.sum_column)?,
+                count: idx(&h.count_column)?,
+            }),
+            None => None,
+        };
+        Ok(MetricsColumnIndex {
+            name: match &mapping.name_column {
+                Some(c) => Some(idx(c)?),
+                None => None,
+            },
+            value: idx(&mapping.value_column)?,
+            ts: idx(&mapping.ts_column)?,
+            labels: mapping
+                .labels
+                .iter()
+                .map(|l| idx(&l.column))
+                .collect::<Result<Vec<_>, String>>()?,
+            histogram,
+        })
+    }
+}
+
+/// One decoded source row, before it becomes a point or joins a histogram
+/// group. Labels are the mapped ones only: `__name__` and the synthesized
+/// `le` are added when the point is built.
+struct MetricRow {
+    name: String,
+    labels: Vec<Label>,
+    ts_ns: i64,
+    value: f64,
+    bucket: Option<BucketRow>,
+}
+
+/// The classic-histogram fields of one source row.
+struct BucketRow {
+    /// This bucket's explicit (finite) upper bound.
+    le: f64,
+    /// The data point's `sum`, `None` for a null cell (no `_sum` series).
+    sum: Option<f64>,
+    /// The data point's total count: the `+Inf` bucket's value and `_count`.
+    count: u64,
+}
+
+/// Read one numeric cell as `f64`, accepting float and integer columns.
+///
+/// An integer wider than 2^53 rounds to the nearest representable `f64`, the
+/// same loss `ravel_otlp::normalize` documents for an OTLP `as_int` value:
+/// the segment format stores `f64` only, so there is nowhere else for the
+/// value to go.
+fn read_metric_number(arr: &ArrayRef, row: usize) -> Result<Option<f64>, String> {
+    if arr.is_null(row) {
+        return Ok(None);
+    }
+    match arr.data_type() {
+        DataType::Float32 | DataType::Float64 => read_f64(arr, row),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => Ok(read_i64(arr, row)?.map(|v| v as f64)),
+        other => Err(format!("expected a numeric column, found {other:?}")),
+    }
+}
+
+/// Read one cell as a Prometheus label value. A label value is a string, so a
+/// numeric or boolean column is stringified: floats through
+/// [`format_float`], the same Go-compatible spelling the `le` label uses, so
+/// two columns carrying the same number never produce two series.
+fn read_label_value(arr: &ArrayRef, row: usize) -> Result<Option<String>, String> {
+    if arr.is_null(row) {
+        return Ok(None);
+    }
+    match arr.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _) => read_string(arr, row),
+        DataType::Boolean => Ok(read_bool(arr, row)?.map(|b| b.to_string())),
+        DataType::Float32 | DataType::Float64 => Ok(read_f64(arr, row)?.map(format_float)),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => Ok(read_i64(arr, row)?.map(|v| v.to_string())),
+        other => Err(format!(
+            "expected a string, numeric or boolean label column, found {other:?}"
+        )),
+    }
+}
+
+/// A bucket or data-point count read from a numeric cell: a non-negative
+/// integer. A float column is accepted only when its value is exactly
+/// integral, so a fractional count is refused rather than silently truncated.
+fn read_count(arr: &ArrayRef, row: usize) -> Result<Option<u64>, String> {
+    let Some(v) = read_metric_number(arr, row)? else {
+        return Ok(None);
+    };
+    if !v.is_finite() || v < 0.0 || v.fract() != 0.0 {
+        return Err(format!(
+            "expected a non-negative whole-number count, found {v}"
+        ));
+    }
+    // `v` is finite, non-negative and integral here, so the cast is exact for
+    // every value a u64 can hold; anything larger is refused rather than
+    // saturating.
+    if v > u64::MAX as f64 {
+        return Err(format!("count {v} does not fit in u64"));
+    }
+    Ok(Some(v as u64))
+}
+
+/// Decode one source row against the mapping, applying the kept admission
+/// checks (future skew, the metric-name and label length caps, the loader
+/// label cap). `Err` carries a per-row rejection reason.
+fn build_metric_row(
+    batch: &RecordBatch,
+    cols: &MetricsColumnIndex,
+    mapping: &MetricsMapping,
+    limits: &IngestLimits,
+    now_ns: i64,
+    row: usize,
+) -> Result<MetricRow, String> {
+    let raw_ts = read_ts(batch.column(cols.ts), row, mapping.ts_unit)?
+        .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
+
+    // Kept: the future-skew bound, at the metrics OTLP limit. The past-lag
+    // check is deliberately omitted (ADR-0089 relaxation, widened to every
+    // signal by ADR-1751 decision 1).
+    let skew_ns = raw_ts.saturating_sub(now_ns);
+    if skew_ns > limits.max_future_skew_ns {
+        return Err(format!(
+            "timestamp is {skew_ns} ns ahead of load time, more than the max future skew of {} ns",
+            limits.max_future_skew_ns
+        ));
+    }
+
+    let name = match (cols.name, &mapping.name) {
+        (Some(i), _) => read_string(batch.column(i), row)?.ok_or_else(|| {
+            format!(
+                "metric name column {:?} is null",
+                mapping.name_column.as_deref().unwrap_or_default()
+            )
+        })?,
+        (None, Some(literal)) => literal.clone(),
+        // `MetricsMapping::validate` refuses a mapping with neither, before
+        // any row is read.
+        (None, None) => return Err("mapping declares no metric name".to_string()),
+    };
+    check_metric_name(&name, limits)?;
+
+    let value = read_metric_number(batch.column(cols.value), row)?
+        .ok_or_else(|| format!("value column {:?} is null", mapping.value_column))?;
+
+    // A null label cell omits that label, which changes the series identity
+    // exactly as a missing OTLP attribute does.
+    let mut labels: Vec<Label> = Vec::with_capacity(cols.labels.len());
+    for (spec, col_idx) in mapping.labels.iter().zip(&cols.labels) {
+        if let Some(value) = read_label_value(batch.column(*col_idx), row)? {
+            check_label(&spec.name, &value, limits)?;
+            labels.push(Label {
+                name: spec.name.clone(),
+                value,
+            });
+        }
+    }
+    // The loader label cap stands in for OTLP's `max_attributes_per_point`
+    // (ADR-1751 decision 1), rejected rather than silently truncated.
+    if labels.len() > LOADER_MAX_ATTRIBUTES_PER_RECORD {
+        return Err(format!(
+            "point has {} labels, more than the loader per-record cap of {}",
+            labels.len(),
+            LOADER_MAX_ATTRIBUTES_PER_RECORD
+        ));
+    }
+
+    let bucket = match &cols.histogram {
+        None => None,
+        Some(h) => {
+            let le = read_metric_number(batch.column(h.le), row)?
+                .ok_or_else(|| "histogram le column is null".to_string())?;
+            if !le.is_finite() {
+                // Matches `Rejection::NonFiniteHistogramBound`: OTLP's
+                // `explicit_bounds` carries finite bounds only, and the `+Inf`
+                // bucket is synthesized from `count`, never mapped as a row.
+                return Err(format!(
+                    "histogram le is {le}, which is not a finite bucket bound. The +Inf bucket is \
+                     synthesized from the count column and must not be a row of its own."
+                ));
+            }
+            let sum = read_metric_number(batch.column(h.sum), row)?;
+            let count = read_count(batch.column(h.count), row)?
+                .ok_or_else(|| "histogram count column is null".to_string())?;
+            Some(BucketRow { le, sum, count })
+        }
+    };
+
+    Ok(MetricRow {
+        name,
+        labels,
+        ts_ns: raw_ts,
+        value,
+        bucket,
+    })
+}
+
+/// Kept metric-name length cap, at the metrics OTLP limit.
+fn check_metric_name(name: &str, limits: &IngestLimits) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("metric name is empty".to_string());
+    }
+    if name.len() > limits.max_metric_name_len {
+        return Err(format!(
+            "metric name {name:?} is {} bytes, more than the limit of {}",
+            name.len(),
+            limits.max_metric_name_len
+        ));
+    }
+    Ok(())
+}
+
+/// Kept length caps for one label, at the metrics OTLP limits.
+fn check_label(name: &str, value: &str, limits: &IngestLimits) -> Result<(), String> {
+    if name.len() > limits.max_label_name_len {
+        return Err(format!(
+            "label name {name:?} is {} bytes, more than the limit of {}",
+            name.len(),
+            limits.max_label_name_len
+        ));
+    }
+    if value.len() > limits.max_label_value_len {
+        return Err(format!(
+            "label {name:?} value is {} bytes, more than the limit of {}",
+            value.len(),
+            limits.max_label_value_len
+        ));
+    }
+    Ok(())
+}
+
+/// Build one [`NormalizedPoint`], the metrics loader's counterpart of
+/// `ravel_otlp::normalize`'s private `finish_point`: base labels plus
+/// `__name__`, plus at most one synthesized label (`le`), through
+/// [`LabelSet::new`] and [`SeriesId::compute`].
+#[allow(clippy::too_many_arguments)]
+fn metrics_point(
+    tenant: &TenantId,
+    base_labels: &[Label],
+    metric_name: &str,
+    extra_label: Option<(&str, String)>,
+    ts_ns: i64,
+    value: f64,
+    is_monotonic_sum: bool,
+    limits: &IngestLimits,
+) -> Result<NormalizedPoint, String> {
+    check_metric_name(metric_name, limits)?;
+    let mut labels = Vec::with_capacity(base_labels.len() + 2);
+    labels.extend_from_slice(base_labels);
+    labels.push(Label {
+        name: METRIC_NAME_LABEL.to_string(),
+        value: metric_name.to_string(),
+    });
+    if let Some((name, value)) = extra_label {
+        check_label(name, &value, limits)?;
+        labels.push(Label {
+            name: name.to_string(),
+            value,
+        });
+    }
+    let label_set = LabelSet::new(labels)
+        .map_err(|e| format!("labels are not a valid series label set: {e}"))?;
+    let series_id = SeriesId::compute(tenant, metric_name, &label_set)
+        .map_err(|e| format!("series identity could not be computed: {e}"))?;
+    Ok(NormalizedPoint {
+        series_id,
+        labels: Arc::new(label_set),
+        sample: Sample { ts_ns, value },
+        is_monotonic_sum,
+    })
+}
+
+/// One classic-histogram data point accumulated from a contiguous run of
+/// source rows.
+struct PendingHistogram {
+    name: String,
+    labels: Vec<Label>,
+    ts_ns: i64,
+    /// The finite explicit bounds, in row order.
+    bounds: Vec<f64>,
+    /// Each bound's OWN bucket count, in row order (OTLP `bucket_counts`).
+    counts: Vec<u64>,
+    /// The data point's `sum`, from its rows' `sum` column.
+    sum: Option<f64>,
+    /// The data point's total count, from its rows' `count` column.
+    count: u64,
+    /// File-absolute index of the group's first row, so a rejection raised
+    /// when the group closes points at a row the operator can find.
+    first_row: u64,
+}
+
+impl PendingHistogram {
+    /// Is `row` another bucket of this same data point? A data point is one
+    /// metric name, one label set and one `ts`.
+    fn accepts(&self, row: &MetricRow) -> bool {
+        self.name == row.name && self.ts_ns == row.ts_ns && self.labels == row.labels
+    }
+}
+
+/// Groups contiguous classic-histogram rows into data points and explodes
+/// each into its Prometheus-convention series.
+struct HistogramGrouper {
+    tenant: TenantId,
+    pending: Option<PendingHistogram>,
+    /// Every group already closed, keyed by its base series id and `ts`. A
+    /// key that comes back means the file interleaves two data points'
+    /// buckets, which no contiguous-run grouping can read correctly, so it is
+    /// refused rather than exploded twice. This costs one 24-byte key per
+    /// data point for the length of the load.
+    closed: std::collections::HashSet<(SeriesId, i64)>,
+    exploded: u64,
+}
+
+impl HistogramGrouper {
+    fn new(tenant: TenantId) -> Self {
+        HistogramGrouper {
+            tenant,
+            pending: None,
+            closed: std::collections::HashSet::new(),
+            exploded: 0,
+        }
+    }
+
+    /// Fold one row into the open group, returning the points of the group it
+    /// closed (empty while the group is still accumulating). `file_row` is
+    /// the row's file-absolute index, used for the rejection the caller
+    /// reports.
+    fn push(
+        &mut self,
+        mut row: MetricRow,
+        file_row: u64,
+        limits: &IngestLimits,
+    ) -> Result<Vec<NormalizedPoint>, (u64, String)> {
+        let Some(bucket) = row.bucket.take() else {
+            return Err((
+                file_row,
+                "internal error: a histogram mapping produced a row with no bucket".to_string(),
+            ));
+        };
+        let mut closed_points = Vec::new();
+        match &mut self.pending {
+            Some(open) if open.accepts(&row) => {
+                // Every row of one data point carries the SAME sum and count:
+                // they describe the point, not the bucket. Compared by bit
+                // pattern, so a NaN sum is compared like any other payload.
+                if open.count != bucket.count {
+                    return Err((
+                        file_row,
+                        format!(
+                            "histogram count is {} here but {} on the first row of the same data \
+                             point (row {}); the count column carries the DATA POINT's total, so \
+                             it must repeat on every one of its bucket rows",
+                            bucket.count, open.count, open.first_row
+                        ),
+                    ));
+                }
+                if open.sum.map(f64::to_bits) != bucket.sum.map(f64::to_bits) {
+                    return Err((
+                        file_row,
+                        format!(
+                            "histogram sum differs from the first row of the same data point (row \
+                             {}); the sum column carries the DATA POINT's sum, so it must repeat \
+                             on every one of its bucket rows",
+                            open.first_row
+                        ),
+                    ));
+                }
+                // The row's value is this bucket's own count, so it goes
+                // through the same whole-number check the count column gets.
+                let exact = exact_count(row.value).map_err(|e| (file_row, e))?;
+                open.bounds.push(bucket.le);
+                open.counts.push(exact);
+            }
+            _ => {
+                if let Some(open) = self.pending.take() {
+                    closed_points = self.close(open, limits)?;
+                }
+                let exact = exact_count(row.value).map_err(|e| (file_row, e))?;
+                self.pending = Some(PendingHistogram {
+                    name: row.name,
+                    labels: row.labels,
+                    ts_ns: row.ts_ns,
+                    bounds: vec![bucket.le],
+                    counts: vec![exact],
+                    sum: bucket.sum,
+                    count: bucket.count,
+                    first_row: file_row,
+                });
+            }
+        }
+        Ok(closed_points)
+    }
+
+    /// Close whatever group is open at end of input.
+    fn finish(&mut self, limits: &IngestLimits) -> Result<Vec<NormalizedPoint>, (u64, String)> {
+        match self.pending.take() {
+            Some(open) => self.close(open, limits),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn close(
+        &mut self,
+        group: PendingHistogram,
+        limits: &IngestLimits,
+    ) -> Result<Vec<NormalizedPoint>, (u64, String)> {
+        let first_row = group.first_row;
+        let key = histogram_group_key(&self.tenant, &group).map_err(|e| (first_row, e))?;
+        if !self.closed.insert(key) {
+            return Err((
+                first_row,
+                format!(
+                    "the rows of the {:?} data point at ts {} are not contiguous: a group with \
+                     this identity was already closed earlier in the file. Sort the input by \
+                     metric name, labels and ts so every data point's bucket rows sit together.",
+                    group.name, group.ts_ns
+                ),
+            ));
+        }
+        let points =
+            explode_classic_histogram(&self.tenant, &group, limits).map_err(|e| (first_row, e))?;
+        self.exploded += 1;
+        Ok(points)
+    }
+}
+
+/// The base series identity of a histogram data point (its labels without the
+/// synthesized `le`, under its unsuffixed name), paired with its `ts`. This
+/// is the grouping key, computed once per group rather than once per row.
+fn histogram_group_key(
+    tenant: &TenantId,
+    group: &PendingHistogram,
+) -> Result<(SeriesId, i64), String> {
+    let mut labels = group.labels.clone();
+    labels.push(Label {
+        name: METRIC_NAME_LABEL.to_string(),
+        value: group.name.clone(),
+    });
+    let label_set = LabelSet::new(labels)
+        .map_err(|e| format!("labels are not a valid series label set: {e}"))?;
+    let series_id = SeriesId::compute(tenant, &group.name, &label_set)
+        .map_err(|e| format!("series identity could not be computed: {e}"))?;
+    Ok((series_id, group.ts_ns))
+}
+
+/// A bucket count read from the `value` column: a non-negative whole number.
+fn exact_count(value: f64) -> Result<u64, String> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+        return Err(format!(
+            "a classic-histogram row's value column is that bucket's own count, so it must be a \
+             non-negative whole number; found {value}"
+        ));
+    }
+    Ok(value as u64)
+}
+
+/// Explode one classic-histogram data point into its Prometheus-convention
+/// series: one `{name}_bucket{le=<bound>}` per explicit bound plus
+/// `{name}_bucket{le="+Inf"}` (= the point's count), `{name}_sum` when the
+/// `sum` column was not null, and `{name}_count`.
+///
+/// Mirrors `ravel_otlp::normalize`'s private `explode_histogram` (which takes
+/// an OTLP `HistogramDataPoint` and applies the past-lag check this path
+/// relaxes, so it cannot be called directly), including its check order,
+/// its accumulation of per-bucket counts into cumulative values, its use of
+/// the point's raw count for BOTH the `+Inf` bucket and `_count`, and its
+/// atomic-rejection contract: an `Err` means none of this point's series were
+/// admitted, never a partial set (ADR-0016). `crates/ravel-otap/src/
+/// normalize.rs`'s `explode_histogram_point` is the same mirror for the OTAP
+/// surface. The `le` value goes through
+/// [`ravel_otlp::promcompat::format_float`], the shared formatter that makes
+/// the same histogram admitted through any of these surfaces land on the same
+/// `SeriesId`.
+///
+/// Two OTLP behaviours have no source here and are therefore absent rather
+/// than reimplemented: the stale marker (`DataPointFlags`, which a Parquet
+/// row carries no equivalent of) and exemplars (ADR-1751 decision 2 maps
+/// none).
+fn explode_classic_histogram(
+    tenant: &TenantId,
+    group: &PendingHistogram,
+    limits: &IngestLimits,
+) -> Result<Vec<NormalizedPoint>, String> {
+    if !group.bounds.windows(2).all(|w| w[0] < w[1]) {
+        return Err(format!(
+            "the {:?} data point at ts {} has bucket bounds that do not strictly increase in row \
+             order ({:?}); sort each data point's rows by le",
+            group.name, group.ts_ns, group.bounds
+        ));
+    }
+    if group.bounds.len() > limits.max_histogram_buckets {
+        return Err(format!(
+            "the {:?} data point at ts {} has {} explicit bounds, more than the limit of {}",
+            group.name,
+            group.ts_ns,
+            group.bounds.len(),
+            limits.max_histogram_buckets
+        ));
+    }
+
+    let bucket_name = format!("{}_bucket", group.name);
+    let mut series = Vec::with_capacity(group.bounds.len() + 3);
+    let mut cumulative: u64 = 0;
+    for (bound, count) in group.bounds.iter().zip(&group.counts) {
+        cumulative = cumulative
+            .checked_add(*count)
+            .ok_or_else(|| "histogram bucket counts overflow u64".to_string())?;
+        series.push(metrics_point(
+            tenant,
+            &group.labels,
+            &bucket_name,
+            Some((LE_LABEL, format_float(*bound))),
+            group.ts_ns,
+            cumulative as f64,
+            false,
+            limits,
+        )?);
+    }
+
+    // The +Inf bucket and _count both use the point's raw count directly, not
+    // the accumulated bucket sum (matches the collector's mapping and
+    // ravel_otlp::explode_histogram).
+    let count_value = group.count as f64;
+    series.push(metrics_point(
+        tenant,
+        &group.labels,
+        &bucket_name,
+        Some((LE_LABEL, "+Inf".to_string())),
+        group.ts_ns,
+        count_value,
+        false,
+        limits,
+    )?);
+
+    if let Some(sum) = group.sum {
+        series.push(metrics_point(
+            tenant,
+            &group.labels,
+            &format!("{}_sum", group.name),
+            None,
+            group.ts_ns,
+            sum,
+            false,
+            limits,
+        )?);
+    }
+
+    series.push(metrics_point(
+        tenant,
+        &group.labels,
+        &format!("{}_count", group.name),
+        None,
+        group.ts_ns,
+        count_value,
+        false,
+        limits,
+    )?);
+
+    Ok(series)
+}
+
+/// The decode/build state the metrics loader shuttles into and back out of
+/// each batch's `spawn_blocking` task: the single sequential cursor, plus the
+/// histogram grouper whose open group can span a batch boundary.
+struct MetricsDecodeState {
+    cursor: CursorState,
+    grouper: Option<HistogramGrouper>,
+    /// `--skip-rows`, applied against each span's own file-absolute base, as
+    /// [`collect_spans`] applies it on the logs path.
+    skip_rows: u64,
+}
+
+/// One batch's decode outcome.
+enum MetricsDecoded {
+    /// Points built from this batch (plus any group it closed), the source
+    /// rows they came from, and whether the input is exhausted.
+    Batch {
+        points: Vec<NormalizedPoint>,
+        rows: u64,
+        done: bool,
+    },
+    /// The batch failed to read from Parquet or to resolve against the
+    /// mapping.
+    Failed(String),
+    /// A row failed a kept admission check, at its FILE-absolute index.
+    Rejected { row: u64, reason: String },
+}
+
+/// Decode and build one metrics batch from the sequential cursor.
+#[allow(clippy::too_many_arguments)]
+fn decode_metrics_batch(
+    state: &mut MetricsDecodeState,
+    tenant: &TenantId,
+    mapping: &MetricsMapping,
+    limits: &IngestLimits,
+    now_ns: i64,
+    batch_rows: usize,
+    is_monotonic_sum: bool,
+) -> MetricsDecoded {
+    let taken = match cursor_take(&mut state.cursor, batch_rows) {
+        Ok(taken) => taken,
+        Err(reason) => return MetricsDecoded::Failed(reason),
+    };
+    let Some((batch, file_base)) = taken else {
+        // Input exhausted: close whatever histogram group is still open, so
+        // the last data point in the file is exploded rather than dropped.
+        let points = match state.grouper.as_mut() {
+            Some(grouper) => match grouper.finish(limits) {
+                Ok(points) => points,
+                Err((row, reason)) => return MetricsDecoded::Rejected { row, reason },
+            },
+            None => Vec::new(),
+        };
+        return MetricsDecoded::Batch {
+            points,
+            rows: 0,
+            done: true,
+        };
+    };
+
+    // `--skip-rows` by file-absolute position, before mapping sees a row.
+    let (batch, file_base) = {
+        let end = file_base + batch.num_rows() as u64;
+        if end <= state.skip_rows {
+            return MetricsDecoded::Batch {
+                points: Vec::new(),
+                rows: 0,
+                done: false,
+            };
+        }
+        if file_base < state.skip_rows {
+            let cut = (state.skip_rows - file_base) as usize;
+            (
+                batch.slice(cut, batch.num_rows() - cut),
+                file_base + cut as u64,
+            )
+        } else {
+            (batch, file_base)
+        }
+    };
+
+    let cols = match MetricsColumnIndex::resolve(&batch, mapping) {
+        Ok(cols) => cols,
+        Err(reason) => return MetricsDecoded::Failed(reason),
+    };
+
+    let mut points = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let file_row = file_base + row as u64;
+        let decoded = match build_metric_row(&batch, &cols, mapping, limits, now_ns, row) {
+            Ok(decoded) => decoded,
+            Err(reason) => {
+                return MetricsDecoded::Rejected {
+                    row: file_row,
+                    reason,
+                };
+            }
+        };
+        match state.grouper.as_mut() {
+            Some(grouper) => match grouper.push(decoded, file_row, limits) {
+                Ok(closed) => points.extend(closed),
+                Err((row, reason)) => return MetricsDecoded::Rejected { row, reason },
+            },
+            None => {
+                let point = metrics_point(
+                    tenant,
+                    &decoded.labels,
+                    &decoded.name,
+                    None,
+                    decoded.ts_ns,
+                    decoded.value,
+                    is_monotonic_sum,
+                    limits,
+                );
+                match point {
+                    Ok(point) => points.push(point),
+                    Err(reason) => {
+                        return MetricsDecoded::Rejected {
+                            row: file_row,
+                            reason,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    MetricsDecoded::Batch {
+        points,
+        rows: batch.num_rows() as u64,
+        done: false,
+    }
+}
+
+/// One in-flight metrics write: the source rows it carries, the points it
+/// carries, and the task running it.
+type MetricsInflight = (
+    u64,
+    u64,
+    tokio::task::JoinHandle<Result<WriteReceipt, WriteError>>,
+);
+
+/// Bulk-import `parquet_path` into `tenant`'s metrics signal (ADR-1751
+/// decision 1).
+///
+/// The same contract as [`load`] on the logs side: the shard count is
+/// validated against (or, for a fresh signal, written to) the durable
+/// provisioning record through [`validate_or_adopt`]; the router is built
+/// from the same [`build_ingest_config`]; every batch is a
+/// [`WriteMode::Strict`] write whose ack means durable; and a failure
+/// mid-file is a genuine partial load whose durable commit tokens are
+/// reported rather than swallowed.
+///
+/// `now_ns` anchors the future-skew check only. Bucketing is by the router's
+/// own clock (load-time wall clock), so a thirty-day-old sample lands in
+/// today's ingest hour and is reached by every later query's listing window,
+/// whose upper bound is `now` (ADR-1751 Context, ADR-0089's discoverability
+/// argument).
+#[allow(clippy::too_many_arguments)]
+pub async fn load_metrics(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &MetricsMapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+) -> Result<MetricsLoadReport, LoadError> {
+    // Same operator-facing lever guards as the logs path: a value that cannot
+    // express what the flag means is rejected, never silently clamped.
+    if batch_rows == 0 {
+        return Err(LoadError::Setup(
+            "--batch-rows must be at least 1 (each batch is one Strict flush per shard); 0 was \
+             given"
+                .to_string(),
+        ));
+    }
+    if pipeline_depth == 0 {
+        return Err(LoadError::Setup(
+            "--pipeline-depth must be at least 1 (the number of concurrent in-flight writes); 0 \
+             was given"
+                .to_string(),
+        ));
+    }
+    if max_inflight_flushes == 0 {
+        return Err(LoadError::Setup(
+            "--max-inflight-flushes must be at least 1 (the number of flushes one shard may have \
+             in flight at once); 0 would deadlock every flush, since a shard could never acquire \
+             a permit to run one"
+                .to_string(),
+        ));
+    }
+    if target_bytes == 0 {
+        return Err(LoadError::Setup(
+            "--target-bytes must be at least 1 (1 flushes every batch as its own object); 0 was \
+             given"
+                .to_string(),
+        ));
+    }
+    mapping.validate()?;
+
+    let limits = IngestLimits::default();
+    let tenant_id = TenantId::new(tenant);
+
+    // Provision or validate the METRICS signal, the same first-touch path
+    // `services/ravel-server` runs and the same one the logs load takes for
+    // `Signal::Logs`.
+    validate_or_adopt(
+        store.as_ref(),
+        &tenant_id.hash(),
+        Signal::Metrics,
+        shards,
+        now_ns,
+        AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .map_err(|e| {
+        LoadError::Setup(format!(
+            "shard-count provisioning check failed for tenant {tenant:?} \
+             (configured --shards {shards}): {e}"
+        ))
+    })?;
+
+    let router = Arc::new(IngestRouter::new(
+        build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock,
+    ));
+    let ack_deadline = write_ack_deadline(max_flush_delay);
+
+    let input = FileInput { path: parquet_path };
+    let metadata = read_input_metadata(&input)?;
+    let row_group_lens = row_group_row_counts(&metadata);
+    // One sequential cursor, not the logs path's K stride cursors: a classic
+    // histogram's data point is a CONTIGUOUS run of rows, and interleaving
+    // far-apart file regions inside one batch would split every such run.
+    let mut cursors = open_stride_cursors(&input, &metadata, &row_group_lens, 1, batch_rows)?;
+    let Some(cursor) = cursors.pop() else {
+        return Err(LoadError::Setup(
+            "internal error: no read cursor was opened for the input file".to_string(),
+        ));
+    };
+
+    let started = Instant::now();
+    let mut report = MetricsLoadReport::default();
+    let total_rows: u64 = row_group_lens.iter().sum();
+    report.rows_skipped = skip_rows.min(total_rows);
+    report.skip_rows_requested = skip_rows;
+    report.file_total_rows = total_rows;
+
+    let is_monotonic_sum = mapping.kind == Some(MetricKindArg::Counter);
+    let mut state = MetricsDecodeState {
+        cursor,
+        grouper: mapping
+            .is_histogram()
+            .then(|| HistogramGrouper::new(tenant_id.clone())),
+        skip_rows,
+    };
+    let mapping = Arc::new(mapping.clone());
+
+    let mut inflight: std::collections::VecDeque<MetricsInflight> =
+        std::collections::VecDeque::with_capacity(pipeline_depth);
+    // Rows whose points are still buffered in an open histogram group, so
+    // they are attributed to the write that finally carries those points
+    // rather than counted as durable before anything was written.
+    let mut carried_rows: u64 = 0;
+
+    loop {
+        let tenant_for_decode = tenant_id.clone();
+        let mapping_for_decode = Arc::clone(&mapping);
+        let limits_for_decode = limits.clone();
+        let (returned, decoded) = tokio::task::spawn_blocking(move || {
+            let mut state = state;
+            let outcome = decode_metrics_batch(
+                &mut state,
+                &tenant_for_decode,
+                &mapping_for_decode,
+                &limits_for_decode,
+                now_ns,
+                batch_rows,
+                is_monotonic_sum,
+            );
+            (state, outcome)
+        })
+        .await
+        .map_err(|join_err| LoadError::BatchFailed {
+            reason: format!("Parquet decode/build task failed: {join_err}"),
+            durable: report.tokens.clone(),
+            resume: metrics_resume(&report),
+        })?;
+        state = returned;
+
+        let (points, rows, done) = match decoded {
+            MetricsDecoded::Failed(reason) => {
+                drain_metrics_inflight(&mut inflight, &mut report).await?;
+                return Err(LoadError::BatchFailed {
+                    reason,
+                    durable: report.tokens.clone(),
+                    resume: metrics_resume(&report),
+                });
+            }
+            MetricsDecoded::Rejected { row, reason } => {
+                drain_metrics_inflight(&mut inflight, &mut report).await?;
+                return Err(LoadError::RowRejected {
+                    row,
+                    reason,
+                    durable: report.tokens.clone(),
+                    resume: metrics_resume(&report),
+                });
+            }
+            MetricsDecoded::Batch { points, rows, done } => (points, rows, done),
+        };
+
+        if points.is_empty() {
+            carried_rows += rows;
+            if done {
+                break;
+            }
+            continue;
+        }
+
+        let batch_points = points.len() as u64;
+        let batch_rows_written = carried_rows + rows;
+        carried_rows = 0;
+        let handle = {
+            let router = Arc::clone(&router);
+            let tenant = tenant_id.clone();
+            tokio::spawn(async move {
+                router
+                    .write(tenant, points, WriteMode::Strict, ack_deadline)
+                    .await
+            })
+        };
+        inflight.push_back((batch_rows_written, batch_points, handle));
+
+        // Bound true concurrency to `pipeline_depth`, resolving strictly
+        // oldest-first so the token list and the first error stay in
+        // submission order however the underlying PUTs complete.
+        while inflight.len() >= pipeline_depth {
+            let Some(entry) = inflight.pop_front() else {
+                break;
+            };
+            if let Err(mut e) = resolve_metrics_write(entry, &mut report).await {
+                harvest_metrics_after_failure(&mut inflight, &mut e).await;
+                return Err(e);
+            }
+        }
+
+        if done {
+            break;
+        }
+    }
+
+    // Publish the tail buffers before draining, for the same reason the logs
+    // path does: no later batch is coming to push a buffer past
+    // `--target-bytes`, so its writes' acks would otherwise wait out the age
+    // trigger. The ticker sweeps a straggler whose send landed after this
+    // flush.
+    router.flush_all().await;
+    let drain_result = {
+        let ticker_router = Arc::clone(&router);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    () = tokio::time::sleep(Duration::from_secs(2)) => {
+                        ticker_router.flush_all().await;
+                    }
+                }
+            }
+        });
+        let result = drain_metrics_inflight(&mut inflight, &mut report).await;
+        let _ = stop_tx.send(());
+        let _ = ticker.await;
+        result
+    };
+    drain_result?;
+
+    report.histogram_points_exploded = state.grouper.as_ref().map_or(0, |g| g.exploded);
+    report.elapsed = started.elapsed();
+    Ok(report)
+}
+
+/// [`ResumeFigures`] from a metrics report, the same two figures a failed
+/// logs load hands back.
+fn metrics_resume(report: &MetricsLoadReport) -> ResumeFigures {
+    ResumeFigures {
+        rows_skipped: report.rows_skipped,
+        rows_written: report.rows_processed,
+    }
+}
+
+/// Resolve one in-flight metrics write, folding its tokens and counts into
+/// the report or turning its failure into a [`LoadError::Flush`] that carries
+/// the tokens already durable, including any sibling shard the router
+/// recovered from a partial write.
+async fn resolve_metrics_write(
+    entry: MetricsInflight,
+    report: &mut MetricsLoadReport,
+) -> Result<(), LoadError> {
+    let (rows, points, handle) = entry;
+    match handle.await {
+        Ok(Ok(receipt)) => {
+            report.tokens.extend(receipt.tokens);
+            report.rows_processed += rows;
+            report.points_written += points;
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            let mut durable = report.tokens.clone();
+            durable.extend_from_slice(err.durable_tokens());
+            Err(LoadError::Flush {
+                durable,
+                cause: err.to_string(),
+                resume: metrics_resume(report),
+            })
+        }
+        Err(join_err) => Err(LoadError::Flush {
+            durable: report.tokens.clone(),
+            cause: format!("write task failed: {join_err}"),
+            resume: metrics_resume(report),
+        }),
+    }
+}
+
+/// Resolve every remaining in-flight write, oldest-first, returning the first
+/// failure.
+async fn drain_metrics_inflight(
+    inflight: &mut std::collections::VecDeque<MetricsInflight>,
+    report: &mut MetricsLoadReport,
+) -> Result<(), LoadError> {
+    let mut first_error: Option<LoadError> = None;
+    while let Some(entry) = inflight.pop_front() {
+        match resolve_metrics_write(entry, report).await {
+            Ok(()) => {}
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Fold whatever the still-outstanding writes committed into an error's
+/// durable-token list. The loader cannot stop a shard-actor flush it already
+/// handed off, so awaiting the outcome is what keeps the report equal to what
+/// landed (issue #800's reasoning on the logs path).
+async fn harvest_metrics_after_failure(
+    inflight: &mut std::collections::VecDeque<MetricsInflight>,
+    err: &mut LoadError,
+) {
+    let mut recovered: Vec<CommitToken> = Vec::new();
+    while let Some((_, _, handle)) = inflight.pop_front() {
+        match handle.await {
+            Ok(Ok(receipt)) => recovered.extend(receipt.tokens),
+            Ok(Err(write_err)) => recovered.extend_from_slice(write_err.durable_tokens()),
+            Err(_) => {}
+        }
+    }
+    if let Some(durable) = err.durable_tokens_mut() {
+        durable.extend(recovered);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -4605,6 +6343,7 @@ type = "i64"
             &pq,
             "acme",
             &mapping_path,
+            SignalArg::Logs,
             4,
             10_000,
             0,
@@ -6245,6 +7984,7 @@ type = "i64"
                     &pq,
                     "acme",
                     &mapping_path,
+                    SignalArg::Logs,
                     shards,
                     16,
                     0,
@@ -7026,6 +8766,7 @@ type = "i64"
             &sorted_pq,
             "acme",
             &mapping_path,
+            SignalArg::Logs,
             shards,
             batch_rows,
             0,
@@ -7057,6 +8798,7 @@ type = "i64"
             &sorted_pq,
             "acme",
             &mapping_path,
+            SignalArg::Logs,
             shards,
             batch_rows,
             0,
@@ -7102,6 +8844,7 @@ type = "i64"
             &interleaved_pq,
             "acme",
             &mapping_path,
+            SignalArg::Logs,
             shards,
             batch_rows,
             0,
@@ -9715,6 +11458,7 @@ type = "i64"
                 &pq,
                 "acme",
                 &mapping_path,
+                SignalArg::Logs,
                 1,
                 2,
                 99,
@@ -9794,6 +11538,7 @@ type = "i64"
                 &pq,
                 "acme",
                 &mapping_path,
+                SignalArg::Logs,
                 1,
                 2,
                 2,

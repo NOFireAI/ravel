@@ -77,6 +77,54 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ravel-cli load` takes `--signal {metrics,logs,spans}` and loads the
+  metrics signal** (ADR-1751 decisions 1 and 2, follow-up task 1, issues
+  #1751 and #1712). The flag defaults to `logs`, so an invocation written
+  before this change is unaffected. A metrics load provisions or validates
+  the metrics signal, builds an `IngestRouter` from the same
+  `build_ingest_config` the logs load uses, and writes every batch in
+  `WriteMode::Strict`; ADR-0089's admission decisions apply per signal, with
+  the metrics OTLP limits (past event-time lag relaxed, future skew kept,
+  metric-name and label length caps kept, the loader per-record cap of 1024
+  in place of OTLP's `max_attributes_per_point`, the server's admission
+  controller bypassed by construction). `--signal spans` is refused with a
+  message naming ADR-1751 follow-up task 2 and never falls back to another
+  signal.
+
+  The `--mapping` TOML gains per-signal sections: exactly one of `[logs]`,
+  `[metrics]` and `[spans]` may be present and it must match `--signal`. A
+  mapping file written before this change needs no migration: its logs keys
+  sit at the document root with no section, and that shape is still read as
+  the `[logs]` section. Mixing the two spellings in one file is refused,
+  since which one wins would otherwise be an invisible precedence rule.
+
+  The `[metrics]` section names the metric (a literal `name` or a
+  `name_column`), `value_column`, `ts_column` and `ts_unit`,
+  `[[metrics.label]]` columns, an optional `kind` of `gauge` or `counter`
+  that sets `is_monotonic_sum`, and an optional `[metrics.histogram]` classic
+  shape (`le_column` plus `sum_column` and `count_column`). With the
+  histogram shape one input row is one bucket, and its `value` column is that
+  bucket's own count (the OTLP `bucket_counts` convention, not an
+  already-cumulative Prometheus `_bucket` value): the loader groups a
+  contiguous run of rows sharing a metric name, label set and `ts` into one
+  data point and explodes it into `_bucket`/`_sum`/`_count` series mirroring
+  `ravel_otlp::normalize`'s `explode_histogram`, accumulating the per-bucket
+  counts, taking the `+Inf` bucket and `_count` from the `count` column
+  rather than from the accumulated total, and formatting `le` through
+  `ravel_otlp::promcompat::format_float`, so the same histogram lands on the
+  same `SeriesId` whichever surface admitted it. A mapping that names a
+  native (exponential) histogram is rejected. Rows of one data point must be
+  contiguous; interleaved rows are refused rather than exploded twice.
+
+  A metrics load reads one sequential cursor rather than the logs path's K
+  stride cursors, because a classic histogram's data point is a contiguous
+  run of rows a stride read would split, and it warns when `--read-cursors`
+  or `--decode-queue-batches` was set to a value it therefore ignores.
+  Everything that shapes the objects (`--shards`, `--batch-rows`,
+  `--target-bytes`, `--max-inflight-flushes`, `--max-flush-delay`,
+  `--pipeline-depth`) applies unchanged. As for logs, a historical sample
+  buckets by load time, so retention runs from the load hour and a query
+  needs a window that reaches it.
 - **Catalog and PromQL decodes reserve their decoded output against the
   process memory budget before they run** (ADR-1702 decision 6, issue #1702).
   The catalog resolve reserves each snapshot part's, postings object's and
