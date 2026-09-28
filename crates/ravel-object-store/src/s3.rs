@@ -1287,9 +1287,7 @@ impl crate::conformance::BucketConfigProbeSource for S3Store {
         BucketConfigProbe {
             versioning,
             abort_incomplete_multipart_upload: rule_status(ProtectionConditionId::AbortMultipart),
-            noncurrent_version_expiration: rule_status(
-                ProtectionConditionId::NoncurrentExpiration,
-            ),
+            noncurrent_version_expiration: rule_status(ProtectionConditionId::NoncurrentExpiration),
             detail: "derived from the ADR-1727 bucket-protection control plane (?versioning, \
                      ?lifecycle over signed read-only GETs)"
                 .to_string(),

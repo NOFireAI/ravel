@@ -23,7 +23,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use object_store::CredentialProvider;
 use object_store::aws::{AwsCredential, AwsCredentialProvider};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -261,7 +260,11 @@ fn request_target(
             let trimmed = endpoint.trim_end_matches('/');
             let (scheme, authority) = split_scheme(trimmed);
             if force_path_style {
-                (scheme, authority.to_string(), format!("/{bucket}{key_path}"))
+                (
+                    scheme,
+                    authority.to_string(),
+                    format!("/{bucket}{key_path}"),
+                )
             } else {
                 (scheme, format!("{bucket}.{authority}"), key_path.clone())
             }
@@ -269,11 +272,7 @@ fn request_target(
         None => {
             let base = format!("s3.{region}.amazonaws.com");
             if force_path_style {
-                (
-                    "https",
-                    base,
-                    format!("/{bucket}{key_path}"),
-                )
+                ("https", base, format!("/{bucket}{key_path}"))
             } else {
                 ("https", format!("{bucket}.{base}"), key_path.clone())
             }
@@ -332,7 +331,7 @@ pub(crate) enum FetchOutcome<T> {
 /// affirmative "not configured" (a `Fail`) from a "could not tell" (an
 /// `Unknown`).
 #[derive(Debug)]
-enum ControlPlaneError {
+pub(crate) enum ControlPlaneError {
     /// 403: the credential cannot read this configuration -> `Unknown`.
     AccessDenied(String),
     /// 404 `NoSuch*`/`*NotFoundError`: affirmatively absent -> `Fail`.
@@ -689,7 +688,9 @@ pub(crate) fn parse_retention(body: &[u8]) -> Result<RetentionConfig, ControlPla
     Ok(config)
 }
 
-pub(crate) fn parse_object_versions(body: &[u8]) -> Result<ObjectVersionListing, ControlPlaneError> {
+pub(crate) fn parse_object_versions(
+    body: &[u8],
+) -> Result<ObjectVersionListing, ControlPlaneError> {
     let mut reader = xml_reader(body);
     let mut buf = Vec::new();
     let mut stack: Vec<Vec<u8>> = Vec::new();
@@ -791,11 +792,10 @@ impl BucketControlPlaneClient {
         object_key: Option<&str>,
         query_pairs: &[(String, String)],
     ) -> Result<String, ControlPlaneError> {
-        let credential = self
-            .credentials
-            .get_credential()
-            .await
-            .map_err(|e| ControlPlaneError::Transport(format!("credential fetch failed: {e}")))?;
+        let credential =
+            self.credentials.get_credential().await.map_err(|e| {
+                ControlPlaneError::Transport(format!("credential fetch failed: {e}"))
+            })?;
 
         let target = request_target(
             &self.bucket,
@@ -1044,7 +1044,9 @@ impl BucketControlPlaneClient {
         } else if sampled_any {
             RetentionSample::Pass
         } else {
-            RetentionSample::Unknown("no objects under the protected prefixes to sample".to_string())
+            RetentionSample::Unknown(
+                "no objects under the protected prefixes to sample".to_string(),
+            )
         }
     }
 }
@@ -1129,13 +1131,8 @@ pub(crate) fn assemble_report(
     ));
 
     // The five lifecycle-derived conditions share one fetched config.
-    let (
-        noncurrent_state,
-        expired_marker_state,
-        abort_state,
-        rule_scope_state,
-        no_foreign_state,
-    ) = lifecycle_conditions(lifecycle, params.expected_noncurrent_days);
+    let (noncurrent_state, expired_marker_state, abort_state, rule_scope_state, no_foreign_state) =
+        lifecycle_conditions(lifecycle, params.expected_noncurrent_days);
     states.push((Id::NoncurrentExpiration, noncurrent_state));
     states.push((Id::ExpiredDeleteMarker, expired_marker_state));
     states.push((Id::AbortMultipart, abort_state));
@@ -1150,9 +1147,7 @@ pub(crate) fn assemble_report(
                 if config.delete_marker_replication_enabled {
                     ConditionState::Pass
                 } else {
-                    ConditionState::Fail(
-                        "DeleteMarkerReplication is not Enabled".to_string(),
-                    )
+                    ConditionState::Fail("DeleteMarkerReplication is not Enabled".to_string())
                 }
             }
             FetchOutcome::Absent(detail) => ConditionState::Fail(detail.clone()),
@@ -1238,9 +1233,7 @@ fn lifecycle_conditions(
         .find(|r| r.noncurrent_days.is_some())
         .copied();
     let noncurrent_state = match noncurrent {
-        None => ConditionState::Fail(
-            "no enabled noncurrent-version expiration rule".to_string(),
-        ),
+        None => ConditionState::Fail("no enabled noncurrent-version expiration rule".to_string()),
         Some(rule) => {
             let days = rule.noncurrent_days.unwrap_or_default();
             match expected_noncurrent_days {
@@ -1283,9 +1276,7 @@ fn lifecycle_conditions(
     {
         ConditionState::Pass
     } else {
-        ConditionState::Fail(
-            "no enabled sanctioned rule covers every t/ prefix".to_string(),
-        )
+        ConditionState::Fail("no enabled sanctioned rule covers every t/ prefix".to_string())
     };
 
     // no-foreign-rule: no enabled rule with a current-version expiration or a
@@ -1400,10 +1391,7 @@ mod tests {
     #[test]
     fn sigv4_known_answer_matches_aws_published_signature() {
         let (request, signed_headers) = kat_canonical_request();
-        assert_eq!(
-            signed_headers,
-            "host;range;x-amz-content-sha256;x-amz-date"
-        );
+        assert_eq!(signed_headers, "host;range;x-amz-content-sha256;x-amz-date");
         let scope = format!("{KAT_DATE_STAMP}/{KAT_REGION}/{SERVICE}/aws4_request");
         let sts = string_to_sign(KAT_AMZ_DATE, &scope, &request);
         let sig = signature(KAT_SECRET_KEY, KAT_DATE_STAMP, KAT_REGION, SERVICE, &sts);
@@ -1459,7 +1447,8 @@ mod tests {
 
     #[test]
     fn parses_versioning_enabled() {
-        let body = br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+        let body =
+            br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
         assert_eq!(
             parse_versioning(body).expect("parse").status.as_deref(),
             Some("Enabled")
@@ -1640,7 +1629,10 @@ mod tests {
             expected_noncurrent_days: Some(30),
             ..Default::default()
         };
-        let (noncurrent, ..) = lifecycle_conditions(&FetchOutcome::Present(lifecycle), params.expected_noncurrent_days);
+        let (noncurrent, ..) = lifecycle_conditions(
+            &FetchOutcome::Present(lifecycle),
+            params.expected_noncurrent_days,
+        );
         assert!(noncurrent.is_fail());
     }
 
@@ -1882,8 +1874,8 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_get_signs_and_parses_over_http() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> =
-            Arc::new(|_sub, _path| {
+        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> = Arc::new(
+            |_sub, _path| {
                 (
                     StatusCode::OK,
                     r#"<LifecycleConfiguration><Rule><Status>Enabled</Status>
@@ -1892,7 +1884,8 @@ mod tests {
                     </Rule></LifecycleConfiguration>"#
                         .to_string(),
                 )
-            });
+            },
+        );
         let (base, seen) = spawn_fake(respond).await;
         let client = test_client(&base);
         match client.fetch_lifecycle().await {
@@ -1906,8 +1899,9 @@ mod tests {
 
     #[tokio::test]
     async fn replication_and_object_lock_get_over_http() {
-        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> =
-            Arc::new(|sub, _path| match sub {
+        let respond: Arc<dyn Fn(&str, &str) -> (StatusCode, String) + Send + Sync> = Arc::new(
+            |sub, _path| {
+                match sub {
                 "replication" => (
                     StatusCode::OK,
                     "<ReplicationConfiguration><Rule><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule></ReplicationConfiguration>".to_string(),
@@ -1917,7 +1911,9 @@ mod tests {
                     "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_string(),
                 ),
                 other => panic!("unexpected subresource {other}"),
-            });
+            }
+            },
+        );
         let (base, seen) = spawn_fake(respond).await;
         let client = test_client(&base);
         assert!(matches!(

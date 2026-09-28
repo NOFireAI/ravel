@@ -5103,7 +5103,10 @@ mod tests {
             "object-lock",
             "object-retention",
         ];
-        let actual: Vec<&str> = ProtectionConditionId::ALL.iter().map(|id| id.id()).collect();
+        let actual: Vec<&str> = ProtectionConditionId::ALL
+            .iter()
+            .map(|id| id.id())
+            .collect();
         assert_eq!(actual, expected);
     }
 
