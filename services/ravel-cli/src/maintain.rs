@@ -11,9 +11,9 @@ use std::sync::Arc;
 use clap::ValueEnum;
 use ravel_commit::keys;
 use ravel_maintain::{
-    Bucket, CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, LegalHoldCheck,
-    MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport, Verification, census_family,
-    compact_bucket, migrate_family, sweep_shard,
+    BlockedBucket, BlockedReason, Bucket, CompactionOutcome, CompactorConfig, FamilyMigrateReport,
+    FixedClock, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport,
+    Verification, census_family, compact_bucket, migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -1389,6 +1389,43 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
     Ok(signal_supported_versions(signal)?.newest)
 }
 
+/// One line per blocked bucket, followed by the sentence that says what an
+/// operator can do about them, which is not re-running this command
+/// (ADR-1331 decisions 2 and 3).
+///
+/// Split out from the printing so a test asserts the exact text an operator
+/// reads. Returns the empty string for an empty list, so the caller can print
+/// unconditionally without emitting a stray blank line.
+fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
+    if blocked.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for bucket in blocked {
+        let reason = match &bucket.reason {
+            BlockedReason::RewriteParts { below_target } => {
+                format!("rewrite_parts below_target={below_target}")
+            }
+            BlockedReason::LoserOnlyInputs => "loser_only_inputs".to_string(),
+        };
+        out.push_str(&format!(
+            "blocked_bucket: shard={} hour={} reason={reason}\n",
+            bucket.shard, bucket.ingest_hour
+        ));
+    }
+    out.push_str(
+        "Re-running migrate does not clear any blocked bucket above; it reports the same list \
+         again. A rewrite_parts bucket holds a live selective-erasure rewrite record whose \
+         surviving parts sit below the target, and migrate never rewrites those: it clears when \
+         retention ages the bucket out (subject to the format-version hold, which keeps an \
+         object this build cannot read) or when a later erasure request supersedes that record \
+         at the current output version. A loser_only_inputs bucket clears when a later \
+         authoritative compaction covers those inputs, or when retention ages them out. Neither \
+         is a command you run.",
+    );
+    out
+}
+
 /// `maintain migrate`: raise a `(tenant, signal, format family)`'s recorded
 /// format floor to `target_version`, migrating every live record still below it
 /// first. The same operation the server
@@ -1409,8 +1446,11 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 /// therefore converges and raises the floor in one invocation, with no
 /// interleaved `sweep` required, but a below-target loser-only input is a
 /// straggler the walk cannot migrate, so that refusal is permanent until the
-/// overlap itself is resolved. `buckets_blocked` reports how many buckets are
-/// in that state.
+/// overlap itself is resolved. A live erasure rewrite record whose surviving
+/// parts sit below the target is the other permanent case: this job never
+/// rewrites them (ADR-1331). Each such bucket is printed on its own
+/// `blocked_bucket` line with its reason, and `buckets_blocked` is how many
+/// there are.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -1470,7 +1510,11 @@ pub async fn migrate(
     println!("budget_records: {budget_records} (0 = unlimited)");
     println!("buckets_examined: {}", report.buckets_examined);
     println!("buckets_migrated: {}", report.buckets_migrated);
-    println!("buckets_blocked: {}", report.buckets_blocked);
+    println!("buckets_blocked: {}", report.buckets_blocked());
+    let blocked = blocked_bucket_report(&report.blocked_buckets);
+    if !blocked.is_empty() {
+        println!("{blocked}");
+    }
     println!("records_migrated: {}", report.records_migrated);
     if let Some((shard, hour)) = report.cursor_advanced_to {
         println!("cursor_advanced_to: shard={shard} hour={hour}");
@@ -1492,13 +1536,20 @@ pub async fn migrate(
             println!("floor_raised_to: {floor_version}");
             Ok(())
         }
-        Some(Verification::Stragglers { l0, l1 }) => {
+        Some(Verification::Stragglers {
+            l0,
+            l1,
+            rewrite_parts,
+            blocked,
+        }) => {
             println!(
-                "verification: FOUND STRAGGLERS l0_commit_records={l0} l1_compaction_parts={l1}"
+                "verification: FOUND STRAGGLERS l0_commit_records={l0} l1_compaction_parts={l1} \
+                 rewrite_record_parts={rewrite_parts}"
             );
             anyhow::bail!(
                 "migrate refused to raise the {family} floor for tenant {tenant} signal {sig:?}: \
-                 the fresh re-audit found {l0} commit record(s) and {l1} compaction part(s) still \
+                 the fresh re-audit found {l0} commit record(s), {l1} compaction part(s) and \
+                 {rewrite_parts} rewrite record part(s) still \
                  below target version {target} (data landed below the target between the walk \
                  finishing and the floor raise, or is not yet migratable -- e.g. still \
                  unsealed). These are genuinely live: a bucket's own pre-rewrite commit records \
@@ -1507,10 +1558,12 @@ pub async fn migrate(
                  Whether re-running helps depends on why they are below target. Data that is \
                  merely not yet sealed migrates on a later run. But a below-target L0 that only \
                  a LOSING compaction record names is served raw by the resolver and is not \
-                 migratable by the walk, so that straggler is permanent until the overlap \
-                 itself is resolved, and re-running will report the same count forever. \
-                 buckets_blocked above counts the buckets in that state: if it is non-zero, \
-                 re-running is not the remedy."
+                 migratable by the walk, and a live erasure rewrite record's parts are never \
+                 migrated by this job at all, so those stragglers are permanent and re-running \
+                 will report the same count forever. The {} blocked_bucket line(s) above name \
+                 every such bucket with its reason: if there are any, re-running is not the \
+                 remedy.",
+                blocked.len()
             )
         }
         None => {
@@ -2187,6 +2240,65 @@ mod tests {
         assert!(w.contains(u32::from(seg.newest())));
         assert!(!w.contains(u32::from(seg.newest()) + 1));
         assert!(!w.contains(u32::from(seg.oldest()).saturating_sub(1)));
+    }
+
+    /// ADR-1331 decision 2, follow-up task 2: `migrate` prints one line per
+    /// blocked bucket naming its shard, hour and reason, and states that
+    /// re-running does not clear it.
+    ///
+    /// The exact line matters: it is what an operator reads to decide whether
+    /// to re-run, and before this the report said only `buckets_blocked: 0`
+    /// beside a straggler count that never drains. Prove-the-test: there was no
+    /// blocked-bucket line at all to assert on, so both `contains` checks fail
+    /// against the pre-change output.
+    #[test]
+    fn migrate_prints_each_blocked_bucket_with_its_reason_and_how_it_clears() {
+        let printed = blocked_bucket_report(&[
+            BlockedBucket {
+                shard: 0,
+                ingest_hour: 100,
+                reason: BlockedReason::RewriteParts { below_target: 2 },
+            },
+            BlockedBucket {
+                shard: 3,
+                ingest_hour: 47,
+                reason: BlockedReason::LoserOnlyInputs,
+            },
+        ]);
+
+        assert!(
+            printed
+                .contains("blocked_bucket: shard=0 hour=100 reason=rewrite_parts below_target=2"),
+            "the rewrite-blocked bucket is named with its exact part count: {printed}"
+        );
+        assert!(
+            printed.contains("blocked_bucket: shard=3 hour=47 reason=loser_only_inputs"),
+            "the overlap-blocked bucket is named too: {printed}"
+        );
+        assert_eq!(
+            printed
+                .lines()
+                .filter(|line| line.starts_with("blocked_bucket:"))
+                .count(),
+            2,
+            "one line per blocked bucket, no more: {printed}"
+        );
+        assert!(
+            printed.contains("Re-running migrate does not clear any blocked bucket"),
+            "the operator is told re-running is not the remedy: {printed}"
+        );
+        assert!(
+            printed.contains("retention ages the bucket out")
+                && printed.contains("later erasure request supersedes that record"),
+            "and is told the two ways a rewrite_parts block actually clears \
+             (ADR-1331 decision 3): {printed}"
+        );
+
+        assert_eq!(
+            blocked_bucket_report(&[]),
+            "",
+            "nothing blocked prints nothing, not a blank line"
+        );
     }
 
     /// Publish one commit record (and its data object) at `shard` for Metrics

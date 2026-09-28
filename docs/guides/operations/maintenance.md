@@ -500,29 +500,52 @@ target on-object format version. One invocation:
    below the target.
 
 A refused raise, reported as "FOUND STRAGGLERS", means the fresh re-audit found
-genuine live data still below the target. Whether re-running helps depends on
-why. A bucket too recently landed to be sealed, or data that arrived after the
-walk passed, migrates on a later run. But an L0 input that only a losing
-compaction record names is served raw and the walk cannot migrate it, so that
-refusal is permanent until the overlap itself is resolved and re-running reports
-the same count forever. `buckets_blocked` in the report counts the buckets in
-that state; when it is non-zero, re-running is not the remedy.
+genuine live data still below the target. It reports three counts, because they
+converge differently: `l0_commit_records`, `l1_compaction_parts`, and
+`rewrite_record_parts`. Whether re-running helps depends on which. A bucket too
+recently landed to be sealed, or data that arrived after the walk passed,
+migrates on a later run, and so does a below-target compaction part (compaction
+outputs are always written at the current version). Two cases never migrate, and
+`migrate` names each affected bucket on its own line:
 
-The counter is narrowed to that case deliberately. The rewrite primitive also
-refuses a bucket when a concurrent compaction or erasure lands between the
-walk's listing and its own, which is harmless and converges on a later run.
-Because the refusal alone cannot tell the two apart, the walk re-reads the
-bucket after a refusal and counts it only when a below-target record is still
-served raw.
+```
+buckets_blocked: 2
+blocked_bucket: shard=0 hour=100 reason=rewrite_parts below_target=2
+blocked_bucket: shard=3 hour=47 reason=loser_only_inputs
+```
 
-There is no command that forces the overlap to resolve. The block clears on its
-own when the loser-only inputs stop being served raw, which happens when a
-later authoritative compaction covers them or when retention ages them out.
-Until one of those occurs the floor stays where it is, which is the correct
-outcome rather than a fault: raising it would claim a format floor over an
-object the resolver still returns. The walk's output identifies the shard and
-ingest hour, so the affected bucket is known even though no command resolves
-the overlap for you.
+`buckets_blocked` is how many such lines there are. When it is non-zero,
+re-running is not the remedy, and neither reason is something a command clears.
+
+**`loser_only_inputs`.** An L0 input that only a losing compaction record names
+is served raw and the walk cannot migrate it: a new record over that subset
+joins the same overlap component and loses to the existing winner. It clears
+when a later authoritative compaction covers those inputs, or when retention
+ages them out.
+
+**`rewrite_parts`.** The bucket holds a live selective-erasure rewrite record
+(the durable steady state of a bucket an erasure request touched), and
+`below_target` of its surviving parts were written at the erasure-time format
+version, below the target. `migrate` never rewrites them. Publishing a migration
+output over inputs a rewrite already covers puts two record sets on one bucket,
+and a snapshot including both resurrects the records that rewrite deliberately
+dropped; an output that re-applies the same drops is an erasure rewrite with all
+of selective erasure's request-binding obligations, which this job does not
+have. So the parts are counted, so the floor is never raised over them, and the
+bucket is named. It clears one of two ways, neither of them a command you run:
+retention ages the bucket out, subject to the format-version hold that keeps an
+object this build cannot read; or a later erasure request against the same
+bucket produces a superseding rewrite at the current output version, which the
+erasure driver does on its own schedule. Until then the family's floor stays
+where it is, which is the correct outcome rather than a fault: raising it would
+claim a format floor over objects every query still reads.
+
+Blocked buckets are narrowed to those two cases deliberately. The rewrite
+primitive also refuses a bucket when a concurrent compaction or erasure lands
+between the walk's listing and its own, which is harmless and converges on a
+later run. Because the refusal alone cannot tell the two apart, the walk
+re-reads the bucket after a refusal and reports it only when a below-target
+record is still served raw.
 
 The re-audit's liveness definition excludes a bucket's pre-rewrite L0 commit
 records once an authoritative compaction or rewrite record supersedes them.
