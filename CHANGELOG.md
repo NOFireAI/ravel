@@ -20,13 +20,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`l0_commit_records`, `l1_compaction_parts`, `rewrite_record_parts`) and
   prints one `blocked_bucket` line per affected bucket with its shard, hour
   and reason, `rewrite_parts below_target=<n>` or `loser_only_inputs`,
-  followed by how each clears: retention under the format-version hold, or a
-  later erasure request superseding the record at the current output version.
-  `buckets_blocked` is the number of those lines and now covers both permanent
-  cases. `count_below_target` returns a `BelowTargetReport` instead of an
-  `(l0, l1)` pair, `Verification::Stragglers` carries the three counts and the
-  list, and `FamilyMigrateReport::buckets_blocked` is a method over
-  `blocked_buckets` rather than a separate counter.
+  followed by how each clears. A `rewrite_parts` block clears when retention
+  ages the bucket out under the format-version hold, or when a later erasure
+  request supersedes the record at the current output version AND a subsequent
+  `sweep` removes the superseded predecessor: `below_target` counts the parts
+  of every rewrite record the bucket still LISTS, and a superseded record stays
+  listed until the sweep deletes it, so the superseding rewrite alone does not
+  clear the block. A `loser_only_inputs` block clears only when retention ages
+  those inputs out, since compaction refuses a bucket that already carries a
+  compaction record and so never publishes the covering record that would
+  otherwise clear it. `buckets_blocked` is the number of those lines, covers
+  both permanent cases, and covers the buckets the invocation examined (a walk
+  resumed from a cursor does not re-report loser-only buckets an earlier
+  invocation found). A below-target compaction part blocks the floor too and is
+  reported as an `l1_compaction_parts` count with no `blocked_bucket` line:
+  nothing migrates one either, because compaction and the migration rewrite
+  both refuse a bucket that already carries a compaction record, so ADR-0066
+  decision 4 force 2 is unimplemented (issue #2093). The explanatory prose
+  between `buckets_blocked` and `records_migrated` is prefixed with `# ` so it
+  is not read as a `key: value` line. `count_below_target` returns a
+  `BelowTargetReport` instead of an `(l0, l1)` pair,
+  `Verification::Stragglers` carries the three counts and the list, and
+  `FamilyMigrateReport::buckets_blocked` is a method over `blocked_buckets`
+  rather than a separate counter.
 
 - **This release reads provisioning record format 3 and still writes 2, and
   `ravel-cli maintain audit-versions` now classifies every recorded format

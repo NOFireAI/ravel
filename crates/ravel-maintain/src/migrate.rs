@@ -146,17 +146,31 @@ pub enum BlockedReason {
     /// already covers resurrects the records that rewrite deliberately dropped,
     /// unless the same `drops` are re-applied, which is an erasure rewrite with
     /// ADR-0064's request-binding obligations rather than a migration
-    /// (ADR-1331 decision 1). The block clears when retention ages the bucket
-    /// out, subject to the ADR-0066 #530 version hold, or when a later erasure
-    /// request supersedes the record at the current output version
+    /// (ADR-1331 decision 1).
+    ///
+    /// `below_target` sums the below-target parts of every rewrite record the
+    /// bucket LISTS, which is not the same as its live ones: a predecessor a
+    /// later rewrite superseded stays listed until `sweep` deletes it, and its
+    /// parts keep counting until then. So a bucket whose superseding rewrite is
+    /// already at the current output version stays blocked, by its
+    /// predecessor's parts, until that sweep runs. The block clears when
+    /// retention ages the bucket out, subject to the ADR-0066 #530 version
+    /// hold, or when a later erasure request supersedes the record at the
+    /// current output version AND a sweep removes the superseded predecessor
     /// (ADR-1331 decision 3).
     RewriteParts { below_target: usize },
     /// Overlapping compaction records resolve to a winner and a loser, and an
     /// input only the loser names is still served raw and below the target. A
     /// new record over that subset joins the same overlap component and loses
-    /// to the existing winner, so no rewrite migrates it. The block clears when
-    /// a later authoritative compaction covers those inputs, or when retention
-    /// ages them out.
+    /// to the existing winner, so no rewrite migrates it.
+    ///
+    /// Nothing in this build clears it except retention aging those inputs out,
+    /// subject to the ADR-0066 #530 version hold. A "later authoritative
+    /// compaction covering those inputs" would, but no path publishes one:
+    /// [`crate::compact::compact_bucket`] and
+    /// [`crate::rewrite::migrate_bucket_format`] both refuse a bucket that
+    /// already carries a compaction record, so the bucket's record set is
+    /// closed.
     LoserOnlyInputs,
 }
 
@@ -172,25 +186,37 @@ pub struct BlockedBucket {
 /// What one [`count_below_target`] pass found below the target, with the three
 /// sources kept apart (ADR-1331 decision 1).
 ///
-/// The split is load-bearing rather than cosmetic: `l1` is migratable by a
-/// later run under ADR-0066 decision 4's rewrite-on-touch, while
-/// `rewrite_parts` never is, so folding the two together leaves an operator
-/// re-running a job that cannot converge.
+/// The split is load-bearing rather than cosmetic: the three sources reach the
+/// target by different routes, and in this build only `l0` has one. The walk
+/// rewrites below-target L0 records. Nothing rewrites a below-target compaction
+/// part: [`crate::compact::compact_bucket`] and
+/// [`crate::rewrite::migrate_bucket_format`] both refuse a bucket that already
+/// carries a compaction record, so ADR-0066 decision 4 force 2's
+/// rewrite-on-touch over "live L1 part below the current version" is
+/// unimplemented (issue #2093). Nothing rewrites a rewrite record's parts
+/// either, by decision (ADR-1331 decision 1). Summing the three into one figure
+/// would hide which part of it a re-run could move, which today is only `l0`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BelowTargetReport {
     /// Below-target L0 commit records still live. A bucket's pre-rewrite commit
     /// records, once an authoritative compaction record or a rewrite record
     /// names them as inputs, are excluded rather than counted here.
     pub l0: usize,
-    /// Below-target parts of compaction records only.
+    /// Below-target parts of compaction records only. They refuse the floor
+    /// raise, and no code path migrates them (issue #2093), so re-running
+    /// `migrate` reports the same figure. Their buckets are not named in
+    /// [`Self::blocked`]; whether they should be is #2093's decision, not this
+    /// type's.
     pub l1: usize,
-    /// Below-target parts of live rewrite records, which this job never
-    /// migrates.
+    /// Below-target parts of the rewrite records a bucket LISTS, which this job
+    /// never migrates. A superseded predecessor stays listed until `sweep`
+    /// deletes it, so its parts are in this figure alongside its successor's.
     pub rewrite_parts: usize,
     /// The buckets whose `rewrite_parts` block the floor, one entry per bucket
-    /// with its exact count. The walk contributes the
-    /// [`BlockedReason::LoserOnlyInputs`] entries separately, so this pass
-    /// reports only what it can see for itself.
+    /// with its exact count, summed over every rewrite record that bucket
+    /// lists. The walk contributes the [`BlockedReason::LoserOnlyInputs`]
+    /// entries separately, so this pass reports only what it can see for
+    /// itself.
     pub blocked: Vec<BlockedBucket>,
 }
 
@@ -216,11 +242,13 @@ pub enum Verification {
     /// still live (a bucket's pre-rewrite commit records already superseded by
     /// an authoritative compaction record, or by a rewrite record, are
     /// excluded, not counted here: [`count_below_target`]), `l1` counts
-    /// below-target compaction parts, and `rewrite_parts` counts below-target
-    /// parts of live rewrite records, which this job never migrates. `blocked`
-    /// names every bucket whose refusal no re-run clears, with its reason
-    /// (ADR-1331 decision 2); it is the same list
-    /// [`FamilyMigrateReport::blocked_buckets`] carries.
+    /// below-target compaction parts, which no code path migrates either
+    /// (issue #2093), and `rewrite_parts` counts below-target parts of the
+    /// rewrite records each bucket lists, which this job never migrates.
+    /// `blocked` names, with its reason, each bucket whose refusal no re-run
+    /// clears THAT THIS INVOCATION EXAMINED (ADR-1331 decision 2); it is the
+    /// same list [`FamilyMigrateReport::blocked_buckets`] carries, and carries
+    /// that list's resume-window caveat too.
     Stragglers {
         l0: usize,
         l1: usize,
@@ -262,7 +290,16 @@ pub struct FamilyMigrateReport {
     /// condition itself resolves; naming the bucket and the reason is what
     /// keeps an operator from re-running a job that cannot converge.
     ///
-    /// Sorted by `(shard, ingest_hour)`, one entry per bucket.
+    /// The two halves have different scopes and the list is their union, so it
+    /// is not a census of the family. The re-audit covers every shard, so its
+    /// [`BlockedReason::RewriteParts`] entries are complete. The walk covers
+    /// only the buckets PAST THE CURSOR that this invocation examined, so a
+    /// walk resumed mid-family omits the [`BlockedReason::LoserOnlyInputs`]
+    /// buckets an earlier invocation found and does not re-report them.
+    ///
+    /// Sorted by `(shard, ingest_hour)`, one entry per bucket. Where both
+    /// passes name the same bucket the re-audit's entry is the one kept, since
+    /// it is the only one of the two that carries a count.
     pub blocked_buckets: Vec<BlockedBucket>,
     /// The `(shard, ingest_hour)` the cursor was persisted at, when this
     /// invocation stopped on its budget. `None` once the walk completes: a
@@ -477,8 +514,14 @@ async fn list_shard_hours(
 /// (ADR-1331 decision 1) and their bucket is named in
 /// [`BelowTargetReport::blocked`]. They still refuse the floor raise -- they are
 /// exactly the live below-target objects a raised floor would deny the
-/// existence of -- but nothing in this crate ever migrates them, so counting
-/// them into `l1` told an operator to re-run a job that cannot converge.
+/// existence of -- but nothing in this crate ever migrates them, and folding
+/// them into `l1` left the report unable to name the bucket holding the floor
+/// down or say how many of its parts did it.
+///
+/// The count is over LISTED records, not live ones. A rewrite record a later
+/// rewrite superseded stays listed until `sweep` deletes it, so its parts are
+/// summed into its bucket's figure alongside the successor's for as long as it
+/// is there.
 pub async fn count_below_target(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -664,10 +707,12 @@ async fn read_named_record(
     })
 }
 
-/// Which kind of record contributed parts. The two converge differently
-/// (ADR-1331 decision 1): a below-target compaction part is migratable by a
-/// later run, a below-target rewrite part never is, so the re-audit has to keep
-/// them apart rather than sum them.
+/// Which kind of record contributed parts. The re-audit keeps them apart rather
+/// than summing them because they are blocked for different reasons and clear
+/// differently (ADR-1331 decision 1): a below-target rewrite part is never
+/// migrated by decision, while a below-target compaction part is one ADR-0066
+/// decision 4 force 2 intends to converge through rewrite-on-touch and no code
+/// path implements yet (issue #2093).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordKind {
     Compaction,
@@ -1175,15 +1220,22 @@ pub async fn migrate_family(
     // one list an operator reads is their union. A bucket both passes name
     // (partial coverage under a rewrite record) is one blocked bucket, not two:
     // `buckets_blocked` counts buckets.
+    //
+    // On that collision the re-audit's entry REPLACES the walk's rather than
+    // being dropped. Both reasons are true of the bucket and neither is cleared
+    // by a re-run, so the line says the same thing about what to do next
+    // either way; but only `RewriteParts` carries a count, and dropping it left
+    // the operator with no figure at all for the parts holding that bucket's
+    // floor down.
     for blocked in std::mem::take(&mut audit.blocked) {
-        if report
+        match report
             .blocked_buckets
-            .iter()
-            .any(|seen| (seen.shard, seen.ingest_hour) == (blocked.shard, blocked.ingest_hour))
+            .iter_mut()
+            .find(|seen| (seen.shard, seen.ingest_hour) == (blocked.shard, blocked.ingest_hour))
         {
-            continue;
+            Some(seen) => *seen = blocked,
+            None => report.blocked_buckets.push(blocked),
         }
-        report.blocked_buckets.push(blocked);
     }
     report
         .blocked_buckets
@@ -2301,8 +2353,9 @@ mod tests {
         );
         assert!(
             audit.blocked.is_empty(),
-            "a compaction part below the target is migratable by a later run, so its bucket \
-             is not blocked: {:?}",
+            "only a rewrite record's parts put a bucket on this list; a below-target \
+             compaction part is counted in l1 and blocks the floor just the same, but \
+             naming it is issue #2093's decision, not this pass's: {:?}",
             audit.blocked
         );
     }
@@ -2454,21 +2507,41 @@ mod tests {
         key
     }
 
-    /// Build and PUT one selective-erasure rewrite record (ADR-0064) at
-    /// `(shard, hour)` naming the L0 inputs seeded at `input_seqs`, carrying
-    /// `part_count` surviving parts all stamped at `part_version`. `hash_seed`
-    /// fills `input_set_hash`, which the key embeds. No part data objects are
-    /// written: neither [`count_below_target`] nor the walk's eligibility check
-    /// reads them.
-    async fn put_rewrite_record(
-        store: &dyn ObjectStoreBackend,
+    /// One selective-erasure rewrite record for [`put_rewrite_record`] to
+    /// build.
+    struct RewriteFixture<'a> {
         shard: u32,
         hour: u32,
-        input_seqs: &[u64],
+        /// The L0 inputs this record supersedes, by the same `seq` [`seed_at`]
+        /// takes. Empty for a rewrite that supersedes another record instead.
+        input_seqs: &'a [u64],
+        /// Fills `input_set_hash`, which the record key embeds.
         hash_seed: u8,
         part_version: u32,
         part_count: u32,
+        /// The record key this one replaces, empty for a first-pass rewrite
+        /// over raw L0, so a test can seed a predecessor that is superseded but
+        /// still listed.
+        supersedes: &'a str,
+    }
+
+    /// Build and PUT one selective-erasure rewrite record (ADR-0064), carrying
+    /// `part_count` surviving parts all stamped at `part_version`. No part data
+    /// objects are written: neither [`count_below_target`] nor the walk's
+    /// eligibility check reads them.
+    async fn put_rewrite_record(
+        store: &dyn ObjectStoreBackend,
+        spec: RewriteFixture<'_>,
     ) -> String {
+        let RewriteFixture {
+            shard,
+            hour,
+            input_seqs,
+            hash_seed,
+            part_version,
+            part_count,
+            supersedes,
+        } = spec;
         use prost::Message;
         use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, RewriteDrop};
 
@@ -2511,7 +2584,7 @@ mod tests {
                 dropped_count: 1,
             }],
             created_unix_ns: created,
-            superseded_record_key: String::new(),
+            superseded_record_key: supersedes.to_string(),
         };
         let hash16: String = input_set_hash[..8]
             .iter()
@@ -2555,7 +2628,19 @@ mod tests {
         // two surviving parts were stamped at the erasure-time version, which is
         // below the target this run is migrating to.
         seed_at(&store, 0, 100, 1, "alpha", VERSION_V7 as u32).await;
-        put_rewrite_record(&store, 0, 100, &[1], 0x33, VERSION_V7 as u32, 2).await;
+        put_rewrite_record(
+            &store,
+            RewriteFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[1],
+                hash_seed: 0x33,
+                part_version: VERSION_V7 as u32,
+                part_count: 2,
+                supersedes: "",
+            },
+        )
+        .await;
 
         let clock = FixedClock::new(sealed_now_ns_for(100));
         let report = migrate_family(
@@ -2625,11 +2710,239 @@ mod tests {
         );
     }
 
+    /// `below_target` counts the parts of every rewrite record the bucket
+    /// LISTS, not its live ones, and the guide, the CLI text and the changelog
+    /// now say so.
+    ///
+    /// A superseding rewrite does not delete the record it supersedes; `sweep`
+    /// does, on its own schedule. Until then both records are listed and both
+    /// sets of parts are real objects the resolver can still be pointed at, so
+    /// both are counted. The consequence an operator has to be told is the
+    /// second half of this test: a bucket whose SUCCESSOR rewrite is already at
+    /// the current output version stays blocked, on its predecessor's parts
+    /// alone, until the sweep runs. "A later erasure request at the current
+    /// version clears the block" was therefore wrong on its own.
+    ///
+    /// The single-bucket figure is a sum over two records (2 + 1, then 2 + 0),
+    /// which is what pins the per-bucket summing rather than a one-record
+    /// count.
+    ///
+    /// Prove-the-test: make `count_below_target` skip a record whose successor
+    /// is present (or key the blocked entry on one record instead of summing
+    /// the bucket) and the first case reports `below_target: 1` instead of 3.
+    #[tokio::test]
+    async fn a_superseded_predecessor_rewrite_keeps_counting_until_the_sweep() {
+        // (successor part version, expected below-target parts for the bucket)
+        for (successor_version, expected) in [(VERSION_V7 as u32, 3usize), (FUTURE_VERSION, 2)] {
+            let store = MemoryStore::new();
+            provision(&store, 1).await;
+            seed_at(&store, 0, 100, 1, "alpha", VERSION_V7 as u32).await;
+            // R1: the first erasure pass over the raw L0 input, two surviving
+            // parts at the erasure-time version.
+            let r1 = put_rewrite_record(
+                &store,
+                RewriteFixture {
+                    shard: 0,
+                    hour: 100,
+                    input_seqs: &[1],
+                    hash_seed: 0x33,
+                    part_version: VERSION_V7 as u32,
+                    part_count: 2,
+                    supersedes: "",
+                },
+            )
+            .await;
+            // R2: a later erasure request supersedes R1 by key. R1 is still
+            // listed: only a sweep removes it.
+            put_rewrite_record(
+                &store,
+                RewriteFixture {
+                    shard: 0,
+                    hour: 100,
+                    input_seqs: &[],
+                    hash_seed: 0x55,
+                    part_version: successor_version,
+                    part_count: 1,
+                    supersedes: &r1,
+                },
+            )
+            .await;
+
+            let clock = FixedClock::new(sealed_now_ns_for(100));
+            let report = migrate_family(
+                &store,
+                &clock,
+                &CompactorConfig::default(),
+                tenant_hash(),
+                Signal::Metrics,
+                FAMILY,
+                FUTURE_VERSION,
+                1,
+                MigrateBudget::unlimited(),
+                "test",
+            )
+            .await
+            .expect("migrate");
+
+            let blocked = vec![BlockedBucket {
+                shard: 0,
+                ingest_hour: 100,
+                reason: BlockedReason::RewriteParts {
+                    below_target: expected,
+                },
+            }];
+            assert_eq!(
+                report.verification,
+                Some(Verification::Stragglers {
+                    l0: 0,
+                    l1: 0,
+                    rewrite_parts: expected,
+                    blocked: blocked.clone(),
+                }),
+                "with the successor at version {successor_version} the bucket's figure is the \
+                 sum over every LISTED rewrite record, so it is {expected}: R1's two parts \
+                 count whether or not R2 supersedes it, because R1's parts are still there"
+            );
+            assert_eq!(report.blocked_buckets, blocked);
+            assert_eq!(
+                report.buckets_blocked(),
+                1,
+                "two records, one bucket: `buckets_blocked` counts buckets"
+            );
+        }
+    }
+
+    /// When BOTH passes name one bucket, the re-audit's `RewriteParts` entry is
+    /// the one kept, and the merged list is sorted.
+    ///
+    /// Bucket `(0, 100)` carries overlapping compaction records that leave
+    /// input 3 served raw and below the target (what the walk sees) and an
+    /// erasure rewrite superseding the winning compaction record whose two
+    /// surviving parts are below the target (what the re-audit sees). Only one
+    /// entry may survive, since `buckets_blocked` counts buckets, and the entry
+    /// that survives has to be the one carrying a count.
+    ///
+    /// Bucket `(0, 99)` is blocked too and sorts BEFORE it while being appended
+    /// after, so the final order is not the order the two passes produced.
+    ///
+    /// Prove-the-test: restore the `continue`-on-collision merge (the walk's
+    /// entry wins) and `(0, 100)` comes back as `LoserOnlyInputs` with no
+    /// count, failing the exact-list assertion; drop the `sort_by_key` and the
+    /// list comes back as `[(0, 100), (0, 99)]`.
+    #[tokio::test]
+    async fn a_bucket_both_passes_name_keeps_the_counted_reason_and_the_list_is_sorted() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+
+        // (0, 99): erased, one surviving part below the target, nothing left
+        // served raw, so only the re-audit names it.
+        seed_at(&store, 0, 99, 6, "zeta", VERSION_V7 as u32).await;
+        put_rewrite_record(
+            &store,
+            RewriteFixture {
+                shard: 0,
+                hour: 99,
+                input_seqs: &[6],
+                hash_seed: 0x66,
+                part_version: VERSION_V7 as u32,
+                part_count: 1,
+                supersedes: "",
+            },
+        )
+        .await;
+
+        // (0, 100): the overlap (winner names {1, 2, 4}, loser names {2, 3}, so
+        // input 3 is served raw) plus an erasure rewrite superseding the winner
+        // with two below-target parts.
+        for (seq, metric) in [(1u64, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
+            seed_at(&store, 0, 100, seq, metric, VERSION_V7 as u32).await;
+        }
+        let winner = put_compaction_record(&store, 0, 100, &[1, 2, 4], 0x11, FUTURE_VERSION).await;
+        put_compaction_record(&store, 0, 100, &[2, 3], 0x22, FUTURE_VERSION).await;
+        put_rewrite_record(
+            &store,
+            RewriteFixture {
+                shard: 0,
+                hour: 100,
+                input_seqs: &[],
+                hash_seed: 0x77,
+                part_version: VERSION_V7 as u32,
+                part_count: 2,
+                supersedes: &winner,
+            },
+        )
+        .await;
+
+        // (0, 101): plain and below target, so the walk migrates it and the
+        // report is not uniformly blocked.
+        seed_at(&store, 0, 101, 5, "epsilon", VERSION_V7 as u32).await;
+
+        let clock = FixedClock::new(sealed_now_ns_for(101));
+        let report = migrate_family(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            FUTURE_VERSION,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("migrate");
+
+        assert_eq!(
+            report.buckets_migrated, 1,
+            "only the plain bucket at hour 101 is migratable"
+        );
+        let expected = vec![
+            BlockedBucket {
+                shard: 0,
+                ingest_hour: 99,
+                reason: BlockedReason::RewriteParts { below_target: 1 },
+            },
+            BlockedBucket {
+                shard: 0,
+                ingest_hour: 100,
+                reason: BlockedReason::RewriteParts { below_target: 2 },
+            },
+        ];
+        assert_eq!(
+            report.blocked_buckets, expected,
+            "hour 100 is named by the walk (loser-only input 3) and by the re-audit (two \
+             rewrite parts); the entry kept is the re-audit's, because dropping it drops \
+             the only count either pass produces. Hour 99, appended second, sorts first"
+        );
+        assert_eq!(report.buckets_blocked(), 2);
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers {
+                l0: 1,
+                l1: 1,
+                rewrite_parts: 3,
+                blocked: expected,
+            }),
+            "l0 is the loser-only input 3, l1 is hour 101's freshly written part (below the \
+             fictional FUTURE_VERSION target), and rewrite_parts is 2 + 1 across the two \
+             erased buckets"
+        );
+    }
+
     /// The other half of the split (ADR-1331 decision 1): a below-target
-    /// COMPACTION part counts in `l1`, contributes nothing to `rewrite_parts`,
-    /// and does not make its bucket blocked. Rewrite-on-touch still converges
-    /// it (ADR-0066 decision 4 Class A force 2), so naming it as blocked would
-    /// tell an operator that a job which does converge cannot.
+    /// COMPACTION part counts in `l1` and contributes nothing to
+    /// `rewrite_parts`.
+    ///
+    /// It blocks the floor exactly as a rewrite part does, and re-running
+    /// `migrate` does not change the figure: no code path migrates a
+    /// below-target compaction part, because `compact_bucket` and
+    /// `migrate_bucket_format` both refuse a bucket that already carries a
+    /// compaction record, and the walk never reaches such a bucket's parts
+    /// (issue #2093 -- ADR-0066 decision 4 force 2 is unimplemented). What this
+    /// test pins is only that the two SOURCES are counted apart, and that this
+    /// round does not name a compaction-part bucket in `blocked_buckets`:
+    /// whether to add a reason for it is #2093's decision.
     ///
     /// Prove-the-test: make `count_below_target` treat every record's parts as
     /// rewrite parts (delete the `match rec.kind`) and this fails with
@@ -2672,11 +2985,35 @@ mod tests {
         );
         assert!(
             report.blocked_buckets.is_empty(),
-            "a compaction part converges under rewrite-on-touch, so its bucket is not \
-             blocked: {:?}",
+            "this round names only rewrite-parts and loser-only buckets; the below-target \
+             compaction part blocks the floor too but is reported as an l1 count alone \
+             (issue #2093): {:?}",
             report.blocked_buckets
         );
         assert_eq!(report.buckets_blocked(), 0);
+
+        // The figure is stable across runs, which is the part of "re-running is
+        // not the remedy" that applies to an l1 straggler as much as to a
+        // rewrite one: nothing migrated it in between.
+        let again = migrate_family(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            FUTURE_VERSION,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("second migrate");
+        assert_eq!(
+            again.verification, report.verification,
+            "re-running reports the identical l1 count: no path migrates a below-target \
+             compaction part (issue #2093), so the floor stays refused on the same figure"
+        );
     }
 
     /// Seed the overlap fixture: one bucket at `(0, 100)` holding four

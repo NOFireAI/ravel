@@ -1389,9 +1389,13 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
     Ok(signal_supported_versions(signal)?.newest)
 }
 
-/// One line per blocked bucket, followed by the sentence that says what an
+/// One line per blocked bucket, followed by the sentences that say what an
 /// operator can do about them, which is not re-running this command
 /// (ADR-1331 decisions 2 and 3).
+///
+/// The prose lines carry a leading `# ` because the rest of this command's
+/// output is `key: value` and the prose contains its own colons; without the
+/// prefix a parser reads a sentence fragment as a key.
 ///
 /// Split out from the printing so a test asserts the exact text an operator
 /// reads. Returns the empty string for an empty list, so the caller can print
@@ -1414,15 +1418,60 @@ fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
         ));
     }
     out.push_str(
-        "Re-running migrate does not clear any blocked bucket above; it reports the same list \
+        "# Re-running migrate does not clear any blocked bucket above; it reports the same list \
          again. A rewrite_parts bucket holds a live selective-erasure rewrite record whose \
-         surviving parts sit below the target, and migrate never rewrites those: it clears when \
-         retention ages the bucket out (subject to the format-version hold, which keeps an \
-         object this build cannot read) or when a later erasure request supersedes that record \
-         at the current output version. A loser_only_inputs bucket clears when a later \
-         authoritative compaction covers those inputs, or when retention ages them out. Neither \
-         is a command you run.",
+         surviving parts sit below the target, and migrate never rewrites those. below_target \
+         counts the parts of every rewrite record the bucket still LISTS, including a \
+         predecessor a later rewrite already superseded, because a superseded record stays \
+         listed until sweep deletes it. So the block clears when retention ages the bucket out \
+         (subject to the format-version hold, which keeps an object this build cannot read), or \
+         when a later erasure request supersedes the record at the current output version AND a \
+         subsequent sweep removes the superseded predecessor.\n\
+         # A loser_only_inputs bucket clears only when retention ages those inputs out: no \
+         later compaction covers them, because compaction refuses a bucket that already carries \
+         a compaction record. Neither is a command you run.",
     );
+    out
+}
+
+/// Everything `migrate` prints to stdout before the verification verdict, as
+/// one string: the `key: value` block, the blocked-bucket lines and the prose
+/// that explains them, in the order an operator reads them.
+///
+/// It is a function rather than a run of `println!` so a test drives the real
+/// printing, interleaving included, instead of only the blocked-bucket helper:
+/// the hazard that put the `# ` prefix on the prose is a property of where the
+/// prose sits relative to `buckets_blocked` and `records_migrated`, which a
+/// test of the helper alone cannot see.
+fn migrate_report_text(
+    tenant: &str,
+    signal: Signal,
+    family: &str,
+    target_version: u32,
+    budget_records: u64,
+    report: &FamilyMigrateReport,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("tenant: {tenant}\n"));
+    out.push_str(&format!("signal: {signal:?}\n"));
+    out.push_str(&format!("family: {family}\n"));
+    out.push_str(&format!("target_version: {target_version}\n"));
+    out.push_str(&format!(
+        "budget_records: {budget_records} (0 = unlimited)\n"
+    ));
+    out.push_str(&format!("buckets_examined: {}\n", report.buckets_examined));
+    out.push_str(&format!("buckets_migrated: {}\n", report.buckets_migrated));
+    out.push_str(&format!("buckets_blocked: {}\n", report.buckets_blocked()));
+    let blocked = blocked_bucket_report(&report.blocked_buckets);
+    if !blocked.is_empty() {
+        out.push_str(&blocked);
+        out.push('\n');
+    }
+    out.push_str(&format!("records_migrated: {}\n", report.records_migrated));
+    if let Some((shard, hour)) = report.cursor_advanced_to {
+        out.push_str(&format!("cursor_advanced_to: shard={shard} hour={hour}\n"));
+    }
+    out.push_str(&format!("walk_complete: {}\n", report.walk_complete));
     out
 }
 
@@ -1448,9 +1497,11 @@ fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
 /// straggler the walk cannot migrate, so that refusal is permanent until the
 /// overlap itself is resolved. A live erasure rewrite record whose surviving
 /// parts sit below the target is the other permanent case: this job never
-/// rewrites them (ADR-1331). Each such bucket is printed on its own
-/// `blocked_bucket` line with its reason, and `buckets_blocked` is how many
-/// there are.
+/// rewrites them (ADR-1331). Each such bucket this invocation examined is
+/// printed on its own `blocked_bucket` line with its reason, and
+/// `buckets_blocked` is how many there are. A below-target compaction part
+/// blocks the floor too and gets no line, because nothing migrates one either
+/// (issue #2093); it shows up as `l1_compaction_parts` alone.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -1503,23 +1554,10 @@ pub async fn migrate(
     .await
     .map_err(|err| anyhow::anyhow!("migrate failed: {err}"))?;
 
-    println!("tenant: {tenant}");
-    println!("signal: {sig:?}");
-    println!("family: {family}");
-    println!("target_version: {target}");
-    println!("budget_records: {budget_records} (0 = unlimited)");
-    println!("buckets_examined: {}", report.buckets_examined);
-    println!("buckets_migrated: {}", report.buckets_migrated);
-    println!("buckets_blocked: {}", report.buckets_blocked());
-    let blocked = blocked_bucket_report(&report.blocked_buckets);
-    if !blocked.is_empty() {
-        println!("{blocked}");
-    }
-    println!("records_migrated: {}", report.records_migrated);
-    if let Some((shard, hour)) = report.cursor_advanced_to {
-        println!("cursor_advanced_to: shard={shard} hour={hour}");
-    }
-    println!("walk_complete: {}", report.walk_complete);
+    print!(
+        "{}",
+        migrate_report_text(tenant, sig, &family, target, budget_records, &report)
+    );
 
     if !report.walk_complete {
         println!(
@@ -1555,14 +1593,18 @@ pub async fn migrate(
                  unsealed). These are genuinely live: a bucket's own pre-rewrite commit records \
                  are already excluded from this count once that bucket has been migrated, so a \
                  `sweep` will not make this converge. The floor was NOT raised.\n\n\
-                 Whether re-running helps depends on why they are below target. Data that is \
-                 merely not yet sealed migrates on a later run. But a below-target L0 that only \
+                 Whether re-running helps depends on why they are below target. Only \
+                 l0_commit_records can move: a below-target L0 record that is merely not yet \
+                 sealed migrates on a later run. Nothing else does. A below-target L0 that only \
                  a LOSING compaction record names is served raw by the resolver and is not \
-                 migratable by the walk, and a live erasure rewrite record's parts are never \
-                 migrated by this job at all, so those stragglers are permanent and re-running \
-                 will report the same count forever. The {} blocked_bucket line(s) above name \
-                 every such bucket with its reason: if there are any, re-running is not the \
-                 remedy.",
+                 migratable by the walk; a live erasure rewrite record's parts are never \
+                 migrated by this job at all; and no code path migrates a below-target \
+                 compaction part either, so l1_compaction_parts will report the same figure \
+                 forever too (issue #2093). The {} blocked_bucket line(s) above name every such \
+                 bucket THIS INVOCATION EXAMINED with its reason -- a walk that resumed from a \
+                 cursor does not re-report the loser-only buckets an earlier invocation found, \
+                 and a below-target compaction part gets no line at all. If there are any, \
+                 re-running is not the remedy.",
                 blocked.len()
             )
         }
@@ -2251,20 +2293,37 @@ mod tests {
     /// beside a straggler count that never drains. Prove-the-test: there was no
     /// blocked-bucket line at all to assert on, so both `contains` checks fail
     /// against the pre-change output.
+    ///
+    /// This drives `migrate_report_text`, the function `migrate` itself prints,
+    /// rather than only `blocked_bucket_report`. Two of the properties asserted
+    /// here are properties of the whole block and are invisible from the helper
+    /// alone: that every non-`blocked_bucket` line parses as `key: value`, and
+    /// that the prose sits between `buckets_blocked` and `records_migrated`
+    /// where an unprefixed sentence would be read as a key.
     #[test]
     fn migrate_prints_each_blocked_bucket_with_its_reason_and_how_it_clears() {
-        let printed = blocked_bucket_report(&[
-            BlockedBucket {
-                shard: 0,
-                ingest_hour: 100,
-                reason: BlockedReason::RewriteParts { below_target: 2 },
-            },
-            BlockedBucket {
-                shard: 3,
-                ingest_hour: 47,
-                reason: BlockedReason::LoserOnlyInputs,
-            },
-        ]);
+        let report = FamilyMigrateReport {
+            buckets_examined: 9,
+            buckets_migrated: 4,
+            records_migrated: 41,
+            blocked_buckets: vec![
+                BlockedBucket {
+                    shard: 0,
+                    ingest_hour: 100,
+                    reason: BlockedReason::RewriteParts { below_target: 2 },
+                },
+                BlockedBucket {
+                    shard: 3,
+                    ingest_hour: 47,
+                    reason: BlockedReason::LoserOnlyInputs,
+                },
+            ],
+            cursor_advanced_to: None,
+            walk_complete: true,
+            budget_exhausted: false,
+            verification: None,
+        };
+        let printed = migrate_report_text("acme", Signal::Metrics, "rseg", 8, 0, &report);
 
         assert!(
             printed
@@ -2284,14 +2343,70 @@ mod tests {
             "one line per blocked bucket, no more: {printed}"
         );
         assert!(
-            printed.contains("Re-running migrate does not clear any blocked bucket"),
+            printed.contains("# Re-running migrate does not clear any blocked bucket"),
             "the operator is told re-running is not the remedy: {printed}"
         );
         assert!(
             printed.contains("retention ages the bucket out")
-                && printed.contains("later erasure request supersedes that record"),
-            "and is told the two ways a rewrite_parts block actually clears \
-             (ADR-1331 decision 3): {printed}"
+                && printed.contains(
+                    "when a later erasure request supersedes the record at the current output \
+                     version AND a subsequent sweep removes the superseded predecessor"
+                ),
+            "and is told how a rewrite_parts block actually clears (ADR-1331 decision 3), \
+             including the sweep the superseding rewrite alone does not replace: {printed}"
+        );
+        assert!(
+            printed.contains(
+                "counts the parts of every rewrite record the bucket still LISTS, including a \
+                 predecessor a later rewrite already superseded"
+            ),
+            "below_target is over listed records, and the operator is told so rather than \
+             reading it as a live-part count: {printed}"
+        );
+        assert!(
+            printed.contains(
+                "A loser_only_inputs bucket clears only when retention ages those inputs out"
+            ),
+            "the loser-only case says what actually clears it; no later compaction does, \
+             because compaction refuses a bucket that already carries a record: {printed}"
+        );
+
+        // Every line the report emits is either a `blocked_bucket` line, a
+        // `key: value` line whose key is a single bare token, or a `# ` prose
+        // line. A prose sentence without the prefix lands in the second class
+        // and parses as a key, which is the defect the prefix removes.
+        let key_lines: Vec<&str> = printed
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        for line in &key_lines {
+            let (key, _) = line
+                .split_once(": ")
+                .unwrap_or_else(|| panic!("line is neither prose nor key: value: {line}"));
+            assert!(
+                !key.contains(' '),
+                "a `key: value` line's key must be one bare token, or the prose is being \
+                 parsed as a key: {line}"
+            );
+        }
+        assert!(
+            key_lines.contains(&"buckets_blocked: 2")
+                && key_lines.contains(&"records_migrated: 41"),
+            "the prose sits between these two and must not have displaced either: {printed}"
+        );
+
+        let clean = FamilyMigrateReport {
+            blocked_buckets: Vec::new(),
+            ..report
+        };
+        let printed = migrate_report_text("acme", Signal::Metrics, "rseg", 8, 0, &clean);
+        assert!(
+            !printed.contains("blocked_bucket") && !printed.contains('#'),
+            "nothing blocked prints no bucket lines and no prose: {printed}"
+        );
+        assert!(
+            printed.contains("buckets_blocked: 0\nrecords_migrated: 41"),
+            "and no stray blank line between them: {printed}"
         );
 
         assert_eq!(
