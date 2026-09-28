@@ -438,6 +438,23 @@ object written) rather than defaulting to bucket 0 (ADR-0051 section 7):
 a fallback bucket would make the data undiscoverable by hour
 with no trace of the failure.
 
+After that plausibility check, and before the ADR-1307 monotonic floor is
+consulted, the actor compares the raw reading with the object store's
+observed clock, the latest response `Date` the store adapter saw
+(ADR-1685). If the reading lags that observation by more than
+`DEFAULT_CLOCK_SKEW_ALLOWANCE_NS` (five minutes), the flush is refused the
+same way an over-bound clock regression is: every strict waiter gets the
+retryable `Abandoned` (503), the buffer goes back into the tenant map for
+the next trigger, nothing is written, and `clock_lag_refused` counts it. A
+writer that far behind would otherwise stamp an ingest hour the fold,
+running on its own clock, may already have sealed. The check is one-sided:
+the observation is a lower bound on the store's clock, so a reading ahead of
+it is normal and is not checked here. It compares the raw reading, never the
+floor-raised stamp, since the floor can only hide lag. When the store has
+not been observed yet (no response so far, or `MemoryStore`), the flush
+proceeds unchecked and `clock_lag_unchecked` counts it; refusing there
+would deadlock, because the flush is itself a source of responses.
+
 ### Pipelined flushes (ADR-0067)
 
 The PUTs no longer run inline in the actor. At flush-open the actor pins
