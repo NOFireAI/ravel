@@ -175,8 +175,9 @@ fn claim_skip_fields(skip: &ClaimSkip) -> String {
         .holder_process_id
         .map_or_else(|| "unknown".to_string(), |id| id.to_string());
     format!(
-        "reason={} holder={holder} claim_expiry_unix_ms={} retry_after_unix_ms={}",
+        "reason={} work_id={} holder={holder} claim_expiry_unix_ms={} retry_after_unix_ms={}",
         skip.reason.name(),
+        skip.work_id_hex,
         skip.expiry_unix_ms,
         skip.reschedule_after_unix_ms
     )
@@ -351,15 +352,13 @@ pub async fn compact_to(
             )?;
             return Ok(());
         }
-        ClaimedCompaction::Cancelled { at, outcome } => {
-            let parts = match outcome {
-                CompactionOutcome::Compacted { parts, .. } => parts,
-                _ => 0,
-            };
+        // A cancelled run publishes nothing; any parts it had already written stay
+        // in the store for a later run to reuse, so no part count is printed.
+        ClaimedCompaction::Cancelled { at, .. } => {
             writeln!(
                 out,
                 "outcome: ClaimCancelled (the claim was lost mid-merge; nothing was \
-                 published) checkpoint={} parts={parts}",
+                 published) checkpoint={}",
                 at.name()
             )?;
             return Ok(());
@@ -922,15 +921,11 @@ fn emit_bucket_outcome(
             out.flush()?;
             return Ok(());
         }
-        Ok(ClaimedCompaction::Cancelled { at, outcome }) => {
+        Ok(ClaimedCompaction::Cancelled { at, .. }) => {
             report.claim_cancelled += 1;
-            let parts = match outcome {
-                CompactionOutcome::Compacted { parts, .. } => parts,
-                _ => 0,
-            };
             writeln!(
                 out,
-                "shard={shard} hour={hour} outcome=ClaimCancelled checkpoint={} parts={parts}",
+                "shard={shard} hour={hour} outcome=ClaimCancelled checkpoint={}",
                 at.name()
             )?;
             out.flush()?;

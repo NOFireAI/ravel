@@ -299,13 +299,16 @@ smaller bucket is merged unclaimed, because duplicating a small merge costs
 less than the claim requests that would prevent it.
 
 A bucket refused its claim is not merged. It prints `outcome=ClaimSkipped`
-with the reason, the holder's process id (`unknown` when there is no readable
-claim to name one), the claim's expiry as `claim_expiry_unix_ms` and the
-earliest useful retry point as `retry_after_unix_ms`, and is counted in
-`claim_skipped`. A bucket that loses its claim mid-merge, because another
-process took it over or the claim object is gone, stops without publishing,
-prints `outcome=ClaimCancelled` with the checkpoint it stopped at, and is
-counted in `claim_cancelled`. Neither counts as a failure: the walk carries on
+with the reason, the claim's `work_id` (the last segment of its key,
+`sys/maintain/claims/compaction/<work_id>`), the holder's process id
+(`unknown` when there is no readable claim to name one), the claim's expiry
+as `claim_expiry_unix_ms` and the earliest useful retry point as
+`retry_after_unix_ms`, and is counted in `claim_skipped`. A bucket that loses
+its claim mid-merge, because another process took it over or the claim object
+is gone, stops without publishing, prints `outcome=ClaimCancelled` with the
+checkpoint it stopped at, and is counted in `claim_cancelled`. Parts it had
+already written stay in the store, content-addressed, for a later run to
+reuse. Neither counts as a failure: the walk carries on
 and exits zero unless some other bucket failed, the same as for a not-sealed
 bucket. `compact-bucket` prints the same two outcomes and also exits zero.
 

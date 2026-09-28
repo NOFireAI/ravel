@@ -89,7 +89,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   line prints. The claim renews on the wall clock rather than on the fixed
   instant the walk judges sealing at, so a long merge keeps its claim. A
   bucket refused its claim prints `outcome=ClaimSkipped` with the reason, the
-  holder and the claim expiry, a bucket that loses its claim mid-merge stops
+  claim's work id, the holder and the claim expiry, a bucket that loses its claim mid-merge stops
   without publishing and prints `outcome=ClaimCancelled`, and the
   `compact-tenant` summary counts both (`claim_skipped`, `claim_cancelled`)
   apart from `compacted`. Neither is a failure: the walk carries on and exits
