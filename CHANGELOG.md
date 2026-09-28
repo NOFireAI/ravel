@@ -297,6 +297,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
+  `span_id` column** (issue #2116). A default Parquet writer dictionary-encodes
+  string columns, and the columnar logs path refused such an id column with
+  "expected a binary or string id column, found Dictionary(Int32, Utf8)". It
+  now resolves the two id columns once per batch and stores the same ids as a
+  plain column; a null cell stores no id in either form.
+- **`ravel-cli load --signal logs` and `--signal metrics` refuse a negative
+  timestamp** (issue #2118), as the spans load already did. A row whose `ts`,
+  read in the declared `ts_unit`, falls before the Unix epoch is a row rejection
+  naming `ts_unit` on the logs and metrics load paths, where before only the
+  future-skew bound was checked. A negative result always means a negative
+  cell: unit conversion never flips a sign.
+- **The spans load's reserved attribute keys come from ravel-otlp** (issue
+  #2123). `ravel_otlp::traces_normalize` now exports `RESERVED_ATTR_KEYS` and
+  `is_reserved_key`, and the loader's `[spans]` mapping check uses them instead
+  of a private copy, so a key reserved there is refused here too. The unused
+  lever warning names every signal explicitly, so a new signal is a compile
+  error rather than a metrics message.
 - **The fold checks a previous postings object's tenant before reusing it**
   (ADR-0050 section 2, ADR-1702, issue #2081). The fold's previous-postings
   reuse path verified the object's blake3 and its binding to the HEAD's part
