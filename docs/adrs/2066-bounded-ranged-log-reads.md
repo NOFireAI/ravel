@@ -48,8 +48,10 @@ fetch issues at most 4 page-range GETs, bridging the smallest gaps
 
 1. **A ranged log read issues as few GETs as its extents allow.** No format
    change:
-   - When both front sections are needed, STREAM_DIR and FIELD_DIR are
-     fetched in one GET covering both.
+   - When FIELD_DIR is fetched, STREAM_DIR comes with it in one GET covering
+     both, unless it is already resident. This happens before the read knows
+     whether it will cross over to a whole-object GET, so a read that does
+     cross over pays STREAM_DIR's bytes without using them.
    - Chunk runs per object are capped at 4, as the metrics path caps an L0
      segment's page ranges (`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`): after
      already-covered runs are dropped, runs beyond the cap are merged across
@@ -105,5 +107,9 @@ measurement (#2066).
 - Bridging gaps reads some bytes the query does not need. The cap trades
   those bytes for requests, and the covering-read check bounds the trade at
   a whole-object read.
+- A read that crosses over to a whole-object GET after fetching FIELD_DIR
+  also pays for STREAM_DIR, which it never uses, with no request saved.
+  `reconcile_accepts_a_measured_run_with_an_exact_phase_split`
+  (`crates/ravel-bench/src/sql_latency.rs`) pins that probe-phase cost.
 - ADR-0996's description of the front sections as one GET was stale; with
   decision 1 it becomes true.
