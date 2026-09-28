@@ -1,25 +1,22 @@
 //! `ravel-cli load --parquet` (ADR-0089, widened by ADR-1751): bulk-import a
 //! Parquet file into the signal named by `--signal`, through the existing
-//! [`ravel_ingest::LogIngestRouter`] (logs) or [`ravel_ingest::IngestRouter`]
-//! (metrics).
+//! [`ravel_ingest::LogIngestRouter`] (logs), [`ravel_ingest::IngestRouter`]
+//! (metrics) or [`ravel_ingest::SpanIngestRouter`] (spans).
 //!
 //! This is a new *caller* of existing public APIs, not a new ingest path. The
 //! loader constructs its own router in-process against the target tenant's
 //! object store and provisioned shard count, reuses
-//! [`ravel_otlp::NormalizedLogRecord`] / [`ravel_otlp::NormalizedPoint`] as the
-//! record shape, re-implements the `ravel-otlp` admission checks the ADR says
-//! to keep (future skew, length caps), relaxes the ones it says to relax
-//! (past-event-time lag, per-record attribute cap), and writes with
-//! [`WriteMode::Strict`] so every returned success has no buffered-but-
-//! unflushed data.
+//! [`ravel_otlp::NormalizedLogRecord`] / [`ravel_otlp::NormalizedPoint`] /
+//! [`ravel_otlp::NormalizedSpan`] as the record shape, re-implements the
+//! `ravel-otlp` admission checks the ADR says to keep (future skew, length
+//! caps), relaxes the ones it says to relax (past-event-time lag, per-record
+//! attribute cap), and writes with [`WriteMode::Strict`] so every returned
+//! success has no buffered-but-unflushed data.
 //!
 //! Which `ravel-otlp` rules this path keeps, relaxes, or bypasses, and why, is
 //! documented in `docs/guides/ingest.md` ("Bulk import") per ADR-0089;
 //! ADR-1751 decision 1 states that the same table applies per signal, with
 //! that signal's own OTLP limits.
-//!
-//! `--signal spans` is refused until ADR-1751 follow-up task 2 lands; it never
-//! falls back to another signal.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -43,8 +40,8 @@ use ravel_catalog::{AbsentPolicy, validate_or_adopt};
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
     Clock, FlushTriggerMix, IngestConfig, IngestRouter, LogIngestMetricsSnapshot, LogIngestRouter,
-    LogWriteError, LogWriteReceipt, STRICT_VISIBILITY_RESERVE_NS, SystemClock, WriteError,
-    WriteMode, WriteReceipt,
+    LogWriteError, LogWriteReceipt, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError,
+    SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
 };
 use ravel_logseg::{
     Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict, stream_attrs_bytes,
@@ -53,7 +50,13 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_limits::LogIngestLimits;
 use ravel_otlp::normalize::{prometheus_family_name, sanitize_label_name, sanitize_metric_name};
 use ravel_otlp::promcompat::format_float;
-use ravel_otlp::{IngestLimits, MetricKind, NormalizedLogRecord, NormalizedPoint};
+use ravel_otlp::traces_limits::SpanIngestLimits;
+use ravel_otlp::traces_normalize::{
+    ATTR_EVENTS_RAW, ATTR_LINKS_RAW, ATTR_SPAN_FLAGS, ATTR_SPAN_KIND, ATTR_TRACE_STATE,
+    status_code_from_i32,
+};
+use ravel_otlp::{IngestLimits, MetricKind, NormalizedLogRecord, NormalizedPoint, NormalizedSpan};
+use ravel_rspan::{StatusCode, merge_attrs};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 use ravel_types::{
     CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantId,
@@ -359,10 +362,8 @@ pub fn parse_mapping(text: &str) -> Result<Mapping, LoadError> {
     match parse_mapping_document(text, SignalArg::Logs)? {
         MappingSection::Logs(mapping) => Ok(mapping),
         // `parse_mapping_document` returns the section matching the signal it
-        // was asked for, so this arm is not reachable through this call.
-        MappingSection::Metrics(_) => Err(LoadError::Setup(
-            "internal error: the logs mapping resolved to a metrics section".to_string(),
-        )),
+        // was asked for, so these arms are not reachable through this call.
+        other => Err(wrong_section_resolved("logs", other)),
     }
 }
 
@@ -371,10 +372,32 @@ pub fn parse_mapping(text: &str) -> Result<Mapping, LoadError> {
 pub fn parse_metrics_mapping(text: &str) -> Result<MetricsMapping, LoadError> {
     match parse_mapping_document(text, SignalArg::Metrics)? {
         MappingSection::Metrics(mapping) => Ok(mapping),
-        MappingSection::Logs(_) => Err(LoadError::Setup(
-            "internal error: the metrics mapping resolved to a logs section".to_string(),
-        )),
+        other => Err(wrong_section_resolved("metrics", other)),
     }
+}
+
+/// Parse the spans section of a `--mapping` TOML document (ADR-1751
+/// decision 2).
+pub fn parse_spans_mapping(text: &str) -> Result<SpansMapping, LoadError> {
+    match parse_mapping_document(text, SignalArg::Spans)? {
+        MappingSection::Spans(mapping) => Ok(mapping),
+        other => Err(wrong_section_resolved("spans", other)),
+    }
+}
+
+/// The internal error a per-signal parse helper returns if
+/// [`parse_mapping_document`] ever handed it another signal's section. Not
+/// reachable: that function returns the section matching the signal it was
+/// asked for, or an error.
+fn wrong_section_resolved(wanted: &str, got: MappingSection) -> LoadError {
+    let got = match got {
+        MappingSection::Logs(_) => "logs",
+        MappingSection::Metrics(_) => "metrics",
+        MappingSection::Spans(_) => "spans",
+    };
+    LoadError::Setup(format!(
+        "internal error: the {wanted} mapping resolved to a {got} section"
+    ))
 }
 
 /// The signal section names a `--mapping` document may carry (ADR-1751
@@ -391,24 +414,12 @@ fn mapping_section_name(signal: SignalArg) -> &'static str {
     }
 }
 
-/// The one refusal `--signal spans` gets until ADR-1751 follow-up task 2
-/// lands. Stated as its own error rather than as a fallback to logs: a load
-/// that silently wrote span-shaped rows into the logs signal would be a
-/// durable mistake nothing later reports.
-pub(crate) fn spans_not_supported() -> LoadError {
-    LoadError::Setup(
-        "--signal spans is not yet supported by load: ADR-1751 follow-up task 2 adds the spans \
-         mapping section and the SpanIngestRouter construction. Nothing was written, and this \
-         does not fall back to another signal."
-            .to_string(),
-    )
-}
-
 /// The resolved mapping section for one load's `--signal`.
 #[derive(Debug, Clone)]
 pub enum MappingSection {
     Logs(Mapping),
     Metrics(MetricsMapping),
+    Spans(SpansMapping),
 }
 
 /// Resolve the one signal section of a `--mapping` document and deserialize
@@ -468,9 +479,6 @@ pub fn parse_mapping_document(text: &str, signal: SignalArg) -> Result<MappingSe
                  one section must be present and it must match --signal (ADR-1751 decision 2)."
             )));
         }
-        if signal == SignalArg::Spans {
-            return Err(spans_not_supported());
-        }
         let value = doc
             .remove(section)
             .unwrap_or(toml::Value::Table(toml::Table::new()));
@@ -478,9 +486,6 @@ pub fn parse_mapping_document(text: &str, signal: SignalArg) -> Result<MappingSe
     }
 
     if signal != SignalArg::Logs {
-        if signal == SignalArg::Spans {
-            return Err(spans_not_supported());
-        }
         return Err(LoadError::Setup(format!(
             "--mapping file has no [{wanted}] section, which --signal {wanted} requires \
              (ADR-1751 decision 2). Its top-level keys are {}.",
@@ -523,6 +528,10 @@ fn deserialize_section(
     struct MetricsSection {
         metrics: MetricsMapping,
     }
+    #[derive(Deserialize)]
+    struct SpansSection {
+        spans: SpansMapping,
+    }
 
     let bad = |e: toml::de::Error| match section {
         Some(section) => LoadError::Setup(format!("invalid --mapping [{section}] section: {e}")),
@@ -541,7 +550,12 @@ fn deserialize_section(
             mapping.validate()?;
             Ok(MappingSection::Metrics(mapping))
         }
-        (SignalArg::Spans, _) => Err(spans_not_supported()),
+        (SignalArg::Spans, _) => {
+            reject_unmappable_span_keys(value)?;
+            let mapping = toml::from_str::<SpansSection>(text).map_err(bad)?.spans;
+            mapping.validate()?;
+            Ok(MappingSection::Spans(mapping))
+        }
     }
 }
 
@@ -867,6 +881,220 @@ impl MetricsMapping {
     }
 }
 
+/// Keys that name a span shape ADR-1751 decision 2 does not map (span events
+/// and span links), refused by name before `deny_unknown_fields` can report
+/// them as a generic typo.
+const UNMAPPABLE_SPAN_KEYS: [&str; 10] = [
+    "event",
+    "events",
+    "span_event",
+    "span_events",
+    "events_column",
+    "link",
+    "links",
+    "span_link",
+    "span_links",
+    "links_column",
+];
+
+/// Refuse a spans section that names events or links at the section's top
+/// level.
+fn reject_unmappable_span_keys(value: &toml::Value) -> Result<(), LoadError> {
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+    for key in UNMAPPABLE_SPAN_KEYS {
+        if table.contains_key(key) {
+            return Err(span_shape_rejected(key));
+        }
+    }
+    Ok(())
+}
+
+/// The refusal a mapping naming span events or links gets (ADR-1751
+/// decision 2).
+fn span_shape_rejected(what: &str) -> LoadError {
+    LoadError::Setup(format!(
+        "--mapping [spans] names {what}, which this version does not map (ADR-1751 decision 2: \
+         native histograms, span events and span links are not mappable, and a mapping that names \
+         them is rejected). The mappable span fields are trace_id, span_id, parent_span_id, name, \
+         start_ts, end_ts, status_code, status_message, and the resource_attribute and attribute \
+         column lists."
+    ))
+}
+
+/// The `attrs` keys `ravel_otlp::traces_normalize` reserves for span fields
+/// RSPAN has no column for: span kind, trace state, span flags, and the
+/// events and links blobs. A `[spans]` mapping may not name any of them,
+/// which is the same refusal [`span_shape_rejected`] gives the section keys:
+/// the OTLP path strips a sender's own attribute under these keys and then
+/// writes the span's real field, so a mapped column here could only fabricate
+/// a field this version does not map.
+const RESERVED_SPAN_ATTR_KEYS: [&str; 5] = [
+    ATTR_SPAN_KIND,
+    ATTR_TRACE_STATE,
+    ATTR_SPAN_FLAGS,
+    ATTR_EVENTS_RAW,
+    ATTR_LINKS_RAW,
+];
+
+/// The `[spans]` section of a `--mapping` TOML (ADR-1751 decision 2).
+///
+/// ```toml
+/// [spans]
+/// trace_id_column       = "trace_id"   # 16-byte binary or 32-char hex string
+/// span_id_column        = "span_id"    # 8-byte binary or 16-char hex string
+/// parent_span_id_column = "parent"     # optional, same shape as span_id
+/// name_column           = "name"
+/// start_ts_column       = "start"
+/// start_ts_unit         = "nanos"      # seconds | millis | micros | nanos
+/// end_ts_column         = "end"
+/// end_ts_unit           = "nanos"
+/// status_code_column    = "status"     # optional, OTLP's 0/1/2 integer enum
+/// status_message_column = "status_msg" # optional
+///
+/// # Resource attributes: merged into every span's one attrs map, winning
+/// # over a span attribute of the same key, exactly as OTLP merges them.
+/// [[spans.resource_attribute]]
+/// key = "service.name"
+/// column = "svc"
+/// type = "str"
+///
+/// # Span attributes.
+/// [[spans.attribute]]
+/// key = "http.method"
+/// column = "method"
+/// type = "str"
+/// ```
+///
+/// A span has no stream identity (ADR-0041 routes by `trace_id`), so unlike
+/// the logs section the two attribute lists differ only in merge precedence,
+/// not in what they identify.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpansMapping {
+    /// Source column carrying the 16-byte trace id.
+    pub trace_id_column: String,
+    /// Source column carrying the 8-byte span id.
+    pub span_id_column: String,
+    /// Source column carrying the parent's 8-byte span id. A null cell is a
+    /// root span.
+    #[serde(default)]
+    pub parent_span_id_column: Option<String>,
+    /// Source column carrying the span name.
+    pub name_column: String,
+    /// Source column carrying the span's start timestamp.
+    pub start_ts_column: String,
+    /// Unit of [`SpansMapping::start_ts_column`] when it is an integer
+    /// column. A native Arrow `Timestamp` column carries its own unit and this
+    /// is not applied again (see [`read_ts`]).
+    pub start_ts_unit: TsUnit,
+    /// Source column carrying the span's end timestamp.
+    pub end_ts_column: String,
+    /// Unit of [`SpansMapping::end_ts_column`], read like
+    /// [`SpansMapping::start_ts_unit`]. Declared separately because a source
+    /// file may well carry a second-granularity start beside a nanosecond
+    /// duration-derived end.
+    pub end_ts_unit: TsUnit,
+    /// Source column carrying OTLP's status code as its integer enum (0
+    /// unset, 1 ok, 2 error). Absent, or a null cell, is `Unset`. Read
+    /// through `ravel_otlp`'s own mapping, so a value outside `0..=2`
+    /// normalizes to `Unset` here exactly as it does on the OTLP path.
+    #[serde(default)]
+    pub status_code_column: Option<String>,
+    /// Source column carrying the status message. An absent column, a null
+    /// cell and an empty string all store no message, as an OTLP status with
+    /// an empty `message` does.
+    #[serde(default)]
+    pub status_message_column: Option<String>,
+    /// Columns merged into the span's `attrs` map with resource precedence
+    /// (they win over a span attribute of the same key, as in OTLP).
+    #[serde(default, rename = "resource_attribute")]
+    pub resource_attributes: Vec<AttrMap>,
+    /// Columns merged into the span's `attrs` map at span precedence.
+    #[serde(default, rename = "attribute")]
+    pub attributes: Vec<AttrMap>,
+}
+
+impl SpansMapping {
+    /// Every mapped attribute column, resource ones first, paired with the
+    /// precedence set it belongs to.
+    fn mapped_attributes(&self) -> impl Iterator<Item = (&AttrMap, AttrScope)> {
+        self.resource_attributes
+            .iter()
+            .map(|a| (a, AttrScope::Resource))
+            .chain(self.attributes.iter().map(|a| (a, AttrScope::Span)))
+    }
+
+    /// The checks a spans mapping fails before any Parquet byte is read.
+    ///
+    /// Everything here is a property of the mapping alone: an attribute key
+    /// that is empty, over the OTLP key-length cap, reserved for a span field
+    /// this version does not map, or declared twice. The duplicate check spans
+    /// both lists, not each list on its own: `attrs` is one map per span and
+    /// `ravel_rspan::merge_attrs` resolves a collision by resource precedence,
+    /// so a key named in both lists would silently make the span column dead.
+    /// Which column reached the record is exactly the kind of thing a mapping
+    /// must not decide invisibly.
+    ///
+    /// Attribute VALUE lengths, the span name length and the status message
+    /// length are per-row and are checked as rows are decoded.
+    pub fn validate(&self) -> Result<(), LoadError> {
+        let limits = SpanIngestLimits::default();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (attr, scope) in self.mapped_attributes() {
+            let list = scope.list_name();
+            if attr.key.is_empty() {
+                return Err(LoadError::Setup(format!(
+                    "--mapping [[spans.{list}]] has an empty key"
+                )));
+            }
+            if attr.key.len() > limits.max_attribute_key_len {
+                return Err(LoadError::Setup(format!(
+                    "--mapping [[spans.{list}]] key {:?} is {} bytes, more than the \
+                     attribute-key limit of {}",
+                    attr.key,
+                    attr.key.len(),
+                    limits.max_attribute_key_len
+                )));
+            }
+            if RESERVED_SPAN_ATTR_KEYS.contains(&attr.key.as_str()) {
+                return Err(span_shape_rejected(&format!(
+                    "the reserved attribute key {:?}",
+                    attr.key
+                )));
+            }
+            if !seen.insert(attr.key.as_str()) {
+                return Err(LoadError::Setup(format!(
+                    "--mapping [spans] declares the attribute key {:?} twice. A span carries one \
+                     merged attrs map with unique keys, and a resource attribute wins over a span \
+                     attribute of the same key, so the second column would never reach the \
+                     record.",
+                    attr.key
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which precedence set a mapped span attribute belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttrScope {
+    Resource,
+    Span,
+}
+
+impl AttrScope {
+    /// The mapping list this scope is spelled as.
+    fn list_name(self) -> &'static str {
+        match self {
+            AttrScope::Resource => "resource_attribute",
+            AttrScope::Span => "attribute",
+        }
+    }
+}
+
 /// Printed to stderr before a load runs: the per-tenant `AdmissionController`
 /// (active-stream cap, stream-creation rate, byte rate) lives in the server's
 /// HTTP layer and is bypassed by construction on this path (ADR-0089).
@@ -886,6 +1114,16 @@ pub const METRICS_ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes di
      re-ingests every row it is given. --skip-rows can resume a failed load positionally, but \
      only one started with --pipeline-depth 1 (see docs/guides/ingest.md). Retention is \
      measured from load time, not from the samples' event times.";
+
+/// [`ADMISSION_BYPASS_WARNING`] for a spans load, which goes through the span
+/// ingest router and reads one sequential cursor.
+pub const SPANS_ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes directly to the span \
+     ingest router. The per-tenant admission control that guards the HTTP ingest path is NOT \
+     applied to loaded data. There is no deduplication: re-running after a failure re-ingests \
+     every row it is given, and a span id that already exists is stored again rather than \
+     replaced. --skip-rows can resume a failed load positionally, but only one started with \
+     --pipeline-depth 1 (see docs/guides/ingest.md). Retention is measured from load time, not \
+     from the spans' event times.";
 
 /// Near-cap warning threshold: the loader warns when the widest single object's
 /// `dynamic_columns_used` reaches this fraction of `max_dynamic_columns`,
@@ -1097,19 +1335,12 @@ pub(crate) async fn run_warning_to(
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
-    // Refused before the mapping is even read, and never by falling back to
-    // another signal: a spans-shaped file written into the logs signal would
-    // be a durable mistake nothing later reports (ADR-1751 follow-up task 2).
-    if signal == SignalArg::Spans {
-        return Err(anyhow::Error::new(spans_not_supported()));
-    }
-
     // A diagnostic that cannot be written is not worth failing a durable load
     // over, here or below.
-    let admission_warning = if signal == SignalArg::Metrics {
-        METRICS_ADMISSION_BYPASS_WARNING
-    } else {
-        ADMISSION_BYPASS_WARNING
+    let admission_warning = match signal {
+        SignalArg::Metrics => METRICS_ADMISSION_BYPASS_WARNING,
+        SignalArg::Spans => SPANS_ADMISSION_BYPASS_WARNING,
+        SignalArg::Logs => ADMISSION_BYPASS_WARNING,
     };
     let _ = writeln!(warnings, "{admission_warning}");
 
@@ -1123,6 +1354,26 @@ pub(crate) async fn run_warning_to(
                 parquet_path,
                 tenant,
                 &metrics,
+                shards,
+                batch_rows,
+                skip_rows,
+                read_cursors,
+                pipeline_depth,
+                max_inflight_flushes,
+                decode_queue_batches,
+                target_bytes,
+                max_flush_delay,
+                now_ns,
+                warnings,
+            )
+            .await;
+        }
+        MappingSection::Spans(spans) => {
+            return run_spans(
+                store,
+                parquet_path,
+                tenant,
+                &spans,
                 shards,
                 batch_rows,
                 skip_rows,
@@ -1246,21 +1497,12 @@ async fn run_metrics(
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
-    // The logs path rejects these; a lever the metrics path ignores is still
-    // not one that may take a value its documentation calls invalid.
-    if read_cursors == Some(0) {
-        return Err(anyhow::Error::new(LoadError::Setup(
-            READ_CURSORS_ZERO.to_string(),
-        )));
-    }
-    if decode_queue_batches == 0 {
-        return Err(anyhow::Error::new(LoadError::Setup(
-            DECODE_QUEUE_BATCHES_ZERO.to_string(),
-        )));
-    }
-    if let Some(warning) = metrics_unused_lever_warning(read_cursors, decode_queue_batches) {
-        let _ = writeln!(warnings, "{warning}");
-    }
+    check_sequential_levers(
+        read_cursors,
+        decode_queue_batches,
+        SignalArg::Metrics,
+        warnings,
+    )?;
 
     match load_metrics(
         store,
@@ -1289,8 +1531,8 @@ async fn run_metrics(
             Ok(())
         }
         Err(err) => {
-            print_durable_tokens(&err, METRICS_RESUMABLE_SETTINGS);
-            if let Some(hint) = metrics_resume_hint(&err, pipeline_depth) {
+            print_durable_tokens(&err, SEQUENTIAL_RESUMABLE_SETTINGS);
+            if let Some(hint) = sequential_resume_hint(&err, pipeline_depth) {
                 let _ = writeln!(warnings, "{hint}");
                 if mapping.is_histogram() {
                     let _ = writeln!(
@@ -1308,11 +1550,83 @@ async fn run_metrics(
     }
 }
 
+/// The CLI-facing spans load: the same shape as [`run_metrics`], over the
+/// span ingest router.
+///
+/// It shares the metrics path's two unused levers for the same reason the
+/// metrics path has them: there is no decode/encode queue here (each batch's
+/// decode is one `spawn_blocking` the submit loop awaits), and the reader is
+/// one sequential cursor, which keeps a failed run's landed rows a file prefix
+/// under `--pipeline-depth 1`. Everything that shapes the objects --
+/// `--shards`, `--batch-rows`, `--target-bytes`, `--max-inflight-flushes`,
+/// `--max-flush-delay`, `--pipeline-depth` -- applies unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn run_spans(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &SpansMapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    read_cursors: Option<usize>,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    decode_queue_batches: usize,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    warnings: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    check_sequential_levers(
+        read_cursors,
+        decode_queue_batches,
+        SignalArg::Spans,
+        warnings,
+    )?;
+
+    match load_spans(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        skip_rows,
+        pipeline_depth,
+        max_inflight_flushes,
+        target_bytes,
+        max_flush_delay,
+        now_ns,
+        Arc::new(SystemClock),
+    )
+    .await
+    {
+        Ok(report) => {
+            print_spans_summary(&report);
+            if let Some(warning) =
+                skip_rows_past_end_warning(report.skip_rows_requested, report.file_total_rows)
+            {
+                let _ = writeln!(warnings, "{warning}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            print_durable_tokens(&err, SEQUENTIAL_RESUMABLE_SETTINGS);
+            if let Some(hint) = sequential_resume_hint(&err, pipeline_depth) {
+                let _ = writeln!(warnings, "{hint}");
+            }
+            Err(anyhow::Error::new(err))
+        }
+    }
+}
+
 /// The flags under which a failed logs load's landed rows are a file prefix.
 const LOGS_RESUMABLE_SETTINGS: &str = "--read-cursors 1 --pipeline-depth 1";
 
-/// The same for a metrics load, which always reads one sequential cursor.
-const METRICS_RESUMABLE_SETTINGS: &str = "--pipeline-depth 1";
+/// The same for the metrics and spans loads, which each read one sequential
+/// cursor and take `--read-cursors` out of the question.
+const SEQUENTIAL_RESUMABLE_SETTINGS: &str = "--pipeline-depth 1";
 
 /// `--read-cursors 0`, rejected on both signals.
 const READ_CURSORS_ZERO: &str = "--read-cursors must be at least 1, or omitted for automatic \
@@ -1323,11 +1637,37 @@ const DECODE_QUEUE_BATCHES_ZERO: &str = "--decode-queue-batches must be at least
                                          of decoded batches allowed to queue ahead of the shard \
                                          writers); 0 was given";
 
-/// The warning naming the levers a metrics load does not use, or `None` when
-/// the operator left both at a value that changes nothing.
-fn metrics_unused_lever_warning(
+/// Reject the two lever values both sequential paths call invalid and warn
+/// about a value either path would ignore, shared by the metrics and spans
+/// loads because the rule and the reasoning are identical on both.
+///
+/// The logs path rejects `0` for either lever; a lever a sequential path
+/// ignores is still not one that may take a value its own documentation calls
+/// invalid, so the rejection is unconditional and the *ignoring* is a warning.
+fn check_sequential_levers(
     read_cursors: Option<usize>,
     decode_queue_batches: usize,
+    signal: SignalArg,
+    warnings: &mut dyn std::io::Write,
+) -> Result<(), LoadError> {
+    if read_cursors == Some(0) {
+        return Err(LoadError::Setup(READ_CURSORS_ZERO.to_string()));
+    }
+    if decode_queue_batches == 0 {
+        return Err(LoadError::Setup(DECODE_QUEUE_BATCHES_ZERO.to_string()));
+    }
+    if let Some(warning) = unused_lever_warning(read_cursors, decode_queue_batches, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    Ok(())
+}
+
+/// The warning naming the levers a sequential (metrics or spans) load does not
+/// use, or `None` when the operator left both at a value that changes nothing.
+fn unused_lever_warning(
+    read_cursors: Option<usize>,
+    decode_queue_batches: usize,
+    signal: SignalArg,
 ) -> Option<String> {
     let mut unused: Vec<String> = Vec::new();
     if let Some(k) = read_cursors
@@ -1341,11 +1681,27 @@ fn metrics_unused_lever_warning(
     if unused.is_empty() {
         return None;
     }
+    // Each signal's own reason for reading one cursor, since they differ: a
+    // metrics histogram's data point is a contiguous run of rows, while a
+    // spans load simply has no shape that stride reads would help and keeps
+    // the failure prefix a resume depends on.
+    let (noun, why) = match signal {
+        SignalArg::Spans => (
+            "spans",
+            "It reads one sequential cursor (nothing in a span's mapping spans several rows, so \
+             stride reads would buy a spread the trace_id routing already gives while costing the \
+             file-prefix property a resume depends on)",
+        ),
+        _ => (
+            "metrics",
+            "It reads one sequential cursor (a classic histogram's data point is a contiguous run \
+             of rows, which stride reads would split)",
+        ),
+    };
     Some(format!(
-        "warning: a metrics load ignores {}. It reads one sequential cursor (a classic \
-         histogram's data point is a contiguous run of rows, which stride reads would split) and \
-         has no decode/encode queue. --shards, --batch-rows, --target-bytes, \
-         --max-inflight-flushes, --max-flush-delay and --pipeline-depth all apply.",
+        "warning: a {noun} load ignores {}. {why} and has no decode/encode queue. --shards, \
+         --batch-rows, --target-bytes, --max-inflight-flushes, --max-flush-delay and \
+         --pipeline-depth all apply.",
         unused.join(" and ")
     ))
 }
@@ -1369,6 +1725,25 @@ fn print_metrics_summary(report: &MetricsLoadReport) {
             report.histogram_points_exploded
         );
     }
+    println!("  rows/sec         : {rows_per_sec:.0}");
+    println!("  objects written  : {}", report.objects_written());
+    println!("  elapsed          : {secs:.3}s");
+}
+
+/// Print the spans load's completion summary to stdout.
+fn print_spans_summary(report: &SpansLoadReport) {
+    let secs = report.elapsed.as_secs_f64();
+    let rows_per_sec = if secs > 0.0 {
+        report.rows_processed as f64 / secs
+    } else {
+        report.rows_processed as f64
+    };
+    println!("bulk load complete");
+    println!("  signal           : spans");
+    println!("  rows_skipped     : {}", report.rows_skipped);
+    // One source row is exactly one span on this path, so there is no second
+    // record count to print beside it.
+    println!("  rows_written     : {}", report.rows_processed);
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
@@ -1497,7 +1872,7 @@ fn print_stage_timings(report: &LoadReport) {
 ///
 /// `resumable_with` is the flag set under which this signal's failed load is a
 /// resumable prefix ([`LOGS_RESUMABLE_SETTINGS`] or
-/// [`METRICS_RESUMABLE_SETTINGS`]).
+/// [`SEQUENTIAL_RESUMABLE_SETTINGS`]).
 fn print_durable_tokens(err: &LoadError, resumable_with: &str) {
     let tokens = err.durable_tokens();
     let is_flush = matches!(err, LoadError::Flush { .. });
@@ -1587,10 +1962,10 @@ fn resume_hint(
     Some(resume_block(resume, &verdict))
 }
 
-/// [`resume_hint`] for a metrics load. That path always reads one sequential
-/// cursor and ignores `--read-cursors`, so the pipeline depth is the only
-/// setting the verdict names.
-fn metrics_resume_hint(err: &LoadError, pipeline_depth: usize) -> Option<String> {
+/// [`resume_hint`] for a metrics or spans load. Both paths always read one
+/// sequential cursor and ignore `--read-cursors`, so the pipeline depth is the
+/// only setting the verdict names.
+fn sequential_resume_hint(err: &LoadError, pipeline_depth: usize) -> Option<String> {
     let resume = err.resume_figures()?;
     let verdict = if pipeline_depth == 1 {
         "this run used --pipeline-depth 1, so the rows that landed are a contiguous prefix of \
@@ -5568,13 +5943,99 @@ fn build_batch_points(
     Ok((points, rows))
 }
 
-/// One in-flight metrics write: the source rows it carries, the points it
-/// carries, and the task running it.
-type MetricsInflight = (
-    u64,
-    u64,
-    tokio::task::JoinHandle<Result<WriteReceipt, WriteError>>,
-);
+/// One in-flight Strict write on a sequential load path: the source rows it
+/// carries, the records it carries, and the task running it.
+///
+/// Shared by the metrics and spans loads, whose write windows differ only in
+/// the router's receipt and error types ([`WriteAck`], [`WriteFailure`]) and
+/// in which report the acks fold into ([`SequentialReport`]).
+type Inflight<A, F> = (u64, u64, tokio::task::JoinHandle<Result<A, F>>);
+
+/// A Strict write's success value, reduced to the commit tokens a load report
+/// keeps.
+trait WriteAck {
+    fn into_tokens(self) -> Vec<CommitToken>;
+}
+
+impl WriteAck for WriteReceipt {
+    fn into_tokens(self) -> Vec<CommitToken> {
+        self.tokens
+    }
+}
+
+impl WriteAck for SpanWriteReceipt {
+    fn into_tokens(self) -> Vec<CommitToken> {
+        self.tokens
+    }
+}
+
+/// A Strict write's failure, reduced to its message and to whatever sibling
+/// shards the router recovered from a partial write. Deliberately not named
+/// `durable_tokens`: both concrete error types already have an inherent method
+/// of that name, and an inherent method shadows a trait one at every call
+/// site, which would make this trait's impls silently recursive.
+trait WriteFailure: std::fmt::Display {
+    fn recovered_tokens(&self) -> &[CommitToken];
+}
+
+impl WriteFailure for WriteError {
+    fn recovered_tokens(&self) -> &[CommitToken] {
+        self.durable_tokens()
+    }
+}
+
+impl WriteFailure for SpanWriteError {
+    fn recovered_tokens(&self) -> &[CommitToken] {
+        self.durable_tokens()
+    }
+}
+
+/// The load-report surface the shared in-flight window writes through.
+trait SequentialReport {
+    /// Fold one acked write's tokens and counts into the report.
+    fn record_ack(&mut self, rows: u64, records: u64, tokens: Vec<CommitToken>);
+    /// Tokens known durable so far, in submission order.
+    fn tokens(&self) -> &[CommitToken];
+    /// The two figures a failed load hands back.
+    fn resume(&self) -> ResumeFigures;
+}
+
+impl SequentialReport for MetricsLoadReport {
+    fn record_ack(&mut self, rows: u64, records: u64, tokens: Vec<CommitToken>) {
+        self.tokens.extend(tokens);
+        self.rows_processed += rows;
+        self.points_written += records;
+    }
+
+    fn tokens(&self) -> &[CommitToken] {
+        &self.tokens
+    }
+
+    fn resume(&self) -> ResumeFigures {
+        ResumeFigures {
+            rows_skipped: self.rows_skipped,
+            rows_written: self.rows_processed,
+        }
+    }
+}
+
+impl SequentialReport for SpansLoadReport {
+    fn record_ack(&mut self, rows: u64, _records: u64, tokens: Vec<CommitToken>) {
+        self.tokens.extend(tokens);
+        self.rows_processed += rows;
+    }
+
+    fn tokens(&self) -> &[CommitToken] {
+        &self.tokens
+    }
+
+    fn resume(&self) -> ResumeFigures {
+        ResumeFigures {
+            rows_skipped: self.rows_skipped,
+            rows_written: self.rows_processed,
+        }
+    }
+}
 
 /// Bulk-import `parquet_path` into `tenant`'s metrics signal (ADR-1751
 /// decision 1).
@@ -5701,7 +6162,7 @@ pub async fn load_metrics(
     };
     let mapping = Arc::new(mapping.clone());
 
-    let mut inflight: std::collections::VecDeque<MetricsInflight> =
+    let mut inflight: std::collections::VecDeque<Inflight<WriteReceipt, WriteError>> =
         std::collections::VecDeque::with_capacity(pipeline_depth);
 
     loop {
@@ -5725,28 +6186,28 @@ pub async fn load_metrics(
         .map_err(|join_err| LoadError::BatchFailed {
             reason: format!("Parquet decode/build task failed: {join_err}"),
             durable: report.tokens.clone(),
-            resume: metrics_resume(&report),
+            resume: report.resume(),
         })?;
         state = returned;
 
         let (points, rows, done) = match decoded {
             MetricsDecoded::Failed(reason) => {
                 let (durable, reason) =
-                    drain_metrics_before_refusal(&mut inflight, &mut report, reason).await;
+                    drain_sequential_before_refusal(&mut inflight, &mut report, reason).await;
                 return Err(LoadError::BatchFailed {
                     reason,
                     durable,
-                    resume: metrics_resume(&report),
+                    resume: report.resume(),
                 });
             }
             MetricsDecoded::Rejected { row, reason } => {
                 let (durable, reason) =
-                    drain_metrics_before_refusal(&mut inflight, &mut report, reason).await;
+                    drain_sequential_before_refusal(&mut inflight, &mut report, reason).await;
                 return Err(LoadError::RowRejected {
                     row,
                     reason,
                     durable,
-                    resume: metrics_resume(&report),
+                    resume: report.resume(),
                 });
             }
             MetricsDecoded::Batch { points, rows, done } => (points, rows, done),
@@ -5782,8 +6243,8 @@ pub async fn load_metrics(
             let Some(entry) = inflight.pop_front() else {
                 break;
             };
-            if let Err(mut e) = resolve_metrics_write(entry, &mut report).await {
-                harvest_metrics_after_failure(&mut inflight, &mut e).await;
+            if let Err(mut e) = resolve_sequential_write(entry, &mut report).await {
+                harvest_sequential_after_failure(&mut inflight, &mut e).await;
                 return Err(e);
             }
         }
@@ -5812,7 +6273,7 @@ pub async fn load_metrics(
                 }
             }
         });
-        let result = drain_metrics_inflight(&mut inflight, &mut report).await;
+        let result = drain_sequential_inflight(&mut inflight, &mut report).await;
         let _ = stop_tx.send(());
         let _ = ticker.await;
         result
@@ -5824,44 +6285,33 @@ pub async fn load_metrics(
     Ok(report)
 }
 
-/// [`ResumeFigures`] from a metrics report, the same two figures a failed
-/// logs load hands back.
-fn metrics_resume(report: &MetricsLoadReport) -> ResumeFigures {
-    ResumeFigures {
-        rows_skipped: report.rows_skipped,
-        rows_written: report.rows_processed,
-    }
-}
-
-/// Resolve one in-flight metrics write, folding its tokens and counts into
-/// the report or turning its failure into a [`LoadError::Flush`] that carries
-/// the tokens already durable, including any sibling shard the router
-/// recovered from a partial write.
-async fn resolve_metrics_write(
-    entry: MetricsInflight,
-    report: &mut MetricsLoadReport,
+/// Resolve one in-flight write, folding its tokens and counts into the report
+/// or turning its failure into a [`LoadError::Flush`] that carries the tokens
+/// already durable, including any sibling shard the router recovered from a
+/// partial write.
+async fn resolve_sequential_write<A: WriteAck, F: WriteFailure, P: SequentialReport>(
+    entry: Inflight<A, F>,
+    report: &mut P,
 ) -> Result<(), LoadError> {
-    let (rows, points, handle) = entry;
+    let (rows, records, handle) = entry;
     match handle.await {
         Ok(Ok(receipt)) => {
-            report.tokens.extend(receipt.tokens);
-            report.rows_processed += rows;
-            report.points_written += points;
+            report.record_ack(rows, records, receipt.into_tokens());
             Ok(())
         }
         Ok(Err(err)) => {
-            let mut durable = report.tokens.clone();
-            durable.extend_from_slice(err.durable_tokens());
+            let mut durable = report.tokens().to_vec();
+            durable.extend_from_slice(err.recovered_tokens());
             Err(LoadError::Flush {
                 durable,
                 cause: err.to_string(),
-                resume: metrics_resume(report),
+                resume: report.resume(),
             })
         }
         Err(join_err) => Err(LoadError::Flush {
-            durable: report.tokens.clone(),
+            durable: report.tokens().to_vec(),
             cause: format!("write task failed: {join_err}"),
-            resume: metrics_resume(report),
+            resume: report.resume(),
         }),
     }
 }
@@ -5869,14 +6319,14 @@ async fn resolve_metrics_write(
 /// Resolve every remaining in-flight write, oldest-first. On the first write
 /// error every later write is still resolved and whatever it committed is
 /// folded into that error's durable-token list
-/// ([`harvest_metrics_after_failure`]), as the steady-state loop does.
-async fn drain_metrics_inflight(
-    inflight: &mut std::collections::VecDeque<MetricsInflight>,
-    report: &mut MetricsLoadReport,
+/// ([`harvest_sequential_after_failure`]), as the steady-state loop does.
+async fn drain_sequential_inflight<A: WriteAck, F: WriteFailure, P: SequentialReport>(
+    inflight: &mut std::collections::VecDeque<Inflight<A, F>>,
+    report: &mut P,
 ) -> Result<(), LoadError> {
     while let Some(entry) = inflight.pop_front() {
-        if let Err(mut e) = resolve_metrics_write(entry, report).await {
-            harvest_metrics_after_failure(inflight, &mut e).await;
+        if let Err(mut e) = resolve_sequential_write(entry, report).await {
+            harvest_sequential_after_failure(inflight, &mut e).await;
             return Err(e);
         }
     }
@@ -5889,13 +6339,13 @@ async fn drain_metrics_inflight(
 /// later writes) become the refusal's durable list and its cause is appended
 /// to the reason, since the resume figures then stop at that write rather than
 /// at the refused row.
-async fn drain_metrics_before_refusal(
-    inflight: &mut std::collections::VecDeque<MetricsInflight>,
-    report: &mut MetricsLoadReport,
+async fn drain_sequential_before_refusal<A: WriteAck, F: WriteFailure, P: SequentialReport>(
+    inflight: &mut std::collections::VecDeque<Inflight<A, F>>,
+    report: &mut P,
     reason: String,
 ) -> (Vec<CommitToken>, String) {
-    match drain_metrics_inflight(inflight, report).await {
-        Ok(()) => (report.tokens.clone(), reason),
+    match drain_sequential_inflight(inflight, report).await {
+        Ok(()) => (report.tokens().to_vec(), reason),
         Err(e) => (
             e.durable_tokens().to_vec(),
             format!("{reason} (an earlier write had also failed: {e})"),
@@ -5907,21 +6357,706 @@ async fn drain_metrics_before_refusal(
 /// durable-token list. The loader cannot stop a shard-actor flush it already
 /// handed off, so awaiting the outcome is what keeps the report equal to what
 /// landed (issue #800's reasoning on the logs path).
-async fn harvest_metrics_after_failure(
-    inflight: &mut std::collections::VecDeque<MetricsInflight>,
+async fn harvest_sequential_after_failure<A: WriteAck, F: WriteFailure>(
+    inflight: &mut std::collections::VecDeque<Inflight<A, F>>,
     err: &mut LoadError,
 ) {
     let mut recovered: Vec<CommitToken> = Vec::new();
     while let Some((_, _, handle)) = inflight.pop_front() {
         match handle.await {
-            Ok(Ok(receipt)) => recovered.extend(receipt.tokens),
-            Ok(Err(write_err)) => recovered.extend_from_slice(write_err.durable_tokens()),
+            Ok(Ok(receipt)) => recovered.extend(receipt.into_tokens()),
+            Ok(Err(write_err)) => recovered.extend_from_slice(write_err.recovered_tokens()),
             Err(_) => {}
         }
     }
     if let Some(durable) = err.durable_tokens_mut() {
         durable.extend(recovered);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Spans load (ADR-1751 decision 1 and 2, follow-up task 2)
+//
+// Everything structural is the metrics path's: provision or validate the
+// signal, build the router from the same `build_ingest_config`, read one
+// sequential cursor, write `WriteMode::Strict` batches through the same
+// in-flight window (`Inflight`, `resolve_sequential_write` and friends). What
+// differs is normalisation: one source row is exactly one
+// `ravel_otlp::NormalizedSpan`, and the attribute coercion, the reserved
+// attrs keys and the status mapping are OTLP's own, so a span loaded here and
+// the same span sent over OTLP are stored as the same record.
+// ---------------------------------------------------------------------------
+
+/// Result of a successful (or partially-durable) spans load.
+#[derive(Debug, Clone, Default)]
+pub struct SpansLoadReport {
+    /// Source rows whose spans acked durable, in submission order. One row is
+    /// one span on this path, so this is also the span count.
+    pub rows_processed: u64,
+    /// `--skip-rows`, clamped to the file's total row count.
+    pub rows_skipped: u64,
+    /// `--skip-rows` as the operator gave it, before the clamp.
+    pub skip_rows_requested: u64,
+    /// The file's total row count, read from the Parquet footer.
+    pub file_total_rows: u64,
+    /// One token per shard acked, across every batch, in submission order.
+    pub tokens: Vec<CommitToken>,
+    pub elapsed: Duration,
+}
+
+impl SpansLoadReport {
+    /// Distinct commit tokens, which is the number of RSPAN objects the load
+    /// wrote. Same derivation as [`LoadReport::objects_written`].
+    pub fn objects_written(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        self.tokens
+            .iter()
+            .filter(|t| seen.insert(t.encode()))
+            .count()
+    }
+}
+
+/// Resolved column indices for the mapped fields of one spans batch.
+struct SpansColumnIndex {
+    trace_id: usize,
+    span_id: usize,
+    parent_span_id: Option<usize>,
+    name: usize,
+    start_ts: usize,
+    end_ts: usize,
+    status_code: Option<usize>,
+    status_message: Option<usize>,
+    /// One column index per `[[spans.resource_attribute]]`, in mapping order.
+    resource_attributes: Vec<usize>,
+    /// One column index per `[[spans.attribute]]`, in mapping order.
+    attributes: Vec<usize>,
+}
+
+impl SpansColumnIndex {
+    /// Resolve every mapped column against this batch's schema, and check the
+    /// id columns' types and declared widths here rather than per row: a
+    /// `FixedSizeBinary(n)` states its width in the schema, so a mapping that
+    /// points `trace_id_column` at an 8-byte column is a mapping error that
+    /// can be reported before the first row is decoded.
+    fn resolve(batch: &RecordBatch, mapping: &SpansMapping) -> Result<SpansColumnIndex, String> {
+        let schema = batch.schema();
+        let idx = |name: &str| -> Result<usize, String> {
+            schema
+                .index_of(name)
+                .map_err(|_| format!("mapped column {name:?} is not present in the Parquet file"))
+        };
+        let id_idx = |name: &str, width: usize| -> Result<usize, String> {
+            let i = idx(name)?;
+            check_id_column(schema.field(i).data_type(), name, width)?;
+            Ok(i)
+        };
+        Ok(SpansColumnIndex {
+            trace_id: id_idx(&mapping.trace_id_column, 16)?,
+            span_id: id_idx(&mapping.span_id_column, 8)?,
+            parent_span_id: match &mapping.parent_span_id_column {
+                Some(c) => Some(id_idx(c, 8)?),
+                None => None,
+            },
+            name: idx(&mapping.name_column)?,
+            start_ts: idx(&mapping.start_ts_column)?,
+            end_ts: idx(&mapping.end_ts_column)?,
+            status_code: match &mapping.status_code_column {
+                Some(c) => Some(idx(c)?),
+                None => None,
+            },
+            status_message: match &mapping.status_message_column {
+                Some(c) => Some(idx(c)?),
+                None => None,
+            },
+            resource_attributes: mapping
+                .resource_attributes
+                .iter()
+                .map(|a| idx(&a.column))
+                .collect::<Result<Vec<_>, String>>()?,
+            attributes: mapping
+                .attributes
+                .iter()
+                .map(|a| idx(&a.column))
+                .collect::<Result<Vec<_>, String>>()?,
+        })
+    }
+}
+
+/// Check that an id column can supply an exact-width id, by the same rule
+/// [`read_id`] reads one: a binary or hex-string column. A
+/// `FixedSizeBinary(n)` whose `n` is not the id's width can never produce one,
+/// and says so in the schema, so it is refused before any row is read rather
+/// than once per row.
+fn check_id_column(data_type: &DataType, column: &str, width: usize) -> Result<(), String> {
+    match data_type {
+        DataType::FixedSizeBinary(n) if *n as usize != width => Err(format!(
+            "id column {column:?} is FixedSizeBinary({n}), but this id is {width} bytes. Ravel \
+             never pads or truncates an id, so no row of this column can produce one."
+        )),
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::FixedSizeBinary(_) => Ok(()),
+        other => Err(format!(
+            "id column {column:?} has type {other:?}; expected a binary column of {width} bytes \
+             or a hex string column of {} characters",
+            width * 2
+        )),
+    }
+}
+
+/// Decode one source row against the mapping into a [`NormalizedSpan`].
+///
+/// The check order is [`ravel_otlp::traces_normalize`]'s `normalize_span`, and
+/// the order is what decides which rejection a row with several problems
+/// reports. The one admission rule deliberately absent is the past-event-time
+/// lag bound (ADR-0089's relaxation, widened to every signal by ADR-1751
+/// decision 1); the future-skew bound is kept, and anchors on the span's end
+/// exactly as `checked_span_interval` does.
+fn build_span(
+    batch: &RecordBatch,
+    cols: &SpansColumnIndex,
+    mapping: &SpansMapping,
+    limits: &SpanIngestLimits,
+    now_ns: i64,
+    row: usize,
+) -> Result<NormalizedSpan, String> {
+    let name = read_string(batch.column(cols.name), row)?
+        .ok_or_else(|| format!("name column {:?} is null", mapping.name_column))?;
+    if name.len() > limits.max_name_len {
+        return Err(format!(
+            "span name is {} bytes, more than the limit of {}",
+            name.len(),
+            limits.max_name_len
+        ));
+    }
+
+    // trace_id and span_id are the record's identity and RSPAN's sort key, so
+    // a wrong width is a rejection and never a pad or a truncation. `read_id`
+    // reports a wrong width as `None`, which is indistinguishable here from a
+    // null cell; both are the same refusal, since neither can name a span.
+    let trace_id = read_id::<16>(batch.column(cols.trace_id), row)?.ok_or_else(|| {
+        format!(
+            "trace_id column {:?} is null, or is not a 16-byte value (or a 32-character hex \
+             string). Ravel never pads or truncates an id.",
+            mapping.trace_id_column
+        )
+    })?;
+    let span_id = read_id::<8>(batch.column(cols.span_id), row)?.ok_or_else(|| {
+        format!(
+            "span_id column {:?} is null, or is not an 8-byte value (or a 16-character hex \
+             string). Ravel never pads or truncates an id.",
+            mapping.span_id_column
+        )
+    })?;
+    // A null parent cell is a root span. A present but wrong-width one is a
+    // rejection here, where the OTLP path drops it and admits the span: an
+    // OTLP sender's malformed field is one record of a live stream, while a
+    // mapped column producing unusable ids is a mapping mistake the whole file
+    // shares, and a silently-rerooted span tree is not visible in the data.
+    let parent_span_id = match cols.parent_span_id {
+        None => None,
+        Some(i) => {
+            let column = batch.column(i);
+            if column.is_null(row) {
+                None
+            } else {
+                Some(read_id::<8>(column, row)?.ok_or_else(|| {
+                    format!(
+                        "parent_span_id column {:?} is not an 8-byte value (or a 16-character hex \
+                         string). Ravel never pads or truncates an id; leave the cell null for a \
+                         root span.",
+                        mapping.parent_span_id_column.as_deref().unwrap_or_default()
+                    )
+                })?)
+            }
+        }
+    };
+
+    // A zero start takes load time and a zero end takes the start, exactly as
+    // `normalize_span` does for the zeros an under-instrumented OTLP sender
+    // emits. A NULL cell has no OTLP counterpart and is refused instead: in a
+    // file the operator controls it is a mapping or export mistake, and
+    // placing a span at load time because a column was empty would hide it.
+    let start_ts_ns = match read_ts(batch.column(cols.start_ts), row, mapping.start_ts_unit)?
+        .ok_or_else(|| format!("start_ts column {:?} is null", mapping.start_ts_column))?
+    {
+        0 => now_ns,
+        v => v,
+    };
+    let end_ts_ns = match read_ts(batch.column(cols.end_ts), row, mapping.end_ts_unit)?
+        .ok_or_else(|| format!("end_ts column {:?} is null", mapping.end_ts_column))?
+    {
+        0 => start_ts_ns,
+        v => v,
+    };
+    if end_ts_ns < start_ts_ns {
+        return Err(format!(
+            "span ends at {end_ts_ns} ns, before it starts at {start_ts_ns} ns"
+        ));
+    }
+    // Kept: the future-skew bound, at the spans OTLP limit, anchored on the
+    // end. The past-lag check is deliberately omitted.
+    let skew_ns = end_ts_ns.saturating_sub(now_ns);
+    if skew_ns > limits.max_future_skew_ns {
+        return Err(format!(
+            "span end is {skew_ns} ns ahead of load time, more than the max future skew of {} ns",
+            limits.max_future_skew_ns
+        ));
+    }
+
+    let status_code = match cols.status_code {
+        None => StatusCode::Unset,
+        Some(i) => match read_i64(batch.column(i), row)? {
+            None => StatusCode::Unset,
+            Some(code) => status_code_from_i32(i32::try_from(code).unwrap_or(i32::MAX)),
+        },
+    };
+    let status_message = match cols.status_message {
+        None => None,
+        Some(i) => match read_string(batch.column(i), row)? {
+            None => None,
+            Some(message) => {
+                if message.len() > limits.max_status_message_len {
+                    return Err(format!(
+                        "status message is {} bytes, more than the limit of {}",
+                        message.len(),
+                        limits.max_status_message_len
+                    ));
+                }
+                // An empty message is no message, as it is on the OTLP path.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message)
+                }
+            }
+        },
+    };
+
+    let resource_attrs = read_span_attrs(
+        batch,
+        &cols.resource_attributes,
+        &mapping.resource_attributes,
+        AttrScope::Resource,
+        limits,
+        row,
+    )?;
+    let span_attrs = read_span_attrs(
+        batch,
+        &cols.attributes,
+        &mapping.attributes,
+        AttrScope::Span,
+        limits,
+        row,
+    )?;
+    // The same merge the OTLP path runs, with an empty scope set: this loader
+    // maps no instrumentation scope, so there is nothing between resource and
+    // span precedence. The reserved-key strip `normalize_span` applies is not
+    // repeated here because `SpansMapping::validate` refuses a mapping naming
+    // any reserved key outright, so no merged map can hold one.
+    let attrs = merge_attrs(&resource_attrs, &[], &span_attrs);
+
+    Ok(NormalizedSpan {
+        trace_id,
+        span_id,
+        parent_span_id,
+        name,
+        start_ts_ns,
+        end_ts_ns,
+        status_code,
+        status_message,
+        attrs,
+    })
+}
+
+/// Read one row's mapped attributes for one precedence set, coerced to the
+/// `Map<Utf8, Utf8>` strings RSPAN stores.
+fn read_span_attrs(
+    batch: &RecordBatch,
+    indices: &[usize],
+    maps: &[AttrMap],
+    scope: AttrScope,
+    limits: &SpanIngestLimits,
+    row: usize,
+) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::with_capacity(indices.len());
+    for (col, map) in indices.iter().zip(maps) {
+        // A null cell is an attribute this row does not carry, the same as an
+        // OTLP span that simply omits the key. An EMPTY string is a value and
+        // is stored: unlike a metric label, an empty attribute value is
+        // meaningful on the span path and OTLP keeps it.
+        let Some(value) = read_attr(batch.column(*col), row, map.value_type)? else {
+            continue;
+        };
+        let value = span_attr_string(&map.key, &value)?;
+        if value.len() > limits.max_attribute_value_len {
+            return Err(format!(
+                "[[spans.{}]] {:?} value is {} bytes, more than the limit of {}",
+                scope.list_name(),
+                map.key,
+                value.len(),
+                limits.max_attribute_value_len
+            ));
+        }
+        out.push((map.key.clone(), value));
+    }
+    Ok(out)
+}
+
+/// Coerce one typed cell to the string RSPAN stores, by
+/// `ravel_otlp::traces_normalize`'s own `convert_value` mapping: a bool and an
+/// integer take their canonical string form, a float goes through the shared
+/// [`format_float`], and bytes become lowercase hex. A list or map has no
+/// Parquet scalar column source and no RSPAN representation, and is refused
+/// rather than given a stringification this code would be inventing.
+fn span_attr_string(key: &str, value: &AttrValue) -> Result<String, String> {
+    Ok(match value {
+        AttrValue::Str(s) => s.clone(),
+        AttrValue::Bool(b) => b.to_string(),
+        AttrValue::I64(i) => i.to_string(),
+        AttrValue::F64(f) => format_float(*f),
+        AttrValue::Bytes(b) => hex::encode(b),
+        AttrValue::List(_) | AttrValue::Map(_) => {
+            return Err(format!(
+                "attribute {key:?} is a list or map, which RSPAN's Map<Utf8, Utf8> attrs cannot \
+                 represent"
+            ));
+        }
+    })
+}
+
+/// The decode state the spans loader shuttles into and back out of each
+/// batch's `spawn_blocking` task: the single sequential cursor plus the
+/// `--skip-rows` offset, applied against each span's own file-absolute base
+/// as [`collect_spans`] applies it on the logs path.
+struct SpansDecodeState {
+    cursor: CursorState,
+    skip_rows: u64,
+}
+
+/// One batch's decode outcome.
+enum SpansDecoded {
+    /// Spans built from this batch, the source rows they came from (one per
+    /// span here), and whether the input is exhausted.
+    Batch {
+        spans: Vec<NormalizedSpan>,
+        rows: u64,
+        done: bool,
+    },
+    /// The batch failed to read from Parquet or to resolve against the
+    /// mapping.
+    Failed(String),
+    /// A row failed a kept admission check, at its FILE-absolute index.
+    Rejected { row: u64, reason: String },
+}
+
+/// Decode and build one spans batch from the sequential cursor.
+fn decode_spans_batch(
+    state: &mut SpansDecodeState,
+    mapping: &SpansMapping,
+    limits: &SpanIngestLimits,
+    now_ns: i64,
+    batch_rows: usize,
+) -> SpansDecoded {
+    let taken = match cursor_take(&mut state.cursor, batch_rows) {
+        Ok(taken) => taken,
+        Err(reason) => return SpansDecoded::Failed(reason),
+    };
+    let Some((batch, file_base)) = taken else {
+        return SpansDecoded::Batch {
+            spans: Vec::new(),
+            rows: 0,
+            done: true,
+        };
+    };
+
+    // `--skip-rows` by file-absolute position, before mapping sees a row.
+    let (batch, file_base) = {
+        let end = file_base + batch.num_rows() as u64;
+        if end <= state.skip_rows {
+            return SpansDecoded::Batch {
+                spans: Vec::new(),
+                rows: 0,
+                done: false,
+            };
+        }
+        if file_base < state.skip_rows {
+            let cut = (state.skip_rows - file_base) as usize;
+            (
+                batch.slice(cut, batch.num_rows() - cut),
+                file_base + cut as u64,
+            )
+        } else {
+            (batch, file_base)
+        }
+    };
+
+    let cols = match SpansColumnIndex::resolve(&batch, mapping) {
+        Ok(cols) => cols,
+        Err(reason) => return SpansDecoded::Failed(reason),
+    };
+
+    let mut spans = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        match build_span(&batch, &cols, mapping, limits, now_ns, row) {
+            Ok(span) => spans.push(span),
+            Err(reason) => {
+                return SpansDecoded::Rejected {
+                    row: file_base + row as u64,
+                    reason,
+                };
+            }
+        }
+    }
+    let rows = spans.len() as u64;
+    SpansDecoded::Batch {
+        spans,
+        rows,
+        done: false,
+    }
+}
+
+/// Bulk-import `parquet_path` into `tenant`'s spans signal (ADR-1751
+/// decision 1).
+///
+/// The same contract as [`load_metrics`]: the shard count is validated
+/// against (or, for a fresh signal, written to) the durable provisioning
+/// record through [`validate_or_adopt`]; the router is built from the same
+/// [`build_ingest_config`]; every batch is a [`WriteMode::Strict`] write whose
+/// ack means durable; and a failure mid-file is a genuine partial load whose
+/// durable commit tokens are reported rather than swallowed.
+///
+/// `now_ns` anchors the future-skew check and the zero-start fallback only.
+/// Bucketing is by the router's own clock (load-time wall clock), so an old
+/// span lands in today's ingest hour and is reached by every later query's
+/// listing window, whose upper bound is `now`.
+#[allow(clippy::too_many_arguments)]
+pub async fn load_spans(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &SpansMapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    pipeline_depth: usize,
+    max_inflight_flushes: u32,
+    target_bytes: usize,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+) -> Result<SpansLoadReport, LoadError> {
+    // Same operator-facing lever guards as the other paths: a value that
+    // cannot express what the flag means is rejected, never silently clamped.
+    if batch_rows == 0 {
+        return Err(LoadError::Setup(
+            "--batch-rows must be at least 1 (each batch is one Strict flush per shard); 0 was \
+             given"
+                .to_string(),
+        ));
+    }
+    if pipeline_depth == 0 {
+        return Err(LoadError::Setup(
+            "--pipeline-depth must be at least 1 (the number of concurrent in-flight writes); 0 \
+             was given"
+                .to_string(),
+        ));
+    }
+    if max_inflight_flushes == 0 {
+        return Err(LoadError::Setup(
+            "--max-inflight-flushes must be at least 1 (the number of flushes one shard may have \
+             in flight at once); 0 would deadlock every flush, since a shard could never acquire \
+             a permit to run one"
+                .to_string(),
+        ));
+    }
+    if target_bytes == 0 {
+        return Err(LoadError::Setup(
+            "--target-bytes must be at least 1 (1 flushes every batch as its own object); 0 was \
+             given"
+                .to_string(),
+        ));
+    }
+    mapping.validate()?;
+    // The loader per-record attribute cap stands in for OTLP's
+    // `max_attributes_per_span` (ADR-1751 decision 1). It is checked here
+    // rather than per row because the mapping bounds every row: a row can
+    // carry at most one attribute per `[[spans.attribute]]` entry, so a
+    // mapping within the cap can never produce a span over it.
+    if mapping.attributes.len() > LOADER_MAX_ATTRIBUTES_PER_RECORD {
+        return Err(LoadError::Setup(format!(
+            "--mapping [spans] declares {} attribute columns, more than the loader per-record cap \
+             of {}",
+            mapping.attributes.len(),
+            LOADER_MAX_ATTRIBUTES_PER_RECORD
+        )));
+    }
+
+    let limits = SpanIngestLimits::default();
+    let tenant_id = TenantId::new(tenant);
+
+    // Provision or validate the SPANS signal, the same first-touch path
+    // `services/ravel-server` runs.
+    validate_or_adopt(
+        store.as_ref(),
+        &tenant_id.hash(),
+        Signal::Spans,
+        shards,
+        now_ns,
+        AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .map_err(|e| {
+        LoadError::Setup(format!(
+            "shard-count provisioning check failed for tenant {tenant:?} \
+             (configured --shards {shards}): {e}"
+        ))
+    })?;
+
+    let router = Arc::new(SpanIngestRouter::new(
+        build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
+        Arc::clone(&store),
+        clock,
+    ));
+    let ack_deadline = write_ack_deadline(max_flush_delay);
+
+    let input = FileInput { path: parquet_path };
+    let metadata = read_input_metadata(&input)?;
+    let row_group_lens = row_group_row_counts(&metadata);
+    // One sequential cursor, as on the metrics path: a failed load's landed
+    // rows stay a file prefix, which is what makes the printed resume offset
+    // mean anything.
+    let mut cursors = open_stride_cursors(&input, &metadata, &row_group_lens, 1, batch_rows)?;
+    let Some(cursor) = cursors.pop() else {
+        return Err(LoadError::Setup(
+            "internal error: no read cursor was opened for the input file".to_string(),
+        ));
+    };
+
+    let started = Instant::now();
+    let mut report = SpansLoadReport::default();
+    let total_rows: u64 = row_group_lens.iter().sum();
+    report.rows_skipped = skip_rows.min(total_rows);
+    report.skip_rows_requested = skip_rows;
+    report.file_total_rows = total_rows;
+
+    let mut state = SpansDecodeState { cursor, skip_rows };
+    let mapping = Arc::new(mapping.clone());
+
+    let mut inflight: std::collections::VecDeque<Inflight<SpanWriteReceipt, SpanWriteError>> =
+        std::collections::VecDeque::with_capacity(pipeline_depth);
+
+    loop {
+        let mapping_for_decode = Arc::clone(&mapping);
+        let limits_for_decode = limits.clone();
+        let (returned, decoded) = tokio::task::spawn_blocking(move || {
+            let mut state = state;
+            let outcome = decode_spans_batch(
+                &mut state,
+                &mapping_for_decode,
+                &limits_for_decode,
+                now_ns,
+                batch_rows,
+            );
+            (state, outcome)
+        })
+        .await
+        .map_err(|join_err| LoadError::BatchFailed {
+            reason: format!("Parquet decode/build task failed: {join_err}"),
+            durable: report.tokens.clone(),
+            resume: report.resume(),
+        })?;
+        state = returned;
+
+        let (spans, rows, done) = match decoded {
+            SpansDecoded::Failed(reason) => {
+                let (durable, reason) =
+                    drain_sequential_before_refusal(&mut inflight, &mut report, reason).await;
+                return Err(LoadError::BatchFailed {
+                    reason,
+                    durable,
+                    resume: report.resume(),
+                });
+            }
+            SpansDecoded::Rejected { row, reason } => {
+                let (durable, reason) =
+                    drain_sequential_before_refusal(&mut inflight, &mut report, reason).await;
+                return Err(LoadError::RowRejected {
+                    row,
+                    reason,
+                    durable,
+                    resume: report.resume(),
+                });
+            }
+            SpansDecoded::Batch { spans, rows, done } => (spans, rows, done),
+        };
+
+        if spans.is_empty() {
+            if done {
+                break;
+            }
+            continue;
+        }
+
+        let handle = {
+            let router = Arc::clone(&router);
+            let tenant = tenant_id.clone();
+            tokio::spawn(async move {
+                router
+                    .write(tenant, spans, WriteMode::Strict, ack_deadline)
+                    .await
+            })
+        };
+        inflight.push_back((rows, rows, handle));
+
+        // Bound true concurrency to `pipeline_depth`, resolving strictly
+        // oldest-first so the token list and the first error stay in
+        // submission order however the underlying PUTs complete.
+        while inflight.len() >= pipeline_depth {
+            let Some(entry) = inflight.pop_front() else {
+                break;
+            };
+            if let Err(mut e) = resolve_sequential_write(entry, &mut report).await {
+                harvest_sequential_after_failure(&mut inflight, &mut e).await;
+                return Err(e);
+            }
+        }
+
+        if done {
+            break;
+        }
+    }
+
+    // Publish the tail buffers before draining, for the same reason the other
+    // paths do: no later batch is coming to push a buffer past
+    // `--target-bytes`, so its writes' acks would otherwise wait out the age
+    // trigger. The ticker sweeps a straggler whose send landed after this
+    // flush.
+    router.flush_all().await;
+    let drain_result = {
+        let ticker_router = Arc::clone(&router);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    () = tokio::time::sleep(Duration::from_secs(2)) => {
+                        ticker_router.flush_all().await;
+                    }
+                }
+            }
+        });
+        let result = drain_sequential_inflight(&mut inflight, &mut report).await;
+        let _ = stop_tx.send(());
+        let _ = ticker.await;
+        result
+    };
+    drain_result?;
+
+    report.elapsed = started.elapsed();
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -12364,6 +13499,243 @@ type = "i64"
         assert_eq!(exact_count(below).expect("below 2^64 fits"), below as u64);
     }
 
+    /// `ravel-cli load --signal spans` (ADR-1751 follow-up task 2). The
+    /// end-to-end round trip and the OTLP differential live in
+    /// `tests/load_spans.rs`; these cover what needs the crate-internal entry
+    /// point or a mapping that never reaches a router.
+    mod spans {
+        use super::*;
+
+        /// The smallest legal spans mapping plus one attribute of each kind.
+        const MAPPING_TOML: &str = r#"
+[spans]
+trace_id_column = "trace_id"
+span_id_column  = "span_id"
+name_column     = "name"
+start_ts_column = "start_ns"
+start_ts_unit   = "nanos"
+end_ts_column   = "end_ns"
+end_ts_unit     = "nanos"
+
+[[spans.attribute]]
+key = "http.method"
+column = "method"
+type = "str"
+"#;
+
+        fn bin_col(vals: Vec<Vec<u8>>) -> ArrayRef {
+            let refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+            Arc::new(BinaryArray::from(refs))
+        }
+
+        /// One span's Parquet file and mapping file on disk, for a test that
+        /// drives the CLI entry point rather than [`load_spans`].
+        fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("spans.parquet");
+            let mapping_path = dir.path().join("mapping.toml");
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]])),
+                ("span_id", bin_col(vec![vec![2u8; 8]])),
+                ("name", str_col(vec!["op"])),
+                ("start_ns", i64_col(vec![NOW_NS])),
+                ("end_ns", i64_col(vec![NOW_NS])),
+                ("method", str_col(vec!["GET"])),
+            ]);
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+                .expect("arrow writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+            std::fs::write(&mapping_path, MAPPING_TOML).expect("write mapping");
+            (dir, pq, mapping_path)
+        }
+
+        /// `--read-cursors 0` and `--decode-queue-batches 0` are rejected on
+        /// the spans path with the same messages the other paths give: a lever
+        /// this path ignores is still not one that may take a value its own
+        /// documentation calls invalid.
+        #[tokio::test]
+        async fn zero_levers_are_rejected() {
+            let (_dir, pq, mapping_path) = fixture();
+            for (read_cursors, decode_queue_batches, want) in [
+                (Some(0), DEFAULT_DECODE_QUEUE_BATCHES, READ_CURSORS_ZERO),
+                (None, 0, DECODE_QUEUE_BATCHES_ZERO),
+            ] {
+                let store: Arc<dyn ObjectStoreBackend> =
+                    Arc::new(ravel_object_store::memory::MemoryStore::new());
+                let mut sink: Vec<u8> = Vec::new();
+                let err = run_warning_to(
+                    store,
+                    &pq,
+                    "acme",
+                    &mapping_path,
+                    SignalArg::Spans,
+                    1,
+                    10_000,
+                    0,
+                    read_cursors,
+                    1,
+                    DEFAULT_MAX_INFLIGHT_FLUSHES,
+                    decode_queue_batches,
+                    DEFAULT_TARGET_BYTES,
+                    None,
+                    NOW_NS,
+                    &mut sink,
+                )
+                .await
+                .expect_err("a zero lever is rejected before anything is written");
+                assert_eq!(err.to_string(), want);
+            }
+        }
+
+        /// The entry point prints the spans admission-bypass warning and names
+        /// both levers a spans load ignores.
+        #[tokio::test]
+        async fn the_entry_point_warns_about_the_levers_it_ignores() {
+            let (_dir, pq, mapping_path) = fixture();
+            let store: Arc<dyn ObjectStoreBackend> =
+                Arc::new(ravel_object_store::memory::MemoryStore::new());
+            let mut sink: Vec<u8> = Vec::new();
+            run_warning_to(
+                store,
+                &pq,
+                "acme",
+                &mapping_path,
+                SignalArg::Spans,
+                1,
+                10_000,
+                0,
+                Some(4),
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                8,
+                DEFAULT_TARGET_BYTES,
+                None,
+                NOW_NS,
+                &mut sink,
+            )
+            .await
+            .expect("an ignored lever is a warning, not a failure");
+            let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+            assert!(
+                emitted.contains(SPANS_ADMISSION_BYPASS_WARNING),
+                "the spans admission-bypass warning reaches the CLI's stream: {emitted}"
+            );
+            assert!(
+                emitted
+                    .contains("a spans load ignores --read-cursors 4 and --decode-queue-batches 8"),
+                "both ignored levers are named: {emitted}"
+            );
+        }
+
+        /// Two mapped attributes cannot share a key, in either list: the
+        /// stored `attrs` is one map and the merge would silently pick one.
+        #[test]
+        fn a_duplicate_attribute_key_is_refused() {
+            let text = format!(
+                "{MAPPING_TOML}\n[[spans.resource_attribute]]\nkey = \"http.method\"\ncolumn = \
+                 \"m2\"\ntype = \"str\"\n"
+            );
+            let err = parse_spans_mapping(&text).expect_err("one key, two columns");
+            let LoadError::Setup(message) = err else {
+                panic!("expected a setup error");
+            };
+            assert!(
+                message.contains("declares the attribute key \"http.method\" twice"),
+                "the refusal names the key: {message}"
+            );
+        }
+
+        /// A mapped attribute key over the OTLP key-length cap is refused
+        /// before any row is read, since the mapping alone decides it.
+        #[test]
+        fn an_oversized_attribute_key_is_refused_at_the_otlp_bound() {
+            let limit = SpanIngestLimits::default().max_attribute_key_len;
+            let key = "k".repeat(limit + 1);
+            let text = format!(
+                "{MAPPING_TOML}\n[[spans.attribute]]\nkey = \"{key}\"\ncolumn = \"x\"\ntype = \
+                 \"str\"\n"
+            );
+            let err = parse_spans_mapping(&text).expect_err("over the key-length cap");
+            let LoadError::Setup(message) = err else {
+                panic!("expected a setup error");
+            };
+            assert!(
+                message.contains(&format!(
+                    "is {} bytes, more than the attribute-key limit of {limit}",
+                    limit + 1
+                )),
+                "the refusal names both lengths: {message}"
+            );
+        }
+
+        /// The future-skew bound is kept and the past-lag bound is relaxed,
+        /// both anchored on the span's END exactly as `checked_span_interval`
+        /// anchors them.
+        #[test]
+        fn future_skew_is_kept_and_past_lag_is_relaxed() {
+            let limits = SpanIngestLimits::default();
+            let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+            let build = |start_ns: i64, end_ns: i64| {
+                let batch = batch(vec![
+                    ("trace_id", bin_col(vec![vec![1u8; 16]])),
+                    ("span_id", bin_col(vec![vec![2u8; 8]])),
+                    ("name", str_col(vec!["op"])),
+                    ("start_ns", i64_col(vec![start_ns])),
+                    ("end_ns", i64_col(vec![end_ns])),
+                    ("method", str_col(vec!["GET"])),
+                ]);
+                let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+                build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
+            };
+
+            let at_bound = NOW_NS + limits.max_future_skew_ns;
+            let span = build(at_bound, at_bound).expect("exactly at the bound is admitted");
+            assert_eq!(span.end_ts_ns, at_bound);
+            let over = build(at_bound + 1, at_bound + 1).expect_err("one ns past it is rejected");
+            assert!(
+                over.contains("more than the max future skew"),
+                "the rejection names the bound: {over}"
+            );
+
+            // Thirty days old: far past `max_ingest_lag_ns`, and admitted.
+            let old = NOW_NS - 30 * 86_400 * 1_000_000_000;
+            let span = build(old, old).expect("the past-lag bound is relaxed on this path");
+            assert_eq!(span.start_ts_ns, old);
+            assert!(
+                limits.max_ingest_lag_ns < NOW_NS - old,
+                "the fixture really is past the OTLP lag bound"
+            );
+        }
+
+        /// A span that ends before it starts is rejected rather than stored
+        /// with an interval no query window can mean anything against.
+        #[test]
+        fn an_end_before_its_start_is_rejected() {
+            let limits = SpanIngestLimits::default();
+            let mapping = parse_spans_mapping(MAPPING_TOML).expect("valid mapping");
+            let batch = batch(vec![
+                ("trace_id", bin_col(vec![vec![1u8; 16]])),
+                ("span_id", bin_col(vec![vec![2u8; 8]])),
+                ("name", str_col(vec!["op"])),
+                ("start_ns", i64_col(vec![NOW_NS])),
+                ("end_ns", i64_col(vec![NOW_NS - 1])),
+                ("method", str_col(vec!["GET"])),
+            ]);
+            let cols = SpansColumnIndex::resolve(&batch, &mapping).expect("columns resolve");
+            let err = build_span(&batch, &cols, &mapping, &limits, NOW_NS, 0)
+                .expect_err("end before start");
+            assert_eq!(
+                err,
+                format!(
+                    "span ends at {} ns, before it starts at {NOW_NS} ns",
+                    NOW_NS - 1
+                )
+            );
+        }
+    }
+
     /// Fix-round regressions for the metrics submit loop and the histogram
     /// grouper (PR #2096 review).
     mod metrics_pipeline_review {
@@ -12383,7 +13755,7 @@ type = "i64"
             match parse_mapping_document(DRAIN_MAPPING, SignalArg::Metrics).expect("valid mapping")
             {
                 MappingSection::Metrics(m) => m,
-                MappingSection::Logs(_) => panic!("a [metrics] section parses as metrics"),
+                _ => panic!("a [metrics] section parses as metrics"),
             }
         }
 
@@ -12550,7 +13922,7 @@ type = "i64"
         /// and row 2 carries a far-future timestamp the decoder rejects, so
         /// the rejection drains both writes first.
         ///
-        /// Non-vacuity: against the `drain_metrics_inflight(..).await?` call
+        /// Non-vacuity: against the `drain_sequential_inflight(..).await?` call
         /// in the `Rejected` arm, the load returns the `Flush` error and this
         /// fails on the `RowRejected` match.
         #[tokio::test]
@@ -12749,7 +14121,7 @@ type = "i64"
                 "a metrics failure never names --read-cursors: {emitted}"
             );
 
-            let hint = metrics_resume_hint(&load_err, 2).expect("a row rejection has figures");
+            let hint = sequential_resume_hint(&load_err, 2).expect("a row rejection has figures");
             assert_eq!(
                 hint,
                 format!(

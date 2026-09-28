@@ -190,6 +190,54 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ravel-cli load --signal spans` loads the spans signal** (ADR-1751
+  decisions 1 and 2, follow-up task 2, issues #1751 and #1712). The load
+  provisions or validates the tenant's spans signal, builds a
+  `SpanIngestRouter` from the same `build_ingest_config` the other loads use,
+  and writes every batch in `WriteMode::Strict`. ADR-0089's admission
+  decisions apply with the spans OTLP limits: the past event-time lag bound is
+  relaxed, the future-skew bound is kept (anchored on the span's end, as the
+  OTLP path anchors it), the span-name, status-message and attribute length
+  caps are kept, the loader per-record cap of 1024 stands in for OTLP's
+  `max_attributes_per_span`, and the server's admission controller is bypassed
+  by construction. The refusal `--signal spans` used to get is gone.
+
+  The `[spans]` mapping section names `trace_id_column`, `span_id_column`, an
+  optional `parent_span_id_column`, `name_column`, `start_ts_column` and
+  `end_ts_column` with their units, an optional `status_code_column` (OTLP's
+  0/1/2 integer enum) and `status_message_column`, and
+  `[[spans.resource_attribute]]` and `[[spans.attribute]]` columns coerced to
+  strings. One input row is one span.
+
+  **A span loaded from Parquet is stored as the same record the same span sent
+  over OTLP produces**, field for field. The loader reuses `ravel-otlp`'s own
+  normalization rather than reimplementing it: the attribute value coercion is
+  `convert_value`'s mapping (integer and boolean verbatim, float through the
+  shared `format_float`, bytes as lowercase hex), the resource-over-span merge
+  is `ravel_rspan::merge_attrs`, and the status column goes through
+  `ravel_otlp::traces_normalize::status_code_from_i32`, which is now public for
+  this caller with no change to its body. Three divergences are deliberate and
+  each has no OTLP counterpart: a null timestamp cell is refused (OTLP's absent
+  timestamp is a zero, and a zero takes the same fallbacks here), a null
+  attribute cell is an attribute the row does not carry, and a
+  `parent_span_id` cell of the wrong width is refused rather than dropped,
+  because a mapped column producing unusable ids is a mapping mistake the whole
+  file shares.
+
+  Span events and span links are not mappable in this version, and a mapping
+  naming them is refused by name rather than as a typo. The same refusal covers
+  the reserved `attrs` keys the OTLP path stores span kind, trace state, span
+  flags, events and links under. An id column that cannot carry an id of the
+  right width, and two mapped attributes sharing one key, are both refused
+  before the first row is read.
+
+  A spans load reads one sequential cursor and has no decode/encode queue, so
+  `--read-cursors` and `--decode-queue-batches` are warned about when set to a
+  value it ignores, and `0` for either is still rejected. It reports the same
+  operator surface a metrics load does: the durable-token banner, the resume
+  figures on a row boundary, and the resume hint naming only
+  `--pipeline-depth`.
+
 - **`ravel-cli load` takes `--signal {metrics,logs,spans}` and loads the
   metrics signal** (ADR-1751 decisions 1 and 2, follow-up task 1, issues
   #1751 and #1712). The flag defaults to `logs`, so an invocation written
@@ -200,9 +248,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the metrics OTLP limits (past event-time lag relaxed, future skew kept,
   metric-name and label length caps kept, the loader per-record cap of 1024
   in place of OTLP's `max_attributes_per_point`, the server's admission
-  controller bypassed by construction). `--signal spans` is refused with a
-  message naming ADR-1751 follow-up task 2 and never falls back to another
-  signal.
+  controller bypassed by construction). The spans half of the same flag
+  shipped in the entry below.
 
   The `--mapping` TOML gains per-signal sections: exactly one of `[logs]`,
   `[metrics]` and `[spans]` may be present and it must match `--signal`. A

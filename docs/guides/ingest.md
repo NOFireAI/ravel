@@ -629,12 +629,71 @@ historical backfill), `ravel-cli load` imports a Parquet file into the signal
 ravel-cli load --parquet events.parquet --tenant acme --mapping map.toml --shards 4
 ravel-cli load --signal metrics --parquet samples.parquet --tenant acme \
   --mapping metrics.toml --shards 4
+ravel-cli load --signal spans --parquet traces.parquet --tenant acme \
+  --mapping spans.toml --shards 4
 ```
 
 `--signal` defaults to `logs`, so an invocation written before the flag
 existed is unaffected. `--signal metrics` loads the metrics signal ([Loading
-metrics](#loading-metrics) below). `--signal spans` is refused by name until
-the spans loader lands, and never falls back to another signal.
+metrics](#loading-metrics) below).
+
+`--signal spans` provisions or validates the tenant's spans signal, builds a
+`SpanIngestRouter` from the same configuration, and writes every batch with
+strict acknowledgement. One input row is one span:
+
+```toml
+[spans]
+trace_id_column       = "trace_id"   # 16-byte binary or 32-character hex string
+span_id_column        = "span_id"    # 8-byte binary or 16-character hex string
+parent_span_id_column = "parent"     # optional; a null cell is a root span
+name_column           = "name"
+start_ts_column       = "start"
+start_ts_unit         = "nanos"      # seconds | millis | micros | nanos
+end_ts_column         = "end"
+end_ts_unit           = "nanos"
+status_code_column    = "status"     # optional; OTLP's 0 unset / 1 ok / 2 error
+status_message_column = "status_msg" # optional
+
+# Merged into the span's one attrs map, winning over a span attribute of the
+# same key, exactly as OTLP merges a resource attribute.
+[[spans.resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+[[spans.attribute]]
+key = "http.method"
+column = "method"
+type = "str"                         # str | i64 | f64 | bool | bytes
+```
+
+**A span loaded here is stored as the same record the same span sent over OTLP
+produces.** Attribute values are coerced to the strings RSPAN's
+`Map<Utf8, Utf8>` holds by OTLP's own rules -- an integer and a boolean
+verbatim, a float through the same Go-compatible formatter the `le` label
+uses, bytes as lowercase hex -- the resource-over-span merge is
+`ravel_rspan::merge_attrs`, and the status column goes through `ravel-otlp`'s
+own enum mapping, so a value outside `0..=2` normalizes to unset here as it
+does there. A null attribute cell is an attribute the row does not carry; an
+empty string is a value and is stored, unlike an empty metric label.
+
+Span events and span links are not mappable in this version, and a mapping
+that names them is refused by name rather than as a typo. The same refusal
+covers the reserved `attrs` keys the OTLP path stores span kind, trace state,
+span flags, events and links under (`_kind`,
+`_trace_state`, `_flags`, `_events_raw`, `_links_raw`): a mapped column there
+could only fabricate a field this version does not map. An id column that
+cannot carry an id of the right width is refused before the first row is read
+-- Ravel never pads or truncates an id -- and so are two mapped attributes
+sharing one key, since the stored map would keep only one of them.
+
+Like a metrics load, a spans load reads **one sequential cursor** and has no
+decode/encode queue, so `--read-cursors` and `--decode-queue-batches` change
+nothing and the loader warns when either was set to a value it ignores. A
+value of 0 for either is still rejected. Everything that shapes the objects
+(`--shards`, `--batch-rows`, `--target-bytes`, `--max-inflight-flushes`,
+`--max-flush-delay`, `--pipeline-depth`) applies unchanged, and spans bucket
+by load time exactly as logs and metrics do.
 
 The loader is an in-process caller of the same log ingest router OTLP uses --
 the same shard actors, flush cadence, and commit protocol, not a parallel write
@@ -1061,11 +1120,11 @@ ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
 **Logs only.** `--signal` has no default, and today it accepts only `logs`.
 `--signal metrics` and `--signal spans` are refused by name: bulk export for a
 signal is sequenced behind bulk import for that signal, and an exported file
-that no command can load back is not an export. `load --signal metrics` has
-landed ([Loading metrics](#loading-metrics)); metrics export is the next piece
-of the sequence, and spans have neither half yet. The spans refusal names
-the missing import. The metrics refusal still names bulk import for metrics as
-the missing piece, which is out of date until metrics export lands.
+that no command can load back is not an export. Both imports have now landed
+(`load --signal metrics` and `load --signal spans` above); their exports are
+the next piece of the sequence. Both refusal messages still name bulk import
+for their signal as the missing piece, which is out of date until those
+exports land.
 
 ### What the window means
 
