@@ -113,6 +113,7 @@ pub const DEFAULT_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Delegates to `ravel-ingest`'s [`SystemClock`], the one blessed wall clock in
 /// this process, so no maintenance code path ever reads `SystemTime::now()`
 /// directly.
+#[derive(Clone, Copy)]
 pub(crate) struct WallClock;
 
 impl Clock for WallClock {
@@ -1623,9 +1624,16 @@ fn orphans_present_total(report: &ravel_maintain::SweepReport) -> usize {
 /// tenant ticks with [`MaintenanceSafetyMetrics::begin_scan_cycle`] and
 /// [`MaintenanceSafetyMetrics::publish_scan_cycle`], as
 /// [`run_discovery_cycle`] does.
+///
+/// The clock is taken as a cloneable concrete type because the advisory-claim
+/// participant installed below keeps its own `Arc<dyn Clock>`: a clone of
+/// `clock` gives it the same time source the tick reads ([`FixedClock`]
+/// clones share one instant).
+///
+/// [`FixedClock`]: ravel_maintain::FixedClock
 #[allow(clippy::too_many_arguments)]
-pub async fn run_tick_with_clock(
-    clock: &dyn Clock,
+pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
+    clock: &C,
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     compactor: &CompactorConfig,
@@ -1643,16 +1651,15 @@ pub async fn run_tick_with_clock(
     // units this process looks at. Claims still only cost anything on a bucket
     // at or above `claim_min_input_bytes` with `coordination` on.
     //
-    // The participant carries its own `Arc<dyn Clock>` because this function
-    // takes a borrowed one it cannot share, and it is installed only when the
-    // caller left the slot empty: a caller driving an injected clock installs
-    // its own participant on that same clock, so the two never disagree.
+    // It is installed only when the caller left the slot empty, and on a clone
+    // of this tick's own clock, so the claim decisions read the same time as
+    // the rest of the tick.
     let coordinated;
     let compactor = if compactor.claim_participant.is_none() {
         coordinated = CompactorConfig {
             claim_participant: Some(ClaimParticipant::new(
                 worker.process_id(),
-                Arc::new(WallClock),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
             )),
             ..compactor.clone()
         };
@@ -3153,6 +3160,89 @@ mod tests {
             stolen.b_ledger.coordinate.requests, 5,
             "B's: the rejected CreateIfAbsent, the GET and HEAD that observed \
              the expired claim, the steal, and the completion"
+        );
+    }
+
+    /// The claim participant a tick installs for itself reads the tick's own
+    /// injected clock, so lease expiry is judged against that clock and not
+    /// against wall time.
+    ///
+    /// Another process holds the bucket's claim, written at a 2023 instant by
+    /// the store's clock. A tick whose fixed clock sits one second after that
+    /// write finds the lease live and skips the bucket; a second tick whose
+    /// clock is past the lease steals the claim and compacts. Wall time is
+    /// years past the lease either way, so a participant on the wall clock
+    /// steals on the first tick.
+    ///
+    /// Shown failing against the tick that installed its participant on
+    /// `WallClock`: "a lease live by the injected clock holds the bucket"
+    /// reads left 0, right 1.
+    #[tokio::test]
+    async fn a_ticks_own_claim_participant_reads_the_injected_clock() {
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
+        let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let store = MemoryStore::new();
+        store.set_clock_ms((written_ns / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        for seq in 1..=2 {
+            publish_compactable_input(&store, &tenant_id, 0, seq).await;
+        }
+
+        let clock = FixedClock::new(written_ns);
+        let holder = ravel_maintain::claim_guard::ClaimGuard::new(
+            &Bucket::new(tenant, Signal::Metrics, 0, 0),
+            &ClaimParticipant::new(
+                Uuid::from_u128(0xC1A1),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            ),
+            ravel_fleet::claim::ClaimConfig {
+                lease_duration: LEASE,
+                ..ravel_fleet::claim::ClaimConfig::default()
+            },
+            None,
+        );
+        assert!(matches!(
+            holder.acquire(&store).await.expect("holder acquires"),
+            ravel_maintain::claim_guard::Acquire::Acquired
+        ));
+
+        let worker = WorkerSet::with_defaults(written_ns).with_process_id(PINNED_WORKER_ID);
+        let live = worker.solo_live_set();
+        // No participant: the tick installs its own.
+        let config = CompactorConfig {
+            coordination: Coordination::On,
+            claim_min_input_bytes: 1,
+            claim_lease_duration: LEASE,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        clock.set(written_ns + 1_000_000_000);
+        let live_tick = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(
+            live_tick.claim_skipped, 1,
+            "a lease live by the injected clock holds the bucket"
+        );
+        assert_eq!(live_tick.compacted, 0);
+
+        clock.set(written_ns + LEASE.as_nanos() as i64 + 1_000_000_000);
+        let expired_tick = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(
+            (expired_tick.compacted, expired_tick.claim_skipped),
+            (1, 0),
+            "past the lease by the injected clock, the tick steals and compacts"
         );
     }
 
