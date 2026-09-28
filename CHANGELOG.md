@@ -8,6 +8,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ravel-cli maintain migrate` names every bucket whose refusal no re-run
+  clears** (ADR-1331, issue #1331). A bucket that selective erasure has
+  touched keeps a live rewrite record whose surviving parts carry the
+  erasure-time format version. The re-audit counted those parts into the
+  compaction-part figure, which was right (they are live objects the floor
+  would otherwise be raised over) but left the report saying "stragglers"
+  forever with `buckets_blocked: 0`, and nothing migrates them: a migration
+  output over inputs a rewrite already covers would resurrect the records that
+  rewrite dropped. The refused raise now reports three counts
+  (`l0_commit_records`, `l1_compaction_parts`, `rewrite_record_parts`) and
+  prints one `blocked_bucket` line per affected bucket with its shard, hour
+  and reason, `rewrite_parts below_target=<n>` or `loser_only_inputs`,
+  followed by how each clears: retention under the format-version hold, or a
+  later erasure request superseding the record at the current output version.
+  `buckets_blocked` is the number of those lines and now covers both permanent
+  cases. `count_below_target` returns a `BelowTargetReport` instead of an
+  `(l0, l1)` pair, `Verification::Stragglers` carries the three counts and the
+  list, and `FamilyMigrateReport::buckets_blocked` is a method over
+  `blocked_buckets` rather than a separate counter.
+
 - **This release reads provisioning record format 3 and still writes 2, and
   `ravel-cli maintain audit-versions` now classifies every recorded format
   floor** (ADR-1746 Release A, issue #1746). `FormatFloor` gains three basis
