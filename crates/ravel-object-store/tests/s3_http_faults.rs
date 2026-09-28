@@ -60,7 +60,7 @@ use ravel_object_store::s3::{
     MULTIPART_THRESHOLD, S3Config, S3HttpConfig, S3Store, UploadIntegrity,
 };
 use ravel_object_store::{
-    GetRange, InstrumentedStore, ObjectStoreBackend, PutOptions, StoreError, StoreMetrics,
+    GetRange, InstrumentedStore, ObjectStoreBackend, Pin, PutOptions, StoreError, StoreMetrics,
 };
 
 /// Bucket name the fake serves. Path-style requests put it in the first path
@@ -72,6 +72,15 @@ const BUCKET: &str = "ravel-fault-bucket";
 /// does not require it, but a real endpoint always sends one and parsing it is
 /// part of the path under test.
 const LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
+
+/// Fixed `x-amz-version-id` for every GET and HEAD response, the way a
+/// versioning-enabled bucket reports one. Distinct from any ETag this fake
+/// issues (an ETag here is a quoted crc32c), so [`Pin::from_store`] keeps it as
+/// a selector rather than filtering it out as the degenerate "version equals
+/// ETag" case an unversioned bucket returns. It is what lets a test tell "the
+/// read sent a versionId" from "it sent none": before the fake reported one,
+/// every pin's version was `None` and both cases looked identical on the wire.
+const VERSION_ID: &str = "fake-version-id-0001";
 
 /// Body cap for a request the fake reads. Above any part these tests upload
 /// (8 MiB) with room to spare; a request over it is truncated to empty rather
@@ -156,6 +165,14 @@ enum Fault {
     /// ignores `x-amz-checksum-mode`. ADR-1696 decision 3 serves it and counts
     /// it, so this is the fault that moves `ravel_store_get_unverified_total`.
     NoGetChecksum,
+    /// `get` only: serve this request normally over the object as it stands,
+    /// then overwrite the object in place (one byte flipped, same length, so a
+    /// new ETag) before the response returns. The next request for the key sees
+    /// the new object, so a continuation `If-Match` pinned to the first
+    /// response's ETag fails 412. Models the key being overwritten mid-read, the
+    /// case `S3Store::get_whole_object` must surface as `Transient` for an
+    /// unpinned read and as `PreconditionFailed` for a caller-pinned one.
+    ReseedDuringRead,
 }
 
 /// How a GET is served once faults have been resolved: the two ADR-1696 read
@@ -714,6 +731,32 @@ async fn handle(
             data,
             GetBehavior::NoChecksum,
         ),
+        Some(Fault::ReseedDuringRead) => {
+            // Serve over the object as it stands now, so the first request of a
+            // split read still gets the old ETag and its truncated body.
+            let response = serve(
+                &state,
+                op,
+                &key,
+                &query,
+                &headers,
+                data,
+                GetBehavior::Normal,
+            );
+            // Then overwrite the key so every later request sees a new ETag. The
+            // length is unchanged, so the continuation ranges the client already
+            // computed stay valid offsets; only the `If-Match` differs, which is
+            // what makes this a mid-read overwrite rather than a truncation.
+            let mut objects = state.objects.lock();
+            if let Some(existing) = objects.get(&key).cloned() {
+                let mut bytes = existing.to_vec();
+                if let Some(first) = bytes.first_mut() {
+                    *first ^= 0x01;
+                }
+                objects.insert(key.clone(), Bytes::from(bytes));
+            }
+            response
+        }
         Some(Fault::Pass) | None => serve(
             &state,
             op,
@@ -779,6 +822,10 @@ fn serve(
             let mut response_headers = vec![
                 (header::ETAG, etag),
                 (header::LAST_MODIFIED, LAST_MODIFIED.to_string()),
+                (
+                    header::HeaderName::from_static("x-amz-version-id"),
+                    VERSION_ID.to_string(),
+                ),
             ];
             // The stored whole-object checksum, returned the way MinIO (and the
             // MinIO-derived RustFS) returns it: only when the request asked with
@@ -830,6 +877,10 @@ fn serve(
                     (header::ETAG, etag_of(&object)),
                     (header::LAST_MODIFIED, LAST_MODIFIED.to_string()),
                     (header::CONTENT_LENGTH, object.len().to_string()),
+                    (
+                        header::HeaderName::from_static("x-amz-version-id"),
+                        VERSION_ID.to_string(),
+                    ),
                 ],
                 Body::empty(),
             )
@@ -1941,7 +1992,13 @@ async fn whole_object_read_is_split_into_requests_the_timeout_can_carry() {
     );
     // Unpinned: the continuation requests pin by ETag alone. A `versionId` would
     // need `s3:GetObjectVersion` on Ravel's own versioned bucket, which the
-    // shipped IAM templates do not grant.
+    // shipped IAM templates do not grant, and it would turn a mid-read overwrite
+    // into a silent old-version read. This is not vacuous: the fake reports a
+    // fixed `x-amz-version-id` on every response, so `first.version` is `Some`;
+    // the continuation drops it deliberately (`Pin::etag`, not
+    // `Pin::from_store`). The mutation `None => Pin::from_store(first.etag.clone(),
+    // first.version.clone())` in `get_whole_object`'s continuation would carry
+    // that version on `gets[1..]` and fail this assertion.
     for seen in &gets {
         assert_eq!(
             seen.version_id, None,
@@ -1971,10 +2028,17 @@ async fn whole_object_read_is_split_into_requests_the_timeout_can_carry() {
 /// `If-Match` itself, so a dropped or wrong pin is a 412 on the wire, and the
 /// request log pins which requests carried it.
 ///
-/// Mutation that fails it: passing `None` instead of `pin` for the first
+/// The pin here carries a version too: the fake reports a fixed
+/// `x-amz-version-id`, so `pin_of`'s HEAD yields a pin whose `version` is `Some`
+/// (distinct from the ETag, so `Pin::from_store` keeps it). Every request must
+/// carry that version as `versionId` as well as the ETag as `If-Match`, since a
+/// caller-supplied pin is passed through verbatim on both the first request and
+/// the continuation (the `Some(pin)` branch clones it for every request).
+///
+/// Mutations that fail it: passing `None` instead of `pin` for the first
 /// request in `S3Store::get_whole_object` (`self.get_one(key, None, None,
-/// Some(self.max_get_chunk))`) leaves `gets[0].if_match` at `None`, which the
-/// first assertion below rejects.
+/// Some(self.max_get_chunk))`) leaves `gets[0].if_match` and `gets[0].version_id`
+/// at `None`, which the first-request assertions below reject.
 #[tokio::test]
 async fn a_caller_pinned_whole_object_read_pins_every_request_including_the_first() {
     let fake = FakeS3::start().await;
@@ -2027,15 +2091,150 @@ async fn a_caller_pinned_whole_object_read_pins_every_request_including_the_firs
              saw {seen:?}"
         );
     }
-    // The pin carries no version (the fake returns no `x-amz-version-id`), so
-    // nothing selects one; `Pin::from_store` drops a version equal to the ETag.
-    assert_eq!(pin.version, None);
+    // The pin carries the version the fake reported to `pin_of`'s HEAD, distinct
+    // from the ETag, so it is a live selector rather than the degenerate
+    // ETag-equals-version case an unversioned bucket returns.
+    assert_eq!(
+        pin.version.as_deref(),
+        Some(VERSION_ID),
+        "the pin must carry the version the endpoint reported"
+    );
     for seen in &gets {
         assert_eq!(
-            seen.version_id, None,
-            "a pin with no version selects none, saw {seen:?}"
+            seen.version_id.as_deref(),
+            Some(VERSION_ID),
+            "every request of a caller-pinned read selects the pin's version, \
+             saw {seen:?}"
         );
     }
+    // `verify_full_read` counts a read as unverified once, for the logical read,
+    // when no single response carried the whole object: a split read assembles
+    // the object from a truncated first body and ranged continuations, none of
+    // which carries a stored checksum over the whole object (s3.rs, `verify_full_read`
+    // and the `None` branch in `get_whole_object`). So a three-request pinned read
+    // is exactly one unverified read, no more per chunk.
+    assert_eq!(
+        store.get_unverified(),
+        1,
+        "a pinned whole-object read split across responses is one unverified read"
+    );
+}
+
+/// A key overwritten between the first request of a split whole-object read and
+/// its continuation fails the read rather than splicing two versions into one
+/// buffer. For an *unpinned* read this is retryable: a fresh read would see one
+/// consistent version, so `get_whole_object` remaps the continuation's 412 to
+/// `Transient` (s3.rs, the `PreconditionFailed if pin.is_none()` arm).
+///
+/// The `ReseedDuringRead` fault serves the first (unranged) request over the
+/// seeded object, then overwrites the key with a new ETag, so the continuation's
+/// `If-Match` on the first ETag is a 412 on the wire.
+///
+/// Mutation that fails it: dropping the `pin.is_none()` arm so the 412 surfaces
+/// as `PreconditionFailed` makes the `Transient` assertion fail.
+#[tokio::test]
+async fn an_unpinned_whole_object_read_overwritten_mid_read_is_transient() {
+    let fake = FakeS3::start().await;
+    let http = small_chunk_http();
+    let bound = http.max_request_body_bytes();
+    let store = fake.store_with_http(http);
+
+    let size = 2 * bound + 77;
+    let object = patterned(size);
+    fake.seed("fault/overwritten-unpinned", &object);
+
+    // Only the first GET reseeds; the continuations then find the new ETag.
+    fake.script(Op::Get, [Fault::ReseedDuringRead]);
+
+    let err = store
+        .get("fault/overwritten-unpinned", GetRange::Full)
+        .await
+        .expect_err("a key overwritten mid-read must fail the read");
+    assert!(
+        matches!(err, StoreError::Transient(_)),
+        "an unpinned mid-read overwrite is retryable, got {err:?}"
+    );
+    // First request served, at least one continuation refused: more than one GET.
+    assert!(
+        fake.count(Op::Get) > 1,
+        "the failure must come from a continuation, not the first request, saw {}",
+        fake.count(Op::Get)
+    );
+}
+
+/// The same overwrite under a *caller-supplied* pin stays `PreconditionFailed`.
+/// The caller pinned one identity, so the refusal is the answer and a fresh read
+/// would fail the same way: `get_whole_object`'s `pin.is_none()` guard keeps the
+/// continuation's 412 as `PreconditionFailed` rather than remapping it. This is
+/// the rule "a refused precondition on a caller-pinned read stays
+/// PreconditionFailed, never Transient", tested on `S3Store`.
+///
+/// The pin is taken before the overwrite, so it matches the first request (which
+/// serves) and not the reseeded object the continuation meets.
+///
+/// Mutation that fails it: widening the remap arm to `PreconditionFailed` with no
+/// `pin.is_none()` guard makes this read `Transient` and fails the assertion.
+#[tokio::test]
+async fn a_caller_pinned_whole_object_read_overwritten_mid_read_stays_precondition_failed() {
+    let fake = FakeS3::start().await;
+    let http = small_chunk_http();
+    let bound = http.max_request_body_bytes();
+    let store = fake.store_with_http(http);
+
+    let size = 2 * bound + 77;
+    let object = patterned(size);
+    fake.seed("fault/overwritten-pinned", &object);
+
+    let (_, pin) = store
+        .pin_of("fault/overwritten-pinned")
+        .await
+        .expect("the pin of a seeded object");
+
+    fake.script(Op::Get, [Fault::ReseedDuringRead]);
+
+    let err = store
+        .get_pinned("fault/overwritten-pinned", GetRange::Full, &pin)
+        .await
+        .expect_err("a caller-pinned read of an overwritten key must fail");
+    assert!(
+        matches!(err, StoreError::PreconditionFailed),
+        "a caller-pinned mid-read overwrite stays PreconditionFailed, got {err:?}"
+    );
+}
+
+/// A pinned whole-object read whose pin's ETag never matched fails on the *first*
+/// request, before any body is paid for: the endpoint evaluates `If-Match` and
+/// returns 412, which maps to `PreconditionFailed`. Exactly one GET reaches the
+/// endpoint, since the read never gets past the first request to issue
+/// continuations.
+#[tokio::test]
+async fn a_wrong_etag_pinned_whole_object_read_fails_on_the_first_request() {
+    let fake = FakeS3::start().await;
+    let store = fake.store_with_http(small_chunk_http());
+
+    let object = patterned(4096);
+    fake.seed("fault/wrong-etag", &object);
+
+    let wrong = Pin::etag("\"deadbeef\"");
+    let err = store
+        .get_pinned("fault/wrong-etag", GetRange::Full, &wrong)
+        .await
+        .expect_err("a pin whose ETag does not match must be refused");
+    assert!(
+        matches!(err, StoreError::PreconditionFailed),
+        "a wrong-ETag pin is a failed precondition, got {err:?}"
+    );
+    let gets = fake.requests(Op::Get);
+    assert_eq!(
+        gets.len(),
+        1,
+        "the read must fail on the first request, not issue continuations, saw {gets:?}"
+    );
+    assert_eq!(
+        gets[0].if_match.as_deref(),
+        Some("\"deadbeef\""),
+        "the first request carries the caller's pin, saw {gets:?}"
+    );
 }
 
 /// The cost of the fix is bounded to objects that need it: an object at or

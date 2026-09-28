@@ -287,8 +287,11 @@ caller's pin rides on all of them, the unranged first included: a read whose
 first request dropped the pin would pay for a body from whatever version the
 key holds now and only then compare. The continuation requests of an
 *unpinned* whole-object read carry the first response's ETag as `If-Match`
-and nothing else, never a version id; the reason is under "One version, or
-an error" in `S3Store::get_whole_object`.
+and nothing else, never a version id: sending `versionId` would need
+`s3:GetObjectVersion` on Ravel's own versioned bucket, a grant the shipped IAM
+templates do not carry, and it would turn a mid-read overwrite into a silent
+read of the old version instead of the failed `If-Match` this section
+documents.
 
 Outcomes, in the order they are decided:
 

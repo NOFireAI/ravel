@@ -1420,6 +1420,50 @@ async fn full_object_get_of_a_corrupted_stored_object_is_refused() {
     );
 }
 
+/// The read-side check of ADR-1696 decision 5 is not the `get` path's alone: a
+/// pinned full read verifies the stored checksum too, since a pin decides *which*
+/// bytes are served, never whether they are checked. So a full-object
+/// `get_pinned` with a *matching* pin, and `get_with_pin`, must both refuse a
+/// stored object whose bytes have rotted at rest, exactly as `get` does.
+///
+/// The pin is taken before the corruption: `corrupt_stored_byte` flips one bit of
+/// the stored bytes and leaves the ETag and version untouched, so the pin still
+/// matches (its version selector and `If-Match` both pass) and the read reaches
+/// `verify_full_read`, which is what refuses it.
+///
+/// Removing the `Self::verify_full_read(key, entry, range)?` call from
+/// `MemoryStore::get_pinned` (or from `get_with_pin`) makes that read return `Ok`
+/// with bit-flipped bytes, failing the matching `expect_err` below.
+#[tokio::test]
+async fn full_object_pinned_get_of_a_corrupted_stored_object_is_refused() {
+    let store = MemoryStore::new();
+    let key = "corrupt/pinned-at-rest";
+    let payload = Bytes::from_static(b"a pinned record whose bytes rot in place");
+    store
+        .put(key, payload.clone(), PutOptions::create_if_absent())
+        .await
+        .expect("seed the object");
+    let (_, pin) = store.pin_of(key).await.expect("pin of the seeded object");
+    store
+        .corrupt_stored_byte(key, 3, 6)
+        .expect("flip one bit of the stored object");
+
+    // The pin still matches (same ETag and version); the read is refused because
+    // the stored bytes no longer match the checksum recorded at write time.
+    let err = store
+        .get_pinned(key, GetRange::Full, &pin)
+        .await
+        .expect_err("a pinned full read of corrupted stored bytes must be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+
+    // `get_with_pin` runs the same verification.
+    let err = store
+        .get_with_pin(key, GetRange::Full)
+        .await
+        .expect_err("a get_with_pin full read of corrupted stored bytes must be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+}
+
 /// The other half of ADR-1696 decision 4, stated as its own case so the two
 /// cannot drift: a *ranged* read of the same corrupted object is served. The
 /// stored checksum covers the whole object and a slice cannot be compared
