@@ -3,8 +3,9 @@
 //!
 //! A query-role process that participates in fan-out registers itself the same
 //! way a maintain worker does (ADR-0065 decision 1, [`crate::worker_set`]): it
-//! writes, every heartbeat interval `H`, a [`QueryWorkerRecord`] to a key it
-//! alone ever writes:
+//! writes, every heartbeat interval `H`, a [`QueryWorkerRecord`] to its own
+//! key (by convention; the query role's grant covers the whole prefix, see
+//! [`QueryWorkers::live_set`]):
 //!
 //! ```text
 //! sys/query/workers/<process_id>
@@ -88,7 +89,7 @@ use crate::worker_set::{
 /// role's `sys/maintain/workers/`. Fixed verbatim; #864 and #865 depend on it.
 pub const QUERY_WORKERS_PREFIX: &str = "sys/query/workers/";
 
-/// The heartbeat key one query-worker process owns and alone ever writes.
+/// The heartbeat key one query-worker process writes its own record to.
 pub fn query_worker_key(process_id: &str) -> String {
     format!("{QUERY_WORKERS_PREFIX}{process_id}")
 }
@@ -98,7 +99,8 @@ pub fn query_worker_key(process_id: &str) -> String {
 /// the record body (mirrors [`crate::worker_set`]'s `process_id_of`), so a
 /// record whose body disagrees with its key cannot claim another worker's
 /// identity. It does not stop a new identity: the shipped query-role IAM grant
-/// allows `PutObject` across the whole `sys/query/workers/` prefix and records
+/// (`deploy/iam/query.json`) allows `PutObject` across the whole
+/// `sys/query/workers/` prefix and records
 /// carry no MAC, so any principal holding that role can write a
 /// self-consistent record at a fresh UUID key and join the live set.
 /// `list_all` yields the prefix itself and any unexpected nested key under it;
@@ -303,9 +305,10 @@ impl QueryWorkers {
     /// so a draining query worker stops advertising itself to sibling
     /// coordinators immediately, rather than lingering in their live set until
     /// its stamp ages past the `3 * H` staleness window. Deletes only the one
-    /// key this process owns (`sys/query/workers/<process_id>`); a single writer
-    /// alone controls that key, so this never races another process. A missing
-    /// key is not an error (`delete` is idempotent).
+    /// key this process writes (`sys/query/workers/<process_id>`). By
+    /// convention no other process writes that key, so this does not race a
+    /// sibling's heartbeat; the query role's grant does not enforce that. A
+    /// missing key is not an error (`delete` is idempotent).
     pub async fn delete_heartbeat(&self, store: &dyn ObjectStoreBackend) -> Result<(), StoreError> {
         store
             .delete(&query_worker_key(&self.process_id.to_string()))
