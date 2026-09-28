@@ -563,6 +563,360 @@ impl NoncurrentVersionSource for dyn ObjectStoreBackend {
     }
 }
 
+// --- Bucket protection control plane (ADR-1727) ---
+//
+// ADR-1727 turns the disaster-recovery checklist (docs/object-store-contract.md,
+// "Required bucket configuration") into a read-only control plane. Unlike the
+// three probes above, which report `Unknown` on every real backend because
+// `object_store` 0.14 exposes no bucket-configuration API, `S3Store` answers
+// affirmatively: it signs its own read-only SigV4 GETs over the reqwest pin it
+// already holds (see `s3/bucket_config.rs`). This is not the "second, direct-SDK
+// side channel" ADR-0042 rejected -- that rejection is about a second *write*
+// path; every request here is a GET (ADR-1727 decision 1). `MemoryStore` and
+// every other backend, and any store reached only through the
+// [`ObjectStoreBackend`] contract, report every condition `Unknown`.
+
+/// Stable identifier for each bucket-protection condition ADR-1727 decision 3
+/// names. An operator greps for these, and the CLI (`store verify-protection`,
+/// ADR-1727 decision 4) and the server gate (decision 5) select by them, so the
+/// spelling is a frozen contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProtectionConditionId {
+    /// Object versioning is `Enabled` (`?versioning`).
+    Versioning,
+    /// An enabled lifecycle rule expires noncurrent versions (`?lifecycle`).
+    /// When an expected `E_v` is supplied, its `NoncurrentDays` must equal it.
+    NoncurrentExpiration,
+    /// An enabled lifecycle rule cleans up expired object delete markers
+    /// (`?lifecycle`).
+    ExpiredDeleteMarker,
+    /// An enabled `AbortIncompleteMultipartUpload` rule of 7 days or less
+    /// (`?lifecycle`).
+    AbortMultipart,
+    /// The sanctioned rules above cover every `t/` prefix (`?lifecycle`).
+    RuleScope,
+    /// No other expiration or transition rule targets `t/` or `sys/`
+    /// (`?lifecycle`).
+    NoForeignRule,
+    /// `DeleteMarkerReplication` is `Enabled` (`?replication`).
+    DeleteMarkerReplication,
+    /// Object Lock is enabled on the bucket (`?object-lock`).
+    ObjectLock,
+    /// Sampled current and noncurrent objects under the protected prefixes carry
+    /// compliance-mode retention (`?retention`).
+    ObjectRetention,
+}
+
+impl ProtectionConditionId {
+    /// Every condition, in the order ADR-1727 decision 3's table lists them. A
+    /// [`BucketProtectionReport`] carries exactly one entry per id in this order.
+    pub const ALL: [ProtectionConditionId; 9] = [
+        ProtectionConditionId::Versioning,
+        ProtectionConditionId::NoncurrentExpiration,
+        ProtectionConditionId::ExpiredDeleteMarker,
+        ProtectionConditionId::AbortMultipart,
+        ProtectionConditionId::RuleScope,
+        ProtectionConditionId::NoForeignRule,
+        ProtectionConditionId::DeleteMarkerReplication,
+        ProtectionConditionId::ObjectLock,
+        ProtectionConditionId::ObjectRetention,
+    ];
+
+    /// The stable, greppable identifier (ADR-1727 decision 3).
+    pub fn id(&self) -> &'static str {
+        match self {
+            ProtectionConditionId::Versioning => "versioning",
+            ProtectionConditionId::NoncurrentExpiration => "noncurrent-expiration",
+            ProtectionConditionId::ExpiredDeleteMarker => "expired-delete-marker",
+            ProtectionConditionId::AbortMultipart => "abort-multipart",
+            ProtectionConditionId::RuleScope => "rule-scope",
+            ProtectionConditionId::NoForeignRule => "no-foreign-rule",
+            ProtectionConditionId::DeleteMarkerReplication => "delete-marker-replication",
+            ProtectionConditionId::ObjectLock => "object-lock",
+            ProtectionConditionId::ObjectRetention => "object-retention",
+        }
+    }
+}
+
+/// The three-valued verdict for one condition (ADR-1727 decision 3). `Unknown`
+/// is never `Fail`: it covers a backend with no API for the call, an access
+/// denial, and a response the reader cannot parse. A `Pass` carries no detail; a
+/// `Fail` or `Unknown` carries a human-readable one so an operator sees why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionState {
+    /// The condition is affirmatively satisfied.
+    Pass,
+    /// The condition is affirmatively violated. The string names how.
+    Fail(String),
+    /// The condition could not be determined: no API, access denied, or an
+    /// unparseable response. Never treated as a violation.
+    Unknown(String),
+}
+
+impl ConditionState {
+    /// Stable, greppable verdict word for CLI output.
+    pub fn verdict(&self) -> &'static str {
+        match self {
+            ConditionState::Pass => "pass",
+            ConditionState::Fail(_) => "fail",
+            ConditionState::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The detail string (empty for [`ConditionState::Pass`]).
+    pub fn detail(&self) -> &str {
+        match self {
+            ConditionState::Pass => "",
+            ConditionState::Fail(detail) | ConditionState::Unknown(detail) => detail,
+        }
+    }
+
+    /// True only for [`ConditionState::Pass`].
+    pub fn is_pass(&self) -> bool {
+        matches!(self, ConditionState::Pass)
+    }
+
+    /// True only for [`ConditionState::Fail`].
+    pub fn is_fail(&self) -> bool {
+        matches!(self, ConditionState::Fail(_))
+    }
+
+    /// True only for [`ConditionState::Unknown`].
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, ConditionState::Unknown(_))
+    }
+}
+
+/// One condition's verdict inside a [`BucketProtectionReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionReport {
+    pub id: ProtectionConditionId,
+    pub state: ConditionState,
+}
+
+/// The full report: exactly one [`ConditionReport`] per
+/// [`ProtectionConditionId`], in [`ProtectionConditionId::ALL`] order (ADR-1727
+/// decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketProtectionReport {
+    pub conditions: Vec<ConditionReport>,
+}
+
+impl BucketProtectionReport {
+    /// A report whose every condition is [`ConditionState::Unknown`] with the
+    /// same `detail`. The honest default for `MemoryStore`, every non-S3
+    /// backend, and any store reached only through the [`ObjectStoreBackend`]
+    /// contract (ADR-1727 decision 2).
+    pub fn all_unknown(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        BucketProtectionReport {
+            conditions: ProtectionConditionId::ALL
+                .iter()
+                .map(|id| ConditionReport {
+                    id: *id,
+                    state: ConditionState::Unknown(detail.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Build a report from an id -> state map, filling any id absent from
+    /// `states` with `Unknown("not evaluated")`, and always emitting exactly one
+    /// entry per id in [`ProtectionConditionId::ALL`] order.
+    pub fn from_states(
+        states: impl IntoIterator<Item = (ProtectionConditionId, ConditionState)>,
+    ) -> Self {
+        let mut map: std::collections::HashMap<ProtectionConditionId, ConditionState> =
+            states.into_iter().collect();
+        BucketProtectionReport {
+            conditions: ProtectionConditionId::ALL
+                .iter()
+                .map(|id| ConditionReport {
+                    id: *id,
+                    state: map.remove(id).unwrap_or_else(|| {
+                        ConditionState::Unknown("condition not evaluated".to_string())
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    /// The state of one condition, or `None` if (impossibly, for a
+    /// well-formed report) it is absent.
+    pub fn state(&self, id: ProtectionConditionId) -> Option<&ConditionState> {
+        self.conditions
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| &entry.state)
+    }
+
+    /// Count of conditions observed [`ConditionState::Fail`] (ADR-1727 decision
+    /// 5: the `ravel_bucket_protection_conditions_failed` gauge).
+    pub fn failed_count(&self) -> usize {
+        self.conditions
+            .iter()
+            .filter(|entry| entry.state.is_fail())
+            .count()
+    }
+
+    /// Count of conditions observed [`ConditionState::Unknown`] (ADR-1727
+    /// decision 5: the `ravel_bucket_protection_conditions_unknown` gauge).
+    pub fn unknown_count(&self) -> usize {
+        self.conditions
+            .iter()
+            .filter(|entry| entry.state.is_unknown())
+            .count()
+    }
+}
+
+/// Inputs that change what some conditions mean (ADR-1727 decisions 4 and 5).
+/// A deployment's choice, not a constant: the server has no expected `E_v` and
+/// does not sample retention, while `store verify-protection` supplies both.
+#[derive(Debug, Clone, Default)]
+pub struct BucketProtectionParams {
+    /// Expected noncurrent-version expiration days (`E_v`). `Some` requires the
+    /// enabled rule's `NoncurrentDays` to equal it (the CLI's
+    /// `--expected-noncurrent-days`). `None` (the server, decision 5) needs an
+    /// enabled noncurrent-expiration rule covering `t/` and fixes no value, but
+    /// covering rules that disagree on `NoncurrentDays` still fail, as does a
+    /// `NewerNoncurrentVersions` on a covering rule; the value the covering
+    /// rules agree on is the reference any other rule's `NoncurrentDays` is
+    /// measured against. With no reference to compare against, a narrower rule
+    /// over `t/` carrying one makes both `noncurrent-expiration` and
+    /// `no-foreign-rule` `Unknown`; a `sys/` rule carrying one makes only
+    /// `no-foreign-rule` `Unknown`.
+    pub expected_noncurrent_days: Option<u32>,
+    /// Whether to sample objects for the `object-retention` condition. Off for
+    /// the server (retention is CLI-only, decision 5); the CLI turns it on with
+    /// `--expect-object-retention`. When off, `object-retention` reports
+    /// `Unknown`.
+    pub sample_object_retention: bool,
+    /// Protected-prefix families to sample one current and one noncurrent object
+    /// from for the `object-retention` condition. Empty leaves the condition
+    /// `Unknown` even when `sample_object_retention` is set.
+    pub protected_retention_prefixes: Vec<String>,
+}
+
+/// A read-only view of a bucket's protection configuration (ADR-1727 decision
+/// 2), kept **separate from [`ObjectStoreBackend`]** for the same reason
+/// [`ObjectLockProbeSource`] and [`BucketConfigProbeSource`] are: a real
+/// bucket-configuration capability belongs to its own trait-extending ADR
+/// (ADR-0042 decision 3), and `object_store` 0.14 has no query for it.
+///
+/// `S3Store` implements this affirmatively over its own SigV4 GETs. Every store
+/// reached only through the [`ObjectStoreBackend`] contract, and `MemoryStore`
+/// and every non-S3 backend, report every condition `Unknown` (never `Fail`):
+/// bucket configuration has no in-memory semantics for `MemoryStore` to be the
+/// oracle for.
+#[async_trait::async_trait]
+pub trait BucketControlPlane {
+    async fn bucket_protection_report(
+        &self,
+        params: &BucketProtectionParams,
+    ) -> BucketProtectionReport;
+}
+
+/// The production path for a store held only as a trait object: no
+/// bucket-configuration query exists through the contract, so every condition is
+/// `Unknown` (ADR-1727 decision 2). Implemented on the trait object itself so a
+/// caller holding an `Arc<dyn ObjectStoreBackend>` can ask without threading a
+/// concrete type; `S3Store` provides its own affirmative impl on the concrete
+/// type.
+#[async_trait::async_trait]
+impl BucketControlPlane for dyn ObjectStoreBackend {
+    async fn bucket_protection_report(
+        &self,
+        _params: &BucketProtectionParams,
+    ) -> BucketProtectionReport {
+        BucketProtectionReport::all_unknown(
+            "the ObjectStoreBackend contract exposes no bucket-configuration query, and \
+             object_store 0.14 has no API for one; the bucket-protection control plane is \
+             implemented only on S3Store, which signs its own read-only GETs (ADR-1727 \
+             decision 1). Reporting unknown is the honest, non-blocking default (ADR-1727 \
+             decision 2): the protection configuration may or may not be compliant out of band",
+        )
+    }
+}
+
+/// Run the bucket-protection control plane against `source` (ADR-1727). Never
+/// fails, never panics: a backend that cannot answer reports `Unknown`, which is
+/// never a violation.
+pub async fn probe_bucket_protection<S: BucketControlPlane + ?Sized>(
+    source: &S,
+    params: &BucketProtectionParams,
+) -> BucketProtectionReport {
+    source.bucket_protection_report(params).await
+}
+
+/// A [`BucketControlPlane`] that returns a fixed [`BucketProtectionReport`],
+/// with no endpoint (ADR-1727 follow-up task 1). Later tasks (the CLI exit-code
+/// logic, the server gate) test their handling of every condition state without
+/// a live S3, and this crate's own tests pin the `Unknown`-is-never-`Fail` rule.
+///
+/// Compiled only under the crate's `test-support` feature, which test builds
+/// enable through their dev-dependencies, so no production build carries it (the
+/// same pattern as `MemoryStore::corrupt_stored_byte`).
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone)]
+pub struct FixtureBucketControlPlane {
+    report: BucketProtectionReport,
+}
+
+#[cfg(feature = "test-support")]
+impl FixtureBucketControlPlane {
+    /// Every condition [`ConditionState::Pass`].
+    pub fn compliant() -> Self {
+        FixtureBucketControlPlane {
+            report: BucketProtectionReport::from_states(
+                ProtectionConditionId::ALL
+                    .iter()
+                    .map(|id| (*id, ConditionState::Pass)),
+            ),
+        }
+    }
+
+    /// Every condition [`ConditionState::Unknown`] with `detail`.
+    pub fn all_unknown(detail: impl Into<String>) -> Self {
+        FixtureBucketControlPlane {
+            report: BucketProtectionReport::all_unknown(detail),
+        }
+    }
+
+    /// Serve exactly `report`.
+    pub fn from_report(report: BucketProtectionReport) -> Self {
+        FixtureBucketControlPlane { report }
+    }
+
+    /// Override one condition's state, leaving the rest as they are. Chains, so a
+    /// test can drive any id into any of `Pass`/`Fail`/`Unknown`.
+    pub fn with_condition(mut self, id: ProtectionConditionId, state: ConditionState) -> Self {
+        for entry in &mut self.report.conditions {
+            if entry.id == id {
+                entry.state = state;
+                return self;
+            }
+        }
+        self.report.conditions.push(ConditionReport { id, state });
+        self
+    }
+
+    /// The report this fixture serves.
+    pub fn report(&self) -> &BucketProtectionReport {
+        &self.report
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+impl BucketControlPlane for FixtureBucketControlPlane {
+    async fn bucket_protection_report(
+        &self,
+        _params: &BucketProtectionParams,
+    ) -> BucketProtectionReport {
+        self.report.clone()
+    }
+}
+
 /// Run every conformance probe against `store`, scoping all writes under
 /// `scratch_prefix` (ADR-0050 section 6: `sys/qualify/<run-id>/`). Never
 /// panics on a misbehaving backend: every probe treats an unexpected
@@ -4995,6 +5349,168 @@ mod tests {
                     .unwrap_or_else(|e| {
                         panic!("{name}: the ETag from `list` must be spendable as a pin: {e}")
                     });
+            }
+        }
+    }
+
+    // --- Bucket protection control plane (ADR-1727) ---
+
+    /// A report always carries exactly one entry per condition id, in
+    /// [`ProtectionConditionId::ALL`] order, even when built from a partial map.
+    #[test]
+    fn report_has_one_entry_per_condition_in_order() {
+        let report = BucketProtectionReport::from_states([(
+            ProtectionConditionId::ObjectLock,
+            ConditionState::Pass,
+        )]);
+        assert_eq!(report.conditions.len(), ProtectionConditionId::ALL.len());
+        for (entry, expected) in report.conditions.iter().zip(ProtectionConditionId::ALL) {
+            assert_eq!(entry.id, expected);
+        }
+        // The one supplied id keeps its state; every other is Unknown, never Fail.
+        assert!(
+            report
+                .state(ProtectionConditionId::ObjectLock)
+                .expect("object-lock present")
+                .is_pass()
+        );
+        assert!(
+            report
+                .state(ProtectionConditionId::Versioning)
+                .expect("versioning present")
+                .is_unknown()
+        );
+    }
+
+    /// `Unknown` and `Fail` are counted separately, and `Unknown` never counts as
+    /// a failure (ADR-1727 decision 3).
+    #[test]
+    fn failed_and_unknown_counts_are_disjoint() {
+        let report = BucketProtectionReport::from_states([
+            (ProtectionConditionId::Versioning, ConditionState::Pass),
+            (
+                ProtectionConditionId::ObjectLock,
+                ConditionState::Fail("disabled".to_string()),
+            ),
+            (
+                ProtectionConditionId::AbortMultipart,
+                ConditionState::Unknown("no api".to_string()),
+            ),
+        ]);
+        // Versioning pass, object-lock fail, one explicit unknown plus the six
+        // unspecified ids default to Unknown: 7 unknown, 1 fail.
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(report.unknown_count(), 7);
+    }
+
+    /// The condition ids are a frozen contract (operators grep them, the CLI and
+    /// server select by them): pin every spelling.
+    #[test]
+    fn condition_ids_are_stable() {
+        let expected = [
+            "versioning",
+            "noncurrent-expiration",
+            "expired-delete-marker",
+            "abort-multipart",
+            "rule-scope",
+            "no-foreign-rule",
+            "delete-marker-replication",
+            "object-lock",
+            "object-retention",
+        ];
+        let actual: Vec<&str> = ProtectionConditionId::ALL
+            .iter()
+            .map(|id| id.id())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// A store reached only through the [`ObjectStoreBackend`] contract reports
+    /// every condition `Unknown`, never `Fail` (ADR-1727 decision 2).
+    #[tokio::test]
+    async fn dyn_backend_reports_all_unknown() {
+        let store = MemoryStore::new();
+        let dyn_store: &dyn ObjectStoreBackend = &store;
+        let report = dyn_store
+            .bucket_protection_report(&BucketProtectionParams::default())
+            .await;
+        assert_eq!(report.conditions.len(), ProtectionConditionId::ALL.len());
+        assert_eq!(report.unknown_count(), ProtectionConditionId::ALL.len());
+        assert_eq!(report.failed_count(), 0);
+        assert!(report.conditions.iter().all(|c| c.state.is_unknown()));
+    }
+
+    /// `MemoryStore` is the semantics oracle for the data plane, but bucket
+    /// configuration has no in-memory semantics, so it too reports all-unknown
+    /// (through the dyn impl, ADR-1727 decision 2). Pinned separately because the
+    /// ADR names `MemoryStore` explicitly.
+    #[tokio::test]
+    async fn memory_store_reports_all_unknown() {
+        let store = MemoryStore::new();
+        let report = probe_bucket_protection(
+            &store as &dyn ObjectStoreBackend,
+            &BucketProtectionParams::default(),
+        )
+        .await;
+        assert!(report.conditions.iter().all(|c| c.state.is_unknown()));
+    }
+
+    /// The fixture serves any condition in any of the three states, so later
+    /// tasks can drive their handling without an endpoint (ADR-1727 follow-up
+    /// task 1).
+    #[tokio::test]
+    async fn fixture_serves_each_state() {
+        let fixture = FixtureBucketControlPlane::compliant()
+            .with_condition(
+                ProtectionConditionId::ObjectLock,
+                ConditionState::Fail("object lock disabled".to_string()),
+            )
+            .with_condition(
+                ProtectionConditionId::ObjectRetention,
+                ConditionState::Unknown("not sampled".to_string()),
+            );
+        let report = probe_bucket_protection(&fixture, &BucketProtectionParams::default()).await;
+        assert!(
+            report
+                .state(ProtectionConditionId::Versioning)
+                .expect("present")
+                .is_pass()
+        );
+        assert!(
+            report
+                .state(ProtectionConditionId::ObjectLock)
+                .expect("present")
+                .is_fail()
+        );
+        assert!(
+            report
+                .state(ProtectionConditionId::ObjectRetention)
+                .expect("present")
+                .is_unknown()
+        );
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(report.unknown_count(), 1);
+    }
+
+    /// Deliverable: the fixture reaches every state for *every* id, not just the
+    /// three the test above names, so a later task can build the exact report it
+    /// needs for any condition.
+    #[tokio::test]
+    async fn fixture_reaches_every_state_for_every_condition() {
+        for id in ProtectionConditionId::ALL {
+            let states = [
+                ConditionState::Pass,
+                ConditionState::Fail(format!("{} failed", id.id())),
+                ConditionState::Unknown(format!("{} not determined", id.id())),
+            ];
+            for state in states {
+                let fixture =
+                    FixtureBucketControlPlane::compliant().with_condition(id, state.clone());
+                let report =
+                    probe_bucket_protection(&fixture, &BucketProtectionParams::default()).await;
+                assert_eq!(report.conditions.len(), ProtectionConditionId::ALL.len());
+                let observed = report.state(id).expect("every id is present");
+                assert_eq!(observed, &state, "id {}", id.id());
             }
         }
     }

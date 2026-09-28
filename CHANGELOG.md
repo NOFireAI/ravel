@@ -511,6 +511,55 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A read-only bucket-protection control plane in `ravel-object-store`**
+  (ADR-1727 follow-up task 1, issue #1727). `S3Store` can now report, per
+  condition, whether the bucket's protection configuration is Pass, Fail, or
+  Unknown, by signing its own read-only SigV4 `GET`s (`?versioning`,
+  `?lifecycle`, `?replication`, `?object-lock`, and `?retention` on sampled
+  keys) over the `reqwest` pin the crate already holds, using the same
+  credential provider the store already uses. A new `BucketControlPlane` trait
+  and `BucketProtectionReport` carry one entry per ADR-1727 decision 3 condition
+  (`versioning`, `noncurrent-expiration`, `expired-delete-marker`,
+  `abort-multipart`, `rule-scope`, `no-foreign-rule`,
+  `delete-marker-replication`, `object-lock`, `object-retention`); `Unknown`
+  covers no API, access denied, and an unparseable response, and is never
+  `Fail`. The sanctioned lifecycle and replication conditions pass only on an
+  enabled rule whose filter covers every key under `t/` (a tag- or
+  object-size-narrowed rule never does, and an unrecognised filter or status, a
+  repeated element where one value is expected (a rule's `Status`,
+  `NoncurrentDays`, `DeleteMarkerReplication`, and the rest), or a day count
+  that does not parse, is `Unknown`); `no-foreign-rule` passes only when no
+  rule that can reach `t/`
+  or `sys/` carries a transition, a current-version expiration, or a
+  `NoncurrentDays` shorter than the reference (the expected value, else the one
+  value the covering rules agree on). A `NoncurrentDays` below the reference
+  fails `no-foreign-rule`, and also `noncurrent-expiration` when the rule
+  reaches part of `t/`; with no reference to compare against, the same rule is
+  `Unknown` there instead. `DeleteMarkerReplication` `Disabled` on a rule over
+  part of `t/` fails `delete-marker-replication`. A 404 is "not configured"
+  only when its `<Error><Code>` is that call's own code
+  (`NoSuchLifecycleConfiguration`, `ReplicationConfigurationNotFoundError`,
+  `ObjectLockConfigurationNotFoundError`, or `NoSuchObjectLockConfiguration`
+  for retention); any other 404, redirect, body over 1 MiB (with or without a
+  `Content-Length`), `ObjectLockConfiguration` whose `ObjectLockEnabled` is
+  missing, empty, or repeated, or `?versions` page without `IsTruncated` or
+  with a version lacking
+  a `VersionId` is `Unknown`. `object-retention` samples the
+  newest (by `LastModified`) current and noncurrent version under each
+  protected prefix and requires compliance mode with a `RetainUntilDate` still
+  in the future; the `?versions` listing is followed for at most 10 pages, and
+  a listing still truncated at that cap yields `Unknown` whatever the samples
+  show, since the newest object may be unlisted. `MemoryStore` and every
+  backend reached only through the `ObjectStoreBackend` contract report every
+  condition `Unknown`; `S3Store` also
+  gains `ObjectLockProbeSource`/`BucketConfigProbeSource` impls derived from the
+  same report. Two new direct dependencies for the crate: `ring` (SigV4
+  HMAC-SHA256 and SHA-256) and `quick-xml` 0.41 (reading the S3 XML responses),
+  both already in the lock and neither pulling in an AWS SDK or a RustCrypto
+  crate. Nothing in the shipping binaries reads these reports yet, though
+  `S3Store::new` now builds the control-plane client on every construction:
+  `ravel-cli store verify-protection` (task 2) and the server startup gate
+  (task 3) are the callers.
 - **`/metrics` renders the three writer clock-lag counters, and a shipped
   alert pages on a refused flush** (ADR-1685 follow-up task 3, issue #1685).
   `ravel_ingest_clock_lag_refused_total`,
