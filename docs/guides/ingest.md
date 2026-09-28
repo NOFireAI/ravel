@@ -736,8 +736,9 @@ column and a value type; a duration column has to be turned into an absolute
 `status_code_column` reads that enum and nothing else. Pointing a mapping at
 an unconverted column of any of these shapes fails the load rather than
 importing part of the file: a column whose type cannot supply the field is
-refused with both the field and the type it found, and a duration read as an
-`end_ts` is refused for ending before its span starts.
+refused, naming the type it found (an id column's refusal also names the
+column), and a duration read as an `end_ts` is refused for ending before its
+span starts.
 
 Span events and span links are not mappable in this version, and a mapping
 that names them is refused by name rather than as a typo. The same refusal
