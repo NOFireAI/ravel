@@ -103,6 +103,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **An alert-signal retention sweep that keeps every identity's current-state
+  record** (ADR-1688, issue #1688). The alert evaluator writes one object and
+  one commit record per transition and nothing ever removed them, so the
+  history grew for the life of the deployment and a cold start re-read all of
+  it. `ravel_maintain::sweep_alert_retention` bounds it: it lists the alert
+  shard's commit prefix, skips a record whose key-derived hour already proves
+  it cannot be expired, and deletes an expired, past-horizon record's commit
+  record before its data object, consulting the same legal-hold hook the other
+  sweeps use. It writes no tombstone, because the evaluator's fold refuses any
+  bucket entry that is not a commit or compaction record. A keep set built from
+  the alert state memo spares each identity's current-state record whatever its
+  age, so a firing alert older than the window keeps the one record that says
+  so and a cold-start fold over the survivors still recovers every identity's
+  state. The keep set is the `ts_ns` of those records, which is what the memo
+  carries and what each commit record's `max_event_ts_ns` equals, together with
+  the memo's watermark hour; a record is deleted only when its ingest hour is
+  strictly below that watermark, since the memo is complete only below it and a
+  late write into the watermark hour itself may be an identity's newest
+  transition. `CompactorConfig::alert_retention_window_ns` is the
+  window, default 90 days, the same value as the query-audit window; `0`
+  disables the sweep and keeps the previous grow-forever behaviour. Nothing in
+  the server calls the sweep yet: the driver that reads the memo, builds the
+  keep set and exposes `--alert-retention` is ADR-1688 follow-up task 2, so
+  this release changes no running deployment's behaviour.
 - **Catalog and PromQL decodes reserve their decoded output against the
   process memory budget before they run** (ADR-1702 decision 6, issue #1702).
   The catalog resolve reserves each snapshot part's, postings object's and
