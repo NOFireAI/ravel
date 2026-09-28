@@ -567,6 +567,95 @@ async fn metrics_render_heartbeat_age_without_listen_health() {
     }
 }
 
+/// `start` must run the heartbeat task, not only build the heartbeat: a
+/// heartbeat is stamped at construction, so a first scrape reads a small age
+/// whether or not anything beats it. The second scrape comes after a real
+/// wait past the bound, which only a running task keeps the age under. The
+/// wait is on the wall clock because `start` beats a `SystemClock` heartbeat
+/// the test cannot step.
+#[tokio::test]
+async fn metrics_heartbeat_age_stays_bounded_while_start_beats() {
+    let running = start_test_server(Mode::All, u64::MAX, false).await;
+    assert_heartbeat_age_rendered(&scrape(&running).await, "first scrape");
+    tokio::time::sleep(HEARTBEAT_INTERVAL * 5 / 2).await;
+    assert_heartbeat_age_rendered(
+        &scrape(&running).await,
+        "scrape 2.5 heartbeat intervals later",
+    );
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A clock that moves only when the test sets it.
+struct SteppedClock(std::sync::atomic::AtomicI64);
+
+impl ravel_ingest::Clock for SteppedClock {
+    fn now_ns(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// `start_with_heartbeat` must render the caller's heartbeat, the same one
+/// the health listener reads, and leave the listener's verdict on it alone.
+/// The heartbeat is never spawned, so only the stepped clock moves its age:
+/// at 45 s `/metrics` reads exactly 45, `/readyz` (30 s bound) fails and
+/// `/healthz` (60 s bound) still passes.
+#[tokio::test]
+async fn metrics_and_health_listener_read_the_same_heartbeat() {
+    const BASE_NS: i64 = 1_800_000_000_000_000_000;
+    let clock = Arc::new(SteppedClock(std::sync::atomic::AtomicI64::new(BASE_NS)));
+    let heartbeat = Heartbeat::new(clock.clone());
+    let listener = HealthListener::bind(
+        "127.0.0.1:0".parse().expect("valid loopback addr"),
+        heartbeat.clone(),
+    )
+    .expect("health listener binds");
+    let running = start_test_server_with(Mode::All, u64::MAX, false, Some(heartbeat)).await;
+    listener.attach_readiness(running.readiness());
+    let health = |route: &str| format!("http://{}{route}", listener.local_addr());
+    let client = reqwest::Client::new();
+    let status = |url: String| {
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .send()
+                .await
+                .expect("health listener request completes")
+                .status()
+                .as_u16()
+        }
+    };
+
+    assert_eq!(
+        status(health("/readyz")).await,
+        200,
+        "/readyz at heartbeat age 0 s, so a later 503 is the heartbeat's"
+    );
+
+    clock.0.store(
+        BASE_NS + 45 * 1_000_000_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let body = scrape(&running).await;
+    let samples: Vec<&str> = body
+        .lines()
+        .filter(|line| line.starts_with("ravel_health_heartbeat_age_seconds{"))
+        .collect();
+    assert_eq!(
+        samples,
+        ["ravel_health_heartbeat_age_seconds{mode=\"all\"} 45"],
+        "/metrics must read the heartbeat passed to start_with_heartbeat:\n{body}"
+    );
+    assert_eq!(status(health("/readyz")).await, 503, "/readyz at 45 s");
+    assert_eq!(status(health("/healthz")).await, 200, "/healthz at 45 s");
+
+    running.shutdown().await.expect("graceful shutdown");
+    tokio::task::spawn_blocking(move || listener.shutdown())
+        .await
+        .expect("health listener shutdown task")
+        .expect("health listener stops");
+}
+
 /// With `--listen-health`, `main` builds the heartbeat, spawns its task and
 /// binds the listener before `start_with_heartbeat`; `/metrics` renders the
 /// age of that same heartbeat, once.
