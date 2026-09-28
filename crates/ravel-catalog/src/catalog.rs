@@ -846,7 +846,7 @@ impl Catalog {
             Ok(reservation) => return Ok(reservation),
             Err(refusal) => refusal,
         };
-        let want = declared.min(ceiling);
+        let want = crate::charged::decoded_charge(declared, ceiling);
         if want > self.memory_budget.limit() {
             return Err(refusal);
         }
@@ -10983,6 +10983,43 @@ mod tests {
             0,
             "a refused reservation charges nothing"
         );
+    }
+
+    /// A part declaring more than the decoder's own ceiling allocates nothing:
+    /// `decode_part` refuses it before it allocates. So it is charged 0, and
+    /// the decoder's refusal decides the outcome (fall back to listing), even
+    /// under a budget with no room at all. Charging the ceiling instead turns
+    /// an oversized part into a retryable memory error on every budget with
+    /// less than the ceiling free.
+    ///
+    /// FLIP: make `charged::decoded_charge` return `declared.min(ceiling)` and
+    /// this resolve fails with
+    /// `CatalogError::MemoryExhausted(MemoryExhausted { requested: 1,
+    /// reserved: 0, limit: 0 })`, so `expect` panics on it.
+    #[tokio::test]
+    async fn a_part_declaring_more_than_the_ceiling_charges_nothing_and_falls_back_to_listing() {
+        let (store, range, now_ns, declared) = folded_one_part_fixture().await;
+        // One byte: every fixture part's declared body is over it, so the
+        // decoder refuses the part before allocating.
+        let refusing = CatalogConfig {
+            max_snapshot_part_bytes: 1,
+            ..config(1)
+        };
+        assert!(declared > refusing.max_snapshot_part_bytes);
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        let catalog = Catalog::new(store.clone(), refusing)
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+
+        let resolved = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("a part the decoder refuses falls back to listing, it does not fail the query");
+        assert!(
+            !resolved.segments.is_empty(),
+            "the listing fallback must still serve the fixture's segment"
+        );
+        assert_eq!(budget.reserved(), 0, "a refused decode charges nothing");
     }
 
     /// ADR-0050 §2 against ADR-1702 decision 6: a snapshot part whose own
