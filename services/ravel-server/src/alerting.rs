@@ -145,14 +145,35 @@ const NS_PER_MS: i64 = 1_000_000;
 const LEASE_TTL_TICKS: u32 = 3;
 
 /// Fraction of one evaluation interval that sink delivery may consume in a
-/// single tick, as `(numerator, denominator)`. Strictly less than one so the
-/// delivery phase always returns before the next tick is due: an unbounded pass
-/// against a slow or failing sink could outlast the interval, and every tick it
-/// overran would push the next tick's rule evaluation later, so one bad sink
-/// would degrade evaluation for every rule. Half the interval leaves the other
-/// half for the rule evaluation and repeat pass that precede delivery in the
-/// same tick. Notifications not attempted before the deadline stay in the
-/// undelivered map and are retried next tick (oldest first).
+/// single tick, as `(numerator, denominator)`. Without it a pass against a slow
+/// or failing sink costs `notifications * sinks * sink_timeout`, which grows
+/// with the undelivered queue and is bounded by nothing the operator chose.
+/// Half the interval leaves the other half for the rule evaluation and repeat
+/// pass that precede delivery in the same tick. Notifications not attempted
+/// before the deadline stay in the undelivered map and keep their place in the
+/// queue for the next tick.
+///
+/// # What this bounds, exactly
+///
+/// [`AlertEvaluator::flush_sinks`] returns at the latest at
+///
+/// ```text
+/// max(tick start + interval * fraction, end of rule evaluation)
+///     + sinks * sink_timeout
+/// ```
+///
+/// The deadline is checked before each attempt rather than during one, and the
+/// first attempt of a tick is unconditional, so the pass can overshoot by one
+/// whole attempt: every sink of the one notification in flight, each bounded by
+/// `sink_timeout`. When rule evaluation alone already ran past the deadline,
+/// that unconditional attempt is the whole of the delivery phase, and it starts
+/// wherever evaluation ended.
+///
+/// Rule evaluation itself is not bounded by this constant, and this change does
+/// not bound it: a tick whose queries are slow still runs as long as its rules
+/// take, so a tick can exceed one interval through evaluation alone.
+/// [`run_loop`] sleeps for a jittered interval *after* a tick returns, so an
+/// overrunning tick delays the next tick rather than overlapping it.
 const SINK_DELIVERY_DEADLINE_FRACTION: (u32, u32) = (1, 2);
 
 /// The per-tenant alert lease object body: who holds it and until when.
@@ -387,8 +408,10 @@ pub struct AlertEvalReport {
     pub notifications_failed: u32,
     /// Notifications this tick did not attempt because the per-tick delivery
     /// deadline ([`SINK_DELIVERY_DEADLINE_FRACTION`] of the interval) elapsed
-    /// first. They stay in the undelivered map, oldest first, and are retried
-    /// next tick, so one failing sink cannot stall a whole tick.
+    /// first. Counted once per notification per tick: a notification deferred
+    /// on several consecutive ticks advances this once on each of them. They
+    /// keep their place at the front of the queue, so the next tick attempts
+    /// them before anything enqueued since.
     pub notifications_deferred: u32,
     /// `true` when the alert history could not be read, so no rule was
     /// evaluated at all. Never acts on a partial history: doing so would
@@ -622,6 +645,21 @@ pub fn active_alert_metrics() -> Option<Arc<AlertMetrics>> {
     ALERT_METRICS.get().map(Arc::clone)
 }
 
+/// One undelivered notification and its place in the delivery queue.
+///
+/// The place is a sequence number rather than the record's `ts_ns` because the
+/// two are different quantities: `ts_ns` is how old the transition is, `seq` is
+/// how long the notification has been waiting for a sink. A repeat re-queues
+/// the firing record unchanged, so its `ts_ns` stays at the original onset for
+/// as long as the alert fires; ordering by `ts_ns` would hand the same oldest
+/// few notifications the whole of every tick's budget and never reach a newer
+/// one (issue #2063).
+struct QueuedNotification {
+    /// Ascending in enqueue order. Lower is earlier in the queue.
+    seq: u64,
+    notification: AlertNotification,
+}
+
 /// The evaluator for one tenant.
 pub struct AlertEvaluator {
     store: Arc<dyn ObjectStoreBackend>,
@@ -636,10 +674,11 @@ pub struct AlertEvaluator {
     /// take it over. Derived from the evaluation interval at construction
     /// ([`LEASE_TTL_TICKS`] times it).
     lease_ttl: Duration,
-    /// How long [`Self::flush_sinks`] may spend delivering notifications in one
+    /// How long [`Self::flush_sinks`] may spend starting deliveries in one
     /// tick, on the injected clock. Derived from the evaluation interval at
-    /// construction ([`SINK_DELIVERY_DEADLINE_FRACTION`] of it), so one failing
-    /// sink cannot stall a tick past its own interval.
+    /// construction ([`SINK_DELIVERY_DEADLINE_FRACTION`] of it); see that
+    /// constant for the bound the budget actually buys, which is not the whole
+    /// tick.
     sink_delivery_budget: Duration,
     /// Only read by the `sql` feature's [`AlertEvaluator::run_sql`]; a build
     /// without that feature rejects SQL rules before it would be needed.
@@ -657,7 +696,14 @@ pub struct AlertEvaluator {
     /// a sink keeps failing that is unbounded: a rule over a churning series
     /// label adds an entry per series that ever fired and resolved (issue
     /// #1438). Its size is the `ravel_alert_undelivered_notifications` gauge.
-    undelivered: HashMap<AlertId, AlertNotification>,
+    ///
+    /// It is a queue, not a set: each entry carries the
+    /// [`QueuedNotification::seq`] that orders [`Self::flush_sinks`].
+    undelivered: HashMap<AlertId, QueuedNotification>,
+    /// Next value of [`QueuedNotification::seq`]. Monotonic for the life of the
+    /// evaluator, incremented by [`Self::take_enqueue_seq`] on every enqueue
+    /// and on every move to the back of the queue.
+    next_enqueue_seq: u64,
     /// This evaluator's share of the `ravel_alert_undelivered_notifications`
     /// gauge: `undelivered.len()` as of the last tick, taken back out on drop.
     undelivered_reported: u64,
@@ -720,6 +766,7 @@ impl AlertEvaluator {
             writer_id: Uuid::new_v4(),
             next_seq: 1,
             undelivered: HashMap::new(),
+            next_enqueue_seq: 0,
             undelivered_reported: 0,
             repeat_marks: HashMap::new(),
             bootstrapped: false,
@@ -755,6 +802,35 @@ impl AlertEvaluator {
     fn with_metrics(mut self, metrics: Arc<AlertMetrics>) -> AlertEvaluator {
         self.metrics = metrics;
         self
+    }
+
+    /// The next place at the back of the delivery queue.
+    ///
+    /// `u64` and saturating: one evaluator would have to enqueue a notification
+    /// every nanosecond for 584 years to reach the ceiling, and saturating
+    /// there degrades the order rather than wrapping it into a front-of-queue
+    /// value that would starve everything already waiting.
+    fn take_enqueue_seq(&mut self) -> u64 {
+        let seq = self.next_enqueue_seq;
+        self.next_enqueue_seq = self.next_enqueue_seq.saturating_add(1);
+        seq
+    }
+
+    /// Queue `notification` for `alert_id` at the back of the delivery queue,
+    /// unless an entry for that identity is already queued.
+    ///
+    /// An existing entry keeps both its notification and its place: it has
+    /// already been waiting, and a bootstrap or a repeat for the same identity
+    /// is a re-send of the same thing, not a newer one. Only
+    /// [`Self::write_transition`] supersedes the notification, and it keeps the
+    /// place too.
+    fn enqueue_if_absent(&mut self, alert_id: AlertId, notification: AlertNotification) {
+        if self.undelivered.contains_key(&alert_id) {
+            return;
+        }
+        let seq = self.take_enqueue_seq();
+        self.undelivered
+            .insert(alert_id, QueuedNotification { seq, notification });
     }
 
     /// One evaluation pass over every rule of this tenant, then one delivery
@@ -1087,9 +1163,8 @@ impl AlertEvaluator {
                     .iter()
                     .find(|rule| rule.rule_id == record.rule_id)
                     .map_or(&[][..], |rule| rule.labels.as_slice());
-                self.undelivered
-                    .entry(*alert_id)
-                    .or_insert_with(|| AlertNotification::new(record.clone(), None, rule_labels));
+                let notification = AlertNotification::new(record.clone(), None, rule_labels);
+                self.enqueue_if_absent(*alert_id, notification);
             }
         }
     }
@@ -1192,14 +1267,20 @@ impl AlertEvaluator {
         }
         // Compose with any entry already queued for this alert this tick (a
         // fresh transition write, or a bootstrap redelivery): the map is keyed
-        // by `alert_id`, so `or_insert_with` never doubles a send, and that
-        // existing send counts as this window's send. `previous_state: None`
-        // mirrors `bootstrap_undelivered`: a repeat is a non-transition re-send
-        // with no prior record to pair, the same single-step-fold approximation
+        // by `alert_id`, so enqueueing only when absent never doubles a send,
+        // that existing send counts as this window's send, and the waiting
+        // entry keeps its queue place rather than being pushed to the back by
+        // its own repeat. `previous_state: None` mirrors
+        // `bootstrap_undelivered`: a repeat is a non-transition re-send with no
+        // prior record to pair, the same single-step-fold approximation
         // `AlertNotification::new` already documents.
-        self.undelivered
-            .entry(alert_id)
-            .or_insert_with(|| AlertNotification::new(record.clone(), None, rule_labels));
+        //
+        // Tested for absence here as well as inside `enqueue_if_absent` so a
+        // stuck queue does not pay a record clone per firing alert per tick.
+        if !self.undelivered.contains_key(&alert_id) {
+            let notification = AlertNotification::new(record.clone(), None, rule_labels);
+            self.enqueue_if_absent(alert_id, notification);
+        }
         self.repeat_marks.insert(alert_id, (record.ts_ns, window));
         report.repeats_queued += 1;
     }
@@ -1358,10 +1439,19 @@ impl AlertEvaluator {
         );
 
         // The record is durable from here on; everything below is notification.
-        self.undelivered.insert(
-            written.alert_id,
-            AlertNotification::new(written.clone(), prior.as_ref(), &rule.labels),
-        );
+        //
+        // A newer transition supersedes whatever was queued for this identity,
+        // but it inherits that entry's queue place rather than going to the
+        // back: the identity has already been waiting for a sink, and an alert
+        // that transitions on every tick would otherwise re-queue itself behind
+        // everything else forever and never be delivered at all.
+        let notification = AlertNotification::new(written.clone(), prior.as_ref(), &rule.labels);
+        let seq = match self.undelivered.get(&written.alert_id) {
+            Some(queued) => queued.seq,
+            None => self.take_enqueue_seq(),
+        };
+        self.undelivered
+            .insert(written.alert_id, QueuedNotification { seq, notification });
         latest.insert(written.alert_id, written);
         Ok(true)
     }
@@ -1640,7 +1730,7 @@ impl AlertEvaluator {
     /// dropping an entry only once all sinks accepted it, and bounded to a
     /// fraction of one interval on the injected clock.
     ///
-    /// A sink that fails leaves its notification in place, so the next tick
+    /// A sink that fails leaves its notification in place, so a later tick
     /// retries it from the latest record (ADR-0043 decision 6) without needing
     /// a new transition to occur. A partial success re-sends to the sinks that
     /// already accepted, which is inside the at-least-once contract.
@@ -1649,35 +1739,58 @@ impl AlertEvaluator {
     ///
     /// Delivery is bounded to `now_ns + sink_delivery_budget`
     /// ([`SINK_DELIVERY_DEADLINE_FRACTION`] of the interval), measured on the
-    /// injected clock. Without it, a slow or unresponsive sink could hold the
-    /// tick well past its own interval: each delivery is bounded by the sink's
-    /// HTTP timeout, but the number of deliveries in one pass is not, so a rule
-    /// over many series behind a timing-out sink could take
-    /// `notifications * timeout` per tick and push every later tick's rule
-    /// evaluation late. Notifications not attempted before the deadline stay in
-    /// the undelivered map and are counted in
+    /// injected clock. Without it, the pass costs
+    /// `notifications * sinks * sink_timeout` against a timing-out sink, which
+    /// grows with the undelivered queue: a rule over many series could hold the
+    /// tick for minutes and push every later tick's rule evaluation late.
+    /// Notifications not attempted before the deadline stay in the undelivered
+    /// map and are counted in
     /// [`AlertEvalReport::notifications_deferred`].
     ///
     /// `now_ns` is the tick's own reading, taken before rule evaluation, so the
     /// deadline bounds the delivery phase against the start of the tick rather
-    /// than against the start of delivery. The check is made before a delivery
-    /// starts, not during one, so the pass can overshoot the deadline by the
-    /// last attempt: at most `sinks * sink_timeout`, which with the defaults
-    /// leaves the whole tick inside one interval.
+    /// than against the start of delivery. See
+    /// [`SINK_DELIVERY_DEADLINE_FRACTION`] for the bound that yields, which is
+    /// not "before the next tick is due".
     ///
     /// The first notification is always attempted, deadline or not. A tick
     /// whose rule evaluation alone consumed the budget would otherwise defer
     /// every notification, every tick, and deliver nothing at all while the
     /// sinks were healthy.
     ///
-    /// # Oldest first
+    /// # Round-robin over the queue, not oldest transition first
     ///
-    /// The undelivered map is a `HashMap`, whose iteration order is not stable,
-    /// so a persistently slow sink that only clears a prefix of the map each
-    /// tick could starve an arbitrary notification indefinitely. Delivering in
-    /// `(ts_ns, alert_id)` order makes the oldest transition the first one
-    /// attempted every tick, so a notification carried across ticks reaches the
-    /// front and is not starved.
+    /// The pass runs in [`QueuedNotification::seq`] order: queue position, not
+    /// record age. Age is the wrong key and starves outright (issue #2063).
+    /// `queue_repeat_for_alert` re-queues a repeat carrying the firing record's
+    /// original `ts_ns`, and [`DEFAULT_REPEAT_INTERVAL`] equals the default
+    /// evaluation interval, so with a sink that drains `k` notifications per
+    /// tick and more than `k` alerts firing, the same oldest `k` are delivered,
+    /// re-queued by the repeat pass, and sorted to the front again on the next
+    /// tick. Every newer notification, including a new alert's first firing, is
+    /// never attempted at all.
+    ///
+    /// Queue position makes the pass a round robin instead:
+    ///
+    /// - An entry that is attempted and not completed (some sink refused it)
+    ///   goes to the back, so the next tick reaches whatever was behind it.
+    ///   Delivery is at-least-once, so re-sending it later costs nothing but a
+    ///   duplicate at the sinks that had accepted.
+    /// - An entry that is never attempted, because the deadline elapsed before
+    ///   the pass reached it, keeps its place. It waited without being served;
+    ///   moving it back would undo exactly the fairness this ordering buys.
+    /// - An entry delivered to every sink leaves the map. A repeat or a new
+    ///   transition for that identity enqueues at the back, behind everything
+    ///   still waiting.
+    ///
+    /// # One dead sink still throttles the healthy ones
+    ///
+    /// An entry leaves the map only once *every* sink accepted it, so with one
+    /// blackholed sink the queue never drains and total delivery is capped at
+    /// what fits in one tick's budget, for every sink. What the rotation
+    /// guarantees is that the cap is spread: a healthy sink receives every
+    /// notification eventually, rather than the same few forever. The guide
+    /// states this cost.
     async fn flush_sinks(&mut self, now_ns: i64, report: &mut AlertEvalReport) {
         if self.sinks.is_empty() {
             self.undelivered.clear();
@@ -1686,18 +1799,19 @@ impl AlertEvaluator {
         let deadline_ns = now_ns.saturating_add(
             i64::try_from(self.sink_delivery_budget.as_nanos()).unwrap_or(i64::MAX),
         );
-        let mut pending: Vec<(AlertId, AlertNotification)> = self
+        let mut pending: Vec<(u64, AlertId, AlertNotification)> = self
             .undelivered
             .iter()
-            .map(|(id, n)| (*id, n.clone()))
+            .map(|(id, queued)| (queued.seq, *id, queued.notification.clone()))
             .collect();
-        pending.sort_by_key(|(id, n)| (n.record.ts_ns, *id));
+        pending.sort_by_key(|(seq, _, _)| *seq);
         let mut attempted = false;
-        for (alert_id, notification) in pending {
+        for (_, alert_id, notification) in pending {
             if attempted && self.clock.now_ns() >= deadline_ns {
                 // Past the per-tick deadline: leave this and every later
-                // notification in the undelivered map for the next tick, where
-                // the oldest-first order will reach them first.
+                // notification in the undelivered map, at their current queue
+                // places, so the next tick attempts them before anything
+                // enqueued since.
                 report.notifications_deferred += 1;
                 continue;
             }
@@ -1713,7 +1827,7 @@ impl AlertEvaluator {
                         alert_id = %alert_id.to_hex(),
                         error = %err,
                         "alert sink delivery failed; the record is durable and delivery is \
-                         retried next tick"
+                         retried on a later tick"
                     );
                 }
             }
@@ -1722,6 +1836,12 @@ impl AlertEvaluator {
                 report.notifications_delivered += 1;
             } else {
                 report.notifications_failed += 1;
+                // Attempted and not completed: to the back, so this tick's
+                // budget does not belong to the same entry on every tick.
+                let seq = self.take_enqueue_seq();
+                if let Some(queued) = self.undelivered.get_mut(&alert_id) {
+                    queued.seq = seq;
+                }
             }
         }
     }
