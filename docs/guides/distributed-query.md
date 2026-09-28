@@ -89,7 +89,7 @@ defaults in place.
 
 ## Turning it on
 
-Distribution is enabled per query node, and the two flags below are a pair:
+Distribution is enabled per query node, and the first two flags below are a pair:
 either without the other fails startup rather than exposing an
 unauthenticated fetch surface or leaving a configured secret inert.
 
@@ -99,7 +99,8 @@ ravel-server --mode all \
   --listen-http 0.0.0.0:4318 \
   --listen-grpc 10.0.0.11:4317 \
   --distributed-query \
-  --fragment-key-file /etc/ravel/fragment.keys
+  --fragment-key-file /etc/ravel/fragment.keys \
+  --sql-ticket-key-file /etc/ravel/sql-ticket.keys
 ```
 
 - `--distributed-query` opts this process in. In `--mode all` or
@@ -115,6 +116,35 @@ ravel-server --mode all \
   key into place. A file, never an inline value or an environment variable, so
   the key never appears in a process listing. **Every node in one cluster must
   read the same key set.**
+- `--sql-ticket-key-file` names the SQL ticket key file, which signs the
+  Flight SQL tickets: the whole-set ticket a client redeems and the slice
+  ticket a coordinator hands a worker, each under its own key derived from
+  every file key. Same file shape and rotation rule as
+  `--fragment-key-file` (the first key mints, every key verifies), but a
+  separate file: one key file no longer covers both lanes. **Every node in one
+  cluster must read the same SQL ticket key set.** Two nodes that disagree
+  cost more than parallelism: a client's whole-set ticket comes back from
+  `GetFlightInfo` as an endpoint with no location, so a client behind a
+  balancer can redeem it on any node, and a node that does not hold the key
+  it was minted under answers `DoGet` with `invalid_argument` ("malformed
+  flight ticket"). That is a client-visible query failure. SQL slice tickets
+  between two such nodes fail the worker's MAC and those slices fall back to
+  the coordinator. Setting the flag without `--distributed-query` fails
+  startup. In this release it is optional: without it the SQL ticket key is
+  derived from the first fragment key, as before, and startup logs one
+  warning naming the flags release B (the release after the operator
+  renders the dedicated listener) requires with
+  `--distributed-query` (`--fragment-listener` and `--sql-ticket-key-file`).
+  The same warning fires when only `--fragment-listener` is missing. To move
+  a running fleet onto the file without a mixed window, follow the switch in
+  the [deployment guide](operations/deployment.md#the-dedicated-fragment-listener).
+- In this release SQL slice tickets travel in plaintext on the public gRPC
+  listener whatever the flags say: the SQL lane dials each worker's
+  `--listen-grpc` address, not its `--fragment-listener` address. A slice
+  ticket read off that network is a replayable read capability for its tenant
+  and segment set until its deadline, so keep the public gRPC port on a
+  network you trust. Every `--distributed-query` process in `--mode all` or
+  `--mode query` logs this once at startup, with both flags set as well.
 - `--listen-grpc` is required in practice. By default the fragment surface is
   bound only on the cluster-internal gRPC listener, never on the client HTTP
   listener and never on the mTLS listener. A node with no gRPC listener never

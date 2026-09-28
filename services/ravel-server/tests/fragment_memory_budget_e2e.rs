@@ -154,6 +154,7 @@ async fn publish_large_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId
 fn distrib_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
+        sql_ticket_keys: None,
         max_inflight_fragments: 8,
         max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {
