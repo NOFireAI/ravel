@@ -295,6 +295,9 @@ pub struct ExternalStore {
     profile: String,
     bucket: String,
     backend: Backend,
+    /// Whether the backend accepts a suffix range: `object_store`'s Azure
+    /// client refuses one with `NotSupported` before sending the request.
+    suffix_range: bool,
 }
 
 enum Backend {
@@ -351,6 +354,7 @@ impl ExternalStore {
             profile: profile.name.clone(),
             bucket: bucket.to_string(),
             backend,
+            suffix_range: !matches!(profile.kind, ExternalKind::Azure { .. }),
         }))
     }
 
@@ -491,9 +495,11 @@ fn open_azure(
 /// The ETag is passed through byte for byte, quotes and all: it is the pin a
 /// later conditional read sends back as `If-Match`, and normalizing it here
 /// would make that read compare a string the store never issued. `version` is
-/// the store's own version or generation when it reports one, so a pin can
-/// carry both halves; it falls back to the ETag for a store that does not
-/// version objects, which is what [`crate::s3::S3Store`] reports too.
+/// the store's own version or generation when it reports one; for a store that
+/// does not version objects it falls back to the ETag, which is what
+/// [`crate::s3::S3Store`] reports too. That fallback is a CAS token only:
+/// [`crate::Pin::from_store`] drops a version equal to the ETag, so a pinned
+/// read of an unversioned object carries the ETag precondition alone.
 fn map_external_meta(meta: object_store::ObjectMeta) -> Result<ObjectMeta, StoreError> {
     let etag = meta.e_tag.clone().ok_or_else(|| {
         StoreError::Permanent(format!("the store returned no ETag for {}", meta.location))
@@ -751,7 +757,7 @@ impl ObjectStoreBackend for ExternalStore {
             consistent_list: true,
             create_if_absent: false,
             cas_version: false,
-            suffix_range: true,
+            suffix_range: self.suffix_range,
             upload_checksum: false,
             prefix_list: true,
             multipart: false,
@@ -866,6 +872,25 @@ mod tests {
         assert!(!caps.upload_checksum);
         assert!(!caps.multipart);
         assert!(caps.consistent_read && caps.prefix_list && caps.suffix_range);
+
+        let sas = dir.path().join("azure.sas");
+        std::fs::write(&sas, "sv=2024-11-04&sig=unused\n").expect("write the SAS file");
+        let azure = ExternalProfile {
+            name: "archive".to_string(),
+            kind: ExternalKind::Azure {
+                account: "contoso".to_string(),
+                credentials: AzureProfileCredentials::SasToken {
+                    token: SecretSource::File { path: sas },
+                },
+            },
+        };
+        let store = ExternalStore::open(&azure, "exports").expect("open");
+        let caps = store.capabilities();
+        assert!(caps.consistent_read && caps.prefix_list);
+        assert!(
+            !caps.suffix_range,
+            "object_store's Azure client refuses a suffix range"
+        );
     }
 
     #[test]
@@ -1113,8 +1138,10 @@ mod tests {
         assert_eq!(meta.size, 17);
         assert_eq!(meta.key, "a/b.parquet");
 
-        // No version reported: the pin's version half falls back to the ETag,
-        // so a pinned read still has both halves to send.
+        // No version reported: the fallback fills ObjectMeta's CAS version
+        // token with the ETag. It does not reach a pin: `Pin::from_store`
+        // drops a version equal to the ETag, so a pinned read of an
+        // unversioned object is precondition-only.
         let meta = map_external_meta(object_store::ObjectMeta {
             location: object_store::path::Path::from("a/b.parquet"),
             last_modified: Default::default(),
