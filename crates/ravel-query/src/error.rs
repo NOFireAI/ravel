@@ -113,6 +113,11 @@ pub enum QueryError {
     Fetch(#[from] FetchError),
     #[error(transparent)]
     Eval(#[from] ravel_promql::Error),
+    /// A PromQL evaluation submitted to the read CPU gate produced no result
+    /// (ADR-1702 decision 2): it panicked, or the runtime dropped it at
+    /// shutdown.
+    #[error("PromQL evaluation on the read CPU gate failed: {0}")]
+    CpuGate(#[from] ravel_cpu_gate::CpuGateError),
     #[error("query matched {count} segments, exceeding the limit of {max}")]
     TooManySegments { count: usize, max: usize },
     #[error("query matched {count} series, exceeding the limit of {max}")]

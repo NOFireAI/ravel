@@ -22,6 +22,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `stale`, `contradicted` or `unknown`, and exits nonzero when a live record
   sits below a recorded floor (`contradicted`). Every floor raised so far has
   no basis and reports `unknown` unless it is contradicted.
+- **The query fetchers and PromQL evaluation can run their CPU-bound work on
+  the read CPU gate** (ADR-1702 follow-up task 7, issue #1702).
+  `SegmentFetcher`, `LogSegmentFetcher`, `SpanSegmentFetcher` and
+  `QueryEngine` gain `with_read_gate`. With a gate set, each RSEG catalog
+  decode (site `segment_section`, or `segment_sparse_catalog` for the chunked
+  catalog probe) is one gate job the size of its decoded catalog, with the
+  decode's memory reservation moved into the job and shrunk after the matcher
+  filter as before. Each RLOG block the LogQL series path drains
+  (`log_block`) and each RSPAN block the row fetch drains (`span_block`) is
+  one job covering all its pages. A PromQL evaluation whose prefetched sample
+  count is at or above the gate's evaluation floor runs on the gate
+  (`promql_eval`); a smaller one runs inline and counts as inline. A failed
+  job surfaces as the fetcher's typed store error, or as the new
+  `QueryError::CpuGate` for an evaluation. With no gate set every path runs
+  inline exactly as before, and the server does not set one yet: wiring its
+  read gate into the engine and fetchers it builds is a later step. The SQL
+  logs and spans scans still decode inside `poll_next` (task 8).
 
 ### Security
 

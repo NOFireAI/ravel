@@ -52,12 +52,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
-use crate::fetcher::ReadCache;
+use crate::fetcher::{ReadCache, gate_store_error};
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
+use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SectionDesc, kind};
@@ -315,7 +316,12 @@ pub struct LogFetchOutput {
 pub struct LogSegmentScan {
     /// The whole object. Block extents are absolute offsets into it.
     bytes: Bytes,
-    scan: BlockScan,
+    /// `None` only once a gated block decode that held the cursor failed or
+    /// was abandoned; every later call then fails rather than skip blocks.
+    scan: Option<BlockScan>,
+    /// The cursor's counters as of the last time it was held here, reported
+    /// once `scan` is gone.
+    lost_stats: ScanStats,
     erasure: Vec<ErasurePredicate>,
     /// The log path's `decode` span, entered around each block decode and
     /// completed with the block counters when the scan runs out.
@@ -330,6 +336,13 @@ pub struct LogSegmentScan {
     /// Set once [`next_block`](Self::next_block) has reported exhaustion, so
     /// the span's counters are recorded exactly once.
     finished: bool,
+    /// The read CPU gate [`next_block_on_gate`](Self::next_block_on_gate)
+    /// decodes on; `None` decodes inline.
+    read_gate: Option<Arc<ReadGate>>,
+    /// The job size of each gated block decode: the largest uncompressed
+    /// block in the object's PAGE_DIR, since the cursor does not say which
+    /// block it decodes next.
+    block_job_bytes: u64,
 }
 
 impl LogSegmentScan {
@@ -337,12 +350,48 @@ impl LogSegmentScan {
     /// `pages_skipped` grow as blocks are drained; read this after the last
     /// [`next_block`](Self::next_block) for the whole segment's figures.
     pub fn stats(&self) -> ScanStats {
-        self.scan.stats()
+        self.scan.as_ref().map_or(self.lost_stats, BlockScan::stats)
     }
 
     /// Surviving blocks not yet decoded.
     pub fn remaining_blocks(&self) -> usize {
-        self.scan.remaining_blocks()
+        self.scan.as_ref().map_or(0, BlockScan::remaining_blocks)
+    }
+
+    /// [`next_block`](Self::next_block) with the block decode run on the
+    /// fetcher's read gate (ADR-1702 decision 4): the whole block, all its
+    /// pages, is one job, so the decode leaves the runtime worker once the
+    /// block is over the gate's byte floor. Without a gate this is
+    /// `next_block`. Reaching exhaustion submits no job.
+    pub async fn next_block_on_gate(&mut self) -> Result<Option<Vec<LogRecord>>, LogFetchError> {
+        let Some(gate) = self.read_gate.clone() else {
+            return self.next_block();
+        };
+        if self.remaining_blocks() == 0 {
+            return self.next_block();
+        }
+        let Some(mut scan) = self.scan.take() else {
+            return Err(scan_lost(&self.key));
+        };
+        self.lost_stats = scan.stats();
+        let bytes = self.bytes.clone();
+        let span = self.span.clone();
+        let (scan, decoded) = gate
+            .run(
+                ReadSite::LogBlock,
+                JobSize::Bytes(self.block_job_bytes),
+                move || {
+                    let decoded = span.in_scope(|| scan.next_block(&bytes));
+                    (scan, decoded)
+                },
+            )
+            .await
+            .map_err(|err| LogFetchError::Store {
+                key: self.key.clone(),
+                source: gate_store_error(err),
+            })?;
+        self.scan = Some(scan);
+        self.finish_block(decoded)
     }
 
     /// Decode the next surviving block and return its matching, unerased rows,
@@ -352,10 +401,21 @@ impl LogSegmentScan {
     /// pruning and hold no row that matches the exact filter, or have every
     /// matching row erased. Only `None` ends the scan.
     pub fn next_block(&mut self) -> Result<Option<Vec<LogRecord>>, LogFetchError> {
-        let span = self.span.clone();
-        let decoded = span
-            .in_scope(|| self.scan.next_block(&self.bytes))
-            .map_err(|source| corrupt(&self.key, source))?;
+        let Some(scan) = self.scan.as_mut() else {
+            return Err(scan_lost(&self.key));
+        };
+        let bytes = &self.bytes;
+        let decoded = self.span.in_scope(|| scan.next_block(bytes));
+        self.finish_block(decoded)
+    }
+
+    /// The row exit's handling of one decoded block, shared by the inline and
+    /// the gated decode.
+    fn finish_block(
+        &mut self,
+        decoded: Result<Option<Vec<LogRecord>>, LogSegError>,
+    ) -> Result<Option<Vec<LogRecord>>, LogFetchError> {
+        let decoded = decoded.map_err(|source| corrupt(&self.key, source))?;
         let Some(mut records) = decoded else {
             self.finish();
             return Ok(None);
@@ -405,7 +465,7 @@ impl LogSegmentScan {
         // the caller holds it, which is longer than the counter-recording read
         // of `scan.stats()` could borrow it for, so the two cannot share one
         // call site.
-        if self.scan.remaining_blocks() == 0 {
+        if self.scan.is_some() && self.remaining_blocks() == 0 {
             self.finish();
             return Ok(ColumnarBlockOutcome::Exhausted);
         }
@@ -413,11 +473,14 @@ impl LogSegmentScan {
         // borrow of the cursor is not held by a closure.
         let Self {
             bytes,
-            scan,
+            scan: Some(scan),
             span,
             key,
             ..
-        } = self;
+        } = self
+        else {
+            return Err(scan_lost(&self.key));
+        };
         let entered = span.enter();
         let decoded = scan.next_block_columnar(bytes);
         drop(entered);
@@ -438,7 +501,7 @@ impl LogSegmentScan {
             return;
         }
         self.finished = true;
-        let stats = self.scan.stats();
+        let stats = self.stats();
         self.span.record("blocks_scanned", stats.blocks_scanned);
         self.span.record("blocks_total", stats.blocks_total);
         self.span
@@ -608,6 +671,9 @@ pub struct LogSegmentFetcher {
     /// `get_limiter`). Default [`ravel_memory::MemoryBudget::unlimited`], so a
     /// fetcher built with plain `new` never refuses.
     memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// The read CPU gate [`LogSegmentScan::next_block_on_gate`] decodes blocks
+    /// on (ADR-1702 decision 4). `None`, the default, decodes inline.
+    read_gate: Option<Arc<ReadGate>>,
 }
 
 impl LogSegmentFetcher {
@@ -628,6 +694,7 @@ impl LogSegmentFetcher {
             probe_misses: ProbeMissCounter::new(),
             wire_bytes,
             memory_budget,
+            read_gate: None,
         }
     }
 
@@ -751,6 +818,44 @@ impl LogSegmentFetcher {
         self.memory_budget = Arc::clone(&budget);
         self.block_range = self.block_range.with_memory_budget(budget);
         self
+    }
+
+    /// Runs the block decodes of every [`LogSegmentScan`] this fetcher opens on
+    /// `gate` when drained through [`LogSegmentScan::next_block_on_gate`]
+    /// (ADR-1702 decision 4). Each block, with all its pages, is one job.
+    #[must_use]
+    pub fn with_read_gate(mut self, gate: Arc<ReadGate>) -> Self {
+        self.read_gate = Some(gate);
+        self
+    }
+
+    /// A drainable scan over `bytes`, carrying this fetcher's read gate and,
+    /// when one is set, the job size each of its block decodes is charged at.
+    fn scan_handle(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        scan: BlockScan,
+        query: &LogQuery,
+        span: tracing::Span,
+        accounting: &QueryAccounting,
+    ) -> LogSegmentScan {
+        let block_job_bytes = match self.read_gate {
+            Some(_) => max_block_uncompressed_len(&bytes, &self.cfg),
+            None => 0,
+        };
+        LogSegmentScan {
+            bytes,
+            lost_stats: scan.stats(),
+            scan: Some(scan),
+            erasure: query.erasure.clone(),
+            span,
+            key: key.to_string(),
+            accounting: accounting.clone(),
+            finished: false,
+            read_gate: self.read_gate.clone(),
+            block_job_bytes,
+        }
     }
 
     /// This fetcher's own memory budget (bounds `fetch_accounted` and
@@ -1305,15 +1410,9 @@ impl LogSegmentFetcher {
         let key = &seg_ref.data_object_key;
         let span = decode_span();
         let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns, accounting))?;
-        Ok(Some(LogSegmentScan {
-            bytes,
-            scan,
-            erasure: query.erasure.clone(),
-            span,
-            key: key.to_string(),
-            accounting: accounting.clone(),
-            finished: false,
-        }))
+        Ok(Some(
+            self.scan_handle(key, bytes, scan, query, span, accounting),
+        ))
     }
 
     /// Whole-object streaming scan for the predicate-free full-window
@@ -1360,15 +1459,9 @@ impl LogSegmentFetcher {
         let key = &seg_ref.data_object_key;
         let span = decode_span();
         let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns, accounting))?;
-        Ok(Some(LogSegmentScan {
-            bytes,
-            scan,
-            erasure: query.erasure.clone(),
-            span,
-            key: key.to_string(),
-            accounting: accounting.clone(),
-            finished: false,
-        }))
+        Ok(Some(
+            self.scan_handle(key, bytes, scan, query, span, accounting),
+        ))
     }
 
     /// Prune one segment for intra-segment scan partitioning (ADR-0102) WITHOUT
@@ -1961,15 +2054,9 @@ impl LogSegmentFetcher {
         let span = decode_span();
         let scan = span
             .in_scope(|| self.open_scan_subset(key, &bytes, query, columns, indices, accounting))?;
-        Ok(Some(LogSegmentScan {
-            bytes,
-            scan,
-            erasure: query.erasure.clone(),
-            span,
-            key: key.to_string(),
-            accounting: accounting.clone(),
-            finished: false,
-        }))
+        Ok(Some(
+            self.scan_handle(key, bytes, scan, query, span, accounting),
+        ))
     }
 
     /// The byte-fetch half of the tenant-aware funnel: the ts-range pre-check,
@@ -6395,6 +6482,44 @@ fn corrupt(key: &str, source: LogSegError) -> LogFetchError {
     }
 }
 
+/// A [`LogSegmentScan`] whose cursor went with a gated decode that failed or
+/// was abandoned. Permanent: the blocks it had not decoded cannot be read
+/// through this scan, and skipping them would return a partial segment.
+fn scan_lost(key: &str) -> LogFetchError {
+    LogFetchError::Store {
+        key: key.to_string(),
+        source: StoreError::Permanent(
+            "read CPU gate: the scan's cursor was lost with a failed block decode".to_string(),
+        ),
+    }
+}
+
+/// The largest uncompressed block in `bytes`' PAGE_DIR, summed over every
+/// page of the block. `u64::MAX` when the directory cannot be read, so a
+/// block of unknown size is never taken for a small one; the scan's own open
+/// already refused such an object.
+fn max_block_uncompressed_len(bytes: &[u8], cfg: &RlogConfig) -> u64 {
+    let page_dir = footer::open(bytes).ok().and_then(|footer| {
+        let desc = *footer.section(kind::PAGE_DIR)?;
+        let raw = ravel_logseg::read_section(bytes, &desc, cfg).ok()?;
+        PageDir::decode(&raw).ok()
+    });
+    let Some(page_dir) = page_dir else {
+        return u64::MAX;
+    };
+    let mut largest = 0u64;
+    for group in &page_dir.groups {
+        let mut per_block = vec![0u64; group.block_count as usize];
+        for page in group.chunks.iter().flat_map(|chunk| &chunk.pages) {
+            if let Some(len) = per_block.get_mut(page.block as usize) {
+                *len = len.saturating_add(page.uncomp_len);
+            }
+        }
+        largest = per_block.into_iter().fold(largest, u64::max);
+    }
+    largest
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod plan_fast_path_tests {
@@ -10012,5 +10137,194 @@ mod ranged_projection_cost_tests {
             !f.ranged_projection_pays(1, 1.0),
             "a full projection still saves nothing"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod read_gate_tests {
+    //! ADR-1702 follow-up task 7, RLOG site: the LogQL fetch path's block
+    //! decodes run on the read gate, one job per surviving block.
+
+    use super::*;
+    use crate::read_gate_test_support::{floor_zero_gate, site_counts, total_inline};
+    use ravel_catalog::SegmentLevel;
+    use ravel_cpu_gate::{CpuGateConfig, InstantClock};
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const KEY: &str = "t/gated.rlog";
+    const BLOCKS: usize = 4;
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("hello world {ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("request.id".to_string(), AttrValue::Str(format!("r{ts}")))],
+        }
+    }
+
+    /// One block per record, so the object carries exactly [`BLOCKS`] blocks.
+    async fn fixture() -> (Arc<MemoryStore>, SegmentRef) {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer = RlogWriter::new(cfg, identity);
+        for ts in 0..BLOCKS as i64 {
+            writer.push(record(ts)).expect("push");
+        }
+        let bytes = writer.finish().expect("finish");
+        let seg_ref = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: bytes.len() as u64,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: BLOCKS as i64 - 1,
+            ingest_hour_bucket: 0,
+            sample_count: BLOCKS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [9u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        (store, seg_ref)
+    }
+
+    /// Opens the scan the LogQL series path opens and drains it through the
+    /// exit that path drains, returning every record in scan order.
+    async fn drain(fetcher: &LogSegmentFetcher, seg_ref: &SegmentRef) -> Vec<LogRecord> {
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+        let mut scan = fetcher
+            .scan_accounted_with_tenant(
+                seg_ref,
+                TENANT,
+                &query,
+                &ColumnSelection::all(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("scan")
+            .expect("the segment is relevant");
+        let mut records = Vec::new();
+        while let Some(block) = scan.next_block_on_gate().await.expect("block") {
+            records.extend(block);
+        }
+        assert_eq!(scan.stats().blocks_scanned, BLOCKS as u32);
+        records
+    }
+
+    /// With the byte floor at 0, every surviving block is exactly one
+    /// `LogBlock` job, reaching exhaustion submits none, nothing runs inline,
+    /// and the records equal the ungated scan's.
+    ///
+    /// FLIP: in `next_block_on_gate`, read the gate as `None` so every block
+    /// takes the inline `next_block`; the `LogBlock` assertion then reads
+    /// `left: (0, 0), right: (4, 0)`.
+    #[tokio::test]
+    async fn log_block_decodes_run_through_the_read_gate() {
+        let (store, seg_ref) = fixture().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let inline = drain(&LogSegmentFetcher::new(backend.clone()), &seg_ref).await;
+        assert_eq!(inline.len(), BLOCKS);
+
+        let gate = floor_zero_gate();
+        let fetcher = LogSegmentFetcher::new(backend.clone()).with_read_gate(gate.clone());
+        let gated = drain(&fetcher, &seg_ref).await;
+        assert_eq!(format!("{gated:?}"), format!("{inline:?}"));
+        assert_eq!(site_counts(&gate, ReadSite::LogBlock), (BLOCKS as u64, 0));
+        assert_eq!(total_inline(&gate), 0);
+
+        // A floor above every block's size runs each block inline and counts
+        // it there, which also shows the job size was read from the object's
+        // PAGE_DIR rather than taken from the unreadable-directory fallback.
+        let high_floor = Arc::new(ReadGate::new(
+            CpuGateConfig {
+                permits: 1,
+                inline_floor_bytes: u64::MAX,
+                eval_floor_samples: 0,
+            },
+            Arc::new(InstantClock::new()),
+        ));
+        let fetcher = LogSegmentFetcher::new(backend).with_read_gate(high_floor.clone());
+        let small = drain(&fetcher, &seg_ref).await;
+        assert_eq!(format!("{small:?}"), format!("{inline:?}"));
+        assert_eq!(
+            site_counts(&high_floor, ReadSite::LogBlock),
+            (0, BLOCKS as u64)
+        );
+    }
+
+    /// The job size is the largest block's summed uncompressed page length.
+    #[test]
+    fn block_job_size_is_the_largest_uncompressed_block() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut writer = RlogWriter::new(
+            cfg,
+            ObjectIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: [2u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        let mut big = record(1);
+        big.body = "x".repeat(10_000);
+        writer.push(record(0)).expect("push");
+        writer.push(big).expect("push");
+        let bytes = writer.finish().expect("finish");
+        let page_dir = {
+            let footer = footer::open(&bytes).expect("footer");
+            let desc = *footer.section(kind::PAGE_DIR).expect("PAGE_DIR");
+            PageDir::decode(&ravel_logseg::read_section(&bytes, &desc, &cfg).expect("read"))
+                .expect("decode")
+        };
+        let per_block = |block: u32| -> u64 {
+            page_dir
+                .block_pages(block)
+                .expect("block")
+                .iter()
+                .map(|page| page.desc.uncomp_len)
+                .sum()
+        };
+        assert!(per_block(1) > 10_000);
+        assert!(per_block(0) < per_block(1));
+        assert_eq!(max_block_uncompressed_len(&bytes, &cfg), per_block(1));
+        assert_eq!(max_block_uncompressed_len(b"not an object", &cfg), u64::MAX);
     }
 }
