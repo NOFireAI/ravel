@@ -443,7 +443,12 @@ pub fn span_kind_name(kind: i32) -> Option<String> {
 /// violation with no meaningful status; it normalizes to `Unset` rather than
 /// being coerced into an unrelated status the sender never sent (the same
 /// choice [`crate::logs_normalize`] makes for an out-of-range severity).
-fn status_code_from_i32(code: i32) -> StatusCode {
+///
+/// Public because `ravel-cli load --signal spans` maps a status column through
+/// this same function rather than reimplementing the enum mapping (ADR-1751
+/// decision 2): a loaded span and the same span sent over OTLP must land on the
+/// same stored `status_code`, including for an out-of-range value.
+pub fn status_code_from_i32(code: i32) -> StatusCode {
     match code {
         1 => StatusCode::Ok,
         2 => StatusCode::Error,
