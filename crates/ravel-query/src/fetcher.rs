@@ -5046,9 +5046,9 @@ mod tests {
     /// job under its site, nothing runs inline, and every fetch returns what
     /// the ungated fetcher returns.
     ///
-    /// FLIP, one wrap at a time (pass `None` instead of
-    /// `self.read_gate.as_ref()` to that `run_on_read_gate` call, so it runs
-    /// the closure inline as the pre-change code did):
+    /// FLIP, one site at a time (take the `None` arm of that site's `match
+    /// &self.read_gate` whatever the gate, so the decode runs inline as the
+    /// pre-change code did):
     /// - the SERIES_META branch of `decode_selected`: the first
     ///   `SegmentSection` assertion reads `left: (0, 0), right: (1, 0)`;
     /// - the whole-object branch of `decode_selected`: the second
