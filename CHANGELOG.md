@@ -103,6 +103,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A documentation claims registry and its gate** (ADR-1658, issue #1658).
+  `docs/review/claims.yaml` records, for each registered sentence of a normative
+  doc, what it claims, whether the code agrees, and the code or test that makes
+  it true; the seed holds 22 entries. `scripts/check-doc-claims.py` fails when a
+  registered quote no longer occurs once and only once, when a bound symbol or
+  test is no longer defined (a keyword inside a comment, a string or a type
+  position does not count), when a line of a normative doc carries one of the
+  fixed absence markers ("does not exist", "not implemented", "will land", and
+  five more) without an entry, or when a contradicted entry names no issue or a
+  not-implemented one's symbols have all landed. It runs in `make check-docs`
+  and CI's doc-scripts job. The seed registers two sentences in
+  `docs/query-engine.md` the code contradicts (#2082): the stamp carrier's write
+  side, which the logs flush and RLOG compaction paths now call, and per-key
+  `attrs['k']` projection, which ships.
 - **An alert-signal retention sweep that keeps every identity's current-state
   record** (ADR-1688, issue #1688). The alert evaluator writes one object and
   one commit record per transition and nothing ever removed them, so the
