@@ -12,8 +12,9 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, Stor
 use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
+use crate::claim_guard::ClaimSkip;
 use crate::clock::Clock;
-use crate::compact::{CompactionOutcome, compact_bucket};
+use crate::compact::{ClaimedCompaction, CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::retention::{
@@ -152,6 +153,17 @@ pub struct MaintainReport {
     /// L0-record count compaction exposes without an extra listing, so it is
     /// the figure `ravel_maintain_l0_records_pending` renders (issue #1729).
     pub l0_records_pending: usize,
+    /// Buckets this pass did not evaluate because another attempt holds their
+    /// advisory compaction claim (ADR-1029 decision 5), plus the ones skipped
+    /// without a store request because a previous tick's observation put them
+    /// on hold until the holder's lease expires. Never counted as compacted:
+    /// this process did no merge for them, and the holder may still be
+    /// running one.
+    pub claim_skipped: usize,
+    /// Buckets whose merge started under a claim this process then lost, and
+    /// which cancelled at a checkpoint and published nothing (ADR-1029
+    /// decision 3). Also never counted as compacted.
+    pub claim_cancelled: usize,
     /// The largest retention lag this pass observed, in nanoseconds: for the
     /// oldest bucket that is expired (past `bucket_end + retention_window`) yet
     /// still physically present (tombstoned, swept-partial, or blocked by a
@@ -170,6 +182,14 @@ pub struct MaintainReport {
     /// under the true lag. It is the figure `ravel_maintain_retention_lag_seconds`
     /// renders (issue #1729).
     pub retention_lag_ns: i64,
+}
+
+/// The claim hold a skipped bucket earns, as the injected clock reads it: the
+/// observation's reschedule point (the holder's expiry plus this contender's
+/// deterministic jitter) converted from unix milliseconds to nanoseconds.
+/// Saturating, so an absurd observed expiry cannot wrap into the past.
+fn reschedule_ns(skip: &ClaimSkip) -> i64 {
+    skip.reschedule_after_unix_ms.saturating_mul(1_000_000)
 }
 
 /// Retention lag, in nanoseconds, of a bucket that is expired yet still present:
@@ -442,6 +462,15 @@ struct MemoEntry {
 #[derive(Debug, Clone)]
 pub struct MaintainMemo {
     entries: HashMap<BucketKey, MemoEntry>,
+    /// Buckets another attempt holds an advisory compaction claim on, and the
+    /// clock reading before which re-attempting one is pointless (the observed
+    /// expiry plus this contender's jitter, ADR-1029 decision 1 step 2).
+    ///
+    /// In memory only, never in the durable snapshot: it is a scheduling hint
+    /// whose whole lifetime is shorter than one lease, and a restarted worker
+    /// paying one extra claim request per bucket is cheaper than carrying a
+    /// stale hold across it.
+    claim_deferred_until_ns: HashMap<BucketKey, i64>,
     reverify_interval_ns: i64,
     /// When [`crate::sweep::sweep_shard`] (the full-keyspace safety-net pass,
     /// not [`crate::sweep::sweep_shard_zoned`]) last ran for a `(tenant,
@@ -461,6 +490,7 @@ impl MaintainMemo {
     pub fn new(reverify_interval_ns: i64) -> Self {
         MaintainMemo {
             entries: HashMap::new(),
+            claim_deferred_until_ns: HashMap::new(),
             reverify_interval_ns,
             last_full_sweep_ns: HashMap::new(),
         }
@@ -612,8 +642,19 @@ impl MaintainMemo {
         if let Some(ns) = self.last_full_sweep_ns.remove(&(tenant, signal, shard)) {
             moved_sweep.insert((tenant, signal, shard), ns);
         }
+        let mut moved_defer = HashMap::new();
+        self.claim_deferred_until_ns
+            .retain(|(t, s, sh, hour), until| {
+                if *t == tenant && *s == signal && *sh == shard {
+                    moved_defer.insert((*t, *s, *sh, *hour), *until);
+                    false
+                } else {
+                    true
+                }
+            });
         MaintainMemo {
             entries: moved,
+            claim_deferred_until_ns: moved_defer,
             reverify_interval_ns: self.reverify_interval_ns,
             last_full_sweep_ns: moved_sweep,
         }
@@ -624,7 +665,31 @@ impl MaintainMemo {
     /// this never overwrites another unit's entry.
     pub fn merge_unit(&mut self, unit: MaintainMemo) {
         self.entries.extend(unit.entries);
+        self.claim_deferred_until_ns
+            .extend(unit.claim_deferred_until_ns);
         self.last_full_sweep_ns.extend(unit.last_full_sweep_ns);
+    }
+
+    /// Hold `key` until `until_ns`: another attempt holds its advisory
+    /// compaction claim, so a re-attempt before the holder's lease can have
+    /// expired would spend a PUT-class request to learn the same thing
+    /// (ADR-1029 decision 1 step 2: never poll an active claim).
+    pub fn defer_claim_until(&mut self, key: BucketKey, until_ns: i64) {
+        self.claim_deferred_until_ns.insert(key, until_ns);
+    }
+
+    /// Whether `key` is still on hold behind another attempt's claim at
+    /// `now_ns`. Clears the hold once it lapses, so the entry does not outlive
+    /// the lease it was derived from.
+    pub fn claim_deferred(&mut self, key: &BucketKey, now_ns: i64) -> bool {
+        match self.claim_deferred_until_ns.get(key) {
+            Some(until) if now_ns < *until => true,
+            Some(_) => {
+                self.claim_deferred_until_ns.remove(key);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Whether a full-keyspace sweep pass ([`crate::sweep::sweep_shard`]) is
@@ -673,6 +738,9 @@ impl MaintainMemo {
         present: &HashSet<u32>,
     ) {
         self.entries.retain(|(t, s, sh, hour), _| {
+            *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+        });
+        self.claim_deferred_until_ns.retain(|(t, s, sh, hour), _| {
             *t != tenant || *s != signal || *sh != shard || present.contains(hour)
         });
     }
@@ -1275,6 +1343,15 @@ pub async fn scan_and_maintain_with_memo(
         // interior bucket terminal and the entry is still fresh (within
         // `CompactorConfig::interior_reverify_ns`), so skip it without
         // listing or reading anything.
+        // A bucket another attempt holds the claim on is on hold until that
+        // claim can have expired. Checked before the zone split, because a
+        // head or tail hour is evaluated every tick and is exactly the bucket
+        // a contender would otherwise re-request a claim for on every one.
+        if memo.claim_deferred(&key, now) {
+            report.claim_skipped += 1;
+            continue;
+        }
+
         let zone = classify_zone(hour, now, config, retention_window_ns);
         if zone != Zone::Interior {
             report.head_tail_hours.push(hour);
@@ -1335,18 +1412,34 @@ pub async fn scan_and_maintain_with_memo(
             // it (compaction always ran in these arms; see maintain_bucket).
             RetentionOutcome::NoPolicy
             | RetentionOutcome::NotSealed
-            | RetentionOutcome::NotExpired => match compaction {
-                Some(CompactionOutcome::NotSealed) => report.not_sealed += 1,
-                Some(CompactionOutcome::Compacted { .. }) => report.compacted += 1,
-                Some(CompactionOutcome::BelowMinInputs { count }) => {
+            | RetentionOutcome::NotExpired => match &compaction {
+                Some(ClaimedCompaction::Ran(CompactionOutcome::NotSealed)) => {
+                    report.not_sealed += 1
+                }
+                Some(ClaimedCompaction::Ran(CompactionOutcome::Compacted { .. })) => {
+                    report.compacted += 1
+                }
+                Some(ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs { count })) => {
                     report.already_done += 1;
                     report.l0_records_pending += count;
                 }
-                Some(
+                Some(ClaimedCompaction::Ran(
                     CompactionOutcome::AlreadyCompacted
                     | CompactionOutcome::RewritePresent
                     | CompactionOutcome::Tombstoned,
-                ) => report.already_done += 1,
+                )) => report.already_done += 1,
+                // Another attempt holds the claim: this process merged nothing
+                // and must not report a compaction. Hold the bucket until the
+                // holder's lease expires (plus this contender's jitter) so the
+                // next tick does not re-issue the claim request, which is the
+                // polling the protocol exists to avoid.
+                Some(ClaimedCompaction::SkippedClaimed(skip)) => {
+                    report.claim_skipped += 1;
+                    memo.defer_claim_until(key, reschedule_ns(skip));
+                }
+                // The claim was lost mid-merge and the run cancelled without
+                // publishing. The holder that took it over is doing the work.
+                Some(ClaimedCompaction::Cancelled { .. }) => report.claim_cancelled += 1,
                 None => {}
             },
         }
@@ -1354,12 +1447,20 @@ pub async fn scan_and_maintain_with_memo(
         // Update the memo from this fresh, authoritative evaluation: remember a
         // newly terminal bucket, and forget one that transitioned away from a
         // terminal state (e.g. a compacted bucket that just became expired).
-        match classify_terminal(&retention_outcome, &compaction) {
+        // A skipped or cancelled run observed nothing about the bucket, so it
+        // is classified on the retention outcome alone (which is `None` for
+        // compaction) and is never memoized as terminal on this process's
+        // behalf.
+        let ran = compaction
+            .as_ref()
+            .and_then(ClaimedCompaction::ran)
+            .cloned();
+        match classify_terminal(&retention_outcome, &ran) {
             Some(state) => {
                 memo.mark_terminal(key, state, now);
                 // Carry this evaluation's below-threshold population on the
                 // entry so the ticks that skip the bucket can still add it.
-                if let Some(CompactionOutcome::BelowMinInputs { count }) = compaction {
+                if let Some(CompactionOutcome::BelowMinInputs { count }) = ran {
                     memo.set_l0_records_pending(&key, count);
                 }
             }

@@ -115,7 +115,7 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         .request_ledger
         .as_ref()
         .and_then(|l| l.reset_for_run_unless_open().then(|| l.run_scope_guard()));
-    let outcome = rewrite_and_publish_scoped::<C>(
+    let outcome = load_then_rewrite::<C>(
         store,
         clock,
         config,
@@ -167,6 +167,11 @@ pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok:
             publish_requests = r.publish.requests,
             publish_wire_bytes_received = r.publish.wire_bytes_received,
             publish_wire_bytes_sent = r.publish.wire_bytes_sent,
+            // The advisory claim protocol's own requests (ADR-1029 decision 4),
+            // never pooled into the merge's phases. Requests only: the claim
+            // payloads are built inside `ravel_fleet::claim` and do not cross
+            // this crate's seam, so its byte figures stay zero.
+            coordinate_requests = r.coordinate.requests,
             total_requests = r.total_requests(),
             total_wire_bytes_received = r.total_wire_bytes_received(),
             total_wire_bytes_sent = r.total_wire_bytes_sent(),
@@ -176,14 +181,95 @@ pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok:
 }
 
 /// [`rewrite_and_publish`]'s body, with the request ledger's run scope already
-/// opened and guaranteed to be closed by its caller.
+/// opened and guaranteed to be closed by its caller: read the input commit
+/// records, then run the primitive over them.
 #[allow(clippy::too_many_arguments)]
-async fn rewrite_and_publish_scoped<C: SegmentCodec>(
+async fn load_then_rewrite<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     config: &CompactorConfig,
     bucket: &Bucket,
     commit_keys: &[String],
+    conservation: impl ConservationPredicate,
+    start_ns: i64,
+) -> Result<RewriteOutcome> {
+    let inputs = load_inputs_with_ledger(
+        store,
+        bucket,
+        commit_keys,
+        config.input_read_concurrency,
+        config.request_ledger.as_ref(),
+    )
+    .await?;
+    rewrite_and_publish_loaded::<C>(store, clock, config, bucket, inputs, conservation, start_ns)
+        .await
+}
+
+/// [`rewrite_and_publish`] over inputs the caller already read.
+///
+/// Compaction's coordinated driver ([`crate::compact::compact_bucket_claimed`])
+/// enters here: it needs the decoded input records before the primitive runs,
+/// because the advisory claim's cost gate is priced on their stored bytes
+/// (ADR-1029 decision 4) and the claim is taken before the first catalog read.
+/// Loading them there and handing them over keeps the input GETs at exactly one
+/// set per run.
+///
+/// The caller owns the request ledger's run scope, as it does for
+/// [`rewrite_and_publish`] when an outer driver opened one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    inputs: Vec<crate::read::InputRecord>,
+    conservation: impl ConservationPredicate,
+    start_ns: i64,
+) -> Result<RewriteOutcome> {
+    // A cancellation checkpoint anywhere below unwinds to here as the typed
+    // `ClaimLost` signal (ADR-1029 decision 3): the run stops and publishes
+    // nothing, which is exactly `PublishOutcome::Abandoned`'s shape and
+    // inherits its safety argument verbatim. `parts` is 0 because a cancelled
+    // run publishes no part set; the parts it had already PUT are left in
+    // place, content-addressed and byte-identical to what a later run over the
+    // same frozen input set republishes.
+    match rewrite_and_publish_guarded::<C>(
+        store,
+        clock,
+        config,
+        bucket,
+        inputs,
+        conservation,
+        start_ns,
+    )
+    .await
+    {
+        Err(MaintainError::ClaimLost { at }) => {
+            tracing::info!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                checkpoint = at,
+                "compaction run cancelled at a claim checkpoint; nothing published (ADR-1029)"
+            );
+            Ok(RewriteOutcome {
+                parts: 0,
+                publish: PublishOutcome::Abandoned,
+            })
+        }
+        other => other,
+    }
+}
+
+/// [`rewrite_and_publish_loaded`]'s body, which may unwind with
+/// [`MaintainError::ClaimLost`] from any of the cancellation checkpoints.
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_and_publish_guarded<C: SegmentCodec>(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    inputs: Vec<crate::read::InputRecord>,
     conservation: impl ConservationPredicate,
     start_ns: i64,
 ) -> Result<RewriteOutcome> {
@@ -194,16 +280,14 @@ async fn rewrite_and_publish_scoped<C: SegmentCodec>(
     if let Some(t) = config.merge_memory_tracker.as_ref() {
         t.reset_for_run();
     }
-    let inputs = load_inputs_with_ledger(
-        store,
-        bucket,
-        commit_keys,
-        config.input_read_concurrency,
-        config.request_ledger.as_ref(),
-    )
-    .await?;
     C::validate_rewrite_inputs(&inputs)?;
     let hash = input_set_hash(&inputs);
+
+    // Cancellation checkpoint 2 (ADR-1029 decision 3): the input set is
+    // listed, read and hashed, and nothing has been fetched per input yet. The
+    // catalog fan-out below is the first read whose cost scales with the
+    // bucket, so a claim lost by here saves all of it.
+    crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::InputSet).await?;
 
     // Catalogs aligned one-to-one with `inputs` (canonical order): the merge
     // relies on that alignment for deterministic tie-breaking, same as
@@ -226,6 +310,12 @@ async fn rewrite_and_publish_scoped<C: SegmentCodec>(
         .await?;
 
     let parts = C::build_parts(store, config, bucket, &inputs, catalogs, &hash).await?;
+
+    // Cancellation checkpoint 5 (ADR-1029 decision 3): the last quiescent
+    // point before the record PUT. A claim lost here stops the run with every
+    // part already written and no record naming them, which is what
+    // `PublishOutcome::Abandoned` is for.
+    crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::Publish).await?;
 
     let publish = publish_record_with_conservation(
         store,
