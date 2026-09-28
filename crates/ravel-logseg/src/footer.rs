@@ -11,6 +11,7 @@ use prost::Message;
 use ravel_proto::logseg::v1 as pb;
 
 use crate::error::LogSegError;
+use crate::source::ByteSource;
 
 /// Trailer magic, last 4 bytes of every RLOG object.
 pub const MAGIC: [u8; 4] = *b"RLG1";
@@ -303,6 +304,30 @@ pub fn open(bytes: &[u8]) -> Result<LogFooter, LogSegError> {
     match open_from_suffix(bytes, bytes.len() as u64)? {
         SuffixOutcome::Ready(footer) => Ok(footer),
         // Unreachable: a whole object covers its own footer.
+        SuffixOutcome::NeedRange { .. } => Err(LogSegError::Corrupted(
+            "footer not covered by whole object".into(),
+        )),
+    }
+}
+
+/// [`open`] over a [`ByteSource`]: reads the trailer, then the footer and
+/// trailer range it names, through [`open_from_suffix`]. On a whole buffer this
+/// runs the same checks in the same order as [`open`] and returns the same
+/// footer or error; on a [`crate::SparseObject`] it needs only those two
+/// ranges placed.
+pub fn open_source<S: ByteSource + ?Sized>(src: &S) -> Result<LogFooter, LogSegError> {
+    let total = src.object_len();
+    let trailer_len = TRAILER_LEN as u64;
+    if total < trailer_len {
+        return Err(LogSegError::Corrupted("object smaller than trailer".into()));
+    }
+    let trailer = src.read(total - trailer_len, trailer_len)?;
+    let (offset, len) = match open_from_suffix(&trailer, total)? {
+        SuffixOutcome::Ready(footer) => return Ok(footer),
+        SuffixOutcome::NeedRange { offset, len } => (offset, len),
+    };
+    match open_from_suffix(&src.read(offset, len)?, total)? {
+        SuffixOutcome::Ready(footer) => Ok(footer),
         SuffixOutcome::NeedRange { .. } => Err(LogSegError::Corrupted(
             "footer not covered by whole object".into(),
         )),

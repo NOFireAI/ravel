@@ -975,7 +975,11 @@ async fn version_4_all_columns_all_blocks_crosses_over_to_one_whole_object_get()
         bytes.len() as u64,
         "the whole object"
     );
-    assert_eq!(got.as_ref(), bytes.as_slice(), "and it is the object");
+    assert_eq!(
+        got.as_whole().map(AsRef::as_ref),
+        Some(bytes.as_slice()),
+        "and it is the object, whole"
+    );
     // The probe plus the crossover read, and nothing in between: no front
     // section GET is paid before the decision (an all-columns query with no
     // numeric arm needs no FIELD_DIR to resolve either channel).
@@ -1049,7 +1053,11 @@ async fn version_4_projection_whose_bridged_runs_cross_the_threshold_becomes_one
         bytes.len() as u64,
         "the whole object"
     );
-    assert_eq!(got.as_ref(), bytes.as_slice(), "and it is the object");
+    assert_eq!(
+        got.as_whole().map(AsRef::as_ref),
+        Some(bytes.as_slice()),
+        "and it is the object, whole"
+    );
 }
 
 // ---- 4. checksums on a projected read ------------------------------------
@@ -2432,4 +2440,167 @@ async fn narrow_projection_amplification_is_below_the_legacy_page_byte_ratio() {
         "the legacy numerator overstates by exactly the bytes version 4 avoids, \
          less the bridging slack this read paid to stay under the cap"
     );
+}
+
+// ---- 10. sparse assembly: a ranged read holds what it placed (#2066) -------
+
+/// The placed extents of the narrow projection
+/// `version_4_projected_read_bridges_chunk_runs_to_the_four_get_cap` reads,
+/// derived from the directories rather than from the fetcher: the tail probe
+/// (`ranged` sizes it to exactly the tail), the one STREAM_DIR+FIELD_DIR span,
+/// and the four bridged chunk runs. Returns `(placed, projection)`.
+fn narrow_projection_placed_bytes(bytes: &[u8]) -> (u64, ColumnSelection) {
+    let sel = ColumnSelection::fixed_only().with_flags();
+    let ids = resolved(bytes, &sel).expect("a projection, not all columns");
+    let f = footer_of(bytes);
+    let stream = f.section(kind::STREAM_DIR).expect("STREAM_DIR");
+    let field = f.section(kind::FIELD_DIR).expect("FIELD_DIR");
+    assert_eq!(
+        stream.offset + stream.len,
+        field.offset,
+        "the front sections are adjacent, so their span is their two lengths"
+    );
+    let front = stream.len + field.len;
+    let all_blocks: Vec<usize> = (0..BLOCKS).collect();
+    let raw: Vec<(u64, u64)> = expected_runs(bytes, &all_blocks, Some(&ids), 0)
+        .into_iter()
+        .map(|(s, l)| (s, s + l))
+        .collect();
+    let runs: u64 = bound_runs_oracle(&raw, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT)
+        .iter()
+        .map(|(s, e)| e - s)
+        .sum();
+    // Literals beside the derivation, so a change in the fixture's layout or
+    // in the oracle moves a number rather than two agreeing sums. The 46 run
+    // bytes are the wire figure the amplification test above pins.
+    assert_eq!(
+        (tail_len(bytes), front, runs),
+        (6_916, 84, 46),
+        "tail probe, front span, bridged runs"
+    );
+    (tail_len(bytes) + front + runs, sel)
+}
+
+/// Issue #2066: a narrow projection over a three-row-group version-4 object
+/// holds exactly the bytes it placed, not the object. The assembly gauge and
+/// the fetch budget's `fetch_reserved` both read the placed figure -- the tail
+/// probe, the front-section span and the four bridged chunk runs, 6,916 + 84 +
+/// 46 = 7,046 of an 81,321-byte object -- while the reader holds the bytes,
+/// and both return to zero when it drops them.
+///
+/// Prove-the-test: against the object-sized pooled buffer this replaced, the
+/// gauge and `fetch_reserved` both read 81,321 at the first figure asserted
+/// after the fetch. A sparse assembler that still reserved the object size
+/// fails the `fetch_reserved` assertion; one that kept a pooled object-sized
+/// buffer beside its regions and charged it fails the gauge assertion.
+#[tokio::test]
+async fn version_4_narrow_projection_holds_exactly_its_placed_bytes() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let object_size = bytes.len() as u64;
+    let (placed, sel) = narrow_projection_placed_bytes(&bytes);
+    assert_eq!(object_size, 81_321, "fixture object size");
+    assert_eq!(placed, 7_046, "placed bytes of the narrow projection");
+
+    let recording = RecordingStore::new(store_with(&bytes).await);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * object_size));
+    let br = ranged(store, &bytes).with_memory_budget(Arc::clone(&budget));
+    let seg = seg_ref(object_size, &recs);
+    let (got, stats) = br
+        .fetch_object_projected(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &sel,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("projected fetch");
+    assert!(!stats.whole_object, "the object is not read whole");
+
+    // What the store was asked for is what the oracle names: the suffix probe
+    // of `tail_len` plus every range GET.
+    assert_eq!(recording.suffix_gets(), 1, "one suffix probe");
+    let ranged_bytes: u64 = recording.ranges().iter().map(|(a, b)| b - a).sum();
+    assert_eq!(ranged_bytes + tail_len(&bytes), placed);
+
+    let held = br.assembly_buffer_stats();
+    assert_eq!(
+        (held.live_bytes, held.peak_live_bytes),
+        (placed, placed),
+        "the read holds its placed bytes, not the {object_size}-byte object"
+    );
+    assert_eq!(
+        budget.fetch_reserved(),
+        placed,
+        "the fetch reservation covers the placed bytes, not the object"
+    );
+
+    drop(got);
+    assert_eq!(br.assembly_buffer_stats().live_bytes, 0);
+    assert_eq!(
+        budget.fetch_reserved(),
+        0,
+        "the reservation releases when the reader drops the bytes"
+    );
+}
+
+/// Issue #2066, ADR-1170 decision 2: during the read of
+/// `version_4_narrow_projection_holds_exactly_its_placed_bytes`, with the
+/// first chunk-run GET held in flight, `fetch_reserved` already equals the
+/// read's placed bytes: the probe and the front span are placed and reserved,
+/// and the four runs were reserved together before any of them was issued.
+/// Nothing else is reserved, and the figure returns to zero once the reader
+/// drops the bytes. GET 1 is the probe, GET 2 the front span, GET 3 the first
+/// chunk run.
+///
+/// Prove-the-test: against the object-sized reservation this replaced, the
+/// in-flight figure read the object size plus the transient run reservation,
+/// 81,321 + 46 = 81,367, not 7,046.
+#[tokio::test]
+async fn version_4_ranged_read_reserves_its_placed_bytes_while_a_get_is_in_flight() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let object_size = bytes.len() as u64;
+    let (placed, sel) = narrow_projection_placed_bytes(&bytes);
+
+    let faulty = Arc::new(FaultStore::new(
+        store_with(&bytes).await,
+        FaultPlan::empty(),
+    ));
+    let gate = faulty.hold(Op::Get, Some(KEY.to_string()), Occurrence::Nth(3));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+    let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * object_size));
+    let br = ranged(store, &bytes).with_memory_budget(Arc::clone(&budget));
+    let seg = seg_ref(object_size, &recs);
+
+    let task = tokio::spawn(async move {
+        br.fetch_object_projected(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &sel,
+            &QueryAccounting::new(),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+        .await
+        .expect("the first chunk-run GET reaches the gate within 30 s");
+    assert_eq!(
+        budget.fetch_reserved(),
+        placed,
+        "mid-read, the reservation is the placed bytes, not the object"
+    );
+    for id in gate.held() {
+        assert!(gate.release(id), "held id must release");
+    }
+    let (got, stats) = task.await.expect("join").expect("projected fetch");
+    assert!(!stats.whole_object);
+    assert_eq!(budget.fetch_reserved(), placed);
+    drop(got);
+    assert_eq!(budget.fetch_reserved(), 0);
 }

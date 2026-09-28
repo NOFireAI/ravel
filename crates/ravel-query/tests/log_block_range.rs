@@ -316,8 +316,8 @@ fn subset_object() -> (Vec<LogRecord>, Vec<u8>) {
 
 /// A 20-block object over the same ts range as [`subset_object`] but with
 /// different, longer bodies, so its object bytes differ at essentially every
-/// offset and its total size is larger. Used to DIRTY a pooled assembly buffer
-/// before the object under test reuses it (issue #894).
+/// offset and its total size is larger. Read before the object under test by
+/// Test 1c, the case a pooled assembly buffer once made dangerous (issue #894).
 fn dirtying_object() -> (Vec<LogRecord>, Vec<u8>) {
     let records: Vec<LogRecord> = (0..20)
         .map(|ts| {
@@ -390,18 +390,18 @@ async fn block_range_rows_match_whole_object_over_same_candidate_set() {
     );
 }
 
-// ---- Test 1b: the assembly buffer is pooled, not allocated per object -----
+// ---- Test 1b: a ranged read holds its placed bytes, not the object ---------
 
-/// Issue #894: three ranged reads of one object cost ONE object-sized buffer
-/// allocation and ONE whole-object zeroing between them, not three of each.
-/// The figures are exact: the second and third reads check out the buffer the
-/// first returned, at no allocation and no `memset`.
+/// Issue #2066: each of three ranged reads of one object holds exactly the
+/// bytes it placed, a strict subset of the object, and releases them when the
+/// assembled bytes drop, so nothing is live between reads and the high-water
+/// mark is one read's placed bytes, not an object size.
 ///
-/// Prove-the-test: restore `ObjectAssembler::new`'s body to
-/// `buf: vec![0u8; total_size]` (dropping the `pool.acquire` call) and this
-/// asserts `allocated: 3, reused: 0, zeroed_bytes: 3 * object_size` instead.
+/// Prove-the-test: against the pooled object-sized buffer this replaced, the
+/// live figure after each fetch read the object size, and the
+/// `held < object_size` and `live_bytes == held` assertions fail.
 #[tokio::test]
-async fn ranged_reads_reuse_one_pooled_assembly_buffer() {
+async fn ranged_reads_hold_only_their_placed_bytes() {
     let (records, bytes) = subset_object();
     let (_blocks_offset, _blocks_len, tail_len) = layout(&bytes);
     let object_size = bytes.len() as u64;
@@ -419,6 +419,7 @@ async fn ranged_reads_reuse_one_pooled_assembly_buffer() {
         .with_coverage_threshold(2.0);
     assert_eq!(br.assembly_buffer_stats(), AssemblyBufferStats::default());
 
+    let mut held = Vec::new();
     for _ in 0..3 {
         let (assembled, stats) = br
             .fetch_object(&seg, TENANT, 6, 13, &QueryAccounting::new())
@@ -426,38 +427,37 @@ async fn ranged_reads_reuse_one_pooled_assembly_buffer() {
             .expect("ranged fetch");
         assert!(!stats.whole_object, "the ranged path ran, not a crossover");
         assert_eq!(assembled.len() as u64, object_size);
-        // The buffer goes back to the pool when the assembled `Bytes` that
-        // borrows it is dropped, which is what the next iteration reuses.
+        assert!(
+            assembled.held_len() < object_size,
+            "a pruned read holds a strict subset: {} of {object_size}",
+            assembled.held_len()
+        );
+        assert_eq!(br.assembly_buffer_stats().live_bytes, assembled.held_len());
+        held.push(assembled.held_len());
         drop(assembled);
+        assert_eq!(br.assembly_buffer_stats().live_bytes, 0);
     }
 
+    assert!(held.iter().all(|h| *h == held[0]), "same read, same bytes");
     assert_eq!(
         br.assembly_buffer_stats(),
         AssemblyBufferStats {
-            allocated: 1,
-            reused: 2,
-            zeroed_bytes: object_size,
             // Each `assembled` is dropped before the next iteration, so one
-            // buffer is out at a time and nothing is live at the end.
+            // read's regions are held at a time and nothing is live at the end.
             live_bytes: 0,
-            peak_live_bytes: object_size,
+            peak_live_bytes: held[0],
         }
     );
 }
 
-// ---- Test 1c: differential ON a dirty reused buffer ----------------------
+// ---- Test 1c: differential after another object's ranged read -------------
 
-/// The differential above, but with the pooled buffer already carrying ANOTHER
-/// object's bytes in the gaps: the second read's rows must still be
-/// byte-identical to the whole-object path's. Without the pool the gaps were
-/// zeros, so this is the case reuse introduced (issue #894).
-///
-/// Prove-the-test: this passes before the change too (there the buffer is
-/// freshly zeroed); it is the guard that the change did not break the
-/// invariant, and it fails if `place`/`slice` ever stop covering a byte the
-/// reader interprets -- as it does if `ObjectAssembler::new` reuses a buffer
-/// while `AssemblyBuffer::as_slice` returns the whole vector rather than
-/// `[..len]`.
+/// The differential above, run right after a ranged read of ANOTHER, larger
+/// object through the same fetcher: the second read's rows must still be
+/// byte-identical to the whole-object path's. This guarded the pooled buffer
+/// of issue #894, whose gaps held the previous object's bytes; with sparse
+/// assembly (issue #2066) nothing carries from one read to the next, and this
+/// keeps the ordering case covered.
 #[tokio::test]
 async fn ranged_rows_match_whole_object_on_a_buffer_dirtied_by_another_object() {
     let (dirty_records, dirty_bytes) = dirtying_object();
@@ -514,22 +514,17 @@ async fn ranged_rows_match_whole_object_on_a_buffer_dirtied_by_another_object() 
     );
     drop(dirtying);
     assert_eq!(
-        br.assembly_buffer_stats().allocated,
-        1,
-        "one buffer so far, now idle in the pool"
+        br.assembly_buffer_stats().live_bytes,
+        0,
+        "the first read's regions are released, nothing retained"
     );
 
-    // Second read: the object under test, on that same buffer.
+    // Second read: the object under test.
     let reused = ranged
         .fetch_accounted_with_tenant(&seg, TENANT, &query, &QueryAccounting::new())
         .await
         .expect("ranged fetch")
         .expect("in range");
-    assert_eq!(
-        br.assembly_buffer_stats().reused,
-        1,
-        "the second read ran on the first read's buffer, not a fresh one"
-    );
 
     assert!(!whole.records.is_empty(), "the subset is nontrivial");
     assert_eq!(

@@ -26,6 +26,7 @@ pub mod ranged;
 pub mod reader;
 pub mod record;
 pub mod skip_index;
+pub mod source;
 pub mod stream_dir;
 pub mod varint;
 pub mod writer;
@@ -49,9 +50,10 @@ pub use footer::{SuffixOutcome, open_from_suffix};
 pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockRows, StreamBlockSpan};
 pub use reader::{
     BlockScan, RlogReader, ScanStats, decode_section, decode_section_accounted, read_section,
-    read_section_accounted, stream_attr_pairs,
+    read_section_accounted, read_section_accounted_from, read_section_from, stream_attr_pairs,
 };
 pub use record::{FieldSel, FieldType, LogRecord, Predicate, stream_attrs_bytes};
+pub use source::{ByteSource, SparseObject};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
 
 // Re-exported for callers building records; these are the ravel-types identity

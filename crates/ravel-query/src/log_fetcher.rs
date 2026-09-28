@@ -32,8 +32,9 @@
 //! RLOG object and every fixture here. Above it they read only the parts
 //! skip-index pruning proved relevant, through [`BlockRangeFetcher`]: a suffix
 //! probe that pins the etag, the directory sections, and coalesced ranges over
-//! the relevant data, assembled into an object-sized buffer the unchanged
-//! reader decodes from. What a "relevant part" is depends on the object's
+//! the relevant data, held as the fetched regions themselves (a
+//! [`LogObjectBytes`], issue #2066) that the reader decodes from at the
+//! object's absolute offsets. What a "relevant part" is depends on the object's
 //! version. A version-3 object's block is one contiguous byte range, so the
 //! ranges are candidate blocks and the projection is a decode choice only. A
 //! version-4 object stores each row group's pages column-major and lists them
@@ -46,6 +47,7 @@
 //! [`LogSegmentFetcher::fetch`]/[`LogSegmentFetcher::fetch_accounted`] entry
 //! points have no cache key and always read the whole object in one GET.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,9 +68,9 @@ use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
-    AttrValue, BlockScan, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError, LogStreamId,
-    Predicate, RlogConfig, RlogReader, ScanStats, SuffixOutcome, decode_section_accounted,
-    open_from_suffix, read_section_accounted,
+    AttrValue, BlockScan, ByteSource, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError,
+    LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SparseObject, SuffixOutcome,
+    decode_section_accounted, open_from_suffix, read_section_accounted_from,
 };
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
@@ -314,8 +316,9 @@ pub struct LogFetchOutput {
 /// records `fetch` would return, in the same order, which is how `fetch` is
 /// implemented.
 pub struct LogSegmentScan {
-    /// The whole object. Block extents are absolute offsets into it.
-    bytes: Bytes,
+    /// The object's bytes as the fetch holds them, whole or placed. Block
+    /// extents are absolute offsets into the object.
+    bytes: LogObjectBytes,
     /// `None` only once a gated block decode that held the cursor failed or
     /// was abandoned; every later call then fails rather than skip blocks.
     scan: Option<BlockScan>,
@@ -895,7 +898,7 @@ impl LogSegmentFetcher {
     async fn open_scan_on_gate(
         &self,
         key: &str,
-        bytes: &Bytes,
+        bytes: &LogObjectBytes,
         query: &LogQuery,
         columns: &ColumnSelection,
         indices: Option<&[usize]>,
@@ -948,7 +951,7 @@ impl LogSegmentFetcher {
     fn scan_handle(
         &self,
         key: &str,
-        bytes: Bytes,
+        bytes: LogObjectBytes,
         scan: BlockScan,
         block_job_bytes: u64,
         query: &LogQuery,
@@ -1249,9 +1252,9 @@ impl LogSegmentFetcher {
     /// `accounting` receives the STREAM_DIR decompression this decode performs
     /// (issue #1401 finding 3); `bytes` is assumed already fetched and its wire
     /// bytes already charged by the caller.
-    pub fn matching_streams(
+    pub fn matching_streams<S: ByteSource + ?Sized>(
         &self,
-        bytes: &[u8],
+        bytes: &S,
         filters: &[StreamAttrEquals],
         accounting: &QueryAccounting,
     ) -> Result<Vec<LogStreamId>, LogSegError> {
@@ -1391,7 +1394,8 @@ impl LogSegmentFetcher {
             // This funnel issues exactly one whole-object GET per call.
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", bytes.len() as u64);
-            self.decode_spanned(key, &bytes, query, accounting).await
+            self.decode_spanned(key, &bytes.into(), query, accounting)
+                .await
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -1484,11 +1488,11 @@ impl LogSegmentFetcher {
     /// produced them depends on the object's size
     /// ([`with_block_range_threshold`](Self::with_block_range_threshold),
     /// ADR-0107). At or below the threshold it is one [`GetRange::Full`] GET of
-    /// the whole object. Above it the bytes are an object-sized buffer with only
-    /// the directory sections and the pruning-relevant blocks populated, fetched
-    /// by [`BlockRangeFetcher`] as a probe plus coalesced block ranges, so the
-    /// raw bytes moved are proportional to pruning rather than to object size --
-    /// but the resident buffer is still object-sized, per call.
+    /// the whole object. Above it the bytes are only the directory sections and
+    /// the pruning-relevant pages, fetched by [`BlockRangeFetcher`] as a probe
+    /// plus coalesced ranges and held as those regions (issue #2066), so both
+    /// the raw bytes moved and the raw bytes held are proportional to pruning
+    /// rather than to object size, unless a crossover reads the whole object.
     ///
     /// # Issue #796 phase attribution
     ///
@@ -2147,7 +2151,7 @@ impl LogSegmentFetcher {
     /// [`fetch_object_with_footer`](Self::fetch_object_with_footer)); `None`
     /// probes as before. It changes only the read shape, never the bytes decoded.
     ///
-    /// `carried_whole`, when `Some`, is the whole-object [`Bytes`] a prior
+    /// `carried_whole`, when `Some`, is the whole object's bytes a prior
     /// [`plan_segment`](Self::plan_segment) fallback already fetched for this
     /// exact (immutable) object (issue #835). Supplying it skips this call's own
     /// wire GET entirely -- no cache lookup, no store round trip -- and charges
@@ -2241,7 +2245,7 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         phase: ProbePhase,
         accounting: &QueryAccounting,
-    ) -> Result<Option<(Bytes, Option<u64>)>, LogFetchError> {
+    ) -> Result<Option<(LogObjectBytes, Option<u64>)>, LogFetchError> {
         self.tenant_bytes_with_footer(
             seg_ref,
             tenant_hash,
@@ -2302,7 +2306,7 @@ impl LogSegmentFetcher {
         carried_whole: Option<CarriedWholeObject>,
         phase: ProbePhase,
         accounting: &QueryAccounting,
-    ) -> Result<Option<(Bytes, Option<u64>)>, LogFetchError> {
+    ) -> Result<Option<(LogObjectBytes, Option<u64>)>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
@@ -2429,7 +2433,7 @@ impl LogSegmentFetcher {
         tenant_hash: TenantHash,
         phase: QueryPhase,
         accounting: &QueryAccounting,
-    ) -> Result<Bytes, LogFetchError> {
+    ) -> Result<LogObjectBytes, LogFetchError> {
         let key = &seg_ref.data_object_key;
 
         // Fetch bound (ADR-0996 decision 2): an object above the bound is read
@@ -2521,7 +2525,7 @@ impl LogSegmentFetcher {
             self.wire_bytes.record(phase, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
-            return Ok(attach_reservation(got.data, reservation));
+            return Ok(attach_reservation(got.data, reservation).into());
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
@@ -2589,7 +2593,7 @@ impl LogSegmentFetcher {
                 reservation.mark_handed_off();
             }
         }
-        Ok(attach_reservation(bytes, reservation))
+        Ok(attach_reservation(bytes, reservation).into())
     }
 
     /// Runs [`scan_bytes`](Self::scan_bytes) inside the log path's `decode`
@@ -2613,7 +2617,7 @@ impl LogSegmentFetcher {
     async fn decode_spanned(
         &self,
         key: &str,
-        bytes: &Bytes,
+        bytes: &LogObjectBytes,
         query: &LogQuery,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
@@ -2636,7 +2640,7 @@ impl LogSegmentFetcher {
         &self,
         gate: &Arc<ReadGate>,
         key: &str,
-        bytes: &Bytes,
+        bytes: &LogObjectBytes,
         query: &LogQuery,
         accounting: &QueryAccounting,
         span: &tracing::Span,
@@ -2711,7 +2715,7 @@ impl LogSegmentFetcher {
     fn scan_bytes(
         &self,
         key: &str,
-        bytes: &Bytes,
+        bytes: &LogObjectBytes,
         query: &LogQuery,
         accounting: &QueryAccounting,
         span: &tracing::Span,
@@ -2763,13 +2767,14 @@ impl LogSegmentFetcher {
     fn open_scan(
         &self,
         key: &str,
-        bytes: &Bytes,
+        bytes: &LogObjectBytes,
         query: &LogQuery,
         columns: &ColumnSelection,
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let reader =
+            RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
         // `prune` is passed as the reader's prune-only channel, never folded
         // into `pred`: an arm there would become an exact per-row filter and
         // drop resource/scope-only matches (docs/adrs/0049-rlog-postings.md
@@ -2790,14 +2795,15 @@ impl LogSegmentFetcher {
     fn open_scan_subset(
         &self,
         key: &str,
-        bytes: &Bytes,
+        bytes: &LogObjectBytes,
         query: &LogQuery,
         columns: &ColumnSelection,
         indices: &[usize],
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
         let pred = self.combined_predicate(key, bytes, query, accounting)?;
-        let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let reader =
+            RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
         reader
             .scan_blocks_subset(&pred, &query.prune, columns, indices)
             .map_err(|source| corrupt(key, source))
@@ -2811,7 +2817,7 @@ impl LogSegmentFetcher {
     fn combined_predicate(
         &self,
         key: &str,
-        bytes: &Bytes,
+        bytes: &LogObjectBytes,
         query: &LogQuery,
         accounting: &QueryAccounting,
     ) -> Result<Predicate, LogFetchError> {
@@ -2932,11 +2938,11 @@ impl LogSegmentFetcher {
             let bytes = self
                 .whole_object_bytes(seg_ref, tenant_hash, QueryPhase::Plan, accounting)
                 .await?;
-            let footer = footer::open(&bytes).map_err(|source| corrupt(key, source))?;
+            let footer = footer::open_source(&bytes).map_err(|source| corrupt(key, source))?;
             match footer.section(kind::STREAM_DIR).copied() {
                 None => None,
                 Some(desc) => {
-                    let raw = read_section_accounted(&bytes, &desc, &self.cfg, accounting)
+                    let raw = read_section_accounted_from(&bytes, &desc, &self.cfg, accounting)
                         .map_err(|source| corrupt(key, source))?;
                     Some(
                         StreamDir::decode(&raw, MAX_STREAMS)
@@ -2962,16 +2968,16 @@ impl LogSegmentFetcher {
     /// `bytes` was already fetched by the caller, so this is the one
     /// in-memory decompression this method itself performs, and it lands
     /// under whichever phase handle the caller is threading.
-    fn decode_stream_dir(
+    fn decode_stream_dir<S: ByteSource + ?Sized>(
         &self,
-        bytes: &[u8],
+        bytes: &S,
         accounting: &QueryAccounting,
     ) -> Result<StreamDir, LogSegError> {
-        let footer = footer::open(bytes)?;
+        let footer = footer::open_source(bytes)?;
         let desc = footer
             .section(kind::STREAM_DIR)
             .ok_or_else(|| LogSegError::Corrupted("missing STREAM_DIR section".into()))?;
-        let raw = read_section_accounted(bytes, desc, &self.cfg, accounting)?;
+        let raw = read_section_accounted_from(bytes, desc, &self.cfg, accounting)?;
         StreamDir::decode(&raw, MAX_STREAMS)
     }
 }
@@ -3419,7 +3425,7 @@ pub struct CarriedFooter<'a> {
 /// stored and checked too rather than inferred from that.
 #[derive(Clone)]
 pub struct CarriedWholeObject {
-    bytes: Bytes,
+    bytes: LogObjectBytes,
     /// `data_object_key` of the segment the plan read fetched these bytes for.
     source_key: String,
     /// Tenant the plan read fetched them under.
@@ -3471,150 +3477,47 @@ impl ByteExtent {
     }
 }
 
-/// Most idle assembly buffers one [`AssemblyBufferPool`] holds on to.
+/// Figures for the bytes one [`BlockRangeFetcher`]'s assembled reads hold
+/// ([`BlockRangeFetcher::assembly_buffer_stats`], issues #1771 and #2066),
+/// shared by all its clones: a gauge and its high-water mark.
 ///
-/// Sized to [`DEFAULT_LOG_MAX_CONCURRENT_GETS`] because that is the scale of
-/// concurrent ranged reads one fetcher serves: partitions striping a segment
-/// each hold a buffer for the length of their own `fetch_object` call, so a cap
-/// below the fan-out would leave most of a wave allocating and only the first
-/// few reusing.
-const MAX_IDLE_ASSEMBLY_BUFFERS: usize = DEFAULT_LOG_MAX_CONCURRENT_GETS;
-
-/// Total length the pool keeps idle across every buffer it holds. A buffer
-/// stays at the length of the largest object it has served (that is what makes
-/// reuse free of any `memset`), so a count-only bound would let a wave of large
-/// objects pin `MAX_IDLE_ASSEMBLY_BUFFERS` times an object size for the life of
-/// the process. Bounding the sum instead scales the pool to the objects it
-/// actually sees: many small ones fill the count cap, a few large ones fill
-/// this, and a single buffer longer than the whole budget is never retained.
-const MAX_IDLE_ASSEMBLY_BYTES: usize = 128 * 1024 * 1024;
-
-/// Assembly-buffer pool figures for one [`BlockRangeFetcher`]
-/// ([`BlockRangeFetcher::assembly_buffer_stats`], issues #894 and #1771),
-/// shared by all its clones.
+/// An assembled read is one built from more than one GET: a ranged read's
+/// probe, directory sections and page runs, or a covering read segmented at
+/// the fetch bound. It holds exactly the regions it placed, as fetched, so the
+/// gauge is the summed length of every placed region still held by an
+/// [`ObjectAssembler`] or by the [`LogObjectBytes`] it produced, and it falls
+/// when the reader drops them. Nothing is pooled or retained between reads, so
+/// the object-sized buffer pool this used to report on and its `allocated`,
+/// `reused` and `zeroed_bytes` counters are retired (issue #2066).
 ///
-/// Two kinds, which do not read the same way. [`Self::allocated`],
-/// [`Self::reused`] and [`Self::zeroed_bytes`] are counters, cumulative over
-/// the fetcher's life, and nothing resets them. [`Self::live_bytes`] is a
-/// gauge that rises and falls as buffers are checked out and returned, and
-/// [`Self::peak_live_bytes`] is its high-water mark.
+/// Zero while every object is read whole in one GET: under a resolved request
+/// cost that saturates the routing threshold, that is every object at or under
+/// the fetch bound, and a larger one is read as segmented covering sub-ranges
+/// that charge this gauge. The saturated case includes `cost-based` at the
+/// reference `s3-intra-region-2026` profile, which prices transfer and
+/// retrieval at zero; the same policy on an egress-billed deployment resolves
+/// a finite rate, routes objects above the threshold through the ranged path,
+/// and charges this gauge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AssemblyBufferStats {
-    /// Ranged reads that found no idle buffer and allocated one.
-    pub allocated: u64,
-    /// Ranged reads served by a buffer an earlier read returned to the pool,
-    /// with neither an allocation nor a `memset`.
-    pub reused: u64,
-    /// Bytes this pool has ever zeroed: each allocated buffer's initial length
-    /// plus each later growth. A read served by a buffer already at least as
-    /// long as its object adds nothing, which is the whole point of the pool.
-    pub zeroed_bytes: u64,
-    /// Bytes currently checked OUT of the pool, the live set. The retention
-    /// bounds cap what sits idle here, not what scans hold: a query holds one
-    /// object-sized buffer per in-flight ranged read, and nothing else reports
-    /// that.
-    ///
-    /// Zero wherever the resolved request cost saturates the routing
-    /// threshold, so that every object is read whole and never touches this
-    /// pool. That includes `cost-based` at the reference
-    /// `s3-intra-region-2026` profile, which prices transfer and retrieval at
-    /// zero; the same policy on an egress-billed deployment resolves a finite
-    /// rate, routes objects above the threshold through the ranged path, and
-    /// charges this gauge.
+    /// Bytes of placed regions currently held by assembled reads.
     pub live_bytes: u64,
-    /// High-water mark of [`Self::live_bytes`] over this pool's life.
+    /// High-water mark of [`Self::live_bytes`] over this fetcher's life.
     pub peak_live_bytes: u64,
 }
 
-/// Object-sized assembly buffers, reused across the ranged reads one
-/// [`BlockRangeFetcher`] serves.
-///
-/// [`ObjectAssembler`] needs a buffer indexable at the object's absolute
-/// offsets, which used to cost one `vec![0u8; object_size]` per object: an
-/// allocation and a full-object `memset` on every read, warm ones included, for
-/// a buffer whose populated fraction is only the directory sections and the
-/// surviving blocks (issue #894). Checking one out of here costs neither once
-/// the pool is warm.
-///
-/// A buffer is kept at the length of the largest object it has served and used
-/// as `[..len]` for a shorter one, so a reuse never re-zeroes and
-/// [`Vec::resize`] runs only over real growth. That is what makes the bytes
-/// outside a read's placed regions the PREVIOUS object's rather than zeros, and
-/// why [`ObjectAssembler::slice`] refuses any range it did not place.
-#[derive(Debug)]
-struct AssemblyBufferPool {
-    idle: std::sync::Mutex<IdleBuffers>,
-    /// Retention bounds, [`MAX_IDLE_ASSEMBLY_BUFFERS`] and
-    /// [`MAX_IDLE_ASSEMBLY_BYTES`] in production. Fields rather than constants
-    /// read at the use site so the tests can pin the eviction behavior at a
-    /// budget small enough to exercise without allocating hundreds of MiB.
-    max_idle_bufs: usize,
-    max_idle_bytes: usize,
-    allocated: AtomicU64,
-    reused: AtomicU64,
-    zeroed_bytes: AtomicU64,
+/// The [`AssemblyBufferStats`] gauge, shared by every clone of one fetcher.
+#[derive(Debug, Default)]
+struct AssemblyGauge {
     live_bytes: AtomicU64,
     peak_live_bytes: AtomicU64,
 }
 
-impl Default for AssemblyBufferPool {
-    fn default() -> Self {
-        AssemblyBufferPool {
-            idle: std::sync::Mutex::default(),
-            max_idle_bufs: MAX_IDLE_ASSEMBLY_BUFFERS,
-            max_idle_bytes: MAX_IDLE_ASSEMBLY_BYTES,
-            allocated: AtomicU64::new(0),
-            reused: AtomicU64::new(0),
-            zeroed_bytes: AtomicU64::new(0),
-            live_bytes: AtomicU64::new(0),
-            peak_live_bytes: AtomicU64::new(0),
-        }
-    }
-}
-
-/// The idle set and its running total length, kept together so
-/// [`AssemblyBufferPool::release`] can enforce the byte budget without walking
-/// the set.
-#[derive(Debug, Default)]
-struct IdleBuffers {
-    bufs: Vec<Vec<u8>>,
-    bytes: usize,
-}
-
-impl AssemblyBufferPool {
-    /// A buffer usable as `[0, len)`, from the idle set when one is there.
-    fn acquire(self: &Arc<Self>, len: usize) -> AssemblyBuffer {
-        let taken = match self.idle.lock() {
-            Ok(mut idle) => {
-                let got = idle.bufs.pop();
-                idle.bytes = idle.bytes.saturating_sub(got.as_ref().map_or(0, Vec::len));
-                got
-            }
-            // A poisoned pool means some other read panicked mid-checkout. The
-            // buffers are plain bytes with no invariant to corrupt, but taking
-            // the lock's word for it and allocating fresh is the cheap, correct
-            // response: the pool degrades to the pre-pooling behavior.
-            Err(_) => None,
-        };
-        if taken.is_some() {
-            self.reused.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.allocated.fetch_add(1, Ordering::Relaxed);
-        }
-        let mut buf = taken.unwrap_or_default();
-        if buf.len() < len {
-            self.zeroed_bytes
-                .fetch_add((len - buf.len()) as u64, Ordering::Relaxed);
-            buf.resize(len, 0);
-        }
-        // Charged on the resident length rather than the requested one: a
-        // reused buffer keeps the length of the largest object it has served,
-        // and those bytes are held whether or not this read addresses them.
-        let charged = buf.len() as u64;
-        let live = self.live_bytes.fetch_add(charged, Ordering::Relaxed) + charged;
+impl AssemblyGauge {
+    fn charge(&self, n: u64) {
+        let live = self.live_bytes.fetch_add(n, Ordering::Relaxed) + n;
         // Raise the high-water mark, retrying only while another thread's
-        // observed peak is lower than ours; a concurrent higher peak wins and
-        // ends the loop.
+        // observed peak is lower than ours.
         let mut seen = self.peak_live_bytes.load(Ordering::Relaxed);
         while seen < live {
             match self.peak_live_bytes.compare_exchange_weak(
@@ -3627,183 +3530,190 @@ impl AssemblyBufferPool {
                 Err(actual) => seen = actual,
             }
         }
-        AssemblyBuffer {
-            buf,
-            len,
-            pool: Arc::clone(self),
-        }
     }
 
-    fn release(&self, buf: Vec<u8>) {
-        if buf.capacity() == 0 {
-            return;
-        }
-        // Released on the same basis it was charged, before the retention
-        // bounds decide whether to keep it: a buffer dropped instead of pooled
-        // still left the live set.
-        self.live_bytes
-            .fetch_sub(buf.len() as u64, Ordering::Relaxed);
-        if let Ok(mut idle) = self.idle.lock()
-            && idle.bufs.len() < self.max_idle_bufs
-            && idle.bytes + buf.len() <= self.max_idle_bytes
-        {
-            idle.bytes += buf.len();
-            idle.bufs.push(buf);
-        }
+    fn release(&self, n: u64) {
+        self.live_bytes.fetch_sub(n, Ordering::Relaxed);
     }
 
     fn stats(&self) -> AssemblyBufferStats {
         AssemblyBufferStats {
-            allocated: self.allocated.load(Ordering::Relaxed),
-            reused: self.reused.load(Ordering::Relaxed),
-            zeroed_bytes: self.zeroed_bytes.load(Ordering::Relaxed),
             live_bytes: self.live_bytes.load(Ordering::Relaxed),
             peak_live_bytes: self.peak_live_bytes.load(Ordering::Relaxed),
         }
     }
 }
 
-/// One object-sized buffer checked out of an [`AssemblyBufferPool`], returned
-/// to it when dropped -- including when it is dropped as the owner behind the
-/// [`Bytes`] [`ObjectAssembler::into_bytes`] hands the reader, so the buffer
-/// comes back only after the scan that borrows it is finished.
-///
-/// The vector may be longer than `len` (it is sized to the largest object it
-/// has served); everything outside `[0, len)` is invisible through
-/// [`AsRef`], so a shorter object never exposes the tail of a longer one.
-struct AssemblyBuffer {
-    buf: Vec<u8>,
-    len: usize,
-    pool: Arc<AssemblyBufferPool>,
+/// The regions an assembled read placed, the fetch-layer reservations that
+/// cover them (ADR-1170 decision 2), and the gauge they are charged to. The
+/// reservations and the gauge charge release together, when the last holder
+/// drops this: the [`ObjectAssembler`] on an error or crossover path, else the
+/// last clone of the [`LogObjectBytes`] handed to the reader.
+struct PlacedObject {
+    regions: SparseObject,
+    reservations: Vec<ravel_memory::Reservation>,
+    gauge: Arc<AssemblyGauge>,
 }
 
-impl AssemblyBuffer {
-    fn as_slice(&self) -> &[u8] {
-        self.buf.get(..self.len).unwrap_or_default()
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        let len = self.len;
-        self.buf.get_mut(..len).unwrap_or_default()
-    }
-}
-
-impl AsRef<[u8]> for AssemblyBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl Drop for AssemblyBuffer {
+impl Drop for PlacedObject {
     fn drop(&mut self) {
-        self.pool.release(std::mem::take(&mut self.buf));
+        self.gauge.release(self.regions.placed_len());
     }
 }
 
-/// Assembles an object-sized buffer from separately fetched regions so the
-/// existing whole-object reader ([`RlogReader`]/[`BlockScan`]) can decode from
-/// it unchanged: block extents are absolute offsets into the object, so the
-/// buffer must be indexable at those offsets. Only the fetched directory
-/// sections and candidate blocks are populated, and the gap bytes between them
-/// (the pruned blocks) are never read -- `BlockScan` restricted to the candidate
-/// blocks only slices the extents that were placed (ADR-0107: gap bytes "never
-/// interpreted, never verified").
+/// One RLOG object's bytes as a read holds them (issue #2066): the whole object
+/// from a single GET, a cache entry or a carry, or the regions an assembled
+/// read placed. Either way a [`ByteSource`] the reader opens with
+/// [`RlogReader::from_source`] and decodes blocks from, addressed at the
+/// object's absolute offsets. Cloning shares the held bytes.
 ///
-/// The buffer comes from an [`AssemblyBufferPool`] and is reused across objects
-/// (issue #894), so those gap bytes are NOT zero: they are whatever the previous
-/// object left at those offsets. The "never read" claim above is therefore
-/// enforced rather than assumed -- [`slice`](Self::slice) refuses any range no
-/// [`place`](Self::place) covered, so a read that violated it fails closed with
-/// a typed [`LogFetchError::Corrupt`] instead of decoding another object's
-/// bytes.
-struct ObjectAssembler {
-    buf: AssemblyBuffer,
-    placed: Vec<(u64, u64)>,
-    /// The fetch-layer memory reservation (ADR-1170 decision 2) covering the
-    /// object this assembler materializes. Reserved once, before the assembler
-    /// issues any GET, for the whole object size. Handed to
-    /// [`into_bytes`](Self::into_bytes) so it travels with the returned `Bytes`
-    /// and releases exactly when the reader drops them, never when the
-    /// assembling GETs completed. `None` only on paths built with an unlimited
-    /// budget's guard omitted, which the constructors never do in production.
-    reservation: Option<ravel_memory::Reservation>,
+/// A placed object holds only its regions, so a read of any range no region
+/// holds fails with [`LogSegError::Unplaced`] instead of returning bytes.
+#[derive(Clone)]
+pub struct LogObjectBytes(ObjectRepr);
+
+#[derive(Clone)]
+enum ObjectRepr {
+    Whole(Bytes),
+    Placed(Arc<PlacedObject>),
 }
 
-/// Owns an [`AssemblyBuffer`] together with the fetch-layer reservation for the
-/// object it holds, so [`Bytes::from_owner`] can attach the reservation guard
-/// to the assembled `Bytes` (ADR-1170 decision 2): the guard is released when
-/// the last `Bytes` clone is dropped. `AsRef<[u8]>` forwards to the buffer, so
-/// the returned `Bytes` view the assembled object exactly as before.
-struct AssembledBytes {
-    buf: AssemblyBuffer,
-    _reservation: Option<ravel_memory::Reservation>,
-}
-
-impl AsRef<[u8]> for AssembledBytes {
-    fn as_ref(&self) -> &[u8] {
-        self.buf.as_ref()
+impl LogObjectBytes {
+    /// The object's length in bytes, placed or not.
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            ObjectRepr::Whole(bytes) => bytes.len(),
+            ObjectRepr::Placed(placed) => {
+                usize::try_from(placed.regions.object_len()).unwrap_or(usize::MAX)
+            }
+        }
     }
+
+    /// Whether the object is zero bytes long.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes this value keeps alive: the whole length for a whole object,
+    /// the summed placed regions for an assembled one.
+    pub fn held_len(&self) -> u64 {
+        match &self.0 {
+            ObjectRepr::Whole(bytes) => bytes.len() as u64,
+            ObjectRepr::Placed(placed) => placed.regions.placed_len(),
+        }
+    }
+
+    /// The whole object's contiguous bytes, or `None` for an assembled read.
+    pub fn as_whole(&self) -> Option<&Bytes> {
+        match &self.0 {
+            ObjectRepr::Whole(bytes) => Some(bytes),
+            ObjectRepr::Placed(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for LogObjectBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogObjectBytes")
+            .field("whole", &self.as_whole().is_some())
+            .field("object_len", &self.object_len())
+            .field("held_len", &self.held_len())
+            .finish()
+    }
+}
+
+impl From<Bytes> for LogObjectBytes {
+    fn from(bytes: Bytes) -> Self {
+        LogObjectBytes(ObjectRepr::Whole(bytes))
+    }
+}
+
+impl ByteSource for LogObjectBytes {
+    fn object_len(&self) -> u64 {
+        match &self.0 {
+            ObjectRepr::Whole(bytes) => bytes.object_len(),
+            ObjectRepr::Placed(placed) => placed.regions.object_len(),
+        }
+    }
+
+    fn read(&self, start: u64, len: u64) -> Result<Cow<'_, [u8]>, LogSegError> {
+        match &self.0 {
+            ObjectRepr::Whole(bytes) => bytes.read(start, len),
+            ObjectRepr::Placed(placed) => placed.regions.read(start, len),
+        }
+    }
+}
+
+/// Assembles an object from separately fetched regions without an
+/// object-sized buffer (issue #2066): each [`place`](Self::place) keeps the
+/// [`Bytes`] it is given, uncopied, at their absolute offset, and
+/// [`into_bytes`](Self::into_bytes) hands the reader a [`LogObjectBytes`] over
+/// exactly those regions. The reader addresses the object at the offsets its
+/// footer and directories name, reading only the directory sections and the
+/// pages of blocks the fetch placed; a read of anything else (a pruned block's
+/// pages, the gaps between runs) fails typed with [`LogSegError::Unplaced`]
+/// rather than decoding bytes that were never fetched (ADR-0107: gap bytes
+/// "never interpreted, never verified").
+///
+/// Memory: the assembler holds the placed bytes and nothing else, and every
+/// placement is covered by a fetch-layer reservation (ADR-1170 decision 2)
+/// its caller took before the GET that fetched it (or, for a cache hit, before
+/// placing it) and handed over with [`hold`](Self::hold). Both release when
+/// the reader drops the bytes.
+struct ObjectAssembler {
+    placed: PlacedObject,
 }
 
 impl ObjectAssembler {
-    fn new(
-        pool: &Arc<AssemblyBufferPool>,
-        total_size: usize,
-        reservation: Option<ravel_memory::Reservation>,
-    ) -> Self {
+    fn new(gauge: &Arc<AssemblyGauge>, total_size: u64) -> Self {
         ObjectAssembler {
-            buf: pool.acquire(total_size),
-            placed: Vec::new(),
-            reservation,
+            placed: PlacedObject {
+                regions: SparseObject::new(total_size),
+                reservations: Vec::new(),
+                gauge: Arc::clone(gauge),
+            },
         }
     }
 
+    /// Whether one earlier [`place`](Self::place) covered all of
+    /// `[start, end)`.
     fn covers(&self, start: u64, end: u64) -> bool {
-        self.placed.iter().any(|(s, e)| *s <= start && end <= *e)
+        self.placed.regions.holds_in_one_region(start, end)
     }
 
-    /// The stored bytes at `[start, start + len)`, or a typed error when no
-    /// single [`place`](Self::place) call covered that whole range.
-    ///
-    /// The coverage check is the fail-closed half of the pooled buffer: outside
-    /// the placed regions the buffer holds a previous object's bytes, so
-    /// returning them would turn a read the "gap bytes are never interpreted"
-    /// invariant did not anticipate into a silent wrong answer instead of an
-    /// error (issue #894).
-    fn slice(&self, key: &str, start: u64, len: u64) -> Result<&[u8], LogFetchError> {
-        let end = start.checked_add(len).ok_or_else(|| corrupt_range(key))?;
-        if !self.covers(start, end) {
-            return Err(uncovered_range(key, start, end));
-        }
-        let s = usize::try_from(start).map_err(|_| corrupt_range(key))?;
-        let e = usize::try_from(end).map_err(|_| corrupt_range(key))?;
-        self.buf
-            .as_slice()
-            .get(s..e)
-            .ok_or_else(|| corrupt_range(key))
-    }
-
-    fn place(&mut self, key: &str, start: u64, bytes: &[u8]) -> Result<(), LogFetchError> {
-        let s = usize::try_from(start).map_err(|_| corrupt_range(key))?;
-        let e = s
-            .checked_add(bytes.len())
-            .ok_or_else(|| corrupt_range(key))?;
-        let slot = self
-            .buf
-            .as_mut_slice()
-            .get_mut(s..e)
-            .ok_or_else(|| corrupt_range(key))?;
-        slot.copy_from_slice(bytes);
+    /// The stored bytes at `[start, start + len)`, or a typed error when the
+    /// placed regions do not hold every byte of it.
+    fn slice(&self, key: &str, start: u64, len: u64) -> Result<Cow<'_, [u8]>, LogFetchError> {
         self.placed
-            .push((start, start.saturating_add(bytes.len() as u64)));
+            .regions
+            .read(start, len)
+            .map_err(|source| corrupt(key, source))
+    }
+
+    /// Keeps `bytes` as the object's bytes at `start`, zero-copy.
+    fn place(&mut self, key: &str, start: u64, bytes: Bytes) -> Result<(), LogFetchError> {
+        let len = bytes.len() as u64;
+        self.placed
+            .regions
+            .place(start, bytes)
+            .map_err(|_| corrupt_range(key))?;
+        self.placed.gauge.charge(len);
         Ok(())
     }
 
-    fn into_bytes(self) -> Bytes {
-        Bytes::from_owner(AssembledBytes {
-            buf: self.buf,
-            _reservation: self.reservation,
-        })
+    /// Keeps `reservation` for as long as the placed bytes are held.
+    fn hold(&mut self, reservation: ravel_memory::Reservation) {
+        self.placed.reservations.push(reservation);
+    }
+
+    /// The fetch-layer bytes this assembler holds reserved.
+    #[cfg(test)]
+    fn reserved(&self) -> u64 {
+        self.placed.reservations.iter().map(|r| r.size()).sum()
+    }
+
+    fn into_bytes(self) -> LogObjectBytes {
+        LogObjectBytes(ObjectRepr::Placed(Arc::new(self.placed)))
     }
 }
 
@@ -3811,7 +3721,7 @@ impl ObjectAssembler {
 /// wholly contains it, or `None` when no region does. The regions are the
 /// `(start, bytes)` pairs [`BlockRangeFetcher::probe_footer`] left resident;
 /// this is [`ObjectAssembler::covers`] + [`ObjectAssembler::slice`] for a read
-/// that never builds an object-sized buffer.
+/// that keeps only those regions.
 fn resident_slice(regions: &[(u64, Bytes)], offset: u64, len: u64) -> Option<Bytes> {
     let end = offset.checked_add(len)?;
     regions.iter().find_map(|(start, bytes)| {
@@ -3832,19 +3742,6 @@ fn corrupt_range(key: &str) -> LogFetchError {
     }
 }
 
-/// A read of assembled bytes no fetch placed (issue #894). Distinct message
-/// from [`corrupt_range`]'s so a failure names the invariant it broke: the
-/// range is inside the object, it was simply never fetched, and the pooled
-/// buffer holds a previous object's bytes there.
-fn uncovered_range(key: &str, start: u64, end: u64) -> LogFetchError {
-    LogFetchError::Corrupt {
-        key: key.to_string(),
-        source: LogSegError::Corrupted(format!(
-            "block-range assembly read of [{start}, {end}) outside the fetched regions"
-        )),
-    }
-}
-
 /// The RLOG-specific coalescing block-range fetcher (ADR-0107). It fetches only
 /// the blocks skip-index pruning proved relevant instead of one whole-object GET
 /// per segment, mirroring [`crate::SegmentFetcher`]'s protocol -- gap
@@ -3854,11 +3751,11 @@ fn uncovered_range(key: &str, start: u64, end: u64) -> LogFetchError {
 /// per-format branches; the "RSEG and RLOG never share fetch code" convention in
 /// this module's header stays intact).
 ///
-/// The result is an object-sized [`Bytes`] with only the directory sections and
-/// candidate blocks populated, ready to hand to [`RlogReader`]/[`BlockScan`]
-/// unchanged: the reader re-prunes and decodes exactly the survivor blocks,
-/// which are a subset of the fetched candidate set, so decode never touches an
-/// unfetched gap. Cache admission is per block, not per coalesced GET (ADR-0107
+/// The result is a [`LogObjectBytes`] holding only the directory sections and
+/// candidate blocks' bytes, which [`RlogReader::from_source`]/[`BlockScan`]
+/// read at the object's absolute offsets: the reader re-prunes and decodes
+/// exactly the survivor blocks, which are a subset of the fetched candidate
+/// set, and a read of an unfetched gap fails typed (`LogSegError::Unplaced`). Cache admission is per block, not per coalesced GET (ADR-0107
 /// decision 3): after a live range GET, the response is split at block
 /// boundaries, each block's `block_crc32c` is verified independently, and one
 /// cache entry per block is admitted keyed `(tenant_hash, content_hash,
@@ -3901,20 +3798,18 @@ pub struct BlockRangeFetcher {
     /// The largest single covering sub-range GET this fetcher (and every clone)
     /// has issued, in bytes: the peak wire size of one request on the segmented
     /// covering path, which never exceeds `max_fetch_run_bytes`. The resident
-    /// assembly buffer is NOT bounded by this -- see the resident-memory note
-    /// on [`Self::covering_read`] (issue #1007): this field only ever reports
-    /// the wire side.
+    /// bytes are NOT bounded by this -- see the resident-memory note on
+    /// [`Self::covering_read`] (issue #1007): this field only ever reports the
+    /// wire side.
     peak_fetch_run: Arc<AtomicU64>,
     /// Bounds in-flight byte-range GETs. By default its own private instance
     /// (ADR-0107 decision 1); [`Self::with_get_limiter`] wires it to the one
     /// process-shared limiter every query-side fetcher can hold instead
     /// (ADR-1195).
     get_limiter: Arc<crate::GetLimiter>,
-    /// Reusable object-sized assembly buffers (issue #894), shared by every
-    /// clone of this fetcher the way `get_limiter` is, so the one production
-    /// `LogSegmentFetcher` pools across every read of the process rather than
-    /// per query.
-    assembly_pool: Arc<AssemblyBufferPool>,
+    /// The bytes this fetcher's assembled reads hold ([`AssemblyBufferStats`]),
+    /// shared by every clone the way `get_limiter` is.
+    assembly_gauge: Arc<AssemblyGauge>,
     /// Per-phase WIRE bytes across every read this fetcher has served (#913).
     /// Written at [`Self::store_get`], the single GET funnel here, beside the
     /// `QueryAccounting` write of the same bytes. Shared by every clone, and by
@@ -3922,10 +3817,10 @@ pub struct BlockRangeFetcher {
     /// execution's whole-object and ranged reads land in the same totals.
     wire_bytes: PhaseWireByteCounter,
     /// The process-wide fetch memory budget (ADR-1170 decision 2). Every ranged
-    /// read reserves against it before its GETs: the whole object size once,
-    /// held by the [`ObjectAssembler`] for the assembled buffer's lifetime, plus
-    /// the transient summed run length before each `join_all`. Default unlimited
-    /// (never refuses); [`Self::with_memory_budget`] wires the shared one.
+    /// read reserves against it before each GET the length that GET places,
+    /// held by the [`ObjectAssembler`] and then the returned [`LogObjectBytes`]
+    /// for as long as the placed bytes live. Default unlimited (never
+    /// refuses); [`Self::with_memory_budget`] wires the shared one.
     memory_budget: Arc<ravel_memory::MemoryBudget>,
     /// The read CPU gate the directory section decodes run on. `None`, the
     /// default, decodes inline.
@@ -3948,7 +3843,7 @@ impl BlockRangeFetcher {
             get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
                 DEFAULT_LOG_MAX_CONCURRENT_GETS,
             )),
-            assembly_pool: Arc::new(AssemblyBufferPool::default()),
+            assembly_gauge: Arc::new(AssemblyGauge::default()),
             wire_bytes: PhaseWireByteCounter::new(),
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
             read_gate: None,
@@ -4039,15 +3934,12 @@ impl BlockRangeFetcher {
         self.wire_bytes.clone()
     }
 
-    /// This fetcher's assembly-buffer pool figures (issues #894 and #1771):
-    /// the cumulative counters -- how many ranged reads had to allocate an
-    /// object-sized buffer, how many were served by a pooled one, how many
-    /// bytes the pool has ever zeroed -- plus the live set currently checked
-    /// out and its high-water mark. Shared by every clone; the counters are
-    /// cumulative, the live figure is a gauge.
+    /// The bytes this fetcher's assembled reads hold now, and the most they
+    /// have held at once ([`AssemblyBufferStats`], issues #1771 and #2066).
+    /// Shared by every clone.
     #[must_use]
     pub fn assembly_buffer_stats(&self) -> AssemblyBufferStats {
-        self.assembly_pool.stats()
+        self.assembly_gauge.stats()
     }
 
     #[must_use]
@@ -4177,51 +4069,16 @@ impl BlockRangeFetcher {
     ///   other whole-object funnels).
     /// - `total_size > max_fetch_run_bytes`: `ceil(total_size /
     ///   max_fetch_run_bytes)` sequential covering sub-range GETs, each at most
-    ///   the bound, assembled into the object buffer. Bounds each request's wire
-    ///   size; the request count is `ceil(total_size / bound)` (the ADR's floor,
-    ///   and its cap too on this unaligned split, since no run is short of the
-    ///   bound except the last).
+    ///   the bound, each kept as its own placed region of the returned
+    ///   [`LogObjectBytes`]. Bounds each request's wire size; the request count
+    ///   is `ceil(total_size / bound)` (the ADR's floor, and its cap too on this
+    ///   unaligned split, since no run is short of the bound except the last).
     ///
-    /// NOTE (issue #1007 finding, superseding the ADR-0996 note this replaces):
-    /// the assembled buffer is still `object_size` on the segmented path. This
-    /// is a bounded-window case in principle, not a genuine whole-object need
-    /// (option (b), not (c), in #1007's terms) -- `decode_v4_block`
-    /// (`ravel_logseg::reader`, `pub(crate)`) already takes a `base: u64` naming
-    /// the absolute offset of its `bytes[0]`, and `RlogRangeReader`
-    /// (`ravel_logseg::ranged`) already exploits exactly that to decode one row
-    /// group or one block at a time for the compactor merge, holding only
-    /// directories plus the one span resident, never the whole object
-    /// (`ranged.rs` module doc, `decode_one_block`). But `BlockScan::decode_block`
-    /// (`reader.rs:882-915`), the only decode entry point this fetcher's callers
-    /// use (`open_scan`/`open_scan_subset`, `log_fetcher.rs:2109,2136`, both via
-    /// `RlogReader::new`), hardcodes `base = 0` (`reader.rs:909`) and its
-    /// `next_block` contract requires `object_bytes` to be the whole object
-    /// from offset 0 (`reader.rs:775-778`) -- neither of those signatures is
-    /// touched by this commit, so `RlogReader`'s and `BlockScan`'s public API is
-    /// unchanged. Bounding this read's resident memory to the window needs a
-    /// reader change of a stated scope, not a local fix: (1) in `ravel-logseg`,
-    /// a windowed decode entry point that accepts `base != 0` for the general
-    /// predicate/prune-pruned case `BlockScan` serves (`RlogRangeReader`'s
-    /// existing windowed methods all filter to one caller-named stream, which
-    /// this fetcher's arbitrary ts-range/content/postings/bloom predicates do
-    /// not fit); and (2) in `ravel-query`, restructuring every `covering_read`
-    /// caller (this function's 4 call sites) to fetch and parse the directory
-    /// sections ahead of the covering loop -- STREAM_DIR, SKIP_IDX and
-    /// FIELD_DIR for any object, plus PAGE_DIR for a version-4 one, since v3
-    /// carries no PAGE_DIR and its blocks are contiguous byte ranges
-    /// (`ravel_logseg::footer`) -- (today `covering_read` knows nothing about
-    /// block boundaries and writes `[0, total_size)`
-    /// unconditionally), choose split points at block boundaries, and decode
-    /// each sub-range's complete blocks immediately and discard its buffer
-    /// before the next sub-range is fetched, instead of assembling into one
-    /// `object_size` buffer before ever calling `RlogReader::new`. That is a
-    /// decode-entry-point change plus a fetch-shape change on a
-    /// query-correctness-critical path, not a bounded local patch; forcing a
-    /// partial version through in one pass risks exactly the kind of
-    /// half-finished critical-path change this repo's invariants forbid. Not
-    /// implemented here; see the commit this note ships with for the full
-    /// evidence trail. [`Self::peak_fetch_run_bytes`] still bounds only the
-    /// request wire size, unchanged by this finding.
+    /// Resident memory is still the whole object on both branches (issue
+    /// #1007): a covering read hands the reader every byte before the first
+    /// block decodes. Bounding it to a window needs the decode to run per
+    /// sub-range, split at block boundaries, which this does not do.
+    /// [`Self::peak_fetch_run_bytes`] bounds only the request wire size.
     #[allow(clippy::too_many_arguments)]
     async fn covering_read(
         &self,
@@ -4232,12 +4089,12 @@ impl BlockRangeFetcher {
         phase: QueryPhase,
         pin: &EtagPin,
         accounting: &QueryAccounting,
-    ) -> Result<(Bytes, u64, u64), LogFetchError> {
+    ) -> Result<(LogObjectBytes, u64, u64), LogFetchError> {
         // Reserve the covering read's whole extent before any GET (ADR-1170
         // decision 2): a refusal fails typed with zero GETs. The guard travels
-        // with the returned `Bytes` -- attached directly in the single-GET
+        // with the returned bytes -- attached directly in the single-GET
         // branch, or carried by the `ObjectAssembler` in the segmented branch --
-        // so it releases when the reader drops the assembled buffer.
+        // so it releases when the reader drops them.
         //
         // This always reserves fresh, and a coverage crossover holding a live
         // assembler for the same object drops it first rather than handing its
@@ -4283,15 +4140,23 @@ impl BlockRangeFetcher {
             }
             let live_bytes = if live { total_size } else { 0 };
             return Ok((
-                attach_reservation(bytes, reservation),
+                attach_reservation(bytes, reservation).into(),
                 u64::from(live),
                 live_bytes,
             ));
         }
 
+        // Segmented: every sub-range is kept as fetched rather than copied into
+        // one object-sized buffer, so the object is held once, not once plus
+        // the sub-range in flight. With a cache wired each sub-range is also a
+        // cache entry (a hit, or `cached_extent`'s miss-path insert), the same
+        // overlap the single-GET branch marks.
         let key = seg_ref.data_object_key.as_str();
-        let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
-        let mut asm = ObjectAssembler::new(&self.assembly_pool, total, Some(reservation));
+        if self.cache.is_some() {
+            reservation.mark_handed_off();
+        }
+        let mut asm = ObjectAssembler::new(&self.assembly_gauge, total_size);
+        asm.hold(reservation);
         let mut live_gets = 0u64;
         // Wire bytes actually moved: a sub-range served from cache moves none,
         // so `bytes.len()` (the whole object) must never be charged as fetched
@@ -4316,7 +4181,7 @@ impl BlockRangeFetcher {
             if live {
                 self.observe_fetch_run(len);
             }
-            asm.place(key, start, &bytes)?;
+            asm.place(key, start, bytes)?;
             live_gets += u64::from(live);
             if live {
                 live_bytes += len;
@@ -4524,6 +4389,57 @@ impl BlockRangeFetcher {
                 Ok((bytes, true))
             }
         }
+    }
+
+    /// [`cached_extent`](Self::cached_extent) placed into `asm`: reserves `len`
+    /// before the GET (ADR-1170 decision 2, so a refusal issues none), then
+    /// places the returned bytes zero-copy and hands `asm` the reservation,
+    /// which it holds for as long as those bytes live. Returns the placed
+    /// bytes and whether the read crossed the network.
+    #[allow(clippy::too_many_arguments)]
+    async fn place_extent(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        start: u64,
+        len: u64,
+        range: GetRange,
+        phase: QueryPhase,
+        pin: &EtagPin,
+        asm: &mut ObjectAssembler,
+        accounting: &QueryAccounting,
+    ) -> Result<(Bytes, bool), LogFetchError> {
+        let reservation = self.reserve_fetch(len)?;
+        let (bytes, live) = self
+            .cached_extent(
+                seg_ref,
+                tenant_hash,
+                start,
+                len,
+                range,
+                phase,
+                pin,
+                accounting,
+            )
+            .await?;
+        self.hold_placement(asm, reservation);
+        asm.place(&seg_ref.data_object_key, start, bytes.clone())?;
+        Ok((bytes, live))
+    }
+
+    /// Hands `asm` a reservation for bytes it places. With a cache wired those
+    /// bytes are a cache entry too (a hit, or the entry a miss just admitted),
+    /// so the cache cap and this guard cover the same allocation: marked
+    /// handed off, as the whole-object funnels mark theirs.
+    fn hold_placement(
+        &self,
+        asm: &mut ObjectAssembler,
+        mut reservation: ravel_memory::Reservation,
+    ) {
+        if self.cache.is_some() {
+            reservation.mark_handed_off();
+        }
+        asm.hold(reservation);
     }
 
     /// Fetch and parse just the [`LogFooter`](footer::LogFooter) via the
@@ -4945,14 +4861,14 @@ impl BlockRangeFetcher {
         Ok((footer, skip, field_dir, stats))
     }
 
-    /// Fetch one segment's object as an assembled, decode-ready buffer, reading
+    /// Fetch one segment's object as decode-ready [`LogObjectBytes`], reading
     /// only the blocks skip-index pruning (over `[ts_min_ns, ts_max_ns]`) proved
-    /// relevant. Returns the buffer plus the [`BlockRangeStats`] for the fetch.
+    /// relevant. Returns the bytes plus the [`BlockRangeStats`] for the fetch.
     ///
     /// The caller has already decided the object is ts-relevant. `ts_min_ns`/
     /// `ts_max_ns` are the inclusive query bounds used for skip-index candidate
     /// selection here; stream/POSTINGS/bloom/numeric pruning still runs at decode
-    /// inside the reader over the assembled buffer (it can only narrow the
+    /// inside the reader over the placed regions (it can only narrow the
     /// candidate set further, so every survivor block is fetched).
     ///
     /// A data read, so its wire bytes are charged under [`ReadPhases::SCAN`]
@@ -4964,7 +4880,7 @@ impl BlockRangeFetcher {
         ts_min_ns: i64,
         ts_max_ns: i64,
         accounting: &QueryAccounting,
-    ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
+    ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         self.fetch_object_with_footer(
             seg_ref,
             tenant_hash,
@@ -4994,7 +4910,7 @@ impl BlockRangeFetcher {
         ts_max_ns: i64,
         columns: &ColumnSelection,
         accounting: &QueryAccounting,
-    ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
+    ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         self.fetch_object_with_footer(
             seg_ref,
             tenant_hash,
@@ -5061,7 +4977,7 @@ impl BlockRangeFetcher {
         plan_footer: Option<CarriedFooter<'_>>,
         phases: ReadPhases,
         accounting: &QueryAccounting,
-    ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
+    ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
@@ -5093,7 +5009,7 @@ impl BlockRangeFetcher {
             stats.probe_gets = 1;
             stats.whole_object = true;
             stats.block_bytes_fetched = got.data.len() as u64;
-            return Ok((got.data, stats));
+            return Ok((got.data.into(), stats));
         }
 
         // Size-threshold pre-probe crossover (ADR-0107 decision 1): a small
@@ -5141,15 +5057,12 @@ impl BlockRangeFetcher {
         // silently mixing: the probe's length check rejects a short read, and a
         // footer parsed at wrong absolute offsets is a `Corrupt`.
         let total_size = seg_ref.object_size;
-        let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
-        // Reserve the object-sized assembly buffer before any block GET
-        // (ADR-1170 decision 2): the pooled buffer is object-sized regardless of
-        // how few blocks the pruned read places into it, so the object size is
-        // the memory this read holds. The guard is owned by the assembler and
-        // travels with its `into_bytes` result, releasing when the reader drops
-        // the assembled buffer. A refusal fails typed with zero GETs.
-        let reservation = self.reserve_fetch(total_size)?;
-        let mut asm = ObjectAssembler::new(&self.assembly_pool, total, Some(reservation));
+        // The assembler holds only what this read places (issue #2066). Each
+        // placement reserves its own length before the GET that fetches it
+        // (ADR-1170 decision 2, `place_extent`), and the assembler, then its
+        // `into_bytes` result, holds those guards until the reader drops the
+        // bytes. A refusal fails typed with zero GETs for the refused range.
+        let mut asm = ObjectAssembler::new(&self.assembly_gauge, total_size);
 
         // Footer: reused from the plan phase when carried (deliverable 2), else
         // read via the etag-establishing suffix probe. The probe is a suffix GET
@@ -5166,7 +5079,7 @@ impl BlockRangeFetcher {
                 let suffix = self.effective_suffix_len(total_size);
                 let probe_start = total_size - suffix;
                 let (probe_bytes, probe_live) = self
-                    .cached_extent(
+                    .place_extent(
                         seg_ref,
                         tenant_hash,
                         probe_start,
@@ -5174,13 +5087,13 @@ impl BlockRangeFetcher {
                         GetRange::Suffix(suffix),
                         phases.metadata,
                         &pin,
+                        &mut asm,
                         accounting,
                     )
                     .await?;
                 if probe_live {
                     stats.probe_gets = 1;
                 }
-                asm.place(key, probe_start, &probe_bytes)?;
                 // Parse from the probe suffix, chasing one range if the suffix
                 // did not cover the whole footer (mirrors
                 // `SegmentFetcher::open_segment`).
@@ -5194,7 +5107,7 @@ impl BlockRangeFetcher {
                         // against the window like the tail-section misses below.
                         stats.probe_misses += 1;
                         let (bytes, live) = self
-                            .cached_extent(
+                            .place_extent(
                                 seg_ref,
                                 tenant_hash,
                                 offset,
@@ -5202,13 +5115,13 @@ impl BlockRangeFetcher {
                                 GetRange::Range(offset, offset + len),
                                 phases.metadata,
                                 &pin,
+                                &mut asm,
                                 accounting,
                             )
                             .await?;
                         if live {
                             stats.probe_gets += 1;
                         }
-                        asm.place(key, offset, &bytes)?;
                         match open_from_suffix(&bytes, total_size)
                             .map_err(|source| corrupt(key, source))?
                         {
@@ -5306,7 +5219,7 @@ impl BlockRangeFetcher {
         // has no phase tag of its own, only the handle it is given.
         let skip_stored = asm.slice(key, skip_desc.offset, skip_desc.len)?;
         let skip_raw = self
-            .decode_section_on_gate(key, skip_stored, skip_desc, accounting)
+            .decode_section_on_gate(key, &skip_stored, skip_desc, accounting)
             .await?;
         let skip =
             SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
@@ -5369,11 +5282,10 @@ impl BlockRangeFetcher {
         if coverage >= self.coverage_threshold {
             // `extents` is already owned (resolved above from the decoded skip
             // index, not borrowed from `asm`), so the assembler holds no live
-            // borrow here. Drop it -- releasing both its object-sized buffer
-            // and its reservation guard -- BEFORE the covering GET reserves
-            // fresh (ADR-1170 decision 2): the object is materialized once, so
-            // only one object-sized reservation is ever live, never the
-            // assembler's plus a second one for the covering read.
+            // borrow here. Drop it -- releasing its placed regions and their
+            // reservation guards -- BEFORE the covering GET reserves fresh
+            // (ADR-1170 decision 2), so the probe and sections placed so far are
+            // not held beside the whole object the covering read brings.
             drop(asm);
             // Keyed and single-flighted like every other GET here, on the same
             // `(0, object_size)` key the whole-object funnel uses: without that,
@@ -5405,7 +5317,7 @@ impl BlockRangeFetcher {
         }
 
         // The suffix probe normally places the object's tail -- the footer and
-        // trailer bytes `RlogReader` re-reads to open the assembled buffer, which
+        // trailer bytes `RlogReader` re-reads to open the placed regions, which
         // are not themselves listed sections. When the footer was carried the
         // probe was skipped, so on this (non-coverage) branch that tail is still
         // unplaced; place it now as one range over `[last_section_end,
@@ -5423,8 +5335,8 @@ impl BlockRangeFetcher {
                 .max()
                 .unwrap_or(0);
             if tail_start < total_size && !asm.covers(tail_start, total_size) {
-                let (bytes, live) = self
-                    .cached_extent(
+                let (_, live) = self
+                    .place_extent(
                         seg_ref,
                         tenant_hash,
                         tail_start,
@@ -5432,13 +5344,13 @@ impl BlockRangeFetcher {
                         GetRange::Range(tail_start, total_size),
                         phases.metadata,
                         &pin,
+                        &mut asm,
                         accounting,
                     )
                     .await?;
                 if live {
                     stats.metadata_gets += 1;
                 }
-                asm.place(key, tail_start, &bytes)?;
             }
         }
 
@@ -5543,7 +5455,7 @@ impl BlockRangeFetcher {
         phases: ReadPhases,
         accounting: &QueryAccounting,
         mut stats: BlockRangeStats,
-    ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
+    ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let total_size = seg_ref.object_size;
         let blocks_desc = *footer
@@ -5583,8 +5495,8 @@ impl BlockRangeFetcher {
         // than the per-section reads it replaces.
         if !probed && self.cache.is_some() && suffix > 0 {
             let probe_start = total_size - suffix;
-            let (bytes, live) = self
-                .cached_extent(
+            let (_, live) = self
+                .place_extent(
                     seg_ref,
                     tenant_hash,
                     probe_start,
@@ -5592,13 +5504,13 @@ impl BlockRangeFetcher {
                     GetRange::Range(probe_start, total_size),
                     phases.metadata,
                     pin,
+                    &mut asm,
                     accounting,
                 )
                 .await?;
             if live {
                 stats.probe_gets += 1;
             }
-            asm.place(key, probe_start, &bytes)?;
         }
 
         // SKIP_IDX and PAGE_DIR first, and nothing the candidate set does not
@@ -5702,9 +5614,9 @@ impl BlockRangeFetcher {
             // `wanted` is already owned (resolved above from the decoded skip
             // index and page directory, not borrowed from `asm`), so dropping
             // the assembler here is safe, as the version-3 coverage crossover
-            // does: it releases the buffer and its reservation guard BEFORE
-            // the covering GET reserves fresh, so only one object-sized
-            // reservation is ever live (ADR-1170 decision 2).
+            // does: it releases the placed regions and their reservation
+            // guards BEFORE the covering GET reserves fresh (ADR-1170
+            // decision 2).
             drop(asm);
             // Bounded by the fetch bound (ADR-0996 decision 2), like the
             // version-3 coverage crossover above.
@@ -5733,7 +5645,7 @@ impl BlockRangeFetcher {
         }
 
         // The suffix probe normally places the object's tail -- the footer and
-        // trailer bytes `RlogReader` re-reads to open the assembled buffer,
+        // trailer bytes `RlogReader` re-reads to open the placed regions,
         // which are not themselves listed sections. A carried footer skipped the
         // probe, so place that tail now (the version-3 path does the same).
         if !probed {
@@ -5744,8 +5656,8 @@ impl BlockRangeFetcher {
                 .max()
                 .unwrap_or(0);
             if tail_start < total_size && !asm.covers(tail_start, total_size) {
-                let (bytes, live) = self
-                    .cached_extent(
+                let (_, live) = self
+                    .place_extent(
                         seg_ref,
                         tenant_hash,
                         tail_start,
@@ -5753,13 +5665,13 @@ impl BlockRangeFetcher {
                         GetRange::Range(tail_start, total_size),
                         phases.metadata,
                         pin,
+                        &mut asm,
                         accounting,
                     )
                     .await?;
                 if live {
                     stats.metadata_gets += 1;
                 }
-                asm.place(key, tail_start, &bytes)?;
             }
         }
 
@@ -5910,14 +5822,12 @@ impl BlockRangeFetcher {
         // against the cap or force a bridge a genuinely uncovered run set
         // would not have needed.
         let runs: Vec<ByteExtent> = self.bounded_chunk_runs(&seg_ref.level, wanted, &*asm);
-        // Reserve the transient wire buffers the coalesced runs materialize
-        // before `join_all` issues a GET (ADR-1170 decision 2): a refusal fails
-        // typed with zero GETs. Held to the end of this call, covering the
-        // per-run buffers until each is copied into `asm` (whose object-sized
-        // reservation, taken at construction, is the durable one). A transient
-        // peak, released when this call returns.
+        // Reserve every run's bytes before `join_all` issues a GET (ADR-1170
+        // decision 2): a refusal fails typed with zero GETs. Each run's buffer
+        // is placed into `asm` as it arrived, so this one guard covers what the
+        // runs place and `asm` holds it for as long as they live.
         let reserved: u64 = runs.iter().map(|r| r.len).fold(0u64, u64::saturating_add);
-        let _reservation = self.reserve_fetch(reserved)?;
+        let reservation = self.reserve_fetch(reserved)?;
         let outcomes = futures::future::join_all(runs.iter().map(|run| async move {
             let (bytes, live) = self
                 .cached_extent(
@@ -5934,6 +5844,7 @@ impl BlockRangeFetcher {
             Ok::<_, LogFetchError>((run.abs_start, bytes, live))
         }))
         .await;
+        self.hold_placement(asm, reservation);
         for outcome in outcomes {
             let (start, bytes, live) = outcome?;
             if live {
@@ -5943,7 +5854,7 @@ impl BlockRangeFetcher {
             } else {
                 stats.block_cache_hits += 1;
             }
-            asm.place(key, start, &bytes)?;
+            asm.place(key, start, bytes)?;
         }
         Ok(())
     }
@@ -5966,7 +5877,6 @@ impl BlockRangeFetcher {
         accounting: &QueryAccounting,
         stats: &mut BlockRangeStats,
     ) -> Result<(), LogFetchError> {
-        let key = seg_ref.data_object_key.as_str();
         let missing: Vec<ByteExtent> = sections
             .iter()
             .filter(|s| !asm.covers(s.offset, s.offset + s.len))
@@ -5976,8 +5886,8 @@ impl BlockRangeFetcher {
             })
             .collect();
         for run in coalesce_byte_extents(&missing, self.effective_coalesce_gap()) {
-            let (bytes, live) = self
-                .cached_extent(
+            let (_, live) = self
+                .place_extent(
                     seg_ref,
                     tenant_hash,
                     run.abs_start,
@@ -5985,18 +5895,18 @@ impl BlockRangeFetcher {
                     GetRange::Range(run.abs_start, run.abs_end()),
                     phase,
                     pin,
+                    asm,
                     accounting,
                 )
                 .await?;
             if live {
                 stats.metadata_gets += 1;
             }
-            asm.place(key, run.abs_start, &bytes)?;
         }
         Ok(())
     }
 
-    /// Decode one whole-compressed section out of the assembled buffer, where an
+    /// Decode one whole-compressed section out of the assembler, where an
     /// earlier `place_*` call already put its stored bytes. Charges the bytes
     /// zstd produced to `accounting` (issue #1401 finding 3): a ranged read's
     /// SKIP_IDX and PAGE_DIR decode, so its callers pass the same handle their
@@ -6009,7 +5919,7 @@ impl BlockRangeFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Vec<u8>, LogFetchError> {
         let stored = asm.slice(key, desc.offset, desc.len)?;
-        self.decode_section_on_gate(key, stored, desc, accounting)
+        self.decode_section_on_gate(key, &stored, desc, accounting)
             .await
     }
 
@@ -6114,7 +6024,9 @@ impl BlockRangeFetcher {
                 if let Some(bytes) = cache.get(&cache_key).await {
                     accounting.record_cache_hit();
                     accounting.add_cache_bytes(bytes.len() as u64);
-                    asm.place(key, desc.offset, &bytes)?;
+                    let reservation = self.reserve_fetch(bytes.len() as u64)?;
+                    self.hold_placement(asm, reservation);
+                    asm.place(key, desc.offset, bytes)?;
                     continue;
                 }
             }
@@ -6126,7 +6038,7 @@ impl BlockRangeFetcher {
         let start = missing.iter().map(|d| d.offset).min().unwrap_or(0);
         let end = missing.iter().map(|d| d.offset + d.len).max().unwrap_or(0);
         let (bytes, live) = self
-            .cached_extent(
+            .place_extent(
                 seg_ref,
                 tenant_hash,
                 start,
@@ -6134,6 +6046,7 @@ impl BlockRangeFetcher {
                 GetRange::Range(start, end),
                 phase,
                 pin,
+                asm,
                 accounting,
             )
             .await?;
@@ -6161,7 +6074,7 @@ impl BlockRangeFetcher {
                 cache.insert(cache_key, section).await;
             }
         }
-        asm.place(key, start, &bytes)
+        Ok(())
     }
 
     /// Place FIELD_DIR (and, when not already resident, STREAM_DIR alongside
@@ -6215,7 +6128,7 @@ impl BlockRangeFetcher {
         .await?;
         let stored = asm.slice(key, desc.offset, desc.len)?;
         let raw = self
-            .decode_section_on_gate(key, stored, &desc, accounting)
+            .decode_section_on_gate(key, &stored, &desc, accounting)
             .await?;
         FieldDir::decode(&raw, MAX_FIELDS).map_err(|source| corrupt(key, source))
     }
@@ -6238,13 +6151,12 @@ impl BlockRangeFetcher {
         accounting: &QueryAccounting,
         stats: &mut BlockRangeStats,
     ) -> Result<(), LogFetchError> {
-        let key = seg_ref.data_object_key.as_str();
         let (start, end) = (section.offset, section.offset + section.len);
         if asm.covers(start, end) {
             return Ok(());
         }
-        let (bytes, live) = self
-            .cached_extent(
+        let (_, live) = self
+            .place_extent(
                 seg_ref,
                 tenant_hash,
                 section.offset,
@@ -6252,13 +6164,14 @@ impl BlockRangeFetcher {
                 GetRange::Range(start, end),
                 phase,
                 pin,
+                asm,
                 accounting,
             )
             .await?;
         if live {
             stats.metadata_gets += 1;
         }
-        asm.place(key, section.offset, &bytes)
+        Ok(())
     }
 
     /// Fetch the candidate blocks into `asm`: serve each from the per-block cache
@@ -6289,12 +6202,12 @@ impl BlockRangeFetcher {
             // by block, so the block-range GET count stays proportional to the
             // blocks the probe did NOT already carry.
             if asm.covers(ext.abs_start, ext.abs_end()) {
-                let block = asm.slice(key, ext.abs_start, ext.len)?;
-                verify_block_crc(key, block, ext)?;
+                let block = Bytes::copy_from_slice(&asm.slice(key, ext.abs_start, ext.len)?);
+                verify_block_crc(key, &block, ext)?;
                 if let Some(cache) = &self.cache {
                     let cache_key =
                         CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-                    cache.insert(cache_key, Bytes::copy_from_slice(block)).await;
+                    cache.insert(cache_key, block).await;
                 }
                 continue;
             }
@@ -6310,7 +6223,9 @@ impl BlockRangeFetcher {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
                 stats.block_cache_hits += 1;
-                asm.place(key, ext.abs_start, &bytes)?;
+                let reservation = self.reserve_fetch(bytes.len() as u64)?;
+                self.hold_placement(asm, reservation);
+                asm.place(key, ext.abs_start, bytes)?;
                 continue;
             }
             if self.cache.is_some() {
@@ -6324,13 +6239,18 @@ impl BlockRangeFetcher {
         // the runs in series made `get_limiter` inert: a sequential loop never
         // has more than one GET in flight to bound.
         let runs = coalesce_extents(&missing, self.effective_coalesce_gap());
-        // Reserve the transient wire buffers the coalesced runs materialize
-        // before `join_all` issues a GET (ADR-1170 decision 2): a refusal fails
-        // typed with zero GETs. Held to the end of this call, until each run's
-        // blocks are copied into `asm` (whose object-sized reservation is the
-        // durable one). A transient peak, released when this call returns.
+        // Reserve before `join_all` issues a GET (ADR-1170 decision 2), so a
+        // refusal fails typed with zero GETs: the runs' transient wire buffers,
+        // held to the end of this call while `fetch_run` copies each block out
+        // of them, and the blocks themselves, which `asm` holds for as long as
+        // they live.
         let reserved: u64 = runs.iter().map(|r| r.len).fold(0u64, u64::saturating_add);
-        let _reservation = self.reserve_fetch(reserved)?;
+        let block_bytes: u64 = missing
+            .iter()
+            .map(|e| e.len)
+            .fold(0u64, u64::saturating_add);
+        let placed = self.reserve_fetch(block_bytes)?;
+        let _transient = self.reserve_fetch(reserved)?;
         let outcomes = futures::future::join_all(runs.iter().map(|run| {
             let blocks: Vec<BlockExtent> = missing
                 .iter()
@@ -6340,13 +6260,14 @@ impl BlockRangeFetcher {
             self.fetch_run(seg_ref, tenant_hash, pin, *run, blocks, phase, accounting)
         }))
         .await;
+        self.hold_placement(asm, placed);
         for outcome in outcomes {
             let run = outcome?;
             stats.block_range_gets += run.gets;
             stats.block_cache_hits += run.cache_hits;
             stats.block_bytes_fetched = stats.block_bytes_fetched.saturating_add(run.bytes);
             for (start, bytes) in run.blocks {
-                asm.place(key, start, &bytes)?;
+                asm.place(key, start, bytes)?;
             }
         }
         Ok(())
@@ -6516,29 +6437,23 @@ impl BlockRangeFetcher {
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
-        object: &Bytes,
+        object: &LogObjectBytes,
         extents: &[BlockExtent],
     ) {
         let Some(cache) = &self.cache else {
             return;
         };
         for ext in extents {
-            let (Ok(start), Ok(len)) = (usize::try_from(ext.abs_start), usize::try_from(ext.len))
-            else {
+            let Ok(block) = object.read(ext.abs_start, ext.len) else {
                 continue;
             };
-            let Some(end) = start.checked_add(len) else {
-                continue;
-            };
-            let Some(block) = object.get(start..end) else {
-                continue;
-            };
-            if crc32c::crc32c(block) != ext.crc32c {
+            if crc32c::crc32c(&block) != ext.crc32c {
                 continue;
             }
             let cache_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-            cache.insert(cache_key, Bytes::copy_from_slice(block)).await;
+            let block = Bytes::copy_from_slice(&block);
+            cache.insert(cache_key, block).await;
         }
     }
 }
@@ -6918,8 +6833,8 @@ fn log_gate_failed(key: &str, err: CpuGateError) -> LogFetchError {
 /// second decode is charged to the query's accounting as well, so the job's
 /// size and the bytes it reports are the same work.
 /// `u64::MAX` when the footer does not open.
-fn open_job_len(bytes: &[u8], block_sizes: bool) -> u64 {
-    let Ok(footer) = footer::open(bytes) else {
+fn open_job_len<S: ByteSource + ?Sized>(bytes: &S, block_sizes: bool) -> u64 {
+    let Ok(footer) = footer::open_source(bytes) else {
         return u64::MAX;
     };
     let len = |k| footer.section(k).map_or(0, |desc| desc.uncomp_len);
@@ -6963,10 +6878,14 @@ fn scan_lost(key: &str) -> LogFetchError {
 /// charges that decode to `accounting` like every other: the bytes zstd
 /// produced here count against the query's `TooManyBytesScanned` budget the
 /// same as the ones the open produced.
-fn max_block_uncompressed_len(bytes: &[u8], cfg: &RlogConfig, accounting: &QueryAccounting) -> u64 {
-    let page_dir = footer::open(bytes).ok().and_then(|footer| {
+fn max_block_uncompressed_len<S: ByteSource + ?Sized>(
+    bytes: &S,
+    cfg: &RlogConfig,
+    accounting: &QueryAccounting,
+) -> u64 {
+    let page_dir = footer::open_source(bytes).ok().and_then(|footer| {
         let desc = *footer.section(kind::PAGE_DIR)?;
-        let raw = ravel_logseg::read_section_accounted(bytes, &desc, cfg, accounting).ok()?;
+        let raw = read_section_accounted_from(bytes, &desc, cfg, accounting).ok()?;
         PageDir::decode(&raw).ok()
     });
     let Some(page_dir) = page_dir else {
@@ -8205,9 +8124,10 @@ mod whole_object_get_limiter_tests {
     /// A block-range read that crosses over to a covering whole-object read
     /// (ADR-0107 decision 1) holds exactly one object-sized reservation AT ANY
     /// INSTANT, never two at once. The coverage crossover drops the assembler
-    /// -- releasing both its pooled buffer and its reservation guard -- before
-    /// the covering GET reserves fresh (ADR-1170 decision 2): the object is
-    /// materialized once, so the real peak is one object width, not two.
+    /// -- releasing its placed regions and their reservation guards -- before
+    /// the covering GET reserves fresh (ADR-1170 decision 2): on this fixture
+    /// the probe alone placed the whole object, so keeping the assembler would
+    /// hold two object widths.
     ///
     /// `with_block_range_threshold(0)` routes the object to the block-range path
     /// and sets that path's own whole-object crossover to zero, so the object is
@@ -10186,294 +10106,124 @@ mod plan_block_stats_tests {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod assembly_buffer_tests {
-    //! Issue #894: the ranged read's object-sized buffer is pooled and reused
-    //! instead of freshly allocated and zeroed per object, and
-    //! [`ObjectAssembler::slice`] fails closed on any range no fetch placed --
-    //! which is what makes the reuse safe, since the bytes outside the placed
-    //! regions are now a previous object's rather than zeros.
+    //! Issue #2066: an [`ObjectAssembler`] holds the regions it placed and
+    //! nothing else, refuses every range it did not place, and charges the
+    //! gauge and the fetch budget for exactly those regions until the reader
+    //! drops the bytes.
 
     use super::*;
 
-    fn pool() -> Arc<AssemblyBufferPool> {
-        Arc::new(AssemblyBufferPool::default())
+    fn gauge() -> Arc<AssemblyGauge> {
+        Arc::new(AssemblyGauge::default())
     }
 
-    /// The retention bounds cap idle buffers; nothing reported what scans hold.
-    /// Under `byte-minimal` that live set is one object-sized buffer per
-    /// in-flight ranged read, so it is the figure a memory question actually
-    /// needs (#1771).
+    /// A read inside a placed region returns its bytes; a range no region
+    /// holds is a typed `Corrupt` wrapping `Unplaced`, never zeros.
     ///
-    /// Pins magnitudes, not non-emptiness: the gauge must equal the SUM of the
-    /// checked-out sizes, fall back as each is returned, and reach exactly zero
-    /// when they all are. Charging on release instead of acquire, or forgetting
-    /// the release path, leaves a monotonically rising gauge that a
-    /// `live_bytes > 0` assertion would still pass.
-    #[test]
-    fn live_bytes_tracks_the_checked_out_set_and_returns_to_zero() {
-        let pool = pool();
-        let a = pool.acquire(1_000);
-        assert_eq!(pool.stats().live_bytes, 1_000, "one buffer out");
-        let b = pool.acquire(2_500);
-        assert_eq!(
-            pool.stats().live_bytes,
-            3_500,
-            "the sum of both, not the last"
-        );
-        let c = pool.acquire(500);
-        assert_eq!(pool.stats().live_bytes, 4_000);
-        assert_eq!(
-            pool.stats().peak_live_bytes,
-            4_000,
-            "the high-water mark is the peak simultaneous set"
-        );
-
-        drop(b);
-        assert_eq!(
-            pool.stats().live_bytes,
-            1_500,
-            "returning the middle buffer drops exactly its own bytes"
-        );
-        drop(a);
-        drop(c);
-        assert_eq!(
-            pool.stats().live_bytes,
-            0,
-            "every buffer returned leaves nothing live"
-        );
-        assert_eq!(
-            pool.stats().peak_live_bytes,
-            4_000,
-            "the peak survives the buffers that produced it"
-        );
-    }
-
-    /// A reused buffer keeps the length of the largest object it has served, so
-    /// the live charge is its resident length rather than the requested one.
-    /// Stated as a test because the two differ only after a reuse, which is
-    /// exactly when a reader would assume they agree.
-    #[test]
-    fn a_reused_buffer_charges_its_resident_length() {
-        let pool = pool();
-        let big = pool.acquire(4_000);
-        drop(big);
-        assert_eq!(pool.stats().live_bytes, 0);
-
-        let small = pool.acquire(100);
-        assert_eq!(
-            pool.stats().live_bytes,
-            4_000,
-            "the pooled buffer is still 4,000 bytes resident, whatever this read asked for"
-        );
-        drop(small);
-        assert_eq!(pool.stats().live_bytes, 0, "and all of it comes back");
-    }
-
-    /// The exact allocation figures the fix is about: three same-sized reads
-    /// through one pool allocate ONE buffer and zero its bytes ONCE, with the
-    /// other two served by reuse. Before the fix each `ObjectAssembler::new`
-    /// ran `vec![0u8; total_size]`, so the same sequence was three allocations
-    /// and three whole-object memsets.
-    #[test]
-    fn three_reads_allocate_and_zero_one_object_sized_buffer() {
-        let pool = pool();
-        for _ in 0..3 {
-            let asm = ObjectAssembler::new(&pool, 4096, None);
-            drop(asm);
-        }
-        assert_eq!(
-            pool.stats(),
-            AssemblyBufferStats {
-                allocated: 1,
-                reused: 2,
-                zeroed_bytes: 4096,
-                // Sequential: each buffer is dropped before the next is taken.
-                live_bytes: 0,
-                peak_live_bytes: 4096,
-            }
-        );
-    }
-
-    /// Growth is charged once, over the growth only: a 4 KiB buffer reused for
-    /// a 6 KiB object zeroes the 2 KiB it gained and nothing else, and a later
-    /// smaller object zeroes nothing at all.
-    #[test]
-    fn a_pooled_buffer_zeroes_only_what_it_grows_by() {
-        let pool = pool();
-        drop(ObjectAssembler::new(&pool, 4096, None));
-        drop(ObjectAssembler::new(&pool, 6144, None));
-        drop(ObjectAssembler::new(&pool, 1024, None));
-        assert_eq!(
-            pool.stats(),
-            AssemblyBufferStats {
-                allocated: 1,
-                reused: 2,
-                zeroed_bytes: 6144,
-                // The 1 KiB read reuses the grown 6 KiB buffer, so the peak is
-                // that resident length rather than the largest object asked for.
-                live_bytes: 0,
-                peak_live_bytes: 6144,
-            }
-        );
-    }
-
-    /// A buffer longer than the object it is serving exposes exactly the
-    /// object's length, so a short object can never hand the reader the tail of
-    /// a longer predecessor.
-    #[test]
-    fn a_reused_buffer_is_truncated_to_the_current_objects_length() {
-        let pool = pool();
-        drop(ObjectAssembler::new(&pool, 4096, None));
-        let asm = ObjectAssembler::new(&pool, 1024, None);
-        assert_eq!(asm.buf.as_slice().len(), 1024);
-        assert_eq!(asm.into_bytes().len(), 1024);
-    }
-
-    /// `slice` returns the placed bytes and refuses everything else with the
-    /// typed [`LogFetchError::Corrupt`], including a range that only partly
-    /// overlaps a placed region.
-    ///
-    /// Prove-the-test: delete the `if !self.covers(start, end)` guard in
-    /// `ObjectAssembler::slice` and the two `expect_err` assertions below fail
-    /// with `Ok`, because the buffer's bytes at those offsets are readable and
-    /// the method has no other reason to refuse them.
+    /// Prove-the-test: a source that zero-fills an unplaced range returns
+    /// `Ok([0; 8])` for the gap read and the `expect_err` fails.
     #[test]
     fn slice_refuses_any_range_no_fetch_placed() {
-        let pool = pool();
-        let mut asm = ObjectAssembler::new(&pool, 64, None);
-        asm.place("k", 8, &[0xABu8; 8]).expect("place");
-
-        assert_eq!(asm.slice("k", 8, 8).expect("placed range"), &[0xABu8; 8]);
-
-        let unplaced = asm.slice("k", 0, 8).expect_err("gap byte read must fail");
+        let mut asm = ObjectAssembler::new(&gauge(), 64);
+        asm.place("k", 8, Bytes::from_static(&[0xAB; 8]))
+            .expect("place");
+        assert_eq!(&*asm.slice("k", 8, 8).expect("placed range"), &[0xAB; 8]);
+        let gap = asm.slice("k", 0, 8).expect_err("gap read must fail");
         assert!(
             matches!(
-                &unplaced,
-                LogFetchError::Corrupt { key, source: LogSegError::Corrupted(m) }
-                    if key == "k" && m == "block-range assembly read of [0, 8) outside the fetched regions"
+                gap,
+                LogFetchError::Corrupt {
+                    source: LogSegError::Unplaced { start: 0, end: 8 },
+                    ..
+                }
             ),
-            "expected the uncovered-range error, got {unplaced}"
+            "got {gap:?}"
         );
-
-        let straddling = asm
-            .slice("k", 12, 8)
-            .expect_err("a range half outside the placed region must fail");
+        let straddle = asm.slice("k", 12, 8).expect_err("half-placed read");
+        assert!(matches!(
+            straddle,
+            LogFetchError::Corrupt {
+                source: LogSegError::Unplaced { start: 12, end: 20 },
+                ..
+            }
+        ));
         assert!(
-            matches!(&straddling, LogFetchError::Corrupt { source: LogSegError::Corrupted(m), .. }
-                if m == "block-range assembly read of [12, 20) outside the fetched regions"),
-            "expected the uncovered-range error, got {straddling}"
+            asm.place("k", 60, Bytes::from_static(&[1; 8])).is_err(),
+            "a region past the object end is refused"
         );
     }
 
-    /// The hazard the fail-closed check exists for, demonstrated end to end: a
-    /// reused buffer really does still hold the previous object's bytes, and
-    /// `slice` refuses them rather than handing them back as this object's.
+    /// The gauge carries the placed bytes, not the object size: 24 of a 4096
+    /// byte object here. It stays charged while any clone of the returned
+    /// bytes lives and returns to zero with the last one; the high-water mark
+    /// keeps the peak.
     ///
-    /// Prove-the-test: with the `covers` guard in `ObjectAssembler::slice`
-    /// removed, `slice` returns `Ok([0xAB; 8])` -- the FIRST assembler's bytes
-    /// presented as the second's -- so `expect_err` fails.
+    /// Prove-the-test: charging `total_size` at construction (the object-sized
+    /// buffer this replaced) reads `live_bytes: 4096` at the first assertion.
     #[test]
-    fn a_reused_buffer_refuses_the_previous_objects_bytes() {
-        let pool = pool();
-        let mut first = ObjectAssembler::new(&pool, 64, None);
-        first.place("a", 8, &[0xABu8; 8]).expect("place");
-        drop(first);
-
-        let second = ObjectAssembler::new(&pool, 64, None);
-        assert_eq!(pool.stats().reused, 1, "the same buffer came back");
+    fn the_gauge_counts_placed_bytes_until_the_reader_drops_them() {
+        let g = gauge();
+        let mut asm = ObjectAssembler::new(&g, 4096);
+        assert_eq!(g.stats(), AssemblyBufferStats::default());
+        asm.place("k", 0, Bytes::from_static(&[1; 16]))
+            .expect("place");
+        asm.place("k", 4000, Bytes::from_static(&[2; 8]))
+            .expect("place");
         assert_eq!(
-            second.buf.as_slice().get(8..16),
-            Some(&[0xABu8; 8][..]),
-            "the buffer was NOT re-zeroed: that is the saved memset"
-        );
-        second
-            .slice("b", 8, 8)
-            .expect_err("the previous object's bytes must not be readable as this object's");
-    }
-
-    /// A buffer returns to the pool only when the [`Bytes`]
-    /// [`ObjectAssembler::into_bytes`] produced is dropped, so a reader still
-    /// borrowing it can never see it reused underneath.
-    #[test]
-    fn a_buffer_returns_to_the_pool_only_after_its_bytes_are_dropped() {
-        let pool = pool();
-        let mut asm = ObjectAssembler::new(&pool, 64, None);
-        asm.place("a", 0, &[0xCDu8; 64]).expect("place");
-        let held = asm.into_bytes();
-
-        let concurrent = ObjectAssembler::new(&pool, 64, None);
-        assert_eq!(
-            pool.stats(),
+            g.stats(),
             AssemblyBufferStats {
-                allocated: 2,
-                reused: 0,
-                zeroed_bytes: 128,
-                // Both buffers are out at once here, which is the case the
-                // gauge exists for: the idle bounds say nothing about it.
-                live_bytes: 128,
-                peak_live_bytes: 128,
-            },
-            "a live Bytes keeps its buffer out of the pool"
+                live_bytes: 24,
+                peak_live_bytes: 24,
+            }
         );
-        assert_eq!(held.as_ref(), &[0xCDu8; 64], "the held bytes are intact");
-        drop(concurrent);
-        drop(held);
-
-        drop(ObjectAssembler::new(&pool, 64, None));
-        assert_eq!(pool.stats().reused, 1, "both buffers are back");
-    }
-
-    /// The pool bounds what it retains by count: past
-    /// [`MAX_IDLE_ASSEMBLY_BUFFERS`] idle buffers the extras are dropped rather
-    /// than held for the life of the process.
-    #[test]
-    fn the_idle_set_is_bounded_by_count() {
-        let pool = pool();
-        let live: Vec<ObjectAssembler> = (0..MAX_IDLE_ASSEMBLY_BUFFERS + 2)
-            .map(|_| ObjectAssembler::new(&pool, 64, None))
-            .collect();
+        let bytes = asm.into_bytes();
+        assert_eq!(bytes.held_len(), 24);
+        assert_eq!(bytes.len(), 4096, "the object's length, not the held bytes");
+        let clone = bytes.clone();
+        drop(bytes);
+        assert_eq!(g.stats().live_bytes, 24, "a clone keeps the regions held");
+        drop(clone);
         assert_eq!(
-            pool.stats().allocated,
-            (MAX_IDLE_ASSEMBLY_BUFFERS + 2) as u64
+            g.stats(),
+            AssemblyBufferStats {
+                live_bytes: 0,
+                peak_live_bytes: 24,
+            }
         );
-        drop(live);
-        let idle = pool.idle.lock().expect("idle");
-        assert_eq!(idle.bufs.len(), MAX_IDLE_ASSEMBLY_BUFFERS);
-        assert_eq!(idle.bytes, MAX_IDLE_ASSEMBLY_BUFFERS * 64);
     }
 
-    /// And by total length, which is the bound that matters when the objects are
-    /// large: with a 3 KiB budget, two concurrent 2 KiB buffers retain one and
-    /// drop the other even though the count cap has room, and a buffer longer
-    /// than the whole budget is never retained.
+    /// An assembler dropped without handing its bytes on (an error or a
+    /// coverage crossover) releases its gauge charge and its reservations.
     #[test]
-    fn the_idle_set_is_bounded_by_total_length() {
-        let pool = Arc::new(AssemblyBufferPool {
-            max_idle_bytes: 3072,
-            ..AssemblyBufferPool::default()
-        });
-        let a = ObjectAssembler::new(&pool, 2048, None);
-        let b = ObjectAssembler::new(&pool, 2048, None);
-        drop(a);
-        drop(b);
-        {
-            let idle = pool.idle.lock().expect("idle");
-            assert_eq!(
-                idle.bufs.len(),
-                1,
-                "the second buffer overflowed the budget"
-            );
-            assert_eq!(idle.bytes, 2048);
-        }
+    fn a_dropped_assembler_releases_what_it_held() {
+        let g = gauge();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1024));
+        let mut asm = ObjectAssembler::new(&g, 512);
+        asm.hold(budget.reserve(32).expect("reserve"));
+        asm.place("k", 100, Bytes::from_static(&[3; 32]))
+            .expect("place");
+        assert_eq!(asm.reserved(), 32);
+        assert_eq!(budget.fetch_reserved(), 32);
+        drop(asm);
+        assert_eq!(budget.fetch_reserved(), 0);
+        assert_eq!(g.stats().live_bytes, 0);
+    }
 
-        // Takes the one idle buffer, grows it past the budget, and is therefore
-        // not taken back.
-        drop(ObjectAssembler::new(&pool, 4096, None));
-        let idle = pool.idle.lock().expect("idle");
-        assert!(
-            idle.bufs.is_empty(),
-            "an over-budget buffer is not retained"
-        );
-        assert_eq!(idle.bytes, 0);
+    /// The reservations travel with the returned bytes: released only when
+    /// the last clone drops, not when the assembler is consumed.
+    #[test]
+    fn reservations_release_with_the_last_clone_of_the_bytes() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1024));
+        let mut asm = ObjectAssembler::new(&gauge(), 512);
+        asm.hold(budget.reserve(40).expect("reserve"));
+        asm.place("k", 0, Bytes::from_static(&[4; 40]))
+            .expect("place");
+        let bytes = asm.into_bytes();
+        let clone = bytes.clone();
+        drop(bytes);
+        assert_eq!(budget.fetch_reserved(), 40);
+        drop(clone);
+        assert_eq!(budget.fetch_reserved(), 0);
     }
 }
 
@@ -10817,7 +10567,7 @@ mod read_gate_tests {
         );
         let unreadable = QueryAccounting::new();
         assert_eq!(
-            max_block_uncompressed_len(b"not an object", &cfg, &unreadable),
+            max_block_uncompressed_len(&b"not an object"[..], &cfg, &unreadable),
             u64::MAX
         );
         assert_eq!(unreadable.snapshot().decompressed_bytes, 0);
