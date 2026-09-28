@@ -446,6 +446,21 @@ check_contains "and reports UNRESOLVED with the reason" "unreachable (curl exit 
 check_eq "state records UNRESOLVED" "UNRESOLVED" \
   "$(jq -r --arg t "${task_a}" '.tasks[$t].state' "${d}/state/900.json")"
 
+# The env file may spell its keys as `export KEY=value`, indented or not;
+# either form must still reach the control plane.
+# Mutation: anchor the parse on `^FLEET_PUBLIC_URL=` again.
+d="$(new_case reconcile_cp_env_export)"
+run_in "${d}" "${ORCHESTRATOR}" init 900 >/dev/null
+printf 'Epic\n- #101 task=%s dispatched\n' "${task_a}" >"${d}/issue-body.txt"
+printf '1111 refs/heads/task/%s/start\n' "${task_a}" >"${d}/task-refs.txt"
+: >"${d}/prs.txt"
+printf '200' >"${d}/cp/${task_a}.code"
+printf '{"status":"running","result_ref":""}' >"${d}/cp/${task_a}.json"
+printf 'export FLEET_PUBLIC_URL="http://cp.invalid:8080"\n  export FLEET_ENQUEUE_TOKEN=stub-token\n' >"${d}/cp.env"
+out="$(run_in "${d}" env RAVEL_FLEET_CP_ENV="${d}/cp.env" "${ORCHESTRATOR}" reconcile 900)"; rc=$?
+check_eq "an export-form env file reaches the control plane (0)" "0" "${rc}"
+check_contains "and the task reads running" "running (control plane: running)" "${out}"
+
 # A PR query that fails is UNKNOWN, never "no PR".
 # Mutation: restore `|| true` on the per-task gh pr list.
 d="$(new_case reconcile_unknown_prs)"
