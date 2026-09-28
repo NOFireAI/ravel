@@ -2070,4 +2070,102 @@ mod tests {
             FetchOutcome::Unknown(_)
         ));
     }
+
+    /// Params that put every condition in play, including the retention sampling
+    /// the server path leaves off (ADR-1727 decision 5).
+    fn full_params() -> BucketProtectionParams {
+        BucketProtectionParams {
+            expected_noncurrent_days: Some(30),
+            sample_object_retention: true,
+            protected_retention_prefixes: vec!["t/".to_string()],
+        }
+    }
+
+    /// The whole report over HTTP, not one call at a time: a compliant bucket
+    /// yields `Pass` on all nine conditions, and every request is a signed GET.
+    #[tokio::test]
+    async fn compliant_bucket_reports_every_condition_pass_over_http() {
+        let respond: Responder = Arc::new(|sub, _path| {
+            // `sub` is the first key of the canonical (sorted) query, so the
+            // `?versions` listing arrives keyed by `max-keys`.
+            let body = match sub {
+                "versioning" => {
+                    "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+                        .to_string()
+                }
+                "lifecycle" => r#"<LifecycleConfiguration><Rule><Status>Enabled</Status>
+                      <Filter><Prefix></Prefix></Filter>
+                      <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays></NoncurrentVersionExpiration>
+                      <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>
+                      <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>
+                    </Rule></LifecycleConfiguration>"#
+                    .to_string(),
+                "replication" => "<ReplicationConfiguration><Rule><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule></ReplicationConfiguration>".to_string(),
+                "object-lock" => "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>".to_string(),
+                "max-keys" => r#"<ListVersionsResult>
+                      <Version><Key>t/a/1.rseg</Key><VersionId>v1</VersionId><IsLatest>true</IsLatest></Version>
+                      <Version><Key>t/a/1.rseg</Key><VersionId>v0</VersionId><IsLatest>false</IsLatest></Version>
+                    </ListVersionsResult>"#
+                    .to_string(),
+                "retention" => "<Retention><Mode>COMPLIANCE</Mode></Retention>".to_string(),
+                other => panic!("unexpected subresource {other}"),
+            };
+            (StatusCode::OK, body)
+        });
+        let (base, seen) = spawn_fake(respond).await;
+        let report = test_client(&base).report(&full_params()).await;
+
+        for id in ProtectionConditionId::ALL {
+            let state = report.state(id).expect("every id present");
+            assert!(state.is_pass(), "{} is {state:?}", id.id());
+        }
+        assert_eq!(report.failed_count(), 0);
+        assert_eq!(report.unknown_count(), 0);
+
+        let requests = seen.lock();
+        // versioning, lifecycle, replication, object-lock, the versions listing,
+        // and one retention read per sampled version.
+        assert_eq!(requests.len(), 7);
+        for req in requests.iter() {
+            verify_authorization(req);
+        }
+    }
+
+    /// A credential that cannot read the control plane reports `Unknown` on every
+    /// condition, never `Fail` (ADR-1727 decision 3): "could not verify" must not
+    /// read as "verified broken".
+    #[tokio::test]
+    async fn access_denied_reports_every_condition_unknown_over_http() {
+        let respond: Responder = Arc::new(|_sub, _path| {
+            (
+                StatusCode::FORBIDDEN,
+                "<Error><Code>AccessDenied</Code></Error>".to_string(),
+            )
+        });
+        let (base, _seen) = spawn_fake(respond).await;
+        let report = test_client(&base).report(&full_params()).await;
+
+        for id in ProtectionConditionId::ALL {
+            let state = report.state(id).expect("every id present");
+            assert!(state.is_unknown(), "{} is {state:?}", id.id());
+        }
+        assert_eq!(report.failed_count(), 0);
+        assert_eq!(report.unknown_count(), ProtectionConditionId::ALL.len());
+    }
+
+    /// A 200 whose body the reader cannot parse is the other `Unknown` source,
+    /// and it must not reach `Fail` through the assembled report either.
+    #[tokio::test]
+    async fn malformed_bodies_report_every_condition_unknown_over_http() {
+        let respond: Responder =
+            Arc::new(|_sub, _path| (StatusCode::OK, "<not-the-expected-root/>".to_string()));
+        let (base, _seen) = spawn_fake(respond).await;
+        let report = test_client(&base).report(&full_params()).await;
+
+        for id in ProtectionConditionId::ALL {
+            let state = report.state(id).expect("every id present");
+            assert!(state.is_unknown(), "{} is {state:?}", id.id());
+        }
+        assert_eq!(report.failed_count(), 0);
+    }
 }
