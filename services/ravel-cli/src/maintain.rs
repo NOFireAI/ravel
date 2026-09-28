@@ -3494,7 +3494,7 @@ mod tests {
     #[test]
     fn inspect_refuses_a_future_version_compaction_record() {
         let record = ravel_proto::commit::v1::CompactionRecord {
-            format_version: 2,
+            format_version: 3,
             tenant_hash: vec![0u8; 16],
             signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
             shard: 0,
@@ -3504,12 +3504,12 @@ mod tests {
         };
         let bytes = record::encode_compaction(&record);
         let err = decode_compaction_record(bytes.as_ref())
-            .expect_err("a version-2 compaction record must be refused, not printed as v1");
+            .expect_err("a version-3 compaction record must be refused, not printed as v1");
         let msg = err.to_string();
         assert!(
             msg.contains("compaction record")
                 && msg.contains("format_version")
-                && msg.contains('2'),
+                && msg.contains('3'),
             "the error names the record kind, the gate, and the version seen: {msg}"
         );
     }
