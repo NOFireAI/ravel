@@ -321,7 +321,8 @@ untouched.
 - **An external read store per credential profile.** A read-only
   `ObjectStoreBackend` (`get` with ranges, `head`, `list`) over the
   `object_store` crate's S3, GCS or Azure client, built at startup from the
-  profile's configuration. `ObjectStoreBackend` gains a conditional get (a
+  profile's configuration (its S3 kind wraps Ravel's own `S3Store`; see the
+  pinning amendment below). `ObjectStoreBackend` gains a conditional get (a
   `GetRange` plus ETag and version preconditions), implemented here and by
   `S3Store`, `MemoryStore` and `FaultStore`, so every failure path can be
   tested without a cloud account. Every Parquet read carries the
@@ -762,7 +763,7 @@ flowchart TB
 
 ## Amendment (2026-09-28): version pins select, S3 versions must be surfaced, and the bucket probe also looks for Ravel's marker
 
-<!-- amendment-applies: sections="D1. A table is a pinned snapshot of Parquet files where they already are" pointer="pinning amendment" -->
+<!-- amendment-applies: sections="D1. A table is a pinned snapshot of Parquet files where they already are|D3. The reader: DataFusion's Parquet scan through Ravel's fetch path" pointer="pinning amendment" -->
 <!-- amendment-supersedes: phrase="`FileChanged`" pointer="pinning amendment" -->
 <!-- amendment-supersedes: phrase="A file that changed fails the query" pointer="pinning amendment" -->
 
@@ -786,13 +787,18 @@ ETag alone. The corrected rule:
   `PreconditionFailed`, and the query fails with `FileChanged`, as D1 said.
 - Old and new bytes are still never mixed in one query, in either case.
 
-**S3 versions must be surfaced.** The external read store's S3 kind is
-built on Ravel's own `S3Store` adapter
-(`crates/ravel-object-store/src/external.rs`), which reports every object's
-version as its ETag and drops `x-amz-version-id`. It must report the real
-version id when the bucket has versioning on, so an S3 file is pinned by
-version as well as ETag; the wave 1 fix round of epic #2040 does this. Until
-it does, S3 pins are ETag-only, and
+**S3 versions must be surfaced.** D3's external read store builds its S3
+kind on Ravel's own `S3Store` adapter rather than on a second S3 client, so
+S3 and S3-compatible stores share one set of credential modes, retries and
+accounting. `S3Store` reports every object's version as its ETag, on every
+bucket, and drops `x-amz-version-id`. That ETag-shaped value is not a
+version: it is never recorded in a manifest as one and never sent as a
+version selector, because S3 would answer `NoSuchVersion` and every read
+would fail with `FileMissing`. An S3 file therefore takes the ETag-only
+branch above. `S3Store` must report the real version id when the bucket has
+versioning on, so an S3 file is pinned by version as well as ETag; epic
+#2040's wave 1 fix round does this. Until it does, S3 pins are ETag-only,
+and
 D1's closing sentence on the cache key ("A versioned bucket, or GCS, removes
 this") holds for GCS and for Azure but not for S3.
 
