@@ -103,7 +103,7 @@ tikv-jemallocator = "0.7"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "logs", "trace"] }
 
 # object storage
-object_store = { version = "0.14", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
 
 # arrow (isolated to ravel-otap for now; Phase 3 query work reuses it)
 arrow = { version = "59", default-features = false, features = ["ipc"] }
