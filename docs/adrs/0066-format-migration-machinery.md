@@ -100,7 +100,7 @@ ADR-1746 amends this decision: a floor also records the basis of the audit that 
 **Class A — bulk data objects (RSEG, RLOG, RSPAN).** Large, immutable, never rewritten in place. Three convergence forces, in preference order:
 
 1. Retention: old-version objects age out with their hour buckets at zero marginal cost. Deployments whose retention window is shorter than their release cadence converge on this alone. (Narrowed to versions this build can read by the 2026-09-13 amendment below.)
-2. Rewrite-on-touch: compaction outputs are always current-version, so L0 converges through the normal maintenance loop once the N-1 reader exists. Additionally, maintenance treats "live L1 part with `segment_format_version` < current" as compaction-eligible at low priority under the existing maintenance cost budget, so compacted data converges opportunistically too. Caveat honored from Context: this carries trailer/section-layer bumps through the existing verbatim-copy pipeline; a page-grammar bump routes through the re-encode primitive of Decision 5 instead. ADR-1331 narrows this force to compaction parts: a rewrite record's below-target parts are reported as a blocked bucket with a reason and are not migrated.
+2. Rewrite-on-touch: compaction outputs are always current-version, so L0 converges through the normal maintenance loop once the N-1 reader exists. Additionally, maintenance treats "live L1 part with `segment_format_version` < current" as compaction-eligible at low priority under the existing maintenance cost budget, so compacted data converges opportunistically too. Caveat honored from Context: this carries trailer/section-layer bumps through the existing verbatim-copy pipeline; a page-grammar bump routes through the re-encode primitive of Decision 5 instead. ADR-1331 narrows this force to compaction parts: a rewrite record's below-target parts are reported as a blocked bucket with a reason and are not migrated. How a re-encoded compaction part set supersedes its predecessor is set by the force 2 superseding-record amendment below.
 3. The operator-triggered migration job (Decision 5) for the tail neither force reaches fast enough, and for verify-and-raise-floor.
 
 **Class B — derived catalog objects (.csnap, .npost, HEAD).** Rebuildable from commit records by construction; the fold rewrites them continuously. A version bump needs no migration tool: the upgraded fold emits the new version, supersession GCs the old parts, and dual-read is needed only across the rolling-upgrade window. Multi-part fold (ADR-0063) is exactly such a bump and is this rule's first consumer.
@@ -523,3 +523,78 @@ holds for the metrics, logs and spans buckets. Audit logs are also RLOG but
 age out through their own sweep, which applies no version hold. The rollback
 consequence is
 recorded in ADR-0531's 2026-09-27 amendment.
+
+## Amendment (2026-09-28, #2093): force 2 for compaction parts, a superseding compaction record
+
+<!-- amendment-applies: sections="4. Convergence, by migration class" pointer="force 2 superseding-record amendment" -->
+
+Decision 4, Class A, force 2 says maintenance treats a live L1 part below the
+current `segment_format_version` as compaction-eligible. Nothing implements it
+(issue #2093), and nothing can without a format change: a compaction record's
+key is `l1.<input_set_hash16>.cmt`, the hash covers only the inputs, so a
+re-encode of the same inputs gets the predecessor's key, `CreateIfAbsent`
+answers `AlreadyExists`, and the publish converges on the old record. Only
+`RewriteRecord` carries a `superseded_record_key`, and borrowing a rewrite
+record fails `validate_rewrite` (no drops), writes a false erasure audit entry,
+drops column statistics, and blocks the bucket from every later migration
+under ADR-1331. So a compaction record gains its own supersession.
+
+1. **Format.** `CompactionRecord` gains `string superseded_record_key = 11`. A
+   record that sets it is stamped `format_version = 2`; every other record stays
+   version 1, byte for byte. A build that predates this amendment refuses a v2
+   record with its existing typed unsupported-version error rather than
+   misreading it (the Class C rule). This is a version bump of the compaction
+   record, recorded here as the ADR the frozen-format rule requires.
+2. **Key and hash.** A v2 record's inputs are copied verbatim from its
+   predecessor. Its hash is taken over a new domain,
+   `(inputs, superseded_record_key)`, so the key shape is unchanged
+   (`l1.<hash16>.cmt`) and the key differs from the predecessor's. Key
+   reconstruction and `seal_divergence` recompute the hash for the record's own
+   version.
+3. **Resolution.** Supersession is applied inside the shared authoritative
+   selector before the overlap-component winner is chosen: a compaction record
+   that a present v2 record names is excluded, and the chase is bounded and
+   cycle-checked (a cycle is a typed error, never a guess). Resolve, the token
+   fallback, the fold, scrub and the erasure completion gate all call that
+   selector, so they agree. The rewrite-record chase treats a v2 record as a
+   link, not an end.
+4. **Where force 2 does not run.** A bucket whose overlap component holds more
+   than one compaction record is not re-encoded: a v2 record's new hash could
+   lose the winner tie-break to the old loser and serve the loser's inputs raw
+   after their parts are gone. `migrate` names such a bucket as blocked with its
+   own reason. A bucket with a rewrite record stays blocked as ADR-1331 says.
+5. **Erasure dominance.** If a live rewrite record and a v2 record both
+   supersede the same predecessor, the rewrite wins and the v2 record is
+   excluded, since its parts may still hold an erased subject. The sweep
+   reclaims an excluded v2 record and its parts under the same horizon and
+   holds as any superseded record.
+6. **Reclaiming the predecessor.** The sweep deletes a predecessor and its parts
+   as one chain group entered from the v2 record, only once
+   `now >= v2.created_unix_ns + protection_horizon_ns`, only when no reachable
+   HEAD still names the predecessor's parts, never under a legal hold, parts
+   first and records after. A reader that pinned the predecessor's parts gets
+   `SnapshotInvalidated` and its re-resolve picks the v2 record.
+7. **Exact contents.** The re-encode must reproduce every record of the
+   predecessor's parts, including the RSEG per-sample dedup provenance columns;
+   the conservation gate (sample-count sums) is necessary but not sufficient,
+   so each signal gets a differential exact-contents test.
+8. **Rollout.** Readers first: the format, resolution and sweep changes ship in
+   a release before any v2 record is written. The writer is behind a switch
+   that defaults to off until every node runs a reading build.
+9. **Losing records and the floor.** `migrate`'s below-target count stops
+   counting a losing compaction record's parts, since no resolve serves them,
+   but only when no reachable HEAD names them (the same reachability gate the
+   sweep uses). Once the floor rises and the N-1 reader is deleted, the
+   retention version hold still probes loser parts and would hold those
+   buckets; reclaiming loser parts, or skipping them in that probe, is a
+   recorded follow-up.
+
+`docs/catalog-and-mvcc.md` (the record-kind and supersession sections) and the
+`CompactionRecord` proto comment change in the same commit as task T2.
+
+Tasks, in order: T1 loser exclusion in `migrate` (reachability-gated); T2 the
+proto field, version 2, hash domain and decoding in `ravel-commit`; T3
+resolution in `ravel-catalog`; T4 sweep and erasure; T5 the re-encode
+primitive in `rewrite.rs`, writer switch off by default; T6 `migrate` wiring;
+T7 (optional) background low-priority re-encode. T2 to T4 release before T5 to
+T7 are switched on.
