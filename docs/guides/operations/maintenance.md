@@ -500,9 +500,12 @@ target on-object format version. One invocation:
    below the target.
 
 A refused raise, reported as "FOUND STRAGGLERS", means the fresh re-audit found
-genuine live data still below the target. It reports three counts, because they
-are blocked for different reasons: `l0_commit_records`, `l1_compaction_parts`,
-and `rewrite_record_parts`.
+objects that still exist below the target, some of which queries still read. It
+reports three counts, because they are blocked for different reasons:
+`l0_commit_records`, `l1_compaction_parts`, and `rewrite_record_parts`.
+`l0_commit_records` is the one that is entirely live; the two part figures count
+the parts of every record a bucket still LISTS, which includes records the
+resolver no longer serves and a `sweep` deletes (see `rewrite_parts` below).
 
 Only `l0_commit_records` can move on a re-run, and only the part of it that was
 merely not yet sealed when the walk passed, or that landed after it. Nothing
@@ -514,7 +517,10 @@ migrates the other two:
   compaction and the migration rewrite refuse a bucket that already carries a
   compaction record, and the walk never reaches such a bucket's parts.
   Re-running `migrate` reports the same `l1_compaction_parts` figure, and no
-  `blocked_bucket` line is printed for one;
+  `blocked_bucket` line is printed for one. The figure is over listed records,
+  so it can still fall without a `migrate` run: a compaction record that a later
+  rewrite record superseded stays listed until a `sweep` deletes it and its
+  parts, the same way a superseded predecessor rewrite does;
 - a **below-target rewrite part** is never migrated by design (see
   `rewrite_parts` below);
 - a **below-target L0 input only a losing compaction record names** is served
@@ -575,7 +581,9 @@ superseding rewrite at the current output version is not something you trigger:
 the erasure driver does it on its own schedule. The `sweep` that removes a
 superseded predecessor, though, is a command you run: `ravel-cli maintain sweep`
 for that tenant, signal and shard deletes a superseded predecessor rewrite record
-once it is past the protection horizon. So when a bucket is blocked only by a
+once the superseding rewrite is past the protection horizon (the horizon is
+anchored on the superseding record's own `created_unix_ns`, not the
+predecessor's). So when a bucket is blocked only by a
 superseded predecessor whose successor is already at the current output version, a
 `sweep` alone clears it. When the live rewrite is itself still below target, a
 superseding rewrite has to land first AND then be swept, so that path stays a

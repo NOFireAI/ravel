@@ -30,9 +30,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   maintain sweep` for that tenant, signal and shard, subject to the protection
   horizon), and when a bucket is blocked only by a superseded predecessor whose
   successor is already at the current output version, that `sweep` alone clears
-  it; the refusal message and the maintenance guide say so, and `l0_commit_records`
-  and `l1_compaction_parts` are scoped as the genuinely-live figures a `sweep`
-  will not move. A `loser_only_inputs` block clears only when retention ages
+  it; the refusal message and the maintenance guide say so. Of the three counts,
+  only `l0_commit_records` is scoped as entirely live and unmovable by a `sweep`:
+  `l1_compaction_parts` is a count over listed records too, and a compaction
+  record that a later rewrite superseded stays listed until a `sweep` deletes it
+  and its parts, so a `sweep` lowers that figure as well even though no `migrate`
+  run can. A `loser_only_inputs` block clears only when retention ages
   those inputs out, since compaction refuses a bucket that already carries a
   compaction record and so never publishes the covering record that would
   otherwise clear it. `buckets_blocked` is the number of those lines, covers
