@@ -672,9 +672,9 @@ the per-row string path; both produce identical output.
 
 The mapping declares how source Parquet columns become record fields. It
 carries exactly one signal section -- `[logs]`, `[metrics]` or `[spans]` --
-and that section must match `--signal`. A mapping
-written before the sections existed, whose logs keys sit at the document root with no
-section at all, is still read as the `[logs]` section, so no existing mapping
+and that section must match `--signal`. A mapping written before the sections
+existed, whose logs keys sit at the document root with no section at all, is
+still read as the `[logs]` section, so no existing mapping
 file needs migrating. Mixing the two spellings in one file is refused: with
 both present there is no rule saying which one a load would use.
 
@@ -768,8 +768,8 @@ the OTLP name pipeline (`ravel_otlp::normalize`) in the same order:
    name goes through the same rewrite for label names, so `http.method`
    becomes `http_method`;
 3. the `unit` key's UCUM value selects a suffix by the OTLP-to-Prometheus
-   unit table (`s` gives `_seconds`, `By` gives `_bytes`, `1` gives `_ratio` on a
-   gauge), appended unless the name already ends with it;
+   unit table (`s` gives `_seconds`, `By` gives `_bytes`, `1` gives `_ratio`
+   on a gauge), appended unless the name already ends with it;
 4. `kind = "counter"` sets `is_monotonic_sum` on every point and appends
    `_total`, exactly as a monotonic OTLP `Sum` does, again unless the name
    already ends with it.
@@ -1063,8 +1063,9 @@ ravel-cli load --parquet acme-day.parquet --tenant acme-copy --mapping map.toml
 signal is sequenced behind bulk import for that signal, and an exported file
 that no command can load back is not an export. `load --signal metrics` has
 landed ([Loading metrics](#loading-metrics)); metrics export is the next piece
-of the sequence, and spans have neither half yet. The refusal says
-which missing piece each one waits on.
+of the sequence, and spans have neither half yet. The spans refusal names
+the missing import. The metrics refusal still names bulk import for metrics as
+the missing piece, which is out of date until metrics export lands.
 
 ### What the window means
 
