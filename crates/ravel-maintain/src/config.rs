@@ -1109,6 +1109,7 @@ impl Default for CompactorConfig {
             force_orphan_gc: false,
             idem_dedup_window_hours: DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
             audit_retention_window_ns: DEFAULT_AUDIT_RETENTION_NS,
+            alert_retention_window_ns: DEFAULT_ALERT_RETENTION_NS,
             dry_run: false,
             merge_memory_tracker: None,
             request_ledger: None,
