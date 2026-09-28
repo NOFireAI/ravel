@@ -5078,6 +5078,8 @@ dependencies = [
  "datafusion-datasource-parquet",
  "futures",
  "object_store 0.13.2",
+ "parquet 58.4.0",
+ "proptest",
  "ravel-cache",
  "ravel-object-store",
  "ravel-pqtable",
@@ -5085,6 +5087,7 @@ dependencies = [
  "ravel-types",
  "thiserror",
  "tokio",
+ "url",
 ]
 
 [[package]]
