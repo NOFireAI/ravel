@@ -33,6 +33,7 @@
 //!
 //! [`CompactionRecord`]: ravel_proto::commit::v1::CompactionRecord
 
+pub mod alert_retention;
 pub mod audit_pipeline;
 pub mod audit_retention;
 mod audit_write;
@@ -67,6 +68,7 @@ pub mod sweep;
 /// here at its original path, so maintain's callers compile unchanged.
 pub use ravel_fleet::worker_set;
 
+pub use alert_retention::{AlertKeepSet, AlertRetentionOutcome, sweep_alert_retention};
 pub use audit_pipeline::{AuditEvent, AuditPipeline, NoopQueryAuditSink, QueryAuditSink};
 pub use audit_retention::{AuditRetentionOutcome, sweep_audit_retention};
 pub use bucket::Bucket;

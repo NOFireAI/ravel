@@ -36,6 +36,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--distributed-query` a `GetFlightInfo` and its `DoGet` that land on an
   old and a new process fail with `invalid_argument` until the rollout
   completes, and the query has to be run again.
+
 ### Fixed
 
 - **A query's fold-lag refusal threshold is now sized from the fold and the
@@ -59,6 +60,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **An alert-signal retention sweep that keeps every identity's current-state
+  record** (ADR-1688, issue #1688). The alert evaluator writes one object and
+  one commit record per transition and nothing ever removed them, so the
+  history grew for the life of the deployment and a cold start re-read all of
+  it. `ravel_maintain::sweep_alert_retention` bounds it: it lists the alert
+  shard's commit prefix, skips a record whose key-derived hour already proves
+  it cannot be expired, and deletes an expired, past-horizon record's commit
+  record before its data object, consulting the same legal-hold hook the other
+  sweeps use. It writes no tombstone, because the evaluator's fold refuses any
+  bucket entry that is not a commit or compaction record. A keep set of
+  `(epoch, seq)` pairs names each identity's current-state record and spares it
+  whatever its age, so a firing alert older than the window keeps the one
+  record that says so and a cold-start fold over the survivors still recovers
+  every identity's state. `CompactorConfig::alert_retention_window_ns` is the
+  window, default 90 days, the same value as the query-audit window; `0`
+  disables the sweep and keeps the previous grow-forever behaviour. Nothing in
+  the server calls the sweep yet: the driver that reads the memo, builds the
+  keep set and exposes `--alert-retention` is ADR-1688 follow-up task 2, so
+  this release changes no running deployment's behaviour.
 - **An end-to-end proof that a stalled fold pages before it refuses a query**
   (issue #1306, ADR-1306 follow-up task 3). ADR-1306 decision 2 states the
   ordering as arithmetic over spans;

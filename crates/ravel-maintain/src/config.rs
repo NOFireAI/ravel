@@ -695,6 +695,17 @@ pub const DEFAULT_QUARANTINE_HORIZON_NS: i64 = 7 * 24 * NS_PER_HOUR;
 /// so it has its own age-based sweep rather than the bucket-tombstone flow.
 pub const DEFAULT_AUDIT_RETENTION_NS: i64 = 90 * 24 * NS_PER_HOUR;
 
+/// Default `alert_retention_window_ns`: 90 days (ADR-1688 decisions 4 and 5).
+/// The retention window for the `Signal::Alerts` transition history swept by
+/// [`crate::alert_retention::sweep_alert_retention`]. It is deliberately the
+/// same value as [`DEFAULT_AUDIT_RETENTION_NS`]: ADR-1688 decision 5 sets the
+/// alert window to "the same value as the audit window", the retention default
+/// an operator already runs with, and decision 4 makes the window double as the
+/// evaluator's cold-start fold horizon (the surviving prefix is every
+/// transition inside the window plus one current-state record per identity).
+/// `0` disables the sweep and keeps today's grow-forever behaviour (decision 5).
+pub const DEFAULT_ALERT_RETENTION_NS: i64 = 90 * 24 * NS_PER_HOUR;
+
 /// Default `idem_dedup_window_hours` (ADR-0051 §5): this crate's own policy
 /// default, chosen to match the 24h dedup window ADR-0051 documents.
 /// `ravel_ingest::idempotency::read_marker` has no default of its own --
@@ -1020,6 +1031,23 @@ pub struct CompactorConfig {
     /// other sweep knob so `..CompactorConfig::default()` call sites are
     /// unaffected. Default [`DEFAULT_AUDIT_RETENTION_NS`] (90 days).
     pub audit_retention_window_ns: i64,
+    /// Retention window for the `Signal::Alerts` transition history (ADR-1688
+    /// decision 5). An alert commit record whose newest event is older than
+    /// this, and which is not the current-state record of any live identity
+    /// (the keep set passed to [`crate::alert_retention::sweep_alert_retention`],
+    /// ADR-1688 decision 2), is swept, horizon-gated on the record's durable
+    /// `created_unix_ns` and gated on the caller-supplied
+    /// [`crate::sweep::LeaseCheck`] -- the same hook the audit retention and
+    /// superseded-input sweeps consult, which the server populates with the
+    /// tenant's legal holds. The window doubles as the evaluator's
+    /// cold-start fold horizon (decision 4). Independent of [`RetentionConfig`]'s
+    /// per-tenant ADR-0019 windows: alert transitions are a server-written
+    /// history, not tenant data, and are not tombstone-gated through the
+    /// resolver. Threaded through the config like every other sweep knob so
+    /// `..CompactorConfig::default()` call sites are unaffected. Default
+    /// [`DEFAULT_ALERT_RETENTION_NS`] (90 days); `0`, or any negative value,
+    /// disables the sweep.
+    pub alert_retention_window_ns: i64,
     /// Dry-run switch. When `true`, every maintenance path
     /// computes exactly the same eligible set and decision it would in a real
     /// run -- all reads (LIST/GET/HEAD, re-verify listings, k-way merges,
@@ -1084,6 +1112,7 @@ impl Default for CompactorConfig {
             force_orphan_gc: false,
             idem_dedup_window_hours: DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
             audit_retention_window_ns: DEFAULT_AUDIT_RETENTION_NS,
+            alert_retention_window_ns: DEFAULT_ALERT_RETENTION_NS,
             dry_run: false,
             merge_memory_tracker: None,
             request_ledger: None,
