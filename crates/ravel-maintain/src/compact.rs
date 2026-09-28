@@ -357,6 +357,12 @@ async fn acquire_claim(
     let Some(participant) = config.claim_participant.as_ref() else {
         return Ok(Claimed::Unclaimed);
     };
+    // Claim writes ignore `dry_run`: the only caller that installs a
+    // participant is the supervisor tick, and the CLI's `--dry-run` config
+    // leaves `claim_participant` unset, so the two never meet. The claim's
+    // `input_set_hash` forensics field stays empty: the hash is computed
+    // later, inside the rewrite, and the claim identity deliberately excludes
+    // it (ADR-1029 rejected alternative 3).
 
     let guard = ClaimGuard::new(
         bucket,
