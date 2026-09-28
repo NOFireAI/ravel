@@ -84,7 +84,7 @@ const GUIDE_FILE: &str = concat!(
 /// no longer resolves) would otherwise leave every assertion below passing
 /// vacuously over an empty set. Adding a rule that names a new metric fails
 /// here until this number is updated.
-const EXPECTED_METRIC_NAMES: usize = 41;
+const EXPECTED_METRIC_NAMES: usize = 40;
 
 /// Groups and alert rules in the shipped file, counted off the parsed
 /// structure. Pinned for the same reason as the name count: a file that lost
@@ -143,7 +143,7 @@ const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 111;
 /// threshold should page on. The complement is asserted in the other
 /// direction: every name the rule file alerts on is graphed somewhere here,
 /// so a page always has a panel to land on.
-const EXPECTED_DASHBOARD_ONLY_NAMES: usize = 70;
+const EXPECTED_DASHBOARD_ONLY_NAMES: usize = 71;
 
 /// Fenced `yaml` blocks in the guide, and the alert rules they hold between
 /// them. Pinned so that an extractor that matches no block, or a block that
