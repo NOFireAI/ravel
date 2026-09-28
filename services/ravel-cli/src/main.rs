@@ -2079,23 +2079,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Parquet {
             command: ParquetCommand::Ls { tenant, table },
         } => {
-            ravel_cli::parquet::ls(
-                store::build_store(&cli.store)?,
-                &tenant,
-                table.as_deref(),
-            )
-            .await
+            ravel_cli::parquet::ls(store::build_store(&cli.store)?, &tenant, table.as_deref()).await
         }
         Command::Parquet {
             command: ParquetCommand::Sweep { tenant, grace },
         } => {
-            ravel_cli::parquet::sweep(
-                store::build_store(&cli.store)?,
-                &tenant,
-                &grace,
-                now_ns()?,
-            )
-            .await
+            ravel_cli::parquet::sweep(store::build_store(&cli.store)?, &tenant, &grace, now_ns()?)
+                .await
         }
         Command::Cache {
             command: CacheCommand::ReclaimLegacy { cache_dir, apply },

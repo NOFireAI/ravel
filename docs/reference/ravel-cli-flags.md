@@ -16,6 +16,7 @@ RAVEL_UPDATE_CLI_REFERENCE=1 cargo test -p ravel-cli
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
+| `--parquet-profiles` | `RAVEL_PARQUET_PROFILES` |  | Path to the external credential profile file (ADR-2040 decision D1), the JSON list of named profiles `tenant parquet-grant add` resolves `--profile` against. Same file and same name ravel-server reads for its own Parquet-table paths. A top-level flag, given before the subcommand, like the tenant-hash flags above |
 | `--s3-access-key` | `RAVEL_S3_ACCESS_KEY` |  |  |
 | `--s3-allow-http` | `RAVEL_S3_ALLOW_HTTP` |  | Accept a plaintext `http://` `--s3-endpoint` whose host is not loopback. The S3 client's `allow_http` follows the endpoint's scheme, and a plaintext endpoint on the network carries every object this command writes and reads, plus the credentials signing those requests, in the clear; the command refuses that combination unless this flag says the operator meant it. A loopback `http://` endpoint (the local RustFS every development launcher here points at) needs no flag, and an `https://` endpoint is unaffected. Same flag, env var, and rule as ravel-server's |
 | `--s3-auth` | `RAVEL_S3_AUTH` | `static` | Where `--store s3` gets its credentials (ADR-0106). `static` (the default) is unchanged behavior: `--s3-access-key` and `--s3-secret-key` are both required. `instance-role` drops that requirement and fetches short-lived credentials from the EC2 instance metadata service instead; combining it with any inline credential flag is refused rather than resolved by precedence |
@@ -448,7 +449,7 @@ Replace the tenant's declaration wholesale, validating it first and swapping the
 
 ## tenant
 
-Manage the durable deployment-wide bearer-token map `sys/auth` (ADR-0072 decision 4): the writer of `sys/auth`
+Per-tenant operator records: the deployment-wide bearer-token map `sys/auth` (ADR-0072 decision 4) and the Parquet location grants record (ADR-2040 decision D1)
 
 _No flags._
 
@@ -485,6 +486,63 @@ List every entry's tenant id and a short token fingerprint. Never prints a raw t
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--deployment-key-file` |  |  | Path to the bucket's 32-byte deployment key (64 hex characters or 32 raw bytes); the same key used for `--tenant-hash-key-file` |
+
+### tenant parquet-grant
+
+Manage the tenant's Parquet location grants (ADR-2040 decision D1): the external locations this tenant may define Parquet tables over
+
+_No flags._
+
+#### tenant parquet-grant add
+
+Grant one location to one credential profile, after qualifying the store behind it
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--location` |  |  | The location URL: `s3://bucket/prefix`, `gs://...` or `az://...`. A trailing `/` names a set of objects |
+| `--profile` |  |  | The credential profile name, resolved in the file named by the top-level `--parquet-profiles` |
+| `--tenant` |  |  | The tenant to grant the location to |
+
+#### tenant parquet-grant remove
+
+Revoke the grant that is exactly this location. A location merely admitted by a wider grant is not removed: name the grant itself
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--location` |  |  | The granted location URL, exactly as it was granted |
+| `--tenant` |  |  | The tenant to revoke the grant from |
+
+#### tenant parquet-grant ls
+
+Print every field of every grant this tenant holds
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--tenant` |  |  | The tenant whose grants to print |
+
+## parquet
+
+Inspect and sweep a tenant's Parquet table manifests (ADR-2040)
+
+_No flags._
+
+### parquet ls
+
+Print every manifest field of each table's newest version. With `--table`, print every retained version of that one table instead
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--table` |  |  | Restrict the output to one table, and print every version of it that has not been swept |
+| `--tenant` |  |  | The tenant whose Parquet tables to print |
+
+### parquet sweep
+
+Delete manifest versions superseded for longer than `--grace`
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--grace` |  |  | How long a superseded version is kept, as a humantime duration (`1h`, `90m`). Must be at least the deployment's stored `max_query_duration` |
+| `--tenant` |  |  | The tenant whose superseded manifest versions to delete |
 
 ## cache
 
