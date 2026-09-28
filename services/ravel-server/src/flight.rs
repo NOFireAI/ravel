@@ -28,6 +28,7 @@ use ravel_ingest::Clock;
 use ravel_query::http::TenantResolver;
 use ravel_sql::{
     DistributedFlightConfig, FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService,
+    SqlTicketKeys,
 };
 use ravel_types::{CommitToken, TenantHash};
 use tonic::Status;
@@ -98,6 +99,19 @@ pub fn service(
     gc_ticket_ceiling: std::time::Duration,
     distributed: Option<DistributedFlightConfig>,
 ) -> FlightServiceServer<DeadlineBoundedFlightService<RavelFlightSqlService>> {
+    service_with_ticket_keys(state, gc_ticket_ceiling, distributed, None)
+}
+
+/// [`service`], with the ticket keys read from `--sql-ticket-key-file`
+/// (ADR-1689 decision 2) installed when `ticket_keys` is `Some`. They take
+/// precedence over any `shared_ticket_key` in `distributed`. `None` keeps the
+/// service's own per-process random keys, or the key `distributed` carries.
+pub fn service_with_ticket_keys(
+    state: &SqlState,
+    gc_ticket_ceiling: std::time::Duration,
+    distributed: Option<DistributedFlightConfig>,
+    ticket_keys: Option<SqlTicketKeys>,
+) -> FlightServiceServer<DeadlineBoundedFlightService<RavelFlightSqlService>> {
     let auth = Arc::new(ResolverFlightAuth {
         tenant_resolver: Arc::clone(&state.tenant_resolver),
     });
@@ -134,6 +148,9 @@ pub fn service(
     // Absent it, the service is byte-identical to the pre-distribution build.
     if let Some(config) = distributed {
         service = service.with_distributed_scan(config);
+    }
+    if let Some(keys) = ticket_keys {
+        service = service.with_ticket_keys(keys);
     }
     // Bound every DoGet stream by the server ceiling so a client that opens the
     // stream and then reads nothing cannot pin its query-concurrency permit

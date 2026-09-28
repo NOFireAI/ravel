@@ -326,6 +326,21 @@ These keys mint and verify a per-tenant, per-query capability. A fragment fetch
 is authorized by that capability and by nothing else. There is no shared
 cluster-internal bearer token.
 
+The Flight SQL lane signs its tickets with a key file of its own,
+`--sql-ticket-key-file`: the same shape and rotation rule as
+`--fragment-key-file`, read by every node in the cluster, and kept with the
+same care as the fragment key file. Give it different keys from the fragment key file. It
+requires `--distributed-query`; setting it alone fails startup. It is optional
+in this release. A node without it derives its SQL ticket key from the first
+fragment key, so a fleet rolling onto this release keeps agreeing on one key,
+but startup logs one warning naming the next release's requirement: with
+`--distributed-query`, both `--fragment-listener` and `--sql-ticket-key-file`.
+A node missing only `--fragment-listener` logs the same warning. To move a
+running fleet onto the new file without a gap, roll it onto every node in one
+deploy: a node on the file and a node on the derived key disagree, and SQL
+slices dispatched between them fall back to the coordinator until the roll
+finishes.
+
 With the key file in place, the cluster-internal fragment surface, where one
 query worker fetches a slice for another, can be moved off the public gRPC
 listener onto a dedicated listener that terminates TLS in-process:
@@ -407,6 +422,7 @@ Mount the Secret and point the flags at the projected paths:
 ravel-server --mode all --distributed-query \
   --listen-grpc 0.0.0.0:4317 \
   --fragment-key-file /etc/ravel/fragment-keys \
+  --sql-ticket-key-file /etc/ravel/sql-ticket-keys \
   --fragment-listener 0.0.0.0:4319 \
   --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
   --fragment-tls-key  /etc/ravel/fragment-tls/tls.key \
