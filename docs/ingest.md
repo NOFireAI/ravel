@@ -453,13 +453,26 @@ it is normal and is not checked here. It compares the raw reading, never the
 floor-raised stamp, since the floor can only hide lag. When the store has
 not been observed yet (no response so far, or `MemoryStore`), the flush
 proceeds unchecked and `clock_lag_unchecked` counts it; refusing there
-would deadlock, because the flush is itself a source of responses. On a
-graceful shutdown of a writer whose clock never converges, every drain pass
-is refused the same way, so after the pass cap the buffered rows are
-reported as residue (logged at ERROR and counted) and lost; in buffered
-mode those rows were already acknowledged. This is the same outcome as an
-over-bound clock regression at shutdown: fix the host clock before
-restarting a writer that is refusing flushes.
+would deadlock, because the flush is itself a source of responses.
+
+A graceful shutdown is the one place the check is bypassed. Unlike an
+over-bound clock regression, a lag refusal re-anchors nothing: it leaves
+both the monotonic floor and the store's observation unchanged, so every
+pass of a drain reads the same lag and refuses again. On the `Shutdown` and
+channel-close drains there is no later tick, so enforcing it to the pass cap
+would report the buffered rows as residue and lose them, and in buffered
+mode those rows were already acknowledged. Durability wins there: once the
+bounded passes leave a tenant refused, a teardown drain makes one final pass
+with the lag check bypassed, publishing with the raw-reading stamp (the
+floor rules unchanged) and counting each such flush as
+`clock_lag_bypassed_at_shutdown`, logged at WARN with the measured lag.
+Those rows can land in an ingest hour the fold has already sealed, so a
+token-less read sees them only after a HEAD rebuild -- the same recoverable
+outcome the writer had before this check existed, rather than a drop.
+`FlushNow` and every size or age trigger keep refusing, since their actor
+keeps running to retry. A regression refusal still refuses on that final
+pass, so the residue path stays reachable for ADR-1307's case. Either way:
+fix the host clock before restarting a writer that is refusing flushes.
 
 ### Pipelined flushes (ADR-0067)
 
