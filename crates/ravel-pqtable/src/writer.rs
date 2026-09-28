@@ -873,6 +873,7 @@ mod tests {
         .await
         .expect("apply returned");
         assert_eq!(got.expect("create"), Outcome::Committed { version: 1 });
+        // hygiene-allow: wall-clock -- start_paused tokio time; elapsed() is virtual and exact
         assert_eq!(
             started.elapsed(),
             Duration::from_nanos(u64::try_from(budget_ns()).expect("positive"))
