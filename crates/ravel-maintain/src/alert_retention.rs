@@ -25,29 +25,57 @@
 //! A tombstone would also have no reader: alert records are not folded into the
 //! catalog, so nothing resolves a bucket-wide exclusion for them.
 //!
-//! What this sweep adds over the audit one is the **keep set** (ADR-1688
-//! decision 2): a set of `(epoch, seq)` pairs naming, per alert identity, the
-//! record that identity's current state comes from. An expired record whose key
-//! parses to a pair in the keep set is kept and counted separately. That is what
-//! makes the deletion safe for the fold: after a sweep the surviving prefix is
-//! every transition inside the window plus one current-state record per
-//! identity, so a cold-start fold over the survivors yields the same
+//! What this sweep adds over the audit one is the **keep set**
+//! ([`AlertKeepSet`], ADR-1688 decision 2 and its 2026-09-28 amendment): the
+//! memo's `watermark_hour` together with the `ts_ns` of each alert identity's
+//! current-state record. An expired record whose decoded `max_event_ts_ns` is
+//! in that set is kept and counted separately, and no record is deleted at all
+//! unless its ingest hour is strictly below the watermark. That is what makes
+//! the deletion safe for the fold: after a sweep the surviving prefix is every
+//! transition inside the window plus one current-state record per identity, so
+//! a cold-start fold over the survivors yields the same
 //! latest-record-per-identity map it would have yielded over the unswept
 //! history. Without it, an alert that has been firing for longer than the
 //! window would read as inactive after a restart and re-fire with a fresh
 //! `generation`, which is exactly the outcome ADR-1294's retention contract
 //! ("prune only into a compact form, never by deletion") forbids.
 //!
-//! # The keep set is checked after the expiry test, not before
+//! # The watermark is a strict floor on what may be deleted
 //!
-//! A keep-set record is spared either way, so checking the set first would save
-//! a GET per identity per sweep. The order here is deliberate: it makes
-//! [`AlertRetentionOutcome::kept_current_state`] mean exactly "expired records
-//! that only the keep set saved", which is the figure that says how much the
-//! keep set is actually holding back. Checked first, the counter would also
-//! absorb every keep-set record that was never at risk, and an operator reading
-//! it could not tell the two apart. The cost is one GET per identity per sweep,
-//! bounded by the identity count, not by the history length.
+//! The memo names each identity's latest record only for hours strictly below
+//! its `watermark_hour`: a late write from an overlapping lease holder can land
+//! in the watermark hour itself after the memo was written, and the memo would
+//! not name it. Deleting an expired record in that hour because the keep set
+//! does not mention it would drop an identity's newest transition, and a
+//! cold-start fold would then return that identity's older, kept record. So the
+//! watermark travels with the keep set and the sweep applies it per record,
+//! strictly: an ingest hour at or above `watermark_hour` is kept without a GET.
+//!
+//! The sweep does not require the watermark to sit at or above the expiry
+//! floor, because a watermark below it can only keep more. Refusing a memo too
+//! stale to be worth sweeping under is the driver's job (ADR-1688 decision 3).
+//! What the sweep does refuse is a call with no memo behind it: the keep set has
+//! no "absent" value, [`AlertKeepSet::new`] demands a watermark, and there is no
+//! `Default`, so a caller that could not read a memo has nothing it can pass.
+//! An empty `ts_ns` set with a real watermark is a different thing and is
+//! legitimate: it is a tenant whose memo holds no identities.
+//!
+//! # The keep set cannot be checked before the expiry test
+//!
+//! Membership is on `max_event_ts_ns`, a record body field, so the GET the
+//! expiry test also reads is needed either way: no ordering of the two saves a
+//! request. What the order still decides is the counters, and it is deliberate.
+//! [`AlertRetentionOutcome::kept_current_state`] means exactly "expired,
+//! past-horizon records that only the keep set saved", the figure that says how
+//! much the keep set is holding back; a record the keep set names that is still
+//! inside the window, or still inside the protection horizon, was never at risk
+//! and is counted under `kept` alone.
+//!
+//! One sweep costs one GET per record that is below the watermark and not
+//! cleared by the hour prefilter. Once a shard has been swept once, that is the
+//! kept identities themselves plus whatever shares their exact `ts_ns` stamp:
+//! bounded by the identity count and one tick's transitions, not by the length
+//! of the history.
 //!
 //! # Compaction never reaches this shard
 //!
@@ -72,20 +100,62 @@ use crate::error::{MaintainError, Result};
 use crate::read::verify_commit_key;
 use crate::sweep::LeaseCheck;
 
-/// The `(epoch, seq)` pairs naming each alert identity's current-state record
-/// (ADR-1688 decision 2). A commit record whose key parses to a pair in this
-/// set is never deleted, however old it is.
+/// What the alert state memo tells the sweep: the hour the memo is complete
+/// below, and the `ts_ns` of each identity's current-state record (ADR-1688
+/// decision 2, as amended on 2026-09-28).
 ///
-/// The pair is the identity the evaluator's fold breaks `ts_ns` ties on, and it
-/// is carried in the commit key, so the sweep can test membership without
-/// reading the record's body. It deliberately does not carry `writer_id`: the
-/// evaluator stamps every record with a constant `writer_epoch` and a `seq`
-/// that restarts at 1 in each evaluator process, so one pair can name records
-/// written by two different evaluator runs. Every such collision keeps a record
-/// that would otherwise have been deleted, never deletes one that should have
-/// been kept, which is the direction ADR-1688 decision 3 requires of any
-/// imprecision in the keep set.
-pub type AlertKeepSet = BTreeSet<(u64, u64)>;
+/// The memo's records carry `alert_id`, `rule_id`, `state`, `generation`,
+/// `ts_ns`, labels, annotations and body, and no commit identity, so a keep set
+/// of `(epoch, seq)` pairs has no source. The pair is not unique either: the
+/// evaluator writes a constant epoch and a `seq` that restarts at 1 in every
+/// evaluator process, so one pair names a record from every process lifetime.
+/// The `ts_ns` is what both sides do carry. Every alert commit record's
+/// `max_event_ts_ns` equals its RLOG row's `ts_ns` because the evaluator stamps
+/// both from the same value, and this sweep decodes the record anyway, so
+/// membership costs no extra request and no memo format change.
+///
+/// Keying by `ts_ns` can only over-keep: two transitions written in the same
+/// tick share one stamp, so a record that is not any identity's current state
+/// can be spared for sharing a kept identity's stamp. The surplus is one tick's
+/// records per kept identity, not a quantity that grows with history, and
+/// over-keeping is the direction ADR-1688 decision 3 requires of any
+/// imprecision here.
+///
+/// There is no `Default` and no empty constructor: a keep set cannot exist
+/// without a watermark, which is what makes "sweep with no memo" unwritable
+/// rather than a call that deletes every expired record. An empty `ts_ns` set
+/// under a real watermark is a tenant with no identities in its memo, and is
+/// swept normally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertKeepSet {
+    watermark_hour: u32,
+    ts_ns: BTreeSet<i64>,
+}
+
+impl AlertKeepSet {
+    /// Build a keep set from a memo's `watermark_hour` and the `ts_ns` of the
+    /// records it holds.
+    pub fn new(watermark_hour: u32, ts_ns: impl IntoIterator<Item = i64>) -> Self {
+        AlertKeepSet {
+            watermark_hour,
+            ts_ns: ts_ns.into_iter().collect(),
+        }
+    }
+
+    /// The memo's watermark hour. The sweep deletes only below it, strictly:
+    /// the memo is complete only for hours strictly below this one, so a record
+    /// in the watermark hour that the memo does not name may still be its
+    /// identity's newest transition.
+    pub fn watermark_hour(&self) -> u32 {
+        self.watermark_hour
+    }
+
+    /// Whether a commit record's `max_event_ts_ns` is one of the memo's
+    /// current-state stamps.
+    pub fn contains(&self, max_event_ts_ns: i64) -> bool {
+        self.ts_ns.contains(&max_event_ts_ns)
+    }
+}
 
 /// What one [`sweep_alert_retention`] pass over a tenant's alert shard deleted
 /// (or, under `dry_run`, would have).
@@ -95,13 +165,21 @@ pub struct AlertRetentionOutcome {
     pub records_deleted: usize,
     /// Data objects of expired alert commit records deleted.
     pub data_deleted: usize,
-    /// Records left in place: not yet expired, still within the protection
-    /// horizon, named by the keep set, or lease/legal-hold protected.
+    /// Entries left in place: not yet expired, still within the protection
+    /// horizon, at or above the keep set's watermark, named by the keep set, or
+    /// lease/legal-hold protected. Every entry the sweep does not delete is
+    /// counted here, including the compaction, rewrite and tombstone entries it
+    /// keeps without understanding them (none of the three belongs under the
+    /// alerts commit prefix, and this sweep never removes one).
     pub kept: usize,
     /// Records that were expired and past the horizon and were kept only
     /// because the keep set names them as an identity's current state. A subset
     /// of `kept`.
     pub kept_current_state: usize,
+    /// Commit records whose GET and decode was skipped because their ingest
+    /// hour is at or above the keep set's watermark, so the memo cannot be
+    /// complete for them. A subset of `kept`.
+    pub kept_at_or_above_watermark: usize,
     /// Commit records whose GET and decode was skipped because the key's
     /// `ingest_hour_bucket` alone proved the record cannot be expired. A subset
     /// of `kept`.
@@ -111,18 +189,31 @@ pub struct AlertRetentionOutcome {
 /// Sweep expired alert transition records from a tenant's alert shard,
 /// keeping every identity's current-state record (ADR-1688 decisions 1 and 2).
 ///
-/// A record is deleted only when all of these hold: it is expired (its newest
-/// event is older than `config.alert_retention_window_ns`), it is past the
-/// protection horizon (`now >= created_unix_ns + config.protection_horizon_ns`),
-/// its `(epoch, seq)` is not in `keep`, and the [`LeaseCheck`] does not protect
-/// it or its data object. The commit record is deleted before its data object,
-/// so a crash between the two leaves record-less data for orphan GC rather than
-/// a record pointing at a deleted object. No tombstone is ever written.
+/// A record is deleted only when all of these hold: its `ingest_hour_bucket` is
+/// strictly below `keep.watermark_hour()`, it is expired (its newest event is
+/// older than `config.alert_retention_window_ns`), it is past the protection
+/// horizon (`now >= created_unix_ns + config.protection_horizon_ns`), its
+/// `max_event_ts_ns` is not in `keep`, and the [`LeaseCheck`] does not protect
+/// it or its data object.
+///
+/// The commit record is deleted before its data object, so a crash between the
+/// two leaves a data object no record points at, never a record pointing at a
+/// deleted object. Nothing reclaims that object today: the orphan sweep over
+/// the alerts shard is ADR-1688 follow-up task 2, and until it lands the object
+/// leaks. No tombstone is ever written.
 ///
 /// `shard` is the alert shard to sweep. It is a parameter rather than a
 /// constant because the evaluator's `ALERT_SHARD` is defined in
 /// `services/ravel-server` (`alerting.rs`), which this crate does not depend
 /// on; the driver passes that constant through.
+///
+/// `keep` is an [`AlertKeepSet`] by value, not an `Option`: the driver builds
+/// one from a memo it actually read, and a tenant whose memo is missing,
+/// undecodable, of an unsupported version, or too stale is skipped there
+/// (ADR-1688 decision 3) rather than swept under a set that means nothing. An
+/// empty `ts_ns` set is not that case; it is a memo holding no identities, and
+/// the sweep honours it, deleting the shard's expired records below the
+/// watermark.
 ///
 /// A non-positive `config.alert_retention_window_ns` disables the sweep
 /// entirely (ADR-1688 decision 5): it returns the empty outcome without even
@@ -170,6 +261,15 @@ pub async fn sweep_alert_retention(
                     outcome.gets_skipped_by_hour_prefilter += 1;
                     continue;
                 }
+                // The memo behind the keep set is complete only for hours
+                // strictly below its watermark, so a record in the watermark
+                // hour may be its identity's newest transition and still be
+                // absent from the set. Keep it, without a GET.
+                if parsed.ingest_hour_bucket >= keep.watermark_hour() {
+                    outcome.kept += 1;
+                    outcome.kept_at_or_above_watermark += 1;
+                    continue;
+                }
                 let commit = record::decode(&store.get(&meta.key, GetRange::Full).await?.data)?;
                 // The record's own identity fields must reconstruct the key we
                 // listed it at (ADR-0010 section 7), or a corrupted-but-decodable
@@ -187,7 +287,7 @@ pub async fn sweep_alert_retention(
                 }
                 // Expired and past the horizon, but the memo names it as some
                 // identity's current state: keep it forever (decision 2).
-                if keep.contains(&(parsed.epoch, parsed.seq)) {
+                if keep.contains(commit.max_event_ts_ns) {
                     outcome.kept += 1;
                     outcome.kept_current_state += 1;
                     continue;
@@ -267,13 +367,25 @@ mod tests {
         TenantHash([7u8; 16])
     }
 
-    /// The keys one seeded alert transition occupies.
+    /// The keys one seeded alert transition occupies, and the stamp a memo
+    /// naming it as an identity's current state would carry.
     #[derive(Debug, Clone)]
     struct Seeded {
         commit_key: String,
         data_key: String,
-        epoch: u64,
-        seq: u64,
+        ts_ns: i64,
+    }
+
+    /// The `ingest_hour_bucket` a transition stamped `ts_ns` lands in.
+    fn hour_of(ts_ns: i64) -> u32 {
+        u32::try_from(ts_ns.div_euclid(NS_PER_HOUR)).expect("hour bucket")
+    }
+
+    /// A keep set whose watermark is `now`'s own hour: every record seeded
+    /// strictly before this hour is below the watermark and so a candidate for
+    /// deletion, which is what tests about the other gates want.
+    fn keep_none_below(now: i64) -> AlertKeepSet {
+        AlertKeepSet::new(hour_of(now), [])
     }
 
     /// Write one alert transition exactly as the evaluator's `publish` does:
@@ -290,9 +402,24 @@ mod tests {
         seq: u64,
         ts_ns: i64,
     ) -> Seeded {
+        seed_alert_created(store, tenant, writer_id, seq, ts_ns, ts_ns).await
+    }
+
+    /// As [`seed_alert`], but with `created_unix_ns` diverging from the
+    /// transition stamp. The evaluator never produces that, a backfill or a
+    /// clock correction can, and it is the only way to exercise the protection
+    /// horizon apart from the retention window.
+    async fn seed_alert_created(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        writer_id: Uuid,
+        seq: u64,
+        ts_ns: i64,
+        created_unix_ns: i64,
+    ) -> Seeded {
         let body = Bytes::from(format!("alert transition seq={seq} ts={ts_ns}"));
         let content_hash: [u8; 32] = *blake3::hash(&body).as_bytes();
-        let ingest_hour_bucket = u32::try_from(ts_ns.div_euclid(NS_PER_HOUR)).expect("hour bucket");
+        let ingest_hour_bucket = hour_of(ts_ns);
         let commit = record::build(NewCommitRecord {
             tenant_hash: *tenant,
             signal: Signal::Alerts,
@@ -309,7 +436,7 @@ mod tests {
             min_ingest_ts_ns: ts_ns,
             max_ingest_ts_ns: ts_ns,
             segment_format_version: 1,
-            created_unix_ns: ts_ns,
+            created_unix_ns,
             ingest_hour_bucket,
         })
         .expect("build alert commit record");
@@ -332,8 +459,7 @@ mod tests {
         Seeded {
             commit_key,
             data_key,
-            epoch: ALERT_WRITER_EPOCH,
-            seq,
+            ts_ns,
         }
     }
 
@@ -415,10 +541,12 @@ mod tests {
 
         assert_eq!(commit_keys(&store, &tenant).await.len(), 6);
 
-        // The memo names seq 4 as some identity's current state: an alert that
-        // last transitioned 97 days ago and is still in that state.
+        // The memo names the 97-day-old transition as some identity's current
+        // state: an alert that last transitioned then and is still in that
+        // state. Its watermark is this tick's hour, so every seeded record is
+        // below it.
         let kept_record = expired[3].clone();
-        let keep: AlertKeepSet = [(kept_record.epoch, kept_record.seq)].into_iter().collect();
+        let keep = AlertKeepSet::new(hour_of(now), [kept_record.ts_ns]);
 
         let outcome = sweep_alert_retention(
             &store,
@@ -440,6 +568,9 @@ mod tests {
                 // 2 live (cleared by the hour prefilter) + 1 keep-set record.
                 kept: 3,
                 kept_current_state: 1,
+                // The live records are cleared by the prefilter before the
+                // watermark is consulted, and everything seeded is below it.
+                kept_at_or_above_watermark: 0,
                 gets_skipped_by_hour_prefilter: 2,
             },
             "exact counts, not just nonzero"
@@ -517,7 +648,7 @@ mod tests {
             &NoLeases,
             &tenant,
             ALERT_SHARD,
-            &AlertKeepSet::new(),
+            &keep_none_below(now),
         )
         .await
         .expect("sweep");
@@ -542,6 +673,345 @@ mod tests {
         }
     }
 
+    /// A negative `alert_retention_window_ns` is refused by the same
+    /// non-positive guard `0` hits, not honoured as a window in the future that
+    /// would make every record on the shard a delete candidate at once.
+    #[tokio::test]
+    async fn a_negative_window_disables_the_sweep_entirely() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let writer = Uuid::from_u128(0xA8);
+        let config = CompactorConfig {
+            alert_retention_window_ns: -NS_PER_DAY,
+            ..CompactorConfig::default()
+        };
+
+        // Records old enough that a window read as `now + 1 day` would sweep
+        // every one of them, including the live one.
+        let seeded = seed_history(
+            &store,
+            &tenant,
+            writer,
+            now,
+            &[(100 * 24, 1), (99 * 24, 2), (5, 3)],
+        )
+        .await;
+        let before = commit_keys(&store, &tenant).await;
+
+        let lists_before = store.metrics().snapshot().op(StoreOp::List).calls;
+        let deletes_before = store.metrics().snapshot().op(StoreOp::Delete).calls;
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &keep_none_below(now),
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(
+            outcome,
+            AlertRetentionOutcome::default(),
+            "a negative window must do nothing at all"
+        );
+        assert_eq!(
+            store.metrics().snapshot().op(StoreOp::List).calls - lists_before,
+            0,
+            "a disabled sweep must not even list the prefix"
+        );
+        assert_eq!(
+            store.metrics().snapshot().op(StoreOp::Delete).calls - deletes_before,
+            0
+        );
+        assert_eq!(commit_keys(&store, &tenant).await, before);
+        for s in &seeded {
+            assert!(exists(&store, &s.data_key).await);
+        }
+    }
+
+    /// The watermark boundary is strict (ADR-1688 keep-set amendment). The memo
+    /// is complete only for hours strictly below its `watermark_hour`, so an
+    /// expired record in the watermark hour that the memo does not name may
+    /// still be its identity's newest transition and must survive. One hour
+    /// below the watermark, the very same record is deleted, so the assertion
+    /// is about the boundary and not about some other gate.
+    #[tokio::test]
+    async fn an_expired_record_in_the_watermark_hour_survives_and_one_hour_below_does_not() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+
+        // Far past the 90-day window and the protection horizon: every other
+        // gate would let this record go.
+        let ts = now - 200 * NS_PER_DAY;
+        let seeded = seed_alert(&store, &tenant, Uuid::from_u128(0xA7), 1, ts).await;
+        let record_hour = hour_of(ts);
+
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &AlertKeepSet::new(record_hour, []),
+        )
+        .await
+        .expect("at-watermark sweep");
+        assert_eq!(
+            outcome,
+            AlertRetentionOutcome {
+                records_deleted: 0,
+                data_deleted: 0,
+                kept: 1,
+                // Kept by the watermark, not by the keep set: the set is empty.
+                kept_current_state: 0,
+                kept_at_or_above_watermark: 1,
+                gets_skipped_by_hour_prefilter: 0,
+            },
+            "a record in the watermark hour must not be deleted"
+        );
+        assert!(exists(&store, &seeded.commit_key).await);
+        assert!(exists(&store, &seeded.data_key).await);
+
+        // The same record, the same empty keep set, a watermark one hour above
+        // it: now strictly below, and swept.
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &AlertKeepSet::new(record_hour + 1, []),
+        )
+        .await
+        .expect("below-watermark sweep");
+        assert_eq!(
+            outcome,
+            AlertRetentionOutcome {
+                records_deleted: 1,
+                data_deleted: 1,
+                kept: 0,
+                kept_current_state: 0,
+                kept_at_or_above_watermark: 0,
+                gets_skipped_by_hour_prefilter: 0,
+            },
+            "one hour below the watermark the same record is deleted"
+        );
+        assert!(!exists(&store, &seeded.commit_key).await);
+        assert!(!exists(&store, &seeded.data_key).await);
+    }
+
+    /// The keep set keys on `ts_ns`, not on `(epoch, seq)`. Two evaluator
+    /// processes each write a record with the constant `ALERT_WRITER_EPOCH` and
+    /// a `seq` counter restarted at 1, so the two share a pair and differ only
+    /// in their stamp. With one of the two stamps in the keep set, exactly one
+    /// survives; keyed by the pair, both would.
+    #[tokio::test]
+    async fn two_writers_sharing_a_seq_are_told_apart_by_ts_ns() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+
+        let kept = seed_alert(
+            &store,
+            &tenant,
+            Uuid::from_u128(0xB1),
+            1,
+            now - 200 * NS_PER_DAY,
+        )
+        .await;
+        let doomed = seed_alert(
+            &store,
+            &tenant,
+            Uuid::from_u128(0xB2),
+            1,
+            now - 199 * NS_PER_DAY,
+        )
+        .await;
+        assert_ne!(
+            kept.ts_ns, doomed.ts_ns,
+            "the two records must differ in the field the keep set reads"
+        );
+
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &AlertKeepSet::new(hour_of(now), [kept.ts_ns]),
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            outcome,
+            AlertRetentionOutcome {
+                records_deleted: 1,
+                data_deleted: 1,
+                kept: 1,
+                kept_current_state: 1,
+                kept_at_or_above_watermark: 0,
+                gets_skipped_by_hour_prefilter: 0,
+            },
+            "exactly one of the two records is kept, and by the keep set"
+        );
+        assert!(exists(&store, &kept.commit_key).await);
+        assert!(exists(&store, &kept.data_key).await);
+        assert!(!exists(&store, &doomed.commit_key).await);
+        assert!(!exists(&store, &doomed.data_key).await);
+    }
+
+    /// An empty `ts_ns` set is a memo that holds no identities, not a missing
+    /// memo: the sweep runs, deletes the expired records strictly below the
+    /// watermark, and keeps everything at or above it.
+    #[tokio::test]
+    async fn an_empty_ts_ns_set_sweeps_below_its_watermark_only() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let writer = Uuid::from_u128(0xC1);
+
+        let watermark_ts = now - 150 * NS_PER_DAY;
+        let watermark = hour_of(watermark_ts);
+        // Two expired records below the watermark, one expired record in the
+        // watermark hour itself, one expired record above it, and one live
+        // record the hour prefilter clears before the watermark is consulted.
+        let below = seed_history(
+            &store,
+            &tenant,
+            writer,
+            now,
+            &[(200 * 24, 1), (199 * 24, 2)],
+        )
+        .await;
+        let at = seed_alert(&store, &tenant, writer, 3, watermark_ts).await;
+        let above = seed_alert(&store, &tenant, writer, 4, now - 100 * NS_PER_DAY).await;
+        let live = seed_alert(&store, &tenant, writer, 5, now - 5 * NS_PER_HOUR).await;
+
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &AlertKeepSet::new(watermark, []),
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            outcome,
+            AlertRetentionOutcome {
+                records_deleted: 2,
+                data_deleted: 2,
+                kept: 3,
+                kept_current_state: 0,
+                kept_at_or_above_watermark: 2,
+                gets_skipped_by_hour_prefilter: 1,
+            },
+            "an empty set still sweeps, but only strictly below the watermark"
+        );
+        for gone in &below {
+            assert!(!exists(&store, &gone.commit_key).await);
+            assert!(!exists(&store, &gone.data_key).await);
+        }
+        for alive in [&at, &above, &live] {
+            assert!(
+                exists(&store, &alive.commit_key).await,
+                "{} must survive",
+                alive.commit_key
+            );
+            assert!(exists(&store, &alive.data_key).await);
+        }
+    }
+
+    /// The keep-set test runs after the expiry and horizon tests, which is what
+    /// makes `kept_current_state` mean "expired, past-horizon records that only
+    /// the keep set saved". Both records here are named by the keep set and
+    /// both are kept, one by the window and one by the horizon, so neither is
+    /// counted as kept by the set.
+    #[tokio::test]
+    async fn a_keep_set_record_that_was_never_at_risk_is_not_counted_as_kept_by_the_set() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        // Half past the hour, so the expiry floor falls inside an hour bucket
+        // and the hour prefilter cannot clear a record that sits just inside
+        // the window: the expiry test itself has to be what keeps it.
+        let now = 400 * NS_PER_DAY + NS_PER_HOUR / 2;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let expiry_floor = now - config.alert_retention_window_ns;
+
+        // Inside the window by a quarter of an hour, in the hour bucket that
+        // starts below the floor.
+        let inside_window = seed_alert(
+            &store,
+            &tenant,
+            Uuid::from_u128(0xD1),
+            1,
+            expiry_floor + NS_PER_HOUR / 4,
+        )
+        .await;
+        assert!(
+            i64::from(hour_of(inside_window.ts_ns)) * NS_PER_HOUR < expiry_floor,
+            "the prefilter must not be able to clear this record"
+        );
+        // Expired long ago, but written moments ago: inside the horizon.
+        let inside_horizon = seed_alert_created(
+            &store,
+            &tenant,
+            Uuid::from_u128(0xD2),
+            1,
+            now - 200 * NS_PER_DAY,
+            now - config.protection_horizon_ns / 2,
+        )
+        .await;
+
+        let keep = AlertKeepSet::new(hour_of(now), [inside_window.ts_ns, inside_horizon.ts_ns]);
+        assert!(keep.contains(inside_window.ts_ns) && keep.contains(inside_horizon.ts_ns));
+
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant,
+            ALERT_SHARD,
+            &keep,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            outcome,
+            AlertRetentionOutcome {
+                records_deleted: 0,
+                data_deleted: 0,
+                kept: 2,
+                // Checked before the expiry and horizon tests, this would be 2.
+                kept_current_state: 0,
+                kept_at_or_above_watermark: 0,
+                gets_skipped_by_hour_prefilter: 0,
+            },
+            "a keep-set record that was never at risk is counted under kept alone"
+        );
+        assert!(exists(&store, &inside_window.commit_key).await);
+        assert!(exists(&store, &inside_horizon.commit_key).await);
+    }
+
     /// The protection horizon is a second, independent gate: a record whose
     /// event time is long past the window but whose object was written moments
     /// ago survives until the horizon elapses. Seeded with a `created_unix_ns`
@@ -558,42 +1028,10 @@ mod tests {
 
         let event_ts = now - 200 * NS_PER_DAY; // far past the 90-day window
         let created = now - config.protection_horizon_ns / 2; // inside the horizon
-        let body = Bytes::from("recently written, long-expired event");
-        let content_hash: [u8; 32] = *blake3::hash(&body).as_bytes();
-        let commit = record::build(NewCommitRecord {
-            tenant_hash: tenant,
-            signal: Signal::Alerts,
-            shard: ALERT_SHARD,
-            writer_id: Uuid::from_u128(0xA3),
-            writer_epoch: ALERT_WRITER_EPOCH,
-            writer_seq: 1,
-            object_size: body.len() as u64,
-            content_hash,
-            sample_count: 1,
-            series_count: 1,
-            min_event_ts_ns: event_ts,
-            max_event_ts_ns: event_ts,
-            min_ingest_ts_ns: event_ts,
-            max_ingest_ts_ns: event_ts,
-            segment_format_version: 1,
-            created_unix_ns: created,
-            ingest_hour_bucket: u32::try_from(event_ts.div_euclid(NS_PER_HOUR)).unwrap(),
-        })
-        .expect("build");
-        let data_key = keys::reconstruct_data_key(&commit).unwrap();
-        store
-            .put(&data_key, body, PutOptions::create_if_absent())
-            .await
-            .unwrap();
-        let commit_key = keys::commit_key_for_record(&commit).unwrap();
-        store
-            .put(
-                &commit_key,
-                record::encode(&commit),
-                PutOptions::create_if_absent(),
-            )
-            .await
-            .unwrap();
+        let seeded =
+            seed_alert_created(&store, &tenant, Uuid::from_u128(0xA3), 1, event_ts, created).await;
+        let commit_key = seeded.commit_key.clone();
+        let data_key = seeded.data_key.clone();
 
         let outcome = sweep_alert_retention(
             &store,
@@ -602,7 +1040,7 @@ mod tests {
             &NoLeases,
             &tenant,
             ALERT_SHARD,
-            &AlertKeepSet::new(),
+            &keep_none_below(now),
         )
         .await
         .expect("sweep");
@@ -613,6 +1051,7 @@ mod tests {
                 data_deleted: 0,
                 kept: 1,
                 kept_current_state: 0,
+                kept_at_or_above_watermark: 0,
                 // The hour bucket is the expired event's, so the prefilter
                 // cannot clear it: the horizon is what saves the record, and it
                 // is read from the record body.
@@ -633,7 +1072,7 @@ mod tests {
             &NoLeases,
             &tenant,
             ALERT_SHARD,
-            &AlertKeepSet::new(),
+            &keep_none_below(now),
         )
         .await
         .expect("sweep");
@@ -644,10 +1083,11 @@ mod tests {
     }
 
     /// Delete ordering under failure: the commit record goes first, so a failure
-    /// on the data-object delete leaves the record already gone and record-less
-    /// data for orphan GC, never a commit record naming a deleted object. The
-    /// error surfaces to the caller, and the FaultStore counter proves the fault
-    /// actually fired.
+    /// on the data-object delete leaves the record already gone and a data
+    /// object nothing points at, never a commit record naming a deleted object.
+    /// That object is reclaimed by the alerts-shard orphan sweep ADR-1688
+    /// follow-up task 2 adds; until then it leaks. The error surfaces to the
+    /// caller, and the FaultStore counter proves the fault actually fired.
     #[tokio::test]
     async fn data_delete_failure_leaves_the_commit_record_deleted_and_reports() {
         let tenant = tenant();
@@ -681,7 +1121,7 @@ mod tests {
             &NoLeases,
             &tenant,
             ALERT_SHARD,
-            &AlertKeepSet::new(),
+            &keep_none_below(now),
         )
         .await
         .expect_err("the data-object delete must surface as an error");
@@ -701,11 +1141,12 @@ mod tests {
         );
         assert!(
             exists(&store, &seeded.data_key).await,
-            "the data object survives the failed delete, as record-less data for orphan GC"
+            "the data object survives the failed delete, with no record naming it"
         );
 
         // Idempotent re-run: the record is gone, so the second pass has nothing
-        // to list and the orphaned data object is left to orphan GC.
+        // to list, and the orphaned data object stays until the alerts-shard
+        // orphan sweep of ADR-1688 follow-up task 2 reclaims it.
         let outcome = sweep_alert_retention(
             &store,
             &clock,
@@ -713,7 +1154,7 @@ mod tests {
             &NoLeases,
             &tenant,
             ALERT_SHARD,
-            &AlertKeepSet::new(),
+            &keep_none_below(now),
         )
         .await
         .expect("re-run converges");
@@ -741,7 +1182,7 @@ mod tests {
                 &NoLeases,
                 &tenant,
                 ALERT_SHARD,
-                &AlertKeepSet::new(),
+                &keep_none_below(now),
             )
             .await
             .expect("control sweep");
@@ -759,7 +1200,7 @@ mod tests {
                 &hold,
                 &tenant,
                 ALERT_SHARD,
-                &AlertKeepSet::new(),
+                &keep_none_below(now),
             )
             .await
             .expect("held sweep");
@@ -770,6 +1211,7 @@ mod tests {
                     data_deleted: 0,
                     kept: 1,
                     kept_current_state: 0,
+                    kept_at_or_above_watermark: 0,
                     gets_skipped_by_hour_prefilter: 0,
                 },
                 "a held record is kept, and not counted as a keep-set record"
