@@ -377,16 +377,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to keep every record as before. The worker that owns a tenant's
   `(alerts, 0)` unit reads the tenant's alert state memo, keeps the `ts_ns` of
   every record it names together with its watermark hour, and runs
-  `ravel_maintain::sweep_alert_retention`. A tenant whose memo is absent,
-  undecodable, of an unsupported version, or has a watermark below the expiry
-  floor is skipped for that tick and counted under the new
-  `ravel_alert_retention_skipped_total{reason}` family, whose `reason` is one
-  of `absent`, `undecodable`, `unsupported_version` and
-  `watermark_below_floor`; a sustained nonzero rate means that tenant's
-  evaluator is not running or cannot write its memo. The same tick runs the
-  shard sweep over the alerts shard, so a data object left behind by a crash
+  `ravel_maintain::sweep_alert_retention`, clamping the memo's watermark to the
+  hour of its own clock reading first. A tenant whose memo is absent while it
+  has alert records, undecodable, of an unsupported version, unreadable for a
+  store reason, or carrying a watermark below the expiry floor is skipped for
+  that tick and counted under the new
+  `ravel_alert_retention_skipped_total{reason}` family, whose `reason` is one of
+  `absent`, `undecodable`, `unsupported_version`, `watermark_below_floor` and
+  `store_error`. The family carries no tenant label, so a sustained nonzero rate
+  says some tenant's alert evaluator is not running or cannot write its memo,
+  not which one. A tenant that has never written an alert transition is neither
+  logged nor counted. A nonzero `--alert-retention` shorter than one hour plus
+  the memo's seal margin (1 h 3 m 30 s at the default evaluation interval) is
+  refused at startup, since every tick would skip under it. The same tick runs
+  the shard sweep over the alerts shard, so a data object left behind by a crash
   between the retention sweep's record delete and its data delete is moved to
-  quarantine by orphan GC like any other signal's.
+  quarantine by orphan GC like any other signal's; the alert evaluator now
+  abandons a transition whose data PUT has been in flight longer than the ingest
+  writers' `max_flush_lifetime` rather than publishing its commit record, which
+  is the interlock that orphan age gate rests on.
 - **`/metrics` renders `ravel_health_heartbeat_age_seconds`** (ADR-1702
   decision 11, issue #2048). The gauge is the time since the main runtime's
   heartbeat task last ran, labelled `mode`, in every mode. The heartbeat now

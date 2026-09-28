@@ -1296,6 +1296,47 @@ by up to the allowed future clock skew. With several maintain replicas take the
 maximum across them, not the sum: each owns a disjoint share of the units and the
 lag is a worst-case, not an additive, figure.
 
+### Alert retention skips (`ravel_alert_retention_skipped_total`)
+
+Labels: `mode` and `reason`. Summed over every tenant this process maintains,
+with no `tenant_hash` dimension, so it says that some tenant is in one of these
+states, never which one. It renders with the maintenance-safety families above
+because the maintenance tick is what records it, not the alert evaluator.
+
+The maintenance tick sweeps alert transitions older than `--alert-retention`,
+and it reads the tenant's alert state memo first to learn which record is each
+alert identity's current state. Without a memo it can trust, it does not sweep
+that tenant on that tick, and counts why here.
+
+| `reason` | Meaning |
+|---|---|
+| `absent` | The tenant has alert records but no memo. A tenant that has never written an alert transition has no memo either and is not counted: it has nothing to sweep. |
+| `undecodable` | The memo object does not decode. |
+| `unsupported_version` | The memo decodes but carries a format version this build does not read. |
+| `watermark_below_floor` | The memo is complete only up to an hour older than the window's expiry floor, so it does not name every identity's current state across the range the sweep would delete from. |
+| `store_error` | Reading the memo, or the one listing that tells an unused alert keyspace from a lost one, failed against object storage. |
+
+Each is a skip for one tenant on one tick, and the next tick retries. A rate
+that stays at zero on a deployment running alert rules is the healthy state: the
+evaluator rewrites each tenant's memo on every tick it runs, so a memo is at most
+one tick old.
+
+A sustained rate on `absent`, `undecodable`, `unsupported_version` or
+`watermark_below_floor` points at an evaluator that is not running or cannot
+write its memo, and the remedy is there rather than on the sweep: read
+`ravel_alert_ticks_total{outcome=...}` and the age of
+`ravel_alert_last_tick_completed_timestamp_seconds` next. A sustained rate on
+`store_error` points at object storage instead, and
+`ravel_store_probe_failures_total` speaks to that. Either way the alert history
+stops being trimmed while it lasts, which shows up later as a growing prefix and
+a slower cold-start fold, not as a failed query.
+
+`watermark_below_floor` at a steady rate immediately after a configuration
+change is worth reading as a window that is too short for the deployment's
+evaluation interval rather than as a broken evaluator; the server refuses the
+worst case at startup, but a window only a little above the floor leaves little
+room for an evaluator that misses ticks.
+
 ### Maintenance ownership and concurrency (`ravel_maintain_workers_live`, `ravel_maintain_units_*`, `ravel_maintain_memo_warm_start_units_total`, `ravel_maintain_full_sweep_passes_total`)
 
 Labels: `mode`. Every series here is process-wide, with no `tenant_hash`
