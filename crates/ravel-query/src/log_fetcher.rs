@@ -319,6 +319,12 @@ pub struct LogSegmentScan {
     /// `None` only once a gated block decode that held the cursor failed or
     /// was abandoned; every later call then fails rather than skip blocks.
     scan: Option<BlockScan>,
+    /// The gate failure that lost the cursor, so a later call reports the same
+    /// class the losing call reported (a panicked decode stays a `Corrupt`,
+    /// not a redacted permanent store error). `None` when the cursor was
+    /// abandoned instead: a caller dropped the future while the job was queued
+    /// or running, and no classified failure exists to repeat.
+    lost_to: Option<CpuGateError>,
     /// The cursor's counters as of the last time it was held here, reported
     /// once `scan` is gone.
     lost_stats: ScanStats,
@@ -343,6 +349,10 @@ pub struct LogSegmentScan {
     /// block in the object's PAGE_DIR, since the cursor does not say which
     /// block it decodes next.
     block_job_bytes: u64,
+    /// Test hook: makes the next gated block decode panic inside the job, the
+    /// only way to drive a real [`CpuGateError::Panicked`] through this path.
+    #[cfg(test)]
+    panic_next_gate_job: bool,
 }
 
 impl LogSegmentScan {
@@ -358,10 +368,18 @@ impl LogSegmentScan {
         self.scan.as_ref().map_or(0, BlockScan::remaining_blocks)
     }
 
+    /// Arms the test hook: the next gated block decode panics inside its job.
+    #[cfg(test)]
+    pub(crate) fn panic_next_gate_job_for_test(&mut self) {
+        self.panic_next_gate_job = true;
+    }
+
     /// [`next_block`](Self::next_block) with the block decode run on the
     /// fetcher's read gate (ADR-1702 decision 4): the whole block, all its
     /// pages, is one job, so the decode leaves the runtime worker once the
-    /// block is over the gate's byte floor. Without a gate this is
+    /// block is over the gate's byte floor. Every block of an object is sized
+    /// at that object's largest block (`block_job_bytes`), not at its own: the
+    /// cursor does not say which block it decodes next. Without a gate this is
     /// `next_block`. Reaching exhaustion submits no job.
     pub async fn next_block_on_gate(&mut self) -> Result<Option<Vec<LogRecord>>, LogFetchError> {
         let Some(gate) = self.read_gate.clone() else {
@@ -371,24 +389,47 @@ impl LogSegmentScan {
             return self.next_block();
         }
         let Some(mut scan) = self.scan.take() else {
-            return Err(scan_lost(&self.key));
+            return Err(self.lost_error());
         };
         self.lost_stats = scan.stats();
         let bytes = self.bytes.clone();
         let span = self.span.clone();
-        let (scan, decoded) = gate
+        #[cfg(test)]
+        let panic_in_job = std::mem::take(&mut self.panic_next_gate_job);
+        let ran = gate
             .run(
                 ReadSite::LogBlock,
                 JobSize::Bytes(self.block_job_bytes),
                 move || {
+                    #[cfg(test)]
+                    assert!(!panic_in_job, "injected gated block decode panic");
                     let decoded = span.in_scope(|| scan.next_block(&bytes));
                     (scan, decoded)
                 },
             )
-            .await
-            .map_err(|err| log_gate_failed(&self.key, err))?;
+            .await;
+        let (scan, decoded) = match ran {
+            Ok(ran) => ran,
+            Err(err) => {
+                // The cursor went into the job, so it is gone whatever the
+                // failure was. Keep the failure so a later call repeats its
+                // class rather than degrading to a permanent store error.
+                self.lost_to = Some(err);
+                return Err(log_gate_failed(&self.key, err));
+            }
+        };
         self.scan = Some(scan);
         self.finish_block(decoded)
+    }
+
+    /// What an exit reports once the cursor is gone: the classified gate
+    /// failure that lost it when there was one, and the bare permanent
+    /// [`scan_lost`] when the cursor was abandoned instead.
+    fn lost_error(&self) -> LogFetchError {
+        match self.lost_to {
+            Some(err) => log_gate_failed(&self.key, err),
+            None => scan_lost(&self.key),
+        }
     }
 
     /// Decode the next surviving block and return its matching, unerased rows,
@@ -399,7 +440,7 @@ impl LogSegmentScan {
     /// matching row erased. Only `None` ends the scan.
     pub fn next_block(&mut self) -> Result<Option<Vec<LogRecord>>, LogFetchError> {
         let Some(scan) = self.scan.as_mut() else {
-            return Err(scan_lost(&self.key));
+            return Err(self.lost_error());
         };
         let bytes = &self.bytes;
         let decoded = self.span.in_scope(|| scan.next_block(bytes));
@@ -476,7 +517,7 @@ impl LogSegmentScan {
             ..
         } = self
         else {
-            return Err(scan_lost(&self.key));
+            return Err(self.lost_error());
         };
         let entered = span.enter();
         let decoded = scan.next_block_columnar(bytes);
@@ -890,7 +931,7 @@ impl LogSegmentFetcher {
                     }
                 }?;
                 let block_job_bytes = if block_sizes {
-                    max_block_uncompressed_len(bytes, &fetcher.cfg)
+                    max_block_uncompressed_len(bytes, &fetcher.cfg, &accounting)
                 } else {
                     0
                 };
@@ -918,6 +959,7 @@ impl LogSegmentFetcher {
             bytes,
             lost_stats: scan.stats(),
             scan: Some(scan),
+            lost_to: None,
             erasure: query.erasure.clone(),
             span,
             key: key.to_string(),
@@ -925,6 +967,8 @@ impl LogSegmentFetcher {
             finished: false,
             read_gate: self.read_gate.clone(),
             block_job_bytes,
+            #[cfg(test)]
+            panic_next_gate_job: false,
         }
     }
 
@@ -1304,10 +1348,10 @@ impl LogSegmentFetcher {
             // own copy of these spans over its own (cache-aware) GET path.
             // Reserve the whole object's bytes before the GET (ADR-1170
             // decision 2): a refusal fails this fetch typed with zero GETs
-            // issued. Held to the end of this block, so it covers the decode
-            // that reads `got.data`; released when this fully-decoded funnel
-            // returns its owned records.
-            let _reservation = self.reserve_fetch(seg_ref.object_size)?;
+            // issued. Attached to the fetched buffer below rather than held as
+            // a local, because a gated block decode clones those bytes into a
+            // job that outlives a dropped caller.
+            let reservation = self.reserve_fetch(seg_ref.object_size)?;
             let fetch_span = tracing::debug_span!(
                 "page_fetch",
                 signal = "logs",
@@ -1337,16 +1381,17 @@ impl LogSegmentFetcher {
             }
             .instrument(fetch_span.clone())
             .await?;
+            let bytes = attach_reservation(got.data, reservation);
             accounting.record_s3_request(AccountedOp::Get);
-            accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            accounting.add_s3_bytes(AccountedOp::Get, bytes.len() as u64);
             // #913: a data read, so the whole object's wire bytes are the
             // scan phase's (`ReadPhases::SCAN.blocks`).
             self.wire_bytes
-                .record(ReadPhases::SCAN.blocks, got.data.len() as u64);
+                .record(ReadPhases::SCAN.blocks, bytes.len() as u64);
             // This funnel issues exactly one whole-object GET per call.
             fetch_span.record("s3_requests", 1u64);
-            fetch_span.record("s3_bytes", got.data.len() as u64);
-            self.decode_spanned(key, &got.data, query, accounting).await
+            fetch_span.record("s3_bytes", bytes.len() as u64);
+            self.decode_spanned(key, &bytes, query, accounting).await
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -6869,7 +6914,9 @@ fn log_gate_failed(key: &str, err: CpuGateError) -> LogFetchError {
 /// The job size of a scan open on the read gate: the uncompressed lengths of
 /// the directory sections `RlogReader::new` decodes, plus POSTINGS when the
 /// object carries it, since the open probes it. With `block_sizes`, PAGE_DIR
-/// counts twice, for [`max_block_uncompressed_len`]'s own read of it.
+/// counts twice, for [`max_block_uncompressed_len`]'s own read of it; that
+/// second decode is charged to the query's accounting as well, so the job's
+/// size and the bytes it reports are the same work.
 /// `u64::MAX` when the footer does not open.
 fn open_job_len(bytes: &[u8], block_sizes: bool) -> u64 {
     let Ok(footer) = footer::open(bytes) else {
@@ -6891,9 +6938,13 @@ fn open_job_len(bytes: &[u8], block_sizes: bool) -> u64 {
     total
 }
 
-/// A [`LogSegmentScan`] whose cursor went with a gated decode that failed or
-/// was abandoned. Permanent: the blocks it had not decoded cannot be read
-/// through this scan, and skipping them would return a partial segment.
+/// A [`LogSegmentScan`] whose cursor went with a gated decode that was
+/// abandoned: the caller dropped the future while the job was queued or
+/// running, so no classified failure exists to repeat. Permanent: the blocks it
+/// had not decoded cannot be read through this scan, and skipping them would
+/// return a partial segment. A cursor lost to a gate failure reports that
+/// failure's own class instead ([`LogSegmentScan::lost_error`]), so a panicked
+/// decode does not turn into a permanent store error the HTTP layer redacts.
 fn scan_lost(key: &str) -> LogFetchError {
     LogFetchError::Store {
         key: key.to_string(),
@@ -6907,10 +6958,15 @@ fn scan_lost(key: &str) -> LogFetchError {
 /// page of the block. `u64::MAX` when the directory cannot be read, so a
 /// block of unknown size is never taken for a small one; the scan's own open
 /// already refused such an object.
-fn max_block_uncompressed_len(bytes: &[u8], cfg: &RlogConfig) -> u64 {
+///
+/// This decodes PAGE_DIR a second time, after the open's own decode of it, and
+/// charges that decode to `accounting` like every other: the bytes zstd
+/// produced here count against the query's `TooManyBytesScanned` budget the
+/// same as the ones the open produced.
+fn max_block_uncompressed_len(bytes: &[u8], cfg: &RlogConfig, accounting: &QueryAccounting) -> u64 {
     let page_dir = footer::open(bytes).ok().and_then(|footer| {
         let desc = *footer.section(kind::PAGE_DIR)?;
-        let raw = ravel_logseg::read_section(bytes, &desc, cfg).ok()?;
+        let raw = ravel_logseg::read_section_accounted(bytes, &desc, cfg, accounting).ok()?;
         PageDir::decode(&raw).ok()
     });
     let Some(page_dir) = page_dir else {
@@ -10697,7 +10753,13 @@ mod read_gate_tests {
         );
     }
 
-    /// The job size is the largest block's summed uncompressed page length.
+    /// The job size is the largest block's summed uncompressed page length,
+    /// and the sizing read charges its own PAGE_DIR decode to the accounting
+    /// handle the caller passed in.
+    ///
+    /// FLIP: reading the sizing PAGE_DIR through `ravel_logseg::read_section`
+    /// instead of `read_section_accounted` reads `left: 0, right: 173` on the
+    /// charge assertion.
     #[test]
     fn block_job_size_is_the_largest_uncompressed_block() {
         let cfg = RlogConfig {
@@ -10735,8 +10797,30 @@ mod read_gate_tests {
         };
         assert!(per_block(1) > 10_000);
         assert!(per_block(0) < per_block(1));
-        assert_eq!(max_block_uncompressed_len(&bytes, &cfg), per_block(1));
-        assert_eq!(max_block_uncompressed_len(b"not an object", &cfg), u64::MAX);
+        let charged = QueryAccounting::new();
+        assert_eq!(
+            max_block_uncompressed_len(&bytes, &cfg, &charged),
+            per_block(1)
+        );
+        let sizing_probe = QueryAccounting::new();
+        let page_dir_decompressed = {
+            let footer = footer::open(&bytes).expect("footer");
+            let desc = *footer.section(kind::PAGE_DIR).expect("PAGE_DIR");
+            ravel_logseg::read_section_accounted(&bytes, &desc, &cfg, &sizing_probe).expect("read");
+            sizing_probe.snapshot().decompressed_bytes
+        };
+        assert!(page_dir_decompressed > 0, "the fixture compresses PAGE_DIR");
+        assert_eq!(
+            charged.snapshot().decompressed_bytes,
+            page_dir_decompressed,
+            "the sizing read charges exactly its own PAGE_DIR decode"
+        );
+        let unreadable = QueryAccounting::new();
+        assert_eq!(
+            max_block_uncompressed_len(b"not an object", &cfg, &unreadable),
+            u64::MAX
+        );
+        assert_eq!(unreadable.snapshot().decompressed_bytes, 0);
     }
 
     async fn fetch_with_tenant(
@@ -10754,18 +10838,37 @@ mod read_gate_tests {
     /// The row fetch the SQL alerts and audit scans, distributed fragments and
     /// cache warming reach: with the byte floor at 0, the scan open is exactly
     /// one `LogPostings` job, each block exactly one `LogBlock` job, nothing
-    /// runs inline, and the records, counters and decompressed-byte charge
-    /// equal the ungated fetch's. The object is below the block-range
-    /// threshold, so no section is decoded on its own. The untenanted
-    /// `fetch_accounted` drains the same way.
+    /// runs inline, and the records and counters equal the ungated fetch's.
+    /// The gated fetch's decompressed-byte charge is the ungated one plus
+    /// exactly one PAGE_DIR: sizing the block jobs reads that directory a
+    /// second time, and that read is accounted like every other. The object is
+    /// below the block-range threshold, so no section is decoded on its own.
+    /// The untenanted `fetch_accounted` drains the same way.
     ///
     /// FLIP: in `decode_spanned`, take the `None` arm whatever the gate; the
     /// `LogBlock` assertion then reads `left: (0, 0), right: (4, 0)`. Reading
     /// the gate as `None` in `open_scan_on_gate` instead reads
-    /// `left: (0, 0), right: (1, 0)` on the `LogPostings` one.
+    /// `left: (0, 0), right: (1, 0)` on the `LogPostings` one. Reading the
+    /// sizing PAGE_DIR in `max_block_uncompressed_len` through
+    /// `ravel_logseg::read_section` instead of `read_section_accounted` leaves
+    /// that decode unaccounted and the charge assertion reads
+    /// `left: 450, right: 766`.
     #[tokio::test]
     async fn fetch_accounted_with_tenant_decodes_on_the_read_gate() {
         let (store, seg_ref) = fixture().await;
+        // The sizing read the gated path adds, measured through the same
+        // accounted reader it uses, so the expected charge is a figure rather
+        // than a direction.
+        let page_dir_decompressed = {
+            let object = store.get(KEY, GetRange::Full).await.expect("get").data;
+            let cfg = RlogConfig::default();
+            let footer = footer::open(&object).expect("footer");
+            let desc = *footer.section(kind::PAGE_DIR).expect("PAGE_DIR");
+            let probe = QueryAccounting::new();
+            ravel_logseg::read_section_accounted(&object, &desc, &cfg, &probe).expect("read");
+            probe.snapshot().decompressed_bytes
+        };
+        assert!(page_dir_decompressed > 0, "the fixture compresses PAGE_DIR");
         let backend: Arc<dyn ObjectStoreBackend> = store;
         let query = LogQuery::new(i64::MIN, i64::MAX);
         let ungated_accounting = QueryAccounting::new();
@@ -10787,7 +10890,7 @@ mod read_gate_tests {
         assert_eq!(format!("{gated:?}"), format!("{inline:?}"));
         assert_eq!(
             gated_accounting.snapshot().decompressed_bytes,
-            ungated_accounting.snapshot().decompressed_bytes
+            ungated_accounting.snapshot().decompressed_bytes + page_dir_decompressed
         );
         assert_eq!(site_counts(&gate, ReadSite::LogBlock), (BLOCKS as u64, 0));
         assert_eq!(site_counts(&gate, ReadSite::LogPostings), (1, 0));
@@ -10906,5 +11009,64 @@ mod read_gate_tests {
                 ..
             }
         ));
+    }
+
+    /// The error class a fetch error carries, which is what the HTTP layer
+    /// maps to a status: a permanent store error is redacted to a 503 and a
+    /// corrupt segment is not.
+    fn class(err: &LogFetchError) -> &'static str {
+        match err {
+            LogFetchError::Corrupt { .. } => "corrupt",
+            LogFetchError::Store {
+                source: StoreError::Transient(_),
+                ..
+            } => "transient",
+            LogFetchError::Store { .. } => "permanent",
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    /// A gated block decode that panicked takes the cursor with it. The call
+    /// that lost it reports the decode's own error, and so does every call
+    /// after it, on both exits: the scan keeps the class rather than degrading
+    /// to a permanent store error the HTTP layer would redact to a 503.
+    ///
+    /// FLIP: return `scan_lost(&self.key)` unconditionally from
+    /// `LogSegmentScan::lost_error` and the second-call assertion reads
+    /// `left: "permanent", right: "corrupt"`.
+    #[tokio::test]
+    async fn a_lost_log_scan_repeats_the_failure_class() {
+        let (store, seg_ref) = fixture().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = LogSegmentFetcher::new(backend).with_read_gate(floor_zero_gate());
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+        let mut scan = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref,
+                TENANT,
+                &query,
+                &ColumnSelection::all(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("scan")
+            .expect("the segment is relevant");
+
+        scan.panic_next_gate_job_for_test();
+        let first = scan
+            .next_block_on_gate()
+            .await
+            .expect_err("the panicking job fails the call that submitted it");
+        assert_eq!(class(&first), "corrupt", "{first:?}");
+
+        let second = scan
+            .next_block_on_gate()
+            .await
+            .expect_err("the cursor went with the panicking job");
+        assert_eq!(class(&second), class(&first), "{second:?}");
+        let inline = scan
+            .next_block()
+            .expect_err("the inline exit has no cursor either");
+        assert_eq!(class(&inline), class(&first), "{inline:?}");
     }
 }
