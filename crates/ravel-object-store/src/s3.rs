@@ -1116,6 +1116,21 @@ fn map_meta(meta: object_store::ObjectMeta) -> Result<ObjectMeta, StoreError> {
     })
 }
 
+/// The metadata and the pin for one object, from what S3 reported about it.
+///
+/// The two carry different things and neither can be derived from the other.
+/// [`ObjectMeta::version`] is the compare-and-swap token, which on S3 is the
+/// ETag, because that is what a conditional write compares. The pin's version
+/// is the object version id, which is what a read selects with `versionId`. A
+/// bucket without versioning reports no version id and the pin then carries
+/// the ETag alone, so a read through it is a plain `If-Match`.
+fn meta_to_pin(meta: object_store::ObjectMeta) -> Result<(ObjectMeta, Pin), StoreError> {
+    let version = meta.version.clone();
+    let mapped = map_meta(meta)?;
+    let pin = Pin::from_store(mapped.etag.0.clone(), version);
+    Ok((mapped, pin))
+}
+
 /// Error mapping shared by every non-`put` operation. `put` has its own
 /// mode-aware wrapper (see [`map_put_error`]) because conditional-write
 /// failures must be interpreted differently depending on `PutMode`.
@@ -2040,10 +2055,7 @@ impl ObjectStoreBackend for S3Store {
         attempts::scope(StoreOp::Head, async move {
             let path = path_of(key);
             let meta = self.store.head(&path).await.map_err(map_error_common)?;
-            let version = meta.version.clone();
-            let mapped = map_meta(meta)?;
-            let pin = Pin::from_store(mapped.etag.0.clone(), version);
-            Ok((mapped, pin))
+            meta_to_pin(meta)
         })
         .await
     }
@@ -2486,6 +2498,53 @@ mod tests {
             auth: S3AuthMode::Static,
             instance_metadata_endpoint: None,
         }
+    }
+
+    /// A versioned bucket reports a version id, and it is the pin's selector.
+    /// Reading it off `ObjectMeta::version` instead would read the ETag back,
+    /// since that field is the compare-and-swap token on S3, and a pinned read
+    /// would then send the ETag as a `versionId` and fail on an object that is
+    /// still there.
+    #[test]
+    fn a_reported_version_id_becomes_the_pins_selector() {
+        let (meta, pin) = meta_to_pin(object_store::ObjectMeta {
+            location: Path::from("t/acme/seg/0001"),
+            last_modified: Default::default(),
+            size: 17,
+            e_tag: Some("\"9a0364b9e99bb480dd25e1f0284c8555\"".to_string()),
+            version: Some("3sL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY".to_string()),
+        })
+        .expect("an object with an ETag maps");
+
+        assert_eq!(pin.etag, "\"9a0364b9e99bb480dd25e1f0284c8555\"");
+        assert_eq!(
+            pin.version.as_deref(),
+            Some("3sL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY"),
+            "the version id S3 reported is the pin's selector"
+        );
+        // The CAS token is unchanged: it is the ETag, and a conditional write
+        // still compares it.
+        assert_eq!(meta.version.0, "\"9a0364b9e99bb480dd25e1f0284c8555\"");
+        assert_eq!(meta.etag.0, "\"9a0364b9e99bb480dd25e1f0284c8555\"");
+    }
+
+    /// An unversioned bucket reports no version id. The pin carries the ETag
+    /// alone, so a read through it is a plain `If-Match` and never asks for a
+    /// version the bucket cannot serve.
+    #[test]
+    fn an_unversioned_bucket_yields_a_pin_with_no_version() {
+        let (meta, pin) = meta_to_pin(object_store::ObjectMeta {
+            location: Path::from("t/acme/seg/0001"),
+            last_modified: Default::default(),
+            size: 17,
+            e_tag: Some("\"abc\"".to_string()),
+            version: None,
+        })
+        .expect("an object with an ETag maps");
+
+        assert_eq!(pin.etag, "\"abc\"");
+        assert_eq!(pin.version, None);
+        assert_eq!(meta.version.0, "\"abc\"");
     }
 
     /// `S3Store` declares the capability `required_capabilities(Mode::

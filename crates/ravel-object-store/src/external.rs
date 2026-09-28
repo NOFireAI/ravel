@@ -1042,6 +1042,49 @@ mod tests {
         assert!(!rendered.contains(MARKER), "leaked the path: {rendered}");
     }
 
+    /// The GCS service-account file is the one credential Ravel hands to
+    /// `object_store` as a path instead of reading itself, and the builder
+    /// reads it during `build`. Its error quotes the path it was given, so
+    /// wrapping that error would put a filesystem path into every log line
+    /// that reports a failed open. The message is fixed per store kind and
+    /// the source error is dropped, which is what this asserts: neither
+    /// `Display` nor `Debug` can reach the path.
+    #[test]
+    fn a_gcs_open_failure_names_the_kind_and_the_profile_and_nothing_else() {
+        let profile = ExternalProfile {
+            name: "lake".into(),
+            kind: ExternalKind::Gcs {
+                credentials: GcsProfileCredentials::ServiceAccount {
+                    path: PathBuf::from(format!("/nonexistent/{MARKER}/service-account.json")),
+                },
+            },
+        };
+
+        let err = ExternalStore::open(&profile, "some-bucket")
+            .err()
+            .expect("the service account file does not exist");
+        assert!(
+            matches!(
+                err,
+                ProfileError::CredentialsRejected {
+                    kind: "gcs",
+                    ref profile
+                } if profile == "lake"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "gcs credentials could not be loaded for profile lake"
+        );
+        let rendered = format!("{err} / {err:?}");
+        assert!(!rendered.contains(MARKER), "leaked the path: {rendered}");
+        assert!(
+            !rendered.contains("service-account"),
+            "leaked the file name: {rendered}"
+        );
+    }
+
     #[test]
     fn a_file_secret_is_read_with_its_trailing_newline_trimmed() {
         let dir = tempfile::tempdir().expect("tempdir");
