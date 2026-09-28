@@ -369,7 +369,11 @@ refreshes its view. The **live set** is itself plus every sibling whose stamp
 is within `3 * H` of the reader's own clock, in either direction: a stuck
 future-dated record drops out just like a stale past-dated one. Worker
 identity comes from the key, not the record body, so a record whose body
-disagrees with its key cannot smuggle a false identity into the live set.
+disagrees with its key is skipped rather than admitted under another worker's
+identity. That check does not keep a new identity out: the shipped query role
+(`deploy/iam/query.json`) may `PutObject` anywhere under `sys/query/workers/`
+and records carry no MAC, so any principal holding that role can write a
+self-consistent record at a fresh UUID key and join the live set.
 
 That listing is also what keeps the prefix bounded. A node that drains
 gracefully deletes its own record on the way out, but one lost to a crash, a
