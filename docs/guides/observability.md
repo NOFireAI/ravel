@@ -2069,11 +2069,12 @@ A worker-reported `CORRUPT` status is never re-dispatched or masked by
 fallback: it fails the query typed so the corruption is not silently papered
 over.
 
-### CPU gates and the tokio runtime (`ravel_cpu_gate_*`, `ravel_runtime_*`)
+### CPU gates, the tokio runtime and the heartbeat (`ravel_cpu_gate_*`, `ravel_runtime_*`, `ravel_health_heartbeat_age_seconds`)
 
 Labels: `mode` and `gate` (`read`|`write`) on every CPU gate sample, plus
-`site` on the two per-site counters; `mode` only on the runtime gauges, plus
-`worker` on the per-worker busy counter. Rendered in every mode.
+`site` on the two per-site counters; `mode` only on the runtime gauges and
+the heartbeat age, plus `worker` on the per-worker busy counter. Rendered in
+every mode.
 
 A CPU gate runs codec work on the tokio blocking pool behind a
 fixed number of permits: a job waits for a permit, runs, and releases the
@@ -2101,6 +2102,7 @@ and encode move onto them.
 | `ravel_runtime_alive_tasks` | Gauge. Tasks alive on the runtime. |
 | `ravel_runtime_global_queue_depth` | Gauge. Tasks waiting in the runtime's global queue. |
 | `ravel_runtime_worker_busy_seconds_total{worker}` | Counter. Time each worker spent busy. Rendered only on targets with 64-bit atomics, which covers every target Ravel builds for. |
+| `ravel_health_heartbeat_age_seconds` | Gauge. Seconds since the heartbeat task on the main runtime last ran. It beats every second, so an idle node reads under 2; a value that keeps growing means the main runtime is not scheduling the task. Rendered in every mode, with or without `--listen-health`, whose `/readyz` fails above 30 and `/healthz` above 60 on this same heartbeat. |
 
 The `site` label takes one value per wrapped call site, from a closed set per
 gate, and every site renders a sample even at 0. On the read gate:

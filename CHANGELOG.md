@@ -228,6 +228,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/metrics` renders `ravel_health_heartbeat_age_seconds`** (ADR-1702
+  decision 11, issue #2048). The gauge is the time since the main runtime's
+  heartbeat task last ran, labelled `mode`, in every mode. The heartbeat now
+  exists whether or not `--listen-health` is set; when it is, the dedicated
+  health listener reads the same heartbeat. The task beats every second, so
+  a value that keeps growing means the main runtime is not scheduling it.
+  Embedders get `ravel_server::start_with_heartbeat` to pass in a heartbeat
+  they built; `ravel_server::start` builds and beats its own.
 - **`ravel-cli load` takes `--signal {metrics,logs,spans}` and loads the
   metrics signal** (ADR-1751 decisions 1 and 2, follow-up task 1, issues
   #1751 and #1712). The flag defaults to `logs`, so an invocation written
