@@ -557,10 +557,11 @@ under ADR-1331. So a compaction record gains its own supersession.
    `(inputs, superseded_record_key)`, so the key shape is unchanged
    (`l1.<hash16>.cmt`) and the key differs from the predecessor's. Key
    reconstruction is unchanged: the key follows the stored hash, as it does for
-   version 1. The compactor's single source of the hash,
-   `ravel_maintain::read::input_set_hash`, switches to the new domain for a v2
-   record, and `seal_divergence` recomputes the hash for the record's own
-   version.
+   version 1. The version-2 domain lives in `ravel_commit::erasure` beside the
+   existing version-1 and rewrite domains, so the decode-time check and the
+   writer share one preimage; the compactor's call site,
+   `ravel_maintain::read::input_set_hash`, selects it for a v2 record, and
+   `seal_divergence` recomputes the hash for the record's own version.
 3. **Resolution.** Supersession is applied inside the shared authoritative
    selector before the overlap-component winner is chosen: a compaction record
    that a present v2 record names is excluded, and the chase is bounded and
@@ -569,15 +570,22 @@ under ADR-1331. So a compaction record gains its own supersession.
    `migrate` all call that selector, so they agree. The rewrite-record chase
    treats a v2 record as a link, not an end.
 4. **Where force 2 does not run.** A bucket whose overlap component holds more
-   than one compaction record is not re-encoded: a v2 record's new hash could
+   than one compaction record, counted after item 3's supersession exclusion,
+   is not re-encoded: a v2 record's new hash could
    lose the winner tie-break to the old loser and serve the loser's inputs raw
    after their parts are gone. `migrate` names such a bucket as blocked with its
    own reason. A bucket with a rewrite record stays blocked as ADR-1331 says.
 5. **Erasure dominance.** If a live rewrite record and a v2 record both
    supersede the same predecessor, the rewrite wins and the v2 record is
-   excluded, since its parts may still hold an erased subject. The sweep
-   reclaims an excluded v2 record and its parts under the same horizon and
-   holds as any superseded record.
+   excluded, since its parts may still hold an erased subject. The shared
+   selector sees only compaction records, so the rule is applied where rewrite
+   and compaction records are both in view: in each caller's bucket resolution
+   before the selector runs (resolve, the token fallback, the fold, scrub, the
+   erasure completion gate and `migrate`). No record's `superseded_record_key`
+   names the dominated v2 record, so the sweep gets an explicit rule for it: a
+   v2 record whose predecessor a present rewrite record also supersedes joins
+   that rewrite's chain group and is deleted with its parts under the same
+   horizon, reachability and hold rules as the predecessor.
 6. **Reclaiming the predecessor.** The sweep deletes a predecessor and its parts
    as one chain group entered from the v2 record, only once
    `now >= v2.created_unix_ns + protection_horizon_ns`, only when no reachable
@@ -591,18 +599,19 @@ under ADR-1331. So a compaction record gains its own supersession.
 8. **Rollout.** Readers first: the format, resolution and sweep changes ship in
    a release before any v2 record is written. The writer is behind a switch
    that defaults to off until every node runs a reading build.
-9. **Losing records and the floor.** `migrate`'s below-target count stops
-   counting a losing compaction record's parts, since no resolve serves them,
-   but only when no reachable HEAD names them (the same reachability gate the
-   sweep uses). Once the floor rises and the N-1 reader is deleted, the
-   retention version hold still probes loser parts and would hold those
-   buckets; reclaiming loser parts, or skipping them in that probe, is a
-   recorded follow-up.
+9. **Losing records and the floor.** A losing compaction record's parts keep
+   counting toward the below-target figure. A build that predates the
+   authoritative-selection rule may still serve them (the sweep keeps them for
+   the same reason), and the reachability gate answers "nothing blocked" when
+   no HEAD exists, so neither is a safe basis for raising the floor over them.
+   `migrate` instead names a bucket blocked only by a losing record's parts
+   with its own reason, so the report says what holds the floor. Reclaiming
+   loser parts is a recorded follow-up.
 
 `docs/catalog-and-mvcc.md` (the record-kind and supersession sections) and the
 `CompactionRecord` proto comment change in the same commit as task T2.
 
-Tasks, in order: T1 loser exclusion in `migrate` (reachability-gated); T2 the
+Tasks, in order: T1 the loser-parts blocked reason in `migrate`; T2 the
 proto field, version 2, hash domain and decoding in `ravel-commit`; T3
 resolution in `ravel-catalog`; T4 sweep and erasure; T5 the re-encode
 primitive in `rewrite.rs`, writer switch off by default; T6 `migrate` wiring;
