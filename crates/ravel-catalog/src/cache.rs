@@ -24,6 +24,14 @@
 //! [`CatalogConfig::byte_cache_max_bytes`](crate::CatalogConfig::byte_cache_max_bytes)):
 //! nothing is admitted at all, so every read falls through to a store GET.
 //!
+//! The decoded-output caches ([`DecodedCache`], holding snapshot parts and
+//! name postings) are bounded differently, because each of their entries
+//! carries the memory [`Reservation`](ravel_memory::Reservation) for its own
+//! decoded bytes: per tenant by an entry cap, and across every tenant of both
+//! caches by the process memory budget itself, which [`DecodedCaches`] hands
+//! memory back to when a decode is refused. Their eviction rule is on
+//! [`DecodedCache`].
+//!
 //! Every `get()` below also records a hit or a miss, and a hit's stored byte
 //! size, into the caller's [`QueryAccounting`] (ADR-0044): the
 //! byte count is the size of the raw object the cached value was originally
@@ -34,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use ravel_proto::catalog::v1::SnapshotHead;
@@ -611,53 +620,160 @@ impl HeadCache {
     }
 }
 
+/// Monotonic recency clock the decoded-output caches stamp their entries
+/// with. The two caches of one [`DecodedCaches`] share one clock, so a
+/// memory-pressure eviction pass can order entries by when they were last
+/// used rather than by which of the two caches happens to hold them.
 #[derive(Default)]
-struct PartTenantCache {
-    entries: HashMap<String, (Arc<ChargedPart>, u64)>,
-    /// Insertion order, oldest first, for capacity-cap eviction.
-    order: std::collections::VecDeque<String>,
+pub(crate) struct RecencyClock(AtomicU64);
+
+impl RecencyClock {
+    /// The next stamp. Wrapping is not a concern: a process would have to
+    /// touch these caches 2^64 times to reach it.
+    fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
-impl PartTenantCache {
-    fn insert(&mut self, key: String, part: Arc<ChargedPart>, bytes: u64, capacity: usize) {
-        if self.entries.contains_key(&key) {
-            return;
-        }
-        self.entries.insert(key.clone(), (part, bytes));
-        self.order.push_back(key);
-        while self.order.len() > capacity.max(1) {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            }
+/// One cached decoded value plus the recency stamp that positions it in
+/// [`DecodedTenantCache::by_use`].
+struct DecodedEntry<V> {
+    value: Arc<V>,
+    /// Size of the raw object this was decoded from, for the accounting a hit
+    /// records (see the module docs). Not the decoded size the value's own
+    /// [`Reservation`](ravel_memory::Reservation) charges.
+    bytes: u64,
+    use_tick: u64,
+}
+
+struct DecodedTenantCache<V> {
+    entries: HashMap<String, DecodedEntry<V>>,
+    /// Recency index, least-recently-used first: `use_tick -> key`, in step
+    /// with `entries`, the same shape and for the same reason as
+    /// [`TenantCache::by_use`].
+    by_use: std::collections::BTreeMap<u64, String>,
+}
+
+impl<V> Default for DecodedTenantCache<V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_use: std::collections::BTreeMap::new(),
         }
     }
 }
 
-/// Decoded snapshot-part cache, partitioned by tenant. Parts are
-/// content-addressed and immutable, so entries never need invalidating,
-/// only capacity-cap eviction (`snapshot_cache_parts`).
-#[derive(Default)]
-pub(crate) struct PartCache {
-    tenants: Mutex<HashMap<TenantHash, PartTenantCache>>,
+impl<V> DecodedTenantCache<V> {
+    /// Return the entry for `key` and mark it used at `tick`, or `None` when
+    /// absent (an absent key leaves the recency order untouched).
+    fn touch(&mut self, key: &str, tick: u64) -> Option<(Arc<V>, u64)> {
+        let entry = self.entries.get_mut(key)?;
+        let previous = entry.use_tick;
+        entry.use_tick = tick;
+        let hit = (entry.value.clone(), entry.bytes);
+        self.by_use.remove(&previous);
+        self.by_use.insert(tick, key.to_string());
+        Some(hit)
+    }
+
+    /// Admit `value` and evict least-recently-used until the tenant holds at
+    /// most `capacity` entries. A key already held keeps its stored value
+    /// (these objects are immutable) and only refreshes its recency.
+    fn insert(&mut self, key: String, value: Arc<V>, bytes: u64, capacity: usize, tick: u64) {
+        if self.touch(&key, tick).is_some() {
+            return;
+        }
+        self.entries.insert(
+            key.clone(),
+            DecodedEntry {
+                value,
+                bytes,
+                use_tick: tick,
+            },
+        );
+        self.by_use.insert(tick, key);
+        while self.entries.len() > capacity.max(1) {
+            if self.remove_lru().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// The stamp of this tenant's least-recently-used entry.
+    fn lru_tick(&self) -> Option<u64> {
+        self.by_use.keys().next().copied()
+    }
+
+    /// Remove this tenant's least-recently-used entry and return it, so the
+    /// caller decides where the value (and so its reservation) is dropped.
+    fn remove_lru(&mut self) -> Option<DecodedEntry<V>> {
+        let (_, key) = self.by_use.pop_first()?;
+        self.entries.remove(&key)
+    }
 }
 
-impl PartCache {
+/// A cache of decoded objects that each carry their own memory reservation
+/// ([`crate::charged::Charged`]), partitioned by tenant. The objects are
+/// content-addressed and immutable, so an entry never needs invalidating.
+///
+/// # Eviction rule
+///
+/// Two bounds, both least-recently-used:
+///
+/// - Per tenant, the configured entry cap (`snapshot_cache_parts` for
+///   [`PartCache`], `postings_cache_entries` for [`PostingsCache`]), applied
+///   on insert.
+/// - Across every tenant of BOTH caches, on memory pressure:
+///   [`DecodedCaches::evict_until_fits`] drops entries least-recently-used
+///   first until the refused reservation would fit. Without it, a finite
+///   [`ravel_memory::MemoryBudget`] wired into the catalog could be held
+///   entirely by other tenants' cached entries, and every later decode would
+///   be refused with nothing able to give the memory back. A reservation
+///   larger than the whole budget takes no such pass: see
+///   [`crate::Catalog::reserve_decoded`].
+///
+/// An entry evicted by either bound releases its reservation only when the
+/// last `Arc` to it drops. A resolve that is still holding the value keeps it
+/// charged to the budget after the cache has forgotten it, so an eviction
+/// pass can free less than the entries it dropped were charged; the pass
+/// bounds itself by the number of entries it removes rather than by the bytes
+/// it frees, and so always terminates.
+pub(crate) struct DecodedCache<V> {
+    tenants: Mutex<HashMap<TenantHash, DecodedTenantCache<V>>>,
+    clock: Arc<RecencyClock>,
+}
+
+impl<V> Default for DecodedCache<V> {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(RecencyClock::default()))
+    }
+}
+
+impl<V> DecodedCache<V> {
+    fn with_clock(clock: Arc<RecencyClock>) -> Self {
+        Self {
+            tenants: Mutex::new(HashMap::new()),
+            clock,
+        }
+    }
+
     pub(crate) fn get(
         &self,
         tenant: &TenantHash,
         key: &str,
         accounting: &QueryAccounting,
-    ) -> Option<Arc<ChargedPart>> {
+    ) -> Option<Arc<V>> {
+        let tick = self.clock.next();
         let hit = self
             .tenants
             .lock()
-            .get(tenant)
-            .and_then(|c| c.entries.get(key).cloned());
+            .get_mut(tenant)
+            .and_then(|c| c.touch(key, tick));
         match hit {
-            Some((part, bytes)) => {
+            Some((value, bytes)) => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes);
-                Some(part)
+                Some(value)
             }
             None => {
                 accounting.record_cache_miss();
@@ -670,102 +786,194 @@ impl PartCache {
         &self,
         tenant: TenantHash,
         key: String,
-        part: Arc<ChargedPart>,
+        value: Arc<V>,
         bytes: u64,
         capacity: usize,
     ) {
+        let tick = self.clock.next();
         self.tenants
             .lock()
             .entry(tenant)
             .or_default()
-            .insert(key, part, bytes, capacity);
+            .insert(key, value, bytes, capacity, tick);
     }
 
     /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
-    /// decision 2). Returns whether an entry was present. Parts are
+    /// decision 2). Returns whether an entry was present. These objects are
     /// content-addressed and immutable, so a later miss re-fetches and
     /// re-decodes.
     pub(crate) fn evict_tenant(&self, tenant: &TenantHash) -> bool {
         self.tenants.lock().remove(tenant).is_some()
     }
-}
 
-#[derive(Default)]
-struct PostingsTenantCache {
-    entries: HashMap<String, (Arc<ChargedPostings>, u64)>,
-    /// Insertion order, oldest first, for capacity-cap eviction.
-    order: std::collections::VecDeque<String>,
-}
-
-impl PostingsTenantCache {
-    fn insert(&mut self, key: String, postings: Arc<ChargedPostings>, bytes: u64, capacity: usize) {
-        if self.entries.contains_key(&key) {
-            return;
-        }
-        self.entries.insert(key.clone(), (postings, bytes));
-        self.order.push_back(key);
-        while self.order.len() > capacity.max(1) {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            }
-        }
+    /// The stamp of the least-recently-used entry across every tenant, or
+    /// `None` when nothing is cached.
+    fn lru_tick(&self) -> Option<u64> {
+        self.tenants
+            .lock()
+            .values()
+            .filter_map(|cache| cache.lru_tick())
+            .min()
     }
-}
 
-/// Decoded name-postings cache, partitioned by tenant. Postings objects are content-addressed
-/// and immutable, so entries never need invalidating, only capacity-cap
-/// eviction, mirroring [`PartCache`].
-#[derive(Default)]
-pub(crate) struct PostingsCache {
-    tenants: Mutex<HashMap<TenantHash, PostingsTenantCache>>,
-}
+    /// Drop the least-recently-used entry across every tenant, returning
+    /// whether one was dropped. The evicted value is dropped after the map
+    /// lock is released: dropping it frees a whole decoded part or postings
+    /// object, and running a deallocation that size under the mutex would
+    /// hold off every concurrent `get` and `insert` on this cache for its
+    /// duration. It is not what returns the memory to the budget -- the
+    /// reservation goes back only when the last `Arc` to the value drops,
+    /// which is here when no reader holds it and later when one does.
+    fn evict_lru(&self) -> bool {
+        let mut tenants = self.tenants.lock();
+        let oldest = tenants
+            .iter()
+            .filter_map(|(tenant, cache)| cache.lru_tick().map(|tick| (tick, *tenant)))
+            .min();
+        let Some((_, tenant)) = oldest else {
+            return false;
+        };
+        let evicted = tenants.get_mut(&tenant).and_then(|c| c.remove_lru());
+        // A tenant whose last entry just went leaves no empty shell behind,
+        // so a later scan does not walk it.
+        if tenants
+            .get(&tenant)
+            .is_some_and(|cache| cache.entries.is_empty())
+        {
+            tenants.remove(&tenant);
+        }
+        drop(tenants);
+        evicted.is_some()
+    }
 
-impl PostingsCache {
-    pub(crate) fn get(
-        &self,
-        tenant: &TenantHash,
-        key: &str,
-        accounting: &QueryAccounting,
-    ) -> Option<Arc<ChargedPostings>> {
-        let hit = self
-            .tenants
+    /// Number of entries currently resident for `tenant`.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self, tenant: &TenantHash) -> usize {
+        self.tenants
             .lock()
             .get(tenant)
-            .and_then(|c| c.entries.get(key).cloned());
-        match hit {
-            Some((postings, bytes)) => {
-                accounting.record_cache_hit();
-                accounting.add_cache_bytes(bytes);
-                Some(postings)
-            }
-            None => {
-                accounting.record_cache_miss();
-                None
-            }
-        }
+            .map_or(0, |cache| cache.entries.len())
     }
 
-    pub(crate) fn insert(
-        &self,
-        tenant: TenantHash,
-        key: String,
-        postings: Arc<ChargedPostings>,
-        bytes: u64,
-        capacity: usize,
-    ) {
+    /// Number of entries currently resident across every tenant.
+    #[cfg(test)]
+    pub(crate) fn total_entries(&self) -> usize {
         self.tenants
             .lock()
-            .entry(tenant)
-            .or_default()
-            .insert(key, postings, bytes, capacity);
+            .values()
+            .map(|cache| cache.entries.len())
+            .sum()
+    }
+}
+
+/// Decoded snapshot-part cache (`snapshot_cache_parts`). See
+/// [`DecodedCache`] for the eviction rule.
+pub(crate) type PartCache = DecodedCache<ChargedPart>;
+
+/// Decoded name-postings cache (`postings_cache_entries`). See
+/// [`DecodedCache`] for the eviction rule.
+pub(crate) type PostingsCache = DecodedCache<ChargedPostings>;
+
+/// The two decoded-output caches a [`Catalog`](crate::Catalog) holds, together
+/// with the recency clock they share.
+///
+/// They are grouped because memory pressure is answered by both at once: a
+/// decode refused by the process [`ravel_memory::MemoryBudget`] gives the
+/// caches a chance to hand memory back before it fails, and which of the two
+/// holds the coldest entry is not something the refused caller should have to
+/// know.
+pub(crate) struct DecodedCaches {
+    parts: PartCache,
+    postings: PostingsCache,
+    /// Entries dropped by [`Self::evict_until_fits`], cumulative.
+    memory_evictions: AtomicU64,
+}
+
+impl Default for DecodedCaches {
+    fn default() -> Self {
+        let clock = Arc::new(RecencyClock::default());
+        Self {
+            parts: PartCache::with_clock(Arc::clone(&clock)),
+            postings: PostingsCache::with_clock(clock),
+            memory_evictions: AtomicU64::new(0),
+        }
+    }
+}
+
+impl DecodedCaches {
+    pub(crate) fn parts(&self) -> &PartCache {
+        &self.parts
     }
 
-    /// Drop the whole per-tenant outer-map entry for `tenant` (ADR-0069
-    /// decision 2). Returns whether an entry was present. Postings objects are
-    /// content-addressed and immutable, so a later miss re-fetches and
-    /// re-decodes.
-    pub(crate) fn evict_tenant(&self, tenant: &TenantHash) -> bool {
-        self.tenants.lock().remove(tenant).is_some()
+    pub(crate) fn postings(&self) -> &PostingsCache {
+        &self.postings
+    }
+
+    /// Drop everything cached for `tenant` in both caches (ADR-0069
+    /// decision 2, idle-tenant state eviction).
+    pub(crate) fn evict_tenant(&self, tenant: &TenantHash) {
+        self.parts.evict_tenant(tenant);
+        self.postings.evict_tenant(tenant);
+    }
+
+    /// Give memory back until `want` bytes would fit in `budget`, dropping
+    /// cached entries least-recently-used first across every tenant of both
+    /// caches. Returns how many entries were dropped.
+    ///
+    /// The loop is bounded by the number of cached entries, not by the bytes
+    /// it frees: an entry a live resolve still holds an `Arc` to stays charged
+    /// to the budget after this drops it, so a pass can remove every entry and
+    /// free nothing. That is what keeps a caller's retry from spinning.
+    ///
+    /// It terminates because every step removes one entry and stops as soon as
+    /// there is none left to remove, whether or not the budget moved. It is
+    /// not bounded by the number of entries present when it started: a
+    /// concurrent resolve inserting into either cache lengthens the pass, and
+    /// under enough concurrent inserts it ends only when `want` fits.
+    ///
+    /// A caller whose `want` exceeds the budget's whole limit must not call
+    /// this at all ([`crate::Catalog::reserve_decoded`] returns its first
+    /// refusal instead): the condition below can never become false, so the
+    /// pass would empty both caches, across every tenant, for a decode no
+    /// eviction could ever admit.
+    pub(crate) fn evict_until_fits(&self, budget: &ravel_memory::MemoryBudget, want: u64) -> u64 {
+        let mut dropped = 0;
+        while budget.limit().saturating_sub(budget.reserved()) < want {
+            if !self.evict_one_lru() {
+                break;
+            }
+            dropped += 1;
+        }
+        self.memory_evictions.fetch_add(dropped, Ordering::Relaxed);
+        dropped
+    }
+
+    /// Drop the older of the two caches' least-recently-used entries.
+    ///
+    /// The two peeks take their caches' locks separately, so a concurrent
+    /// resolve can make the comparison stale between them; evicting a slightly
+    /// newer entry costs a re-fetch and re-decode, never correctness.
+    fn evict_one_lru(&self) -> bool {
+        let parts_first = match (self.parts.lru_tick(), self.postings.lru_tick()) {
+            (Some(parts), Some(postings)) => parts <= postings,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if parts_first {
+            if self.parts.evict_lru() {
+                return true;
+            }
+        } else if self.postings.evict_lru() {
+            return true;
+        }
+        // The chosen cache was emptied between the peek and the eviction, so
+        // try the other rather than reporting both empty.
+        self.parts.evict_lru() || self.postings.evict_lru()
+    }
+
+    /// Entries dropped under memory pressure since this catalog was built.
+    pub(crate) fn memory_evictions(&self) -> u64 {
+        self.memory_evictions.load(Ordering::Relaxed)
     }
 }
 
@@ -1686,6 +1894,50 @@ mod tests {
         assert!(cache.get(&tenant, "k4", &accounting).is_some());
     }
 
+    /// The per-tenant cap evicts LEAST RECENTLY USED, not oldest inserted: a
+    /// key read since it was admitted outlives one inserted after it and never
+    /// read. Without this the cap cannot be told from insertion order, since
+    /// an insert-only sequence evicts the same key either way.
+    ///
+    /// FLIP: stop restamping in `DecodedTenantCache::touch` (cache.rs) -- have
+    /// it return `(entry.value.clone(), entry.bytes)` without writing
+    /// `entry.use_tick` or moving the key in `by_use` -- and the cap falls
+    /// back to insertion order: "k0" goes and the assert below fails.
+    #[test]
+    fn part_cache_capacity_cap_evicts_the_least_recently_used() {
+        let cache = PartCache::default();
+        let tenant = TenantHash([0x21; 16]);
+        let accounting = QueryAccounting::new();
+        for i in 0..3 {
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(Charged::for_test(decoded_part(1))),
+                1,
+                3,
+            );
+        }
+        assert!(
+            cache.get(&tenant, "k0", &accounting).is_some(),
+            "the oldest insert, read once and so now the most recently used"
+        );
+        cache.insert(
+            tenant,
+            "k3".to_string(),
+            Arc::new(Charged::for_test(decoded_part(1))),
+            1,
+            3,
+        );
+
+        assert!(
+            cache.get(&tenant, "k1", &accounting).is_none(),
+            "the least recently used key is the one never read, not the oldest insert"
+        );
+        assert!(cache.get(&tenant, "k0", &accounting).is_some());
+        assert!(cache.get(&tenant, "k2", &accounting).is_some());
+        assert!(cache.get(&tenant, "k3", &accounting).is_some());
+    }
+
     #[test]
     fn part_cache_tenants_are_isolated() {
         let cache = PartCache::default();
@@ -1760,6 +2012,48 @@ mod tests {
         assert!(cache.get(&tenant, "k4", &accounting).is_some());
     }
 
+    /// [`part_cache_capacity_cap_evicts_the_least_recently_used`] for the
+    /// other decoded cache: the two share one implementation, and a test on
+    /// only one of them would pass a `PostingsCache` wired to a cap of its
+    /// own.
+    ///
+    /// FLIP: the same one in `DecodedTenantCache::touch` (cache.rs); "k0" is
+    /// evicted instead of "k1" and the assert below fails.
+    #[test]
+    fn postings_cache_capacity_cap_evicts_the_least_recently_used() {
+        let cache = PostingsCache::default();
+        let tenant = TenantHash([0x22; 16]);
+        let accounting = QueryAccounting::new();
+        for i in 0..3 {
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(Charged::for_test(decoded_postings())),
+                1,
+                3,
+            );
+        }
+        assert!(
+            cache.get(&tenant, "k0", &accounting).is_some(),
+            "the oldest insert, read once and so now the most recently used"
+        );
+        cache.insert(
+            tenant,
+            "k3".to_string(),
+            Arc::new(Charged::for_test(decoded_postings())),
+            1,
+            3,
+        );
+
+        assert!(
+            cache.get(&tenant, "k1", &accounting).is_none(),
+            "the least recently used key is the one never read, not the oldest insert"
+        );
+        assert!(cache.get(&tenant, "k0", &accounting).is_some());
+        assert!(cache.get(&tenant, "k2", &accounting).is_some());
+        assert!(cache.get(&tenant, "k3", &accounting).is_some());
+    }
+
     #[test]
     fn postings_cache_tenants_are_isolated() {
         let cache = PostingsCache::default();
@@ -1775,6 +2069,67 @@ mod tests {
         );
         assert!(cache.get(&a, "k", &accounting).is_some());
         assert!(cache.get(&b, "k", &accounting).is_none());
+    }
+
+    /// A memory-pressure eviction orders by the shared recency clock, not by
+    /// which of the two caches holds the entry: whichever of a part and a
+    /// postings entry was used longer ago is the one that goes, in either
+    /// direction.
+    ///
+    /// FLIP: give [`DecodedCaches`] a clock per cache (`PartCache::default()`
+    /// and `PostingsCache::default()` in its `Default` impl, cache.rs) and the
+    /// two stamps are no longer comparable: each cache's first entry is
+    /// stamped 0, so the part is evicted in both halves and the first assert
+    /// below fails.
+    #[test]
+    fn a_memory_eviction_takes_the_older_entry_from_either_cache() {
+        let tenant = TenantHash([0x23; 16]);
+
+        let caches = DecodedCaches::default();
+        caches.postings().insert(
+            tenant,
+            "older-postings".to_string(),
+            Arc::new(Charged::for_test(decoded_postings())),
+            1,
+            10,
+        );
+        caches.parts().insert(
+            tenant,
+            "newer-part".to_string(),
+            Arc::new(Charged::for_test(decoded_part(1))),
+            1,
+            10,
+        );
+        assert!(caches.evict_one_lru());
+        assert_eq!(
+            caches.postings().total_entries(),
+            0,
+            "the older postings entry goes first"
+        );
+        assert_eq!(caches.parts().total_entries(), 1);
+
+        let caches = DecodedCaches::default();
+        caches.parts().insert(
+            tenant,
+            "older-part".to_string(),
+            Arc::new(Charged::for_test(decoded_part(1))),
+            1,
+            10,
+        );
+        caches.postings().insert(
+            tenant,
+            "newer-postings".to_string(),
+            Arc::new(Charged::for_test(decoded_postings())),
+            1,
+            10,
+        );
+        assert!(caches.evict_one_lru());
+        assert_eq!(
+            caches.parts().total_entries(),
+            0,
+            "and the older part goes first when the order is the other way round"
+        );
+        assert_eq!(caches.postings().total_entries(), 1);
     }
 
     // -----------------------------------------------------------------
