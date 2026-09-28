@@ -5780,7 +5780,11 @@ impl BlockRangeFetcher {
         // section under its per-section key too, or a later read with a fresh
         // assembler peeks and misses both again. A lone section's span key is
         // already its per-section key. `insert` records no miss and the bytes
-        // were charged once by the GET above.
+        // were charged once by the GET above. The span entry `cached_extent`
+        // admitted stays too, redundant with these two: on a tiered cache a
+        // first-touch object writes three small entries instead of one, which
+        // is accepted because later reads hit the per-section keys and the
+        // span entry ages out.
         if missing.len() > 1
             && let Some(cache) = &self.cache
         {
