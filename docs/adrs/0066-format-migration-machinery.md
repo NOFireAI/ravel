@@ -544,20 +544,30 @@ under ADR-1331. So a compaction record gains its own supersession.
    version 1, byte for byte. A build that predates this amendment refuses a v2
    record with its existing typed unsupported-version error rather than
    misreading it (the Class C rule). This is a version bump of the compaction
-   record, recorded here as the ADR the frozen-format rule requires.
+   record, recorded here as the ADR the frozen-format rule requires. Decoding
+   validates the field as `validate_rewrite` validates its twin: a v2 record's
+   `superseded_record_key` must be non-empty and must parse as a compaction or
+   rewrite record key in the same tenant, signal, shard and hour bucket, and
+   its stored `input_set_hash` must equal the version-2 hash of item 2; a v1
+   record that sets the field is rejected. Without these checks a malformed or
+   wrong-bucket value would exclude a live record in the selector with nothing
+   to catch it.
 2. **Key and hash.** A v2 record's inputs are copied verbatim from its
    predecessor. Its hash is taken over a new domain,
    `(inputs, superseded_record_key)`, so the key shape is unchanged
    (`l1.<hash16>.cmt`) and the key differs from the predecessor's. Key
-   reconstruction and `seal_divergence` recompute the hash for the record's own
+   reconstruction is unchanged: the key follows the stored hash, as it does for
+   version 1. The compactor's single source of the hash,
+   `ravel_maintain::read::input_set_hash`, switches to the new domain for a v2
+   record, and `seal_divergence` recomputes the hash for the record's own
    version.
 3. **Resolution.** Supersession is applied inside the shared authoritative
    selector before the overlap-component winner is chosen: a compaction record
    that a present v2 record names is excluded, and the chase is bounded and
    cycle-checked (a cycle is a typed error, never a guess). Resolve, the token
-   fallback, the fold, scrub and the erasure completion gate all call that
-   selector, so they agree. The rewrite-record chase treats a v2 record as a
-   link, not an end.
+   fallback, the fold, scrub, the erasure completion gate, the sweep and
+   `migrate` all call that selector, so they agree. The rewrite-record chase
+   treats a v2 record as a link, not an end.
 4. **Where force 2 does not run.** A bucket whose overlap component holds more
    than one compaction record is not re-encoded: a v2 record's new hash could
    lose the winner tie-break to the old loser and serve the loser's inputs raw
