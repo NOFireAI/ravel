@@ -96,6 +96,41 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Alert sink delivery is bounded per evaluation tick, and ADR-0117's stated
+  per-tick publish bound is corrected** (issues #2063, #2064). The evaluator
+  delivered every undelivered notification to every sink sequentially with no
+  per-tick limit, so the delivery phase grew with the undelivered queue behind a
+  slow or unresponsive sink and delayed every later tick's rule evaluation.
+  Delivery is now bounded to half the evaluation interval, measured on the
+  evaluator's injected clock from the tick's own reading. The deadline is
+  checked before each attempt and the first attempt of a tick is unconditional,
+  so the delivery phase ends at the latest at `max(tick start + half the
+  interval, start of delivery)` plus the number of sinks times the sink HTTP
+  timeout. Delivery starts after whatever precedes it in the tick: the history
+  read, the lease acquire, and on the lease holder rule evaluation, the repeat
+  pass and the alert state memo write. None of that earlier work is bounded,
+  and a tick that overruns delays the next tick rather than overlapping it.
+  Previously every tick tried every queued notification in no defined order;
+  the pass now serves the oldest-queued notification first, an attempt some
+  sink refused moves to the back of the queue, and one the deadline never
+  reached keeps its place, so a sink that drains only a few notifications per
+  tick reaches every alert in turn. A notification still leaves the queue only
+  once every configured sink has accepted it, so one blackholed sink throttles
+  delivery for every sink to what fits in one tick's budget; what the rotation
+  guarantees is that a healthy sink receives all of them eventually. The new
+  `ravel_alert_notifications_deferred_total` counter reports how many were
+  deferred, once per notification per tick; it also rises when the work before
+  delivery alone runs past the deadline, since every notification after the
+  first is then deferred however fast the sinks answer. Separately, ADR-0117 stated the
+  per-tick publish worst case for one rule as `MAX_ALERTS_PER_RULE` (1000); the
+  true worst case is `2 x MAX_ALERTS_PER_RULE`, because one tick also writes a
+  resolution for each previously-open alert that stopped matching, and that
+  holds for a tick following a fully successful one rather than
+  unconditionally: pre-upgrade history, a tick whose write path fails partway
+  through a rule, and two overlapping lease holders each leave more open
+  identities behind than the cap. A dated amendment to the ADR and the alerting
+  guide carry the corrected bound.
+
 - **A query's fold-lag refusal threshold is now sized from the fold and the
   catalog the process is actually running** (issue #1306). The threshold that
   decides whether a request-budget refusal names fold lag is the catalog's seal

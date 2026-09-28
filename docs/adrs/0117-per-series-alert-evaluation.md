@@ -77,7 +77,10 @@ holds no evaluation-cap variant.
    written, prior state is untouched, `rules_failed` increments, and the
    warning names the count and the limit. The tick is otherwise unaffected.
    The cap is a crate constant, not a flag, so every tenant's memo, sink
-   fan-out and per-tick publish cost have one known bound.
+   fan-out and per-tick publish cost have one known bound. That per-tick publish
+   bound is `2 x MAX_ALERTS_PER_RULE`, not `MAX_ALERTS_PER_RULE`, because one
+   tick also writes a resolution per previously-open alert now absent: see the
+   per-tick publish bound amendment below.
 
 4. **A series that stops matching resolves.** After computing the matched set
    the evaluator walks the folded `latest` entries whose `rule_id` is the
@@ -155,7 +158,11 @@ flowchart LR
 - A tick that flips 1000 series writes 1000 sequential object-plus-commit
   pairs (`alerting.rs:1261-1288`) and sends 1000 notifications per sink.
   The cap bounds it; the lease TTL and query deadline
-  (`alerting.rs:876-884`) still have to cover the worst case.
+  (`alerting.rs:876-884`) still have to cover the worst case. This figure
+  counts only the matched set and omits the resolutions the same tick writes
+  for previously-open alerts now absent; the true per-tick worst case is
+  `2 x MAX_ALERTS_PER_RULE`, corrected in the per-tick publish bound amendment
+  below.
 - Identities left behind by a rule label change were never resolved before;
   decision 4's walk resolves them once. An operator sees one Resolved
   transition per stale identity after the upgrade.
@@ -225,3 +232,107 @@ decision 5 is the `QueryResultSummary::RowCount` variant in
 `crates/ravel-alerting/src/condition.rs`. The `condition_met` function that
 decision 1 keeps for the SQL path was removed once nothing called it: the SQL
 path goes through `matching_series` like the PromQL one.
+
+## Amendment (2026-09-28): the per-tick publish bound includes resolutions
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="per-tick publish bound amendment" -->
+
+Decision 3 and the Consequences bullet on the per-tick cost both state the
+per-tick publish bound as `MAX_ALERTS_PER_RULE` (1000): "a tick that flips 1000
+series writes 1000 sequential object-plus-commit pairs and sends 1000
+notifications per sink." That counts only the matched set and omits the
+resolutions the same tick writes for alerts that were open on the previous tick
+and are absent from this tick's matched set.
+
+The correct worst case for one rule in one tick is
+`2 x MAX_ALERTS_PER_RULE` records: the matched set, at most
+`MAX_ALERTS_PER_RULE` (decision 3), plus one resolution per alert that was
+Pending or Firing at the end of the previous tick and is now absent, also at
+most `MAX_ALERTS_PER_RULE`. `evaluate_rule` writes a transition record for each
+of the two groups in one pass: the matched instances with `condition_met = true`
+and then the absent Pending/Firing instances with `condition_met = false`
+(decision 4). Each of the two iterables is bounded by `MAX_ALERTS_PER_RULE`:
+
+- The matched set is bounded directly. `alert_instances` returns
+  `AlertError::TooManyAlerts` when a rule matches more than
+  `MAX_ALERTS_PER_RULE` series (`crates/ravel-alerting/src/instance.rs`), so the
+  rule fails the tick before any write above the cap.
+- The absent set is bounded transitively, and only for a tick that follows a
+  fully successful one. After a tick that ran every one of the rule's writes to
+  completion, the only Pending or Firing entries left for the rule are those in
+  that tick's matched set (an absent entry is fed `condition_met = false` and
+  resolves to a terminal state), so the live Pending/Firing count for the rule
+  is at most `MAX_ALERTS_PER_RULE`. The next tick's absent set is a subset of
+  that live count, hence also at most `MAX_ALERTS_PER_RULE`.
+
+Both groups can be disjoint in one tick: 1000 previously-firing series all stop
+matching while 1000 new series start matching. That tick writes up to 1000
+resolutions plus up to 1000 new transitions, so up to 2000 object-plus-commit
+pairs and up to 2000 notifications per sink. The lease TTL (`alerting.rs`
+`LEASE_TTL_TICKS`, the evaluator's `lease_ttl`) and the query deadline
+(`DEFAULT_QUERY_DEADLINE`, `AlertEvalConfig::query_deadline`) still have to
+cover this doubled worst case, not the halved figure the original text implied.
+
+`2 x MAX_ALERTS_PER_RULE` is therefore the bound for a tick that follows a
+fully successful one, and nothing else. `absent` is built from the folded
+`latest` map, which is whatever history holds, not from anything this tick or
+this version wrote, and three routes leave more than `MAX_ALERTS_PER_RULE`
+Pending or Firing identities in it for one `rule_id`:
+
+- **Pre-upgrade history.** Before decision 4 existed no walk resolved an
+  identity a rule label change had orphaned, so each rule label revision could
+  leave a Firing entry that is still Firing at upgrade time. The Consequences
+  bullet above already names this ("Identities left behind by a rule label
+  change were never resolved before; decision 4's walk resolves them once"). On
+  the first tick after the upgrade the absent set is the number of such
+  orphaned identities, which can exceed the cap, and the tick writes one
+  resolution for each.
+- **A tick that fails partway.** `evaluate_rule` writes the matched instances
+  first and the absent ones after, in one pass, and `write_transition` returns
+  the error as soon as a PUT or a publish fails. So a rule whose write path
+  fails mid-pass leaves the matched instances it already wrote open and the
+  absent ones it had not reached still open, and `rules_failed` counts the rule
+  rather than the tick rolling anything back. The live Pending/Firing set for
+  that rule can then exceed `MAX_ALERTS_PER_RULE`, and the next tick's absent
+  set with it, so that next tick can write more than
+  `2 x MAX_ALERTS_PER_RULE` records. A failed rule leaving prior state as it
+  was, which the Context section states for rule failures in general and
+  decision 3 states for `TooManyAlerts`, holds only for a rule that fails
+  *before* its first write, which is what `TooManyAlerts` and a failed query
+  do; it is not true of a failure inside the write loop.
+- **Overlapping lease holders.** `acquire_lease` permits a two-holder overlap
+  during a handover (`alerting.rs`, `acquire_lease` and `seal_bound_hour`), and
+  the lease is advisory rather than a fencing token. Each holder's own tick is
+  capped, but the two run against independently folded `latest` maps, so a
+  holder that folded before the other's writes landed walks an absent set the
+  other has already resolved and writes a second resolution for each. Over one
+  interval the keyspace can take up to twice what one tick's bound allows. The
+  duplicates are what ADR-0043 decision 6 already tolerates. The fold
+  (`fold_commit_entries`) keeps, per identity, the record with the greatest
+  `(ts_ns, epoch, seq)`, taking `ts_ns` from the record and `epoch` and `seq`
+  from its commit key, and on an exact tie keeps the one it folded first; the
+  commit key's `writer_id`, which is what keeps two holders' keys distinct, is
+  not part of that order. Every replica folding the same history therefore
+  converges on one of the duplicates. The bound above is still per tick, not
+  per interval.
+
+For pre-upgrade history and overlapping lease holders the excess is a
+transient: a tick that walks the oversized absent set to the end writes a
+resolution for every identity in it, so the excess does not compound. A tick
+that fails partway does not have that property. It never walks the rest of the
+absent set, so those identities stay open, and while the write path keeps
+failing after the matched instances are written, each tick can open up to
+`MAX_ALERTS_PER_RULE` new identities for a rule whose matched series change
+while resolving none of the old ones. The open set, and the next successful
+tick's absent set with it, grows by up to the cap per failing tick until a
+tick's writes succeed through the end of the rule. Bounding the live set
+itself is memo pruning's problem (#1438), not this amendment's; a deployment
+upgrading a rule set with a long label-change history, or one whose object
+store is failing writes mid-rule, should expect ticks above the bound.
+
+This corrects the stated bound only; the code already publishes resolutions
+this way, and this amendment changes no publish behaviour. The cap, the
+identity preimage, and the storage format are unchanged. The bound is on what
+one tick publishes and queues, not on what one tick delivers: sink delivery
+carries notifications across ticks and is bounded separately, by the per-tick
+delivery deadline in `flush_sinks` (issue #2063).
