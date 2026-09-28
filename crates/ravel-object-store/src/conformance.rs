@@ -781,8 +781,10 @@ pub struct BucketProtectionParams {
     /// covering rules that disagree on `NoncurrentDays` still fail, as does a
     /// `NewerNoncurrentVersions` on a covering rule; the value the covering
     /// rules agree on is the reference any other rule's `NoncurrentDays` is
-    /// measured against, and a narrower or `sys/` rule carrying one with no
-    /// reference to compare against is `Unknown`.
+    /// measured against. With no reference to compare against, a narrower rule
+    /// over `t/` carrying one makes both `noncurrent-expiration` and
+    /// `no-foreign-rule` `Unknown`; a `sys/` rule carrying one makes only
+    /// `no-foreign-rule` `Unknown`.
     pub expected_noncurrent_days: Option<u32>,
     /// Whether to sample objects for the `object-retention` condition. Off for
     /// the server (retention is CLI-only, decision 5); the CLI turns it on with

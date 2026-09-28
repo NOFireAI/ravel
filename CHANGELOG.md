@@ -429,8 +429,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Fail`. The sanctioned lifecycle and replication conditions pass only on an
   enabled rule whose filter covers every key under `t/` (a tag- or
   object-size-narrowed rule never does, and an unrecognised filter or status, a
-  repeated `NoncurrentVersionExpiration`, or a day count that does not parse,
-  is `Unknown`); `no-foreign-rule` passes only when no rule that can reach `t/`
+  repeated element where one value is expected (a rule's `Status`,
+  `NoncurrentDays`, `DeleteMarkerReplication`, and the rest), or a day count
+  that does not parse, is `Unknown`); `no-foreign-rule` passes only when no
+  rule that can reach `t/`
   or `sys/` carries a transition, a current-version expiration, or a
   `NoncurrentDays` shorter than the reference (the expected value, else the one
   value the covering rules agree on). A `NoncurrentDays` below the reference
@@ -442,8 +444,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`NoSuchLifecycleConfiguration`, `ReplicationConfigurationNotFoundError`,
   `ObjectLockConfigurationNotFoundError`, or `NoSuchObjectLockConfiguration`
   for retention); any other 404, redirect, body over 1 MiB (with or without a
-  `Content-Length`), `ObjectLockConfiguration` without an `ObjectLockEnabled`
-  element, or `?versions` page without `IsTruncated` or with a version lacking
+  `Content-Length`), `ObjectLockConfiguration` whose `ObjectLockEnabled` is
+  missing, empty, or repeated, or `?versions` page without `IsTruncated` or
+  with a version lacking
   a `VersionId` is `Unknown`. `object-retention` samples the
   newest (by `LastModified`) current and noncurrent version under each
   protected prefix and requires compliance mode with a `RetainUntilDate` still
@@ -456,9 +459,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same report. Two new direct dependencies for the crate: `ring` (SigV4
   HMAC-SHA256 and SHA-256) and `quick-xml` 0.41 (reading the S3 XML responses),
   both already in the lock and neither pulling in an AWS SDK or a RustCrypto
-  crate. Nothing in the shipping binaries reaches this yet: `ravel-cli store
-  verify-protection` (task 2) and the server startup gate (task 3) are the
-  callers.
+  crate. Nothing in the shipping binaries reads these reports yet, though
+  `S3Store::new` now builds the control-plane client on every construction:
+  `ravel-cli store verify-protection` (task 2) and the server startup gate
+  (task 3) are the callers.
 
 - **`/metrics` renders `ravel_health_heartbeat_age_seconds`** (ADR-1702
   decision 11, issue #2048). The gauge is the time since the main runtime's
