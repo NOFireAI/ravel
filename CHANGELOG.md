@@ -414,6 +414,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Readers accept and validate a version 2 compaction record** (ADR-0066,
+  force 2 amendment, issue #2093). `CompactionRecord` gains
+  `superseded_record_key`, naming the compaction record a version 2 record
+  re-encodes. Decoding accepts `format_version` 1 or 2 and checks that a
+  version 2 record names a compaction record in its own tenant, signal, shard
+  and hour and carries the version 2 input-set hash over its inputs and that
+  key; a version 1 record that sets the field is refused. Nothing writes a
+  version 2 record yet, and resolution does not yet honour one. A build
+  without this change refuses a version 2 record with its unsupported
+  `format_version` error. Version 1 records encode and decode byte for byte
+  as before.
 - **`/metrics` renders `ravel_health_heartbeat_age_seconds`** (ADR-1702
   decision 11, issue #2048). The gauge is the time since the main runtime's
   heartbeat task last ran, labelled `mode`, in every mode. The heartbeat now
