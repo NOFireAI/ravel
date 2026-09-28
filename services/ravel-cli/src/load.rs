@@ -29,7 +29,8 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::array::{BinaryArray, FixedSizeBinaryArray};
+use arrow::array::{BinaryArray, FixedSizeBinaryArray, new_null_array};
+use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{
@@ -1657,7 +1658,7 @@ async fn run_spans(
         }
         Err(err) => {
             print_durable_tokens(&err, SEQUENTIAL_RESUMABLE_SETTINGS);
-            print_spans_attrs_dropped(&report);
+            print_spans_attrs_dropped(&report, AttrsDroppedScope::Failed);
             if let Some(hint) = sequential_resume_hint(&err, pipeline_depth) {
                 let _ = writeln!(warnings, "{hint}");
             }
@@ -1791,7 +1792,7 @@ fn print_spans_summary(report: &SpansLoadReport) {
     println!("  rows_written     : {}", report.rows_processed);
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
-    print_spans_attrs_dropped(report);
+    print_spans_attrs_dropped(report, AttrsDroppedScope::Complete);
     println!("  elapsed          : {secs:.3}s");
 }
 
@@ -1805,12 +1806,39 @@ fn print_spans_summary(report: &SpansLoadReport) {
 /// partial-success message; a load has no partial-success channel, so the
 /// summary is where it goes. Zero prints too: an operator reading the line as
 /// evidence that nothing was dropped needs it to be there when nothing was.
-fn print_spans_attrs_dropped(report: &SpansLoadReport) {
-    println!(
-        "  attrs_dropped    : {} (attribute values over the OTLP value-length cap; each span was \
-         stored without them)",
+///
+/// `scope` decides what the line claims about the spans behind the count; see
+/// [`AttrsDroppedScope`].
+fn print_spans_attrs_dropped(report: &SpansLoadReport, scope: AttrsDroppedScope) {
+    println!("{}", spans_attrs_dropped_line(report, scope));
+}
+
+/// Whether the load this count belongs to ran to completion.
+///
+/// The count is taken where a span is BUILT, so on a failed load it also covers
+/// the batches the failure abandoned, whose spans are in no object. The line
+/// says which of the two it is rather than claiming stored records either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttrsDroppedScope {
+    /// Every decoded batch was written and acknowledged.
+    Complete,
+    /// The load failed, so some decoded batches never landed.
+    Failed,
+}
+
+/// The `attrs_dropped` summary line, as [`print_spans_attrs_dropped`] prints it.
+fn spans_attrs_dropped_line(report: &SpansLoadReport, scope: AttrsDroppedScope) -> String {
+    let tail = match scope {
+        AttrsDroppedScope::Complete => "each span was stored without them",
+        AttrsDroppedScope::Failed => {
+            "counted where each span was built, so this includes batches the failure abandoned, \
+             whose spans are in no object"
+        }
+    };
+    format!(
+        "  attrs_dropped    : {} (attribute values over the OTLP value-length cap; {tail})",
         report.attributes_dropped
-    );
+    )
 }
 
 /// The warning for a `--skip-rows` past the end of the file, or `None` when the
@@ -3806,6 +3834,11 @@ struct ColumnIndex {
     resource: Vec<(usize, usize)>,
     /// `(index, &AttrMap)` for each record attribute column.
     record: Vec<(usize, usize)>,
+    /// The batch's columns with every mapped dictionary column resolved once.
+    /// Read by the row path ([`build_record`]); the columnar path keys its
+    /// `StrColumnDict` fast path on the dictionary itself and reads the
+    /// batch's own columns.
+    columns: ResolvedColumns,
 }
 
 impl ColumnIndex {
@@ -3834,16 +3867,37 @@ impl ColumnIndex {
             .enumerate()
             .map(|(i, a)| Ok((idx(&a.column)?, i)))
             .collect::<Result<Vec<_>, String>>()?;
+        let ts = idx(&mapping.ts_column)?;
+        let body = opt(&mapping.body_column)?;
+        let severity_number = opt(&mapping.severity_number_column)?;
+        let severity_text = opt(&mapping.severity_text_column)?;
+        let trace_id = opt(&mapping.trace_id_column)?;
+        let span_id = opt(&mapping.span_id_column)?;
+        // Every column the row path reads a string, a byte string or an id out
+        // of. The ts and severity-number columns are numeric.
+        let dictionary_candidates = [body, severity_text, trace_id, span_id]
+            .into_iter()
+            .flatten()
+            .chain(resource.iter().map(|(i, _)| *i))
+            .chain(record.iter().map(|(i, _)| *i));
+        let columns = ResolvedColumns::resolve(batch, dictionary_candidates)?;
         Ok(ColumnIndex {
-            ts: idx(&mapping.ts_column)?,
-            body: opt(&mapping.body_column)?,
-            severity_number: opt(&mapping.severity_number_column)?,
-            severity_text: opt(&mapping.severity_text_column)?,
-            trace_id: opt(&mapping.trace_id_column)?,
-            span_id: opt(&mapping.span_id_column)?,
+            ts,
+            body,
+            severity_number,
+            severity_text,
+            trace_id,
+            span_id,
             resource,
             record,
+            columns,
         })
+    }
+
+    /// Column `i` as the row path must read it: resolved when it was a mapped
+    /// dictionary column, the batch's own otherwise.
+    fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
+        self.columns.col(batch, i)
     }
 }
 
@@ -3858,7 +3912,7 @@ fn build_record(
     row: usize,
 ) -> Result<NormalizedLogRecord, String> {
     // Timestamp is required; a null or unreadable ts is a row rejection.
-    let ts_col = batch.column(cols.ts);
+    let ts_col = cols.col(batch, cols.ts);
     let raw_ts = read_ts(ts_col, row, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
 
@@ -3874,7 +3928,7 @@ fn build_record(
 
     // Body (optional). Kept: max_body_len.
     let body = match cols.body {
-        Some(i) => read_string(batch.column(i), row)?.unwrap_or_default(),
+        Some(i) => read_string(cols.col(batch, i), row)?.unwrap_or_default(),
         None => String::new(),
     };
     if body.len() > limits.max_body_len {
@@ -3888,24 +3942,24 @@ fn build_record(
     let severity_num = match cols.severity_number {
         // OTLP severity_number is 0..=24; an out-of-u8 value normalizes to 0
         // (UNSPECIFIED), matching ravel-otlp rather than truncating.
-        Some(i) => read_i64(batch.column(i), row)?
+        Some(i) => read_i64(cols.col(batch, i), row)?
             .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(0),
         None => 0,
     };
     let severity_text = match cols.severity_text {
-        Some(i) => read_string(batch.column(i), row)?.unwrap_or_default(),
+        Some(i) => read_string(cols.col(batch, i), row)?.unwrap_or_default(),
         None => String::new(),
     };
 
     // Trace/span ids: exact byte length or absent (never padded or truncated),
     // matching ravel-otlp.
     let trace_id = match cols.trace_id {
-        Some(i) => read_id::<16>(batch.column(i), row)?,
+        Some(i) => read_id::<16>(cols.col(batch, i), row)?,
         None => None,
     };
     let span_id = match cols.span_id {
-        Some(i) => read_id::<8>(batch.column(i), row)?,
+        Some(i) => read_id::<8>(cols.col(batch, i), row)?,
         None => None,
     };
 
@@ -3913,7 +3967,7 @@ fn build_record(
     let mut resource_attrs: Vec<(String, AttrValue)> = Vec::with_capacity(cols.resource.len());
     for (col_idx, map_idx) in &cols.resource {
         let spec = &mapping.resource_attributes[*map_idx];
-        if let Some(value) = read_attr(batch.column(*col_idx), row, spec.value_type)? {
+        if let Some(value) = read_attr(cols.col(batch, *col_idx), row, spec.value_type)? {
             check_attr(&spec.key, &value, limits)?;
             resource_attrs.push((spec.key.clone(), value));
         }
@@ -3923,7 +3977,7 @@ fn build_record(
     let mut attrs: Vec<(String, AttrValue)> = Vec::with_capacity(cols.record.len());
     for (col_idx, map_idx) in &cols.record {
         let spec = &mapping.attributes[*map_idx];
-        if let Some(value) = read_attr(batch.column(*col_idx), row, spec.value_type)? {
+        if let Some(value) = read_attr(cols.col(batch, *col_idx), row, spec.value_type)? {
             check_attr(&spec.key, &value, limits)?;
             attrs.push((spec.key.clone(), value));
         }
@@ -4084,6 +4138,146 @@ fn read_bool(arr: &ArrayRef, row: usize) -> Result<Option<bool>, String> {
     }
 }
 
+/// The refusal for a dictionary chunk whose dictionary is empty while a key
+/// names a value in it. Arrow's `normalized_keys` asserts the values array is
+/// non-empty and aborts the process on this shape, so it is refused before that
+/// assertion is reached, in the resolution path and in the per-cell path alike
+/// (#708 guards the same shape in [`str_src`] and [`bytes_src`]).
+const EMPTY_DICTIONARY: &str = "dictionary-encoded column has an empty dictionary under a non-null \
+                                key, so no value can be resolved; the Parquet file's dictionary \
+                                page is corrupt";
+
+/// The string and binary value types a dictionary column is resolved for. These
+/// are exactly the types the per-cell readers below resolve a dictionary key
+/// into, so resolving the column ahead of them changes no answer.
+fn is_resolvable_dictionary_value(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+/// Resolve a dictionary-encoded string or binary column to a flat column of its
+/// value type, or `None` for a column the per-cell readers already index in
+/// place.
+///
+/// `DictionaryArray::normalized_keys` builds a key vector the size of the whole
+/// batch on every call, so a reader that resolves a dictionary cell per row
+/// costs O(rows^2) per dictionary column. Every row path resolves its mapped
+/// dictionary columns once, here, and indexes the result.
+fn resolve_dictionary_column(arr: &ArrayRef) -> Result<Option<ArrayRef>, String> {
+    let DataType::Dictionary(_, value_ty) = arr.data_type() else {
+        return Ok(None);
+    };
+    if !is_resolvable_dictionary_value(value_ty) {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    DICT_COLUMNS_RESOLVED.with(|n| n.set(n.get() + 1));
+    let dict = arr.as_any_dictionary();
+    if dict.values().is_empty() {
+        // An all-null chunk with an empty dictionary is a shape a Parquet
+        // writer emits, and resolves to an all-null column of the value type,
+        // the same answer `str_src` gives it. Anything else over an empty
+        // dictionary is corrupt.
+        if arr.null_count() != arr.len() {
+            return Err(EMPTY_DICTIONARY.to_string());
+        }
+        return Ok(Some(new_null_array(value_ty, arr.len())));
+    }
+    take(dict.values().as_ref(), dict.keys(), None)
+        .map(Some)
+        .map_err(|e| format!("could not resolve a dictionary-encoded column: {e}"))
+}
+
+/// One batch's columns, with every mapped dictionary column resolved once by
+/// [`resolve_dictionary_column`]. Every other column is the batch's own.
+struct ResolvedColumns {
+    columns: Vec<ArrayRef>,
+}
+
+impl ResolvedColumns {
+    /// Resolve the columns `mapped` names. A column named twice (two attributes
+    /// reading one column) resolves on the first pass and is already flat on
+    /// the second.
+    fn resolve(
+        batch: &RecordBatch,
+        mapped: impl IntoIterator<Item = usize>,
+    ) -> Result<ResolvedColumns, String> {
+        let mut columns = batch.columns().to_vec();
+        for i in mapped {
+            let Some(column) = columns.get(i) else {
+                continue;
+            };
+            if let Some(resolved) = resolve_dictionary_column(column)? {
+                columns[i] = resolved;
+            }
+        }
+        Ok(ResolvedColumns { columns })
+    }
+
+    /// Column `i` of the batch these columns were resolved from.
+    fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
+        self.columns.get(i).unwrap_or_else(|| batch.column(i))
+    }
+}
+
+/// The dictionary key at `row`, refusing an empty dictionary rather than
+/// aborting inside arrow's `normalized_keys`.
+///
+/// The row paths index columns [`ResolvedColumns`] has already resolved, so
+/// this is reached only by a caller handed a dictionary column directly.
+fn dictionary_key(arr: &ArrayRef, row: usize) -> Result<usize, String> {
+    #[cfg(test)]
+    DICT_CELL_KEYS_RESOLVED.with(|n| n.set(n.get() + 1));
+    let dict = arr.as_any_dictionary();
+    if dict.values().is_empty() {
+        return Err(EMPTY_DICTIONARY.to_string());
+    }
+    dict.normalized_keys()
+        .get(row)
+        .copied()
+        .ok_or_else(|| format!("dictionary column has no key at row {row}"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Columns [`resolve_dictionary_column`] has resolved on this thread, for
+    /// the test that pins one resolution per dictionary column per batch. A
+    /// thread local rather than a global: tests share a process.
+    static DICT_COLUMNS_RESOLVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The same for [`dictionary_key`], which is the per-cell cost.
+    static DICT_CELL_KEYS_RESOLVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Zero both dictionary counters and return a handle that reads them.
+#[cfg(test)]
+fn dict_counters() -> DictCounters {
+    DICT_COLUMNS_RESOLVED.with(|n| n.set(0));
+    DICT_CELL_KEYS_RESOLVED.with(|n| n.set(0));
+    DictCounters
+}
+
+#[cfg(test)]
+struct DictCounters;
+
+#[cfg(test)]
+impl DictCounters {
+    /// Dictionary columns resolved once each, ahead of the row loop.
+    fn columns(&self) -> u64 {
+        DICT_COLUMNS_RESOLVED.with(std::cell::Cell::get)
+    }
+
+    /// Dictionary keys resolved per cell, which is the quadratic cost.
+    fn cell_keys(&self) -> u64 {
+        DICT_CELL_KEYS_RESOLVED.with(std::cell::Cell::get)
+    }
+}
+
 /// Read a UTF-8 string cell, accepting `Utf8` and `LargeUtf8`.
 fn read_string(arr: &ArrayRef, row: usize) -> Result<Option<String>, String> {
     if arr.is_null(row) {
@@ -4098,11 +4292,11 @@ fn read_string(arr: &ArrayRef, row: usize) -> Result<Option<String>, String> {
         // Parquet file that carries Arrow dictionary schema metadata): resolve
         // the row's key to its value and read that. The columnar fast path
         // passes such a column through as a `StrColumnDict`; the row path here,
-        // its differential reference, must read the same values.
+        // its differential reference, must read the same values. The row paths
+        // reach this arm only for a column [`ResolvedColumns`] did not resolve.
         DataType::Dictionary(_, _) => {
             let dict = arr.as_any_dictionary();
-            let key = dict.normalized_keys()[row];
-            read_string(dict.values(), key)
+            read_string(dict.values(), dictionary_key(arr, row)?)
         }
         other => Err(format!("expected a string column, found {other:?}")),
     }
@@ -4123,8 +4317,7 @@ fn read_bytes(arr: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
         // [`read_string`].
         DataType::Dictionary(_, _) => {
             let dict = arr.as_any_dictionary();
-            let key = dict.normalized_keys()[row];
-            read_bytes(dict.values(), key)
+            read_bytes(dict.values(), dictionary_key(arr, row)?)
         }
         other => Err(format!("expected a binary column, found {other:?}")),
     }
@@ -4197,14 +4390,12 @@ fn read_id<const N: usize>(arr: &ArrayRef, row: usize) -> Result<Option<[u8; N]>
             read_bytes(arr, row)?.unwrap_or_default()
         }
         // A dictionary-encoded id column: resolve the row's key and read the
-        // value it names, by this same rule. A default `ArrowWriter`
-        // dictionary-encodes a string column until its dictionary outgrows the
-        // page limit, so a hex id column in an ordinary Parquet export arrives
-        // here as `Dictionary(_, Utf8)` rather than as `Utf8`.
+        // value it names, by this same rule. A hex id column loads in both
+        // forms: `Dictionary(_, Utf8)` when the file's every chunk for it is
+        // dictionary encoded, and plain `Utf8` otherwise.
         DataType::Dictionary(_, _) => {
             let dict = arr.as_any_dictionary();
-            let key = dict.normalized_keys()[row];
-            return read_id::<N>(dict.values(), key);
+            return read_id::<N>(dict.values(), dictionary_key(arr, row)?);
         }
         other => {
             return Err(format!(
@@ -5127,6 +5318,8 @@ struct MetricsColumnIndex {
     /// The metric kind and monotonicity the family name is suffixed under.
     kind: MetricKind,
     is_monotonic_sum: bool,
+    /// The batch's columns with every mapped dictionary column resolved once.
+    columns: ResolvedColumns,
 }
 
 struct HistogramColumnIndex {
@@ -5163,24 +5356,41 @@ impl MetricsColumnIndex {
             ),
             None => None,
         };
+        let name = match &mapping.name_column {
+            Some(c) => Some(idx(c)?),
+            None => None,
+        };
+        let value = idx(&mapping.value_column)?;
+        let ts = idx(&mapping.ts_column)?;
+        let labels = mapping
+            .sanitized_label_names()
+            .into_iter()
+            .zip(&mapping.labels)
+            .map(|(name, l)| Ok((name, idx(&l.column)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        // The name and the label columns are the two a row reader reads a
+        // string out of; the value, ts and histogram columns are numeric.
+        let columns = ResolvedColumns::resolve(
+            batch,
+            name.into_iter().chain(labels.iter().map(|(_, i)| *i)),
+        )?;
         Ok(MetricsColumnIndex {
-            name: match &mapping.name_column {
-                Some(c) => Some(idx(c)?),
-                None => None,
-            },
+            name,
             literal_family_name,
-            value: idx(&mapping.value_column)?,
-            ts: idx(&mapping.ts_column)?,
-            labels: mapping
-                .sanitized_label_names()
-                .into_iter()
-                .zip(&mapping.labels)
-                .map(|(name, l)| Ok((name, idx(&l.column)?)))
-                .collect::<Result<Vec<_>, String>>()?,
+            value,
+            ts,
+            labels,
             histogram,
             kind,
             is_monotonic_sum,
+            columns,
         })
+    }
+
+    /// Column `i` as the row readers must read it: resolved when it was a
+    /// mapped dictionary column, the batch's own otherwise.
+    fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
+        self.columns.col(batch, i)
     }
 }
 
@@ -5345,7 +5555,7 @@ fn build_metric_row(
     now_ns: i64,
     row: usize,
 ) -> Result<MetricRow, String> {
-    let raw_ts = read_ts(batch.column(cols.ts), row, mapping.ts_unit)?
+    let raw_ts = read_ts(cols.col(batch, cols.ts), row, mapping.ts_unit)?
         .ok_or_else(|| format!("ts column {:?} is null", mapping.ts_column))?;
 
     // Kept: the future-skew bound, at the metrics OTLP limit. The past-lag
@@ -5365,7 +5575,7 @@ fn build_metric_row(
     // admitted over OTLP.
     let name = match (cols.name, &cols.literal_family_name) {
         (Some(i), _) => {
-            let raw = read_string(batch.column(i), row)?.ok_or_else(|| {
+            let raw = read_string(cols.col(batch, i), row)?.ok_or_else(|| {
                 format!(
                     "metric name column {:?} is null",
                     mapping.name_column.as_deref().unwrap_or_default()
@@ -5385,7 +5595,7 @@ fn build_metric_row(
     // one series here too.
     let mut labels: Vec<Label> = Vec::with_capacity(cols.labels.len());
     for (name, col_idx) in &cols.labels {
-        if let Some(value) = read_label_value(batch.column(*col_idx), row)? {
+        if let Some(value) = read_label_value(cols.col(batch, *col_idx), row)? {
             if value.is_empty() {
                 continue;
             }
@@ -5408,11 +5618,11 @@ fn build_metric_row(
 
     let payload = match &cols.histogram {
         None => RowPayload::Scalar(
-            read_metric_number(batch.column(cols.value), row)?
+            read_metric_number(cols.col(batch, cols.value), row)?
                 .ok_or_else(|| format!("value column {:?} is null", mapping.value_column))?,
         ),
         Some(h) => {
-            let le = read_metric_number(batch.column(h.le), row)?
+            let le = read_metric_number(cols.col(batch, h.le), row)?
                 .ok_or_else(|| "histogram le column is null".to_string())?;
             if !le.is_finite() {
                 // Matches `Rejection::NonFiniteHistogramBound`: OTLP's
@@ -5425,7 +5635,7 @@ fn build_metric_row(
             }
             // With a histogram mapping the value column is this bucket's own
             // count, so it is read as a count, not as a sample value.
-            let own_count = read_count(batch.column(cols.value), row)
+            let own_count = read_count(cols.col(batch, cols.value), row)
                 .map_err(|e| {
                     format!(
                         "value column {:?} is this bucket's own count on a classic-histogram \
@@ -5434,8 +5644,8 @@ fn build_metric_row(
                     )
                 })?
                 .ok_or_else(|| format!("value column {:?} is null", mapping.value_column))?;
-            let sum = read_metric_number(batch.column(h.sum), row)?;
-            let count = read_count(batch.column(h.count), row)?
+            let sum = read_metric_number(cols.col(batch, h.sum), row)?;
+            let count = read_count(cols.col(batch, h.count), row)?
                 .ok_or_else(|| "histogram count column is null".to_string())?;
             RowPayload::Bucket(BucketRow {
                 le,
@@ -6527,6 +6737,8 @@ struct SpansColumnIndex {
     resource_attributes: Vec<usize>,
     /// One column index per `[[spans.attribute]]`, in mapping order.
     attributes: Vec<usize>,
+    /// The batch's columns with every mapped dictionary column resolved once.
+    columns: ResolvedColumns,
 }
 
 impl SpansColumnIndex {
@@ -6535,6 +6747,10 @@ impl SpansColumnIndex {
     /// `FixedSizeBinary(n)` states its width in the schema, so a mapping that
     /// points `trace_id_column` at an 8-byte column is a mapping error that
     /// can be reported before the first row is decoded.
+    ///
+    /// Each mapped dictionary column is resolved to its value type here too,
+    /// once for the whole batch rather than once per cell
+    /// ([`resolve_dictionary_column`]).
     fn resolve(batch: &RecordBatch, mapping: &SpansMapping) -> Result<SpansColumnIndex, String> {
         let schema = batch.schema();
         let idx = |name: &str| -> Result<usize, String> {
@@ -6547,35 +6763,62 @@ impl SpansColumnIndex {
             check_id_column(schema.field(i).data_type(), name, width, empty_is_root)?;
             Ok(i)
         };
+        let trace_id = id_idx(&mapping.trace_id_column, 16, false)?;
+        let span_id = id_idx(&mapping.span_id_column, 8, false)?;
+        let parent_span_id = match &mapping.parent_span_id_column {
+            Some(c) => Some(id_idx(c, 8, true)?),
+            None => None,
+        };
+        let name = idx(&mapping.name_column)?;
+        let start_ts = idx(&mapping.start_ts_column)?;
+        let end_ts = idx(&mapping.end_ts_column)?;
+        let status_code = match &mapping.status_code_column {
+            Some(c) => Some(idx(c)?),
+            None => None,
+        };
+        let status_message = match &mapping.status_message_column {
+            Some(c) => Some(idx(c)?),
+            None => None,
+        };
+        let resource_attributes = mapping
+            .resource_attributes
+            .iter()
+            .map(|a| idx(&a.column))
+            .collect::<Result<Vec<_>, String>>()?;
+        let attributes = mapping
+            .attributes
+            .iter()
+            .map(|a| idx(&a.column))
+            .collect::<Result<Vec<_>, String>>()?;
+        // Every column a row reader may read a string, a byte string or an id
+        // out of. The timestamp and status columns are numeric and carry no
+        // dictionary a reader resolves.
+        let dictionary_candidates = [Some(trace_id), Some(span_id), parent_span_id, Some(name)]
+            .into_iter()
+            .flatten()
+            .chain(status_message)
+            .chain(resource_attributes.iter().copied())
+            .chain(attributes.iter().copied());
+        let columns = ResolvedColumns::resolve(batch, dictionary_candidates)?;
         Ok(SpansColumnIndex {
-            trace_id: id_idx(&mapping.trace_id_column, 16, false)?,
-            span_id: id_idx(&mapping.span_id_column, 8, false)?,
-            parent_span_id: match &mapping.parent_span_id_column {
-                Some(c) => Some(id_idx(c, 8, true)?),
-                None => None,
-            },
-            name: idx(&mapping.name_column)?,
-            start_ts: idx(&mapping.start_ts_column)?,
-            end_ts: idx(&mapping.end_ts_column)?,
-            status_code: match &mapping.status_code_column {
-                Some(c) => Some(idx(c)?),
-                None => None,
-            },
-            status_message: match &mapping.status_message_column {
-                Some(c) => Some(idx(c)?),
-                None => None,
-            },
-            resource_attributes: mapping
-                .resource_attributes
-                .iter()
-                .map(|a| idx(&a.column))
-                .collect::<Result<Vec<_>, String>>()?,
-            attributes: mapping
-                .attributes
-                .iter()
-                .map(|a| idx(&a.column))
-                .collect::<Result<Vec<_>, String>>()?,
+            trace_id,
+            span_id,
+            parent_span_id,
+            name,
+            start_ts,
+            end_ts,
+            status_code,
+            status_message,
+            resource_attributes,
+            attributes,
+            columns,
         })
+    }
+
+    /// Column `i` as the row readers must read it: resolved when it was a
+    /// mapped dictionary column, the batch's own otherwise.
+    fn col<'a>(&'a self, batch: &'a RecordBatch, i: usize) -> &'a ArrayRef {
+        self.columns.col(batch, i)
     }
 }
 
@@ -6589,11 +6832,12 @@ impl SpansColumnIndex {
 /// parent rather than a malformed id: a `FixedSizeBinary(0)` column then says
 /// every row is a root span, which is a file this loader can read.
 ///
-/// A dictionary column is judged by its VALUE type, which is what
-/// [`read_id`] resolves each key to. That is the common case rather than an
-/// exotic one: [`dictionary_preserving_schema`] retypes a fully
-/// dictionary-encoded `Utf8` column to `Dictionary(_, Utf8)`, and a default
-/// `ArrowWriter` dictionary-encodes hex id columns.
+/// A dictionary column is judged by its VALUE type, which is what a resolved
+/// dictionary column carries and what [`read_id`] resolves each key to. A hex
+/// id column reaches here in either form: as `Dictionary(_, Utf8)` when
+/// [`dictionary_preserving_schema`] retyped it, which needs every chunk of it
+/// dictionary encoded on every data page, and as plain `Utf8` otherwise, as a
+/// column whose dictionary outgrew the writer's page limit is.
 fn check_id_column(
     data_type: &DataType,
     column: &str,
@@ -6638,8 +6882,7 @@ fn id_cell_is_empty(arr: &ArrayRef, row: usize) -> Result<bool, String> {
         // below and fail on its own `Utf8` values.
         DataType::Dictionary(_, _) => {
             let dict = arr.as_any_dictionary();
-            let key = dict.normalized_keys()[row];
-            id_cell_is_empty(dict.values(), key)
+            id_cell_is_empty(dict.values(), dictionary_key(arr, row)?)
         }
         _ => Ok(read_bytes(arr, row)?.is_none_or(|b| b.is_empty())),
     }
@@ -6683,7 +6926,7 @@ fn build_span(
     row: usize,
     dropped: &mut u64,
 ) -> Result<NormalizedSpan, String> {
-    let name = read_string(batch.column(cols.name), row)?
+    let name = read_string(cols.col(batch, cols.name), row)?
         .ok_or_else(|| format!("name column {:?} is null", mapping.name_column))?;
     if name.len() > limits.max_name_len {
         return Err(format!(
@@ -6697,14 +6940,14 @@ fn build_span(
     // a wrong width is a rejection and never a pad or a truncation. `read_id`
     // reports a wrong width as `None`, which is indistinguishable here from a
     // null cell; both are the same refusal, since neither can name a span.
-    let trace_id = read_id::<16>(batch.column(cols.trace_id), row)?.ok_or_else(|| {
+    let trace_id = read_id::<16>(cols.col(batch, cols.trace_id), row)?.ok_or_else(|| {
         format!(
             "trace_id column {:?} is null, or is not a 16-byte value (or a 32-character hex \
              string). Ravel never pads or truncates an id.",
             mapping.trace_id_column
         )
     })?;
-    let span_id = read_id::<8>(batch.column(cols.span_id), row)?.ok_or_else(|| {
+    let span_id = read_id::<8>(cols.col(batch, cols.span_id), row)?.ok_or_else(|| {
         format!(
             "span_id column {:?} is null, or is not an 8-byte value (or a 16-character hex \
              string). Ravel never pads or truncates an id.",
@@ -6721,7 +6964,7 @@ fn build_span(
     let parent_span_id = match cols.parent_span_id {
         None => None,
         Some(i) => {
-            let column = batch.column(i);
+            let column = cols.col(batch, i);
             if id_cell_is_empty(column, row)? {
                 None
             } else {
@@ -6742,13 +6985,13 @@ fn build_span(
     // emits. A NULL cell has no OTLP counterpart and is refused instead: in a
     // file the operator controls it is a mapping or export mistake, and
     // placing a span at load time because a column was empty would hide it.
-    let start_ts_ns = match read_ts(batch.column(cols.start_ts), row, mapping.start_ts_unit)?
+    let start_ts_ns = match read_ts(cols.col(batch, cols.start_ts), row, mapping.start_ts_unit)?
         .ok_or_else(|| format!("start_ts column {:?} is null", mapping.start_ts_column))?
     {
         0 => now_ns,
         v => v,
     };
-    let end_ts_ns = match read_ts(batch.column(cols.end_ts), row, mapping.end_ts_unit)?
+    let end_ts_ns = match read_ts(cols.col(batch, cols.end_ts), row, mapping.end_ts_unit)?
         .ok_or_else(|| format!("end_ts column {:?} is null", mapping.end_ts_column))?
     {
         0 => start_ts_ns,
@@ -6784,11 +7027,11 @@ fn build_span(
 
     let status_code = match cols.status_code {
         None => StatusCode::Unset,
-        Some(i) => read_status_code(batch.column(i), row)?,
+        Some(i) => read_status_code(cols.col(batch, i), row)?,
     };
     let status_message = match cols.status_message {
         None => None,
-        Some(i) => match read_string(batch.column(i), row)? {
+        Some(i) => match read_string(cols.col(batch, i), row)? {
             None => None,
             Some(message) => {
                 if message.len() > limits.max_status_message_len {
@@ -6810,6 +7053,7 @@ fn build_span(
 
     let resource_attrs = read_span_attrs(
         batch,
+        cols,
         &cols.resource_attributes,
         &mapping.resource_attributes,
         limits,
@@ -6818,6 +7062,7 @@ fn build_span(
     )?;
     let span_attrs = read_span_attrs(
         batch,
+        cols,
         &cols.attributes,
         &mapping.attributes,
         limits,
@@ -6850,8 +7095,10 @@ fn build_span(
 /// `dropped` counts the values this row lost to the value-length cap, so the
 /// summary can say the stored record is an approximation. OTLP reports the
 /// same drop as `AttributeValueTooLong` in its partial-success message.
+#[allow(clippy::too_many_arguments)]
 fn read_span_attrs(
     batch: &RecordBatch,
+    cols: &SpansColumnIndex,
     indices: &[usize],
     maps: &[AttrMap],
     limits: &SpanIngestLimits,
@@ -6864,7 +7111,7 @@ fn read_span_attrs(
         // OTLP span that simply omits the key. An EMPTY string is a value and
         // is stored: unlike a metric label, an empty attribute value is
         // meaningful on the span path and OTLP keeps it.
-        let Some(value) = read_attr(batch.column(*col), row, map.value_type)? else {
+        let Some(value) = read_attr(cols.col(batch, *col), row, map.value_type)? else {
             continue;
         };
         let value = span_attr_string(&map.key, &value)?;
