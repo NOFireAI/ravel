@@ -884,6 +884,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sweep` takes its minimum `--grace` from `sys/gc`'s `max_query_duration_ns`,
   the value ADR-0050 section 4 bounds every engine deadline against, and
   refuses a bucket that has no `sys/gc` rather than assuming a default.
+- **`ravel-parquet`: DataFusion's Parquet scan over a table manifest**
+  (ADR-2040 decision D3, issue #2052). Every read of a manifest file is served
+  from the process `ReadCache` or by one GET under a `GetLimiter` permit,
+  pinned to the ETag and version the manifest recorded; a file overwritten or
+  deleted after the table was created fails the scan with `FileChanged` or
+  `FileMissing`, telling the caller to run `CREATE OR REPLACE`. The footer is
+  one explicit range ending at the recorded size, charged to the Probe phase,
+  and decoded footers are kept in a byte-bounded cache outside the query
+  session; a footer that disagrees with the manifest, or that would panic the
+  scan, is refused as `Corrupt`. `TenantParquetStore` names each file under
+  the tenant and table version, serves `head` from the manifest and refuses
+  every other path, write and list, and `SingleStoreRegistry` answers only
+  that tenant's URL. `ParquetTableProvider` applies the D5 coercions
+  (`binary_as_string` and the `ravel.cast.<column>` integer casts) and the D6
+  file groups: up to `target_partitions` groups for a parallel scan, and one
+  group in manifest order, never re-split, otherwise. Nothing routes SQL to it
+  yet; issue #2053 does.
 
 ## [0.19.0] - 2026-09-27
 
