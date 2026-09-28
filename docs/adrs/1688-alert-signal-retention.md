@@ -96,7 +96,8 @@ identity, and the window bounds both the corpus and the cold start.
    keep-set amendment below adds the per-record rule that makes records at
    or after the watermark safe: the sweep never deletes them). When the memo is absent,
    undecodable, of an unsupported version, or its watermark sits below the
-   expiry floor, the driver skips the sweep for that tenant this tick, logs
+   expiry floor (the store-error amendment below revises both this set and what
+   `absent` means), the driver skips the sweep for that tenant this tick, logs
    it, and counts it under a new `ravel_alert_retention_skipped_total{reason}`
    family. The evaluator rewrites the memo every tick, so a live tenant's
    memo is at most one tick old; a tenant with no evaluator has no new
@@ -124,7 +125,9 @@ identity, and the window bounds both the corpus and the cold start.
    the query-audit block, gated on `worker.owns_unit(live_set, tenant,
    Signal::Alerts, ALERT_SHARD)` under the ADR-0065 live set, and reports the
    way the audit sweep does: a `tracing::info!` with records, data and kept
-   counts, outside `MaintainReport` and outside `MaintenanceSafetyMetrics`.
+   counts, outside `MaintainReport` and outside `MaintenanceSafetyMetrics`
+   (see the store-error amendment below, which separates the sweep's outcome
+   from decision 3's skip counter).
 
 ```mermaid
 flowchart LR
@@ -189,9 +192,11 @@ flowchart LR
   same bound ADR-1294 states for the memo. A cold-start fold reads that bound,
   not the deployment's age.
 - A tenant whose memo is missing or stale is not swept, and
-  `ravel_alert_retention_skipped_total{reason}` says so. A sustained nonzero
+  `ravel_alert_retention_skipped_total{reason}` says so (the store-error
+  amendment below revises which states count and adds one). A sustained nonzero
   rate for one tenant means its evaluator is not running or cannot write its
-  memo; the remedy is on the evaluator, not the sweep.
+  memo; the remedy is on the evaluator, not the sweep. The family carries no
+  tenant label, so it says that some tenant is in that state, not which.
 - The sweep depends on the memo's completeness invariant. ADR-1294 already
   makes the evaluator correct only under that invariant; this ADR adds a
   deleter to its consumers, which raises the cost of breaking it from a wrong
@@ -263,3 +268,68 @@ written, and that decision 3's boundary is off by one hour.
   sweep runs on `Signal::Alerts` today, so the object would leak. Follow-up
   task 2 runs the orphan sweep over the alerts shard beside the retention
   sweep, the way the audit shard already has one.
+
+## Amendment (2026-09-28): the skip reasons, and where the skip counter lives
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="store-error amendment" -->
+<!-- amendment-supersedes: phrase="When the memo is absent, undecodable, of an unsupported version, or its watermark sits below the expiry floor" pointer="store-error amendment" -->
+<!-- amendment-supersedes: phrase="outside `MaintainReport` and outside `MaintenanceSafetyMetrics`" pointer="store-error amendment" -->
+
+Review of follow-up task 2 found decision 3's reason set short in one direction
+and too wide in another, and decision 6 at odds with where the counter decision
+3 asks for actually has to live.
+
+- **`store_error` is a fifth reason.** A memo read that failed against object
+  storage with anything other than not-found was logged and not counted, on the
+  reasoning that it says nothing about the evaluator. It says something about
+  the sweep: a store that never answers stalls it exactly as a missing memo
+  does, and an uncounted skip reads the same as a tick with nothing to do. It is
+  now `ravel_alert_retention_skipped_total{reason="store_error"}`, which also
+  covers the listing below.
+
+- **`absent` counts only a tenant that has alert records.** Every tenant of a
+  deployment that runs no alert rules has no memo, forever, so the original rule
+  counted a skip and logged a warning for each of them on every tick. When the
+  memo is absent the driver now spends one bounded listing of the tenant's alert
+  commit prefix, and a tenant whose prefix holds nothing is neither logged nor
+  counted: it has no history to sweep. The orphan sweep still runs for it, since
+  a data object whose first-ever commit record never landed is the leak that
+  sweep exists to reclaim.
+
+- **The watermark is clamped to the driver's own hour.** ADR-1294 calls
+  `watermark_hour` untrusted on read, and the evaluator's fold clamps it to the
+  fold's seal bound. The driver passed it through unclamped, although its
+  watermark is the floor below which the sweep DELETES, so a memo from a replica
+  whose clock ran ahead widened the deletable range rather than merely shortening
+  a tail. It is clamped to the hour of the driver's own clock reading, which can
+  only lower it and so can only keep more.
+
+- **The evaluator honours the ingest writers' `max_flush_lifetime`.** The
+  keep-set amendment put an orphan sweep on the alerts shard. That sweep's age
+  gate (`grace + max_flush_lifetime`) is sound only for writers that abandon a
+  flush older than `max_flush_lifetime` instead of publishing its commit record
+  afterwards, and the evaluator's publish had no elapsed-time check at all: a
+  stall past the gate let the sweep quarantine the data object while the publish
+  went on to write a commit record naming it. The publish now refuses the commit
+  record once that bound has passed since its data PUT began, leaving one orphan
+  for the sweep and one transition for the next tick to rewrite.
+
+- **The skip counter lives on `MaintenanceSafetyMetrics`; decision 6 was about
+  the sweep's outcome.** Decision 6 puts the sweep outside `MaintainReport` and
+  outside `MaintenanceSafetyMetrics`, while decision 3 asks for a counter the
+  maintenance tick must be able to reach, and the tick carries exactly one
+  process-wide counter handle: `MaintenanceSafetyMetrics`. The two are
+  reconciled by scope rather than by moving code. The per-pass OUTCOME (records
+  deleted, data deleted, kept, kept as current state) stays out of both, reported
+  as a log line the way the audit sweep's is. The skip COUNTER is a field on
+  `MaintenanceSafetyMetrics` and renders in the maintain-safety family. What
+  decision 6's exclusion protects is untouched: nothing about `Signal::Alerts`
+  enters that struct's per-signal arrays, which are sized by
+  `MAINTAINED_SIGNALS`, and the alerts signal is still not a member.
+
+- **The window has a floor.** An `--alert-retention` shorter than one hour plus
+  the alert state memo's seal margin puts the expiry floor above every watermark
+  the evaluator can write, so every tick would skip under
+  `watermark_below_floor` and nothing would ever be swept. A nonzero window below
+  that floor is refused at startup, naming the minimum. `0` is still the
+  documented opt-out.

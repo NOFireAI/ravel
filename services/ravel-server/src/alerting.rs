@@ -51,10 +51,13 @@
 //!
 //! # The state memo
 //!
-//! `Signal::Alerts` is never maintained (it is absent from
-//! `maintain::MAINTAINED_SIGNALS`), so that transition history only grows and a
-//! full fold every tick costs `2N` GETs for a cumulative transition count `N`,
-//! independent of the rule count actually needed. [`AlertEvaluator::fold_latest`]
+//! `Signal::Alerts` is absent from `maintain::MAINTAINED_SIGNALS` and no alert
+//! record is ever compacted, so a full fold every tick costs `2N` GETs for a
+//! transition count `N`, independent of the rule count actually needed. `N` is
+//! bounded rather than cumulative since ADR-1688: the maintenance tick sweeps
+//! alert transitions older than its retention window, keeping each identity's
+//! current-state record whatever its age, so the history holds one window's
+//! transitions plus one record per identity. [`AlertEvaluator::fold_latest`]
 //! avoids that with a tenant-wide derived cache, the alert state memo
 //! ([`crate::alert_state_memo`], issue #1294): each tick seeds from the memo and
 //! folds only the ingest hours at or after its watermark, clamped to the
@@ -135,6 +138,36 @@ const ALERT_WRITER_EPOCH: u64 = 1;
 
 const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
 const NS_PER_MS: i64 = 1_000_000;
+
+/// How far behind the clock an evaluator on `eval_interval` holds the memo's
+/// `watermark_hour`: `lease_ttl + query_deadline`, the margin
+/// [`AlertEvaluator::seal_bound_hour`] applies, which is where that reasoning
+/// lives.
+///
+/// Public because the alert retention window is only usable above it: the
+/// maintenance driver refuses to sweep under a memo whose watermark sits below
+/// the expiry floor's hour, so a window shorter than this margin puts the floor
+/// above every watermark the evaluator can write and the sweep never runs. The
+/// `query_deadline` term is the compiled-in [`DEFAULT_QUERY_DEADLINE`] rather
+/// than an evaluator's own, because nothing configures that field away from it.
+pub fn alert_memo_seal_margin(eval_interval: Duration) -> Duration {
+    eval_interval
+        .saturating_mul(LEASE_TTL_TICKS)
+        .saturating_add(DEFAULT_QUERY_DEADLINE)
+}
+
+/// How long an alert transition's two-object write may stay in flight before
+/// the evaluator abandons it rather than publishing its commit record.
+///
+/// This is the ingest writers' own `max_flush_lifetime`, read through the one
+/// function that answers that question for the whole workspace rather than
+/// copied as a second constant. Orphan GC's age gate (`grace +
+/// max_flush_lifetime`) is sound only for writers that honour it, and since
+/// ADR-1688's keep-set amendment the alerts shard has an orphan sweep; see
+/// [`AlertEvaluator::publish`] for what breaks without this.
+fn alert_publish_lifetime_ns() -> i64 {
+    ravel_maintain::ingest_max_flush_lifetime_floor_ns()
+}
 
 /// Lease lifetime as a multiple of the evaluation interval. A holder
 /// renews the lease at the start of every tick, so the lease must outlive a
@@ -1548,6 +1581,28 @@ impl AlertEvaluator {
     /// PUT with a CRC32C upload checksum, then a `CreateIfAbsent` commit record
     /// (ADR-0002). Until the commit record lands the object is an orphan, and
     /// [`Self::load_latest_records`] does not read orphans.
+    ///
+    /// # The writer interlock
+    ///
+    /// The commit record is refused once more than
+    /// [`alert_publish_lifetime_ns`] has passed since this call read the clock
+    /// for its data PUT. That bound is the ingest writers' own
+    /// `max_flush_lifetime`, and honouring it here is what makes orphan GC over
+    /// the alerts shard safe (ADR-1688's keep-set amendment put an orphan sweep
+    /// on this shard). Orphan GC reclaims a record-less `l0/` object once it is
+    /// older than `grace + max_flush_lifetime`, on the promise that no writer
+    /// ever publishes a commit record for a flush that old. A publish that
+    /// stalled past the bound and then wrote its commit record anyway would
+    /// break that promise: the sweep could already have quarantined the data
+    /// object, and the commit record would name an object that is no longer
+    /// there, which every reader of this history treats as corruption rather
+    /// than as an abandoned write.
+    ///
+    /// Refusing is the recoverable direction. The transition record was never
+    /// made durable, so the rule fails this tick, the prior state is left
+    /// exactly as it was, and the next tick re-evaluates and rewrites the
+    /// transition under a fresh stamp. What it leaves behind is one orphan data
+    /// object, which is precisely what orphan GC reclaims.
     async fn publish(&self, bytes: Vec<u8>, seq: u64, now_ns: i64) -> anyhow::Result<()> {
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let data = Bytes::from(bytes);
@@ -1572,7 +1627,17 @@ impl AlertEvaluator {
             ingest_hour_bucket: hour_bucket(now_ns),
         })?;
         let data_key = keys::reconstruct_data_key(&commit)?;
+        let put_started_ns = self.clock.now_ns();
         publish::put_data_object(self.store.as_ref(), &data_key, data).await?;
+        let lifetime_ns = alert_publish_lifetime_ns();
+        let elapsed_ns = self.clock.now_ns().saturating_sub(put_started_ns);
+        if elapsed_ns > lifetime_ns {
+            anyhow::bail!(
+                "alert transition publish abandoned: {elapsed_ns} ns elapsed since the data PUT \
+                 for {data_key} began, past the {lifetime_ns} ns writer interlock, so the commit \
+                 record is not written and the transition is rewritten next tick"
+            );
+        }
         publish::publish(self.store.as_ref(), &commit, &RetryPolicy::default()).await?;
         Ok(())
     }
@@ -2919,6 +2984,253 @@ mod tick_tests {
         }
         out.sort_by_key(|r| r.ts_ns);
         out
+    }
+
+    /// Every written transition's commit record carries `max_event_ts_ns`
+    /// equal to its RLOG record's `ts_ns`. The alert retention sweep keys its
+    /// keep set on exactly this (ADR-1688, keep-set amendment): it matches a
+    /// record's `max_event_ts_ns` against the memo's `ts_ns` values, so a
+    /// commit stamp that drifts from the record's stamp would let the sweep
+    /// delete an identity's current-state record.
+    ///
+    /// The second transition is written under a backward clock step, where the
+    /// record's `ts_ns` is the corrected `prior.ts_ns + 1` rather than the
+    /// clock reading, so a publish that took the clock instead of the stamp
+    /// fails here.
+    #[tokio::test]
+    async fn a_written_transitions_commit_max_event_ts_ns_equals_its_record_ts_ns() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert_eq!(evaluator.run_tick().await.records_written, 1, "onset fires");
+        clock.set(NOW_NS - 100 * NS_PER_SEC);
+        assert_eq!(evaluator.run_tick().await.records_written, 1, "resolves");
+
+        let prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let cfg = RlogConfig::default();
+        let mut pairs = Vec::new();
+        for meta in list_all_after(store.as_ref(), &prefix, None)
+            .await
+            .expect("list")
+        {
+            let commit = record::decode(
+                &store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get commit")
+                    .data,
+            )
+            .expect("decode commit");
+            let data_key = keys::verify_object_key(&commit).expect("object key");
+            let object = store
+                .get(&data_key, GetRange::Full)
+                .await
+                .expect("get data");
+            let reader = RlogReader::new(&object.data, &cfg).expect("open rlog");
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            assert_eq!(rows.len(), 1, "one alert record per object");
+            let alert = AlertRecord::from_log_record(&rows[0]).expect("decode alert record");
+            pairs.push((commit.max_event_ts_ns, alert.ts_ns));
+        }
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![(NOW_NS, NOW_NS), (NOW_NS + 1, NOW_NS + 1)],
+            "each commit record's max_event_ts_ns is its record's ts_ns, including the \
+             corrected stamp written under a backward clock step"
+        );
+    }
+
+    /// A store that moves the injected clock forward as an alert data object's
+    /// PUT completes, so a test can put a publish past the writer interlock with
+    /// no wall-clock wait and no sleep. `stall_ns` is settable at runtime so one
+    /// test can stall a publish and then let the next one through.
+    struct StallingDataPut {
+        inner: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        data_prefix: String,
+        stall_ns: AtomicI64,
+        data_puts: AtomicU64,
+    }
+
+    impl StallingDataPut {
+        fn new(inner: Arc<dyn ObjectStoreBackend>, clock: Arc<TestClock>, stall_ns: i64) -> Self {
+            let tenant = TenantId::new(TENANT).hash();
+            StallingDataPut {
+                inner,
+                clock,
+                data_prefix: format!("t/{}/a/l0/", tenant.to_hex()),
+                stall_ns: AtomicI64::new(stall_ns),
+                data_puts: AtomicU64::new(0),
+            }
+        }
+
+        fn data_puts(&self) -> u64 {
+            self.data_puts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for StallingDataPut {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            let outcome = self.inner.put(key, data, opts).await?;
+            if key.starts_with(&self.data_prefix) {
+                self.data_puts.fetch_add(1, Ordering::SeqCst);
+                self.clock.advance(self.stall_ns.load(Ordering::SeqCst));
+            }
+            Ok(outcome)
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Every live key under the tenant's alert commit prefix and its `l0/` data
+    /// space, read straight off the store.
+    async fn alert_keyspace(store: &dyn ObjectStoreBackend, tenant: TenantHash) -> (usize, usize) {
+        let commits = list_all_after(
+            store,
+            &keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix"),
+            None,
+        )
+        .await
+        .expect("list commits");
+        let data = list_all_after(store, &format!("t/{}/a/l0/", tenant.to_hex()), None)
+            .await
+            .expect("list data");
+        (commits.len(), data.len())
+    }
+
+    /// A publish whose data PUT stalls past the ingest writers' own
+    /// `max_flush_lifetime` writes no commit record, and the transition is
+    /// rewritten on a later tick.
+    ///
+    /// The interlock is what makes orphan GC over the alerts shard safe: it
+    /// reclaims a record-less data object older than `grace +
+    /// max_flush_lifetime` on the promise that no writer publishes a commit
+    /// record for a flush that old. A publish that stalled past the bound and
+    /// then wrote its commit record anyway would leave a commit record naming an
+    /// object the sweep is entitled to have quarantined already.
+    ///
+    /// The stall is on the injected clock, not on the wall clock: the store
+    /// wrapper advances the evaluator's own clock as the data PUT completes.
+    ///
+    /// Watch it fail: delete the `elapsed_ns > lifetime_ns` bail in
+    /// `AlertEvaluator::publish`. The first tick then writes its commit record
+    /// and the first assertion, that the tick wrote no record, fails.
+    #[tokio::test]
+    async fn a_data_put_stalled_past_the_writer_interlock_publishes_no_commit_record() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            alert_publish_lifetime_ns() + NS_PER_SEC,
+        ));
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "the transition was not made durable"
+        );
+        assert_eq!(report.rules_failed, 1, "the rule is on the retry path");
+        assert_eq!(store.data_puts(), 1, "the data object was written first");
+        assert_eq!(
+            alert_keyspace(memory.as_ref(), tenant).await,
+            (0, 1),
+            "one orphan data object, no commit record: exactly what orphan GC reclaims"
+        );
+
+        // The same evaluator, with the stall removed and the clock back where it
+        // started: the transition is rewritten under a fresh object.
+        store.stall_ns.store(0, Ordering::SeqCst);
+        clock.set(NOW_NS);
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.records_written, 1, "the retry writes the transition");
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(
+            alert_keyspace(memory.as_ref(), tenant).await,
+            (1, 2),
+            "the abandoned object is still an orphan beside the published pair"
+        );
+        assert_eq!(
+            read_alert_records(memory.as_ref(), tenant)
+                .await
+                .into_iter()
+                .map(|r| (r.state, r.ts_ns))
+                .collect::<Vec<_>>(),
+            vec![(AlertState::Firing, NOW_NS)],
+            "one transition, stamped at the retry's clock reading"
+        );
+    }
+
+    /// A stall shorter than the interlock is not a refusal: the bound is a
+    /// ceiling on an in-flight publish, not a ban on a slow one.
+    #[tokio::test]
+    async fn a_data_put_inside_the_writer_interlock_publishes_normally() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            alert_publish_lifetime_ns() - NS_PER_SEC,
+        ));
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.records_written, 1);
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(alert_keyspace(memory.as_ref(), tenant).await, (1, 1));
     }
 
     /// a backward wall-clock step between ticks must still produce a

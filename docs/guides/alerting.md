@@ -522,10 +522,29 @@ compacted, so a query lists the tenant's alert commit records for its window on
 every call, one bounded listing per shard. One object per transition keeps that
 listing small.
 
-No retention rule covers the alerts signal today. A transition record is
-written once and is never swept, so alert history grows with the number of
-transitions and nothing trims it. A future retention rule that covers the
-signal would change that; until then, plan for the records to stay.
+Alert history is swept by the maintenance loop. A transition older than
+`--alert-retention`, 90 days by default, is deleted, both its commit record and
+its object, with one exception: each alert identity's current-state record is
+kept whatever its age. A rule that has been firing for a year keeps the one
+record that says so, and a rule deleted a year ago keeps the one `resolved`
+record carrying its last generation. So an `alerts` query answers for the
+retention window plus every identity's current state, and the prefix a query
+lists holds one window's transitions plus one record per identity rather than
+the whole life of the deployment.
+
+The sweep runs on the process that owns the tenant's alert unit, on the ordinary
+maintenance tick. It learns which record is each identity's current state from
+the tenant's alert state memo, which the evaluator rewrites on every tick it
+runs. A tenant whose memo is missing, unreadable, or too far behind the window
+is not swept at all that tick rather than swept without that protection, and
+`ravel_alert_retention_skipped_total` counts those ticks by reason.
+
+Set `--alert-retention` to a longer window before upgrading if you need more
+history, or `--alert-retention 0` to keep every transition forever, which is
+what deployments did before the sweep existed. A nonzero window shorter than one
+hour plus the memo's seal margin (three evaluation intervals plus the query
+deadline, so 1 h 3 m 30 s at the defaults) is refused at startup: the sweep could
+never run under it, and every tick would report a skip.
 
 ## Background
 
