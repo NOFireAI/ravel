@@ -57,7 +57,7 @@ use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase}
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
-use ravel_catalog::SegmentRef;
+use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SectionDesc, kind};
@@ -5321,7 +5321,7 @@ impl BlockRangeFetcher {
         // every block reaches ~1.0 and takes the single GET.
         //
         // Computed against the BRIDGED run set (ADR-2066 decision 1), not the
-        // raw `wanted` extents: bridging a projection down to
+        // raw `wanted` extents: bridging an L0 projection down to
         // `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs can itself push the byte
         // count over the threshold, and the covering-read check must still
         // apply after that bridging, not before it. Deliberately NOT filtered
@@ -5332,7 +5332,7 @@ impl BlockRangeFetcher {
         // routinely covers the whole object) must not shrink that footprint,
         // or an all-columns read of such an object would skip `covering_read`
         // and its whole-object cache admission entirely.
-        let wanted_bytes: u64 = self.bridged_run_bytes(&wanted);
+        let wanted_bytes: u64 = self.bridged_run_bytes(&seg_ref.level, &wanted);
         let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
             // `wanted` is already owned (resolved above from the decoded skip
@@ -5455,21 +5455,25 @@ impl BlockRangeFetcher {
 
     /// The coalesced, already-covered-filtered, request-bounded byte ranges a
     /// version-4 chunk fetch will actually issue for `wanted`: at most
-    /// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] runs, the metrics path's own
-    /// cap (ADR-2066 decision 1), bridging the smallest gaps first
-    /// ([`bound_runs`]) when coalescing leaves more runs than that. This
-    /// answers "what does this fetch still need to GET", so
+    /// [`chunk_run_cap`] runs for `level`, bridging the smallest gaps first
+    /// ([`bound_runs`]) when coalescing leaves more runs than that (ADR-2066
+    /// decision 1). This answers "what does this fetch still need to GET", so
     /// [`fetch_chunk_ranges`](Self::fetch_chunk_ranges) is the only caller;
     /// the coverage crossover in [`fetch_object_v4`] uses
     /// [`bridged_run_bytes`](Self::bridged_run_bytes) instead, which answers
     /// a different question and must not filter by `asm` coverage.
-    fn bounded_chunk_runs(&self, wanted: &[ByteExtent], asm: &ObjectAssembler) -> Vec<ByteExtent> {
+    fn bounded_chunk_runs(
+        &self,
+        level: &SegmentLevel,
+        wanted: &[ByteExtent],
+        asm: &ObjectAssembler,
+    ) -> Vec<ByteExtent> {
         let runs: Vec<(u64, u64)> = coalesce_byte_extents(wanted, self.effective_coalesce_gap())
             .into_iter()
             .filter(|r| !asm.covers(r.abs_start, r.abs_end()))
             .map(|r| (r.abs_start, r.abs_end()))
             .collect();
-        bound_runs(runs, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT)
+        bound_runs(runs, chunk_run_cap(level))
             .into_iter()
             .map(|(start, end)| ByteExtent {
                 abs_start: start,
@@ -5480,9 +5484,10 @@ impl BlockRangeFetcher {
 
     /// The coalesced, request-bounded byte total a version-4 chunk fetch
     /// would need for `wanted` on its own, before subtracting whatever `asm`
-    /// already holds: at most [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] runs,
-    /// bridging the smallest gaps first ([`bound_runs`]) when coalescing
-    /// leaves more runs than that (ADR-2066 decision 1). Used only by the
+    /// already holds: at most [`chunk_run_cap`] runs for `level`, the same cap
+    /// [`bounded_chunk_runs`](Self::bounded_chunk_runs) applies, bridging the
+    /// smallest gaps first ([`bound_runs`]) when coalescing leaves more runs
+    /// than that (ADR-2066 decision 1). Used only by the
     /// coverage crossover in [`fetch_object_v4`]: that decision is about this
     /// query's own projected footprint against the object's size, and must
     /// not shrink just because an unrelated earlier read (a suffix probe, on
@@ -5494,12 +5499,12 @@ impl BlockRangeFetcher {
     /// [`bounded_chunk_runs`](Self::bounded_chunk_runs) answers the different
     /// question of what an actual fetch still needs to GET, and keeps its own
     /// `asm`-covers filter for that.
-    fn bridged_run_bytes(&self, wanted: &[ByteExtent]) -> u64 {
+    fn bridged_run_bytes(&self, level: &SegmentLevel, wanted: &[ByteExtent]) -> u64 {
         let runs: Vec<(u64, u64)> = coalesce_byte_extents(wanted, self.effective_coalesce_gap())
             .into_iter()
             .map(|r| (r.abs_start, r.abs_end()))
             .collect();
-        bound_runs(runs, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT)
+        bound_runs(runs, chunk_run_cap(level))
             .into_iter()
             .map(|(start, end)| end - start)
             .sum()
@@ -5517,7 +5522,7 @@ impl BlockRangeFetcher {
     /// [`ReadPhases::blocks`] and the WIRE bytes recorded here are the
     /// numerator of fetch amplification (#913). A run's coalescing holes are
     /// included, because the store transferred them, and so are any bytes a
-    /// gap bridged to hold the run count at
+    /// gap bridged to hold an L0 object's run count at
     /// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] (ADR-2066 decision 1): those
     /// bytes are real transfer too, reserved and charged the same as any
     /// other run's.
@@ -5536,11 +5541,11 @@ impl BlockRangeFetcher {
         let key = seg_ref.data_object_key.as_str();
         // A run the probe already brought costs nothing: its bytes are in
         // `asm` at the right offsets already. Bounding to at most
-        // `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs happens AFTER that filter,
+        // `chunk_run_cap(level)` runs happens AFTER that filter,
         // per ADR-2066 decision 1: an already-covered run should never count
         // against the cap or force a bridge a genuinely uncovered run set
         // would not have needed.
-        let runs: Vec<ByteExtent> = self.bounded_chunk_runs(wanted, &*asm);
+        let runs: Vec<ByteExtent> = self.bounded_chunk_runs(&seg_ref.level, wanted, &*asm);
         // Reserve the transient wire buffers the coalesced runs materialize
         // before `join_all` issues a GET (ADR-1170 decision 2): a refusal fails
         // typed with zero GETs. Held to the end of this call, covering the
@@ -5706,7 +5711,9 @@ impl BlockRangeFetcher {
     /// resident in the shared read cache under its OWN per-section key (a plan
     /// read that fetched it alone) is also served from there and dropped from
     /// the span, so a scan never re-fetches live bytes the plan phase already
-    /// cached under a narrower key. Counts one [`BlockRangeStats::metadata_gets`]
+    /// cached under a narrower key. A combined GET of both sections admits each
+    /// under its per-section key as well as the span's, so while those entries
+    /// stay resident the next read of the object serves both from those peeks. Counts one [`BlockRangeStats::metadata_gets`]
     /// when it fetches, never a `probe_miss` (the front is unreachable by any
     /// probe, so counting it there would put a floor under that metric -- see
     /// the `probe_misses` field doc).
@@ -5768,6 +5775,23 @@ impl BlockRangeFetcher {
             .await?;
         if live {
             stats.metadata_gets += 1;
+        }
+        // The span's own key is not one the peek above consults, so admit each
+        // section under its per-section key too, or a later read with a fresh
+        // assembler peeks and misses both again. A lone section's span key is
+        // already its per-section key. `insert` records no miss and the bytes
+        // were charged once by the GET above.
+        if missing.len() > 1
+            && let Some(cache) = &self.cache
+        {
+            let span = [(start, bytes.clone())];
+            for desc in &missing {
+                let section = resident_slice(&span, desc.offset, desc.len)
+                    .ok_or_else(|| corrupt_range(key))?;
+                let cache_key =
+                    CacheKey::new(tenant_hash.0, seg_ref.content_hash, desc.offset, desc.len);
+                cache.insert(cache_key, section).await;
+            }
         }
         asm.place(key, start, &bytes)
     }
@@ -6349,6 +6373,19 @@ fn coalesce_extents(extents: &[BlockExtent], max_gap: u64) -> Vec<BlockExtent> {
             crc32c: 0,
         })
         .collect()
+}
+
+/// Most chunk-run GETs one version-4 read of an object at `level` issues
+/// (ADR-2066 decision 1). An L0 flush is capped at
+/// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`], as the metrics path caps an L0
+/// segment's page ranges; an L1 part is left unbounded for the same reason it
+/// is there: a compacted part can be far larger than a flush, so bridging its
+/// runs down to the cap would move most of the object.
+fn chunk_run_cap(level: &SegmentLevel) -> usize {
+    match level {
+        SegmentLevel::L0 => MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
+        SegmentLevel::L1 { .. } => usize::MAX,
+    }
 }
 
 /// [`coalesce_extents`] over plain byte extents: the same rule (sort by start,

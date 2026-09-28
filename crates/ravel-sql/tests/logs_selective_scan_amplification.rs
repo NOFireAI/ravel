@@ -939,15 +939,21 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "q37: the plan phase counted survivors from the skip index, fetching no \
          block"
     );
-    // Exact GET count: 8 plan probes plus 8 range GETs per segment. Under
-    // version 4 the surviving block's bytes are one page per column chunk of its
-    // row group, and this fixture's blocks carry pages in eight chunks (ts,
-    // observed_ts, stream_ref, severity_num, severity_text, body, flags, code),
-    // none of which coalesce at gap 0 because the pruned blocks' pages for the
-    // same column sit between them. The two front sections (STREAM_DIR,
-    // FIELD_DIR) and every tail section are absorbed by the probe and the 64 MiB
-    // cache. No whole-object GET anywhere.
-    assert_eq!(q37.gets, 72, "q37: exact GET count with no eviction");
+    // Exact GET count, 56 per 8 segments, 7 per segment:
+    // - the plan probe;
+    // - FIELD_DIR alone, which the plan phase reads to resolve the numeric arm
+    //   and caches under its own key;
+    // - STREAM_DIR alone, the scan's front-section GET: FIELD_DIR is served
+    //   from the plan's cache entry, so the combined front GET (ADR-2066
+    //   decision 1) has only STREAM_DIR left to fetch;
+    // - 4 chunk runs. Under version 4 the surviving block's bytes are one page
+    //   per projected column chunk of its row group. At gap 0 they form 6
+    //   disjoint runs per segment, because the pruned blocks' pages for the
+    //   same column sit between them, and the L0 cap
+    //   (`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`) bridges the two smallest gaps
+    //   to leave 4.
+    // Every tail section is absorbed by the probe. No whole-object GET anywhere.
+    assert_eq!(q37.gets, 56, "q37: exact GET count with no eviction");
     assert_eq!(
         q37.blocks_scanned, SEGMENTS,
         "q37 decodes exactly one block per segment"
@@ -965,16 +971,18 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q37.bytes,
         q37_block_bytes
     );
-    // 165,365 = 99,157 page bytes (the 8 surviving blocks' pages across their
-    // eight column chunks; blocks differ slightly in encoded size -- segment
-    // 0's surviving block also carries `MARKER_RARE` -- so the term is the
-    // measured sum, not blocks x a constant) + 65,536 probe bytes (8 x 8 KiB)
-    // + 672 front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR 22)). The page
-    // term is 15% of the full scan; the probe term is the fixed per-object
-    // directory cost, which on this deliberately tiny fixture is 40% of the
-    // total and on a production 1.3 MB object is a rounding error.
+    // 165,445 = 99,237 chunk-run bytes + 65,536 probe bytes (8 x 8 KiB) + 672
+    // front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR 22)). The chunk-run
+    // term is 99,157 page bytes (the 8 surviving blocks' pages; blocks differ
+    // slightly in encoded size -- segment 0's surviving block also carries
+    // `MARKER_RARE` -- so the term is the measured sum, not blocks x a
+    // constant) plus 80 bridged gap bytes: the L0 cap merges each segment's
+    // two smallest gaps, 5 bytes each. The chunk-run term is 15% of the full
+    // scan; the probe term is the fixed per-object directory cost, which on
+    // this deliberately tiny fixture is 40% of the total and on a production
+    // 1.3 MB object is a rounding error.
     assert_eq!(
-        q37.bytes, 165_365,
+        q37.bytes, 165_445,
         "q37 moves the surviving blocks' page bytes plus the probe and the two \
          front sections, not the object"
     );
@@ -993,11 +1001,13 @@ async fn selective_numeric_reads_only_surviving_blocks() {
     );
     assert_eq!(q20.full_gets, 0, "q20: no whole-object GET");
     assert_eq!(q20.plan_full_reads, 0, "q20: skip-index plan");
-    // Same shape as q37: 8 probes plus 8 chunk ranges per segment. q20's second
-    // surviving block per segment is ADJACENT to the first, so its page sits
-    // next to the first's in every chunk and the pair coalesces even at gap 0 --
-    // the range count is unchanged and only the bytes grow.
-    assert_eq!(q20.gets, 72, "q20: exact GET count with no eviction");
+    // Same shape as q37, 56: per segment the probe, FIELD_DIR, STREAM_DIR and
+    // 4 chunk runs. q20's second surviving block per segment is ADJACENT to
+    // the first, so its page sits next to the first's in every chunk and the
+    // pair coalesces even at gap 0 -- still 6 runs per segment before the L0
+    // cap bridges them to 4, so the range count is unchanged and only the
+    // bytes grow.
+    assert_eq!(q20.gets, 56, "q20: exact GET count with no eviction");
     assert_eq!(
         q20.blocks_scanned,
         SEGMENTS * 2,
@@ -1015,12 +1025,14 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q20.bytes,
         q20_block_bytes
     );
-    // 264,415 = 198,207 page bytes (16 surviving blocks) + the same 65,536 probe
-    // and 672 front-section bytes q37 pays: twice q37's page term, identical
-    // fixed term.
+    // 264,479 = 198,271 chunk-run bytes + the same 65,536 probe and 672
+    // front-section bytes q37 pays. The chunk-run term is 198,207 page bytes
+    // (16 surviving blocks) plus 64 bridged gap bytes: the L0 cap merges each
+    // segment's two smallest gaps, 4 bytes each. About twice q37's page term,
+    // identical fixed term.
     assert_eq!(
-        q20.bytes, 264_415,
-        "q20 moves twice q37's page bytes and the same fixed directory bytes"
+        q20.bytes, 264_479,
+        "q20 moves about twice q37's page bytes and the same fixed directory bytes"
     );
     assert!(
         q20.bytes <= full.bytes * 3 / 5,
@@ -1109,10 +1121,10 @@ async fn text_predicate_falls_back_to_full_object_read() {
 }
 
 /// The q20 shape under a cache too small to hold the working set: eviction can
-/// only add reads, but with #761 each surviving block is read at most once per
-/// scan, so the GET count does NOT multiply by the partition count the way the
-/// pre-fix whole-object re-reads did. Bounds the per-segment scan reads rather
-/// than pinning a single eviction-dependent figure.
+/// only add reads, but with #761 no read is a whole object, so the bytes do NOT
+/// multiply by the partition count the way the pre-fix whole-object re-reads
+/// did. A surviving block's chunk runs can still be fetched once per partition
+/// that owns one of the blocks they span; the exact bytes below count that.
 #[tokio::test]
 async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     let big = measure("q20_big_cache", &[code_le(1)], 64 << 20).await;
@@ -1146,31 +1158,42 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     );
 
     // The decisive #761 bound: the bytes never reach even a single full scan of
-    // the objects. Each surviving block is owned by exactly one partition (the
-    // ADR-0102 stripe) and the plan phase decodes no block, so every surviving
-    // block is read once regardless of eviction; only the small directory
-    // sections are ever re-fetched. So the 17.9 GB > 11.1 GB whole-object
-    // re-read amplification the reproduction showed (bytes ~ 3x the object
-    // bytes) is gone: bytes stay below one full pass. Bytes, not GET count, is
-    // pinned here -- the raw GET count under eviction is scheduling-dependent,
-    // but no GET is ever a whole-object read (asserted above), so partitions
-    // cannot multiply the object bytes.
+    // the objects. The plan phase decodes no block and no GET is a
+    // whole-object read (asserted above), so what eviction re-fetches is
+    // directory extents and the surviving blocks' chunk runs, not whole
+    // objects. So the 17.9 GB > 11.1 GB whole-object re-read amplification the
+    // reproduction showed (bytes ~ 3x the object bytes) is gone: bytes stay
+    // below one full pass.
     let full = measure("full_scan", &[], 64 << 20).await;
     assert!(
         small.bytes < full.bytes,
-        "q20 under pressure moves fewer bytes than a full scan ({} vs {}): each \
-         surviving block is read once, none of the pruned blocks at all",
+        "q20 under pressure moves fewer bytes than a full scan ({} vs {}): \
+         no whole-object read, only directory and chunk-run re-fetches",
         small.bytes,
         full.bytes
     );
-    // 264,415 with no eviction (16 surviving blocks' page bytes plus the fixed
-    // probe and front-section bytes) against 479,157 under pressure: the
-    // difference is re-fetched probe and directory extents, never a re-read
-    // page. Both stay under the 649,903 a single full pass moves.
-    assert_eq!(big.bytes, 264_415, "q20 with no eviction");
+    // 264,479 with no eviction: the figure
+    // `selective_numeric_reads_only_surviving_blocks` decomposes for q20.
+    //
+    // 479,269 under pressure =
+    //   65,536 (8 plan probes, 8 KiB each)
+    // + 65,536 (8 probe-window range re-reads of an evicted tail, 8 KiB each)
+    // +    176 (8 plan FIELD_DIR GETs, 22 each)
+    // +    672 (8 combined STREAM_DIR+FIELD_DIR front GETs, 84 each, where
+    //           eviction left both sections cold)
+    // +    372 (6 lone STREAM_DIR front GETs, 62 each)
+    // + 346,977 (56 chunk-run GETs: 14 sets of 4 runs, because 6 of the 8
+    //           segments have their runs fetched twice -- the two partitions
+    //           owning that segment's two surviving blocks each read runs that
+    //           span both blocks' pages, and the first copy is evicted before
+    //           the second read; each set carries its segment's 8 bridged gap
+    //           bytes).
+    // Pages are re-read under pressure, so the bound is one full pass, not
+    // the no-eviction figure: both stay under the 649,903 a full pass moves.
+    assert_eq!(big.bytes, 264_479, "q20 with no eviction");
     assert_eq!(
-        small.bytes, 479_157,
-        "q20 under eviction: more directory re-reads, still under one full pass"
+        small.bytes, 479_269,
+        "q20 under eviction: directory and chunk-run re-reads, still under one full pass"
     );
 }
 
