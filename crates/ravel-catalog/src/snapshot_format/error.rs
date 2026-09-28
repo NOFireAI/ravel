@@ -287,4 +287,9 @@ pub enum SnapshotFormatError {
     /// amount and an AVG wrong in both terms.
     #[error("column-stats column {name:?} has no non-null values but carries sum {sum}")]
     ColumnStatsSumWithoutValues { name: String, sum: i64 },
+
+    /// The read CPU gate produced no result for this decode (ADR-1702
+    /// decision 2): the job panicked, or the runtime dropped it.
+    #[error("decode job on the read CPU gate failed: {0}")]
+    DecodeJob(ravel_cpu_gate::CpuGateError),
 }

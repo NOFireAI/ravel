@@ -4614,6 +4614,7 @@ dependencies = [
  "prost",
  "ravel-cache",
  "ravel-commit",
+ "ravel-cpu-gate",
  "ravel-logseg",
  "ravel-memory",
  "ravel-object-store",

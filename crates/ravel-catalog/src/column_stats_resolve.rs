@@ -55,6 +55,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use prost::Message;
+use ravel_cpu_gate::ReadSite;
 use ravel_object_store::StoreError;
 use ravel_proto::catalog::v1::{ColumnStatsSegment, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
@@ -62,6 +63,7 @@ use ravel_types::{Signal, TenantHash};
 use crate::EntryIdentity;
 use crate::charged::reserve_decoded;
 use crate::provisioning::AccountedRecordGet;
+use crate::read_gate::run_snapshot_decode;
 use crate::snapshot_format::{
     ColumnStatsLimits, SnapshotFormatError, decode_column_stats, decode_column_stats_header,
     decode_head,
@@ -364,6 +366,7 @@ pub(crate) async fn fetch_stats_object(
     tenant: &TenantHash,
     resolved: &ResolvedStatsRef,
     budget: &Arc<ravel_memory::MemoryBudget>,
+    gate: Option<&ravel_cpu_gate::ReadGate>,
 ) -> Result<FetchOutcome, LoadColumnStatsError> {
     let data = match getter.accounted_get_full(&resolved.key).await {
         Ok(got) => got.data,
@@ -441,7 +444,14 @@ pub(crate) async fn fetch_stats_object(
         header.body_uncompressed_len,
         limits.max_column_stats_bytes,
     )?;
-    let decoded = match decode_column_stats(&data, &limits) {
+    let (decoded, reservation) = match run_snapshot_decode(
+        gate,
+        ReadSite::CatalogColumnStats,
+        header.body_uncompressed_len,
+        move || decode_column_stats(&data, &limits).map(|decoded| (decoded, reservation)),
+    )
+    .await
+    {
         Ok(decoded) => decoded,
         // Decode of an object the ref points at: the fold wrote it, so a
         // failure to open it is never the ordinary not-covered case. Surface

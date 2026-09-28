@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 use ravel_commit::{keys, signal};
+use ravel_cpu_gate::ReadSite;
 use ravel_object_store::{GetRange, StoreError};
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead};
 use ravel_types::accounting::QueryAccounting;
@@ -31,6 +32,7 @@ use crate::declared_stats::{self, DeclaredColumnStats};
 use crate::error::CatalogError;
 use crate::fold::head_object_key;
 use crate::provisioning::{ShardGeneration, shard_ceiling};
+use crate::read_gate::run_snapshot_decode;
 use crate::snapshot::{SegmentLevel, SegmentRef};
 use crate::snapshot_format::{self, PartLimits, PostingsLimits};
 
@@ -565,9 +567,19 @@ impl Catalog {
         // unpruned scan it would fall back to holds more memory, not less.
         let reservation =
             self.reserve_decoded(header.body_uncompressed_len, limits.max_postings_bytes)?;
-        let decoded = match snapshot_format::decode_postings(&data, &limits, &expected_part_blake3)
+        let stored_len = data.len() as u64;
+        let decoded = match run_snapshot_decode(
+            self.read_gate(),
+            ReadSite::CatalogPostings,
+            header.body_uncompressed_len,
+            move || {
+                snapshot_format::decode_postings(&data, &limits, &expected_part_blake3)
+                    .map(|decoded| Charged::new(decoded, reservation))
+            },
+        )
+        .await
         {
-            Ok(decoded) => Charged::new(decoded, reservation),
+            Ok(decoded) => decoded,
             Err(err) => {
                 tracing::warn!(error = %err, key = %postings_ref.key, "postings failed to decode, pruning disabled");
                 return Ok(None);
@@ -584,7 +596,7 @@ impl Catalog {
             *tenant,
             postings_ref.key.clone(),
             decoded.clone(),
-            data.len() as u64,
+            stored_len,
             self.config().postings_cache_entries,
         );
         Ok(Some(decoded))
@@ -866,8 +878,19 @@ impl Catalog {
             Ok(reservation) => reservation,
             Err(err) => return OnePartOutcome::MemoryExhausted(err),
         };
-        let decoded = match snapshot_format::decode_part(&data, &limits) {
-            Ok(decoded) => Arc::new(Charged::new(decoded, reservation)),
+        let stored_len = data.len() as u64;
+        let decoded = match run_snapshot_decode(
+            self.read_gate(),
+            ReadSite::CatalogPart,
+            header.entries_uncompressed_len,
+            move || {
+                snapshot_format::decode_part(&data, &limits)
+                    .map(|decoded| Charged::new(decoded, reservation))
+            },
+        )
+        .await
+        {
+            Ok(decoded) => Arc::new(decoded),
             Err(err) => {
                 tracing::warn!(error = %err, key = %part_ref.key, "snapshot part failed to decode, falling back to listing");
                 return OnePartOutcome::Unusable;
@@ -877,7 +900,7 @@ impl Catalog {
             *tenant,
             part_ref.key.clone(),
             decoded.clone(),
-            data.len() as u64,
+            stored_len,
             self.config().snapshot_cache_parts,
         );
         OnePartOutcome::Loaded(decoded)

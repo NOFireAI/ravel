@@ -18,6 +18,7 @@ mod fold;
 mod key_epoch;
 mod metrics_meta;
 mod provisioning;
+mod read_gate;
 mod seal_divergence;
 mod snapshot;
 mod snapshot_format;
@@ -72,7 +73,7 @@ pub use metrics_meta::{
     METRICS_META_FORMAT_VERSION, METRICS_META_MAX_READ_VERSION, METRICS_META_MIN_READ_VERSION,
     MergeOutcome, MetricKind, MetricMetadataEntry, MetricsMetaDefect, MetricsMetaError,
     merge_entries, metrics_meta_key, read_metrics_meta, read_metrics_meta_for_serve,
-    write_metrics_meta,
+    read_metrics_meta_for_serve_on_gate, read_metrics_meta_on_gate, write_metrics_meta,
 };
 pub use provisioning::{
     AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, FLUSH_BOUND_SLACK_HOURS, FloorBasis, FloorDefect,
