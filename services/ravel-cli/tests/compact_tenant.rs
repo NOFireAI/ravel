@@ -2003,7 +2003,7 @@ async fn compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it() {
     let text = run(false, claiming()).await;
     assert!(
         text.contains(&format!(
-            "\noutcome: ClaimSkipped (another process holds this bucket's compaction claim; \
+            "\noutcome: ClaimSkipped (this bucket's compaction claim was not taken; \
              nothing was merged) reason=held_by_another work_id={} holder={foreign} \
              claim_expiry_unix_ms={} retry_after_unix_ms={}\n",
             work_id_hex(CLAIMED_SHARD, HOUR_OLD),

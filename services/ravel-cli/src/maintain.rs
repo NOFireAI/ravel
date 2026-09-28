@@ -346,8 +346,8 @@ pub async fn compact_to(
         ClaimedCompaction::SkippedClaimed(skip) => {
             writeln!(
                 out,
-                "outcome: ClaimSkipped (another process holds this bucket's compaction \
-                 claim; nothing was merged) {}",
+                "outcome: ClaimSkipped (this bucket's compaction claim was not taken; \
+                 nothing was merged) {}",
                 claim_skip_fields(&skip)
             )?;
             return Ok(());
