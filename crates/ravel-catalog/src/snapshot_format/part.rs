@@ -108,6 +108,35 @@ pub fn encode_part_ranged(
     Ok(out)
 }
 
+/// Reads only a part's header, without checking either crc or touching the
+/// body, so a caller can reserve `entries_uncompressed_len` before
+/// [`decode_part`] decompresses it. The caller must already have verified
+/// `bytes` against the part ref's blake3; every failure is still a typed
+/// error. `decode_part` re-reads and fully validates the same header, so this
+/// never widens what is accepted.
+pub fn decode_part_header(bytes: &[u8]) -> Result<SnapshotPartHeader, SnapshotFormatError> {
+    if bytes.len() < MIN_ENVELOPE_LEN {
+        return Err(SnapshotFormatError::TooSmall { size: bytes.len() });
+    }
+    let mut pos = 0usize;
+    let magic = take_array::<4>(bytes, &mut pos)?;
+    if magic != MAGIC {
+        return Err(SnapshotFormatError::BadMagic);
+    }
+    let version = take_bytes(bytes, &mut pos, 1)?[0];
+    if version != VERSION {
+        return Err(SnapshotFormatError::UnsupportedVersion(version));
+    }
+    let reserved = take_array::<3>(bytes, &mut pos)?;
+    if reserved != RESERVED {
+        return Err(SnapshotFormatError::ReservedNonZero);
+    }
+    let header_len = take_u32_le(bytes, &mut pos)?;
+    let header_bytes = take_bytes(bytes, &mut pos, to_usize(header_len)?)?;
+    SnapshotPartHeader::decode(header_bytes)
+        .map_err(|e| SnapshotFormatError::HeaderDecode(e.to_string()))
+}
+
 /// Decodes and fully validates a snapshot part. Every byte is untrusted;
 /// every failure is a typed error, never a panic.
 pub fn decode_part(bytes: &[u8], limits: &PartLimits) -> Result<DecodedPart, SnapshotFormatError> {
@@ -301,4 +330,53 @@ fn take_u32_le(bytes: &[u8], pos: &mut usize) -> Result<u32, SnapshotFormatError
 
 fn take_u64_le(bytes: &[u8], pos: &mut usize) -> Result<u64, SnapshotFormatError> {
     Ok(u64::from_le_bytes(take_array::<8>(bytes, pos)?))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn entry(seq: u64) -> SnapshotEntry {
+        SnapshotEntry {
+            level: 0,
+            ingest_hour_bucket: 5,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: seq,
+            content_hash: vec![seq as u8; 32],
+            object_size: 100,
+            ..SnapshotEntry::default()
+        }
+    }
+
+    /// The header peek reads exactly the header `decode_part` validates, so
+    /// the length the resolve reserves is the length the decode allocates.
+    #[test]
+    fn header_peek_matches_the_full_decode() {
+        let bytes = encode_part([7; 16], 1, 1, 10, &[entry(1), entry(2)]).expect("encode");
+        let peeked = decode_part_header(&bytes).expect("peek");
+        let decoded = decode_part(&bytes, &PartLimits::default()).expect("decode");
+        assert_eq!(peeked, decoded.header);
+        assert!(peeked.entries_uncompressed_len > 0);
+    }
+
+    /// The header peek returns on every truncation of a valid part, never
+    /// panics.
+    #[test]
+    fn header_peek_of_any_truncation_never_panics() {
+        let bytes = encode_part([7; 16], 1, 1, 10, &[entry(1)]).expect("encode");
+        for len in 0..bytes.len() {
+            let _ = decode_part_header(&bytes[..len]);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn header_peek_of_arbitrary_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let _ = decode_part_header(&bytes);
+        }
+    }
 }

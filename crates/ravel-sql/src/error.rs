@@ -443,9 +443,14 @@ impl SqlError {
             // A store read that failed (issue #1976: most often AccessDenied
             // on a missing read grant) is not corruption; it redacts to the
             // same transient message a segment store fault does.
-            SqlError::ColumnStats(LoadColumnStatsError::Store { .. }) => {
-                MSG_UNAVAILABLE.to_string()
-            }
+            // A memory-budget refusal is not corruption either: it carries
+            // only the budget's three figures, and retrying under less
+            // pressure can succeed, so it redacts to the same transient
+            // message `CatalogError::MemoryExhausted` takes through
+            // `redact_catalog`.
+            SqlError::ColumnStats(
+                LoadColumnStatsError::Store { .. } | LoadColumnStatsError::MemoryExhausted(_),
+            ) => MSG_UNAVAILABLE.to_string(),
             SqlError::ColumnStats(_) => MSG_CORRUPT.to_string(),
             SqlError::Fetch(fetch) => match fetch {
                 FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
@@ -586,6 +591,34 @@ mod tests {
         let message = err.client_message();
         assert_eq!(message, MSG_UNAVAILABLE);
         assert_redacted(&message);
+        assert_eq!(err.class(), ErrorClass::Unavailable);
+    }
+
+    /// A column-stats memory-budget refusal (ADR-1702 decision 6) is a
+    /// resource refusal, not corrupt data: the client must get the same
+    /// transient message `CatalogError::MemoryExhausted` produces on the
+    /// catalog path, so a process under memory pressure never tells a caller
+    /// its stored statistics failed integrity validation.
+    ///
+    /// FLIP: drop `LoadColumnStatsError::MemoryExhausted(_)` from the
+    /// `MSG_UNAVAILABLE` arm and the first assertion fails with
+    /// `left: "stored data failed integrity validation"`,
+    /// `right: "upstream storage temporarily unavailable"`.
+    #[test]
+    fn column_stats_memory_refusal_redacts_to_unavailable_not_corrupt() {
+        let exhausted = ravel_memory::MemoryExhausted {
+            requested: 4096,
+            reserved: 1024,
+            limit: 2048,
+        };
+        let err = SqlError::ColumnStats(LoadColumnStatsError::MemoryExhausted(exhausted));
+        assert_eq!(err.client_message(), MSG_UNAVAILABLE);
+        assert_eq!(
+            SqlError::Catalog(CatalogError::MemoryExhausted(exhausted)).client_message(),
+            err.client_message(),
+            "the two decode refusals answer a client the same way"
+        );
+        assert_redacted(&err.client_message());
         assert_eq!(err.class(), ErrorClass::Unavailable);
     }
 

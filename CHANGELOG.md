@@ -77,6 +77,46 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Catalog and PromQL decodes reserve their decoded output against the
+  process memory budget before they run** (ADR-1702 decision 6, issue #1702).
+  The catalog resolve reserves each snapshot part's, postings object's and
+  column-statistics object's header-declared uncompressed length, and the
+  reservation stays with the decoded value, in the decoded-part and postings
+  caches included, until it is dropped; the column-statistics reservation is
+  released when `load_column_stats` returns, since the loaded statistics do
+  not carry it. The PromQL fetcher reserves a segment's catalog sections
+  before `decode_selected` or `decode_sparse_catalog` decodes them, and the
+  `/api/v1/metadata` cache reserves a record's declared decompressed size. A
+  reservation that does not fit fails the read with a typed error
+  (`CatalogError::MemoryExhausted`, `LoadColumnStatsError::MemoryExhausted`,
+  `FetchMemoryExhausted`, `MetricsMetaError::MemoryExhausted`); a catalog
+  refusal never falls back to a listing pass, and a column-statistics refusal
+  reaches a SQL client as the same transient 503 a store fault does, never as
+  corrupt data. **The segment fetcher's reservations are live in a running
+  server now** wherever it runs under the process budget: PromQL evaluation,
+  cache warming and distributed query fragments, so a read whose catalog
+  decode does not fit is refused with 503 rather than decoding uncharged. The
+  SQL query path's fetchers still reserve against their own unlimited budget,
+  so a SQL scan's catalog decode is charged but never refused yet. The
+  catalog and the metadata cache take the budget through the new
+  `Catalog::with_memory_budget` and `MetadataCache::with_memory_budget`, and
+  both still default to an unlimited budget, so the part, postings,
+  column-statistics and metadata reservations refuse nothing until the server
+  wires the real budget into them. `read_metrics_meta_for_serve` now takes the
+  budget and returns the reservation alongside the entries.
+
+  A chunked (sparse) segment's catalog is charged what it inflates to, not
+  what it stores: SERIES_META_CHUNKS carries no section-level compression, so
+  its footer `uncompressed_len` is the stored zstd frames, and the reservation
+  instead sums the SERIES_IDX chunk directory's `frame_uncompressed_len`. Once
+  the matchers have run, the whole-catalog reservation is exchanged for one
+  sized to the entries that survived, so a selective query does not hold the
+  whole catalog's charge through its page fetches; the exchange never fails a
+  read, and a refused one keeps the whole-catalog reservation. A snapshot
+  part's tenant check, and a column-statistics object's tenant, version and
+  part-binding checks, now run before the reservation, so a cross-tenant object
+  is still reported as an isolation breach, and a stale-bound statistics object
+  still degrades to no statistics, under a budget too small to decode it.
 - **The `ravel-operator` Deployment itself now has a securityContext, a
   metrics/health HTTP surface, and liveness/readiness probes** (issues #1731
   and #1923). Its own Pod and container now carry the same hardened

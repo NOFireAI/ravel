@@ -41,7 +41,7 @@ use ravel_proto::commit::v1::{CommitRecord, CompactionRecord};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash};
 
-use crate::snapshot_format::{DecodedPart, DecodedPostings};
+use crate::charged::{ChargedPart, ChargedPostings};
 
 /// Charged cost of one cached commit entry beyond its variable-length
 /// members: the `CommitRecord` struct (about 224 bytes of scalars and
@@ -613,13 +613,13 @@ impl HeadCache {
 
 #[derive(Default)]
 struct PartTenantCache {
-    entries: HashMap<String, (Arc<DecodedPart>, u64)>,
+    entries: HashMap<String, (Arc<ChargedPart>, u64)>,
     /// Insertion order, oldest first, for capacity-cap eviction.
     order: std::collections::VecDeque<String>,
 }
 
 impl PartTenantCache {
-    fn insert(&mut self, key: String, part: Arc<DecodedPart>, bytes: u64, capacity: usize) {
+    fn insert(&mut self, key: String, part: Arc<ChargedPart>, bytes: u64, capacity: usize) {
         if self.entries.contains_key(&key) {
             return;
         }
@@ -647,7 +647,7 @@ impl PartCache {
         tenant: &TenantHash,
         key: &str,
         accounting: &QueryAccounting,
-    ) -> Option<Arc<DecodedPart>> {
+    ) -> Option<Arc<ChargedPart>> {
         let hit = self
             .tenants
             .lock()
@@ -670,7 +670,7 @@ impl PartCache {
         &self,
         tenant: TenantHash,
         key: String,
-        part: Arc<DecodedPart>,
+        part: Arc<ChargedPart>,
         bytes: u64,
         capacity: usize,
     ) {
@@ -692,13 +692,13 @@ impl PartCache {
 
 #[derive(Default)]
 struct PostingsTenantCache {
-    entries: HashMap<String, (Arc<DecodedPostings>, u64)>,
+    entries: HashMap<String, (Arc<ChargedPostings>, u64)>,
     /// Insertion order, oldest first, for capacity-cap eviction.
     order: std::collections::VecDeque<String>,
 }
 
 impl PostingsTenantCache {
-    fn insert(&mut self, key: String, postings: Arc<DecodedPostings>, bytes: u64, capacity: usize) {
+    fn insert(&mut self, key: String, postings: Arc<ChargedPostings>, bytes: u64, capacity: usize) {
         if self.entries.contains_key(&key) {
             return;
         }
@@ -726,7 +726,7 @@ impl PostingsCache {
         tenant: &TenantHash,
         key: &str,
         accounting: &QueryAccounting,
-    ) -> Option<Arc<DecodedPostings>> {
+    ) -> Option<Arc<ChargedPostings>> {
         let hit = self
             .tenants
             .lock()
@@ -749,7 +749,7 @@ impl PostingsCache {
         &self,
         tenant: TenantHash,
         key: String,
-        postings: Arc<DecodedPostings>,
+        postings: Arc<ChargedPostings>,
         bytes: u64,
         capacity: usize,
     ) {
@@ -783,6 +783,8 @@ mod tests {
     use ravel_types::accounting::AccountedOp;
 
     use super::*;
+    use crate::charged::Charged;
+    use crate::snapshot_format::{DecodedPart, DecodedPostings};
     use crate::{Catalog, CatalogConfig};
 
     fn record(tenant_hash: [u8; 16], shard: u32) -> CommitRecord {
@@ -1648,7 +1650,13 @@ mod tests {
         let tenant = TenantHash([8; 16]);
         let accounting = QueryAccounting::new();
         assert!(cache.get(&tenant, "k", &accounting).is_none());
-        cache.insert(tenant, "k".to_string(), Arc::new(decoded_part(1)), 9, 10);
+        cache.insert(
+            tenant,
+            "k".to_string(),
+            Arc::new(Charged::for_test(decoded_part(1))),
+            9,
+            10,
+        );
         assert!(cache.get(&tenant, "k", &accounting).is_some());
 
         let snap = accounting.snapshot();
@@ -1663,7 +1671,13 @@ mod tests {
         let tenant = TenantHash([9; 16]);
         let accounting = QueryAccounting::new();
         for i in 0..5 {
-            cache.insert(tenant, format!("k{i}"), Arc::new(decoded_part(1)), 1, 3);
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(Charged::for_test(decoded_part(1))),
+                1,
+                3,
+            );
         }
         assert!(cache.get(&tenant, "k0", &accounting).is_none());
         assert!(cache.get(&tenant, "k1", &accounting).is_none());
@@ -1678,7 +1692,13 @@ mod tests {
         let a = TenantHash([10; 16]);
         let b = TenantHash([11; 16]);
         let accounting = QueryAccounting::new();
-        cache.insert(a, "k".to_string(), Arc::new(decoded_part(1)), 1, 10);
+        cache.insert(
+            a,
+            "k".to_string(),
+            Arc::new(Charged::for_test(decoded_part(1))),
+            1,
+            10,
+        );
         assert!(cache.get(&a, "k", &accounting).is_some());
         assert!(cache.get(&b, "k", &accounting).is_none());
     }
@@ -1707,7 +1727,7 @@ mod tests {
         cache.insert(
             tenant,
             "k".to_string(),
-            Arc::new(decoded_postings()),
+            Arc::new(Charged::for_test(decoded_postings())),
             13,
             10,
         );
@@ -1725,7 +1745,13 @@ mod tests {
         let tenant = TenantHash([13; 16]);
         let accounting = QueryAccounting::new();
         for i in 0..5 {
-            cache.insert(tenant, format!("k{i}"), Arc::new(decoded_postings()), 1, 3);
+            cache.insert(
+                tenant,
+                format!("k{i}"),
+                Arc::new(Charged::for_test(decoded_postings())),
+                1,
+                3,
+            );
         }
         assert!(cache.get(&tenant, "k0", &accounting).is_none());
         assert!(cache.get(&tenant, "k1", &accounting).is_none());
@@ -1740,7 +1766,13 @@ mod tests {
         let a = TenantHash([14; 16]);
         let b = TenantHash([15; 16]);
         let accounting = QueryAccounting::new();
-        cache.insert(a, "k".to_string(), Arc::new(decoded_postings()), 1, 10);
+        cache.insert(
+            a,
+            "k".to_string(),
+            Arc::new(Charged::for_test(decoded_postings())),
+            1,
+            10,
+        );
         assert!(cache.get(&a, "k", &accounting).is_some());
         assert!(cache.get(&b, "k", &accounting).is_none());
     }

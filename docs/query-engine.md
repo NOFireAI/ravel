@@ -749,6 +749,53 @@ reservations in `fetch_blocks`/`fetch_chunk_ranges` are taken after the probe
 and directory-section GETs, so a refusal there aborts a read that has already
 issued those GETs.
 
+**Decoded output (ADR-1702 decision 6).** The PromQL catalog decode is charged
+to the same budget before it runs. `SegmentFetcher::decode_selected` (and
+`decode_sparse_catalog` on the sparse probe path) reserves the footer-declared
+`uncompressed_len` of every catalog section the object carries (LABEL_DICT,
+SERIES_IDS, SERIES_META, SERIES_IDX, SERIES_META_CHUNKS), each clamped to the
+reader's section ceiling, and the guard travels with the decoded entries rather
+than with the fetched regions. A refusal is the same typed
+`FetchMemoryExhausted`.
+
+SERIES_META_CHUNKS is the one section whose footer figure is not what it
+decodes to. It carries no section-level compression, so its `uncompressed_len`
+is the STORED zstd frames' length, while `decode_catalog_v5_chunked` inflates
+every frame and keeps an entry for every series. The reservation therefore uses
+the SERIES_IDX chunk directory's summed `frame_uncompressed_len` for that
+section (the directory is already fetched before the decode on every chunked
+path), falling back to the footer figure only when that directory is not
+readable. On the 4096-series fixture the two differ by an order of magnitude:
+8,599 stored bytes against 90,356 inflated.
+
+Once the matchers have run, `decode_selected` exchanges the whole-catalog
+reservation for one sized to the entries that survived, measured over their
+structs, label strings and runs. A selective query on a large object therefore
+holds a few hundred bytes through its page fetches rather than the whole
+catalog's charge. The exchange only ever shrinks: on an object small enough
+that the decoded entries measure more than the sections they came from, the
+original reservation stands rather than growing into a new refusal point. The
+exchange never fails the query either, since the decode it follows already
+succeeded: the retained reservation is taken before the whole-catalog one is
+released, and a refusal keeps the whole-catalog one. A decode that retained no
+entries releases its reservation and holds none.
+
+**Where these are live.** These catalog-decode reservations are enforced in a
+running server today wherever the segment fetcher runs under the process
+budget: PromQL evaluation (`QueryEngine::with_memory_budget`, wired in
+`ravel-server`), cache warming (`ravel-server`'s `cache_warm.rs`) and
+distributed query fragments (`ravel-server`'s `distrib.rs`). A read whose
+decode does not fit is refused with the 503 `FetchMemoryExhausted` maps to.
+The SQL samples scan reaches the same `decode_selected`, but its fetchers
+reserve against their own unlimited budget (see the SQL-path paragraph
+above), so its decodes are charged and never refused until that fetcher is
+wired to the process budget. The catalog resolve charges its own decodes the same way
+(`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), as does the
+`/api/v1/metadata` cache (`MetadataCache::with_memory_budget`), but both still
+default to an unlimited budget and the server does not yet pass them the real
+one, so those reservations account without refusing. These guards come from the
+same RAII `reserve` API, so they read under `component="fetch"`.
+
 ## Endpoints (Prometheus compatibility subset)
 
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.
@@ -974,7 +1021,8 @@ The PromQL engine's fetchers and the SQL executor share this one budget (see
 "Fetch-layer memory reservations" above), and the two `component` samples
 split its reserved total without double-counting. `component="fetch"` is
 `MemoryBudget::fetch_reserved()`, the bytes held by live `Reservation` guards
-(the fetch layer's RAII `reserve` API). `component="sql"` is
+(the RAII `reserve` API: fetched buffers, plus the decoded catalog output
+described under "Decoded output" above). `component="sql"` is
 `MemoryBudget::sql_reserved()`, the reserved total minus the fetch share,
 which is what the SQL executor's per-tenant accountants hold through the raw
 `try_reserve`/`reserve_unchecked`/`release` API. The two counters are separate

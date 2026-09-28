@@ -174,7 +174,8 @@ rule on thread placement.
    6 and 7), their decoded output is charged to `MemoryBudget`: the
    uncompressed length is known from the descriptor before decode, so the
    caller reserves it and moves the `Reservation` into the gate closure.
-   That is task 5 in the list below.
+   That is task 5 in the list below. (What is reserved, and when it
+   shrinks, is refined by the decoded-output charge amendment below.)
 
 7. **The logs and spans scans get a decode state.** Their decode runs
    inside `poll_next`, so a wrap in place is not possible. Each scan's state
@@ -435,7 +436,8 @@ change, shown by reverting the change under test.
    - A render test pins every new metric name exactly once.
 5. **Charge decoded output on the catalog and PromQL paths**
    (`ravel-catalog`, `ravel-query`). Before each decode the caller reserves
-   the descriptor's uncompressed length against `MemoryBudget`, and the
+   the descriptor's uncompressed length against `MemoryBudget` (see the
+   decoded-output charge amendment below for the chunked and shrink cases), and the
    `Reservation` travels with the decoded buffer. No placement changes yet.
    Acceptance test `catalog_part_decode_reserves_its_output`: with a budget
    smaller than one fixture part's uncompressed length, resolve fails with
@@ -493,3 +495,31 @@ change, shown by reverting the change under test.
     is revisited first, since it binds before the 60 s liveness one. Acceptance test: the default-render test
     from task 3 expects 4316 and the `--listen-health` argument, and the
     release notes carry the image requirement.
+
+## Amendment (2026-09-28): what the decoded-output charge reserves
+
+<!-- amendment-applies: sections="Decision|Follow-up tasks, in order" pointer="decoded-output charge amendment" -->
+
+Task 5 landed with three refinements to decision 6's "the caller reserves the
+descriptor's uncompressed length". None changes where decode runs.
+
+- **A chunked PromQL catalog is charged its inflated size.** A
+  `SERIES_META_CHUNKS` section's footer length is its stored, compressed size,
+  about a tenth of what its decode allocates on a sparse catalog. The charge
+  sums each chunk frame's uncompressed length from the already-fetched and
+  crc-verified `SERIES_IDX` directory, clamped per frame to the reader
+  ceiling, and falls back to the footer figure when that directory is absent,
+  not among the fetched regions, compressed, fails its crc or does not
+  parse.
+- **The PromQL reservation shrinks after the matcher filter.** Once the filter
+  has kept the entries a query needs, the reservation is replaced by one sized
+  to those entries, reserving the smaller amount before releasing the larger
+  and keeping the larger when the smaller is refused. The shrink never fails
+  a read that has already decoded.
+- **Header checks run before any reservation.** A snapshot part has its
+  tenant and envelope version checked on the peeked header (its binding is
+  the blake3 check over its bytes, which runs before either), and a
+  column-statistics object its tenant, format version and part binding,
+  before the body is reserved, so memory
+  pressure never turns a tenant breach or a stale binding into a retryable
+  refusal.
