@@ -1090,6 +1090,20 @@ pub struct Running {
     /// routers so a draining process stops advertising itself to sibling
     /// coordinators.
     query_worker_heartbeat: Option<QueryWorkerHeartbeat>,
+    /// The ADR-1702 runtime heartbeat task, `Some` when [`start`] spawned it.
+    /// A caller of [`start_with_heartbeat`] owns its own task instead. Held
+    /// to the end of [`Running::shutdown`], so the heartbeat keeps beating
+    /// through the drain.
+    runtime_heartbeat_task: Option<AbortOnDrop>,
+}
+
+/// Aborts the task when dropped.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Handle to the ADR-0071 query-worker heartbeat loop, held on [`Running`] so
@@ -1358,6 +1372,7 @@ impl Running {
             shutdown_timeout,
             drain_settle_interval,
             query_worker_heartbeat,
+            runtime_heartbeat_task: _runtime_heartbeat_task,
             // `..` drops the fields with no shutdown behavior: the bound addresses
             // and the `metadata_sink`/`query_service`/`mtls_query_service`
             // handles. The struct has no `Drop`, so they are released here. This
@@ -1916,12 +1931,44 @@ fn warn_distributed_query_once(
 /// stays on the foreground handle: ADR-0070 classes only the ingest/query/
 /// catalog foreground and the maintain/fold/sweep/scrub/audit background, and
 /// in passthrough the choice is immaterial regardless.
+///
+/// Builds the ADR-1702 runtime heartbeat on [`SystemClock`] and spawns its
+/// task on the current runtime; [`Running`] holds the task until shutdown. A
+/// caller that must read the heartbeat before `start` returns (the
+/// `--listen-health` listener) builds it itself and calls
+/// [`start_with_heartbeat`].
 pub async fn start(
+    config: ServerConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    store_background: Arc<dyn ObjectStoreBackend>,
+    store_metrics: Arc<StoreMetrics>,
+    cache: Option<ravel_query::ReadCache>,
+) -> anyhow::Result<Running> {
+    let heartbeat = health_listener::Heartbeat::new(Arc::new(SystemClock));
+    let task = AbortOnDrop(heartbeat.spawn());
+    let mut running = start_with_heartbeat(
+        config,
+        store,
+        store_background,
+        store_metrics,
+        cache,
+        heartbeat,
+    )
+    .await?;
+    running.runtime_heartbeat_task = Some(task);
+    Ok(running)
+}
+
+/// [`start`] with a runtime heartbeat the caller built and beats. `/metrics`
+/// renders its age as `ravel_health_heartbeat_age_seconds`; the caller keeps
+/// its task running until after [`Running::shutdown`].
+pub async fn start_with_heartbeat(
     mut config: ServerConfig,
     store: Arc<dyn ObjectStoreBackend>,
     store_background: Arc<dyn ObjectStoreBackend>,
     store_metrics: Arc<StoreMetrics>,
     cache: Option<ravel_query::ReadCache>,
+    heartbeat: health_listener::Heartbeat,
 ) -> anyhow::Result<Running> {
     // Install the rustls process-level crypto provider before any TLS endpoint
     // is built (ADR-0071 amendment decision 1: the dedicated fragment listener
@@ -2585,6 +2632,7 @@ pub async fn start(
         // `Mode::mounts_on_demand_fold` for the route's mount gate.
         can_fold: config.folds_in_process(),
         fold_loop: fold_loop_metrics.clone(),
+        heartbeat,
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register
@@ -3876,6 +3924,7 @@ pub async fn start(
         shutdown_timeout: config.shutdown_timeout,
         drain_settle_interval: config.drain_settle_interval,
         query_worker_heartbeat,
+        runtime_heartbeat_task: None,
     })
 }
 
