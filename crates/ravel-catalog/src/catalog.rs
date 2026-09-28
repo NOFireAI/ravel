@@ -572,6 +572,13 @@ pub struct Catalog {
     /// `None` in every real production run; read through
     /// [`Catalog::column_stats_part_ceiling`].
     column_stats_part_ceiling_override: Option<u64>,
+    /// The budget each resolve-path decode reserves its declared uncompressed
+    /// length against before decoding (ADR-1702 decision 6). The reservation
+    /// travels with the decoded value, including while the part or postings
+    /// cache holds it. [`Catalog::new`] installs
+    /// [`ravel_memory::MemoryBudget::unlimited`], so nothing is refused until a
+    /// caller installs a finite budget with [`Catalog::with_memory_budget`].
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -748,7 +755,32 @@ impl Catalog {
             warned_decode_failures: Mutex::new(HashSet::new()),
             column_stats_decode_refusals: AtomicU64::new(0),
             column_stats_part_ceiling_override: None,
+            memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         })
+    }
+
+    /// Charge this catalog's decoded snapshot parts, postings and
+    /// column-statistics objects to a caller-owned
+    /// [`ravel_memory::MemoryBudget`] (ADR-1702 decision 6), the same `Arc` the
+    /// query engine's fetchers reserve from. A decode whose declared
+    /// uncompressed length does not fit fails its resolve with
+    /// [`CatalogError::MemoryExhausted`] (or
+    /// [`LoadColumnStatsError::MemoryExhausted`]). Call it before the catalog
+    /// serves a read: parts already cached stay charged to the budget they were
+    /// decoded under.
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// [`crate::charged::reserve_decoded`] against this catalog's budget.
+    pub(crate) fn reserve_decoded(
+        &self,
+        declared: u64,
+        ceiling: u64,
+    ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+        crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
     }
 
     /// Enable durable `shard_count` enforcement on the resolve path (ADR-0050
@@ -1419,13 +1451,27 @@ impl Catalog {
         let mut by_content_hash: HashMap<[u8; 32], ravel_proto::catalog::v1::ColumnStatsSegment> =
             HashMap::new();
 
+        // Each decoded object's reservation (ADR-1702 decision 6), held until
+        // the merged result is built. `LoadedColumnStats` has no slot to carry
+        // them past this call, so the merged value is uncharged once returned;
+        // when the column-stats cache is enabled, its own byte budget bounds
+        // the cached copy.
+        let mut reservations = Vec::new();
         for part in &covered {
             // No field-7 ref at all: the part is simply left uncovered.
             if let Some(resolved) = column_stats_resolve::resolve_part_stats_ref(part) {
-                match column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await? {
-                    column_stats_resolve::FetchOutcome::Loaded(decoded) => {
+                match column_stats_resolve::fetch_stats_object(
+                    &getter,
+                    tenant,
+                    &resolved,
+                    &self.memory_budget,
+                )
+                .await?
+                {
+                    column_stats_resolve::FetchOutcome::Loaded(decoded, reservation) => {
                         segments.extend(decoded.segments);
                         by_content_hash.extend(decoded.by_content_hash);
+                        reservations.push(reservation);
                     }
                     // Store read or stale binding: this part is simply
                     // left uncovered, silently.
@@ -8467,13 +8513,15 @@ mod tests {
     /// content hash changing with `value`. The object keys are namespaced by
     /// tenant hex and signal prefix so distinct `(tenant, signal)` installs
     /// never collide in one store.
+    /// Returns the installed object's declared `body_uncompressed_len`, the
+    /// figure `fetch_stats_object` reserves before decoding it.
     async fn install_stats(
         store: &MemoryStore,
         tenant: TenantHash,
         signal: Signal,
         part_hash: [u8; 32],
         value: i64,
-    ) {
+    ) -> u64 {
         let signal_num = signal::to_proto(signal) as u32;
         let prefix = signal.key_prefix();
 
@@ -8558,12 +8606,18 @@ mod tests {
             )
             .await
             .expect("put head");
+
+        crate::snapshot_format::decode_column_stats_header(&stats_bytes)
+            .expect("the object this helper just wrote has a readable header")
+            .header
+            .body_uncompressed_len
     }
 
     /// [`install_stats`] for the default [`tenant`] on `Signal::Logs`, the
-    /// fixture the issue #888 reuse tests were written against.
-    async fn install_logs_stats(store: &MemoryStore, part_hash: [u8; 32], value: i64) {
-        install_stats(store, tenant(), Signal::Logs, part_hash, value).await;
+    /// fixture the issue #888 reuse tests were written against. Returns the
+    /// installed object's declared `body_uncompressed_len`.
+    async fn install_logs_stats(store: &MemoryStore, part_hash: [u8; 32], value: i64) -> u64 {
+        install_stats(store, tenant(), Signal::Logs, part_hash, value).await
     }
 
     /// The exact I64 `status` value carried by the one segment of a loaded
@@ -10691,5 +10745,499 @@ mod tests {
         );
         let v1_gets = store.get_keys().iter().filter(|k| *k == &v1_key).count();
         assert_eq!(v1_gets, 0, "the field-11 object is never fetched");
+    }
+
+    /// One sealed hour folded into a snapshot (HEAD plus one part), for the
+    /// decode-reservation tests. Returns the store, a window served from that
+    /// part, its `now_ns`, and the part's declared `entries_uncompressed_len`
+    /// read straight off the stored object.
+    async fn folded_one_part_fixture() -> (Arc<MemoryStore>, TimeRange, i64, u64) {
+        let store = Arc::new(MemoryStore::new());
+        let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        let sealed_hour = 500_000u32;
+        let created = (i64::from(sealed_hour) + 1) * NS_PER_HOUR - 1_000;
+        publish_segment(&store, 0, 1, sealed_hour, created, created - 1_000, created).await;
+        let now_ns = (i64::from(sealed_hour) + 1) * NS_PER_HOUR + fold_margin;
+        Catalog::new(store.clone(), config(1))
+            .expect("fold catalog")
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold produces a snapshot HEAD");
+
+        let head_bytes = store
+            .get(
+                &crate::fold::head_object_key(&tenant(), Signal::Metrics),
+                GetRange::Full,
+            )
+            .await
+            .expect("HEAD present")
+            .data;
+        let head = crate::snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
+        assert_eq!(head.parts.len(), 1, "the fixture folds exactly one part");
+        let part_bytes = store
+            .get(&head.parts[0].key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        let declared = crate::snapshot_format::decode_part_header(&part_bytes)
+            .expect("part header decodes")
+            .entries_uncompressed_len;
+        assert!(declared > 1, "the fixture part has a non-trivial body");
+
+        let range = TimeRange {
+            start_ns: i64::from(sealed_hour) * NS_PER_HOUR,
+            end_ns: (i64::from(sealed_hour) + 1) * NS_PER_HOUR - 1,
+        };
+        (store, range, now_ns, declared)
+    }
+
+    /// ADR-1702 follow-up task 5 acceptance: with a budget one byte smaller
+    /// than the fixture part's declared uncompressed length, the resolve fails
+    /// with the typed budget error naming exactly that length, and never falls
+    /// back to listing.
+    ///
+    /// FLIP: replace the `reserve_decoded` match in `load_one_part`
+    /// (snapshot_resolve.rs) with a reservation that is never made, and this
+    /// resolve succeeds from the part, so `expect_err` fails.
+    #[tokio::test]
+    async fn catalog_part_decode_reserves_its_output() {
+        let (store, range, now_ns, declared) = folded_one_part_fixture().await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+
+        let err = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("a part whose decoded body does not fit the budget must fail the resolve");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, declared, "the part's declared length");
+                assert_eq!(exhausted.reserved, 0);
+                assert_eq!(exhausted.limit, declared - 1);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a refused reservation charges nothing"
+        );
+    }
+
+    /// ADR-0050 §2 against ADR-1702 decision 6: a snapshot part whose own
+    /// header names another tenant is an isolation breach, and it stays one
+    /// under a budget with no room to decode that part. `load_one_part` reads
+    /// the tenant off the peeked header BEFORE it reserves, the same order
+    /// `load_snapshot_postings` uses, so a memory refusal can never stand in
+    /// for the breach and leave it (and `isolation_breaches()`) unreported.
+    ///
+    /// FLIP: move the tenant check back below the `reserve_decoded` call in
+    /// `load_one_part` (snapshot_resolve.rs) and this resolve fails with
+    /// `CatalogError::MemoryExhausted` instead, so the match below panics with
+    /// "expected a tenant_hash FieldMismatch, got MemoryExhausted(...)" and
+    /// `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn a_foreign_tenant_part_is_a_breach_even_under_a_budget_too_small_to_decode_it() {
+        let (store, range, now_ns, declared) = folded_one_part_fixture().await;
+        let head_key = crate::fold::head_object_key(&tenant(), Signal::Metrics);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+        let mut head = crate::snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
+        let part_key = head.parts[0].key.clone();
+        let part_bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        let part = crate::snapshot_format::decode_part(
+            &part_bytes,
+            &crate::snapshot_format::PartLimits::default(),
+        )
+        .expect("the fixture part decodes");
+
+        // The same entries under a foreign tenant_hash, re-pointed from the
+        // HEAD so the blake3 gate that runs before the header check passes and
+        // the header check is what the part reaches.
+        let foreign = crate::snapshot_format::encode_part_ranged(
+            [0xff; 16],
+            part.header.signal,
+            part.header.shard_count,
+            part.header.min_hour,
+            part.header.watermark_hour,
+            &part.entries,
+        )
+        .expect("re-encode the fixture part for a foreign tenant");
+        head.parts[0].blake3 = blake3::hash(&foreign).as_bytes().to_vec();
+        head.parts[0].size = foreign.len() as u64;
+        store
+            .put(&part_key, Bytes::from(foreign), PutOptions::default())
+            .await
+            .expect("put the foreign part");
+        let rewritten = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(&head_key, Bytes::from(rewritten), PutOptions::default())
+            .await
+            .expect("put the re-pointed HEAD");
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let err = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("a part naming a foreign tenant must hard-fail the resolve");
+        match err {
+            CatalogError::FieldMismatch { field, key, .. } => {
+                assert_eq!(field, "tenant_hash");
+                assert_eq!(key, part_key);
+            }
+            other => panic!("expected a tenant_hash FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            catalog.isolation_breaches(),
+            1,
+            "the breach is counted, not swallowed by the budget refusal"
+        );
+        assert_eq!(budget.reserved(), 0, "nothing was reserved for the part");
+    }
+
+    /// A successful resolve charges exactly the part's declared length while
+    /// the decoded part is alive (the part cache holds it, and a second resolve
+    /// served from that cache charges nothing more), and returns the budget to
+    /// exactly its starting figure once the decoded part is dropped.
+    #[tokio::test]
+    async fn resolve_returns_the_budget_to_its_starting_figure_once_decoded_parts_drop() {
+        let (store, range, now_ns, declared) = folded_one_part_fixture().await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let starting = budget.reserve(7).expect("the starting figure fits");
+        assert_eq!(budget.reserved(), 7);
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+
+        let snapshot = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("resolve within budget");
+        assert_eq!(snapshot.segments.len(), 1, "the folded segment is served");
+        assert_eq!(
+            budget.reserved(),
+            7 + declared,
+            "one part decoded, charged once"
+        );
+
+        let again = catalog
+            .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("second resolve");
+        assert_eq!(again.segments.len(), 1);
+        assert_eq!(
+            budget.reserved(),
+            7 + declared,
+            "a part-cache hit decodes nothing and charges nothing more"
+        );
+
+        drop(snapshot);
+        drop(again);
+        drop(catalog);
+        assert_eq!(
+            budget.reserved(),
+            7,
+            "dropping the cached decoded part releases exactly its reservation"
+        );
+        drop(starting);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A pruned resolve charges the postings object's declared uncompressed
+    /// body on top of the part's: one byte short of both fails the resolve
+    /// with the typed budget error for exactly the postings body, rather than
+    /// disabling pruning and decoding uncharged.
+    ///
+    /// FLIP: drop the `reserve_decoded` call in `load_snapshot_postings` and
+    /// the resolve succeeds, failing `expect_err`.
+    #[tokio::test]
+    async fn postings_decode_reserves_its_output() {
+        let (store, range, now_ns, part_len) = folded_one_part_fixture().await;
+        let head_key = crate::fold::head_object_key(&tenant(), Signal::Metrics);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+        let mut head = crate::snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
+
+        // A postings object bound to the fixture's one part (one entry), under
+        // a HEAD that references it.
+        let part_blake3: [u8; 32] = head.parts[0]
+            .blake3
+            .clone()
+            .try_into()
+            .expect("32-byte part blake3");
+        let postings_bytes = crate::snapshot_format::encode_postings(
+            tenant().0,
+            signal::to_proto(Signal::Metrics) as u32,
+            &[part_blake3],
+            1,
+            &[crate::snapshot_format::NamePostings {
+                name: "any_metric".to_string(),
+                ordinals: vec![0],
+            }],
+        )
+        .expect("encode postings");
+        let postings_len = crate::snapshot_format::decode_postings_header(&postings_bytes)
+            .expect("postings header decodes")
+            .body_uncompressed_len;
+        assert!(postings_len > 0);
+        let postings_key = "postings-reserve".to_string();
+        store
+            .put(
+                &postings_key,
+                Bytes::from(postings_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put postings");
+        head.postings = Some(ravel_proto::catalog::v1::SnapshotPostingsRef {
+            key: postings_key,
+            blake3: blake3::hash(&postings_bytes).as_bytes().to_vec(),
+            size: postings_bytes.len() as u64,
+            name_count: 1,
+            part_blake3: vec![part_blake3.to_vec()],
+        });
+        store
+            .put(
+                &head_key,
+                Bytes::from(crate::snapshot_format::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let limit = part_len + postings_len - 1;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let err = catalog
+            .resolve_pruned(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now_ns,
+                Some("any_metric"),
+            )
+            .await
+            .expect_err("postings that do not fit the budget must fail the resolve");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, postings_len);
+                assert_eq!(exhausted.reserved, part_len, "the decoded part is held");
+                assert_eq!(exhausted.limit, limit);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+    }
+
+    /// The declared `body_uncompressed_len` of the one-segment, one-column v3
+    /// object [`install_stats`] writes: length-delimited protobuf, so a fixed
+    /// figure for a fixed fixture.
+    const COLUMN_STATS_DECLARED_BODY_LEN: u64 = 75;
+
+    /// A column-statistics object is charged its declared uncompressed body
+    /// before decoding: a budget with no room for it fails the load with the
+    /// typed budget error rather than decoding uncharged.
+    ///
+    /// FLIP: drop the `reserve_decoded` call in `fetch_stats_object` and the
+    /// load succeeds, failing `expect_err`.
+    #[tokio::test]
+    async fn column_stats_decode_reserves_its_output() {
+        let store = Arc::new(MemoryStore::new());
+        let declared =
+            install_logs_stats(&store, *blake3::hash(b"part-reserve").as_bytes(), 1).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        let catalog = Catalog::new(store.clone(), config(8))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let (range, now_ns) = full_window();
+
+        let err = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect_err("a stats object that does not fit the budget fails the load");
+        match err {
+            column_stats_resolve::LoadColumnStatsError::MemoryExhausted(exhausted) => {
+                assert_eq!(
+                    exhausted.requested, declared,
+                    "exactly the object's declared uncompressed body"
+                );
+                assert_eq!(declared, COLUMN_STATS_DECLARED_BODY_LEN);
+                assert_eq!(exhausted.limit, 0);
+            }
+            other => panic!("expected LoadColumnStatsError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Installs the default logs fixture for [`tenant`], then replaces its
+    /// column-stats object with a v3 object encoded under `object_tenant` and
+    /// bound to `object_part`, and re-points the HEAD's stats ref blake3 and
+    /// size at it, so the load's blake3 gate passes and the header checks are
+    /// what decide.
+    async fn install_repointed_stats(
+        store: &MemoryStore,
+        object_tenant: TenantHash,
+        object_part: [u8; 32],
+    ) {
+        let part_hash = *blake3::hash(b"part-repointed").as_bytes();
+        install_logs_stats(store, part_hash, 1).await;
+        let head_key = crate::fold::head_object_key(&tenant(), Signal::Logs);
+        let head_bytes = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("get head")
+            .data;
+        let mut head = crate::snapshot_format::decode_head(&head_bytes).expect("decode head");
+        let stats_ref = head.parts[0]
+            .column_stats
+            .as_mut()
+            .expect("the fixture's part carries a stats ref");
+
+        let segments = [ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            writer_id: object_part.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            ..Default::default()
+        }];
+        let stats_bytes = crate::snapshot_format::encode_column_stats_v3(
+            object_tenant.0,
+            signal::to_proto(Signal::Logs) as u32,
+            object_part,
+            &segments,
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        )
+        .expect("encode v3 column stats");
+        let declared = crate::snapshot_format::decode_column_stats_header(&stats_bytes)
+            .expect("the object just encoded has a readable header")
+            .header
+            .body_uncompressed_len;
+        assert!(
+            declared > 0,
+            "a zero budget must be unable to hold the body"
+        );
+        store
+            .put(
+                &stats_ref.key,
+                Bytes::from(stats_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put repointed stats");
+        stats_ref.blake3 = blake3::hash(&stats_bytes).as_bytes().to_vec();
+        stats_ref.size = stats_bytes.len() as u64;
+        store
+            .put(
+                &head_key,
+                Bytes::from(crate::snapshot_format::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+    }
+
+    /// A foreign-tenant stats object is an ADR-0050 section 2 breach and
+    /// surfaces as one even when the budget has no room for its body: the
+    /// tenant check runs on the peeked header, before the reservation.
+    ///
+    /// FLIP: move `reserve_decoded` above the header checks in
+    /// `fetch_stats_object` and the load fails with `MemoryExhausted` instead.
+    #[tokio::test]
+    async fn foreign_tenant_stats_under_memory_pressure_is_a_tenant_mismatch() {
+        let store = Arc::new(MemoryStore::new());
+        let foreign = TenantHash([0xEE; 16]);
+        assert_ne!(foreign, tenant());
+        install_repointed_stats(&store, foreign, *blake3::hash(b"part-repointed").as_bytes()).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        let catalog = Catalog::new(store.clone(), config(8))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let (range, now_ns) = full_window();
+
+        let err = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect_err("a foreign-tenant stats object fails the load");
+        match err {
+            column_stats_resolve::LoadColumnStatsError::TenantHashMismatch {
+                expected,
+                actual,
+                ..
+            } => {
+                assert_eq!(expected, tenant().to_hex());
+                assert_eq!(actual, foreign.to_hex());
+            }
+            other => panic!("expected LoadColumnStatsError::TenantHashMismatch, got {other:?}"),
+        }
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A stats object bound to a different part than the one naming it is a
+    /// stale binding and degrades to no statistics even when the budget has
+    /// no room for its body, rather than failing the load.
+    ///
+    /// FLIP: move `reserve_decoded` above the header checks in
+    /// `fetch_stats_object` and the load fails with `MemoryExhausted` instead.
+    #[tokio::test]
+    async fn stale_binding_stats_under_memory_pressure_degrades_to_absent() {
+        let store = Arc::new(MemoryStore::new());
+        install_repointed_stats(&store, tenant(), *blake3::hash(b"another-part").as_bytes()).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        let catalog = Catalog::new(store.clone(), config(8))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("a stale binding degrades rather than failing the load");
+        let covered = loaded.map_or(0, |l| l.by_content_hash.len() + l.segments.len());
+        assert_eq!(covered, 0, "the stale-bound object covers nothing");
+        assert_eq!(budget.reserved(), 0);
     }
 }

@@ -2455,9 +2455,34 @@ impl Catalog {
         let limits = snapshot_format::PostingsLimits {
             max_postings_bytes: self.config().max_postings_bytes,
         };
+        // The decoded postings go into the same postings cache the resolve
+        // path reads, so they carry a decode reservation the same way
+        // (ADR-1702 decision 6).
+        let declared = match snapshot_format::decode_postings_header(&got.data) {
+            Ok(header) => header.body_uncompressed_len,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = %postings_ref.key,
+                    "previous postings header unreadable, rebuilding postings from scratch"
+                );
+                return None;
+            }
+        };
+        let reservation = match self.reserve_decoded(declared, limits.max_postings_bytes) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = %postings_ref.key,
+                    "memory budget refused the previous postings decode, rebuilding postings from scratch"
+                );
+                return None;
+            }
+        };
         let decoded =
             match snapshot_format::decode_postings(&got.data, &limits, &expected_part_blake3) {
-                Ok(decoded) => decoded,
+                Ok(decoded) => crate::charged::Charged::new(decoded, reservation),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,

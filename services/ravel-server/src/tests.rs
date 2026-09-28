@@ -504,6 +504,22 @@ async fn fetch_reservation_steps(
     panic!("the oracle did not converge in 16 budget steps: {steps:?}");
 }
 
+/// Splits [`fetch_reservation_steps`] for the one-segment instant query these
+/// tests run into the totals a held GET can observe, and the size of the
+/// catalog decode's reservation (ADR-1702 decision 6). The query reserves three
+/// times: the catalog-section range read, the catalog decode, then the page
+/// read. The decode reserves between GETs, so no held GET sees its own running
+/// total, and it charges decoded output rather than cache-bound bytes, so it is
+/// never marked handed off.
+fn split_decode_step(steps: &[u64]) -> (Vec<u64>, u64) {
+    assert_eq!(
+        steps.len(),
+        3,
+        "range read, catalog decode, page read: {steps:?}"
+    );
+    (vec![steps[0], steps[2]], steps[1] - steps[0])
+}
+
 fn sql_body(query: &str) -> String {
     serde_json::json!({
         "query": query,
@@ -910,6 +926,7 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
     let steps =
         fetch_reservation_steps(&store, &tenant, "big_gauge_gauge", query_time_s, now).await;
+    let (observable, _decode) = split_decode_step(&steps);
 
     let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
     let mut query = Box::pin(state.engine.instant(
@@ -926,9 +943,9 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
         tokio::select! {
             result = &mut query => {
                 assert_eq!(
-                    seen, steps,
-                    "every reservation step must be observed held, in order, at its \
-                     exact total"
+                    seen, observable,
+                    "every reservation step a GET follows must be observed held, in \
+                     order, at its exact total"
                 );
                 let (_value, _coverage) = result.expect("query must succeed");
                 break;
@@ -988,9 +1005,11 @@ async fn memory_gauges_report_a_nonzero_fetch_reservation_during_a_query() {
 /// `Reservation` is marked handed off as soon as the cache takes its own copy
 /// of the fetched bytes (`Reservation::mark_handed_off`), so while the fetch
 /// is in flight `ravel_memory_handoff_overlap_bytes` reads EXACTLY the same
-/// value as the live fetch reservation (the whole reservation is handed off,
-/// never a partial amount), both through the direct counters and through a
-/// real `/metrics` scrape; both return to exactly 0 once the query completes.
+/// value as the live fetch reservations (the whole reservation is handed off,
+/// never a partial amount; the catalog decode's reservation for decoded output
+/// is the one live guard that is not), both through the direct counters and
+/// through a real `/metrics` scrape; both return to exactly 0 once the query
+/// completes.
 ///
 /// Prove-the-test: remove `.with_memory_budget(process_memory_budget)` from
 /// `build_app_state`, and the oracle panics as in the sibling gauge test
@@ -1016,6 +1035,7 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
     let query_time_s = (now - LARGE_SEGMENT_QUERY_OFFSET_S * NS_PER_SEC) / NS_PER_SEC;
     let steps =
         fetch_reservation_steps(&store, &tenant, "big_gauge_overlap", query_time_s, now).await;
+    let (observable, decode) = split_decode_step(&steps);
 
     let gate = fault_store.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Always);
     let mut query = Box::pin(state.engine.instant(
@@ -1032,9 +1052,9 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
         tokio::select! {
             result = &mut query => {
                 assert_eq!(
-                    seen, steps,
-                    "every reservation step must be observed held, in order, at its \
-                     exact total"
+                    seen, observable,
+                    "every reservation step a GET follows must be observed held, in \
+                     order, at its exact total"
                 );
                 let (_value, _coverage) = result.expect("query must succeed");
                 break;
@@ -1053,11 +1073,15 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
                         seen.push(reserved);
                     }
                     let expected = reserved;
+                    // Past the first step the decoded catalog is held too, and
+                    // its reservation is not a fetch the cache also holds.
+                    let decoded_held = if reserved > observable[0] { decode } else { 0 };
+                    let overlap = reserved - decoded_held;
                     assert_eq!(
                         budget.handoff_overlap(),
-                        expected,
+                        overlap,
                         "a cache-configured fetch hands off its WHOLE reservation, so the \
-                         overlap must equal the fetcher's reservation exactly"
+                         overlap must equal the fetch reservations exactly"
                     );
                     assert_eq!(
                         budget.reserved(),
@@ -1067,9 +1091,9 @@ async fn memory_handoff_overlap_equals_the_fetch_reservation_while_a_cached_fetc
                     let scrape = scrape_metrics(&metrics).await;
                     assert!(
                         scrape.contains(&format!(
-                            "ravel_memory_handoff_overlap_bytes{{mode=\"all\"}} {expected}\n"
+                            "ravel_memory_handoff_overlap_bytes{{mode=\"all\"}} {overlap}\n"
                         )),
-                        "the overlap gauge must equal the fetcher's reservation ({expected}):\n{scrape}"
+                        "the overlap gauge must equal the fetch reservations ({overlap}):\n{scrape}"
                     );
                     assert!(
                         scrape.contains(&format!(

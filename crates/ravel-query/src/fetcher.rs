@@ -31,6 +31,11 @@ const SECTION_SERIES_META: u32 = 6;
 const SECTION_SERIES_IDX: u32 = 8;
 const SECTION_SERIES_META_CHUNKS: u32 = 9;
 
+/// `Compression.COMPRESSION_NONE` from proto/ravel/segment.proto, the same way
+/// the section kinds above are spelled here: `ravel-segment` keeps its own
+/// copy private.
+const COMPRESSION_NONE: i32 = 0;
+
 /// Store-sourced GET cost, either of a single `guarded_get` call or accumulated
 /// across the coalesced GETs of one `ensure_ranges` call. It scopes ADR-0044
 /// decision 5's per-span `s3_requests`/`s3_bytes` to bytes that actually
@@ -58,6 +63,147 @@ const SECTION_SERIES_META_CHUNKS: u32 = 9;
 struct GetCost {
     requests: u64,
     bytes: u64,
+}
+
+/// What a catalog decode is charged before it runs (ADR-1702 decision 6): the
+/// footer-declared `uncompressed_len` of every catalog section the object
+/// carries, each clamped to the reader's section ceiling, since the decoder
+/// refuses a larger section before allocating it.
+///
+/// SERIES_META_CHUNKS is the exception, and `meta_chunks_inflated` is what
+/// replaces its footer figure when the chunk directory is readable. That
+/// section carries no section-level compression, so its `uncompressed_len` is
+/// the STORED (zstd) frames' length, while `decode_catalog_v5_chunked`
+/// inflates every frame and keeps an entry for every series in it. Charging
+/// the footer figure there charges the compressed size for an output several
+/// times larger.
+fn catalog_decode_len(
+    footer: &Footer,
+    limits: ReaderLimits,
+    meta_chunks_inflated: Option<u64>,
+) -> u64 {
+    footer
+        .sections
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SECTION_LABEL_DICT
+                    | SECTION_SERIES_IDS
+                    | SECTION_SERIES_META
+                    | SECTION_SERIES_IDX
+                    | SECTION_SERIES_META_CHUNKS
+            )
+        })
+        .map(|s| match (s.kind, meta_chunks_inflated) {
+            (SECTION_SERIES_META_CHUNKS, Some(inflated)) => inflated,
+            _ => s
+                .uncompressed_len
+                .min(limits.max_section_uncompressed_bytes),
+        })
+        .fold(0, u64::saturating_add)
+}
+
+/// The bytes SERIES_META_CHUNKS inflates to: the sum of its chunk directory's
+/// `frame_uncompressed_len` (docs/segment-format.md "SERIES_IDX"), each
+/// clamped to the reader's section ceiling, since
+/// `decode_catalog_v5_chunked` refuses a larger frame before allocating it.
+/// The directory lives in SERIES_IDX, which every chunked path has already
+/// fetched into `regions` before the decode.
+///
+/// `None` means the footer figure is the only reading available: the object
+/// carries no SERIES_IDX (it is not chunked), its bytes are not in `regions`,
+/// the section is stored compressed (this parse reads stored bytes, and the
+/// writer always stores it uncompressed), its stored bytes fail the section
+/// crc32c, or the directory does not parse. In the last two cases the decode
+/// that follows fails on the same bytes. The crc is checked before the parse
+/// so a corrupt directory cannot set the charge and turn a corrupt-data error
+/// into a budget refusal.
+fn meta_chunks_inflated_len(
+    footer: &Footer,
+    regions: &FetchedRegions,
+    limits: ReaderLimits,
+) -> Option<u64> {
+    let idx = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == SECTION_SERIES_IDX)
+        .filter(|s| s.comp == COMPRESSION_NONE)?;
+    let bytes = regions.slice(idx.offset, idx.len)?;
+    if crc32c::crc32c(&bytes) != idx.crc32c {
+        return None;
+    }
+    let index = ravel_segment::parse_series_idx(&bytes).ok()?;
+    let mut total = 0u64;
+    for series_index in 0..u64::from(index.series_count()) {
+        // The directory is dense and `chunk_for` reports the row's offset
+        // within its frame, so `row_in_chunk == 0` walks each frame exactly
+        // once through the public lookup.
+        match index.chunk_for(series_index) {
+            Some(chunk) if chunk.row_in_chunk == 0 => {
+                total = total.saturating_add(
+                    chunk
+                        .frame_uncompressed_len
+                        .min(limits.max_section_uncompressed_bytes),
+                );
+            }
+            _ => {}
+        }
+    }
+    Some(total)
+}
+
+/// Heap bytes one decoded catalog entry holds once the fetched section bytes
+/// are gone: the entry itself, its label set's `Label` vector with every name
+/// and value string's bytes, its run vector, and its per-sample provenance.
+fn catalog_entry_len(entry: &SeriesEntryV4) -> u64 {
+    let labels = entry.entry.labels.iter().fold(0u64, |acc, label| {
+        acc.saturating_add(std::mem::size_of::<ravel_types::Label>() as u64)
+            .saturating_add(label.name.len() as u64)
+            .saturating_add(label.value.len() as u64)
+    });
+    let runs = (entry.runs.len() as u64).saturating_mul(std::mem::size_of::<RunEntry>() as u64);
+    let provenance = entry.per_sample_provenance.iter().fold(0u64, |acc, slot| {
+        acc.saturating_add(std::mem::size_of::<Option<Vec<SampleProvenance>>>() as u64)
+            .saturating_add(slot.as_ref().map_or(0, |v| {
+                (v.len() as u64).saturating_mul(std::mem::size_of::<SampleProvenance>() as u64)
+            }))
+    });
+    (std::mem::size_of::<SeriesEntryV4>() as u64)
+        .saturating_add(labels)
+        .saturating_add(runs)
+        .saturating_add(provenance)
+}
+
+/// [`catalog_entry_len`] summed over the entries a decode retained.
+fn retained_catalog_len(entries: &[SeriesEntryV4]) -> u64 {
+    entries
+        .iter()
+        .map(catalog_entry_len)
+        .fold(0, u64::saturating_add)
+}
+
+/// The series a catalog decode selected, and the reservation charging the
+/// decoded catalog to the memory budget (ADR-1702 decision 6) for as long as
+/// they are held. Derefs to the entries. `None` holds nothing: a decode that
+/// retained no entries has nothing left to charge.
+struct DecodedCatalog {
+    entries: Vec<SeriesEntryV4>,
+    reservation: Option<ravel_memory::Reservation>,
+}
+
+impl DecodedCatalog {
+    fn into_parts(self) -> (Vec<SeriesEntryV4>, Option<ravel_memory::Reservation>) {
+        (self.entries, self.reservation)
+    }
+}
+
+impl std::ops::Deref for DecodedCatalog {
+    type Target = [SeriesEntryV4];
+
+    fn deref(&self) -> &[SeriesEntryV4] {
+        &self.entries
+    }
 }
 
 /// Absolute `(offset, len)` of a section by kind, from the footer.
@@ -182,7 +328,8 @@ pub enum FetchError {
     #[error("etag changed between reads of segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
     /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
-    /// reservation for the bytes this GET would materialize. Carries only the
+    /// reservation for the bytes this GET would materialize, or for the bytes
+    /// a catalog decode would produce (ADR-1702 decision 6). Carries only the
     /// three accounting figures, never an object key or tenant value: the
     /// refusal is a resource condition, not data corruption, and its message
     /// must not leak which object or tenant provoked it.
@@ -891,6 +1038,63 @@ impl SegmentFetcher {
             })
     }
 
+    /// Reserves [`catalog_decode_len`] for `footer` before a catalog decode
+    /// (ADR-1702 decision 6), refusing with the same typed
+    /// [`FetchError::FetchMemoryExhausted`] a fetch reservation does. The guard
+    /// travels with the decoded entries in a [`DecodedCatalog`].
+    ///
+    /// `regions` supplies the already-fetched SERIES_IDX bytes a chunked
+    /// object's real decode size is read from ([`meta_chunks_inflated_len`]).
+    fn reserve_catalog_decode(
+        &self,
+        footer: &Footer,
+        regions: &FetchedRegions,
+    ) -> Result<ravel_memory::Reservation, FetchError> {
+        let inflated = meta_chunks_inflated_len(footer, regions, self.limits);
+        self.reserve_fetch(catalog_decode_len(footer, self.limits, inflated))
+    }
+
+    /// Exchanges a decode's whole-catalog reservation for one sized to the
+    /// entries the matchers retained (ADR-1702 decision 6). The pre-decode
+    /// reservation covers every catalog section the object carries; after a
+    /// selective matcher the caller holds a handful of entries through the
+    /// page fetches that follow, and charging the whole catalog for all of
+    /// them overstates the query's memory for the rest of its life.
+    ///
+    /// This never fails: the decode it follows already succeeded, and a shrink
+    /// only gives memory back. The retained reservation is taken before the
+    /// held one is released, so a refusal (a concurrent reserver, or a
+    /// `reserve_unchecked` caller that pushed the budget over its limit) keeps
+    /// the held reservation and skips the shrink. A decode that retained no
+    /// entries releases what it holds and reserves nothing, since even a
+    /// zero-byte reservation is refused once the budget is over its limit.
+    ///
+    /// A retained figure at or above what is held keeps the existing
+    /// reservation untouched, so this only ever shrinks: the pre-decode figure
+    /// is an estimate over section bytes and the retained figure measures
+    /// structs, and exchanging upward would turn a filter that retained
+    /// everything into a new refusal point.
+    fn shrink_to_retained(&self, decoded: DecodedCatalog) -> DecodedCatalog {
+        let held = decoded.reservation.as_ref().map_or(0, |r| r.size());
+        if decoded.entries.is_empty() {
+            return DecodedCatalog {
+                entries: decoded.entries,
+                reservation: None,
+            };
+        }
+        let retained = retained_catalog_len(&decoded.entries);
+        if retained >= held {
+            return decoded;
+        }
+        match self.memory_budget.reserve(retained) {
+            Ok(reservation) => DecodedCatalog {
+                entries: decoded.entries,
+                reservation: Some(reservation),
+            },
+            Err(_) => decoded,
+        }
+    }
+
     /// One store GET, bounded by the shared in-flight limiter. The permit
     /// is released the moment the GET resolves; callers must
     /// never hold the returned future's permit across another
@@ -1440,7 +1644,7 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
-    ) -> Result<Vec<SeriesEntryV4>, FetchError> {
+    ) -> Result<DecodedCatalog, FetchError> {
         // See `open_segment`'s comment: recorded on this handle directly,
         // never through `tracing::Span::current()`.
         let span = tracing::debug_span!(
@@ -1451,7 +1655,7 @@ impl SegmentFetcher {
         );
         async {
             let key = seg_ref.data_object_key.as_str();
-            let matched: Vec<SeriesEntryV4> = if let Some((sm_off, sm_len)) =
+            let matched: DecodedCatalog = if let Some((sm_off, sm_len)) =
                 section_range(footer, SECTION_SERIES_META)
             {
                 let (ld_off, ld_len) =
@@ -1497,7 +1701,8 @@ impl SegmentFetcher {
                 // label-set materialization of every non-matching series
                 // (issue #1076); otherwise materialize the whole catalog and
                 // filter it.
-                if let Some(equals) = ordinal_equals(matchers) {
+                let reservation = self.reserve_catalog_decode(footer, regions)?;
+                let entries = if let Some(equals) = ordinal_equals(matchers) {
                     let matched = decode_catalog_matching_v4(
                         footer,
                         &dict,
@@ -1517,9 +1722,13 @@ impl SegmentFetcher {
                         .into_iter()
                         .filter(|e| matches_series(matchers, &e.entry.labels))
                         .collect()
+                };
+                DecodedCatalog {
+                    entries,
+                    reservation: Some(reservation),
                 }
             } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
-                let entries = self
+                let (entries, reservation) = self
                     .decode_sparse_catalog(
                         seg_ref,
                         tenant_hash,
@@ -1529,12 +1738,16 @@ impl SegmentFetcher {
                         &sparse,
                         accounting,
                     )
-                    .await?;
+                    .await?
+                    .into_parts();
                 self.record_materialized(entries.len());
-                entries
-                    .into_iter()
-                    .filter(|e| matches_series(matchers, &e.entry.labels))
-                    .collect()
+                DecodedCatalog {
+                    entries: entries
+                        .into_iter()
+                        .filter(|e| matches_series(matchers, &e.entry.labels))
+                        .collect(),
+                    reservation,
+                }
             } else {
                 self.ensure_ranges(
                     seg_ref,
@@ -1549,13 +1762,17 @@ impl SegmentFetcher {
                 let object = regions
                     .slice(0, total_size)
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
+                let reservation = self.reserve_catalog_decode(footer, regions)?;
                 let entries = decode_catalog_v5(footer, &object, self.limits)
                     .map_err(|source| corrupt(key, source))?;
                 self.record_materialized(entries.len());
-                entries
-                    .into_iter()
-                    .filter(|e| matches_series(matchers, &e.entry.labels))
-                    .collect()
+                DecodedCatalog {
+                    entries: entries
+                        .into_iter()
+                        .filter(|e| matches_series(matchers, &e.entry.labels))
+                        .collect(),
+                    reservation: Some(reservation),
+                }
             };
             accounting.add_series_matched(matched.len() as u64);
             // The catalog decode fetches only catalog sections, not page bytes, so
@@ -1563,7 +1780,10 @@ impl SegmentFetcher {
             // page bytes (ADR-0044 decision 5: "record decompressed_bytes if
             // applicable, or series_matched"). Recorded from this call's own count.
             span.record("series_matched", matched.len() as u64);
-            Ok(matched)
+            // The decode was charged for the whole catalog; from here only the
+            // matched entries are held, through the page fetches the caller
+            // runs next.
+            Ok(self.shrink_to_retained(matched))
         }
         .instrument(span.clone())
         .await
@@ -1619,7 +1839,7 @@ impl SegmentFetcher {
         regions: &mut FetchedRegions,
         ranges: &SparseCatalogRanges,
         accounting: &QueryAccounting,
-    ) -> Result<Vec<SeriesEntryV4>, FetchError> {
+    ) -> Result<DecodedCatalog, FetchError> {
         let key = seg_ref.data_object_key.as_str();
         let needed = [
             (
@@ -1661,8 +1881,13 @@ impl SegmentFetcher {
         let chunks = regions
             .slice(ranges.meta_chunks.0, ranges.meta_chunks.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-        decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, self.limits)
-            .map_err(|source| corrupt(key, source))
+        let reservation = self.reserve_catalog_decode(footer, regions)?;
+        let entries = decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, self.limits)
+            .map_err(|source| corrupt(key, source))?;
+        Ok(DecodedCatalog {
+            entries,
+            reservation: Some(reservation),
+        })
     }
 
     /// Coalesced page ranges for the scalar runs of `scalar` (TS/VAL) and the
@@ -2379,7 +2604,10 @@ impl SegmentFetcher {
                 accounting.probe(),
             )
             .await?;
-        Ok(selected.into_iter().map(|e| e.entry).collect())
+        // The reservation is held until the conversion below finishes; the
+        // returned `Vec<SeriesEntry>` has no slot to carry it further.
+        let (entries, _reservation) = selected.into_parts();
+        Ok(entries.into_iter().map(|e| e.entry).collect())
     }
 
     /// Fetches and decodes the scalar samples of every series in this segment
@@ -4115,6 +4343,346 @@ mod tests {
         );
     }
 
+    /// `decode_sparse_catalog` charges the bytes the chunked catalog actually
+    /// inflates to, not the stored frames' length its footer descriptor
+    /// records, and that reservation rides with the decoded entries after the
+    /// fetched regions are gone.
+    ///
+    /// SERIES_META_CHUNKS carries no section-level compression, so its footer
+    /// `uncompressed_len` IS the stored (zstd) frame bytes, while the decoder
+    /// inflates every frame and materializes all 4096 entries. The exact
+    /// figures below are the fixture's, and they are what makes the
+    /// distinction visible: the compressed-size reservation is a small
+    /// fraction of the real one. `frame_uncompressed_len` comes from the
+    /// writer's chunk-frame encoding, not from zstd, so it does not move with
+    /// the compressor.
+    ///
+    /// FLIP: ignore `meta_chunks_inflated` in `catalog_decode_len` (take the
+    /// `_ =>` arm for SERIES_META_CHUNKS too, which is the pre-fix code) and
+    /// the reserved figure drops to `SPARSE_STORED_CATALOG_LEN`, failing the
+    /// first assertion with `left: 151466, right: 233223`.
+    #[tokio::test]
+    async fn sparse_catalog_decode_reserves_its_output() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let fetcher = fetcher
+            .with_whole_object_threshold(0)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let sparse = fetcher
+            .sparse_probe_qualifies(&footer, total, &matchers)
+            .expect("the fixture takes the sparse catalog-probe path");
+
+        // `decode_sparse_catalog` rather than `decode_selected`: this is the
+        // reservation as taken, before the matcher filter shrinks it
+        // (`shrink_to_retained`, pinned by
+        // `sparse_catalog_reservation_shrinks_to_the_retained_entries`).
+        let decoded = fetcher
+            .decode_sparse_catalog(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                &etag,
+                &mut regions,
+                &sparse,
+                &accounting,
+            )
+            .await
+            .expect("decode sparse catalog");
+        assert_eq!(decoded.len(), 4096, "every series in the chunked catalog");
+        assert_eq!(
+            declared_catalog_len(&footer),
+            SPARSE_STORED_CATALOG_LEN,
+            "the footer figure the pre-fix reservation used"
+        );
+
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            SPARSE_INFLATED_CATALOG_LEN,
+            "the inflated chunk frames stay charged with the entries"
+        );
+        // The other three catalog sections are stored uncompressed, so the
+        // whole gap between the two totals is SERIES_META_CHUNKS alone.
+        let chunks_stored = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == SECTION_SERIES_META_CHUNKS)
+            .expect("the fixture is chunked")
+            .uncompressed_len;
+        assert_eq!(chunks_stored, SPARSE_STORED_META_CHUNKS_LEN);
+        let chunks_inflated =
+            SPARSE_INFLATED_CATALOG_LEN - (SPARSE_STORED_CATALOG_LEN - chunks_stored);
+        assert_eq!(
+            chunks_inflated, SPARSE_INFLATED_META_CHUNKS_LEN,
+            "the whole difference is the chunk frames"
+        );
+        assert!(
+            chunks_inflated > chunks_stored * 10,
+            "the stored frames understate what they inflate to ten times over: \
+             {chunks_inflated} against {chunks_stored}"
+        );
+        drop(decoded);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A SERIES_IDX whose bytes fail their section crc32c does not set the
+    /// catalog charge: the reservation falls back to the footer figure and the
+    /// decode reports the corruption, rather than an inflated charge read from
+    /// the corrupt directory refusing the read as a retryable budget error.
+    ///
+    /// The flipped byte is the high byte of chunk 0's `frame_uncompressed_len`,
+    /// so the corrupt directory still parses and claims a frame at the section
+    /// ceiling, far over the 1 MiB budget that fits the honest charge.
+    ///
+    /// FLIP: drop the crc32c check in `meta_chunks_inflated_len` and the read
+    /// fails with `FetchMemoryExhausted { requested: 1073963752, .. }` instead.
+    #[tokio::test]
+    async fn corrupt_series_idx_is_corrupt_data_not_a_budget_refusal() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (clean, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let (footer, _total, _etag, _regions) = clean
+            .open_segment(tenant_hash, &seg_ref, &QueryAccounting::new())
+            .await
+            .expect("open the clean segment");
+        let idx = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == SECTION_SERIES_IDX)
+            .expect("the fixture is chunked");
+        assert_eq!(idx.comp, COMPRESSION_NONE);
+        let idx_start = usize::try_from(idx.offset).expect("offset fits");
+        let at = |pos: usize| idx_start + pos;
+        let sparse_count =
+            u32::from_le_bytes(bytes[at(12)..at(16)].try_into().expect("four bytes")) as usize;
+        // version, flags and reserved (4), stride, series_count and
+        // sparse_count (12), 36 bytes per sparse entry, chunk_stride and
+        // chunk_count (8), then chunk 0's frame_offset and frame_stored_len
+        // (16) before its frame_uncompressed_len.
+        let high_byte = at(16 + sparse_count * 36 + 8 + 16 + 7);
+        let mut corrupted = bytes.to_vec();
+        corrupted[high_byte] ^= 0x01;
+
+        let (fetcher, _metrics) =
+            metered_fetcher(&seg_ref.data_object_key, Bytes::from(corrupted)).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        assert!(SPARSE_INFLATED_CATALOG_LEN < budget.limit());
+        let fetcher = fetcher
+            .with_whole_object_threshold(0)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("the footer is intact");
+        let err = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &matchers,
+                &accounting,
+            )
+            .await
+            .err()
+            .expect("a corrupt SERIES_IDX fails the decode");
+        match err {
+            FetchError::Corrupt {
+                source: ravel_segment::SegmentError::SectionCrcMismatch,
+                ..
+            } => {}
+            other => panic!("expected FetchError::Corrupt(SectionCrcMismatch), got {other:?}"),
+        }
+        drop(regions);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Sum of the fixture's catalog-section `uncompressed_len` as the footer
+    /// records them, with SERIES_META_CHUNKS counted at its STORED frame
+    /// length. This is what the pre-fix `catalog_decode_len` reserved.
+    const SPARSE_STORED_CATALOG_LEN: u64 = 151_466;
+
+    /// The same sum with SERIES_META_CHUNKS counted at the chunk directory's
+    /// summed `frame_uncompressed_len`: what `decode_catalog_v5_chunked`
+    /// really inflates and materializes.
+    const SPARSE_INFLATED_CATALOG_LEN: u64 = 233_223;
+
+    /// SERIES_META_CHUNKS alone, as its footer descriptor records it: the
+    /// stored zstd frames.
+    const SPARSE_STORED_META_CHUNKS_LEN: u64 = 8_599;
+
+    /// SERIES_META_CHUNKS alone, inflated: the chunk directory's summed
+    /// `frame_uncompressed_len`.
+    const SPARSE_INFLATED_META_CHUNKS_LEN: u64 = 90_356;
+
+    /// After the matchers have run, the catalog reservation is exchanged for
+    /// one sized to the entries that survived, so a single-series query does
+    /// not hold the whole 4096-series catalog's charge through its page
+    /// fetches.
+    ///
+    /// The retained figure is spelled out from the fixture rather than read
+    /// back from `retained_catalog_len`: one entry, one `__name__` label whose
+    /// name is 8 bytes and whose value `sparse_metric_2000` is 18, and one run
+    /// (an L0 write).
+    ///
+    /// FLIP: drop the `shrink_to_retained` call at the end of
+    /// `decode_selected` and the reserved figure stays at
+    /// `SPARSE_INFLATED_CATALOG_LEN`, failing the assertion below with
+    /// `left: 233223, right: 330`.
+    #[tokio::test]
+    async fn sparse_catalog_reservation_shrinks_to_the_retained_entries() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let fetcher = fetcher
+            .with_whole_object_threshold(0)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let decoded = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &matchers,
+                &accounting,
+            )
+            .await
+            .expect("decode sparse catalog");
+        assert_eq!(decoded.len(), 1, "exactly the matched series");
+
+        let one_entry = std::mem::size_of::<SeriesEntryV4>() as u64
+            + std::mem::size_of::<ravel_types::Label>() as u64
+            + "__name__".len() as u64
+            + "sparse_metric_2000".len() as u64
+            + std::mem::size_of::<RunEntry>() as u64;
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            one_entry,
+            "only the retained entry stays charged once the filter has run"
+        );
+        assert!(
+            one_entry < SPARSE_INFLATED_CATALOG_LEN / 100,
+            "the shrink is the point: {one_entry} against {SPARSE_INFLATED_CATALOG_LEN}"
+        );
+        drop(decoded);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The two fixture series, decoded, with the decode's reservation dropped:
+    /// entries to hand `shrink_to_retained` under a budget the test controls.
+    async fn fixture_catalog_entries() -> (Arc<MemoryStore>, Vec<SeriesEntryV4>) {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fetcher = SegmentFetcher::new(backend);
+        let accounting = QueryAccounting::new();
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let decoded = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &[],
+                &accounting,
+            )
+            .await
+            .expect("decode catalog");
+        let (entries, _reservation) = decoded.into_parts();
+        assert_eq!(entries.len(), 2, "both fixture series decode");
+        (store, entries)
+    }
+
+    /// A decode whose matchers retained nothing gives its whole reservation
+    /// back, even when a `reserve_unchecked` caller has pushed the budget past
+    /// its limit on its own, where a zero-byte reservation is itself refused.
+    ///
+    /// FLIP: restore the release-then-`reserve_fetch(retained)?` body and the
+    /// zero-byte reserve is refused (`requested: 0, reserved: 4097, limit:
+    /// 4096`), so the shrink fails a decode that had already succeeded.
+    #[tokio::test]
+    async fn shrink_of_an_empty_decode_over_the_limit_releases_everything() {
+        let (store, _entries) = fixture_catalog_entries().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(4096));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let decoded = DecodedCatalog {
+            entries: Vec::new(),
+            reservation: Some(budget.reserve(4096).expect("the held figure fits")),
+        };
+        budget.reserve_unchecked(4097);
+        assert_eq!(budget.reserved(), 8193);
+
+        let shrunk = fetcher.shrink_to_retained(decoded);
+        assert!(shrunk.is_empty());
+        assert_eq!(
+            budget.reserved(),
+            4097,
+            "only the unchecked bytes stay charged once the empty decode shrinks"
+        );
+        drop(shrunk);
+        assert_eq!(budget.reserved(), 4097);
+        budget.release(4097);
+    }
+
+    /// A shrink the budget refuses keeps the held reservation and the entries,
+    /// rather than failing: the retained figure is reserved before the held
+    /// one is released, and a refusal leaves both where they were.
+    ///
+    /// FLIP: restore the release-then-reserve body and the held reservation
+    /// is gone before the retained one is taken, so the budget reads
+    /// `retained + 1` rather than `held + 1`.
+    #[tokio::test]
+    async fn refused_shrink_keeps_the_held_reservation() {
+        let (store, entries) = fixture_catalog_entries().await;
+        let retained = retained_catalog_len(&entries);
+        let held = 2 * retained;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(held));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let decoded = DecodedCatalog {
+            entries,
+            reservation: Some(budget.reserve(held).expect("the held figure fits")),
+        };
+        budget.reserve_unchecked(1);
+
+        let shrunk = fetcher.shrink_to_retained(decoded);
+        assert_eq!(shrunk.len(), 2, "the entries survive a refused shrink");
+        assert_eq!(
+            budget.reserved(),
+            held + 1,
+            "a refused shrink keeps the held reservation"
+        );
+        drop(shrunk);
+        assert_eq!(budget.reserved(), 1);
+        budget.release(1);
+    }
+
     /// An object that does not qualify for the probe path keeps the
     /// unchanged whole-object fallback. An empty matcher matches every series,
     /// so the fetcher takes the whole-object GET (one GET covering the object)
@@ -4209,6 +4777,154 @@ mod tests {
             0,
             "the reservation releases when the FetchedRegions buffer drops"
         );
+    }
+
+    /// The footer-declared uncompressed length of the catalog sections the
+    /// fixture segment carries, summed here independently of
+    /// `catalog_decode_len`.
+    fn declared_catalog_len(footer: &Footer) -> u64 {
+        let kinds = [
+            SECTION_LABEL_DICT,
+            SECTION_SERIES_IDS,
+            SECTION_SERIES_META,
+            SECTION_SERIES_IDX,
+            SECTION_SERIES_META_CHUNKS,
+        ];
+        footer
+            .sections
+            .iter()
+            .filter(|s| kinds.contains(&s.kind))
+            .map(|s| s.uncompressed_len)
+            .sum()
+    }
+
+    /// Reserved bytes after `open_segment` alone, and the catalog's declared
+    /// uncompressed length, on a fresh fetcher over the fixture segment.
+    async fn open_segment_figures(
+        backend: Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+    ) -> (u64, u64) {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let (footer, _total, _etag, regions) = fetcher
+            .open_segment(tenant_hash, seg_ref, &QueryAccounting::new())
+            .await
+            .expect("open segment");
+        let opened = budget.reserved();
+        drop(regions);
+        (opened, declared_catalog_len(&footer))
+    }
+
+    /// ADR-1702 follow-up task 5, PromQL fetch path: with a budget one byte
+    /// short of what `open_segment` holds plus the catalog's declared
+    /// uncompressed length, the fetch fails with the typed budget error for
+    /// exactly the catalog decode, and nothing stays charged.
+    ///
+    /// FLIP: drop the `reserve_catalog_decode` call in `decode_selected`'s
+    /// SERIES_META branch and the fetch succeeds, so `expect_err` fails.
+    #[tokio::test]
+    async fn promql_catalog_decode_reserves_its_output() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let (opened, catalog_len) =
+            open_segment_figures(backend.clone(), tenant_hash, &seg_ref).await;
+        assert!(catalog_len > 0, "the fixture carries catalog sections");
+
+        let limit = opened + catalog_len - 1;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let err = fetcher
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect_err("a catalog decode that does not fit the budget must fail the fetch");
+        match err {
+            FetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit: refused_limit,
+            } => {
+                assert_eq!(requested, catalog_len, "the catalog's declared length");
+                assert_eq!(reserved, opened, "only the open segment's bytes are held");
+                assert_eq!(refused_limit, limit);
+            }
+            other => panic!("expected FetchError::FetchMemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a failed fetch leaves nothing charged"
+        );
+    }
+
+    /// The catalog decode's reservation is charged exactly while the decoded
+    /// entries are held, independently of the fetched regions, and the budget
+    /// returns to exactly its starting figure once both drop.
+    #[tokio::test]
+    async fn promql_catalog_decode_returns_the_budget_to_its_starting_figure() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let starting = budget.reserve(7).expect("the starting figure fits");
+        let fetcher = SegmentFetcher::new(backend).with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let opened = budget.reserved() - 7;
+        let decoded = fetcher
+            .decode_selected(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                total,
+                &etag,
+                &mut regions,
+                &[],
+                &accounting,
+            )
+            .await
+            .expect("decode catalog");
+        assert_eq!(decoded.len(), 2, "both fixture series decode");
+        // An empty matcher retains both series, and on a fixture this small
+        // the two `SeriesEntryV4` structs measure MORE than the catalog
+        // sections they decoded from, so `shrink_to_retained` keeps the
+        // reservation it was given rather than exchanging it upward: the
+        // exchange only ever shrinks.
+        let retained = 2
+            * (std::mem::size_of::<SeriesEntryV4>() as u64
+                + std::mem::size_of::<ravel_types::Label>() as u64
+                + "__name__".len() as u64
+                + std::mem::size_of::<RunEntry>() as u64)
+            + "smooth_metric".len() as u64
+            + "chaotic_metric".len() as u64;
+        assert!(
+            retained > declared_catalog_len(&footer),
+            "the two entries measure more than the sections they decoded from: \
+             {retained} against {}",
+            declared_catalog_len(&footer)
+        );
+        // The fixture is small enough that `open_segment` reads it whole, so
+        // the catalog sections need no further GET and the only new charge is
+        // the decode's.
+        assert_eq!(
+            budget.reserved(),
+            7 + opened + declared_catalog_len(&footer),
+            "the decoded catalog is charged its declared length on top of the open segment"
+        );
+
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            7 + declared_catalog_len(&footer),
+            "the decode reservation rides with the entries, not the regions"
+        );
+        drop(decoded);
+        assert_eq!(budget.reserved(), 7, "back to exactly the starting figure");
+        drop(starting);
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// `ensure_ranges`'s reservation covers a coalesced-run batch, not one
