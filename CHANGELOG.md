@@ -225,6 +225,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deployment context falls back to, and a test pins `ravel-query`'s hand copy
   of the fold interval against the server's own default so the two cannot drift
   apart unnoticed.
+- **`ravel-cli export --signal metrics|spans` now names what it actually waits
+  on** (ADR-1751 follow-up task 2 review, issues #1751 and #1712). Both
+  refusals said bulk import for that signal does not exist yet. Both imports
+  have since landed, so each message now names ADR-1751 follow-up task 3, the
+  export work itself, and says the import half of the round trip is already
+  there. The `export` help text and the ingest guide's bulk-export section say
+  the same.
 
 ### Added
 
@@ -254,20 +261,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shared `format_float`, bytes as lowercase hex), the resource-over-span merge
   is `ravel_rspan::merge_attrs`, and the status column goes through
   `ravel_otlp::traces_normalize::status_code_from_i32`, which is now public for
-  this caller with no change to its body. Three divergences are deliberate and
-  each has no OTLP counterpart: a null timestamp cell is refused (OTLP's absent
-  timestamp is a zero, and a zero takes the same fallbacks here), a null
-  attribute cell is an attribute the row does not carry, and a
-  `parent_span_id` cell of the wrong width is refused rather than dropped,
-  because a mapped column producing unusable ids is a mapping mistake the whole
-  file shares.
+  this caller with no change to its body. An empty parent cell (empty binary,
+  empty string, or a zero-width fixed-size value) is a root span, exactly as
+  OTLP's own empty `parent_span_id` field is; a status outside `0..=2` is
+  unset, including one too wide for `i64`; and an attribute value over the
+  8192-byte cap drops that attribute and keeps the span, as
+  `convert_attrs_lossy` does on the OTLP path.
+
+  Five differences remain, and this is the complete list of what the stored
+  record can differ on for the same input. A null `start_ts`, `end_ts` or
+  `name` cell is refused: OTLP has no null for any of them, its absent
+  timestamp is a zero (a zero takes the same fallbacks here) and its absent
+  name is the empty string. A negative timestamp is refused: OTLP's two are
+  unsigned, and a negative start beside a positive end would store a span whose
+  interval overlaps nearly every query window, so the refusal names both
+  declared units, since a unit that does not match the column is the usual
+  cause. A `parent_span_id` cell that is non-empty and of the wrong width is
+  refused rather than dropped, because a mapped column producing unusable ids
+  is a mapping mistake the whole file shares. A null attribute cell is an
+  attribute the row does not carry. And attribute keys and both
+  attribute-count caps are checked against the `--mapping` rather than per
+  span: an empty, over-long, reserved or twice-declared key refuses the load,
+  as does a mapping with more than 1024 `[[spans.attribute]]` columns (the
+  loader per-record cap) or more than 128 `[[spans.resource_attribute]]`
+  columns (OTLP's own `max_resource_attributes`, which the loader had no
+  counterpart for before).
 
   Span events and span links are not mappable in this version, and a mapping
   naming them is refused by name rather than as a typo. The same refusal covers
   the reserved `attrs` keys the OTLP path stores span kind, trace state, span
-  flags, events and links under. An id column that cannot carry an id of the
-  right width, and two mapped attributes sharing one key, are both refused
-  before the first row is read.
+  flags, events and links under. Two mapped attributes sharing one key are
+  refused at mapping parse, and an id column that cannot carry an id of the
+  right width is refused when the batch's columns are resolved, before any row
+  is built or written.
 
   A spans load reads one sequential cursor and has no decode/encode queue, so
   `--read-cursors` and `--decode-queue-batches` are warned about when set to a

@@ -1,11 +1,13 @@
 //! `ravel-cli export`: bulk read-out of a tenant's stored records into a
 //! Parquet file, the inverse of `ravel-cli load` (ADR-1751 decision 4).
 //!
-//! Only `--signal logs` is implemented. ADR-1751's follow-up order puts bulk
-//! import for metrics and for spans ahead of export for those signals, and
-//! neither import path exists yet, so there is nothing for an export of them
-//! to round-trip against; [`unsupported_signal_message`] refuses them by name
-//! rather than producing a file nothing can read back.
+//! Only `--signal logs` is implemented. Bulk import for metrics and for spans
+//! has landed (`load --signal metrics`, `load --signal spans`), so what an
+//! export of either now waits on is its own follow-up, ADR-1751 follow-up
+//! task 3, which is where the read path, the column layout each signal's
+//! `--mapping` describes, and the round trip back through `load` are worked
+//! out. [`unsupported_signal_message`] refuses those two by name rather than
+//! producing a file whose shape nothing has agreed on yet.
 //!
 //! # What makes this a store read rather than a query
 //!
@@ -109,20 +111,21 @@ pub struct ExportReport {
 
 /// Why `signal` cannot be exported yet, or `None` when it can.
 ///
-/// `logs` is the only supported signal. ADR-1751 sequences bulk import for
-/// metrics (follow-up 1) and for spans (follow-up 2) ahead of export for those
-/// signals (follow-up 3), so refusing by name is the honest answer: an export
-/// written now could not be loaded back by anything.
+/// `logs` is the only supported signal. Bulk import for metrics (follow-up 1)
+/// and for spans (follow-up 2) has landed, so the missing piece each of them
+/// now waits on is export itself, ADR-1751 follow-up task 3. Refusing by name
+/// keeps naming what is missing rather than reporting an empty file.
 pub fn unsupported_signal_message(signal: SignalArg) -> Option<String> {
-    let (name, waits_on) = match signal {
+    let (name, loader) = match signal {
         SignalArg::Logs => return None,
-        SignalArg::Metrics => ("metrics", "bulk import for metrics (ADR-1751 follow-up 1)"),
-        SignalArg::Spans => ("spans", "bulk import for spans (ADR-1751 follow-up 2)"),
+        SignalArg::Metrics => ("metrics", "load --signal metrics"),
+        SignalArg::Spans => ("spans", "load --signal spans"),
     };
     Some(format!(
-        "export --signal {name} is not available: ADR-1751 follow-up 3 sequences export for \
-         {name} behind {waits_on}, which does not exist yet, so an exported {name} file could \
-         not be loaded back. Only --signal logs is supported."
+        "export --signal {name} is not available: it waits on ADR-1751 follow-up task 3, which \
+         is where the {name} read path and the column layout a {name} --mapping describes are \
+         decided. Bulk import for {name} has landed (`{loader}`), so this is the remaining half \
+         of that round trip. Only --signal logs is supported."
     ))
 }
 
@@ -797,6 +800,9 @@ mod tests {
         build_batch(mapping, &rows).expect("batch builds")
     }
 
+    /// The refusal names what each signal's export waits on NOW. Both bulk
+    /// imports have landed, so a message still naming one of them as the
+    /// missing piece is stale, and the assertions below say so by name.
     #[test]
     fn unsupported_signal_message_names_the_follow_up_each_signal_waits_on() {
         assert_eq!(unsupported_signal_message(SignalArg::Logs), None);
@@ -804,18 +810,25 @@ mod tests {
             unsupported_signal_message(SignalArg::Metrics).expect("metrics is unsupported");
         assert_eq!(
             metrics,
-            "export --signal metrics is not available: ADR-1751 follow-up 3 sequences export for \
-             metrics behind bulk import for metrics (ADR-1751 follow-up 1), which does not exist \
-             yet, so an exported metrics file could not be loaded back. Only --signal logs is \
-             supported."
+            "export --signal metrics is not available: it waits on ADR-1751 follow-up task 3, \
+             which is where the metrics read path and the column layout a metrics --mapping \
+             describes are decided. Bulk import for metrics has landed (`load --signal metrics`), \
+             so this is the remaining half of that round trip. Only --signal logs is supported."
         );
         let spans = unsupported_signal_message(SignalArg::Spans).expect("spans is unsupported");
         assert_eq!(
             spans,
-            "export --signal spans is not available: ADR-1751 follow-up 3 sequences export for \
-             spans behind bulk import for spans (ADR-1751 follow-up 2), which does not exist yet, \
-             so an exported spans file could not be loaded back. Only --signal logs is supported."
+            "export --signal spans is not available: it waits on ADR-1751 follow-up task 3, which \
+             is where the spans read path and the column layout a spans --mapping describes are \
+             decided. Bulk import for spans has landed (`load --signal spans`), so this is the \
+             remaining half of that round trip. Only --signal logs is supported."
         );
+        for message in [&metrics, &spans] {
+            assert!(
+                !message.contains("does not exist yet"),
+                "neither import is the missing piece any more: {message}"
+            );
+        }
     }
 
     /// The window is half-open at both spellings of its end: the last
