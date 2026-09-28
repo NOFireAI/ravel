@@ -9238,10 +9238,11 @@ mod alert_retention_tests {
     ///   the watermark, is fetched, is expired and past the horizon, is not in
     ///   the keep set, and is deleted.
     /// - change `if i64::from(watermark_hour) < floor_hour` to `<=` in
-    ///   `alert_keep_set`: the tenant is skipped under `watermark_below_floor`,
-    ///   so nothing is deleted at all and the skip assertion fails. The record
-    ///   survives either way, which is why this test asserts both that it
-    ///   survives and that the sweep ran.
+    ///   `alert_keep_set`: the tenant is skipped under `watermark_below_floor`
+    ///   and nothing is deleted at all, so the two expired records below the
+    ///   watermark survive with it. The record this test is named for survives
+    ///   either way, which is why the survivor set is asserted whole rather than
+    ///   one key at a time.
     #[tokio::test]
     async fn a_memo_watermark_at_the_floor_hour_keeps_an_expired_record_in_that_hour() {
         const HALF_HOUR_NS: i64 = 30 * 60 * 1_000_000_000;

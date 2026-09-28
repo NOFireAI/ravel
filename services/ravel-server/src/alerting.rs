@@ -3043,6 +3043,196 @@ mod tick_tests {
         );
     }
 
+    /// A store that moves the injected clock forward as an alert data object's
+    /// PUT completes, so a test can put a publish past the writer interlock with
+    /// no wall-clock wait and no sleep. `stall_ns` is settable at runtime so one
+    /// test can stall a publish and then let the next one through.
+    struct StallingDataPut {
+        inner: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        data_prefix: String,
+        stall_ns: AtomicI64,
+        data_puts: AtomicU64,
+    }
+
+    impl StallingDataPut {
+        fn new(inner: Arc<dyn ObjectStoreBackend>, clock: Arc<TestClock>, stall_ns: i64) -> Self {
+            let tenant = TenantId::new(TENANT).hash();
+            StallingDataPut {
+                inner,
+                clock,
+                data_prefix: format!("t/{}/a/l0/", tenant.to_hex()),
+                stall_ns: AtomicI64::new(stall_ns),
+                data_puts: AtomicU64::new(0),
+            }
+        }
+
+        fn data_puts(&self) -> u64 {
+            self.data_puts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for StallingDataPut {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            let outcome = self.inner.put(key, data, opts).await?;
+            if key.starts_with(&self.data_prefix) {
+                self.data_puts.fetch_add(1, Ordering::SeqCst);
+                self.clock.advance(self.stall_ns.load(Ordering::SeqCst));
+            }
+            Ok(outcome)
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Every live key under the tenant's alert commit prefix and its `l0/` data
+    /// space, read straight off the store.
+    async fn alert_keyspace(store: &dyn ObjectStoreBackend, tenant: TenantHash) -> (usize, usize) {
+        let commits = list_all_after(
+            store,
+            &keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix"),
+            None,
+        )
+        .await
+        .expect("list commits");
+        let data = list_all_after(store, &format!("t/{}/a/l0/", tenant.to_hex()), None)
+            .await
+            .expect("list data");
+        (commits.len(), data.len())
+    }
+
+    /// A publish whose data PUT stalls past the ingest writers' own
+    /// `max_flush_lifetime` writes no commit record, and the transition is
+    /// rewritten on a later tick.
+    ///
+    /// The interlock is what makes orphan GC over the alerts shard safe: it
+    /// reclaims a record-less data object older than `grace +
+    /// max_flush_lifetime` on the promise that no writer publishes a commit
+    /// record for a flush that old. A publish that stalled past the bound and
+    /// then wrote its commit record anyway would leave a commit record naming an
+    /// object the sweep is entitled to have quarantined already.
+    ///
+    /// The stall is on the injected clock, not on the wall clock: the store
+    /// wrapper advances the evaluator's own clock as the data PUT completes.
+    ///
+    /// Watch it fail: delete the `elapsed_ns > lifetime_ns` bail in
+    /// `AlertEvaluator::publish`. The first tick then writes its commit record
+    /// and the first assertion, that the tick wrote no record, fails.
+    #[tokio::test]
+    async fn a_data_put_stalled_past_the_writer_interlock_publishes_no_commit_record() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            alert_publish_lifetime_ns() + NS_PER_SEC,
+        ));
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "the transition was not made durable"
+        );
+        assert_eq!(report.rules_failed, 1, "the rule is on the retry path");
+        assert_eq!(store.data_puts(), 1, "the data object was written first");
+        assert_eq!(
+            alert_keyspace(memory.as_ref(), tenant).await,
+            (0, 1),
+            "one orphan data object, no commit record: exactly what orphan GC reclaims"
+        );
+
+        // The same evaluator, with the stall removed and the clock back where it
+        // started: the transition is rewritten under a fresh object.
+        store.stall_ns.store(0, Ordering::SeqCst);
+        clock.set(NOW_NS);
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.records_written, 1, "the retry writes the transition");
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(
+            alert_keyspace(memory.as_ref(), tenant).await,
+            (1, 2),
+            "the abandoned object is still an orphan beside the published pair"
+        );
+        assert_eq!(
+            read_alert_records(memory.as_ref(), tenant)
+                .await
+                .into_iter()
+                .map(|r| (r.state, r.ts_ns))
+                .collect::<Vec<_>>(),
+            vec![(AlertState::Firing, NOW_NS)],
+            "one transition, stamped at the retry's clock reading"
+        );
+    }
+
+    /// A stall shorter than the interlock is not a refusal: the bound is a
+    /// ceiling on an in-flight publish, not a ban on a slow one.
+    #[tokio::test]
+    async fn a_data_put_inside_the_writer_interlock_publishes_normally() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            alert_publish_lifetime_ns() - NS_PER_SEC,
+        ));
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.records_written, 1);
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(alert_keyspace(memory.as_ref(), tenant).await, (1, 1));
+    }
+
     /// a backward wall-clock step between ticks must still produce a
     /// strictly-increasing `ts_ns`, and the evaluator must converge rather than
     /// re-transition from stale state every tick. The instant query sees the
