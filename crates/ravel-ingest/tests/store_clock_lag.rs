@@ -759,7 +759,7 @@ async fn shutdown_publishes_what_the_lag_check_refused_and_counts_the_bypass() {
             .await
             .len(),
         1,
-        "the teardown drain's final pass publishes the acknowledged rows"
+        "the teardown drain's first bypass pass publishes the acknowledged rows"
     );
     assert_eq!(
         published_samples(store.as_ref(), &tenant).await,
@@ -1279,9 +1279,10 @@ async fn spans_flush_now_is_still_refused_with_a_lagging_clock() {
 /// teardown too, so it bypasses the lag check rather than drop rows buffered
 /// mode already acknowledged.
 ///
-/// Changing that arm's `DrainIntent::Teardown` to `DrainIntent::Retryable` in
-/// shard.rs fails this: no bypass pass runs, nothing is published, and the
-/// commit-record assertion below reports an empty store.
+/// Changing that arm's `DrainIntent::Teardown` to `DrainIntent::Retryable`
+/// (shard.rs, the `None` arm's `flush_all` call at line 1098) fails this: no
+/// bypass pass runs, nothing is published, and the commit-record assertion
+/// below reports an empty store (left 0, right 1).
 #[tokio::test]
 async fn channel_close_publishes_what_the_lag_check_refused() {
     let (_memory, store) = observed_store(Some(STORE_NS));
@@ -1350,6 +1351,160 @@ async fn channel_close_publishes_what_the_lag_check_refused() {
         published_samples(store.as_ref(), &tenant).await,
         vec![(1_000, 1.0_f64.to_bits())],
         "and that commit's segment holds exactly the buffered row"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "nothing was left buffered, so nothing is residue"
+    );
+    assert_eq!(
+        snap.clock_lag_bypassed_at_shutdown, 1,
+        "one flush published with the check bypassed"
+    );
+    assert_eq!(
+        snap.clock_lag_refused, DRAIN_REFUSALS,
+        "every enforced pass of the channel-close drain refused first"
+    );
+}
+
+/// Logs: the same channel-close teardown. `LogIngestRouter` spawns its shard
+/// actors detached, so dropping the router without `shutdown()` closes their
+/// mailboxes and the `None` arm drains.
+///
+/// Changing that arm's `DrainIntent::Teardown` to `DrainIntent::Retryable`
+/// (log_shard.rs, the `None` arm's `flush_all` call at line 1144) fails this:
+/// no bypass pass runs, so the poll below times out with an empty store and the
+/// body assertion panics inside `sole_published_object` with "expected exactly
+/// one commit record", left 0, right 1.
+#[tokio::test]
+async fn logs_channel_close_publishes_what_the_lag_check_refused() {
+    let (_memory, store) = observed_store(Some(STORE_NS));
+    let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
+    let router = LogIngestRouter::new(
+        buffer_until_drain_config(),
+        Arc::clone(&store),
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "acked")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered log write acknowledged");
+
+    // A buffered ack fires at enqueue, so wait until the actor has actually
+    // buffered the record before dropping the router; otherwise the drop could
+    // race the actor and prove nothing.
+    let metrics = router.metrics_handle();
+    for _ in 0..100 {
+        if metrics.snapshot().buffered_records_total == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        metrics.snapshot().buffered_records_total,
+        1,
+        "the record must be buffered in the actor before the router is dropped"
+    );
+
+    drop(router);
+
+    // Wait for the commit record rather than a flat sleep: a slow host takes
+    // longer instead of failing, and a host that never writes one fails on the
+    // assertions below.
+    for _ in 0..2_000 {
+        if !commit_records(store.as_ref(), &tenant, Signal::Logs)
+            .await
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    assert_eq!(
+        published_log_bodies(store.as_ref(), &tenant).await,
+        vec!["acked".to_string()],
+        "the channel-close drain publishes the acknowledged record"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "nothing was left buffered, so nothing is residue"
+    );
+    assert_eq!(
+        snap.clock_lag_bypassed_at_shutdown, 1,
+        "one flush published with the check bypassed"
+    );
+    assert_eq!(
+        snap.clock_lag_refused, DRAIN_REFUSALS,
+        "every enforced pass of the channel-close drain refused first"
+    );
+}
+
+/// Spans: the same channel-close teardown at the span shard's `None` arm.
+///
+/// Changing that arm's `DrainIntent::Teardown` to `DrainIntent::Retryable`
+/// (span_shard.rs, the `None` arm's `flush_all` call at line 713) fails this:
+/// no bypass pass runs, so the poll below times out with an empty store and the
+/// start-timestamp assertion panics inside `sole_published_object` with
+/// "expected exactly one commit record", left 0, right 1.
+#[tokio::test]
+async fn spans_channel_close_publishes_what_the_lag_check_refused() {
+    let (_memory, store) = observed_store(Some(STORE_NS));
+    let clock = TestClock::new(STORE_NS - TWO_HOURS_NS);
+    let router = SpanIngestRouter::new(
+        buffer_until_drain_config(),
+        Arc::clone(&store),
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered span write acknowledged");
+
+    let metrics = router.metrics_handle();
+    for _ in 0..100 {
+        if metrics.snapshot().buffered_spans_total == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        metrics.snapshot().buffered_spans_total,
+        1,
+        "the span must be buffered in the actor before the router is dropped"
+    );
+
+    drop(router);
+
+    for _ in 0..2_000 {
+        if !commit_records(store.as_ref(), &tenant, Signal::Spans)
+            .await
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    assert_eq!(
+        published_span_starts(store.as_ref(), &tenant).await,
+        vec![1_000],
+        "the channel-close drain publishes the acknowledged span"
     );
     let snap = metrics.snapshot();
     assert_eq!(

@@ -210,18 +210,22 @@ pub struct IngestMetrics {
     /// a clock-refused flush and retries it in the same call; this counts the
     /// residue that survived every pass on a drain the actor does not outlive
     /// (`Shutdown`, channel close), which is a lost acknowledged buffered-mode
-    /// write (a pathological clock that steps back on every reading). Nonzero
-    /// is a durability defect, logged at ERROR beside this bump so the residue
-    /// is never silent.
+    /// write (a pathological clock that steps back past the hold bound on every
+    /// bypass pass's reading). Nonzero is a durability defect, logged at ERROR
+    /// beside this bump so the residue is never silent.
     ///
     /// An ADR-1685 lag refusal on its own never reaches here: a teardown
     /// drain's bypass passes disable that check and publish
-    /// (`clock_lag_bypassed_at_shutdown`). What still leaves teardown residue
-    /// is the ADR-1307 floor refusing every pass, enforced and bypassed alike,
-    /// which takes a clock stepping backwards beyond the hold bound on every
-    /// reading. One such step is not enough even when a lag refusal keeps the
-    /// floor from seeing it until the first bypass pass: that refusal
-    /// re-anchors the floor, and the next bypass pass publishes.
+    /// (`clock_lag_bypassed_at_shutdown`). Teardown residue needs every
+    /// enforced pass refused, by the lag check or by the ADR-1307 floor, and
+    /// every bypass pass refused by that floor. A lag refusal returns before
+    /// the floor is read, so what the bypass passes need is
+    /// [`crate::MAX_FLUSH_ALL_PASSES`] consecutive backwards steps past the
+    /// hold bound on their own readings, the same count the floor alone needed
+    /// for residue before this check existed. One such step is not enough even
+    /// when a lag refusal keeps the floor from seeing it until the first bypass
+    /// pass: that refusal re-anchors the floor, and the next bypass pass
+    /// publishes.
     ///
     /// Residue on a `FlushNow` drain is deliberately NOT counted here: that
     /// arm leaves the actor running with the tenants still buffered and their

@@ -1316,8 +1316,12 @@ impl ShardActor {
     /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
     /// the residue is still in the tenant map with its arrival bookkeeping and
     /// the actor is still running to flush it. On a teardown that residue now
-    /// needs the floor to refuse every bypass pass too, which takes a clock
-    /// stepping backwards beyond the hold bound on every reading.
+    /// needs every enforced pass refused, by the lag check or by the floor, and
+    /// every bypass pass refused by the floor. A lag refusal never consults the
+    /// floor, so what the bypass passes need is [`MAX_FLUSH_ALL_PASSES`]
+    /// consecutive backwards steps past the hold bound on their own readings,
+    /// the same count the floor alone needed for residue before the lag check
+    /// existed.
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
@@ -1460,7 +1464,7 @@ impl ShardActor {
                         shard = self.shard,
                         raw_ns,
                         lag_ns,
-                        "ravel-ingest: flush clock lags the object store's observed clock beyond the clock-skew allowance, but this is a teardown drain's final pass; publishing anyway so acknowledged buffered-mode rows are not lost. The commit record may land in an ingest hour the fold has sealed, so a token-less read needs a catalog HEAD rebuild to see it"
+                        "ravel-ingest: flush clock lags the object store's observed clock beyond the clock-skew allowance, but this is a teardown bypass pass; not refusing on the lag, so the flush proceeds to the monotonic floor check and publishes unless the floor refuses it, rather than dropping acknowledged buffered-mode rows. The commit record may land in an ingest hour the fold has sealed, so a token-less read needs a catalog HEAD rebuild to see it"
                     );
                 }
             },

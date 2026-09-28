@@ -146,12 +146,16 @@ pub struct SpanIngestMetrics {
     ///
     /// An ADR-1685 lag refusal on its own never reaches here: a teardown
     /// drain's bypass passes disable that check and publish
-    /// (`clock_lag_bypassed_at_shutdown`). What still leaves teardown residue
-    /// is the ADR-1307 floor refusing every pass, enforced and bypassed alike,
-    /// which takes a clock stepping backwards beyond the hold bound on every
-    /// reading. One such step is not enough even when a lag refusal keeps the
-    /// floor from seeing it until the first bypass pass: that refusal
-    /// re-anchors the floor, and the next bypass pass publishes.
+    /// (`clock_lag_bypassed_at_shutdown`). Teardown residue needs every
+    /// enforced pass refused, by the lag check or by the ADR-1307 floor, and
+    /// every bypass pass refused by that floor. A lag refusal returns before
+    /// the floor is read, so what the bypass passes need is
+    /// [`crate::MAX_FLUSH_ALL_PASSES`] consecutive backwards steps past the
+    /// hold bound on their own readings, the same count the floor alone needed
+    /// for residue before this check existed. One such step is not enough even
+    /// when a lag refusal keeps the floor from seeing it until the first bypass
+    /// pass: that refusal re-anchors the floor, and the next bypass pass
+    /// publishes.
     flush_all_residue_tenants: AtomicU64,
     /// Multi-shard Strict writes that returned
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard

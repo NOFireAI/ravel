@@ -479,9 +479,12 @@ refusal returns before the floor is read, so a backwards step past
 `MAX_FLUSH_CLOCK_HOLD_NS` stays hidden behind the lag check until the first
 bypass pass reaches the floor and is refused there; that refusal re-anchors
 the floor, and the next bypass pass stamps and publishes. Residue on a
-teardown therefore needs the floor to refuse every pass, enforced and
-bypassed alike, which takes a clock stepping backwards beyond the hold
-bound on every reading. Either way: fix the host clock before restarting a
+teardown therefore needs every enforced pass refused, by the lag check or by
+the floor, and every bypass pass refused by the floor; since a lag refusal
+never consults the floor, what the bypass passes need is
+`MAX_FLUSH_ALL_PASSES` consecutive backwards steps past the hold bound on
+their own readings, the same count the floor alone needed for residue before
+this check existed. Either way: fix the host clock before restarting a
 writer that is refusing flushes.
 
 ### Pipelined flushes (ADR-0067)

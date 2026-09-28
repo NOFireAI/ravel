@@ -188,7 +188,7 @@ flowchart LR
   buffered mode the rows stay buffered and retry each tick under the
   ADR-0069 byte budget, so a host whose clock never converges eventually
   sheds at the ceiling. On a graceful shutdown they are published instead,
-  with the check bypassed on the drain's final pass and counted: see the
+  with the check bypassed on the drain's bypass passes and counted: see the
   teardown amendment below. That is the same operator surface as
   `clock_regressions_refused`: fix the host clock.
 - Two cases remain outside the check and are stated here rather than
@@ -298,12 +298,14 @@ hidden behind it: the first bypass pass is where the floor sees that step
 and refuses, and that refusal re-anchors the floor, so the pass after it
 stamps and publishes. With a single bypass pass those acknowledged rows
 became residue, which is the durability hole this paragraph replaces. The
-residue path (ERROR plus `flush_all_residue_tenants`) therefore remains
-reachable exactly when the floor refuses every pass of the drain, enforced
-and bypassed alike, which takes a clock stepping backwards beyond the hold
-bound on every reading. A lagging clock alone never reaches it, and neither
-does a lagging clock plus a single backwards step. The operator remedy is
-unchanged: fix the host
-clock before restarting a writer that is refusing flushes, and rebuild the
-catalog HEAD if a token-less read is missing rows a bypassed flush
-published.
+residue path (ERROR plus `flush_all_residue_tenants`) therefore needs every
+enforced pass refused, by the lag check or by the floor, and every bypass
+pass refused by the floor. A lag refusal returns before the floor is read,
+so the enforced passes say nothing about the floor; what the bypass passes
+need is `MAX_FLUSH_ALL_PASSES` consecutive backwards steps past the hold
+bound on their own readings, the same count the floor alone needed for
+residue before this check existed. A lagging clock alone never reaches it,
+and neither does a lagging clock plus a single backwards step. The operator
+remedy is unchanged: fix the host clock before restarting a writer that is
+refusing flushes, and rebuild the catalog HEAD if a token-less read is
+missing rows a bypassed flush published.
