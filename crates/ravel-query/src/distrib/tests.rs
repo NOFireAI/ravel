@@ -3086,11 +3086,9 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
 // suite whose slices carried none (an empty-result or all-metrics case, say)
 // could in principle have kept running through `SliceStreamDecoder` -- it was
 // removed only because its decoder was, not because the decoder would have
-// refused it. What survives here is the span TOTAL-ORDER pinning below, which
-// is coordinator-side and independent of any transport.
-// The span total order the coordinator sorts by. `span_order_key` and
-// `span_cmp` are coordinator-side and reachable without any transport, so they
-// are pinned here directly rather than through a fan-out.
+// refused it. What survives here is the span TOTAL-ORDER pinning below
+// (`span_order_key` and `span_cmp`), which is coordinator-side and independent
+// of any transport.
 
 const TA: [u8; 16] = [0xAA; 16];
 const TB: [u8; 16] = [0xBB; 16];
