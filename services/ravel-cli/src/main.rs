@@ -358,8 +358,10 @@ enum Command {
     /// metric's name and label names are rewritten exactly as OTLP rewrites
     /// them (the Prometheus character set, then the `[metrics] unit` suffix
     /// and `_total` for `kind = "counter"`), so a loaded metric lands on the
-    /// same series as the same metric sent over OTLP. A row that fails a kept
-    /// check is
+    /// same series as the same metric sent over OTLP. A loaded span is stored
+    /// as the same record the same span sent over OTLP produces: the same
+    /// attribute coercion, the same resource-over-span merge, and the same
+    /// status mapping. A row that fails a kept check is
     /// rejected fail-fast: the run stops at the first bad row and exits
     /// nonzero. `--skip-rows` (issue #1713) drops that many leading rows by
     /// file-absolute position; a failed run prints the figures a resume would
@@ -385,9 +387,12 @@ enum Command {
         /// bypassed by construction) applies per signal. The `--mapping` file
         /// must carry exactly one signal section and it must match this flag;
         /// a mapping written before ADR-1751, whose logs keys sit at the top
-        /// level, is still read as the `[logs]` section. `spans` is refused
-        /// until ADR-1751 follow-up task 2 lands, and never falls back to
-        /// another signal. Defaults to `logs`.
+        /// level, is still read as the `[logs]` section. A `[spans]` mapping
+        /// names the span's ids, name, start and end timestamps with their
+        /// units, optional status code and message, and its resource and span
+        /// attribute columns; span events and span links are not mappable in
+        /// this version and a mapping naming them is refused. Defaults to
+        /// `logs`.
         #[arg(long, value_enum, default_value_t = ravel_cli::maintain::SignalArg::Logs)]
         signal: ravel_cli::maintain::SignalArg,
         /// Configured shard count. Validated against (or, for a fresh signal,
