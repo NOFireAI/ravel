@@ -511,17 +511,19 @@ and lists every page in PAGE_DIR, so the fetch unit is a column chunk rather
 than a block. The request law for one statement over one such object:
 
 **One suffix probe, plus one coalesced range per surviving `(row group,
-projected column)` bounded at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4, ADR-2066
-decision 1), plus front-section ranges (STREAM_DIR and FIELD_DIR together, in
-one GET, when the query carries numeric arms or projects fewer than every
-column) only when the probe's cached suffix does not already cover them.**
-That is one to seven GETs per object (probe, SKIP_IDX/PAGE_DIR, front
-sections, and up to `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4) chunk-run GETs)
-for a typical narrow projection over a small object; below that cap the
-count grows with
-`row_groups x projected_columns` rather than with the object's block count,
-and above it the candidate runs bridge down to the cap instead of growing
-further.
+projected column)`, bounded at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4,
+ADR-2066 decision 1) on an L0 object and unbounded on an L1 segment, plus
+front-section ranges (STREAM_DIR and FIELD_DIR together, in one GET, when the
+query carries numeric arms or projects fewer than every column) only when the
+probe's cached suffix does not already cover them.**
+For a typical narrow projection over a small L0 object that is one to seven
+GETs: the probe, a SKIP_IDX/PAGE_DIR chase when the probe falls short, the
+front sections, and up to 4 chunk-run GETs. The count excludes the tail
+sections a predicate can need beyond those (BLOOM and POSTINGS, each one GET
+when the probe does not cover it), which add to it. Below the cap the
+chunk-run count grows with `row_groups x projected_columns` rather than with
+the object's block count; above it an L0 object's candidate runs bridge down
+to the cap, while an L1 segment issues one GET per coalesced run.
 
 The pieces, and why each is where it is:
 
@@ -551,11 +553,15 @@ The pieces, and why each is where it is:
   adjacent chunks coalesce, and one for the whole group when the projection
   keeps every column and every block of the group survives. Pruned blocks' pages
   are the holes inside those runs, read through or split around by the
-  `coalesce_gap` policy. When the coalesced candidate runs still exceed
-  `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4), `bounded_chunk_runs` bridges the
-  smallest remaining gaps between them down to the cap, the same bound
-  `SegmentFetcher::fetch_pages` already applied to L0 metrics flushes (ADR-1306,
-  below) and ADR-2066 decision 1 extends to RLOG.
+  `coalesce_gap` policy. On an L0 object, when the coalesced candidate runs
+  still exceed `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4), `bounded_chunk_runs`
+  bridges the smallest remaining gaps between them down to the cap: the same
+  L0-only bound `SegmentFetcher::fetch_pages` already applied to metrics
+  flushes (ADR-1306, below), which ADR-2066 decision 1 extends to RLOG L0
+  objects. L1 segments (compaction and rewrite outputs) are exempt for the
+  same reason the metrics path exempts them: a large segment with many row
+  groups would bridge a narrow projection into spans covering most of the
+  object.
 - The 75% coverage crossover still applies, now computed against that bounded,
   bridged run set rather than the raw projected page bytes (ADR-2066 decision
   1): bridging can itself push the covered bytes over the threshold, so a
