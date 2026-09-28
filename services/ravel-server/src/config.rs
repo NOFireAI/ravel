@@ -646,6 +646,21 @@ pub struct Cli {
     #[arg(long = "maintain-interior-reverify", value_name = "DURATION")]
     pub maintain_interior_reverify: Option<String>,
 
+    /// Age past which the maintenance loop deletes alert transition records,
+    /// as a humantime duration (e.g. `90d`), ADR-1688 decision 5. Each alert
+    /// identity's current-state record is kept whatever its age. A tenant
+    /// whose alert state memo is missing, unreadable, or carries a watermark
+    /// below this window's expiry floor is not swept that tick. `0` disables
+    /// the sweep and keeps every alert record. A nonzero window shorter than
+    /// one hour plus the memo's seal margin (three evaluation intervals plus
+    /// the query deadline) is refused at startup: it would put the expiry
+    /// floor above every watermark the evaluator can write, so every tick
+    /// would skip. Omitted defaults to
+    /// `ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS` (90 days).
+    /// (default: 90d)
+    #[arg(long, value_name = "DURATION")]
+    pub alert_retention: Option<String>,
+
     /// Default age-based retention window applied to every tenant with no
     /// explicit `--retention-tenant` override, as a humantime duration
     /// (e.g. `30d`, `720h`). Omitted means no default retention: nothing is
@@ -5292,6 +5307,54 @@ impl Cli {
                 Ok(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX))
             }
         }
+    }
+
+    /// Parse `--alert-retention` into nanoseconds (ADR-1688 decision 5),
+    /// defaulting to [`ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS`].
+    /// Zero is accepted and returned verbatim: it is the documented "disable
+    /// the sweep" value.
+    ///
+    /// A nonzero window below [`Self::alert_retention_floor_ns`] fails startup
+    /// rather than being clamped or accepted. The driver skips a tenant whose
+    /// memo watermark is below the expiry floor's hour, and the evaluator holds
+    /// that watermark a seal margin behind the clock, so such a window is
+    /// indistinguishable at runtime from a broken evaluator: every tick counts
+    /// `watermark_below_floor` and nothing is ever swept.
+    pub fn parse_alert_retention(&self) -> anyhow::Result<i64> {
+        let Some(s) = self.alert_retention.as_deref() else {
+            return Ok(ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS);
+        };
+        let dur = humantime::parse_duration(s)
+            .map_err(|e| anyhow::anyhow!("invalid --alert-retention '{s}': {e}"))?;
+        let window_ns = i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX);
+        if window_ns == 0 {
+            return Ok(0);
+        }
+        let floor = self.alert_retention_floor();
+        if dur < floor {
+            anyhow::bail!(
+                "invalid --alert-retention '{s}': a nonzero window must be at least {}, one hour \
+                 plus the alert state memo's seal margin at --alert-eval-interval-secs {}; a \
+                 shorter window puts the expiry floor above every watermark the evaluator writes, \
+                 so every maintenance tick skips the sweep. Use 0 to disable the sweep instead.",
+                humantime::format_duration(floor),
+                self.alert_eval_interval_secs,
+            );
+        }
+        Ok(window_ns)
+    }
+
+    /// The smallest nonzero `--alert-retention` window this configuration can
+    /// sweep under: one hour plus [`crate::alerting::alert_memo_seal_margin`]
+    /// at the configured evaluation interval.
+    ///
+    /// The hour is not slack. Both the watermark and the expiry floor are
+    /// compared as ingest hours, so a window equal to the margin alone still
+    /// leaves the floor one hour above the watermark whenever the two fall on
+    /// opposite sides of an hour boundary, which is most of the time.
+    fn alert_retention_floor(&self) -> Duration {
+        crate::alerting::alert_memo_seal_margin(Duration::from_secs(self.alert_eval_interval_secs))
+            .saturating_add(Duration::from_secs(3600))
     }
 
     /// Parse `--idle-tenant-state-ttl` into a duration (ADR-0069 decision 2),
@@ -11295,6 +11358,86 @@ mod tests {
         let mut argv = vec!["ravel-server"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("flags parse")
+    }
+
+    /// `--alert-retention` defaults to 90 days, accepts `0` as the opt-out,
+    /// parses a humantime window, and refuses an unparseable one (ADR-1688
+    /// decision 5).
+    #[test]
+    fn alert_retention_parses_default_zero_and_window() {
+        assert_eq!(
+            cli(&[]).parse_alert_retention().expect("default"),
+            ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS
+        );
+        assert_eq!(
+            ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS,
+            90 * 24 * 3_600_000_000_000
+        );
+        assert_eq!(
+            cli(&["--alert-retention", "0"])
+                .parse_alert_retention()
+                .expect("zero"),
+            0
+        );
+        assert_eq!(
+            cli(&["--alert-retention", "30d"])
+                .parse_alert_retention()
+                .expect("30d"),
+            30 * 24 * 3_600_000_000_000
+        );
+        let err = cli(&["--alert-retention", "soon"])
+            .parse_alert_retention()
+            .expect_err("unparseable");
+        assert!(err.to_string().contains("--alert-retention"), "{err}");
+    }
+
+    /// A nonzero window below one hour plus the memo's seal margin is refused
+    /// at parse time, and the message names the minimum. At the default 60 s
+    /// evaluation interval the margin is three intervals plus the 30 s query
+    /// deadline, so the minimum is 1 h 3 m 30 s: `1h` is refused, `2h` is not,
+    /// and `0` stays the opt-out at any interval. A longer evaluation interval
+    /// raises the minimum, which is why the message names the interval too.
+    #[test]
+    fn alert_retention_refuses_a_window_below_the_seal_margin_floor() {
+        let err = cli(&["--alert-retention", "1h"])
+            .parse_alert_retention()
+            .expect_err("1h is below the floor at the default interval");
+        let text = err.to_string();
+        assert!(text.contains("at least 1h 3m 30s"), "{text}");
+        assert!(text.contains("--alert-eval-interval-secs 60"), "{text}");
+        assert!(
+            text.contains("Use 0 to disable the sweep instead."),
+            "{text}"
+        );
+
+        assert_eq!(
+            cli(&["--alert-retention", "2h"])
+                .parse_alert_retention()
+                .expect("2h clears the floor"),
+            2 * 3_600_000_000_000
+        );
+
+        let err = cli(&[
+            "--alert-retention",
+            "2h",
+            "--alert-eval-interval-secs",
+            "3600",
+        ])
+        .parse_alert_retention()
+        .expect_err("a 1 h evaluation interval raises the floor past 2 h");
+        assert!(err.to_string().contains("at least 4h 30s"), "{err}");
+
+        assert_eq!(
+            cli(&[
+                "--alert-retention",
+                "0",
+                "--alert-eval-interval-secs",
+                "3600"
+            ])
+            .parse_alert_retention()
+            .expect("zero is the opt-out at any interval"),
+            0
+        );
     }
 
     /// The identity the qualification gate compares against is the exact string

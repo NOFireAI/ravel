@@ -2,11 +2,14 @@
 //!
 //! [`crate::alerting::AlertEvaluator`] derives each alert's current state by
 //! folding the tenant's whole `Signal::Alerts` transition history to the most
-//! recent record per `alert_id` (ADR-0040 decision 3). Nothing maintains that
-//! signal (`Signal::Alerts` is absent from `maintain::MAINTAINED_SIGNALS`), so
-//! the history only grows, and a fold that re-reads all of it every tick costs
-//! `ceil(N/page)` LISTs plus `2N` GETs where `N` is the cumulative transition
-//! count, independent of the rule count the evaluator actually needs.
+//! recent record per `alert_id` (ADR-0040 decision 3). A fold that re-reads all
+//! of it every tick costs `ceil(N/page)` LISTs plus `2N` GETs where `N` is the
+//! transition count, independent of the rule count the evaluator actually
+//! needs. `Signal::Alerts` is still absent from `maintain::MAINTAINED_SIGNALS`
+//! and no alert record is ever compacted, but since ADR-1688 the maintenance
+//! tick does sweep it: `N` is one retention window's transitions plus one
+//! current-state record per identity, not the whole life of the deployment.
+//! This memo is what keeps the steady-state tick off `N` altogether.
 //!
 //! This memo is a derived cache of that fold at one durable, tenant-wide key
 //! (`t/<tenant_hash>/a/state/latest`), deliberately outside the
