@@ -342,13 +342,15 @@ enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
-    /// Bulk-import a Parquet file into the logs signal (ADR-0089).
+    /// Bulk-import a Parquet file into the signal named by `--signal`
+    /// (ADR-0089, widened to every signal by ADR-1751).
     ///
-    /// Writes directly to the log ingest router in-process. NOTE: the
+    /// Writes directly to that signal's ingest router in-process. NOTE: the
     /// per-tenant AdmissionController (active-stream cap, stream-creation rate,
     /// byte rate) that guards the HTTP ingest path is BYPASSED by construction
     /// on this path. The future-skew and length caps are enforced identically
-    /// to OTLP; the past-event-time lag check is deliberately NOT enforced, so
+    /// to OTLP, at the named signal's own OTLP limits; the past-event-time lag
+    /// check is deliberately NOT enforced, so
     /// historical timestamps are admitted (they bucket by load time, so query
     /// with a window that reaches now). A per-record attribute cap of 1024
     /// applies (relaxed from OTLP's 128). A row that fails a kept check is
@@ -2885,6 +2887,55 @@ mod tests {
              allocation: the process is not running under the jemalloc global allocator"
         );
         std::hint::black_box(big);
+    }
+
+    /// `load --signal` defaults to logs and accepts all three signal names
+    /// (ADR-1751 decision 1). The default is what keeps every pre-ADR-1751
+    /// invocation, which names no signal at all, loading into logs.
+    ///
+    /// Non-vacuity (prove-the-test): the pre-change tree had no `signal`
+    /// field on `Command::Load`, and `--signal metrics` exited 2 with
+    /// "unexpected argument '--signal' found"; this test's second block fails
+    /// to parse against it.
+    #[test]
+    fn load_signal_flag_defaults_to_logs_and_accepts_every_signal() {
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ];
+
+        let Command::Load { signal, .. } = Cli::try_parse_from(base)
+            .expect("a load with no --signal parses")
+            .command
+        else {
+            panic!("expected the load subcommand");
+        };
+        assert_eq!(
+            signal,
+            ravel_cli::maintain::SignalArg::Logs,
+            "an omitted --signal keeps the pre-ADR-1751 behaviour: load into logs"
+        );
+
+        for (name, want) in [
+            ("metrics", ravel_cli::maintain::SignalArg::Metrics),
+            ("logs", ravel_cli::maintain::SignalArg::Logs),
+            ("spans", ravel_cli::maintain::SignalArg::Spans),
+        ] {
+            let Command::Load { signal, .. } =
+                Cli::try_parse_from(base.iter().copied().chain(["--signal", name]))
+                    .unwrap_or_else(|e| panic!("--signal {name} parses: {e}"))
+                    .command
+            else {
+                panic!("expected the load subcommand");
+            };
+            assert_eq!(signal, want, "--signal {name} reaches the field");
+        }
     }
 
     /// The shipped write-concurrency defaults, read where an operator meets

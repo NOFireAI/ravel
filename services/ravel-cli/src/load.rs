@@ -4764,6 +4764,7 @@ fn check_label(name: &str, value: &str, limits: &IngestLimits) -> Result<(), Str
 /// `ravel_otlp::normalize`'s private `finish_point`: base labels plus
 /// `__name__`, plus at most one synthesized label (`le`), through
 /// [`LabelSet::new`] and [`SeriesId::compute`].
+#[allow(clippy::too_many_arguments)]
 fn metrics_point(
     tenant: &TenantId,
     base_labels: &[Label],
