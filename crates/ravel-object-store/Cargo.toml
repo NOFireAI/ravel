@@ -35,6 +35,15 @@ serde_json = { workspace = true }
 # the link-local metadata endpoint. Version pinned once in the workspace so all
 # crates resolve the same reqwest.
 reqwest = { workspace = true }
+# SigV4 HMAC-SHA256 and SHA-256 for the read-only bucket-protection control
+# plane (ADR-1727 decision 1, crates/ravel-object-store/src/s3/bucket_config.rs).
+# Already in the graph under object_store; a direct dependency here so the
+# hand-rolled signer needs no RustCrypto crate and no AWS SDK.
+ring = { workspace = true }
+# Reads the S3 bucket-configuration XML responses the same control plane fetches
+# (?versioning, ?lifecycle, ?replication, ?object-lock, ?retention). 0.41 is the
+# release outside the two advisories deny.toml tracks.
+quick-xml = { workspace = true }
 
 [features]
 # Test-only hooks on the reference backends, off in every production build:
