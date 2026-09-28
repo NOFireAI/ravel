@@ -58,6 +58,14 @@ struct Cli {
     #[command(flatten)]
     tenancy: TenancyArgs,
 
+    /// Path to the external credential profile file (ADR-2040 decision D1),
+    /// the JSON list of named profiles `tenant parquet-grant add` resolves
+    /// `--profile` against. Same file and same name ravel-server reads for
+    /// its own Parquet-table paths. A top-level flag, given before the
+    /// subcommand, like the tenant-hash flags above.
+    #[arg(long, value_name = "PATH", env = "RAVEL_PARQUET_PROFILES")]
+    parquet_profiles: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -106,7 +114,11 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Load { .. }
         // `export` resolves the catalog under `t/<tenant_hash>/logs/...` from
         // its `--tenant`, exactly as `catalog list` does.
-        | Command::Export { .. } => true,
+        | Command::Export { .. }
+        // Every Parquet-table object is under `t/<tenant_hash>/pq/`
+        // (ADR-2040 decision D1), so both `parquet` subcommands hash a
+        // tenant.
+        | Command::Parquet { .. } => true,
         // `commit reconstruct` computes a `t/<tenant_hash>/` prefix from its
         // `--tenant`, so it needs the bucket's scheme resolved first; the
         // other `commit` variants take an explicit key/path and do not.
@@ -129,10 +141,16 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // the same shape: deployment-wide, at the bucket root, never under a
         // tenant prefix, so `tenant token` never hashes a tenant either.
         | Command::GcConfig { .. }
-        | Command::Tenant { .. }
         // `cache reclaim-legacy` operates on a local directory, not object
         // storage: no tenant prefix, no store built.
         | Command::Cache { .. } => false,
+        // `tenant token` reads and writes bucket-root `sys/auth`;
+        // `tenant parquet-grant` reads and writes the grants record at
+        // `t/<tenant_hash>/pq/grants`, so only the second half hashes.
+        Command::Tenant { command } => match command {
+            TenantCommand::Token { .. } => false,
+            TenantCommand::ParquetGrant { .. } => true,
+        },
     }
 }
 
@@ -228,6 +246,21 @@ fn command_is_write(command: &Command) -> bool {
                 // never under `t/<tenant_hash>/`.
                 TenantTokenCommand::Upsert { .. } | TenantTokenCommand::Revoke { .. } => false,
             },
+            // `add`/`remove` replace the grants record at
+            // `t/<tenant_hash>/pq/grants` under CAS, and `add` also writes a
+            // probe object to the bucket root; `ls` only reads the record.
+            TenantCommand::ParquetGrant { command } => match command {
+                TenantParquetGrantCommand::Add { .. }
+                | TenantParquetGrantCommand::Remove { .. } => true,
+                TenantParquetGrantCommand::Ls { .. } => false,
+            },
+        },
+        Command::Parquet { command } => match command {
+            // Reads manifest versions only.
+            ParquetCommand::Ls { .. } => false,
+            // Deletes superseded manifest versions under
+            // `t/<tenant_hash>/pq/t/`.
+            ParquetCommand::Sweep { .. } => true,
         },
         // Pure inspection commands that take an explicit key/path or decode a
         // marker directly (`tenancy show`/`resolve` resolve the scheme
@@ -330,11 +363,17 @@ enum Command {
         #[command(subcommand)]
         command: TypedAttrColumnCommand,
     },
-    /// Manage the durable deployment-wide bearer-token map `sys/auth`
-    /// (ADR-0072 decision 4): the writer of `sys/auth`.
+    /// Per-tenant operator records: the deployment-wide bearer-token map
+    /// `sys/auth` (ADR-0072 decision 4) and the Parquet location grants
+    /// record (ADR-2040 decision D1).
     Tenant {
         #[command(subcommand)]
         command: TenantCommand,
+    },
+    /// Inspect and sweep a tenant's Parquet table manifests (ADR-2040).
+    Parquet {
+        #[command(subcommand)]
+        command: ParquetCommand,
     },
     /// Operate on a node's local read-cache directory (ADR-0046). A local
     /// filesystem tool: it takes no `--store` and never touches object storage.
@@ -691,6 +730,85 @@ enum TenantCommand {
     Token {
         #[command(subcommand)]
         command: TenantTokenCommand,
+    },
+    /// Manage the tenant's Parquet location grants (ADR-2040 decision D1):
+    /// the external locations this tenant may define Parquet tables over.
+    ParquetGrant {
+        #[command(subcommand)]
+        command: TenantParquetGrantCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TenantParquetGrantCommand {
+    /// Grant one location to one credential profile, after qualifying the
+    /// store behind it.
+    ///
+    /// Refuses a location whose scheme does not address the profile's store
+    /// kind; a prefix holding no object, which leaves nothing to probe;
+    /// a store that serves a read carrying an ETag it never issued, which
+    /// cannot pin a Parquet file; and a bucket that is Ravel's own reached
+    /// under another name, or whose answer about that is inconclusive.
+    Add {
+        /// The tenant to grant the location to.
+        #[arg(long)]
+        tenant: String,
+        /// The location URL: `s3://bucket/prefix`, `gs://...` or `az://...`.
+        /// A trailing `/` names a set of objects.
+        #[arg(long)]
+        location: String,
+        /// The credential profile name, resolved in the file named by the
+        /// top-level `--parquet-profiles`.
+        #[arg(long)]
+        profile: String,
+    },
+    /// Revoke the grant that is exactly this location. A location merely
+    /// admitted by a wider grant is not removed: name the grant itself.
+    Remove {
+        /// The tenant to revoke the grant from.
+        #[arg(long)]
+        tenant: String,
+        /// The granted location URL, exactly as it was granted.
+        #[arg(long)]
+        location: String,
+    },
+    /// Print every field of every grant this tenant holds.
+    Ls {
+        /// The tenant whose grants to print.
+        #[arg(long)]
+        tenant: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ParquetCommand {
+    /// Print every manifest field of each table's newest version. With
+    /// `--table`, print every retained version of that one table instead.
+    Ls {
+        /// The tenant whose Parquet tables to print.
+        #[arg(long)]
+        tenant: String,
+        /// Restrict the output to one table, and print every version of it
+        /// that has not been swept.
+        #[arg(long)]
+        table: Option<String>,
+    },
+    /// Delete manifest versions superseded for longer than `--grace`.
+    ///
+    /// Deletes nothing outside `t/<tenant_hash>/pq/t/`: the Parquet files a
+    /// table names live in the tenant's own bucket and a sweep never touches
+    /// them. A grace below the deployment's stored `max_query_duration`
+    /// (`sys/gc`) is refused, since a query resolved under that deadline may
+    /// still be reading the version it would delete.
+    Sweep {
+        /// The tenant whose superseded manifest versions to delete.
+        #[arg(long)]
+        tenant: String,
+        /// How long a superseded version is kept, as a humantime duration
+        /// (`1h`, `90m`). Must be at least the deployment's stored
+        /// `max_query_duration`.
+        #[arg(long)]
+        grace: String,
     },
 }
 
@@ -1920,6 +2038,64 @@ async fn main() -> anyhow::Result<()> {
                 tenant_token::list(store::build_store(&cli.store)?, &deployment_key_file).await?;
             print!("{report}");
             Ok(())
+        }
+        Command::Tenant {
+            command:
+                TenantCommand::ParquetGrant {
+                    command:
+                        TenantParquetGrantCommand::Add {
+                            tenant,
+                            location,
+                            profile,
+                        },
+                },
+        } => {
+            ravel_cli::parquet_grant::add(
+                store::build_store(&cli.store)?,
+                cli.parquet_profiles.as_deref(),
+                &tenant,
+                &location,
+                &profile,
+                "ravel-cli",
+                now_ns()?,
+            )
+            .await
+        }
+        Command::Tenant {
+            command:
+                TenantCommand::ParquetGrant {
+                    command: TenantParquetGrantCommand::Remove { tenant, location },
+                },
+        } => {
+            ravel_cli::parquet_grant::remove(store::build_store(&cli.store)?, &tenant, &location)
+                .await
+        }
+        Command::Tenant {
+            command:
+                TenantCommand::ParquetGrant {
+                    command: TenantParquetGrantCommand::Ls { tenant },
+                },
+        } => ravel_cli::parquet_grant::ls(store::build_store(&cli.store)?, &tenant).await,
+        Command::Parquet {
+            command: ParquetCommand::Ls { tenant, table },
+        } => {
+            ravel_cli::parquet::ls(
+                store::build_store(&cli.store)?,
+                &tenant,
+                table.as_deref(),
+            )
+            .await
+        }
+        Command::Parquet {
+            command: ParquetCommand::Sweep { tenant, grace },
+        } => {
+            ravel_cli::parquet::sweep(
+                store::build_store(&cli.store)?,
+                &tenant,
+                &grace,
+                now_ns()?,
+            )
+            .await
         }
         Command::Cache {
             command: CacheCommand::ReclaimLegacy { cache_dir, apply },

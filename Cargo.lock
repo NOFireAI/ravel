@@ -4740,6 +4740,7 @@ dependencies = [
  "ravel-memory",
  "ravel-object-store",
  "ravel-otlp",
+ "ravel-pqtable",
  "ravel-proto",
  "ravel-query",
  "ravel-rspan",

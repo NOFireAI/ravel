@@ -1,0 +1,672 @@
+//! `ravel-cli tenant parquet-grant` (ADR-2040 decision D1): the external
+//! locations an operator admits for one tenant, and the checks a location
+//! clears before it is written into the grants record.
+//!
+//! The durable record and every rule about it belong to
+//! [`ravel_pqtable::grants`]: this module parses flags, opens the external
+//! store the grant names, runs the two qualification probes, and delegates the
+//! record change. There is no CLI-side copy of the location grammar, of the
+//! overlap rules, or of the compare-and-swap.
+//!
+//! # What `add` checks, in order
+//!
+//! 1. The URL parses and its scheme matches the credential profile's store
+//!    kind. `s3://` needs an `s3` profile, `gs://` a `gcs` one, `az://` an
+//!    `azure` one. A profile of the wrong kind would reach a different service
+//!    with the same bucket name.
+//! 2. The granted prefix holds at least one object, and
+//!    [`probe_preconditions`] qualifies the store on it. A store that serves a
+//!    read carrying an ETag it never issued cannot pin a Parquet file, so a
+//!    manifest over it would name bytes that can change underneath a query. A
+//!    prefix with no object is refused too: there is nothing to probe, so the
+//!    grant would be admitted unqualified.
+//! 3. [`probe_not_ravel_bucket`] qualifies the bucket itself. Anything but a
+//!    clean pass is a refusal, including an inconclusive answer: a grant on
+//!    Ravel's own bucket under another handle would let an external table read
+//!    Ravel's objects across tenants.
+//! 4. Only then [`grants::add`] writes the record.
+//!
+//! # Credential profiles
+//!
+//! Profiles are read from the JSON file named by the global
+//! `--parquet-profiles` flag (or `RAVEL_PARQUET_PROFILES`), through
+//! [`load_profiles`], which is the same loader the server uses. The file holds
+//! secrets by reference, never in the clear; see
+//! [`ravel_object_store::external`] for the shapes.
+//!
+//! # The test seam
+//!
+//! [`ExternalStore::open`] always builds a network backend and has no fake
+//! kind, so [`add_grant`] takes the opener as a parameter. The clap layer
+//! passes [`ExternalStore::open`]; the tests pass a closure returning a second
+//! in-memory store, which is what lets the four refusals above be driven end
+//! to end.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::Context as _;
+use ravel_object_store::external::probe::{probe_not_ravel_bucket, probe_preconditions};
+use ravel_object_store::external::{ExternalKind, ExternalProfile, ExternalStore, load_profiles};
+use ravel_object_store::{ObjectStoreBackend, PageToken};
+use ravel_pqtable::clock::Clock;
+use ravel_pqtable::grants::{self, Grant};
+use ravel_types::{TenantHash, TenantId};
+
+/// How many listing pages `add` reads while looking for one object under the
+/// granted prefix. A prefix whose first objects are this far into a listing is
+/// reported as empty rather than probed, so the search is bounded on a bucket
+/// whose listing is dominated by keys outside the grant.
+const MAX_PROBE_LIST_PAGES: usize = 8;
+
+/// Opens the store a profile names for one bucket. [`ExternalStore::open`] in
+/// the shipping paths; a closure over an in-memory store in tests.
+pub type OpenExternal<'a> =
+    &'a dyn Fn(&ExternalProfile, &str) -> anyhow::Result<Arc<dyn ObjectStoreBackend>>;
+
+/// A [`Clock`] reading a timestamp the caller already took, so this module
+/// never reads the system clock itself.
+pub struct AtNs(pub i64);
+
+impl Clock for AtNs {
+    fn now_ns(&self) -> i64 {
+        self.0
+    }
+}
+
+/// Read and validate the credential profile file.
+pub fn profiles_from_file(path: &Path) -> anyhow::Result<Vec<ExternalProfile>> {
+    let json = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the profile file {}", path.display()))?;
+    load_profiles(&json)
+        .with_context(|| format!("loading external profiles from {}", path.display()))
+}
+
+/// The profile named `name`, or an error listing the names that are defined.
+pub fn find_profile<'a>(
+    profiles: &'a [ExternalProfile],
+    name: &str,
+) -> anyhow::Result<&'a ExternalProfile> {
+    profiles
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| {
+            let defined: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+            anyhow::anyhow!(
+                "no credential profile named {name:?}; the file defines {defined:?}"
+            )
+        })
+}
+
+/// Does a location scheme address the store kind this profile configures?
+fn kind_admits_scheme(kind: &ExternalKind, scheme: &str) -> bool {
+    matches!(
+        (kind, scheme),
+        (ExternalKind::S3 { .. }, "s3")
+            | (ExternalKind::Gcs { .. }, "gs")
+            | (ExternalKind::Azure { .. }, "az")
+    )
+}
+
+/// The key of one object the candidate grant admits, or `None` when the
+/// prefix holds none within [`MAX_PROBE_LIST_PAGES`] listing pages.
+///
+/// Admission is decided by [`grants::contains_key`], the same segment-wise
+/// rule the read path applies, so a listing prefix of `data` cannot offer
+/// `data2/x.parquet` as the object to probe.
+async fn one_object_under(
+    store: &dyn ObjectStoreBackend,
+    candidate: &Grant,
+) -> anyhow::Result<Option<String>> {
+    let mut page: Option<PageToken> = None;
+    for _ in 0..MAX_PROBE_LIST_PAGES {
+        let listed = store
+            .list(&candidate.prefix, page)
+            .await
+            .with_context(|| format!("listing {}", candidate.url()))?;
+        for meta in &listed.objects {
+            if grants::contains_key(
+                candidate,
+                &candidate.profile,
+                &candidate.bucket,
+                meta.key.as_bytes(),
+            ) {
+                return Ok(Some(meta.key.clone()));
+            }
+        }
+        match listed.next {
+            Some(next) => page = Some(next),
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// Grant `url` to `profile` for `tenant`, after the checks this module's
+/// header lists. Returns the grant that was written.
+///
+/// This is the whole of `tenant parquet-grant add` below the clap layer: the
+/// external store is reached through `open_external` rather than constructed
+/// here, so the same path runs in tests over in-memory stores.
+pub async fn add_grant(
+    ravel_store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    profile: &ExternalProfile,
+    url: &str,
+    created_by: &str,
+    clock: &dyn Clock,
+    open_external: OpenExternal<'_>,
+) -> anyhow::Result<Grant> {
+    let parsed = grants::parse_location(url)?;
+    if !kind_admits_scheme(&profile.kind, &parsed.scheme) {
+        anyhow::bail!(
+            "location {url:?} uses the {:?} scheme, which does not address the {:?} store \
+             profile {:?} configures: the same bucket name on another service is another \
+             bucket",
+            parsed.scheme,
+            profile.kind.name(),
+            profile.name
+        );
+    }
+
+    let external = open_external(profile, &parsed.bucket)?;
+    let candidate = Grant {
+        profile: profile.name.clone(),
+        scheme: parsed.scheme.clone(),
+        bucket: parsed.bucket.clone(),
+        prefix: parsed.key.key.clone(),
+        created_unix_ns: clock.now_ns(),
+        created_by: created_by.to_string(),
+    };
+
+    let Some(probe_key) = one_object_under(external.as_ref(), &candidate).await? else {
+        anyhow::bail!(
+            "the prefix {url:?} holds no object, so the store's preconditions could not be \
+             probed on it: grant a prefix that already holds at least one object"
+        );
+    };
+    probe_preconditions(external.as_ref(), &probe_key)
+        .await
+        .with_context(|| {
+            format!(
+                "profile {:?} does not qualify for pinned reads of {url:?}, so a manifest over \
+                 it could not pin the files it names",
+                profile.name
+            )
+        })?;
+    probe_not_ravel_bucket(ravel_store, external.as_ref())
+        .await
+        .with_context(|| format!("the bucket behind {url:?} did not qualify as external"))?;
+
+    let grant = grants::add(
+        ravel_store,
+        tenant,
+        &profile.name,
+        url,
+        created_by,
+        clock,
+    )
+    .await?;
+    Ok(grant)
+}
+
+/// Print every field of one grant.
+fn print_grant(grant: &Grant) {
+    println!("url: {}", grant.url());
+    println!("  profile: {}", grant.profile);
+    println!("  scheme: {}", grant.scheme);
+    println!("  bucket: {}", grant.bucket);
+    println!("  prefix: {}", grant.prefix);
+    println!("  created_unix_ns: {}", grant.created_unix_ns);
+    println!("  created_by: {}", grant.created_by);
+}
+
+/// `tenant parquet-grant add`.
+pub async fn add(
+    store: Arc<dyn ObjectStoreBackend>,
+    profiles_path: Option<&Path>,
+    tenant: &str,
+    location: &str,
+    profile_name: &str,
+    created_by: &str,
+    now_ns: i64,
+) -> anyhow::Result<()> {
+    let path = require_profiles_path(profiles_path)?;
+    let profiles = profiles_from_file(path)?;
+    let profile = find_profile(&profiles, profile_name)?;
+    let hash = TenantId::new(tenant).hash();
+    let grant = add_grant(
+        store.as_ref(),
+        &hash,
+        profile,
+        location,
+        created_by,
+        &AtNs(now_ns),
+        &|profile, bucket| ExternalStore::open(profile, bucket).map_err(anyhow::Error::from),
+    )
+    .await?;
+    println!("granted");
+    print_grant(&grant);
+    Ok(())
+}
+
+/// `tenant parquet-grant remove`.
+pub async fn remove(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    location: &str,
+) -> anyhow::Result<()> {
+    let hash = TenantId::new(tenant).hash();
+    let removed = grants::remove(store.as_ref(), &hash, location).await?;
+    println!("revoked");
+    print_grant(&removed);
+    Ok(())
+}
+
+/// `tenant parquet-grant ls`.
+pub async fn ls(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::Result<()> {
+    let hash = TenantId::new(tenant).hash();
+    let granted = grants::list(store.as_ref(), &hash).await?;
+    if granted.is_empty() {
+        println!("no parquet location grants for tenant {tenant}");
+        return Ok(());
+    }
+    println!("{} parquet location grants:", granted.len());
+    for grant in &granted {
+        print_grant(grant);
+    }
+    Ok(())
+}
+
+fn require_profiles_path(path: Option<&Path>) -> anyhow::Result<&Path> {
+    path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no credential profile file: pass --parquet-profiles <PATH> (or set \
+             RAVEL_PARQUET_PROFILES), the same file ravel-server reads"
+        )
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use bytes::Bytes;
+    use ravel_object_store::external::{GcsProfileCredentials, S3ProfileCredentials};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+        Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
+    };
+
+    use super::*;
+
+    const NOW: i64 = 1_700_000_000_000_000_000;
+
+    /// The credential modes here name no secret at all (an instance role,
+    /// application default credentials), so no fixture carries key material
+    /// and nothing in these tests resolves one: the opener is faked.
+    fn s3_profile(name: &str) -> ExternalProfile {
+        ExternalProfile {
+            name: name.to_string(),
+            kind: ExternalKind::S3 {
+                region: "us-east-1".into(),
+                endpoint: None,
+                force_path_style: false,
+                allow_http: false,
+                credentials: S3ProfileCredentials::InstanceRole,
+            },
+        }
+    }
+
+    fn gcs_profile(name: &str) -> ExternalProfile {
+        ExternalProfile {
+            name: name.to_string(),
+            kind: ExternalKind::Gcs {
+                credentials: GcsProfileCredentials::ApplicationDefault,
+            },
+        }
+    }
+
+    /// An external bucket holding one object under `data/`.
+    async fn external_bucket() -> MemoryStore {
+        let store = MemoryStore::new();
+        store
+            .put(
+                "data/part-0.parquet",
+                Bytes::from_static(b"parquet bytes"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        store
+    }
+
+    /// Hands every `open_external` call the same store, whatever profile and
+    /// bucket it names.
+    fn opener(
+        store: Arc<dyn ObjectStoreBackend>,
+    ) -> impl Fn(&ExternalProfile, &str) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
+        move |_profile, _bucket| Ok(store.clone())
+    }
+
+    /// Forwards everything to the inner store except `get_pinned`, which
+    /// serves the object whatever ETag the caller pinned: a store that accepts
+    /// an `If-Match` it should refuse.
+    struct IgnoresIfMatch<S>(S);
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for IgnoresIfMatch<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.0.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.0.get(key, range).await
+        }
+
+        async fn get_pinned(
+            &self,
+            key: &str,
+            range: GetRange,
+            _pin: &Pin,
+        ) -> Result<PinnedRead, StoreError> {
+            self.0.get_with_pin(key, range).await
+        }
+
+        async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+            self.0.get_with_pin(key, range).await
+        }
+
+        async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+            self.0.pin_of(key).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.0.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.0.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.0.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.0.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.0.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.0.capabilities()
+        }
+    }
+
+    /// The reachability test for issue #2051: `add` drives the profile, both
+    /// probes and the grants record end to end, over two in-memory stores, and
+    /// the grant it wrote is the one `ls` reads back.
+    #[tokio::test]
+    async fn add_qualifies_the_store_and_writes_the_grant() {
+        let ravel = MemoryStore::new();
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
+        let profile = s3_profile("prod");
+        let grant = add_grant(
+            &ravel,
+            &TenantId::new("acme").hash(),
+            &profile,
+            "s3://customer/data/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect("grant");
+
+        assert_eq!(grant.profile, "prod");
+        assert_eq!(grant.scheme, "s3");
+        assert_eq!(grant.bucket, "customer");
+        assert_eq!(grant.prefix, "data");
+        assert_eq!(grant.created_unix_ns, NOW);
+        assert_eq!(grant.created_by, "ravel-cli");
+        assert_eq!(
+            grants::list(&ravel, &TenantId::new("acme").hash())
+                .await
+                .expect("list"),
+            vec![grant]
+        );
+    }
+
+    /// The probe object the bucket check writes to Ravel's own store is
+    /// deleted again, so a qualified grant leaves nothing behind under
+    /// `sys/pq-probe/`.
+    #[tokio::test]
+    async fn add_leaves_no_probe_object_in_ravels_bucket() {
+        let ravel = MemoryStore::new();
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
+        add_grant(
+            &ravel,
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "s3://customer/data/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect("grant");
+        let left = ravel_object_store::list_all(&ravel, "sys/pq-probe/")
+            .await
+            .expect("list");
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// Distinguishing test for the precondition probe: an external store that
+    /// serves a read carrying an ETag it never issued is refused, and nothing
+    /// is written to the grants record.
+    #[tokio::test]
+    async fn add_refuses_a_store_that_ignores_if_match() {
+        let ravel = MemoryStore::new();
+        let external: Arc<dyn ObjectStoreBackend> =
+            Arc::new(IgnoresIfMatch(external_bucket().await));
+        let err = add_grant(
+            &ravel,
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "s3://customer/data/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect_err("must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("does not qualify for pinned reads"), "{text}");
+        assert!(
+            grants::list(&ravel, &TenantId::new("acme").hash())
+                .await
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    /// Distinguishing test for the bucket probe: the candidate is Ravel's own
+    /// store reached under a second handle, so it serves the probe object
+    /// Ravel just wrote and the grant is refused.
+    #[tokio::test]
+    async fn add_refuses_ravels_own_bucket_under_another_handle() {
+        let ravel = Arc::new(MemoryStore::new());
+        ravel
+            .put(
+                "data/part-0.parquet",
+                Bytes::from_static(b"parquet bytes"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        let err = add_grant(
+            ravel.as_ref(),
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "s3://customer/data/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(ravel.clone()),
+        )
+        .await
+        .expect_err("must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("did not qualify as external"), "{text}");
+        assert!(
+            grants::list(ravel.as_ref(), &TenantId::new("acme").hash())
+                .await
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    /// Distinguishing test for the scheme check: a `gs://` location under an
+    /// S3 profile is refused before any store is opened.
+    #[tokio::test]
+    async fn add_refuses_a_scheme_the_profile_kind_does_not_address() {
+        let ravel = MemoryStore::new();
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
+        let err = add_grant(
+            &ravel,
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "gs://customer/data/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect_err("must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("does not address the"), "{text}");
+        assert!(
+            grants::list(&ravel, &TenantId::new("acme").hash())
+                .await
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    /// The mirror of the case above: a `gs://` location under a GCS profile
+    /// clears the scheme check, so the refusal above is about the kind and not
+    /// about the scheme being unusable.
+    #[tokio::test]
+    async fn a_gs_location_under_a_gcs_profile_is_granted() {
+        let ravel = MemoryStore::new();
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
+        let grant = add_grant(
+            &ravel,
+            &TenantId::new("acme").hash(),
+            &gcs_profile("archive"),
+            "gs://customer/data/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect("grant");
+        assert_eq!(grant.scheme, "gs");
+    }
+
+    /// A grant whose prefix holds no object is refused, and the message says
+    /// that is why: there is nothing to run the precondition probe on.
+    #[tokio::test]
+    async fn add_refuses_a_prefix_that_holds_no_object() {
+        let ravel = MemoryStore::new();
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
+        let err = add_grant(
+            &ravel,
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "s3://customer/empty/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect_err("must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("holds no object"), "{text}");
+    }
+
+    /// The object probed is one the grant admits: a sibling prefix sharing the
+    /// grant's first characters is not offered to the probe, so an empty grant
+    /// beside a populated `data2/` is still refused as empty.
+    #[tokio::test]
+    async fn a_sibling_prefix_does_not_supply_the_probe_object() {
+        let store = MemoryStore::new();
+        store
+            .put(
+                "data2/part-0.parquet",
+                Bytes::from_static(b"x"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        let candidate = Grant {
+            profile: "prod".into(),
+            scheme: "s3".into(),
+            bucket: "customer".into(),
+            prefix: "data".into(),
+            created_unix_ns: NOW,
+            created_by: "ravel-cli".into(),
+        };
+        assert_eq!(
+            one_object_under(&store, &candidate).await.expect("list"),
+            None
+        );
+    }
+
+    /// `remove` takes the grant back out, and `ls` then reports none.
+    #[tokio::test]
+    async fn remove_takes_the_grant_back_out() {
+        let ravel = MemoryStore::new();
+        let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
+        let tenant = TenantId::new("acme").hash();
+        add_grant(
+            &ravel,
+            &tenant,
+            &s3_profile("prod"),
+            "s3://customer/data/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect("grant");
+        let removed = grants::remove(&ravel, &tenant, "s3://customer/data/")
+            .await
+            .expect("remove");
+        assert_eq!(removed.prefix, "data");
+        assert!(grants::list(&ravel, &tenant).await.expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_missing_profile_names_the_ones_that_are_defined() {
+        let profiles = vec![s3_profile("prod"), gcs_profile("archive")];
+        let err = find_profile(&profiles, "staging").expect_err("must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("\"prod\""), "{text}");
+        assert!(text.contains("\"archive\""), "{text}");
+    }
+}

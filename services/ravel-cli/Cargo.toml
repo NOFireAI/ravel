@@ -52,6 +52,10 @@ ravel-otlp = { workspace = true }
 # this crate, where a second copy could drift and resurrect erased data.
 # Workspace pin, no new external crate.
 ravel-query = { workspace = true }
+# `tenant parquet-grant` and `parquet ls`/`sweep` (ADR-2040, issue #2051) are
+# the first shipping callers of the Parquet-table grants record, manifest
+# resolution and manifest sweep. Workspace pin, no new external crate.
+ravel-pqtable = { workspace = true }
 prost = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }

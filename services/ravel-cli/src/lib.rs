@@ -14,6 +14,8 @@ pub mod hold;
 pub mod idem;
 pub mod load;
 pub mod maintain;
+pub mod parquet;
+pub mod parquet_grant;
 pub mod provision;
 pub mod qualify;
 pub mod reconstruct;
