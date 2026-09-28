@@ -152,6 +152,10 @@ proptest = { workspace = true }
 # normalization helpers instead would assert nothing. Workspace pin, already
 # in the lock through ravel-otlp; test-only here.
 opentelemetry-proto = { workspace = true }
+# The compaction-claim tests write a foreign process's claim through the same
+# `ravel_fleet::claim::acquire` a supervisor uses. Workspace pin, already a
+# dependency of ravel-maintain; adds no new external crate.
+ravel-fleet = { workspace = true }
 # A real deployment-key file on disk for the `tenant_token` CLI tests (they
 # exercise `--deployment-key-file`, not an in-memory key). Already a
 # workspace pin; adds no new external crate.

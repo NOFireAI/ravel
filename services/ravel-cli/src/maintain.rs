@@ -7,13 +7,16 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::ValueEnum;
 use ravel_commit::keys;
+use ravel_ingest::Clock as _;
 use ravel_maintain::{
-    BlockedBucket, BlockedReason, Bucket, CompactionOutcome, CompactorConfig, FamilyMigrateReport,
-    FixedClock, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport,
-    Verification, census_family, compact_bucket, migrate_family, sweep_shard,
+    BlockedBucket, BlockedReason, Bucket, ClaimParticipant, ClaimSkip, ClaimedCompaction,
+    CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, LegalHoldCheck,
+    MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport, Verification, census_family,
+    compact_bucket_claimed, migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -47,6 +50,107 @@ impl SignalArg {
 /// long-lived loop, which the service task provides, not this CLI).
 fn wall_clock() -> anyhow::Result<FixedClock> {
     Ok(FixedClock::new(crate::now_ns()?))
+}
+
+/// The moving wall clock advisory claims read. Delegates to `ravel-ingest`'s
+/// `SystemClock`, as the server's maintenance clock does.
+#[derive(Debug, Clone, Copy)]
+struct LiveClock;
+
+impl ravel_maintain::Clock for LiveClock {
+    fn now_ns(&self) -> i64 {
+        ravel_ingest::SystemClock.now_ns()
+    }
+}
+
+/// How one `compact-bucket` / `compact-tenant` invocation takes advisory
+/// compaction claims (ADR-1029 decision 5).
+///
+/// The CLI binary builds this once per invocation with
+/// [`ClaimOptions::for_invocation`], so every bucket of one walk is claimed
+/// under the same process id. The two override fields exist for callers of
+/// this library, the tests among them; the binary leaves both at `None`.
+#[derive(Debug, Clone)]
+pub struct ClaimOptions {
+    /// `--no-claim`: take no claims at all. The run is still correct, because
+    /// the compaction record's `CreateIfAbsent` decides which output is
+    /// published, but it may duplicate a merge another maintainer is running.
+    pub no_claim: bool,
+    /// The identity this invocation's claims are written under.
+    pub process_id: Uuid,
+    /// Replaces the compactor's `claim_min_input_bytes` cost gate when set.
+    pub min_input_bytes: Option<u64>,
+    /// Replaces the compactor's `claim_lease_duration` when set.
+    pub lease_duration: Option<Duration>,
+}
+
+impl ClaimOptions {
+    /// One fresh process id for this invocation, the compactor's claim
+    /// defaults, and claiming off when `no_claim` is set.
+    pub fn for_invocation(no_claim: bool) -> Self {
+        ClaimOptions {
+            no_claim,
+            process_id: Uuid::new_v4(),
+            min_input_bytes: None,
+            lease_duration: None,
+        }
+    }
+
+    /// [`Self::for_invocation`] with claiming on.
+    pub fn fresh() -> Self {
+        Self::for_invocation(false)
+    }
+}
+
+/// Install `claims` on `config`, and return the `claims:` header line that
+/// says what was installed.
+///
+/// A dry run installs no participant: the claim protocol does not honour
+/// `dry_run` itself, so a participant on a dry run would write claim objects.
+/// `--no-claim` installs none either. Without a participant,
+/// `compact_bucket_claimed` runs every bucket unclaimed.
+///
+/// The participant's clock is [`LiveClock`], not the [`FixedClock`] each
+/// bucket's seal check is evaluated at: renewal cadence and lease expiry are
+/// measured in elapsed time, so under a frozen clock a merge longer than a
+/// third of the lease would never renew its claim, and another maintainer
+/// could steal the bucket mid-merge once the lease ran out.
+fn install_claims(config: &mut CompactorConfig, dry_run: bool, claims: &ClaimOptions) -> String {
+    if let Some(bytes) = claims.min_input_bytes {
+        config.claim_min_input_bytes = bytes;
+    }
+    if let Some(lease) = claims.lease_duration {
+        config.claim_lease_duration = lease;
+    }
+    if dry_run {
+        return "claims: off (--dry-run)".to_string();
+    }
+    if claims.no_claim {
+        return "claims: off (--no-claim)".to_string();
+    }
+    config.claim_participant = Some(ClaimParticipant::new(
+        claims.process_id,
+        Arc::new(LiveClock),
+    ));
+    format!(
+        "claims: on process_id={} min_input_bytes={} lease_ms={}",
+        claims.process_id,
+        config.claim_min_input_bytes,
+        config.claim_lease_duration.as_millis()
+    )
+}
+
+/// The report fields of a bucket refused its claim, shared by both commands.
+fn claim_skip_fields(skip: &ClaimSkip) -> String {
+    let holder = skip
+        .holder_process_id
+        .map_or_else(|| "unknown".to_string(), |id| id.to_string());
+    format!(
+        "reason={} holder={holder} claim_expiry_unix_ms={} retry_after_unix_ms={}",
+        skip.reason.name(),
+        skip.expiry_unix_ms,
+        skip.reschedule_after_unix_ms
+    )
 }
 
 /// An operator override of a memory-relevant compactor knob was rejected. Typed
@@ -132,6 +236,15 @@ pub fn build_compactor_config(
 /// `selection` is which store `--store` resolved to: it heads the report, and a
 /// tenant prefix holding nothing at all on the defaulted memory store is
 /// refused rather than compacted as an empty bucket (issue #1024).
+///
+/// A bucket at or above the claim cost gate asks for its claim first (see
+/// [`install_claims`]). A bucket refused its claim is reported as
+/// `outcome: ClaimSkipped` with the reason, the holder and the claim expiry,
+/// and a run that lost its claim mid-merge as `outcome: ClaimCancelled`.
+/// Neither is an error: the command exits zero, as it does for a bucket that is
+/// not sealed yet.
+///
+/// Thin wrapper over [`compact_to`] that writes the report to stdout.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
     store: Arc<dyn ObjectStoreBackend>,
@@ -142,11 +255,45 @@ pub async fn compact(
     hour: u32,
     dry_run: bool,
     max_flush_lifetime_ns: Option<i64>,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    let mut out = std::io::stdout();
+    compact_to(
+        &mut out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shard,
+        hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        wall_clock()?,
+        claims,
+    )
+    .await
+}
+
+/// [`compact`] with the report written to `out` and the bucket evaluated at
+/// `clock`. The store-selection header still prints to stdout.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_to(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    hour: u32,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    clock: FixedClock,
+    claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     let bucket = Bucket::new(tenant_hash, signal.to_signal(), shard, hour);
-    let config = build_compactor_config(dry_run, max_flush_lifetime_ns, None, None, None)?;
-    let clock = wall_clock()?;
+    let mut config = build_compactor_config(dry_run, max_flush_lifetime_ns, None, None, None)?;
+    let claims_line = install_claims(&mut config, dry_run, claims);
 
     selection.print_header();
     require_tenant_data_present(
@@ -158,36 +305,69 @@ pub async fn compact(
     )
     .await?;
 
-    let outcome = compact_bucket(store.as_ref(), &clock, &config, &bucket)
+    let outcome = compact_bucket_claimed(store.as_ref(), &clock, &config, &bucket)
         .await
         .map_err(|err| anyhow::anyhow!("compaction failed: {err}"))?;
 
-    println!("dry_run: {dry_run}");
-    match outcome {
-        CompactionOutcome::NotSealed => println!("outcome: NotSealed (bucket not yet sealed)"),
-        CompactionOutcome::Tombstoned => println!("outcome: Tombstoned (retired; not compacted)"),
-        CompactionOutcome::AlreadyCompacted => {
-            println!("outcome: AlreadyCompacted (a compaction record already exists)")
+    writeln!(out, "dry_run: {dry_run}")?;
+    writeln!(out, "{claims_line}")?;
+    let outcome = match outcome {
+        ClaimedCompaction::Ran(outcome) => outcome,
+        ClaimedCompaction::SkippedClaimed(skip) => {
+            writeln!(
+                out,
+                "outcome: ClaimSkipped (another process holds this bucket's compaction \
+                 claim; nothing was merged) {}",
+                claim_skip_fields(&skip)
+            )?;
+            return Ok(());
         }
-        CompactionOutcome::RewritePresent => println!(
+        ClaimedCompaction::Cancelled { at, outcome } => {
+            let parts = match outcome {
+                CompactionOutcome::Compacted { parts, .. } => parts,
+                _ => 0,
+            };
+            writeln!(
+                out,
+                "outcome: ClaimCancelled (the claim was lost mid-merge; nothing was \
+                 published) checkpoint={} parts={parts}",
+                at.name()
+            )?;
+            return Ok(());
+        }
+    };
+    match outcome {
+        CompactionOutcome::NotSealed => {
+            writeln!(out, "outcome: NotSealed (bucket not yet sealed)")?
+        }
+        CompactionOutcome::Tombstoned => {
+            writeln!(out, "outcome: Tombstoned (retired; not compacted)")?
+        }
+        CompactionOutcome::AlreadyCompacted => writeln!(
+            out,
+            "outcome: AlreadyCompacted (a compaction record already exists)"
+        )?,
+        CompactionOutcome::RewritePresent => writeln!(
+            out,
             "outcome: RewritePresent (a live erasure rewrite record already \
              serves this bucket; compacting it would make the catalog serve \
              two record sets)"
-        ),
-        CompactionOutcome::BelowMinInputs { count } => {
-            println!("outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)")
-        }
+        )?,
+        CompactionOutcome::BelowMinInputs { count } => writeln!(
+            out,
+            "outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)"
+        )?,
         CompactionOutcome::Compacted { parts, publish } => {
             let verb = if dry_run { "would write" } else { "wrote" };
-            println!("outcome: Compacted");
-            println!("parts ({verb}): {parts}");
+            writeln!(out, "outcome: Compacted")?;
+            writeln!(out, "parts ({verb}): {parts}")?;
             match publish {
-                PublishOutcome::Published => println!("publish: Published"),
+                PublishOutcome::Published => writeln!(out, "publish: Published")?,
                 PublishOutcome::Converged { parts_repaired } => {
-                    println!("publish: Converged (parts_repaired={parts_repaired})")
+                    writeln!(out, "publish: Converged (parts_repaired={parts_repaired})")?
                 }
                 PublishOutcome::Abandoned => {
-                    println!("publish: Abandoned (past lifetime deadline)")
+                    writeln!(out, "publish: Abandoned (past lifetime deadline)")?
                 }
             }
         }
@@ -260,6 +440,13 @@ pub struct CompactTenantReport {
     pub below_min: usize,
     /// Buckets carrying a retention tombstone.
     pub tombstoned: usize,
+    /// Buckets not compacted because this run was refused their compaction
+    /// claim (ADR-1029). Not counted in `compacted`.
+    pub claim_skipped: usize,
+    /// Buckets whose claim was lost mid-merge (taken over, or the claim
+    /// object gone), so the run stopped and published nothing. Not counted in
+    /// `compacted`.
+    pub claim_cancelled: usize,
     /// L1 parts written across every compacted bucket (would-be writes under
     /// `--dry-run`).
     pub parts_written: usize,
@@ -354,7 +541,7 @@ async fn shard_hours(
 /// Exposes `ravel_maintain::scan`'s per-shard hour walk rather than
 /// reimplementing it: hours ascend from the shard's oldest present hour (or
 /// `from_hour`) to `to_hour` (or the hour containing `now_ns`), each bucket
-/// goes through the same [`compact_bucket`] `compact-bucket` calls, and the
+/// goes through the same [`compact_bucket_claimed`] `compact-bucket` calls, and the
 /// walk stops at the first unsealed hour in a shard because every later hour is
 /// also unsealed. No advisory cursor is read or written: a one-shot operator
 /// invocation covers the range it was asked for, every time.
@@ -366,11 +553,22 @@ async fn shard_hours(
 /// non-zero with a summary of how many buckets succeeded and failed. This holds
 /// at every `bucket_concurrency`, including the default 1.
 ///
+/// Every bucket at or above the claim cost gate asks for its claim before its
+/// merge, one independent claim per bucket, all under `claims`'s one process id
+/// (see [`install_claims`]; `--dry-run` and `--no-claim` take none). A bucket
+/// refused its claim prints `outcome=ClaimSkipped` with the reason, the holder
+/// and the claim expiry, and one that lost its claim mid-merge prints
+/// `outcome=ClaimCancelled`. Both are counted apart from `compacted`
+/// (`claim_skipped`, `claim_cancelled`) and neither is a failure: the walk goes
+/// on and exits zero unless some bucket failed, as it does for a bucket that is
+/// not sealed yet.
+///
 /// `bucket_concurrency` runs up to N buckets' compactions at once. Buckets are
 /// independent by construction (disjoint per-(shard, hour) input sets, separate
 /// content-addressed parts, separate CAS-published records), so the walk is
-/// embarrassingly parallel; [`compact_bucket`]'s own contract confirms it is
-/// safe to call concurrently against one store. Each concurrent bucket runs
+/// embarrassingly parallel; [`ravel_maintain::compact_bucket`]'s own contract
+/// confirms its pipeline, which [`compact_bucket_claimed`] runs too, is safe to
+/// call concurrently against one store. Each concurrent bucket runs
 /// with its OWN [`CompactorConfig`] carrying a FRESH [`MergeMemoryTracker`],
 /// because ADR-0979's per-bucket memory model gives each bucket its own merge
 /// budget and tracker and a shared tracker would combine two runs' figures.
@@ -422,6 +620,7 @@ pub async fn compact_tenant(
     input_read_concurrency: Option<usize>,
     bucket_concurrency: usize,
     now_ns: i64,
+    claims: &ClaimOptions,
 ) -> anyhow::Result<CompactTenantReport> {
     let mut out = std::io::stdout();
     compact_tenant_to(
@@ -440,6 +639,7 @@ pub async fn compact_tenant(
         input_read_concurrency,
         bucket_concurrency,
         now_ns,
+        claims,
     )
     .await
 }
@@ -467,6 +667,7 @@ pub async fn compact_tenant_to(
     input_read_concurrency: Option<usize>,
     bucket_concurrency: usize,
     now_ns: i64,
+    claims: &ClaimOptions,
 ) -> anyhow::Result<CompactTenantReport> {
     let started = std::time::Instant::now();
     let tenant_hash = TenantId::new(tenant).hash();
@@ -476,13 +677,14 @@ pub async fn compact_tenant_to(
     // Knob validation runs before any store access: a zero byte target must
     // surface as its CompactorKnobError even on a tenant with no provisioning
     // record, not be masked by NoProvisioningRecord.
-    let config = build_compactor_config(
+    let mut config = build_compactor_config(
         dry_run,
         max_flush_lifetime_ns,
         l1_part_memory_target_bytes,
         max_l1_part_bytes,
         input_read_concurrency,
     )?;
+    let claims_line = install_claims(&mut config, dry_run, claims);
     // A zero fan-out is refused before any store access, like the byte-target
     // knobs above: it is an operator error, not a walk that compacts nothing.
     if bucket_concurrency == 0 {
@@ -528,6 +730,7 @@ pub async fn compact_tenant_to(
         config.input_read_concurrency
     )?;
     writeln!(out, "dry_run: {dry_run}")?;
+    writeln!(out, "{claims_line}")?;
 
     // Build the walk in deterministic order (shard ascending, then hour
     // ascending), truncating each shard at and including its first unsealed
@@ -596,17 +799,22 @@ pub async fn compact_tenant_to(
     writeln!(out, "not_sealed: {}", report.not_sealed)?;
     writeln!(out, "below_min: {}", report.below_min)?;
     writeln!(out, "tombstoned: {}", report.tombstoned)?;
+    writeln!(out, "claim_skipped: {}", report.claim_skipped)?;
+    writeln!(out, "claim_cancelled: {}", report.claim_cancelled)?;
     writeln!(out, "parts ({verb}): {}", report.parts_written)?;
     writeln!(out, "wall_time_ms: {}", started.elapsed().as_millis())?;
     // Buckets that reported any non-error outcome (compacted, already,
-    // rewrite-present, not-sealed, below-min, tombstoned). `failed` is the
-    // count of buckets whose compaction returned a typed error.
+    // rewrite-present, not-sealed, below-min, tombstoned, claim-skipped,
+    // claim-cancelled). `failed` is the count of buckets whose compaction
+    // returned a typed error.
     let succeeded = report.compacted
         + report.already
         + report.rewrite_present
         + report.not_sealed
         + report.below_min
-        + report.tombstoned;
+        + report.tombstoned
+        + report.claim_skipped
+        + report.claim_cancelled;
     writeln!(out, "failed: {failed}")?;
     writeln!(out, "bucket_concurrency: {bucket_concurrency}")?;
     // The counters above are printed first even on the refusal path: an
@@ -671,8 +879,36 @@ fn emit_bucket_outcome(
     failure_details: &mut Vec<String>,
     shard: u32,
     hour: u32,
-    outcome: Result<CompactionOutcome, String>,
+    outcome: Result<ClaimedCompaction, String>,
 ) -> anyhow::Result<()> {
+    let outcome = match outcome {
+        Ok(ClaimedCompaction::Ran(outcome)) => Ok(outcome),
+        Ok(ClaimedCompaction::SkippedClaimed(skip)) => {
+            report.claim_skipped += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=ClaimSkipped {}",
+                claim_skip_fields(&skip)
+            )?;
+            out.flush()?;
+            return Ok(());
+        }
+        Ok(ClaimedCompaction::Cancelled { at, outcome }) => {
+            report.claim_cancelled += 1;
+            let parts = match outcome {
+                CompactionOutcome::Compacted { parts, .. } => parts,
+                _ => 0,
+            };
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=ClaimCancelled checkpoint={} parts={parts}",
+                at.name()
+            )?;
+            out.flush()?;
+            return Ok(());
+        }
+        Err(err) => Err(err),
+    };
     match outcome {
         Ok(CompactionOutcome::NotSealed) => {
             report.not_sealed += 1;
@@ -725,9 +961,9 @@ fn emit_bucket_outcome(
 }
 
 /// One bucket's walk-order slot: `(shard, hour, outcome)`.
-type BucketSlot = (u32, u32, Result<CompactionOutcome, String>);
+type BucketSlot = (u32, u32, Result<ClaimedCompaction, String>);
 /// A spawned bucket task's return value: its dispatch index plus its slot.
-type BucketTask = (usize, u32, u32, Result<CompactionOutcome, String>);
+type BucketTask = (usize, u32, u32, Result<ClaimedCompaction, String>);
 
 /// Compact every bucket in `work` (already in deterministic walk order) with up
 /// to `concurrency` buckets in flight at once, invoking `on_ready` for each
@@ -738,9 +974,11 @@ type BucketTask = (usize, u32, u32, Result<CompactionOutcome, String>);
 /// stall the buckets after it from running.
 ///
 /// Each bucket runs on its own task with the [`per_bucket_config`] derived from
-/// `base`. `compact_bucket` takes `&store` and a per-call config and clock, and
-/// its own contract states it is safe to call concurrently against one store, so
-/// the disjoint per-(shard, hour) buckets never contend.
+/// `base`. `compact_bucket_claimed` takes `&store` and a per-call config and
+/// clock, and runs `compact_bucket`'s pipeline, whose contract states it is safe
+/// to call concurrently against one store, so the disjoint per-(shard, hour)
+/// buckets never contend. Each bucket's claim guard lives on that call's own
+/// config clone, so N concurrent buckets hold N independent claims.
 ///
 /// A bucket whose compaction errors is delivered as the `Err` of its slot; it
 /// does not cancel or abort its siblings, which all run to completion. A bucket
@@ -761,7 +999,7 @@ async fn run_bucket_walk<F>(
     mut on_ready: F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(u32, u32, Result<CompactionOutcome, String>) -> anyhow::Result<()>,
+    F: FnMut(u32, u32, Result<ClaimedCompaction, String>) -> anyhow::Result<()>,
 {
     // `concurrency >= 1` is guaranteed by the caller's ZeroBucketConcurrency
     // check.
@@ -776,9 +1014,11 @@ where
         let store = Arc::clone(store);
         let config = per_bucket_config(base, concurrency);
         let handle = set.spawn(async move {
+            // The walk's frozen clock decides sealing; the claim participant
+            // on `config` reads its own live clock (see `install_claims`).
             let clock = FixedClock::new(now_ns);
             let bucket = Bucket::new(tenant_hash, signal, shard, hour);
-            let result = compact_bucket(store.as_ref(), &clock, &config, &bucket)
+            let result = compact_bucket_claimed(store.as_ref(), &clock, &config, &bucket)
                 .await
                 .map_err(|err| err.to_string());
             (idx, shard, hour, result)

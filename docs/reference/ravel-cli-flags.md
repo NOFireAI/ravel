@@ -170,30 +170,32 @@ _No flags._
 
 ### maintain compact-bucket
 
-Run one compaction pass over a single sealed bucket
+Run one compaction pass over a single sealed bucket. A bucket with at least 64 MiB of input is first claimed (ADR-1029); if another process holds its claim, it is reported as ClaimSkipped with the holder and not merged
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--dry-run` |  |  | Compute the plan and report it, but write no L1 segments or record |
+| `--dry-run` |  |  | Compute the plan and report it, but write no L1 segments or record. Takes no compaction claim |
 | `--hour` |  |  |  |
 | `--max-flush-lifetime` |  |  | Override the compactor's `max_flush_lifetime` (humantime duration, e.g. `30m`, `0s`; the same grammar and unit as ravel-server's `--gc-max-flush-lifetime`). A bucket seals only at its hour's end plus this plus the clock-skew allowance, so lowering it seals buckets sooner. UNSAFE below the ingest path's real flush lifetime: a bucket a writer is still flushing into can then be sealed and compacted, and that writer's later-published object is missed by the compaction. The default is the safe 1h; use this only for a tenant known quiescent, such as one whose bulk load has finished |
+| `--no-claim` |  |  | Take no advisory compaction claim, for repair work when a claim is in the way. Safe for correctness, because the compaction record's create-if-absent still decides which output is published, but the merge may duplicate one another maintainer is running |
 | `--shard` |  |  |  |
 | `--signal` |  |  |  |
 | `--tenant` |  |  |  |
 
 ### maintain compact-tenant
 
-Compact every sealed bucket of a whole tenant signal: walk each shard's ingest hours and run the same per-bucket compaction `compact-bucket` runs, so an operator no longer has to guess the hour numbers or write a per-(shard, hour) shell loop
+Compact every sealed bucket of a whole tenant signal: walk each shard's ingest hours and run the same per-bucket compaction `compact-bucket` runs, so an operator no longer has to guess the hour numbers or write a per-(shard, hour) shell loop. Each bucket with at least 64 MiB of input is claimed before its merge (ADR-1029); a bucket another process holds the claim on is reported as ClaimSkipped with the holder, counted in claim_skipped, and not merged
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--bucket-concurrency` |  | `1` | Number of buckets to compact CONCURRENTLY. Buckets are independent by construction (disjoint per-(shard, hour) input sets, separate content-addressed segments, separate CAS-published records), so the walk is embarrassingly parallel: N > 1 runs up to N buckets' compactions at once. Default 1, which is today's fully sequential behavior byte-for-byte (report line order included). Refused at 0 |
-| `--dry-run` |  |  | Compute each bucket's plan and report it, but write no L1 segments or records |
+| `--dry-run` |  |  | Compute each bucket's plan and report it, but write no L1 segments or records. Takes no compaction claims |
 | `--from-hour` |  |  | First ingest-hour bucket to consider, inclusive. Omit to start at each shard's oldest present hour |
 | `--input-read-concurrency` |  |  | Number of per-input reads a compaction keeps in flight at once (the commit-record GET and catalog load per input). Raise it to hide store round-trip latency on a many-input bucket; it never changes output bytes. Default 8 (the compactor default); values below 1 act as 1 |
 | `--l1-part-memory-target-bytes` |  |  | The decoded record-heap size at which a merge closes an in-progress L1 segment (a split target, not a peak-memory bound: a merge can overshoot it, e.g. by a whole trace on the RSPAN path, so size the host for path-specific overshoot). Lower it for smaller segments on a small host; raise it for fewer, larger segments. Refused at 0. Default 256 MiB (the compactor default) |
 | `--max-flush-lifetime` |  |  | Override the compactor's `max_flush_lifetime` (humantime duration, e.g. `30m`, `0s`; the same grammar and unit as ravel-server's `--gc-max-flush-lifetime`). A bucket seals only at its hour's end plus this plus the clock-skew allowance, so lowering it seals buckets sooner. UNSAFE below the ingest path's real flush lifetime: a bucket a writer is still flushing into can then be sealed and compacted, and that writer's later-published object is missed by the compaction. The default is the safe 1h; use this only for a tenant known quiescent, such as one whose bulk load has finished |
 | `--max-l1-part-bytes` |  |  | Bound the encoded/on-object bytes a merge writes before it closes an L1 segment (the stored-size target). A segment closes on whichever of this and --l1-part-memory-target-bytes is reached first. Refused at 0. Default 256 MiB (the compactor default) |
+| `--no-claim` |  |  | Take no advisory compaction claims, for repair work when a claim is in the way. Safe for correctness, because each compaction record's create-if-absent still decides which output is published, but a merge may duplicate one another maintainer is running |
 | `--shards` |  |  | Shard count to walk (shards `0..N`). Omit to resolve it from the tenant's durable shard-count provisioning record; given together with a record, the two must agree. With neither flag nor record the command errors, naming the tenant |
 | `--signal` |  |  |  |
 | `--tenant` |  |  |  |

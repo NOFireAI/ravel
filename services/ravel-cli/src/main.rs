@@ -194,8 +194,10 @@ fn command_is_write(command: &Command) -> bool {
         },
         Command::Maintain { command } => match command {
             // Writes L1 segment objects and a compaction record under
-            // `t/<tenant_hash>/<signal>/<shard>/...`, EXCEPT under `--dry-run`,
-            // which only reports the plan it would run. Gating a dry run would
+            // `t/<tenant_hash>/<signal>/<shard>/...`, plus an advisory claim
+            // under `sys/maintain/claims/` for a bucket at or above the claim
+            // threshold, EXCEPT under `--dry-run`, which takes no claim and
+            // only reports the plan it would run. Gating a dry run would
             // stop an operator inspecting that plan on a marker-less bucket,
             // which is the one case where they most need to look before acting.
             MaintainCommand::CompactBucket { dry_run, .. }
@@ -1067,7 +1069,10 @@ enum CommitCommand {
 
 #[derive(Debug, Subcommand)]
 enum MaintainCommand {
-    /// Run one compaction pass over a single sealed bucket.
+    /// Run one compaction pass over a single sealed bucket. A bucket with at
+    /// least 64 MiB of input is first claimed (ADR-1029); if another process
+    /// holds its claim, it is reported as ClaimSkipped with the holder and not
+    /// merged.
     CompactBucket {
         #[arg(long)]
         tenant: String,
@@ -1078,8 +1083,15 @@ enum MaintainCommand {
         #[arg(long)]
         hour: u32,
         /// Compute the plan and report it, but write no L1 segments or record.
+        /// Takes no compaction claim.
         #[arg(long)]
         dry_run: bool,
+        /// Take no advisory compaction claim, for repair work when a claim is
+        /// in the way. Safe for correctness, because the compaction record's
+        /// create-if-absent still decides which output is published, but the
+        /// merge may duplicate one another maintainer is running.
+        #[arg(long)]
+        no_claim: bool,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
         /// e.g. `30m`, `0s`; the same grammar and unit as ravel-server's
         /// `--gc-max-flush-lifetime`). A bucket seals only at its hour's end
@@ -1096,7 +1108,10 @@ enum MaintainCommand {
     /// Compact every sealed bucket of a whole tenant signal: walk each shard's
     /// ingest hours and run the same per-bucket compaction `compact-bucket`
     /// runs, so an operator no longer has to guess the hour numbers or write a
-    /// per-(shard, hour) shell loop.
+    /// per-(shard, hour) shell loop. Each bucket with at least 64 MiB of input
+    /// is claimed before its merge (ADR-1029); a bucket another process holds
+    /// the claim on is reported as ClaimSkipped with the holder, counted in
+    /// claim_skipped, and not merged.
     CompactTenant {
         #[arg(long)]
         tenant: String,
@@ -1117,9 +1132,15 @@ enum MaintainCommand {
         #[arg(long)]
         to_hour: Option<u32>,
         /// Compute each bucket's plan and report it, but write no L1 segments or
-        /// records.
+        /// records. Takes no compaction claims.
         #[arg(long)]
         dry_run: bool,
+        /// Take no advisory compaction claims, for repair work when a claim is
+        /// in the way. Safe for correctness, because each compaction record's
+        /// create-if-absent still decides which output is published, but a
+        /// merge may duplicate one another maintainer is running.
+        #[arg(long)]
+        no_claim: bool,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
         /// e.g. `30m`, `0s`; the same grammar and unit as ravel-server's
         /// `--gc-max-flush-lifetime`). A bucket seals only at its hour's end
@@ -1499,6 +1520,7 @@ async fn main() -> anyhow::Result<()> {
                     shard,
                     hour,
                     dry_run,
+                    no_claim,
                     max_flush_lifetime,
                 },
         } => {
@@ -1511,6 +1533,7 @@ async fn main() -> anyhow::Result<()> {
                 hour,
                 dry_run,
                 max_flush_lifetime,
+                &maintain::ClaimOptions::for_invocation(no_claim),
             )
             .await
         }
@@ -1523,6 +1546,7 @@ async fn main() -> anyhow::Result<()> {
                     from_hour,
                     to_hour,
                     dry_run,
+                    no_claim,
                     max_flush_lifetime,
                     l1_part_memory_target_bytes,
                     max_l1_part_bytes,
@@ -1544,6 +1568,7 @@ async fn main() -> anyhow::Result<()> {
             input_read_concurrency,
             bucket_concurrency,
             now_ns()?,
+            &maintain::ClaimOptions::for_invocation(no_claim),
         )
         .await
         .map(|_| ()),

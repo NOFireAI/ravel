@@ -12,8 +12,8 @@ use bytes::Bytes;
 use prost::Message;
 use ravel_cli::hold;
 use ravel_cli::maintain::{
-    SignalArg, audit_versions, compact, decode_compaction_record, decode_retention_tombstone,
-    migrate, status, sweep, verify_custody,
+    ClaimOptions, SignalArg, audit_versions, compact, decode_compaction_record,
+    decode_retention_tombstone, migrate, status, sweep, verify_custody,
 };
 use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
@@ -256,6 +256,7 @@ async fn compact_empty_bucket_is_below_min() {
         0,
         true,
         None,
+        &ClaimOptions::fresh(),
     )
     .await
     .expect("compact dry-run runs");
@@ -386,6 +387,7 @@ async fn cli_compact_bucket_publishes_without_holding_ownership() {
         100,
         false,
         None,
+        &ClaimOptions::fresh(),
     )
     .await
     .expect("compaction runs");
@@ -433,6 +435,7 @@ async fn cli_compact_bucket_publishes_with_no_claim_taken() {
         100,
         false,
         None,
+        &ClaimOptions::fresh(),
     )
     .await
     .expect("compaction runs");
