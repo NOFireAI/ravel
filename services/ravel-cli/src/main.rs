@@ -3492,6 +3492,92 @@ mod tests {
         );
     }
 
+    /// `--no-claim` on `compact-bucket`, and its absence, reach the
+    /// `ClaimOptions` the command runs with (issue #1034).
+    ///
+    /// The flag is the operator's only way to turn advisory claiming off for a
+    /// repair run, and nothing else in the suite parses a real argument vector
+    /// for it: a wired-up `ClaimOptions` construction over an unwired flag is
+    /// the failure this catches.
+    ///
+    /// Non-vacuity (prove-the-test): unwire the flag by changing
+    /// `MaintainCommand::CompactBucket::no_claim`'s `#[arg(long)]` to
+    /// `#[arg(skip)]`, and clap no longer accepts it: the `try_parse_from`
+    /// carrying `--no-claim` fails with "unexpected argument '--no-claim'
+    /// found".
+    #[test]
+    fn compact_bucket_no_claim_flag_reaches_the_claim_options() {
+        let base = [
+            "ravel",
+            "maintain",
+            "compact-bucket",
+            "--tenant",
+            "acme",
+            "--signal",
+            "logs",
+            "--shard",
+            "0",
+            "--hour",
+            "100",
+        ];
+
+        for (argv_tail, want) in [(Vec::new(), false), (vec!["--no-claim"], true)] {
+            let cli = Cli::try_parse_from(base.iter().copied().chain(argv_tail.iter().copied()))
+                .unwrap_or_else(|e| panic!("compact-bucket {argv_tail:?} parses: {e}"));
+            let Command::Maintain {
+                command: super::MaintainCommand::CompactBucket { no_claim, .. },
+            } = cli.command
+            else {
+                panic!("expected the maintain compact-bucket subcommand");
+            };
+            assert_eq!(no_claim, want, "--no-claim {argv_tail:?} reaches the field");
+            assert_eq!(
+                maintain::ClaimOptions::for_invocation(no_claim).no_claim,
+                want,
+                "and the ClaimOptions the command is dispatched with",
+            );
+        }
+    }
+
+    /// `--no-claim` on `compact-tenant`, and its absence, reach the
+    /// `ClaimOptions` the walk runs with (issue #1034). The `compact-bucket`
+    /// pin above says why; the flag is declared separately on each subcommand,
+    /// so one pin does not cover the other.
+    ///
+    /// Non-vacuity (prove-the-test): unwire the flag by changing
+    /// `MaintainCommand::CompactTenant::no_claim`'s `#[arg(long)]` to
+    /// `#[arg(skip)]`, and the `try_parse_from` carrying `--no-claim` fails
+    /// with "unexpected argument '--no-claim' found".
+    #[test]
+    fn compact_tenant_no_claim_flag_reaches_the_claim_options() {
+        let base = [
+            "ravel",
+            "maintain",
+            "compact-tenant",
+            "--tenant",
+            "acme",
+            "--signal",
+            "logs",
+        ];
+
+        for (argv_tail, want) in [(Vec::new(), false), (vec!["--no-claim"], true)] {
+            let cli = Cli::try_parse_from(base.iter().copied().chain(argv_tail.iter().copied()))
+                .unwrap_or_else(|e| panic!("compact-tenant {argv_tail:?} parses: {e}"));
+            let Command::Maintain {
+                command: super::MaintainCommand::CompactTenant { no_claim, .. },
+            } = cli.command
+            else {
+                panic!("expected the maintain compact-tenant subcommand");
+            };
+            assert_eq!(no_claim, want, "--no-claim {argv_tail:?} reaches the field");
+            assert_eq!(
+                maintain::ClaimOptions::for_invocation(no_claim).no_claim,
+                want,
+                "and the ClaimOptions the walk is dispatched with",
+            );
+        }
+    }
+
     /// A zero part-split byte target is refused with its typed error, per each
     /// field's own doc (the byte budget a part is closed at; zero closes a part
     /// before anything accumulates).

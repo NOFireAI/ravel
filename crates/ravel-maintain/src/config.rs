@@ -832,7 +832,9 @@ pub enum Coordination {
 /// ([`crate::compact::compact_bucket_claimed`]); `None` means this caller takes
 /// no claims whatever [`CompactorConfig::coordination`] says, which is the
 /// state every existing direct caller of [`crate::compact::compact_bucket`] is
-/// in. `ravel-cli` adopts it in wave 3 (#1034).
+/// in. The background supervisor tick installs one, and so does `ravel-cli`'s
+/// `compact-bucket` and `compact-tenant` (#1034), except on `--dry-run` and
+/// `--no-claim`.
 ///
 /// The clock is held as an `Arc` rather than borrowed because the guard is
 /// consulted deep inside the merge, at call sites that take no clock

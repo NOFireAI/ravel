@@ -299,18 +299,40 @@ smaller bucket is merged unclaimed, because duplicating a small merge costs
 less than the claim requests that would prevent it.
 
 A bucket refused its claim is not merged. It prints `outcome=ClaimSkipped`
-with the reason (`held_by_another`, `steal_lost`, `unreadable_claim` or
-`vanished_twice`), the holder's process id (`unknown` when there is no
-readable claim to name one) and the claim's expiry, and is counted in
+with the reason, the holder's process id (`unknown` when there is no readable
+claim to name one), the claim's expiry as `claim_expiry_unix_ms` and the
+earliest useful retry point as `retry_after_unix_ms`, and is counted in
 `claim_skipped`. A bucket that loses its claim mid-merge, because another
 process took it over or the claim object is gone, stops without publishing,
 prints `outcome=ClaimCancelled` with the checkpoint it stopped at, and is
 counted in `claim_cancelled`. Neither counts as a failure: the walk carries on
 and exits zero unless some other bucket failed, the same as for a not-sealed
-bucket. `compact-bucket` prints the same two outcomes and also exits zero. To
-compact a skipped bucket yourself, rerun after the claim expiry it printed; if
-the holder finished its merge by then, the rerun reports the bucket as already
-compacted.
+bucket. `compact-bucket` prints the same two outcomes and also exits zero.
+
+To compact a skipped bucket yourself, rerun at `retry_after_unix_ms`, not at
+`claim_expiry_unix_ms`: the retry point tracks the printed expiry only for
+`held_by_another`, and for the other three reasons the printed expiry is the
+wrong instant to wait for. If the holder finished its merge by then, the rerun
+reports the bucket as already compacted. The four reasons are:
+
+- `held_by_another`: a live claim, held by the process id printed. The retry
+  point is one millisecond past the printed expiry.
+- `steal_lost`: the claim had expired and this run tried to steal it, but
+  another contender's steal won the compare-and-swap first. The printed expiry
+  is the one already in the past, and the winner has just written a fresh
+  lease, so the retry point is a full lease from the moment of the loss.
+- `unreadable_claim`: the claim object does not decode, so it is never stolen
+  (never overwrite what you cannot read) and never deleted programmatically.
+  The retry point is one lease plus this run's own deterministic jitter past
+  the claim's `last_modified`, which is the instant a run is allowed to proceed
+  unclaimed. The lease used is the observer's configured one, since an
+  unreadable payload declares none.
+  If a bucket stays wedged past that, the operator repair is a plain
+  manual delete of that one key; it is safe because the claim is advisory and
+  the worst cost of deleting any claim is one duplicated merge.
+- `vanished_twice`: the claim key disappeared between the create and the read
+  that followed it, twice in a row. Nothing is held, so the printed expiry is
+  `0` and the retry point is immediate.
 
 `--dry-run` takes no claims. `--no-claim` takes none either, for repair work
 when a claim is in the way. It is safe for correctness, because the compaction

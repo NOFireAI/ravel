@@ -97,7 +97,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--dry-run` takes no claims. The new `--no-claim` flag on both commands takes
   none either, for repair work: correctness is unchanged, since the compaction
   record's create-if-absent still decides the published output, but the merge
-  may duplicate one another maintainer is running.
+  may duplicate one another maintainer is running. The claim clock is injected:
+  `ravel_cli::maintain::ClaimOptions` carries an optional `clock`, which the
+  binary leaves unset to get the live wall clock and a test sets to drive
+  renewal and expiry deterministically. The skip line's
+  `retry_after_unix_ms` field, not its `claim_expiry_unix_ms`, is the point to
+  rerun from; the maintenance guide says what each of the four skip reasons
+  means and why the two differ for three of them.
 
 - **This release reads provisioning record format 3 and still writes 2, and
   `ravel-cli maintain audit-versions` now classifies every recorded format

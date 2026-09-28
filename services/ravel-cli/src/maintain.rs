@@ -68,9 +68,9 @@ impl ravel_maintain::Clock for LiveClock {
 ///
 /// The CLI binary builds this once per invocation with
 /// [`ClaimOptions::for_invocation`], so every bucket of one walk is claimed
-/// under the same process id. The two override fields exist for callers of
-/// this library, the tests among them; the binary leaves both at `None`.
-#[derive(Debug, Clone)]
+/// under the same process id. The three override fields exist for callers of
+/// this library, the tests among them; the binary leaves all three at `None`.
+#[derive(Clone)]
 pub struct ClaimOptions {
     /// `--no-claim`: take no claims at all. The run is still correct, because
     /// the compaction record's `CreateIfAbsent` decides which output is
@@ -82,23 +82,58 @@ pub struct ClaimOptions {
     pub min_input_bytes: Option<u64>,
     /// Replaces the compactor's `claim_lease_duration` when set.
     pub lease_duration: Option<Duration>,
+    /// Replaces the claim participant's clock when set. `None` is the binary's
+    /// case and resolves to the live wall clock (see [`Self::clock`]); a test
+    /// sets a [`FixedClock`] here and drives renewal and expiry by moving it,
+    /// which is what makes a claim-timing test deterministic and free of any
+    /// real sleep.
+    pub clock: Option<Arc<dyn ravel_maintain::Clock>>,
+}
+
+/// Hand-written because [`ravel_maintain::Clock`] is not `Debug`: the override
+/// is reported as present or absent, which is what a failure message needs.
+impl std::fmt::Debug for ClaimOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimOptions")
+            .field("no_claim", &self.no_claim)
+            .field("process_id", &self.process_id)
+            .field("min_input_bytes", &self.min_input_bytes)
+            .field("lease_duration", &self.lease_duration)
+            .field("clock_override", &self.clock.is_some())
+            .finish()
+    }
 }
 
 impl ClaimOptions {
     /// One fresh process id for this invocation, the compactor's claim
-    /// defaults, and claiming off when `no_claim` is set.
+    /// defaults, the live clock, and claiming off when `no_claim` is set.
     pub fn for_invocation(no_claim: bool) -> Self {
         ClaimOptions {
             no_claim,
             process_id: Uuid::new_v4(),
             min_input_bytes: None,
             lease_duration: None,
+            clock: None,
         }
     }
 
     /// [`Self::for_invocation`] with claiming on.
     pub fn fresh() -> Self {
         Self::for_invocation(false)
+    }
+
+    /// The clock the claim participant reads: the override when one is set,
+    /// otherwise the live wall clock (`ravel_ingest::SystemClock`).
+    ///
+    /// The default is deliberately NOT the [`FixedClock`] each bucket's seal
+    /// check is evaluated at. Renewal cadence and lease expiry are elapsed-time
+    /// decisions, so under a frozen clock a merge longer than a third of the
+    /// lease would never renew its claim, and another maintainer could steal
+    /// the bucket mid-merge once the lease ran out.
+    pub fn clock(&self) -> Arc<dyn ravel_maintain::Clock> {
+        self.clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(LiveClock) as Arc<dyn ravel_maintain::Clock>)
     }
 }
 
@@ -110,11 +145,8 @@ impl ClaimOptions {
 /// `--no-claim` installs none either. Without a participant,
 /// `compact_bucket_claimed` runs every bucket unclaimed.
 ///
-/// The participant's clock is [`LiveClock`], not the [`FixedClock`] each
-/// bucket's seal check is evaluated at: renewal cadence and lease expiry are
-/// measured in elapsed time, so under a frozen clock a merge longer than a
-/// third of the lease would never renew its claim, and another maintainer
-/// could steal the bucket mid-merge once the lease ran out.
+/// The participant's clock is [`ClaimOptions::clock`], which is [`LiveClock`]
+/// for the binary and an injected clock for a test that drives claim timing.
 fn install_claims(config: &mut CompactorConfig, dry_run: bool, claims: &ClaimOptions) -> String {
     if let Some(bytes) = claims.min_input_bytes {
         config.claim_min_input_bytes = bytes;
@@ -128,10 +160,7 @@ fn install_claims(config: &mut CompactorConfig, dry_run: bool, claims: &ClaimOpt
     if claims.no_claim {
         return "claims: off (--no-claim)".to_string();
     }
-    config.claim_participant = Some(ClaimParticipant::new(
-        claims.process_id,
-        Arc::new(LiveClock),
-    ));
+    config.claim_participant = Some(ClaimParticipant::new(claims.process_id, claims.clock()));
     format!(
         "claims: on process_id={} min_input_bytes={} lease_ms={}",
         claims.process_id,
@@ -1015,7 +1044,8 @@ where
         let config = per_bucket_config(base, concurrency);
         let handle = set.spawn(async move {
             // The walk's frozen clock decides sealing; the claim participant
-            // on `config` reads its own live clock (see `install_claims`).
+            // on `config` reads its own clock, live for the binary (see
+            // `install_claims` and `ClaimOptions::clock`).
             let clock = FixedClock::new(now_ns);
             let bucket = Bucket::new(tenant_hash, signal, shard, hour);
             let result = compact_bucket_claimed(store.as_ref(), &clock, &config, &bucket)

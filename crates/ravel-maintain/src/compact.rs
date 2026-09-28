@@ -101,9 +101,10 @@ impl ClaimedCompaction {
 ///
 /// This entry point never claims, whatever [`CompactorConfig::coordination`]
 /// says: the coordinated entry point is [`compact_bucket_claimed`], which the
-/// background supervisor drives (ADR-1029 decision 5) and which `ravel-cli`
-/// adopts in wave 3 (#1034). Both run the identical pipeline; a claimed run
-/// merely has a guard installed for its cancellation checkpoints.
+/// background supervisor drives (ADR-1029 decision 5) and which `ravel-cli`'s
+/// `compact-bucket` and `compact-tenant` drive too (#1034). Both run the
+/// identical pipeline; a claimed run merely has a guard installed for its
+/// cancellation checkpoints.
 pub async fn compact_bucket(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -357,9 +358,10 @@ async fn acquire_claim(
     let Some(participant) = config.claim_participant.as_ref() else {
         return Ok(Claimed::Unclaimed);
     };
-    // Claim writes ignore `dry_run`: the only caller that installs a
-    // participant is the supervisor tick, and the CLI's `--dry-run` config
-    // leaves `claim_participant` unset, so the two never meet. The claim's
+    // Claim writes ignore `dry_run`. Both callers that install a participant,
+    // the supervisor tick and ravel-cli's compact-bucket/compact-tenant, keep
+    // `claim_participant` unset on a dry run, so the two never meet; on the CLI
+    // side that is `install_claims`'s own `dry_run` check. The claim's
     // `input_set_hash` forensics field stays empty: the hash is computed
     // later, inside the rewrite, and the claim identity deliberately excludes
     // it (ADR-1029 rejected alternative 3).

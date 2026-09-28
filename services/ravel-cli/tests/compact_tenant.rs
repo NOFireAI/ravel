@@ -1766,22 +1766,30 @@ async fn dry_run_takes_no_claim() {
     );
 }
 
-/// The claim participant reads a live clock, not the walk's frozen one: a
-/// merge that outlives a third of the lease renews its claim.
+/// The claim participant reads its own injected clock, not the walk's frozen
+/// one: a merge that outlives a third of the lease renews its claim.
 ///
-/// The lease is 3 s, so the renewal cadence is 1 s. The first L0 data GET of
-/// shard 0's older bucket, which comes after its claim is taken, is held for
-/// 1.5 s of real time; the next checkpoint then renews. Built on the walk's
-/// `FixedClock`, the participant would see no time pass, never renew, and
-/// leave `renewed_count` at 0 with two claim PUTs instead of three.
+/// Deterministic and sleep-free. The lease is 3 s, so the renewal cadence is
+/// 1 s, and renewal is evaluated only at a checkpoint. The first L0 data GET of
+/// shard 0's older bucket, which comes after its claim is taken, is held on a
+/// `FaultStore` gate; with the merge parked there the test moves the claim
+/// clock 1.5 s forward and releases the gate, so the next checkpoint renews
+/// exactly once.
+///
+/// Non-vacuity (prove-the-test): make `ClaimOptions::clock` ignore the
+/// override and return a frozen clock, which is what a participant built on
+/// the walk's own `FixedClock` would see, and the `renewed_count` assertion
+/// fails 0 against 1 (two claim PUTs instead of three).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_merge_longer_than_a_third_of_the_lease_renews_its_claim() {
-    let (mem, _) = claim_fixture().await;
+    let (mem, wall_ms) = claim_fixture().await;
     let fault = FaultStore::new(mem.clone(), FaultPlan::empty());
     let gate = fault.hold(Op::Get, Some("/l0/0000/".to_string()), Occurrence::Nth(1));
     let store = CountingStore::new(Arc::new(fault));
+    let claim_clock = FixedClock::new(wall_ms * 1_000_000);
     let claims = ClaimOptions {
         lease_duration: Some(Duration::from_secs(3)),
+        clock: Some(Arc::new(claim_clock.clone()) as Arc<dyn ravel_maintain::Clock>),
         ..claiming()
     };
     let key = claim_key(0, HOUR_OLD);
@@ -1818,7 +1826,9 @@ async fn a_merge_longer_than_a_third_of_the_lease_renews_its_claim() {
             1,
             "the claim is taken before the held read"
         );
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // Half a renewal cadence past one: exactly one renewal is due, and the
+        // merge cannot advance past the gate until it is set.
+        claim_clock.set(wall_ms * 1_000_000 + 1_500_000_000);
         assert!(gate.release(held[0].0));
     };
     let (result, ()) = tokio::join!(walk, releaser);
@@ -1841,19 +1851,25 @@ async fn a_merge_longer_than_a_third_of_the_lease_renews_its_claim() {
 /// prints `outcome=ClaimCancelled` with the checkpoint, and is counted in
 /// `claim_cancelled`, not `compacted`; the walk goes on and exits zero.
 ///
-/// Same timing as the renewal test: while shard 0's first data read is held,
-/// the test overwrites that bucket's claim as another process would, so the
-/// renewal due at the next checkpoint (the merge loop head) loses its CAS.
-/// Against a walk that counted a cancelled run as compacted, `compacted` is 2;
-/// against one that treated it as an error, the walk exits non-zero.
+/// Same deterministic shape as the renewal test: while shard 0's first data
+/// read is held on the gate, the test overwrites that bucket's claim as another
+/// process would and moves the claim clock past the renewal cadence, so the
+/// renewal due at the next checkpoint (the merge loop head) loses its CAS. No
+/// real time passes. Against a walk that counted a cancelled run as compacted,
+/// `compacted` is 2; against one that treated it as an error, the walk exits
+/// non-zero. Making `ClaimOptions::clock` ignore the override and return a
+/// frozen clock fails the `claim_cancelled` assertion 0 against 1: with no
+/// time passing no renewal is due, so the stolen claim is never noticed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bucket_whose_claim_is_taken_over_mid_merge_is_reported_cancelled() {
-    let (mem, _) = claim_fixture().await;
+    let (mem, wall_ms) = claim_fixture().await;
     let fault = FaultStore::new(mem.clone(), FaultPlan::empty());
     let gate = fault.hold(Op::Get, Some("/l0/0000/".to_string()), Occurrence::Nth(1));
     let store = CountingStore::new(Arc::new(fault));
+    let claim_clock = FixedClock::new(wall_ms * 1_000_000);
     let claims = ClaimOptions {
         lease_duration: Some(Duration::from_secs(3)),
+        clock: Some(Arc::new(claim_clock.clone()) as Arc<dyn ravel_maintain::Clock>),
         ..claiming()
     };
     let key = claim_key(0, HOUR_OLD);
@@ -1889,7 +1905,7 @@ async fn a_bucket_whose_claim_is_taken_over_mid_merge_is_reported_cancelled() {
         mem.put(&key, stolen.encode_to_vec().into(), PutOptions::default())
             .await
             .expect("overwrite the claim");
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        claim_clock.set(wall_ms * 1_000_000 + 1_500_000_000);
         let held = gate.held();
         assert_eq!(held.len(), 1);
         assert!(gate.release(held[0]));
@@ -2018,4 +2034,141 @@ async fn compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it() {
         bucket_output(mem.as_ref(), CLAIMED_SHARD, HOUR_OLD).await,
         (1, 1)
     );
+}
+
+/// The claim clock the BINARY runs on is the live wall clock, not the frozen
+/// instant the walk judges sealing at.
+///
+/// Renewal cadence and lease expiry are elapsed-time decisions, so a
+/// participant built on the walk's `FixedClock` would never renew a merge
+/// longer than a third of the lease and would let another maintainer steal the
+/// bucket mid-merge. The two claim-timing tests above inject their own clock;
+/// this is what pins the default the binary actually gets, and it does so
+/// without depending on how much wall time passes: the walk's frozen instant
+/// (`now_ns()`, some months away from today) and the real wall clock are hours
+/// apart under any scheduling.
+///
+/// Distinguishing: against `ClaimOptions::clock` returning the walk's
+/// `FixedClock`, or any fixed instant, the first assertion fails.
+#[test]
+fn the_default_claim_clock_is_the_live_wall_clock() {
+    let real_ns = ravel_cli::now_ns().expect("wall clock");
+    let default_ns = ClaimOptions::fresh().clock().now_ns();
+    assert!(
+        (default_ns - real_ns).abs() < 60 * 1_000_000_000,
+        "the default claim clock reads the real wall clock: {default_ns} against {real_ns}"
+    );
+    assert!(
+        (default_ns - now_ns()).abs() > NS_PER_HOUR,
+        "and is not the walk's frozen seal clock: {default_ns} against {}",
+        now_ns()
+    );
+
+    let injected = FixedClock::new(1_234_567_890);
+    let overridden = ClaimOptions {
+        clock: Some(Arc::new(injected) as Arc<dyn ravel_maintain::Clock>),
+        ..ClaimOptions::fresh()
+    };
+    assert_eq!(
+        overridden.clock().now_ns(),
+        1_234_567_890,
+        "an injected clock replaces the live one"
+    );
+}
+
+/// `compact-bucket` prints the `ClaimCancelled` outcome line for a run whose
+/// claim is taken over mid-merge, publishes nothing, and exits zero.
+///
+/// The `compact-tenant` walk's own cancellation case is covered above; this
+/// pins the single-bucket command's own line and its exit status, which is the
+/// surface an operator scripting `compact-bucket` sees. Deterministic and
+/// sleep-free by the same mechanism: the first L0 data GET is held on a gate,
+/// the claim is overwritten as another process would, the injected claim clock
+/// moves half a cadence past one renewal interval, and the gate is released, so
+/// the renewal at the merge-loop checkpoint loses its CAS.
+///
+/// Distinguishing: against a `compact_to` that fell through to the pipeline's
+/// own `CompactionOutcome` instead of returning on the `Cancelled` arm, the run
+/// prints `outcome: Compacted` and the `ClaimCancelled` assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_bucket_reports_a_claim_lost_mid_merge_and_exits_zero() {
+    let (mem, wall_ms) = claim_fixture().await;
+    let fault = FaultStore::new(mem.clone(), FaultPlan::empty());
+    let gate = fault.hold(Op::Get, Some("/l0/0000/".to_string()), Occurrence::Nth(1));
+    let store = CountingStore::new(Arc::new(fault));
+    let claim_clock = FixedClock::new(wall_ms * 1_000_000);
+    let claims = ClaimOptions {
+        lease_duration: Some(Duration::from_secs(3)),
+        clock: Some(Arc::new(claim_clock.clone()) as Arc<dyn ravel_maintain::Clock>),
+        ..claiming()
+    };
+    let key = claim_key(0, HOUR_OLD);
+    let thief = Uuid::new_v4();
+
+    let mut out: Vec<u8> = Vec::new();
+    let run = compact_to(
+        &mut out,
+        store.clone(),
+        MEMORY,
+        TENANT,
+        SignalArg::Logs,
+        0,
+        HOUR_OLD,
+        false,
+        Some(0),
+        FixedClock::new(now_ns()),
+        &claims,
+    );
+    let thief_writes = async {
+        tokio::time::timeout(Duration::from_secs(60), gate.wait_until_held(1))
+            .await
+            .expect("the data read was never held");
+        assert_eq!(
+            store.requests_on("put", &key),
+            1,
+            "the claim is taken before the held read"
+        );
+        let stolen = CompactionClaim {
+            owner_process_id: thief.as_bytes().to_vec(),
+            ..CompactionClaim::default()
+        };
+        mem.put(&key, stolen.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("overwrite the claim");
+        claim_clock.set(wall_ms * 1_000_000 + 1_500_000_000);
+        let held = gate.held();
+        assert_eq!(held.len(), 1);
+        assert!(gate.release(held[0]));
+    };
+    let (result, ()) = tokio::join!(run, thief_writes);
+    result.expect("a cancelled run is not a failure: compact-bucket exits zero");
+    let text = String::from_utf8(out).expect("utf-8");
+
+    assert!(
+        text.contains(
+            "\noutcome: ClaimCancelled (the claim was lost mid-merge; nothing was \
+             published) checkpoint=merge_loop parts=0\n"
+        ),
+        "the cancelled outcome line: {text}"
+    );
+    assert!(
+        !text.contains("\npublish: "),
+        "nothing was published: {text}"
+    );
+    assert_eq!(
+        bucket_output(mem.as_ref(), 0, HOUR_OLD).await,
+        (0, 0),
+        "no L1 part and no compaction record"
+    );
+    assert_eq!(
+        claim_objects(mem.as_ref())
+            .await
+            .get(&key)
+            .expect("claim")
+            .owner_process_id,
+        thief.as_bytes().to_vec(),
+        "the cancelled run left the thief's claim in place"
+    );
+    // Create, then the renewal that lost its CAS; no completion.
+    assert_eq!(store.requests_on("put", &key), 2);
 }
