@@ -248,6 +248,13 @@ mcp = [
     "rmcp/tower",
 ]
 
+# jemalloc heap profiling, for attributing live memory to allocation sites
+# (docs/guides/operations/troubleshooting.md, "Attributing server memory with a
+# heap profile"). Off by default and not in the published image: it compiles
+# jemalloc's profiler in, and profiling stays inactive unless
+# `_RJEM_MALLOC_CONF=prof:true,...` is set at startup.
+heap-profiling = ["tikv-jemallocator/profiling"]
+
 [dev-dependencies]
 # Test-only: the MCP end-to-end tests drive the mounted route with a real MCP
 # client rather than a hand-rolled JSON-RPC body, so the negotiation the
