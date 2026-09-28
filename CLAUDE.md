@@ -254,9 +254,15 @@ connection, a pushed-but-broken main).
   wave). `record <kind>` writes each transition; `task-dispatched` also
   appends the ledger line to the epic issue BODY and reads it back, because
   `epic-status.sh` parses the body and nothing else. `reconcile` rewrites
-  the index from live GitHub state and blocks the next dispatch (65) on any
-  drift, reporting a task with a start ref and no result ref as UNRESOLVED
-  rather than guessing between RUNNING and LOST. `resume-set --reason` parks
+  the index from live GitHub and fleet control-plane state and blocks the
+  next dispatch (65) on any drift. It finds each task's merge PR by its
+  exact branch, so an old landed task reads LANDED however far back it
+  merged. A task with a start ref and no result ref is settled by the
+  control plane's `GET /v1/tasks/<id>`: RUNNING does not block; DEAD blocks
+  unless another task on the same ticket landed, completed, or is running
+  (SUPERSEDED); an unreachable control plane leaves it UNRESOLVED, which
+  blocks. The URL comes from `FLEET_CP_URL`, else `FLEET_PUBLIC_URL`, else
+  `~/.fleet/cp.env`. `resume-set --reason` parks
   a recoverable interruption with the next backoff delay (900, 1800, 3600;
   below 900 the PreToolUse guard refuses the wakeup) and exits 69, or exits
   75 on a fatal error or an exhausted budget. `classify` and `backoff` are

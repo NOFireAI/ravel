@@ -324,11 +324,32 @@ from the one decision 2 describes.
 
 This key is sound only because every read of such an object carries the
 recorded ETag and version as a precondition, and a store that fails the
-precondition probe cannot back a grant. So a cached range under this key
-is always a range of the bytes the precondition admits. It is weaker than
-decision 2's key in one way, stated here rather than hidden: on an
-unversioned S3 bucket a single-PUT ETag is an MD5, and someone who can
+precondition probe cannot back a grant. (The version is a selector, not a
+precondition; see the selector correction below.) So a cached range under
+this key is always a range of the bytes the precondition admits. It is
+weaker than decision 2's key in one way, stated here rather than hidden: on
+an unversioned S3 bucket (every S3 bucket for now; see the selector
+correction below) a single-PUT ETag is an MD5, and someone who can
 write the granted location could in principle forge an MD5 collision. The
 harm stays inside the tenants granted that location, because `tenant_hash`
 is still part of the key. Decision 2's key is unchanged for every object
 Ravel writes.
+
+### Correction (2026-09-28): the version is a selector (ADR-2040 pinning amendment)
+
+<!-- amendment-applies: sections="Amendment (2026-09-27): a pinned key for external Parquet objects (ADR-2040)" pointer="selector correction" -->
+
+The pinned-key amendment above says every read carries the recorded ETag
+and version "as a precondition". ADR-2040's pinning amendment corrects
+that: object stores treat a version as a selector that picks that version
+of the object, and only `If-Match` on the ETag is a precondition. The key
+stays sound for the same reason in both cases. A read admitted by the ETag
+precondition, or served from the selected version, returns exactly the
+bytes the key names, so a cached range under this key is a range of those
+bytes.
+
+The MD5 bound above also widens. It names "an unversioned S3 bucket", but
+until `S3Store` surfaces the real `x-amz-version-id`, every S3 file is
+pinned by ETag alone (ADR-2040's pinning amendment), so the bound applies
+to every S3 bucket, versioned or not. GCS files, and Azure files on a
+bucket with versioning on, are pinned by version and are outside it.

@@ -150,6 +150,7 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 |---|---|
 | `ravel_ingest_flushes_by_size_total` | Flushes opened because the tenant buffer reached target_bytes. |
 | `ravel_ingest_flushes_by_age_total` | Flushes opened because the tenant buffer aged past max_flush_delay. |
+| `ravel_ingest_flushes_by_age_floor_total` | Flushes opened because the tenant buffer aged past the sub-floor hold, which a buffer holding fewer object bytes than `--idle-flush-byte-floor` waits for instead of max_flush_delay_idle. Zero unless that flag is set. A rising figure means the floor is holding buffers, which is the point of setting it, and it is also the count of flushes whose rows sat in memory for up to an hour before the flush opened: it is how an operator sizes the buffered-mode loss window they accepted. |
 | `ravel_ingest_flushes_manual_total` | Flushes opened by an explicit, shutdown, or drop-path drain. |
 | `ravel_ingest_put_retries_total` | Retried PUT attempts on the data-object or commit-record path. |
 | `ravel_ingest_abandoned_retry_exhausted_total` | Flushes abandoned by retry-budget or lifetime exhaustion. |
@@ -183,18 +184,21 @@ spans, not zero.
 The `ravel_ingest_flushes_by_age_adaptive_total` family likewise carries only
 the `signal="metrics"` series: the adaptive-delay corridor is a
 metrics-pipeline feature, so that sample is structurally absent for logs and
-spans, not zero. `ravel_ingest_in_flight_flushes`,
+spans, not zero. `ravel_ingest_flushes_by_age_floor_total`,
+`ravel_ingest_in_flight_flushes`,
 `ravel_ingest_flush_permit_wait_seconds_total`,
 `ravel_ingest_queued_flushes`, `ravel_ingest_flush_trigger_deferred_total`,
 and `ravel_ingest_grace_extended_stale_flushes_total` are carried for every
-signal, each for its own reason: the in-flight gauge because all three shard
+signal, each for its own reason: the sub-floor hold counter because all three
+shard actors read the floor, so a logs- or spans-only process renders a real
+sample for it rather than nothing; the in-flight gauge because all three shard
 actors arm an `InFlightFlushGuard`; the permit-wait counter because the
 `max_inflight_flushes` acquire runs off-actor for all three ingest pipelines;
 the queue-depth gauge and its deferral counter because the queued-flush cap is
 wired identically in all three; the grace-extended counter because all three
 snapshots already expose the stale-provisioning counter it pairs with. A logs-
 or spans-only process therefore still renders a real (possibly zero) sample
-for all five. `ravel_ingest_flush_all_residue_tenants_total` is carried for
+for all six. `ravel_ingest_flush_all_residue_tenants_total` is carried for
 all three signals too, for the same reason: `DrainIntent::Teardown` runs
 identically in every shard actor.
 
@@ -1189,7 +1193,7 @@ Labels: `mode`.
 | `ravel_maintain_tenants_maintained` | Gauge. Discovered tenants actually maintained this cycle, after any flag restriction. |
 | `ravel_maintain_tenant_discovery_failures_total` | Maintenance cycles skipped because tenant discovery itself failed. |
 
-### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`, `ravel_maintain_l0_records_pending`, `ravel_maintain_objects_deleted_total`)
+### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`, `ravel_maintain_l0_records_pending`, `ravel_maintain_objects_deleted_total`, `ravel_maintain_bytes_reclaimed_total`, `ravel_maintain_retention_lag_seconds`)
 
 Labels: `mode`, plus `signal` on every series except the legal-hold counter
 (`mode` only) and `ravel_maintain_objects_deleted_total`, which carries `mode`
@@ -1200,6 +1204,8 @@ and `kind` and no `signal`. These carry no `tenant_hash` label.
 | `ravel_maintain_legal_hold_refresh_failures_total` | Legal-hold refresh failures. Each one skips that tenant's whole maintenance tick. |
 | `ravel_maintain_l0_records_pending` | Gauge. L0 commit records sitting below `min_compaction_inputs` in a sealed bucket, by signal, summed over every tenant and shard this process maintains. |
 | `ravel_maintain_objects_deleted_total` | Objects the sweep physically deleted, by `kind`: `superseded_records_deleted`, `superseded_data_deleted`, `unreferenced_parts_deleted`, `quarantine_reaped`. |
+| `ravel_maintain_bytes_reclaimed_total` | Bytes of deleted objects reclaimed by the sweep, by signal. Counts only the quarantine reaper and the unreferenced-part delete, whose object sizes the sweep already listed; superseded and retention deletions are excluded because they delete by key without a listed size, so this is a lower bound. Per process. |
+| `ravel_maintain_retention_lag_seconds` | Gauge. How far past its retention deadline the oldest still-present expired bucket is, by signal, from this process's most recent completed cycle. 0 when none. A per-cycle maximum over the process's units, so it names the single worst bucket. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
 | `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the last completed orphan pass, by signal. |
@@ -1262,6 +1268,33 @@ every cycle publishes the whole pending population rather than only what that
 cycle re-read. The count a skipped bucket contributes is as old as its last
 re-verify, so a bucket that crossed the threshold since then is reflected only
 once its re-verify or its compaction runs.
+
+`ravel_maintain_bytes_reclaimed_total` is the throughput counterpart to those
+pending gauges: bytes physically freed by the sweep. It counts only the two
+deletions whose object size the sweep already listed, the quarantine reaper and
+the unreferenced-part delete, so it undercounts all bytes reclaimed (it can also
+count one object twice when two replicas sweep a unit during an ownership
+handoff, since deleting a missing key succeeds). Superseded and retention deletions delete by object key without
+a listed size, and charging their bytes would cost an extra HEAD per object, so
+they are deliberately excluded; `ravel_maintain_objects_deleted_total{kind=...}`
+still counts those deletions. It is a per-process counter: sum it across maintain
+replicas for a deployment-wide figure.
+
+`ravel_maintain_retention_lag_seconds` reports how far retention's physical sweep
+has fallen behind. For the oldest bucket that is expired (past its hour's
+retention deadline) yet still physically present, it is how far the clock is past
+that deadline; it is `0` when no expired bucket is still present. It is a gauge
+and a per-cycle maximum over the units this process owns, so it names the single
+worst bucket rather than a sum, and a scrape mid-cycle reads the previous
+completed cycle's value. A steadily climbing value means expired data is not
+being deleted fast enough (a HEAD-reachability block from a lagging fold, an
+out-of-window format version, or a legal hold on the bucket); a healthy sweep
+holds it near one protection horizon. A bucket kept deliberately by a legal hold
+or a format version hold counts as lag too, for as long as the hold stands. The
+figure uses the ingest hour's nominal deadline, so it can over-state the true lag
+by up to the allowed future clock skew. With several maintain replicas take the
+maximum across them, not the sum: each owns a disjoint share of the units and the
+lag is a worst-case, not an additive, figure.
 
 ### Maintenance ownership and concurrency (`ravel_maintain_workers_live`, `ravel_maintain_units_*`, `ravel_maintain_memo_warm_start_units_total`, `ravel_maintain_full_sweep_passes_total`)
 
@@ -1455,7 +1488,8 @@ alert rules below quiet there.
 | `ravel_alert_records_written_total` | Alert transition records durably written. |
 | `ravel_alert_repeats_queued_total` | Repeat notifications queued for a still-firing alert. A repeat writes no new record, so it advances this and then the delivery counter, never `ravel_alert_records_written_total`. |
 | `ravel_alert_notifications_delivered_total` | Notifications delivered to every configured sink, including ones carried over from an earlier tick's failure. |
-| `ravel_alert_notifications_failed_total` | Notifications still undelivered after a tick's attempt, counted once per tick per notification, so one stuck notification keeps advancing it while it is retried. |
+| `ravel_alert_notifications_failed_total` | Notifications attempted but not accepted by every configured sink, counted once per tick per notification, so one stuck notification keeps advancing it while it is retried. |
+| `ravel_alert_notifications_deferred_total` | Notifications not attempted in a tick because the per-tick delivery deadline (half the evaluation interval) elapsed first, counted once per notification per tick: a notification deferred again on the next tick is counted again. They keep their place at the front of the queue. A rising value has two causes: a sink too slow to drain the queue within a tick, or a tick whose work before delivery (history fold, rule evaluation, memo write) already ran past the deadline, in which case every notification after the first is deferred even when every sink answers at once. |
 | `ravel_alert_undelivered_notifications` | Gauge. Notifications not yet accepted by every configured sink, summed over this process's evaluators, at most one per alert identity. While a sink keeps failing it grows by one for every identity that transitions, without bound. |
 | `ravel_alert_ticks_total` | Evaluation ticks by `outcome`. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Gauge. Unix time the alert loop last completed a tick in this process, `0` if none has completed since it started. Its age is the alert-loop liveness signal. |
@@ -1532,15 +1566,19 @@ groups:
       - alert: RavelAlertNotificationsAllFailing
         # Delivery failure is retried every tick, so a genuinely broken sink
         # advances the failure counter continuously while the delivered counter
-        # stays flat. The second term is what keeps a partial failure (one
+        # stays flat. The last term is what keeps a partial failure (one
         # notification stuck behind a bad URL while the rest get through) out of
         # this critical rule; it belongs to RavelAlertRuleEvaluationFailing's
         # quieter class.
         #
+        # No term on ravel_alert_notifications_deferred_total: every pass
+        # attempts its first notification before the deadline check applies,
+        # and each attempt counts as delivered or failed in the same tick, so
+        # a window with deferrals and no deliveries already has failures.
+        #
         # Quiet on a healthy deployment with no rules configured: the family is
         # absent, so both terms are empty. Quiet on one whose rules simply never
-        # fire: nothing is ever queued, so the failure counter never increases
-        # and the first term is false.
+        # fire: nothing is ever queued, so the failure counter never increases.
         expr: |
           increase(ravel_alert_notifications_failed_total[15m]) > 0
           and
@@ -1554,8 +1592,9 @@ groups:
           description: >-
             Transitions are still being written durably, so no alert history is
             lost, but nothing is reaching Alertmanager or the configured
-            webhooks. Check the sink URLs and credentials, and the evaluator
-            logs for the per-sink delivery error.
+            webhooks: the sinks are refusing every attempt. Check the sink
+            URLs and credentials, and the evaluator logs for the per-sink
+            delivery error.
       - alert: RavelAlertRuleEvaluationFailing
         # A rule whose query, condition, or write fails is retried next tick, so
         # a persistently broken rule (a PromQL expression that no longer parses
@@ -2160,4 +2199,5 @@ Distributed read fan-out: ADR-0071. Wire-byte accounting: ADR-0084. The metric
 metadata cache: ADR-0085. Alert evaluation and its at-least-once notification
 contract: ADR-0043. Per-shard ingest skew metrics and the `shard` label:
 ADR-1692. The retiring-generation shard set that family also renders:
-ADR-0052. The CPU gates and the tokio runtime families: ADR-1702.
+ADR-0052. The sub-floor hold counter and the flag that turns it on:
+ADR-1737. The CPU gates and the tokio runtime families: ADR-1702.

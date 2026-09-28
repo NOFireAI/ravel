@@ -155,7 +155,8 @@ Rules on grants, checked when a grant is added:
   key from the granted bucket through the grant's profile, and deletes the
   probe object afterwards. If the read succeeds, the granted bucket is
   Ravel's own under another name, and the grant is refused. The same probe
-  runs again at `CREATE`.
+  runs again at `CREATE`. (A copy of Ravel's bucket also has to be caught;
+  see the pinning amendment below.)
 - This protects Ravel's internal objects and every tenant's prefix inside
   Ravel's bucket. It does not police user buckets: granting two tenants
   overlapping locations in a user's bucket is an operator decision, and
@@ -192,14 +193,16 @@ schema is encoded by one arrow major and decoded by another.
 
 **Pinning.** The files are not Ravel's, so their owner can overwrite or
 delete them at any time. Ravel's rule is that a table reads exactly the
-bytes it was created over, or fails:
+bytes it was created over, or fails. (How a version pin behaves is
+corrected in the pinning amendment below.)
 
 - Every read carries a precondition: `If-Match` on the recorded ETag, and
   the recorded version or generation when there is one. The `object_store`
   crate sends both for S3, GCS and Azure through `GetOptions`. S3 and Azure
   report a version only on a bucket with versioning on. GCS always reports
   a generation, so a GCS file is pinned exactly.
-- A file that changed fails the query with a typed error naming it, "file
+- A file that changed fails the query (narrowed by the pinning amendment
+  below for a version-pinned file) with a typed error naming it, "file
   changed since the table was created; run `CREATE OR REPLACE`". A file
   that is gone fails the same way. Old and new bytes are never mixed in one
   query.
@@ -318,12 +321,14 @@ untouched.
 - **An external read store per credential profile.** A read-only
   `ObjectStoreBackend` (`get` with ranges, `head`, `list`) over the
   `object_store` crate's S3, GCS or Azure client, built at startup from the
-  profile's configuration. `ObjectStoreBackend` gains a conditional get (a
+  profile's configuration (its S3 kind wraps Ravel's own `S3Store`; see the
+  pinning amendment below). `ObjectStoreBackend` gains a conditional get (a
   `GetRange` plus ETag and version preconditions), implemented here and by
   `S3Store`, `MemoryStore` and `FaultStore`, so every failure path can be
   tested without a cloud account. Every Parquet read carries the
   manifest's ETag and version, and a failed precondition is a typed
-  `FileChanged` error. The workspace's `object_store` gains its `gcp` and
+  `FileChanged` error (a version pin selects rather than fails; see the
+  pinning amendment below). The workspace's `object_store` gains its `gcp` and
   `azure` features for this.
 - **A `ParquetFileReaderFactory` and `AsyncFileReader`.** They read through
   the external read store, the process-wide `GetLimiter`, and the
@@ -372,7 +377,8 @@ grants record is cached per tenant for at most 60 seconds, so a revoked
 grant stops admitting reads within 60 seconds.
 
 A file changed or deleted under a table fails the
-query with `FileChanged` or `FileMissing`. Re-resolving cannot help,
+query with `FileChanged` or `FileMissing`, as the pinning amendment below
+narrows for version-pinned files. Re-resolving cannot help,
 because the manifest still names the old bytes, so the error tells the
 caller to run `CREATE OR REPLACE`.
 
@@ -672,7 +678,9 @@ and the per-query memory cap:
   typed errors, never panics, and property tests over mutated files pin
   that.
 - **A table breaks when its owner changes a file.** Queries fail with
-  `FileChanged` or `FileMissing` until someone runs `CREATE OR REPLACE`.
+  `FileChanged` or `FileMissing` (per the pinning amendment below, a
+  version-pinned file fails only when that version is deleted) until
+  someone runs `CREATE OR REPLACE`.
   That is deliberate, since the alternative is a silent wrong answer. An
   append-only data lake that only adds files never hits it; a new file
   simply stays invisible until the next `CREATE OR REPLACE`.
@@ -749,5 +757,58 @@ flowchart TB
   ext --> lake[(granted bucket)]
   sess -. any other URL .-> refuse[error]
   tps -. file outside manifest .-> refuse
+  %% amendment-supersedes-allow: the diagram shows the ETag-only case; the pinning amendment below covers version pins
   ext -. file changed .-> changed[FileChanged]
 ```
+
+## Amendment (2026-09-28): version pins select, S3 versions must be surfaced, and the bucket probe also looks for Ravel's marker
+
+<!-- amendment-applies: sections="D1. A table is a pinned snapshot of Parquet files where they already are|D3. The reader: DataFusion's Parquet scan through Ravel's fetch path" pointer="pinning amendment" -->
+<!-- amendment-supersedes: phrase="`FileChanged`" pointer="pinning amendment" -->
+<!-- amendment-supersedes: phrase="A file that changed fails the query" pointer="pinning amendment" -->
+
+The wave 1 checkpoint review of epic #2040 found three places where D1
+described behaviour the storage backends do not have.
+
+**A version pin selects a version. It is not a precondition.** The
+`object_store` crate sends a recorded version as `versionId` (S3),
+`generation` (GCS) or `versionid` (Azure). Each of those asks the store for
+that version of the object; none of them fails when a newer version exists.
+So D1's "a file that changed fails the query" holds only for a file pinned by
+ETag alone. The corrected rule:
+
+- A file whose store reported a version is read at that version, with
+  `If-Match` on its ETag as well. After the owner overwrites it, the table
+  keeps returning the bytes it was created over, which is still exactly the
+  pinned bytes. If that version has been deleted, the read is `NotFound`
+  and the query fails with `FileMissing`.
+- A file with no version (an unversioned S3 or Azure bucket) is read with
+  `If-Match` on its ETag alone. After an overwrite the read is refused with
+  `PreconditionFailed`, and the query fails with `FileChanged`, as D1 said.
+- Old and new bytes are still never mixed in one query, in either case.
+
+**S3 versions must be surfaced.** D3's external read store builds its S3
+kind on Ravel's own `S3Store` adapter rather than on a second S3 client, so
+S3 and S3-compatible stores share one set of credential modes, retries and
+accounting. `S3Store` reports every object's version as its ETag, on every
+bucket, and drops `x-amz-version-id`. That ETag-shaped value is not a
+version: it is never recorded in a manifest as one and never sent as a
+version selector, because S3 would answer `NoSuchVersion` and every read
+would fail with `FileMissing`. An S3 file therefore takes the ETag-only
+branch above. `S3Store` must report the real version id when the bucket has
+versioning on, so an S3 file is pinned by version as well as ETag; epic
+#2040's wave 1 fix round does this. Until it does, S3 pins are ETag-only,
+and D1's closing sentence on the cache key ("A versioned bucket, or GCS,
+removes this") holds for GCS and for Azure but not for S3.
+
+**The Ravel-bucket probe also reads Ravel's marker.** A random key written a
+moment earlier is not in a replica or a backup copy of Ravel's bucket, so
+that half of the probe passes a copy that holds every tenant's data. The
+probe therefore also reads `sys/tenancy`, the write-once marker every Ravel
+bucket carries (ADR-0050), from the candidate bucket, and refuses the grant
+if the marker is there. A profile whose credentials cannot tell present
+from absent for either key (a 403 for a missing key, a grant that cannot
+read `sys/`) makes the probe inconclusive, and an inconclusive probe
+refuses the grant. Least-privilege credentials that can read only the
+granted prefix are therefore refused, and the operator widens them to
+read `sys/tenancy` or uses another profile.

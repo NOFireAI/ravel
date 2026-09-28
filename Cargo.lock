@@ -907,6 +907,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1498,6 +1504,7 @@ dependencies = [
  "libc",
  "log",
  "object_store 0.13.2",
+ "parquet 58.4.0",
  "sqlparser",
  "tokio",
  "uuid",
@@ -1613,6 +1620,37 @@ dependencies = [
  "object_store 0.13.2",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "datafusion-datasource-parquet"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cc35b92cd560082155e80d9c826929c852d3c51543f4affd3a51c464a0aab3a"
+dependencies = [
+ "arrow 58.4.0",
+ "async-trait",
+ "bytes",
+ "datafusion-common",
+ "datafusion-common-runtime",
+ "datafusion-datasource",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions",
+ "datafusion-functions-aggregate-common",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-adapter",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "datafusion-pruning",
+ "datafusion-session",
+ "futures",
+ "itertools 0.14.0",
+ "log",
+ "object_store 0.13.2",
+ "parking_lot",
+ "parquet 58.4.0",
+ "tokio",
 ]
 
 [[package]]
@@ -2885,6 +2923,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "integer-encoding"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3736,6 +3780,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "httparse",
  "humantime",
  "hyper",
  "itertools 0.15.0",
@@ -3900,6 +3945,42 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "parquet"
+version = "58.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d298093b2dec60289dce0684c986d0f7679e9dd15771c2c65406e1aaf604a704"
+dependencies = [
+ "ahash",
+ "arrow-array 58.4.0",
+ "arrow-buffer 58.4.0",
+ "arrow-data 58.4.0",
+ "arrow-ipc 58.4.0",
+ "arrow-schema 58.4.0",
+ "arrow-select 58.4.0",
+ "base64 0.22.1",
+ "brotli",
+ "bytes",
+ "chrono",
+ "flate2",
+ "futures",
+ "half",
+ "hashbrown 0.17.1",
+ "lz4_flex 0.13.1",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "object_store 0.13.2",
+ "paste",
+ "seq-macro",
+ "simdutf8",
+ "snap",
+ "thrift",
+ "tokio",
+ "twox-hash",
+ "zstd",
 ]
 
 [[package]]
@@ -4550,7 +4631,7 @@ dependencies = [
  "futures",
  "lz4_flex 0.14.0",
  "object_store 0.13.2",
- "parquet",
+ "parquet 59.1.0",
  "pprof",
  "proptest",
  "prost",
@@ -4591,6 +4672,7 @@ dependencies = [
 name = "ravel-cache"
 version = "0.19.0"
 dependencies = [
+ "blake3",
  "bytes",
  "crc32c",
  "parking_lot",
@@ -4614,7 +4696,9 @@ dependencies = [
  "prost",
  "ravel-cache",
  "ravel-commit",
+ "ravel-cpu-gate",
  "ravel-logseg",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-proto",
  "ravel-segment",
@@ -4642,7 +4726,8 @@ dependencies = [
  "crc32c",
  "hex",
  "humantime",
- "parquet",
+ "opentelemetry-proto",
+ "parquet 59.1.0",
  "pprof",
  "proptest",
  "prost",
@@ -4890,12 +4975,14 @@ version = "0.19.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.23.0",
  "bytes",
  "crc32c",
  "futures",
  "object_store 0.14.1",
  "parking_lot",
  "rand 0.10.2",
+ "ravel-object-store",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -4910,10 +4997,14 @@ name = "ravel-operator"
 version = "0.19.0"
 dependencies = [
  "blake3",
+ "bytes",
  "clap",
  "futures",
  "hex",
+ "http-body-util",
  "humantime",
+ "hyper",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "kube-runtime",
@@ -4925,6 +5016,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror",
  "tokio",
  "tracing",
@@ -4972,6 +5064,45 @@ dependencies = [
  "ravel-segment",
  "ravel-types",
  "stats_alloc",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "ravel-parquet"
+version = "0.19.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "datafusion",
+ "datafusion-datasource-parquet",
+ "futures",
+ "object_store 0.13.2",
+ "ravel-cache",
+ "ravel-object-store",
+ "ravel-pqtable",
+ "ravel-query",
+ "ravel-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "ravel-pqtable"
+version = "0.19.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "hex",
+ "object_store 0.14.1",
+ "proptest",
+ "prost",
+ "rand 0.10.2",
+ "ravel-object-store",
+ "ravel-proto",
+ "ravel-types",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -5047,6 +5178,7 @@ dependencies = [
  "ravel-cache",
  "ravel-catalog",
  "ravel-commit",
+ "ravel-cpu-gate",
  "ravel-logseg",
  "ravel-maintain",
  "ravel-memory",
@@ -5892,6 +6024,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6177,7 +6322,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6210,6 +6355,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "thrift"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e54bc85fc7faa8bc175c4bab5b92ba8d9a3ce893d0e9f42cc455c8ab16a9e09"
+dependencies = [
+ "byteorder",
+ "integer-encoding",
+ "ordered-float",
 ]
 
 [[package]]
@@ -6691,6 +6847,12 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

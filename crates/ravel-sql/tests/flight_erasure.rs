@@ -379,7 +379,7 @@ async fn distributed_slice_do_get_excludes_what_the_resolve_saw_pending() {
 
     let handle = mem_slice
         .ticket
-        .encode(service.ticket_key())
+        .encode(service.slice_ticket_key())
         .expect("encode slice ticket");
     let raw = Ticket::new(
         TicketStatementQuery {
@@ -409,7 +409,7 @@ async fn distributed_slice_do_get_excludes_what_the_resolve_saw_pending() {
 
     // Flip: the same slice ticket with `pending_erasure` forced back to
     // empty, re-signed under the real key, must bring ts=150 back.
-    let flipped = re_encode_with_erasure_cleared(&raw, service.ticket_key());
+    let flipped = re_encode_with_erasure_cleared(&raw, service.slice_ticket_key());
     let leaked_rows = merged(&do_get_raw(&service, tenant.as_str(), &flipped).await);
     let has_150 = (0..leaked_rows.num_rows()).any(|i| {
         leaked_rows

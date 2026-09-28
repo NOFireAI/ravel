@@ -122,6 +122,16 @@ pub enum MaintainError {
     UnknownBucketEntry(String),
     #[error("decoded record signal {actual} does not match the queried signal {expected}")]
     SignalMismatch { expected: String, actual: String },
+    /// The run's advisory compaction claim was lost at a cancellation
+    /// checkpoint (ADR-1029 decision 3). Internal plumbing, not an operator
+    /// failure: it unwinds the merge pipeline to
+    /// [`crate::rewrite::rewrite_and_publish`], which turns it into
+    /// [`crate::publish::PublishOutcome::Abandoned`], so no caller ever
+    /// receives it. Nothing was published.
+    #[error(
+        "compaction claim lost at the {at} checkpoint; the run cancelled and published nothing (ADR-1029 decision 3)"
+    )]
+    ClaimLost { at: &'static str },
     #[error(
         "sealed bucket holds two compaction records with different input_set_hash (fatal invariant breach at {observed_key:?}): ours {ours}, theirs {theirs}"
     )]

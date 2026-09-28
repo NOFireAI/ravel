@@ -248,9 +248,16 @@ landed: <merge-sha> <merge-sha2>; main=<sha>; closed #103 #106
    `.claude/epic-state/<epic>.json` from live GitHub state and exits 65 on
    drift that must be fixed before the next dispatch, including a task
    the local index knows about that never reached the issue body. A task
-   with a start ref and no result ref comes back UNRESOLVED: only
-   `fleet_status` separates running from lost. `resume-get <epic>` says whether an
-   interruption is parked; a rate limit, 5xx or session limit is parked
+   with a start ref and no result ref is settled by asking the fleet control
+   plane (`GET /v1/tasks/<id>`). RUNNING does not block. DEAD blocks until
+   its ticket is re-dispatched, unless another task on the same ticket
+   landed, completed, or is running, which makes it SUPERSEDED. If the
+   control plane cannot be asked, the task stays UNRESOLVED and blocks:
+   guessing "running" is how a dead task's ticket sits unfixed for the rest
+   of the session. Set `FLEET_CP_URL` when `~/.fleet/cp.env` names a stale
+   host.
+   `resume-get <epic>` says whether an interruption is parked and how long
+   the backoff has to run; a rate limit, a 5xx or a session limit is parked
    with `resume-set --reason`, which exits 69 with the delay to pass to
    ScheduleWakeup, or 75 when the error is fatal or the budget is spent.
 1. Read the ledger's last wave block and its status.

@@ -24,15 +24,22 @@
 //! snapshot from the ticket. There is no second `Catalog::resolve` anywhere on
 //! the redemption path.
 //!
-//! # Tenancy is never taken from the ticket
+//! # A client ticket's tenant is never trusted
 //!
-//! The ticket carries a tenant field, but it is not a trust boundary: a ticket
-//! is bytes a client holds and can replay. Every method resolves the
-//! authoritative tenant from the caller's gRPC metadata through
-//! [`FlightAuth`], and `DoGet` additionally compares that tenant against the
-//! ticket's embedded tenant and rejects a mismatch with `PERMISSION_DENIED`
-//! before touching the pinned snapshot. A ticket minted for tenant A and
-//! presented with tenant B's credentials reads nothing.
+//! A client whole-set ticket carries a tenant field, but it is not a trust
+//! boundary: a ticket is bytes a client holds and can replay. Every client
+//! method resolves the authoritative tenant from the caller's gRPC metadata
+//! through [`FlightAuth`], and `DoGet` additionally compares that tenant
+//! against the ticket's embedded tenant and rejects a mismatch with
+//! `PERMISSION_DENIED` before touching the pinned snapshot. A ticket minted for
+//! tenant A and presented with tenant B's credentials reads nothing.
+//!
+//! A slice ticket is the one exception (ADR-1689 decision 2). A coordinator
+//! mints it under a separate slice key after resolving the client's tenant, a
+//! worker `DoGet` for it carries no credential, and the worker executes under
+//! the ticket's tenant once the capability verifies (`slice.rs`). A client
+//! ticket fails the slice MAC by construction, so no client-held ticket can
+//! take this path.
 //!
 //! The catalog/metadata methods resolve the tenant too, before returning
 //! anything. There is exactly one logical table (`samples`) per tenant and the
@@ -66,6 +73,7 @@
 mod metadata;
 mod request;
 mod service;
+mod slice;
 mod stream;
 
 use std::sync::Arc;
@@ -78,6 +86,7 @@ use tonic::metadata::MetadataMap;
 pub use metadata::{CATALOG_NAME, SCHEMA_NAME, TABLE_TYPE};
 pub use request::{END_KEY, START_KEY, TIMEOUT_KEY};
 pub use service::RavelFlightSqlService;
+pub use slice::{FlightListenerRole, SliceReject, SliceRejectCounters};
 
 /// The injected wall clock the Flight path reads.
 ///

@@ -156,9 +156,8 @@ pub fn healthy_tail_max(seal_margin: SealMargin) -> Duration {
 /// `services/ravel-server/src/fold.rs`'s `DEFAULT_FOLD_INTERVAL`, 5 minutes:
 /// how long a keeping-up fold waits between cycles, so how long a tail keeps
 /// growing after the fold that last shortened it. Named here rather than
-/// imported: ravel-server depends on ravel-query, not the other way round.
-/// Wiring the running server's `FoldTaskConfig` through to
-/// [`EngineConfig::fold_interval`] is a later ADR-1306 task.
+/// imported: ravel-server depends on ravel-query, not the other way round;
+/// ravel-server pins the two equal in a test.
 pub const REFERENCE_FOLD_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// `CatalogConfig::default`'s `head_cache_ttl`
@@ -625,24 +624,26 @@ pub struct EngineConfig {
     /// of [`Self::fold_lag_threshold`], the tail at which a request-budget
     /// refusal starts naming fold lag (ADR-1306 decision 6). Defaults to
     /// [`SealMargin::REFERENCE`], the catalog's own compiled-in durations;
-    /// wiring the running server's `CatalogConfig` through to here is ADR-1306
-    /// follow-up task 5.
+    /// ravel-server sets it from the `CatalogConfig` of the catalog it resolves
+    /// through.
     pub seal_margin: SealMargin,
     /// How long the scheduled fold waits between cycles, the second term of
     /// [`Self::fold_lag_threshold`] (ADR-1306 decision 6, "Amendment
     /// (2026-09-27, #1306)"): a fold that is keeping up still lets the tail
     /// grow by this much before its next cycle shortens it again. Defaults to
-    /// [`REFERENCE_FOLD_INTERVAL`], the server's own `DEFAULT_FOLD_INTERVAL`;
-    /// wiring the running server's `FoldTaskConfig` through to here is a later
-    /// ADR-1306 task.
+    /// [`REFERENCE_FOLD_INTERVAL`], the server's own `DEFAULT_FOLD_INTERVAL`.
+    /// ravel-server sets it from its own `FoldTaskConfig`, which is the real
+    /// interval only where that process runs the scheduled fold (`all` and
+    /// `maintain`); a `query` or `gateway` process keeps the default even when
+    /// the `maintain` processes fold on a longer interval.
     pub fold_interval: Duration,
     /// How long a decoded catalog HEAD may be served from the TTL cache, the
     /// third term of [`Self::fold_lag_threshold`] (ADR-1306 decision 6,
     /// "Amendment (2026-09-27, #1306)"): the watermark a resolve resolves
     /// against may be this much older than the fold's real one. Defaults to
     /// [`REFERENCE_HEAD_CACHE_TTL`], the catalog's own
-    /// `DEFAULT_HEAD_CACHE_TTL_NS`; wiring the running server's `CatalogConfig`
-    /// through to here is ADR-1306 follow-up task 5.
+    /// `DEFAULT_HEAD_CACHE_TTL_NS`; ravel-server sets it from the
+    /// `CatalogConfig` of the catalog it resolves through.
     pub head_cache_ttl: Duration,
     pub deadline: Duration,
     pub fetch_concurrency: usize,

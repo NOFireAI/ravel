@@ -82,7 +82,7 @@ asserts each one appears on a `# TYPE` line of a `/metrics` body rendered by a
 running server, through the same scanner and the same rendered bodies the rule
 file goes through. It also asserts that every one of the 40 metric names the
 shipped rules alert on is graphed by some panel here, so a page always has a
-panel to land on. The 6 rows, 36 panels, 107 targets and 110 names are pinned
+panel to land on. The 6 rows, 36 panels, 108 targets and 111 names are pinned
 as literals, so a walk that stops finding panels fails rather than checking an
 empty set.
 

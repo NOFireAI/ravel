@@ -19,6 +19,14 @@ struct Entry {
     etag: Etag,
     version: Version,
     last_modified_unix_ms: i64,
+    /// CRC-32C of `data` as it was written, the oracle's stand-in for the
+    /// checksum S3 stores beside an object at upload (ADR-1696 decision 5).
+    /// Recorded on every write, not only when the caller supplied a
+    /// [`UploadChecksum`], because the real store computes one either way; a
+    /// full-object [`ObjectStoreBackend::get`] checks the bytes against it.
+    /// `MemoryStore::corrupt_stored_byte` (feature `test-support`) is the only
+    /// thing that can make the two disagree.
+    stored_checksum: u32,
 }
 
 impl Entry {
@@ -42,6 +50,13 @@ pub struct MemoryStore {
     clock_ms: AtomicU64,
     /// Page size for listings; tests can shrink it to exercise pagination.
     page_size: usize,
+    /// What [`ObjectStoreBackend::observed_store_time_ns`] reports (ADR-1685
+    /// decision 1). `None` unless a test sets it through
+    /// [`MemoryStore::set_observed_store_time_ns`]: the oracle is in-process
+    /// and receives no responses, so it observes no store clock of its own,
+    /// and inventing one from the host clock would hand callers an unasked-for
+    /// second time source.
+    observed_store_time_ns: RwLock<Option<i64>>,
 }
 
 impl MemoryStore {
@@ -65,6 +80,64 @@ impl MemoryStore {
         self.clock_ms.store(ms, Ordering::SeqCst);
     }
 
+    /// Set what [`ObjectStoreBackend::observed_store_time_ns`] reports, so a
+    /// caller's store-clock check (ADR-1685 decision 2) can be driven against
+    /// the oracle. `None` restores the default of having observed nothing.
+    ///
+    /// The oracle never sets this itself: it serves no HTTP responses, so it
+    /// has no store clock to observe, and a test that wants one says so.
+    ///
+    /// Only compiled with the `test-support` feature, which no production
+    /// build enables.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_observed_store_time_ns(&self, ns: Option<i64>) {
+        *self.observed_store_time_ns.write() = ns;
+    }
+
+    /// Flip one bit of a stored object *without* touching the checksum recorded
+    /// when it was written: bit rot at rest, the corruption ADR-1696's read-side
+    /// verification exists to catch.
+    ///
+    /// This is the only way the oracle's stored bytes and stored checksum can
+    /// disagree, so it is what makes that verification testable. Nothing else
+    /// mutates an entry in place: a `put` rewrites the whole entry, checksum
+    /// included, which is a new object rather than a corrupted one, and is why
+    /// re-putting flipped bytes cannot stand in for this.
+    ///
+    /// `offset` is a byte index into the object and `bit` selects the bit
+    /// within it; both are checked, so a test cannot silently corrupt nothing.
+    /// Returns [`StoreError::NotFound`] for an absent key and
+    /// [`StoreError::InvalidRange`] for an offset past the object's end or a
+    /// bit index above 7.
+    ///
+    /// Only compiled with the `test-support` feature, which no production
+    /// build enables.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn corrupt_stored_byte(
+        &self,
+        key: &str,
+        offset: usize,
+        bit: u32,
+    ) -> Result<(), StoreError> {
+        if bit > 7 {
+            return Err(StoreError::InvalidRange(format!(
+                "bit {bit} is not a bit index of a byte"
+            )));
+        }
+        let mut objects = self.objects.write();
+        let entry = objects.get_mut(key).ok_or(StoreError::NotFound)?;
+        if offset >= entry.data.len() {
+            return Err(StoreError::InvalidRange(format!(
+                "offset {offset} of a {}-byte object",
+                entry.data.len()
+            )));
+        }
+        let mut bytes = entry.data.to_vec();
+        bytes[offset] ^= 1u8 << bit;
+        entry.data = Bytes::from(bytes);
+        Ok(())
+    }
+
     fn next_id(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::SeqCst) + 1
     }
@@ -81,6 +154,32 @@ impl MemoryStore {
                     "upload checksum mismatch: expected {expected:08x}, computed {actual:08x}"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Read-side verification (ADR-1696 decision 5), the oracle's form of what
+    /// the S3 adapter does with the checksum S3 stored at upload: a full-object
+    /// read is checked against the checksum recorded when the object was
+    /// written, so bytes that changed at rest are refused with `Corrupted`
+    /// instead of handed to a decoder. A ranged read is not checked, matching
+    /// decision 4: the stored checksum covers the whole object and a slice
+    /// cannot be compared against it.
+    ///
+    /// Every read path runs it, pinned or not: a pin decides *which* bytes are
+    /// served, never whether they are checked.
+    fn verify_full_read(key: &str, entry: &Entry, range: GetRange) -> Result<(), StoreError> {
+        if range != GetRange::Full {
+            return Ok(());
+        }
+        let actual = crc32c(&entry.data);
+        if actual != entry.stored_checksum {
+            return Err(StoreError::Corrupted(format!(
+                "get of {key}: stored crc32c {:08x} does not match {actual:08x} computed over \
+                 the {} stored bytes",
+                entry.stored_checksum,
+                entry.data.len()
+            )));
         }
         Ok(())
     }
@@ -238,6 +337,7 @@ impl ObjectStoreBackend for MemoryStore {
         }
         let id = self.next_id();
         let entry = Entry {
+            stored_checksum: crc32c(&data),
             data,
             etag: Etag(format!("mem-etag-{id}")),
             version: Version(format!("mem-v-{id}")),
@@ -254,12 +354,87 @@ impl ObjectStoreBackend for MemoryStore {
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         let objects = self.objects.read();
         let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        Self::verify_full_read(key, entry, range)?;
         Ok(GetOutcome {
             data: Self::slice(&entry.data, range)?,
             etag: entry.etag.clone(),
             version: entry.version.clone(),
             total_size: entry.data.len() as u64,
         })
+    }
+
+    /// Evaluates the pin under the same lock that serves the bytes, so an
+    /// overwrite cannot land between the check and the read.
+    ///
+    /// The order is the contract's, and the two halves answer differently
+    /// (docs/object-store-contract.md, "Conditional reads"; the ADR-2040
+    /// pinning amendment):
+    ///
+    /// - A missing key is `NotFound` whatever the pin says.
+    /// - `pin.version` is a *selector*. This store keeps only the current
+    ///   object, so any version but the current one has been replaced and is
+    ///   gone: the answer is `NotFound`, the same answer a versioned store
+    ///   gives for a version that has been deleted. It is never
+    ///   `PreconditionFailed`, which would say the object is there and
+    ///   different.
+    /// - `pin.etag` is a *precondition*, evaluated on the object the selector
+    ///   chose. A mismatch is `PreconditionFailed`, which for a pin with no
+    ///   version is the overwrite case the pinning model rests on.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        if let Some(version) = pin.version.as_deref()
+            && entry.version.0 != version
+        {
+            return Err(StoreError::NotFound);
+        }
+        if entry.etag.0 != pin.etag {
+            return Err(StoreError::PreconditionFailed);
+        }
+        Self::verify_full_read(key, entry, range)?;
+        Ok(crate::PinnedRead {
+            outcome: GetOutcome {
+                data: Self::slice(&entry.data, range)?,
+                etag: entry.etag.clone(),
+                version: entry.version.clone(),
+                total_size: entry.data.len() as u64,
+            },
+            pin: crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone())),
+        })
+    }
+
+    /// This store models a versioned one: its `version` is a distinct value per
+    /// `put`, not the ETag again, so the pin it reports carries a selector and
+    /// the selector case above is reachable from the conformance suite.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        Self::verify_full_read(key, entry, range)?;
+        Ok(crate::PinnedRead {
+            outcome: GetOutcome {
+                data: Self::slice(&entry.data, range)?,
+                etag: entry.etag.clone(),
+                version: entry.version.clone(),
+                total_size: entry.data.len() as u64,
+            },
+            pin: crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone())),
+        })
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        let objects = self.objects.read();
+        let entry = objects.get(key).ok_or(StoreError::NotFound)?;
+        let pin = crate::Pin::from_store(entry.etag.0.clone(), Some(entry.version.0.clone()));
+        Ok((entry.meta(key), pin))
     }
 
     async fn put_multipart<'a>(
@@ -380,6 +555,11 @@ impl ObjectStoreBackend for MemoryStore {
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.objects.write().remove(key);
         Ok(())
+    }
+
+    /// Whatever a test set (ADR-1685 decision 1), `None` otherwise.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        *self.observed_store_time_ns.read()
     }
 
     fn capabilities(&self) -> Capabilities {

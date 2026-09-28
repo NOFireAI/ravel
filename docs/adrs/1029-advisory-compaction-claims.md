@@ -1,6 +1,6 @@
 # ADR-1029: advisory compaction claims over object-store CAS
 
-Status: Proposed
+Status: Accepted (2026-09-01, PR #1031; see the 2026-09-28 amendment)
 
 ## Context
 
@@ -91,7 +91,8 @@ which merges are paid for. Deliberately excluded from the identity:
 - `input_set_hash`. Two nodes whose listings diverge on a sealed bucket
   must collide on one claim, run once, and surface the divergence through
   the existing `InputSetHashDivergence` machinery, not run twice under
-  two claims.
+  two claims. (The surfacing mechanism moved; see the 2026-09-28
+  amendment.)
 - A compaction policy version. None exists in the repo; the record key
   itself embeds only `input_set_hash16`, and geometry knobs
   (`max_l1_part_bytes`, `l1_part_memory_target_bytes`) already change
@@ -166,10 +167,13 @@ defend it.
 ### 3. Cancellation checkpoints in the merge pipeline
 
 The merge gains a `ClaimGuard` consulted at the five natural quiescent
-points the pipeline already has:
+points the pipeline already has (the claim is acquired at the first and
+consulted at the other four; see the amendment on jitter on the contended
+path):
 
 1. after the seal/tombstone/already-compacted/min-input gates, before
-   any read (`compact.rs:60-71`);
+   any read (`compact.rs:60-71`); the claim is in fact taken after the input
+   commit-record reads, see the amendment on where the claim is taken;
 2. after input listing and `input_set_hash`, before catalog fan-out
    (`rewrite.rs:112-134`);
 3. at the per-stream merge loop head (`rlog.rs:777-788`);
@@ -205,7 +209,8 @@ duplicated work is cheaper than coordination and the bucket runs
 unclaimed, exactly as today. Deterministic jitter (derived from
 `blake3(work_id || process_id)`, so it is stable per contender and free
 of a shared clock) precedes every acquisition attempt, spreading
-simultaneous starts. In steady state the supervisor's rendezvous gate
+simultaneous starts (see the amendment on jitter on the contended path:
+it now precedes only the contended ones). In steady state the supervisor's rendezvous gate
 already ensures a single contender, so the added cost is one PUT per
 claimed bucket plus renewals for long merges; the claim earns its PUT
 whenever it prevents even one duplicated merge per ~thousands of claims.
@@ -221,8 +226,9 @@ Both callers of `compact_bucket` participate:
 - the background supervisor's per-unit tick, inside its existing
   ownership gate;
 - `ravel-cli maintain compact-tenant`, which is exactly the actor the
-  rendezvous hash cannot see. The bucket walk (sequential today, with
-  bucket-level concurrency arriving under #1028's stage 1) claims each
+  rendezvous hash cannot see. The bucket walk (sequential when written;
+  optionally concurrent since #1028's stage 1, see the 2026-09-28 amendment)
+  claims each
   bucket before merging it and reports skipped-because-claimed buckets
   in the walk summary, per the no-silent-defaults rule.
 
@@ -288,7 +294,8 @@ sequenceDiagram
    being protected.
 3. **`input_set_hash` in the work id.** Divergent input views must
    collide on one claim so one run executes and the divergence surfaces
-   as the existing typed invariant breach; hashing the view into the key
+   as the existing typed invariant breach (that mechanism moved; see the
+   2026-09-28 amendment); hashing the view into the key
    would let both run and publish two records under two claims.
 4. **Unconditional claim deletion on completion.** A stale worker's
    DELETE after a steal would destroy the newer owner's claim; `If-Match`
@@ -326,7 +333,9 @@ sequenceDiagram
   `claims_lost_total`, `claims_stolen_total`,
   `claim_renew_failures_total`, `claimed_buckets_skipped` on the walk
   report. Alert rule: sustained steal rate above zero (a steal storm
-  means lease duration is below a non-cancellable stage).
+  means lease duration is below a non-cancellable stage). These land with
+  #1035; until then see the amendment on jitter on the contended path for
+  where claim outcomes surface.
 - **Interaction with #1028 bucket concurrency**: claims are per bucket;
   a concurrent walk holds N claims with independent renewal state.
   Jitter is per work id, so N parallel acquisitions do not stampede.
@@ -339,10 +348,166 @@ sequenceDiagram
   claim HEAD after DELETE-by-sweep; divergent input hashes colliding on
   one claim; and a two-supervisor MemoryStore test asserting via
   request counters that exactly one merge runs where today's test
-  observes two. Every count is an exact figure, not `> 0`.
+  observes two (corrected in the 2026-09-28 amendment). Every count is an
+  exact figure, not `> 0`.
 - **Wave preview** (Stage 2 decomposes properly): W1 claim primitive +
   contract/key-layout docs (ravel-fleet, docs); W2 checkpoints + claim
   participation (ravel-maintain, serialized behind the in-flight #872
   chain on rlog.rs); W3 CLI participation + flags (ravel-cli, behind
   #1028 stage 1); W4 metrics + operations guide. Reuse for
   retention/sweep/fold/erasure is explicitly follow-up work.
+
+## Amendment (2026-09-28): status, and four facts that moved
+
+<!-- amendment-applies: sections="Decision|Rejected alternatives|Consequences" pointer="2026-09-28 amendment" -->
+
+This ADR passed its approval gate on 2026-09-01 (epic #1029 ledger; PR #1031
+merged that day) and the claim primitive landed with #1032 (PR #1062), but the
+status line still read Proposed. It now reads Accepted. The decisions stand;
+four statements they rest on no longer describe main, and are corrected here.
+
+1. **How a divergent listing surfaces.** Since #1070, two runs over the same
+   bucket with different input sets publish two separate compaction records,
+   and readers pick one with `select_authoritative_compaction_records`
+   (`crates/ravel-catalog/src/catalog.rs`). `InputSetHashDivergence` now fires
+   only when two different input-set hashes share the record key's 16-hex
+   prefix. Leaving `input_set_hash` out of the work id still makes divergent
+   views collide on one claim, so one merge is paid, which is the purpose of
+   this ADR. The claim path must not turn a divergent listing into a silent
+   success: the run that is refused the claim reports the bucket as skipped,
+   never as compacted.
+2. **The CLI bucket walk can run buckets concurrently.** Since #1028's stage 1
+   `--bucket-concurrency` (default 1, `services/ravel-cli/src/maintain.rs`)
+   lets an operator run several buckets at once, so decision 5 applies per
+   bucket per concurrency slot. A test that never raises the flag covers only
+   the one-bucket-at-a-time walk.
+3. **Today's two-replica test runs no merge at all.** With a shared live set,
+   `two_replicas_partition_units_without_double_pay`
+   (`services/ravel-server/src/maintain.rs`) seeds one below-threshold bucket
+   per shard and asserts that each unit is evaluated exactly once and
+   classified `already_done`. It never reads `MaintainReport::compacted`, so it
+   cannot show a duplicate merge either way. In the steady state rendezvous
+   ownership already gives each unit one evaluator. The duplicate this ADR
+   removes happens where ownership overlaps: an operator's
+   `ravel-cli maintain compact-*` run, which the rendezvous hash cannot see,
+   and a membership change during a merge, since the ownership check is taken
+   at discovery and a running merge continues after its shard moves. The
+   acceptance test therefore needs a bucket at or above the merge threshold,
+   has to force the overlap (two replicas with solo live sets, or the owner
+   changing while a merge runs), and asserts on `compacted` or the request
+   counters: two merges without claims, exactly one with them.
+4. **Code references drifted.** The seams this ADR names are on main at
+   different lines than it cites: the supervisor ownership gate at
+   `services/ravel-server/src/maintain.rs` around line 1737, the CLI merge
+   calls at `services/ravel-cli/src/maintain.rs` around lines 161 and 781,
+   the discovery check at `crates/ravel-maintain/src/compact.rs` around line
+   102, and the part PUT at `crates/ravel-maintain/src/rlog.rs` around line
+   2742. Every other line number in this document also predates this
+   amendment and may no longer point at the code it describes. The
+   implementing task locates each seam by name, not by line.
+
+A duplicate compaction is a cost, not a correctness, problem: converging and
+authoritative-record selection keep reads correct either way. The leak of a
+losing record's parts (#1155) is separate work that claims make rarer but do
+not fix.
+
+
+## Amendment (2026-09-28): where the claim is taken
+
+<!-- amendment-applies: sections="Decision" pointer="amendment on where the claim is taken" -->
+<!-- amendment-supersedes: phrase="before any read" pointer="amendment on where the claim is taken" -->
+
+Decision 3 item 1 places the claim acquisition "before any read". The
+implementation (`compact_bucket_scoped` in
+`crates/ravel-maintain/src/compact.rs`) takes it later: after the bucket
+LIST and the gates it feeds, and after the input commit records are read, one
+GET per L0 input. Decision 4 forces that order. The cost gate compares the
+inputs' stored bytes with `claim_min_input_bytes`, and those bytes are the
+`object_size` each commit record carries; the bucket listing names the
+records, not their sizes. The claim still precedes every catalog and block
+read and every PUT.
+
+This is safe because the reads before the claim are read-only: a run refused
+the claim has written nothing, so it has nothing to abandon, and the claim
+stays advisory (decision 2) whenever it is taken.
+
+The cost falls on a contender that is refused the claim. Before its claim
+request it pays the bucket LIST plus one commit-record GET per input, on top
+of the rejected PUT, the GET and the HEAD that Consequences lists for the
+contention path. Those commit-record GETs are counted under the record-read
+phase of the request ledger, not under `coordinate`. The background
+supervisor then holds the bucket until the holder's expiry
+(`MaintainMemo::claim_deferred`, checked before the bucket is listed; see
+the amendment on jitter on the contended path), so it pays them once per
+observed claim rather than once per tick.
+`a_held_claim_skips_the_bucket_without_merging_it`
+(`crates/ravel-maintain/tests/compaction_claims.rs`) pins the figures for a
+two-input bucket: two record reads, zero catalog and block reads, three
+coordinate requests.
+
+## Amendment (2026-09-28): jitter on the contended path only
+
+<!-- amendment-applies: sections="3. Cancellation checkpoints in the merge pipeline|4. Cost gating: claims only where duplication is expensive|Consequences" pointer="amendment on jitter on the contended path" -->
+<!-- amendment-supersedes: phrase="precedes every acquisition attempt" pointer="amendment on jitter on the contended path" -->
+<!-- amendment-supersedes: phrase="checked before the bucket is listed" pointer="amendment on jitter on the contended path" -->
+
+Decision 4 says the deterministic jitter "precedes every acquisition
+attempt". It now precedes only the contended ones. `ClaimGuard::acquire`
+(`crates/ravel-maintain/src/claim_guard.rs`) issues its first
+`CreateIfAbsent` with no wait, and waits out the jitter, through the
+participant's `ClaimSleeper`, once before each of the two writes that can
+follow a refused create: the steal of an expired claim, and the second
+`CreateIfAbsent` after a claim vanished between the refusal and its read.
+
+The reason is cost with nothing bought. The first `CreateIfAbsent` resolves
+the race on its own, so a wait before it decorrelates nobody; jitter only
+spreads contenders that retry or steal. Paid before every first attempt, it
+charged every claimed bucket up to 10% of the lease at the default
+`jitter_span_fraction` (30 s at the 300 s default lease, about 15 s on
+average), and `scan_and_maintain_with_memo` awaits a shard's buckets one
+after another, so a shard with ten claimed buckets spent about half of a
+300 s maintain tick asleep. A single-replica deployment with no CLI run
+beside it has no contender, and paid it on every claimed bucket.
+
+The moment a steal lands shifts only by the latency of the refused create
+and its two reads. Decision 1 step 2 reschedules a contender to after expiry
+plus its jitter; the skip now reports one millisecond past expiry, and the
+retry waits out the jitter before its steal instead of before its create. A
+contender that loses a steal reschedules one full lease from the moment it
+lost, because the winner has just written a claim with a fresh lease. An
+unreadable claim's skip reschedules to one millisecond past one lease plus
+the contender's jitter, the instant the claim stops holding the bucket back,
+because that retry steals nothing and so waits nothing.
+The claim guard's tests `an_uncontended_claim_requests_no_jitter_wait`,
+`a_refused_then_retried_create_requests_the_jitter_once` and
+`a_steal_requests_the_jitter_once_and_the_reschedule_carries_none` pin the
+waits.
+
+Three further facts about the landed implementation:
+
+1. **Four consulted checkpoints.** Of decision 3's five points, the first is
+   where the claim is acquired (moved after the input record reads by the
+   amendment on where the claim is taken), and the guard is consulted at the
+   other four. The `Checkpoint` enum names only those four.
+2. **The Consequences metrics are not shipped yet.**
+   `ravel_maintain_claims_acquired_total`, `claims_lost_total`,
+   `claims_stolen_total`, `claim_renew_failures_total` and
+   `claimed_buckets_skipped` land with #1035. Until then claim outcomes
+   surface as tracing fields (the skip and completion-failure events in
+   `crates/ravel-maintain/src/compact.rs`, the lost-claim warning in
+   `claim_guard.rs`, and the supervisor's per-shard pass summary) and as the
+   `MaintainReport` counters `claim_skipped` and `claim_cancelled`.
+3. **A held bucket is still retention-evaluated.** The supervisor's claim
+   hold (`MaintainMemo::claim_deferred`) skips only the held bucket's
+   compaction call. Retention and zone classification run for it as for any
+   other bucket, so a held head or tail hour still reaches
+   `MaintainReport::head_tail_hours`, which scopes the supervisor's zoned
+   sweep. The amendment on where the claim is taken describes the hold as
+   checked before the bucket is listed; it is still read at the top of the
+   bucket loop, but it now gates only the compaction call, and retention
+   lists the bucket whenever the tenant has a retention policy and the
+   bucket is sealed. The compaction path's own
+   listing, its commit-record reads and its claim requests are still not
+   issued while the hold lasts. `a_held_bucket_still_reaches_the_zone_split`
+   (`crates/ravel-maintain/tests/compaction_claims.rs`) pins the zone split,
+   zero coordinate requests and zero compactions for a held bucket.

@@ -18,7 +18,9 @@
 //! decisions 1 and 2 from the
 //! metrics [`crate::shard`]; the adaptive flush delay (decision 3) is
 //! metrics-only and deliberately absent here (the age trigger stays the fixed
-//! `max_flush_delay`/`max_flush_delay_idle` in [`SpanShardActor::age_threshold_ns`]).
+//! `max_flush_delay`/`max_flush_delay_idle`, plus the opt-in ADR-1737
+//! sub-floor hold shared with the metrics actor, in
+//! [`SpanShardActor::age_threshold_ns`]).
 //!
 //! The divergences from the log shard actor are otherwise deliberate and narrow: the
 //! buffer holds [`NormalizedSpan`]s, the flush builds an RSPAN object with
@@ -57,9 +59,10 @@ use uuid::Uuid;
 use crate::budget::{BufferBudgetCeiling, IngestByteCharge};
 use crate::clock::Clock;
 use crate::config::{
-    DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
-    SPAN_SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket, memory_backstop_crossed,
-    size_trigger_fires,
+    DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
+    MAX_FLUSH_CLOCK_HOLD_NS, SPAN_SEGMENT_FORMAT_VERSION, StoreClockLag,
+    checked_ingest_hour_bucket, idle_age_threshold, memory_backstop_crossed, size_trigger_fires,
+    store_clock_lag,
 };
 use crate::metrics::FlushTrigger;
 use crate::span_error::SpanWriteError;
@@ -764,7 +767,8 @@ impl SpanShardActor {
             })
             .unwrap_or(false);
         if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
-            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                .await;
         }
     }
 
@@ -772,36 +776,42 @@ impl SpanShardActor {
     /// least `min_flush_bytes` of object,
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7). "Worth a PUT" is a claim about the object, so this
+    /// (ADR-0051 section 7), or, below a non-zero `idle_flush_byte_floor`, for
+    /// the sub-floor hold, `max_flush_lifetime` less one `flush_tick`
+    /// (ADR-1737, [`idle_age_threshold`]). "Worth a PUT"
+    /// is a claim about the object, so this
     /// reads the object-bytes estimate, not the buffered-memory charge (issue
     /// #1305). Strict-mode ack latency is unaffected:
     /// a strict write always leaves `waiters` non-empty for its whole flush
-    /// window.
-    fn age_threshold_ns(&self, buf: &SpanTenantBuf) -> i64 {
+    /// window. Returns the trigger to record alongside the threshold.
+    fn age_threshold_ns(&self, buf: &SpanTenantBuf) -> (i64, FlushTrigger) {
         let has_priority =
             !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if has_priority {
-            self.config.max_flush_delay.as_nanos() as i64
+            (
+                self.config.max_flush_delay.as_nanos() as i64,
+                FlushTrigger::Age,
+            )
         } else {
-            self.config.max_flush_delay_idle.as_nanos() as i64
+            idle_age_threshold(buf.flush_est_bytes, &self.config)
         }
     }
 
     async fn flush_aged(&mut self) {
         let now = self.clock.now_ns();
-        let due: Vec<TenantId> = self
+        let due: Vec<(TenantId, FlushTrigger)> = self
             .tenants
             .iter()
-            .filter(|(_, buf)| {
-                buf.oldest_arrival_ns
-                    .map(|t| now.saturating_sub(t) >= self.age_threshold_ns(buf))
-                    .unwrap_or(false)
+            .filter_map(|(tenant, buf)| {
+                let oldest = buf.oldest_arrival_ns?;
+                let (threshold_ns, trigger) = self.age_threshold_ns(buf);
+                (now.saturating_sub(oldest) >= threshold_ns).then(|| (tenant.clone(), trigger))
             })
-            .map(|(t, _)| t.clone())
             .collect();
-        for tenant in due {
+        for (tenant, trigger) in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, FlushTrigger::Age).await;
+                self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
+                    .await;
             }
         }
     }
@@ -825,27 +835,57 @@ impl SpanShardActor {
     /// paths there is no later actor tick to retry it, so the re-buffered
     /// tenant would drop on teardown -- the exact loss the channel-close arm
     /// forbids. Retry over fresh snapshots until the map empties, bounded by
-    /// [`MAX_FLUSH_ALL_PASSES`]. This terminates because a refusal re-anchors
+    /// [`MAX_FLUSH_ALL_PASSES`]. A *regression* refusal (ADR-1307) re-anchors
     /// the monotonic floor to the raw reading, so the next pass stamps it and
-    /// proceeds; the bound only guards a pathological clock stepping back on
-    /// every reading.
+    /// proceeds; for that refusal the bound only guards a pathological clock
+    /// stepping back on every reading.
     ///
-    /// Residue left by the bound is never dropped silently, but it is only a
+    /// A *lag* refusal (ADR-1685) re-anchors nothing: it changes neither the
+    /// floor nor the store's observation, so every pass reads the same lag and
+    /// refuses again, and the pass bound is what ends the enforced loop. That
+    /// would strand acknowledged buffered-mode rows on a teardown, so after the
+    /// bound a [`DrainIntent::Teardown`] keeps making passes with
+    /// [`LagCheck::BypassedAtTeardown`] while tenants remain, under the same
+    /// bound: the lag is counted (`clock_lag_bypassed_at_shutdown`) and logged,
+    /// and the flush publishes. Those rows may land in an ingest hour the fold
+    /// has sealed, recoverable by a HEAD rebuild, where the drop is not
+    /// recoverable at all.
+    ///
+    /// Floor rules are unchanged on a bypass pass, which is why it is a loop
+    /// and not a single pass. A lag refusal never consults the floor, so a
+    /// backwards step big enough to cross [`MAX_FLUSH_CLOCK_HOLD_NS`] stays
+    /// hidden behind the lag check until the first bypass pass reaches the
+    /// floor and refuses there. That refusal re-anchors the floor to the raw
+    /// reading, so the next bypass pass stamps it and publishes. A single
+    /// bypass pass would have reported those rows as residue and lost them.
+    /// [`DrainIntent::Retryable`] never bypasses: its actor keeps running, so a
+    /// later trigger retries once the host clock converges.
+    ///
+    /// Residue left by the bounds is never dropped silently, but it is only a
     /// durability defect when nothing will retry it, so `intent` decides how it
     /// is reported: an ERROR and the `flush_all_residue_tenants` bump on a
     /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
     /// the residue is still in the tenant map with its arrival bookkeeping and
-    /// the actor is still running to flush it.
+    /// the actor is still running to flush it. On a teardown that residue now
+    /// needs every enforced pass refused, by the lag check or by the floor, and
+    /// every bypass pass refused by the floor. A lag refusal never consults the
+    /// floor, so what the bypass passes need is [`MAX_FLUSH_ALL_PASSES`]
+    /// consecutive backwards steps past the hold bound on their own readings,
+    /// the same count the floor alone needed for residue before the lag check
+    /// existed.
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
-            let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
-            for tenant in tenants {
-                if let Some(buf) = self.tenants.remove(&tenant) {
-                    self.flush_tenant(tenant, buf, trigger).await;
-                }
-            }
+            self.flush_all_pass(trigger, LagCheck::Enforced).await;
             passes += 1;
+        }
+        let mut bypass_passes = 0;
+        if matches!(intent, DrainIntent::Teardown) {
+            while !self.tenants.is_empty() && bypass_passes < MAX_FLUSH_ALL_PASSES {
+                self.flush_all_pass(trigger, LagCheck::BypassedAtTeardown)
+                    .await;
+                bypass_passes += 1;
+            }
         }
         if !self.tenants.is_empty() {
             let (tenant_count, buffered_spans) = self.buffered_summary();
@@ -857,6 +897,7 @@ impl SpanShardActor {
                         tenant_count,
                         buffered_spans,
                         passes,
+                        bypass_passes,
                         "ravel-ingest: flush_all left buffered tenants unflushed after \
                          exhausting retry passes; acknowledged buffered-mode rows lost \
                          on this graceful drain"
@@ -877,6 +918,18 @@ impl SpanShardActor {
             }
         }
         self.join_all_flushes().await;
+    }
+
+    /// One drain pass: a fresh snapshot of the buffered tenant keys, each
+    /// flushed under `lag_check`. A refused flush re-inserts its key, which the
+    /// next pass's snapshot picks up.
+    async fn flush_all_pass(&mut self, trigger: FlushTrigger, lag_check: LagCheck) {
+        let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
+        for tenant in tenants {
+            if let Some(buf) = self.tenants.remove(&tenant) {
+                self.flush_tenant(tenant, buf, trigger, lag_check).await;
+            }
+        }
     }
 
     /// Awaits every spawned flush task, not only ones triggered by this call:
@@ -967,8 +1020,37 @@ impl SpanShardActor {
     /// The floor is in-process state, never persisted, so it resets to 0 on
     /// restart by construction. The guarantee is per-process; ADR-1307 records
     /// the cross-restart limitation.
-    fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, FlushClockError> {
+    fn monotonic_flush_open_ns(
+        &mut self,
+        raw_ns: i64,
+        lag_check: LagCheck,
+    ) -> Result<i64, FlushClockError> {
         checked_ingest_hour_bucket(raw_ns).map_err(FlushClockError::InvalidReading)?;
+        match store_clock_lag(raw_ns, self.ctx.store.observed_store_time_ns()) {
+            StoreClockLag::WithinAllowance => {}
+            StoreClockLag::Unobserved => self.metrics.record_clock_lag_unchecked(),
+            StoreClockLag::Refused { lag_ns, msg } => match lag_check {
+                LagCheck::Enforced => {
+                    self.metrics.record_clock_lag_refused();
+                    tracing::warn!(
+                        shard = self.shard,
+                        raw_ns,
+                        lag_ns,
+                        "ravel-ingest: span flush clock lags the object store's observed clock beyond the clock-skew allowance; refusing the flush"
+                    );
+                    return Err(FlushClockError::LagRefused(msg));
+                }
+                LagCheck::BypassedAtTeardown => {
+                    self.metrics.record_clock_lag_bypassed_at_shutdown();
+                    tracing::warn!(
+                        shard = self.shard,
+                        raw_ns,
+                        lag_ns,
+                        "ravel-ingest: span flush clock lags the object store's observed clock beyond the clock-skew allowance, but this is a teardown bypass pass; not refusing on the lag, so the flush proceeds to the monotonic floor check and publishes unless the floor refuses it, rather than dropping acknowledged buffered-mode rows. The commit record may land in an ingest hour the fold has sealed, so a token-less read needs a catalog HEAD rebuild to see it"
+                    );
+                }
+            },
+        }
         if raw_ns >= self.last_flush_open_ns {
             self.last_flush_open_ns = raw_ns;
             return Ok(raw_ns);
@@ -1013,6 +1095,7 @@ impl SpanShardActor {
         tenant: TenantId,
         mut buf: SpanTenantBuf,
         trigger: FlushTrigger,
+        lag_check: LagCheck,
     ) {
         if buf.spans.is_empty() {
             // Nothing to write, so no flush task runs: dropping `charges` here
@@ -1053,7 +1136,7 @@ impl SpanShardActor {
         // must not be counted as a flush that happened, and (on the retryable
         // arm) its rows must be re-buffered rather than dropped (ADR-1307
         // finding 1).
-        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
+        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns, lag_check) {
             Ok(ns) => ns,
             Err(FlushClockError::InvalidReading(msg)) => {
                 // A grossly broken raw reading is fail-loud and non-retryable
@@ -1064,13 +1147,16 @@ impl SpanShardActor {
                     .ack_waiters(buf.waiters, Err(SpanWriteError::SegmentBuild(msg)));
                 return;
             }
-            Err(FlushClockError::RegressionRefused(msg)) => {
-                // Already counted as `clock_regressions_refused` inside the
-                // helper; a clock regression is a transient server condition the
-                // next flush recovers from, so it is retryable (`Abandoned`, 503),
-                // not a client `SegmentBuild` (400) that would drop the buffered
-                // rows on a conformant exporter. The floor re-anchored to `raw_ns`
-                // inside the helper, so the next reading at or above `raw_ns`
+            Err(FlushClockError::RegressionRefused(msg) | FlushClockError::LagRefused(msg)) => {
+                // Both arms are already counted inside the helper
+                // (`clock_regressions_refused`, `clock_lag_refused`) and are
+                // transient server conditions a later flush recovers from, so
+                // both are retryable (`Abandoned`, 503), not a client
+                // `SegmentBuild` (400) that would drop the buffered rows on a
+                // conformant exporter. What recovers them differs.
+                //
+                // A REGRESSION refusal re-anchored the floor to `raw_ns` inside
+                // the helper, so the next reading at or above `raw_ns`
                 // proceeds: the bound is per backwards step, not global, and a
                 // single backwards step refuses exactly one flush. It is not a
                 // guarantee that only one flush is refused over the process
@@ -1079,7 +1165,18 @@ impl SpanShardActor {
                 // continues, and within one drain the absorb path returns the held
                 // stamp without advancing the floor, so a receding clock can refuse
                 // one tenant, absorb the next few against the re-anchored value,
-                // and refuse again. Re-buffer the rows
+                // and refuse again.
+                //
+                // A LAG refusal (ADR-1685) re-anchors nothing: the floor was
+                // never consulted and the store's observation is unchanged, so
+                // every retry against the same clock refuses identically until
+                // the host clock converges. Inside a drain that means
+                // `MAX_FLUSH_ALL_PASSES` is what ends the enforced loop, and a
+                // teardown drain then makes bypass passes with
+                // `LagCheck::BypassedAtTeardown` so these rows publish rather
+                // than becoming residue.
+                //
+                // Re-buffer the rows
                 // so that next trigger flushes them (finding 1): `charges` ride
                 // back with the buffer (the byte budget is not refunded, the bytes
                 // are still held), and the whole buffer -- spans and the trigger

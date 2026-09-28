@@ -52,11 +52,21 @@
 //!   so it holds there (issue #928). A backend that issues no HTTP requests (for example
 //!   [`crate::memory::MemoryStore`]) leaves `attempts` at zero: there is no bill
 //!   and nothing retried. Because a single logical read may fan a whole-object
-//!   `GetRange::Full` into several bounded ranged GETs, `attempts` can exceed
-//!   `calls` for `get` even with no retry at all; each ranged request is a real
-//!   billed request. `attempts` for `put` likewise counts every request a
+//!   `GetRange::Full` into an unranged GET cut at the per-request bound plus
+//!   ranged GETs for the rest, `attempts` can exceed `calls` for `get` even
+//!   with no retry at all; each of those requests is a real billed request. `attempts` for `put` likewise counts every request a
 //!   multipart upload issues (create, each part, complete), not one per logical
 //!   `put`.
+//! - `get_unverified` (`ravel_store_get_unverified_total`) is a store-wide total,
+//!   not a per-op block: it counts full-object reads the S3 adapter served
+//!   without checking the body against a stored checksum, because the response
+//!   carried no `x-amz-checksum-*` header, carried one this adapter cannot
+//!   recompute, or arrived as several responses none of which is the
+//!   whole object (ADR-1696 decision 3). Like `attempts`, it is recorded by the
+//!   adapter's HTTP connector's owner rather than by this decorator, through
+//!   [`StoreMetrics::record_get_unverified`]. Zero for a backend that is not the
+//!   S3 adapter. A non-zero and *growing* value against an endpoint that is
+//!   supposed to store checksums is the signal that it is dropping them.
 //! - `errors[class]` is indexed by [`StoreErrorClass`], one slot per
 //!   [`StoreError`] variant. `AlreadyExists` under `CreateIfAbsent` is a
 //!   protocol signal rather than a failure (ADR-0002), so a healthy commit
@@ -202,6 +212,15 @@ impl StoreErrorClass {
             StoreError::ListRepeatedToken { .. }
             | StoreError::ListPageCeiling { .. }
             | StoreError::ListOrderViolation { .. } => StoreErrorClass::Permanent,
+            // A capability the backend does not have, and a mutation of a
+            // store opened read-only: both are client-side configuration
+            // failures that no retry and no other argument can fix, so they
+            // class as `Permanent` rather than widening the class enum (and
+            // with it every exported metrics array). Named explicitly, not via
+            // a wildcard, for the same reason as the variants above.
+            StoreError::Unsupported { .. } | StoreError::ReadOnly { .. } => {
+                StoreErrorClass::Permanent
+            }
         }
     }
 
@@ -409,6 +428,10 @@ impl OpMetricsSnapshot {
 #[derive(Debug, Default)]
 pub struct StoreMetrics {
     ops: [OpMetrics; STORE_OP_COUNT],
+    /// `ravel_store_get_unverified_total`: full-object reads served without a
+    /// checksum check (ADR-1696 decision 3). Store-wide rather than per-op:
+    /// only `get` can move it, so a per-op block would be five permanent zeros.
+    get_unverified: AtomicU64,
 }
 
 impl StoreMetrics {
@@ -432,6 +455,21 @@ impl StoreMetrics {
     /// contend on the same field. See the [module docs](self).
     pub fn record_attempt(&self, op: StoreOp) {
         self.op(op).record_attempt();
+    }
+
+    /// Record one full-object read served without verifying it against a
+    /// stored checksum (`ravel_store_get_unverified_total`, ADR-1696
+    /// decision 3). The S3 adapter records this once per logical full-object
+    /// `get`, not once per HTTP request, so a large object split into several
+    /// bounded requests counts one unverified read rather than one per chunk. It touches no other counter.
+    pub fn record_get_unverified(&self) {
+        self.get_unverified.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current value of `ravel_store_get_unverified_total`, for a caller that
+    /// wants the one counter without taking a whole [`snapshot`](Self::snapshot).
+    pub fn get_unverified(&self) -> u64 {
+        self.get_unverified.load(Ordering::Relaxed)
     }
 
     /// Record one completed call from outside this module, using the same
@@ -461,6 +499,7 @@ impl StoreMetrics {
             list: self.op(StoreOp::List).snapshot(),
             list_delimited: self.op(StoreOp::ListDelimited).snapshot(),
             delete: self.op(StoreOp::Delete).snapshot(),
+            get_unverified: self.get_unverified.load(Ordering::Relaxed),
         }
     }
 }
@@ -476,6 +515,10 @@ pub struct StoreMetricsSnapshot {
     pub list: OpMetricsSnapshot,
     pub list_delimited: OpMetricsSnapshot,
     pub delete: OpMetricsSnapshot,
+    /// `ravel_store_get_unverified_total`: full-object reads the S3 adapter
+    /// served without checking the body against a stored checksum (ADR-1696
+    /// decision 3). Store-wide, not per-op; see the [module docs](self).
+    pub get_unverified: u64,
 }
 
 impl StoreMetricsSnapshot {
@@ -596,6 +639,51 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         result
     }
 
+    /// Counted as a [`StoreOp::Get`], identically to [`Self::get`]: a pinned
+    /// read is one GET on the wire and costs the same, so splitting it into
+    /// its own op would make a caller's GET count depend on which read path it
+    /// took. A refused precondition lands in the `PreconditionFailed` error
+    /// class and counts zero bytes.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let start = self.clock.now_nanos();
+        let result = self.inner.get_pinned(key, range, pin).await;
+        let bytes = result
+            .as_ref()
+            .map_or(0, |read| read.outcome.data.len() as u64);
+        self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// Counted as a [`StoreOp::Get`] for the same reason as
+    /// [`Self::get_pinned`]: it is the same GET, with the object's version
+    /// reported alongside the bytes.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let start = self.clock.now_nanos();
+        let result = self.inner.get_with_pin(key, range).await;
+        let bytes = result
+            .as_ref()
+            .map_or(0, |read| read.outcome.data.len() as u64);
+        self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// One HEAD on the wire, counted as [`StoreOp::Head`] like [`Self::head`].
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        let start = self.clock.now_nanos();
+        let result = self.inner.pin_of(key).await;
+        self.record(StoreOp::Head, start, 0, &result);
+        result
+    }
+
     /// Passthrough, uncounted. A multipart upload is a handle, not a call:
     /// counting it would mean wrapping the returned [`MultipartUpload`] and
     /// attributing its parts to some [`StoreOp`], and no `StoreOp` describes
@@ -659,12 +747,35 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
+
+    /// Passthrough (ADR-1685 decision 1). Answering `None` here would leave a
+    /// wrapped S3 store's observation invisible to the writer's clock-lag
+    /// check, silently disabling it for every production process, since
+    /// `ravel-server` wraps its backend in this decorator unconditionally.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The decorator reports the wrapped backend's store-clock observation
+    /// rather than the trait default (ADR-1685 decision 1). `ravel-server`
+    /// wraps every backend in this, so a `None` here would disable the
+    /// writer's clock-lag check in every production process.
+    #[test]
+    fn observed_store_time_delegates_to_the_inner_store() {
+        let inner = crate::memory::MemoryStore::new();
+        inner.set_observed_store_time_ns(Some(1_700_000_000_123_456_789));
+        let store = InstrumentedStore::new(inner);
+        assert_eq!(
+            store.observed_store_time_ns(),
+            Some(1_700_000_000_123_456_789)
+        );
+    }
 
     #[test]
     fn op_and_error_class_indices_are_dense_and_stable() {
@@ -677,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn every_store_error_variant_has_its_own_class() {
+    fn every_error_class_is_reachable_and_the_shared_variants_are_pinned() {
         let errors = [
             (StoreError::NotFound, StoreErrorClass::NotFound),
             (StoreError::AlreadyExists, StoreErrorClass::AlreadyExists),
@@ -718,6 +829,26 @@ mod tests {
         );
         for (err, expected) in &errors {
             assert_eq!(StoreErrorClass::of(err), *expected, "misclassified {err:?}");
+        }
+
+        // The two variants that share a class rather than owning one. They are
+        // both caller-side facts about the backend's shape, not about the
+        // request, so they read as permanent and widening the class enum would
+        // renumber every exported metrics array.
+        for err in [
+            StoreError::Unsupported {
+                operation: "conditional get".into(),
+            },
+            StoreError::ReadOnly {
+                operation: "put".into(),
+                store: "external".into(),
+            },
+        ] {
+            assert_eq!(
+                StoreErrorClass::of(&err),
+                StoreErrorClass::Permanent,
+                "misclassified {err:?}"
+            );
         }
     }
 
@@ -789,6 +920,80 @@ mod tests {
         // never drifts on a backend that issues no HTTP (e.g. MemoryStore).
         assert_eq!(snap.put.attempts, 0);
         assert_eq!(snap.head.attempts, 0);
+    }
+
+    /// `ravel_store_get_unverified_total` is store-wide and independent of
+    /// every per-op counter (ADR-1696 decision 3): a read that was served
+    /// without a checksum check is still an ordinary successful `get`, so
+    /// recording one must not touch `calls`, `ok`, `errors` or `attempts`, and
+    /// the two accessors must agree.
+    #[test]
+    fn get_unverified_is_store_wide_and_touches_no_op_counter() {
+        let metrics = StoreMetrics::default();
+        metrics.record(StoreOp::Get, 10_000, 42, None);
+        metrics.record_get_unverified();
+        metrics.record_get_unverified();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.get_unverified, 2, "two unverified full-object reads");
+        assert_eq!(
+            metrics.get_unverified(),
+            snap.get_unverified,
+            "the direct accessor and the snapshot must read one counter"
+        );
+        assert_eq!(snap.get.calls, 1, "the read itself is one ordinary call");
+        assert_eq!(snap.get.ok, 1);
+        assert_eq!(snap.get.attempts, 0);
+        assert_eq!(snap.get.errors_total(), 0);
+        assert_eq!(
+            StoreMetrics::default().snapshot().get_unverified,
+            0,
+            "a store that recorded nothing reads exactly zero"
+        );
+    }
+
+    /// A pinned read is a GET on the wire and is billed as one: it lands in the
+    /// same `StoreOp::Get` block as an unpinned read, with its bytes, and a
+    /// refusal lands in that block's `PreconditionFailed` class. Anything else
+    /// would make the cost of a pinned read invisible to the per-phase
+    /// accounting every read path reports.
+    #[tokio::test]
+    async fn get_pinned_is_billed_as_a_get_with_its_bytes_and_its_refusals() {
+        use crate::memory::MemoryStore;
+        use crate::{GetRange, ObjectStoreBackend, Pin, PutOptions};
+        use bytes::Bytes;
+
+        let store = InstrumentedStore::new(MemoryStore::new());
+        store
+            .put(
+                "pinned/k",
+                Bytes::from_static(b"0123456789"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        let meta = store.head("pinned/k").await.expect("head");
+        let pin = Pin::etag(meta.etag.0.clone());
+
+        let got = store
+            .get_pinned("pinned/k", GetRange::Range(0, 4), &pin)
+            .await
+            .expect("a matching pin is served");
+        assert_eq!(&got.outcome.data[..], b"0123");
+
+        let err = store
+            .get_pinned("pinned/k", GetRange::Range(0, 4), &Pin::etag("\"0\""))
+            .await
+            .expect_err("a wrong pin is refused");
+        assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+
+        let snap = store.metrics().snapshot();
+        assert_eq!(snap.get.calls, 2, "both pinned reads are GET calls");
+        assert_eq!(snap.get.ok, 1);
+        assert_eq!(snap.get.bytes, 4, "only the served range is charged");
+        assert_eq!(snap.get.error_count(StoreErrorClass::PreconditionFailed), 1);
+        assert_eq!(snap.head.calls, 1, "the head is billed separately");
+        assert_eq!(snap.put.calls, 1);
     }
 
     #[test]

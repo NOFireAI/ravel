@@ -259,17 +259,19 @@ Two carriers feed it, unioned per segment and per column (ADR-0873 decision
   string with no scalar form on this path, so `MIN`/`MAX` over one is always
   answered by the scan.
 
-**The write side of the stamp carrier does not exist.** Nothing in the
-flush or compaction path calls the stamp writers in
-`ravel_commit::declared_stats` (`stamp_commit_record`,
-`stamp_compaction_part`); their only callers are tests. Every record a real
-tenant has written carries an empty list, so
-the stamp half of the union is empty for every segment of every tenant, every
-answer above comes from `.cstat` alone, and the stamp path is exercised only by
-tests that stamp a record directly and by the fold's carriage of whatever a
-record happens to carry. The reader that refuses a defective stamp has to exist
-before any writer can emit one, so on today's deployments this shortcut is
-inert on the stamp side, and no coverage change is observable from it.
+**Which records carry a stamp.** The logs flush stamps each commit record
+with the extrema it accumulated for the tenant's typed attribute columns
+(`run_flush` in `ravel_ingest::log_shard`, stamps built by
+`DeclaredStatAccum::build_stamps`). RLOG compaction re-stamps each part it
+writes over the columns its input records already carry stamps for
+(`finalize_part` in `ravel_maintain::rlog`). These records carry no stamp: a
+flush for a tenant with no typed attribute columns, or whose stream
+attributes could not be decoded; a compaction part whose inputs carry no
+stamps, or where a stream's attribute blob does not decode; every part an
+erasure rewrite writes, which stamps an empty list by design; and records
+written before the stamp writer shipped. For those segments the answer comes
+from `.cstat` alone. The metrics and span paths write no stamps, which does
+not affect this rule, since it reads only logs segments.
 
 Stamp eligibility is an allowlist, `I64` and `BOOL`
 (`ravel_types::declared_stats`). `Str`/`Bytes` are excluded because a stamped
@@ -509,11 +511,19 @@ and lists every page in PAGE_DIR, so the fetch unit is a column chunk rather
 than a block. The request law for one statement over one such object:
 
 **One suffix probe, plus one coalesced range per surviving `(row group,
-projected column)`, plus front-section ranges (STREAM_DIR always, FIELD_DIR
-when the query carries numeric arms) only when the probe's cached suffix does
-not already cover them.** That is one to four GETs per object for a typical
-narrow projection over a small object, and it grows with `row_groups x
-projected_columns` rather than with the object's block count.
+projected column)`, bounded at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4,
+ADR-2066 decision 1) on an L0 object and unbounded on an L1 segment, plus
+front-section ranges (STREAM_DIR and FIELD_DIR together, in one GET, when the
+query carries numeric arms or projects fewer than every column) only when the
+probe's cached suffix does not already cover them.**
+For a typical narrow projection over a small L0 object that is one to seven
+GETs: the probe, a SKIP_IDX/PAGE_DIR chase when the probe falls short, the
+front sections, and up to 4 chunk-run GETs. The count excludes the tail
+sections a predicate can need beyond those (BLOOM and POSTINGS, each one GET
+when the probe does not cover it), which add to it. Below the cap the
+chunk-run count grows with `row_groups x projected_columns` rather than with
+the object's block count; above it an L0 object's candidate runs bridge down
+to the cap, while an L1 segment issues one GET per coalesced run.
 
 The pieces, and why each is where it is:
 
@@ -543,10 +553,21 @@ The pieces, and why each is where it is:
   adjacent chunks coalesce, and one for the whole group when the projection
   keeps every column and every block of the group survives. Pruned blocks' pages
   are the holes inside those runs, read through or split around by the
-  `coalesce_gap` policy.
-- The 75% coverage crossover still applies, now against the projected page
-  bytes: an all-columns read of every block takes a single whole-object GET
-  instead.
+  `coalesce_gap` policy. On an L0 object, when the coalesced candidate runs
+  still exceed `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4), `bounded_chunk_runs`
+  bridges the smallest remaining gaps between them down to the cap: the same
+  L0-only bound `SegmentFetcher::fetch_pages` already applied to metrics
+  flushes (ADR-1306, below), which ADR-2066 decision 1 extends to RLOG L0
+  objects. L1 segments (compaction and rewrite outputs) are exempt for the
+  same reason the metrics path exempts them: a large segment with many row
+  groups would bridge a narrow projection into spans covering most of the
+  object.
+- The 75% coverage crossover still applies, now computed against that bounded,
+  bridged run set rather than the raw projected page bytes (ADR-2066 decision
+  1): bridging can itself push the covered bytes over the threshold, so a
+  projection whose own selected bytes stay well under it can still convert to
+  one whole-object GET once its candidate runs bridge down to the cap. An
+  all-columns read of every block still takes a single whole-object GET too.
 
 Reference figures on the 8,424-object ClickBench tenant, at version 4. A
 single-column, predicate-free statement reads 8,424 probes plus about one
@@ -748,6 +769,53 @@ block-range object-assembly reservations. The transient summed-run
 reservations in `fetch_blocks`/`fetch_chunk_ranges` are taken after the probe
 and directory-section GETs, so a refusal there aborts a read that has already
 issued those GETs.
+
+**Decoded output (ADR-1702 decision 6).** The PromQL catalog decode is charged
+to the same budget before it runs. `SegmentFetcher::decode_selected` (and
+`decode_sparse_catalog` on the sparse probe path) reserves the footer-declared
+`uncompressed_len` of every catalog section the object carries (LABEL_DICT,
+SERIES_IDS, SERIES_META, SERIES_IDX, SERIES_META_CHUNKS), each clamped to the
+reader's section ceiling, and the guard travels with the decoded entries rather
+than with the fetched regions. A refusal is the same typed
+`FetchMemoryExhausted`.
+
+SERIES_META_CHUNKS is the one section whose footer figure is not what it
+decodes to. It carries no section-level compression, so its `uncompressed_len`
+is the STORED zstd frames' length, while `decode_catalog_v5_chunked` inflates
+every frame and keeps an entry for every series. The reservation therefore uses
+the SERIES_IDX chunk directory's summed `frame_uncompressed_len` for that
+section (the directory is already fetched before the decode on every chunked
+path), falling back to the footer figure only when that directory is not
+readable. On the 4096-series fixture the two differ by an order of magnitude:
+8,599 stored bytes against 90,356 inflated.
+
+Once the matchers have run, `decode_selected` exchanges the whole-catalog
+reservation for one sized to the entries that survived, measured over their
+structs, label strings and runs. A selective query on a large object therefore
+holds a few hundred bytes through its page fetches rather than the whole
+catalog's charge. The exchange only ever shrinks: on an object small enough
+that the decoded entries measure more than the sections they came from, the
+original reservation stands rather than growing into a new refusal point. The
+exchange never fails the query either, since the decode it follows already
+succeeded: the retained reservation is taken before the whole-catalog one is
+released, and a refusal keeps the whole-catalog one. A decode that retained no
+entries releases its reservation and holds none.
+
+**Where these are live.** These catalog-decode reservations are enforced in a
+running server today wherever the segment fetcher runs under the process
+budget: PromQL evaluation (`QueryEngine::with_memory_budget`, wired in
+`ravel-server`), cache warming (`ravel-server`'s `cache_warm.rs`) and
+distributed query fragments (`ravel-server`'s `distrib.rs`). A read whose
+decode does not fit is refused with the 503 `FetchMemoryExhausted` maps to.
+The SQL samples scan reaches the same `decode_selected`, but its fetchers
+reserve against their own unlimited budget (see the SQL-path paragraph
+above), so its decodes are charged and never refused until that fetcher is
+wired to the process budget. The catalog resolve charges its own decodes the same way
+(`Catalog::with_memory_budget`, docs/catalog-and-mvcc.md), as does the
+`/api/v1/metadata` cache (`MetadataCache::with_memory_budget`), but both still
+default to an unlimited budget and the server does not yet pass them the real
+one, so those reservations account without refusing. These guards come from the
+same RAII `reserve` API, so they read under `component="fetch"`.
 
 ## Endpoints (Prometheus compatibility subset)
 
@@ -974,7 +1042,8 @@ The PromQL engine's fetchers and the SQL executor share this one budget (see
 "Fetch-layer memory reservations" above), and the two `component` samples
 split its reserved total without double-counting. `component="fetch"` is
 `MemoryBudget::fetch_reserved()`, the bytes held by live `Reservation` guards
-(the fetch layer's RAII `reserve` API). `component="sql"` is
+(the RAII `reserve` API: fetched buffers, plus the decoded catalog output
+described under "Decoded output" above). `component="sql"` is
 `MemoryBudget::sql_reserved()`, the reserved total minus the fetch share,
 which is what the SQL executor's per-tenant accountants hold through the raw
 `try_reserve`/`reserve_unchecked`/`release` API. The two counters are separate
@@ -1232,6 +1301,17 @@ either in `deploy/prometheus/ravel.rules.yaml` without widening
 `lag_allowance` fails a test instead of silently putting the first refusal
 before the page.
 
+That the ordering holds in practice, and not only in the arithmetic, is
+`fold_stall_alert_fires_before_first_request_budget_refusal`
+(`services/ravel-server/tests/fold_lag_budget_ordering.rs`). It runs one
+simulated timeline at a scaled cadence with the fold wedged by a fault on its
+HEAD PUT, evaluates the shipped alert against the rendered
+`/metrics` gauge every simulated minute, and runs a cold query each minute
+under a budget built from `request_budget_parts`: the alert fires 9 minutes
+before the first `RequestBudgetExceeded`, and the same timeline replayed
+against ADR-0075's one-hour span is refused at the very first minute, before
+any stall.
+
 Each unsealed flush in that span is sized at
 `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of
 `REQUESTS_PER_UNSEALED_FLUSH` (2, the measured cold cost of a flush at or under
@@ -1265,10 +1345,18 @@ configured seal margin, plus the
 one interval, and the HEAD a resolve reads may be one TTL older again, so a
 fold that is keeping up can show up to that sum. At the defaults it is
 8,400 + 300 + 30 = 8,730 s. `EngineConfig` carries all three
-(`seal_margin`, `fold_interval`, `head_cache_ttl`), each defaulting to the
-catalog's and the server's own compiled-in values; passing a running server's
-`CatalogConfig` and `FoldTaskConfig` through to them is a follow-up, so a
-deployment that has changed them is classified against the defaults until then.
+(`seal_margin`, `fold_interval`, `head_cache_ttl`). `ravel-server` fills them
+from what this process is actually running, in the one place it turns a
+`ServerConfig` into an `EngineConfig`
+(`services/ravel-server/src/query.rs`'s `build_engine_config`): the seal margin
+and the HEAD cache TTL off the `CatalogConfig` of the catalog it hands to both
+resolve and the fold, and the fold interval off the `FoldTaskConfig` it spawns
+the fold with. The fold interval is the real one only in a process that runs
+the scheduled fold (`--mode all` and `--mode maintain`); a `query` or `gateway`
+process keeps the 300 s default, so where the `maintain` processes fold on a longer
+interval, a query node's threshold is too short by the difference and can
+blame a fold that is keeping up. The compiled-in defaults remain what an `EngineConfig` built
+with no deployment context falls back to.
 
 The tail is read off the origins the resolve already produced, never a new
 store request, and it is reported only when that resolve actually read a folded
@@ -1716,8 +1804,8 @@ Reachable end to end: `QueryEngine::prefetch` runs the eligibility gate,
 computes the pushdown target, and sends the resulting request live on the
 wire for the one eligible plan; `MergedSource` overrides
 `SeriesSource::query_precomputed_count` to serve the collected partials back
-to the PromQL fast path, and `PROTOCOL_VERSION` 4 carries the wire opt-in. A
-worker's `count: Some(0)` (a real,
+to the PromQL fast path, and `PROTOCOL_VERSION` 4 and later carry the wire opt-in.
+A worker's `count: Some(0)` (a real,
 correctly-computed zero-in-window count) is dropped before it reaches
 `MergedSource`, never surfaced as a phantom zero-valued series, the same
 absence-of-output-sample contract the raw path already has.
@@ -3360,9 +3448,14 @@ Two consequences an operator and a plan reader both see:
   columns, plus `ts`/`stream_ref` (always), plus every field a pushed content
   predicate names, plus every attribute key a pending erasure predicate names
   (ADR-0064). `read_block` decompresses and decodes only those columns' pages.
-  Because `attrs` is one merged map column, a query referencing `attrs` at all
+  Because `attrs` is one merged map column, a query that uses the whole map
   -- `SELECT *` included -- resolves to every dynamic column plus the
-  `attrs_raw` overflow; per-key `attrs['k']` projection is not implemented.
+  `attrs_raw` overflow. A query that reads `attrs` only through literal
+  subscripts (`attrs['k']`) decodes only those keys' columns plus `attrs_raw`
+  when the `AttrsPerKeyProjection` rule applies: the rule rewrites the scan to
+  one per-key column each, through `LogsScanExec::reproject_attr_keys`, for a
+  single-scan plan with no pending erasure. Any other shape keeps the whole
+  map.
   Skip-index, POSTINGS, and bloom pruning are unchanged: they read stored
   statistics, not decoded pages.
 

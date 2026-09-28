@@ -33,11 +33,13 @@
 //!
 //! [`CompactionRecord`]: ravel_proto::commit::v1::CompactionRecord
 
+pub mod alert_retention;
 pub mod audit_pipeline;
 pub mod audit_retention;
 mod audit_write;
 pub mod bucket;
 pub mod build;
+pub mod claim_guard;
 pub mod clock;
 pub mod codec;
 pub mod compact;
@@ -67,15 +69,17 @@ pub mod sweep;
 /// here at its original path, so maintain's callers compile unchanged.
 pub use ravel_fleet::worker_set;
 
+pub use alert_retention::{AlertKeepSet, AlertRetentionOutcome, sweep_alert_retention};
 pub use audit_pipeline::{AuditEvent, AuditPipeline, NoopQueryAuditSink, QueryAuditSink};
 pub use audit_retention::{AuditRetentionOutcome, sweep_audit_retention};
 pub use bucket::Bucket;
+pub use claim_guard::{Acquire, Checkpoint, ClaimGuard, ClaimSkip, ClaimSkipReason, Verdict};
 pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
-pub use compact::{CompactionOutcome, compact_bucket};
+pub use compact::{ClaimedCompaction, CompactionOutcome, compact_bucket, compact_bucket_claimed};
 pub use config::{
-    AdmissionMode, AuditMode, AuditPipelineConfig, CompactorConfig, MergeMemoryTracker,
-    MergePhasePeaks, RetentionConfig, RetentionConfigError, RetentionPolicy,
+    AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
+    MergeMemoryTracker, MergePhasePeaks, RetentionConfig, RetentionConfigError, RetentionPolicy,
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{
@@ -95,7 +99,8 @@ pub use legal_hold::{
 };
 pub use memo_snapshot::{MEMO_PREFIX, memo_key, read_all_memo_snapshots, write_memo_snapshot};
 pub use migrate::{
-    FamilyMigrateReport, MigrateBudget, Verification, count_below_target, migrate_family,
+    FamilyCensus, FamilyMigrateReport, MigrateBudget, Verification, census_family,
+    count_below_target, migrate_family,
 };
 pub use provision_audit::write_reshard_audit;
 pub use publish::{

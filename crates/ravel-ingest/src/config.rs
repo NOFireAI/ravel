@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::budget::IngestByteBudgetLimit;
+use crate::metrics::FlushTrigger;
 
 /// RSEG trailer version every flush emits. ADR-0027 leaves v7 the only
 /// writable version (ADR-0092 bumped it from v6), so this is no longer a
@@ -164,23 +165,102 @@ pub(crate) fn checked_ingest_hour_bucket(flush_open_ns: i64) -> Result<u32, Stri
 /// follow-up (reported, not fixed here).
 pub const MAX_FLUSH_CLOCK_HOLD_NS: i64 = ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
 
+/// Outcome of the flush-open check of the raw clock reading against the
+/// object store's observed clock (ADR-1685 decision 2).
+pub(crate) enum StoreClockLag {
+    /// The store's observed time is at most
+    /// [`ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`] ahead of the reading.
+    WithinAllowance,
+    /// The store has not been observed yet, so nothing was checked (decision 4).
+    Unobserved,
+    /// The reading lags the store's observed time by more than the allowance.
+    /// `lag_ns` is that lag, so a caller that bypasses the refusal can still
+    /// name the figure it bypassed.
+    Refused { lag_ns: i64, msg: String },
+}
+
+/// Whether the ADR-1685 store-clock lag check may refuse this flush attempt.
+///
+/// A lag refusal is not self-clearing the way an over-bound regression is: it
+/// changes neither the monotonic floor nor the store's observation, so every
+/// pass of a drain reads the same lag and refuses again. On a teardown drain
+/// there is no later tick, so enforcing it on every pass would lose the
+/// buffered rows the drain exists to save.
+///
+/// The choice is per pass, not per drain: a teardown drain runs its bounded
+/// enforced passes first and only then bypasses, so the counters still show
+/// every refusal the clock earned.
+#[derive(Clone, Copy)]
+pub(crate) enum LagCheck {
+    /// The normal path: a reading lagging the store's observed clock beyond
+    /// the allowance is refused, retryably.
+    Enforced,
+    /// A bypass pass of a teardown drain (`Shutdown` or the channel-close arm),
+    /// made after the bounded enforced passes left the buffer still refused.
+    /// The lag is still measured, counted as `clock_lag_bypassed_at_shutdown`,
+    /// and logged, but the flush proceeds: publishing acknowledged rows into a
+    /// possibly sealed hour (recoverable by a HEAD rebuild) beats dropping them
+    /// on a graceful path. The ADR-1307 floor rules are unchanged, so a
+    /// regression refusal still applies here, which is why the drain makes
+    /// bypass passes under the same bound rather than one: the enforced passes
+    /// never reached the floor, so the first bypass pass is where an over-bound
+    /// backwards step surfaces, and it re-anchors the floor for the next one.
+    BypassedAtTeardown,
+}
+
+/// Checks the raw flush-open reading `raw_ns` against `observed_store_ns`, a
+/// lower bound on the store's clock. One-sided: a reading ahead of the
+/// observation is normal, since the observation only ages between responses
+/// (ADR-1685 decision 3). The caller passes the raw reading, never the
+/// floor-raised stamp, because the floor can only hide lag.
+pub(crate) fn store_clock_lag(raw_ns: i64, observed_store_ns: Option<i64>) -> StoreClockLag {
+    let Some(observed_ns) = observed_store_ns else {
+        return StoreClockLag::Unobserved;
+    };
+    let lag_ns = observed_ns.saturating_sub(raw_ns);
+    if lag_ns > ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS {
+        StoreClockLag::Refused {
+            lag_ns,
+            msg: format!(
+                "flush clock lags the object store's observed clock by {lag_ns} ns, beyond the \
+                 clock-skew allowance of {} ns; refusing the flush so it cannot publish into an \
+                 ingest hour the fold may already have sealed (ADR-1685)",
+                ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            ),
+        }
+    } else {
+        StoreClockLag::WithinAllowance
+    }
+}
+
 /// Bound on the number of drain passes a graceful `flush_all` makes before it
 /// gives up and records the residue (ADR-1307 finding F1).
 ///
 /// `flush_all` re-buffers a clock-refused flush and must retry it in the same
 /// call, because on a graceful teardown there is no later actor tick to retry
 /// it (the map is snapshotted per pass, and a refusal re-inserts a key the
-/// snapshot already consumed). A refusal re-anchors the monotonic floor to the
-/// raw reading, so with any clock that does not keep stepping backwards the
-/// very next pass stamps that reading and proceeds: a normal drain finishes in
-/// one pass, and a single absorbed regression in two. The bound exists only so
-/// a pathological clock that steps back on *every* reading cannot spin the
-/// drain forever; `4` leaves generous headroom above the two passes the
-/// ADR-guaranteed "at most one flush refused per backwards step" needs while
-/// still terminating such a clock in a handful of iterations. Residue that
-/// survives all passes is never dropped silently: how it is reported depends on
-/// whether the caller can still retry it, which is what [`DrainIntent`]
-/// carries.
+/// snapshot already consumed). A *regression* refusal (ADR-1307) re-anchors the
+/// monotonic floor to the raw reading, so with any clock that does not keep
+/// stepping backwards the very next pass stamps that reading and proceeds: a
+/// normal drain finishes in one pass, and a single absorbed regression in two.
+/// The bound exists only so a pathological clock that steps back on *every*
+/// reading cannot spin the drain forever; `4` leaves generous headroom above
+/// the two passes the ADR-guaranteed "at most one flush refused per backwards
+/// step" needs while still terminating such a clock in a handful of iterations.
+///
+/// A *lag* refusal (ADR-1685) re-anchors nothing: it changes neither the floor
+/// nor the store's observation, so every pass reads the same lag and refuses
+/// again. This bound is what ends the enforced loop for it, and on a
+/// [`DrainIntent::Teardown`] the drain then makes passes with
+/// [`LagCheck::BypassedAtTeardown`], bounded by this same value, so those rows
+/// publish rather than becoming residue. More than one bypass pass can be
+/// needed: the enforced passes never consulted the floor, so an over-bound
+/// backwards step hidden behind the lag check refuses the first bypass pass and
+/// re-anchors the floor, and the pass after it publishes.
+///
+/// Residue that survives all passes is never dropped silently: how it is
+/// reported depends on whether the caller can still retry it, which is what
+/// [`DrainIntent`] carries.
 pub const MAX_FLUSH_ALL_PASSES: usize = 4;
 
 /// What the caller of a shard actor's `flush_all` does after the drain returns,
@@ -207,8 +287,9 @@ pub(crate) enum DrainIntent {
     Retryable,
 }
 
-/// Why [`monotonic_flush_open_ns`] declined to produce a flush-open stamp. The
-/// two arms surface different write errors because they are different failures.
+/// Why [`monotonic_flush_open_ns`] declined to produce a flush-open stamp.
+/// `InvalidReading` is fail-loud and non-retryable; the other two arms are
+/// transient and surface the same retryable error.
 ///
 /// [`monotonic_flush_open_ns`]: crate::shard::ShardActor::monotonic_flush_open_ns
 pub(crate) enum FlushClockError {
@@ -227,6 +308,18 @@ pub(crate) enum FlushClockError {
     /// as the retryable `Abandoned` and counted as `clock_regressions_refused`,
     /// never as an `abandoned_input_rejected` client signal.
     RegressionRefused(String),
+    /// The raw reading lags the object store's observed clock by more than the
+    /// clock-skew allowance (ADR-1685): stamping it could publish into an
+    /// ingest hour the fold has already sealed. Nothing in this flush was
+    /// acknowledged and the flush succeeds once the host clock converges, so it
+    /// is surfaced exactly as `RegressionRefused` is, as the retryable
+    /// `Abandoned`, and counted as `clock_lag_refused`.
+    ///
+    /// Never produced under [`LagCheck::BypassedAtTeardown`], where a lagging
+    /// reading goes on to the floor rules instead of stranding acknowledged
+    /// rows on a graceful drain. The floor can still refuse it there, as
+    /// [`RegressionRefused`](FlushClockError::RegressionRefused).
+    LagRefused(String),
 }
 
 /// Share of the process-wide ADR-0069 ceiling that one (shard, tenant) buffer
@@ -328,6 +421,43 @@ pub(crate) fn size_trigger_fires(
     flush_est_bytes >= config.target_bytes || memory_backstop_crossed(est_bytes, config, ceiling)
 }
 
+/// The age threshold, and the trigger to record, for a buffer with no
+/// strict-mode waiter and under `min_flush_bytes` of object, shared by the
+/// metrics, log, and span shard actors (ADR-1737 decision 2). Below a non-zero
+/// `idle_flush_byte_floor` the buffer waits for the sub-floor hold, one
+/// `flush_tick` short of `max_flush_lifetime`; otherwise it waits for
+/// `max_flush_delay_idle`. `flush_est_bytes` is the same object-bytes estimate
+/// the caller compared against `min_flush_bytes`, so a buffer moves up a tier
+/// as rows arrive and a trickle that reaches the floor flushes on the idle
+/// clock measured from its oldest row.
+///
+/// The tick is subtracted because the age check runs on a `flush_tick`, not at
+/// the instant the threshold is crossed, so a buffer whose threshold is `T`
+/// opens its flush at an age of up to `T + flush_tick`. Holding the tick back
+/// keeps the worst buffer age at flush open at exactly `max_flush_lifetime`,
+/// which is the figure ADR-0052's
+/// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS = 2` is derived from
+/// (ADR-1737 decision 3 as amended). It saturates at zero, so a `flush_tick`
+/// at or above `max_flush_lifetime` gives a hold of zero rather than wrapping.
+pub(crate) fn idle_age_threshold(
+    flush_est_bytes: usize,
+    config: &IngestConfig,
+) -> (i64, FlushTrigger) {
+    if config.idle_flush_byte_floor > 0 && flush_est_bytes < config.idle_flush_byte_floor {
+        let lifetime_ns = config.max_flush_lifetime.as_nanos() as i64;
+        let tick_ns = config.flush_tick.as_nanos() as i64;
+        (
+            lifetime_ns.saturating_sub(tick_ns).max(0),
+            FlushTrigger::AgeFloor,
+        )
+    } else {
+        (
+            config.max_flush_delay_idle.as_nanos() as i64,
+            FlushTrigger::Age,
+        )
+    }
+}
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -368,6 +498,25 @@ pub struct IngestConfig {
     /// PUT" is a statement about the object, not about the RAM the buffer
     /// occupies while building it.
     pub min_flush_bytes: usize,
+    /// Opt-in third age tier (ADR-1737). When non-zero, a buffer with no
+    /// strict-mode waiter whose flush would write fewer than this many object
+    /// bytes waits for the sub-floor hold, `max_flush_lifetime` less one
+    /// `flush_tick`, instead of `max_flush_delay_idle` before its age trigger
+    /// fires, and that flush is counted as [`FlushTrigger::AgeFloor`]. Read by
+    /// the metrics, log, and span actors against the same object-bytes
+    /// estimate as `min_flush_bytes`. The tick the hold gives up is the one
+    /// the age check may take to notice the threshold, so the buffer is at
+    /// most `max_flush_lifetime` old when its flush opens.
+    ///
+    /// 0, the default, disables the tier, and every actor keeps the two-clock
+    /// predicate. A non-zero value widens the buffered-mode loss window that
+    /// docs/consistency-model.md states, for a buffer below the floor, from
+    /// `max_flush_delay_idle` to `max_flush_lifetime`. It must be below
+    /// `min_flush_bytes`;
+    /// [`IngestConfig::validate`] refuses anything else.
+    ///
+    /// [`FlushTrigger::AgeFloor`]: crate::FlushTrigger::AgeFloor
+    pub idle_flush_byte_floor: usize,
     /// Retries after the first attempt for the data-object PUT (total
     /// attempts = this + 1). Also bounds retries of the commit-record PUT.
     /// This matches `ravel_commit::publish::RetryPolicy::max_attempts`'s own
@@ -476,6 +625,7 @@ impl Default for IngestConfig {
             flush_tick: Duration::from_millis(200),
             max_flush_delay_idle: Duration::from_secs(40),
             min_flush_bytes: 256 * 1024,
+            idle_flush_byte_floor: 0,
             put_retry_max_attempts: 4,
             put_retry_base_delay: Duration::from_millis(100),
             put_retry_max_delay: Duration::from_secs(2),
@@ -512,7 +662,37 @@ impl Default for IngestConfig {
     }
 }
 
+/// A cross-field [`IngestConfig`] constraint that [`IngestConfig::validate`]
+/// refuses.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IngestConfigError {
+    /// A non-zero `idle_flush_byte_floor` at or above `min_flush_bytes`
+    /// (ADR-1737 decision 1). Such a floor has no idle tier left between it
+    /// and the fast clock, so every buffer below `min_flush_bytes` would wait
+    /// for the sub-floor hold.
+    #[error(
+        "idle_flush_byte_floor ({floor} bytes) must be below min_flush_bytes \
+         ({min_flush_bytes} bytes), or 0 to disable it"
+    )]
+    IdleFlushByteFloorNotBelowMinFlushBytes {
+        floor: usize,
+        min_flush_bytes: usize,
+    },
+}
+
 impl IngestConfig {
+    /// Checks the cross-field constraints a caller building an `IngestConfig`
+    /// from operator input must refuse before constructing a router.
+    pub fn validate(&self) -> Result<(), IngestConfigError> {
+        if self.idle_flush_byte_floor != 0 && self.idle_flush_byte_floor >= self.min_flush_bytes {
+            return Err(IngestConfigError::IdleFlushByteFloorNotBelowMinFlushBytes {
+                floor: self.idle_flush_byte_floor,
+                min_flush_bytes: self.min_flush_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// The per-shard queued-flush cap as the shard actors enforce it: at least
     /// 1, whatever [`IngestConfig::max_queued_flushes`] holds. This is where
     /// the "at least 1" rule is applied, rather than in a validator every
@@ -530,6 +710,38 @@ impl IngestConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ADR-1685 lag check is one-sided and inclusive at the allowance, and
+    /// an extreme observation saturates rather than overflowing into a pass.
+    #[test]
+    fn store_clock_lag_bounds() {
+        let allowance = ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+        let raw = MIN_PLAUSIBLE_INGEST_CLOCK_NS + NS_PER_HOUR;
+        assert!(matches!(
+            store_clock_lag(raw, None),
+            StoreClockLag::Unobserved
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(raw + allowance)),
+            StoreClockLag::WithinAllowance
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(raw + allowance + 1)),
+            StoreClockLag::Refused { lag_ns, .. } if lag_ns == allowance + 1
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(raw - 10 * NS_PER_HOUR)),
+            StoreClockLag::WithinAllowance
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(i64::MAX)),
+            StoreClockLag::Refused { .. }
+        ));
+        assert!(matches!(
+            store_clock_lag(raw, Some(i64::MIN)),
+            StoreClockLag::WithinAllowance
+        ));
+    }
 
     /// The trigger reads the object-bytes estimate, and the memory backstop is
     /// the bound on the other side: a buffer whose struct headers dwarf its
@@ -646,6 +858,7 @@ mod tests {
         assert_eq!(cfg.flush_tick, Duration::from_millis(200));
         assert_eq!(cfg.max_flush_delay_idle, Duration::from_secs(40));
         assert_eq!(cfg.min_flush_bytes, 256 * 1024);
+        assert_eq!(cfg.idle_flush_byte_floor, 0);
         assert_eq!(cfg.put_retry_max_attempts, 4);
         assert_eq!(cfg.put_retry_base_delay, Duration::from_millis(100));
         assert_eq!(cfg.put_retry_max_delay, Duration::from_secs(2));
@@ -670,6 +883,36 @@ mod tests {
         assert_eq!(
             cfg.strict_visibility_budget_ns,
             cfg.max_flush_delay.as_nanos() as i64 + STRICT_VISIBILITY_RESERVE_NS
+        );
+    }
+
+    /// ADR-1737 decision 1: 0 disables the floor and is always accepted, a
+    /// floor below `min_flush_bytes` is accepted, and a floor at or above it
+    /// is refused with the typed error naming both values.
+    #[test]
+    fn idle_flush_byte_floor_must_be_below_min_flush_bytes() {
+        let min_flush_bytes = 256 * 1024;
+        let with_floor = |floor| IngestConfig {
+            min_flush_bytes,
+            idle_flush_byte_floor: floor,
+            ..IngestConfig::default()
+        };
+        assert_eq!(IngestConfig::default().validate(), Ok(()));
+        assert_eq!(with_floor(0).validate(), Ok(()));
+        assert_eq!(with_floor(min_flush_bytes - 1).validate(), Ok(()));
+        assert_eq!(
+            with_floor(min_flush_bytes).validate(),
+            Err(IngestConfigError::IdleFlushByteFloorNotBelowMinFlushBytes {
+                floor: min_flush_bytes,
+                min_flush_bytes,
+            })
+        );
+        assert_eq!(
+            with_floor(min_flush_bytes + 1).validate(),
+            Err(IngestConfigError::IdleFlushByteFloorNotBelowMinFlushBytes {
+                floor: min_flush_bytes + 1,
+                min_flush_bytes,
+            })
         );
     }
 

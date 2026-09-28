@@ -320,6 +320,11 @@ pub async fn build_parts(
         if window_input_bytes < config.max_l1_part_bytes && !last {
             continue;
         }
+        // Cancellation checkpoint 3 (ADR-1029 decision 3): this signal's merge
+        // loop head. A fetch window is RSEG's unit of merge progress, the way a
+        // stream is RLOG's, and nothing of this window has been fetched yet.
+        crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::MergeLoop)
+            .await?;
         let window = &builds[window_start..=i];
         let regions = fetch_batch_pages(store, &semaphore, window, ledger).await?;
         for build in window {
@@ -343,6 +348,14 @@ pub async fn build_parts(
                     std::mem::take(&mut pending_exemplars),
                 )?;
                 put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
+                // Cancellation checkpoint 4: a part boundary, after the PUT
+                // returned.
+                crate::claim_guard::checkpoint(
+                    config,
+                    store,
+                    crate::claim_guard::Checkpoint::PartBoundary,
+                )
+                .await?;
                 parts.push(part);
                 part_index += 1;
                 pending_estimate.reset();
@@ -365,6 +378,9 @@ pub async fn build_parts(
             pending_exemplars,
         )?;
         put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
+        // Cancellation checkpoint 4 for the tail part.
+        crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
+            .await?;
         parts.push(part);
     }
 

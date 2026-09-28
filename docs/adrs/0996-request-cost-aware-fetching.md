@@ -70,9 +70,11 @@ bytes include them, `log_fetcher.rs:4380-4382`). The gap is
 `effective_coalesce_gap` = `request_cost_bytes` floored at 64 KiB
 (`log_fetcher.rs:2963-2966,2166`), i.e. ~1.8 MiB at the default
 (`DEFAULT_LOG_REQUEST_COST_BYTES = 1_887_437`, `log_fetcher.rs:2156`).
-There is **no covering-GET mode**: runs separated by more than the gap
-stay separate requests, and nothing today can force "at most one GET per
-object" short of the whole-object crossovers.
+There is **no covering-GET mode** for chunk-run GETs (corrected below by the
+front-section and chunk-run bounding amendment, ADR-2066 decision 1): runs
+separated by more than the gap stay separate requests, and nothing today
+can force "at most one GET per object" short of the whole-object
+crossovers.
 
 **Why ranged runs at all on 3.47 MB objects**: the pre-probe crossover
 (`effective_whole_object_threshold` = 5 × request_cost ≈ 9 MiB,
@@ -712,3 +714,66 @@ source is logged as `derived-loopback-endpoint`.
 ADR-2023 decision 1 withdraws the loopback default the amendment above
 describes. With `--logs-fetch-policy` unset, every deployment resolves
 `cost-based`, whatever its endpoint, and no policy is derived from an endpoint.
+
+## Amendment (2026-09-27, ADR-2066): the front-section and chunk-run bounding amendment
+
+<!-- amendment-applies: sections="Where the ~5 GETs/object/statement come from (the code says)" pointer="front-section and chunk-run bounding amendment" -->
+<!-- amendment-supersedes: phrase="no covering-GET mode" pointer="front-section and chunk-run bounding amendment" -->
+
+ADR-2066 decision 1 corrects two claims in the numbered breakdown above,
+independently of 996-3 (still unimplemented at this writing): that task's
+policy-driven fetch bound and segmented covering fallback are a different,
+larger mechanism, not what shipped here.
+
+Step 3 (front sections): before this change, `place_and_decode_field_dir`
+resolved FIELD_DIR through a single-section fetch, and the combined
+STREAM_DIR+FIELD_DIR GET step 3 describes ran again afterward whenever
+STREAM_DIR was still missing -- a narrow projection of a one-row-group
+object cost two front-section GETs, not the one step 3 states. This is now
+`place_front_sections`, called directly from `place_and_decode_field_dir`
+(`log_fetcher.rs`, `place_front_sections` ~line 5684,
+`place_and_decode_field_dir` ~line 5768), so the combined GET this step
+describes is first accurate for this path. Front-section placement also now
+peeks each section's own per-section cache key before folding it into the
+combined span, so a section a prior plan-phase read already cached (e.g.
+FIELD_DIR via `plan_section_raw`) is served from cache rather than
+re-fetched into the combined GET.
+
+Step 5 (chunk-run GETs) and the "no covering-GET mode" claim right after the
+list: chunk-run GETs are now capped at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`
+(4) per L0 object -- the same constant `fetcher.rs` already used for the
+metrics RSEG format's per-object GET ceiling, now shared with the log
+format. L1 segments (compaction and rewrite outputs) are exempt, as they
+are on the metrics path, and still issue one GET per coalesced run. When a
+projection's coalesced candidate runs exceed the cap,
+`bounded_chunk_runs` (`log_fetcher.rs` ~line 5463) bridges the smallest gaps
+between them down to it, so "runs separated by more than the [coalescing]
+gap stay separate requests" no longer holds once the candidate count clears
+the cap. The whole-object coverage crossover (`fetch_object_v4`,
+`log_fetcher.rs` ~line 5170) is computed against the same bridged run set,
+through a second helper, `bridged_run_bytes` (`log_fetcher.rs` ~line 5481):
+bridging can itself push the covered byte count over the crossover
+threshold, converting even a projection whose own selected bytes stay far
+under it into one whole-object GET
+(`crates/ravel-query/tests/log_page_dir_fetch.rs`,
+`version_4_projection_whose_bridged_runs_cross_the_threshold_becomes_one_whole_object_get`).
+The crossover deliberately uses a separate helper rather than
+`bounded_chunk_runs` itself: `bounded_chunk_runs` also filters out whatever
+the in-flight `ObjectAssembler` already covers, which is the right question
+for "what does this fetch still need to GET" but the wrong one for the
+crossover, whose coverage ratio is this query's own projected footprint
+against the object's size, not what remains after an unrelated earlier
+read (a suffix probe, which on a small object routinely covers the whole
+thing). Reusing the covers-filtered helper for both was tried first and
+regressed two whole-object-admission unit tests
+(`whole_object_get_limiter_tests::coverage_crossover_reserves_the_object_once`,
+`whole_object_get_limiter_tests::covering_read_cache_hit_marks_the_reservation_handed_off`)
+before the split above fixed it.
+
+Both corrections narrow, not remove, the gap 996-3 is scoped to close: a
+ranged log read's GET count per L0 object is now bounded (probe + SKIP_IDX/
+PAGE_DIR + front sections + up to `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` chunk
+runs, or one GET on crossover), where before this amendment it was not.
+996-3's policy-driven fetch bound and segmented covering fallback remain a
+separate, not-yet-implemented mechanism; this amendment does not anticipate
+or substitute for it.

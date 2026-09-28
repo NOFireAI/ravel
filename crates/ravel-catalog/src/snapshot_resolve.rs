@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 use ravel_commit::{keys, signal};
+use ravel_cpu_gate::ReadSite;
 use ravel_object_store::{GetRange, StoreError};
 use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead};
 use ravel_types::accounting::QueryAccounting;
@@ -26,12 +27,14 @@ use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
 use crate::catalog::Catalog;
+use crate::charged::{Charged, ChargedPart, ChargedPostings};
 use crate::declared_stats::{self, DeclaredColumnStats};
 use crate::error::CatalogError;
 use crate::fold::head_object_key;
 use crate::provisioning::{ShardGeneration, shard_ceiling};
+use crate::read_gate::run_snapshot_decode;
 use crate::snapshot::{SegmentLevel, SegmentRef};
-use crate::snapshot_format::{self, DecodedPart, DecodedPostings, PartLimits, PostingsLimits};
+use crate::snapshot_format::{self, PartLimits, PostingsLimits};
 
 /// Leading sentinel that marks a `name_filter` string as a literal-prefix
 /// range key rather than an exact `__name__` value (ADR-0061 decision 3).
@@ -67,7 +70,7 @@ pub(crate) const PREFIX_FILTER_SENTINEL: char = '\u{1}';
 /// verified and decoded.
 pub(crate) struct SnapshotWindow {
     pub(crate) watermark_hour: u32,
-    parts: Vec<Arc<DecodedPart>>,
+    parts: Vec<Arc<ChargedPart>>,
     /// The blake3 of each part in `parts`, same order (from the HEAD part
     /// refs). Kept so the postings-binding check (ADR-0063 section 7) can
     /// confirm a postings object covers exactly the parts actually loaded,
@@ -80,7 +83,7 @@ pub(crate) struct SnapshotWindow {
     /// don't cleanly bind to `parts`. Always safe to treat as absent:
     /// postings are a pure pruning optimization, never a correctness
     /// dependency (`extract_into` falls back to including every entry).
-    postings: Option<Arc<DecodedPostings>>,
+    postings: Option<Arc<ChargedPostings>>,
 }
 
 impl SnapshotWindow {
@@ -320,7 +323,7 @@ impl SnapshotWindow {
 
 /// Outcome of loading every part a HEAD names.
 enum PartLoadOutcome {
-    Loaded(Vec<Arc<DecodedPart>>),
+    Loaded(Vec<Arc<ChargedPart>>),
     /// A part GET returned `NotFound`: races GC of a just-superseded part.
     /// The caller re-reads HEAD
     /// once and retries before falling back.
@@ -332,6 +335,10 @@ enum PartLoadOutcome {
     /// go on to serve the foreign part's bytes: the caller propagates it as a
     /// hard `CatalogError`.
     IsolationBreach(CatalogError),
+    /// The memory budget refused a part's decode reservation (ADR-1702
+    /// decision 6). Propagated as [`CatalogError::MemoryExhausted`], never
+    /// absorbed into a listing fallback.
+    MemoryExhausted(ravel_memory::MemoryExhausted),
 }
 
 impl Catalog {
@@ -412,6 +419,7 @@ impl Catalog {
             }
             PartLoadOutcome::Unusable => Ok((None, revalidated)),
             PartLoadOutcome::IsolationBreach(err) => Err(err),
+            PartLoadOutcome::MemoryExhausted(err) => Err(err.into()),
             PartLoadOutcome::NotFoundRace => {
                 // At most one HEAD re-read: bypass the TTL cache so a part GC'd since the
                 // cached HEAD was read is not raced again.
@@ -454,6 +462,7 @@ impl Catalog {
                         ))
                     }
                     PartLoadOutcome::IsolationBreach(err) => Err(err),
+                    PartLoadOutcome::MemoryExhausted(err) => Err(err.into()),
                     PartLoadOutcome::Unusable | PartLoadOutcome::NotFoundRace => {
                         Ok((None, revalidated))
                     }
@@ -476,9 +485,9 @@ impl Catalog {
         &self,
         tenant: &TenantHash,
         head: &SnapshotHead,
-        parts: &[Arc<DecodedPart>],
+        parts: &[Arc<ChargedPart>],
         accounting: &QueryAccounting,
-    ) -> Result<Option<Arc<DecodedPostings>>, CatalogError> {
+    ) -> Result<Option<Arc<ChargedPostings>>, CatalogError> {
         let Some(postings_ref) = head.postings.as_ref() else {
             return Ok(None);
         };
@@ -527,7 +536,14 @@ impl Catalog {
         // hash-verified bytes, means a foreign tenant_hash hard-fails as an
         // isolation breach even when the object also fails to bind, instead of
         // that breach being masked by the binding degrade.
-        match snapshot_format::postings_declared_tenant_hash(&data) {
+        let header = match snapshot_format::decode_postings_header(&data) {
+            Ok(header) => header,
+            Err(err) => {
+                tracing::warn!(error = %err, key = %postings_ref.key, "postings header unreadable, pruning disabled");
+                return Ok(None);
+            }
+        };
+        match <[u8; 16]>::try_from(header.tenant_hash.as_slice()) {
             Ok(declared) if declared != tenant.0 => {
                 self.record_isolation_breach();
                 return Err(CatalogError::FieldMismatch {
@@ -538,15 +554,30 @@ impl Catalog {
                 });
             }
             Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, key = %postings_ref.key, "postings header unreadable, pruning disabled");
+            Err(_) => {
+                tracing::warn!(key = %postings_ref.key, "postings header tenant_hash malformed, pruning disabled");
                 return Ok(None);
             }
         }
         let limits = PostingsLimits {
             max_postings_bytes: self.config().max_postings_bytes,
         };
-        let decoded = match snapshot_format::decode_postings(&data, &limits, &expected_part_blake3)
+        // ADR-1702 decision 6: charge the decoded body before decoding it. A
+        // refusal fails the resolve rather than disabling pruning, because the
+        // unpruned scan it would fall back to holds more memory, not less.
+        let reservation =
+            self.reserve_decoded(header.body_uncompressed_len, limits.max_postings_bytes)?;
+        let stored_len = data.len() as u64;
+        let decoded = match run_snapshot_decode(
+            self.read_gate(),
+            ReadSite::CatalogPostings,
+            header.body_uncompressed_len,
+            move || {
+                snapshot_format::decode_postings(&data, &limits, &expected_part_blake3)
+                    .map(|decoded| Charged::new(decoded, reservation))
+            },
+        )
+        .await
         {
             Ok(decoded) => decoded,
             Err(err) => {
@@ -565,7 +596,7 @@ impl Catalog {
             *tenant,
             postings_ref.key.clone(),
             decoded.clone(),
-            data.len() as u64,
+            stored_len,
             self.config().postings_cache_entries,
         );
         Ok(Some(decoded))
@@ -761,6 +792,9 @@ impl Catalog {
                 OnePartOutcome::IsolationBreach(err) => {
                     return PartLoadOutcome::IsolationBreach(err);
                 }
+                OnePartOutcome::MemoryExhausted(err) => {
+                    return PartLoadOutcome::MemoryExhausted(err);
+                }
             }
         }
         PartLoadOutcome::Loaded(parts)
@@ -806,10 +840,10 @@ impl Catalog {
         let limits = PartLimits {
             max_snapshot_part_bytes: self.config().max_snapshot_part_bytes,
         };
-        let decoded = match snapshot_format::decode_part(&data, &limits) {
-            Ok(decoded) => Arc::new(decoded),
+        let header = match snapshot_format::decode_part_header(&data) {
+            Ok(header) => header,
             Err(err) => {
-                tracing::warn!(error = %err, key = %part_ref.key, "snapshot part failed to decode, falling back to listing");
+                tracing::warn!(error = %err, key = %part_ref.key, "snapshot part header unreadable, falling back to listing");
                 return OnePartOutcome::Unusable;
             }
         };
@@ -819,20 +853,54 @@ impl Catalog {
         // that check can still reference a part object belonging to another
         // tenant; the part header's tenant_hash is the independent binding to
         // the requester.
-        if decoded.header.tenant_hash.as_slice() != tenant.0.as_slice() {
+        //
+        // Read off the peeked header, before the reservation below, the same
+        // way `load_snapshot_postings` does it: a budget with no room for this
+        // part would otherwise refuse first, reporting a memory exhaustion
+        // where a cross-tenant part was sitting and leaving the breach and its
+        // counter unreported.
+        if header.tenant_hash.as_slice() != tenant.0.as_slice() {
             self.record_isolation_breach();
             return OnePartOutcome::IsolationBreach(CatalogError::FieldMismatch {
                 key: part_ref.key.clone(),
                 field: "tenant_hash",
                 expected: tenant.to_hex(),
-                actual: hex::encode(&decoded.header.tenant_hash),
+                actual: hex::encode(&header.tenant_hash),
             });
         }
+        // ADR-1702 decision 6: charge the decoded entry body before decoding
+        // it; the reservation rides with the decoded part, in the part cache
+        // included, until the last `Arc` to it drops.
+        let reservation = match self.reserve_decoded(
+            header.entries_uncompressed_len,
+            limits.max_snapshot_part_bytes,
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => return OnePartOutcome::MemoryExhausted(err),
+        };
+        let stored_len = data.len() as u64;
+        let decoded = match run_snapshot_decode(
+            self.read_gate(),
+            ReadSite::CatalogPart,
+            header.entries_uncompressed_len,
+            move || {
+                snapshot_format::decode_part(&data, &limits)
+                    .map(|decoded| Charged::new(decoded, reservation))
+            },
+        )
+        .await
+        {
+            Ok(decoded) => Arc::new(decoded),
+            Err(err) => {
+                tracing::warn!(error = %err, key = %part_ref.key, "snapshot part failed to decode, falling back to listing");
+                return OnePartOutcome::Unusable;
+            }
+        };
         self.part_cache().insert(
             *tenant,
             part_ref.key.clone(),
             decoded.clone(),
-            data.len() as u64,
+            stored_len,
             self.config().snapshot_cache_parts,
         );
         OnePartOutcome::Loaded(decoded)
@@ -842,11 +910,13 @@ impl Catalog {
 /// One part's load result, folded back into a [`PartLoadOutcome`] over the
 /// whole part set in HEAD order.
 enum OnePartOutcome {
-    Loaded(Arc<DecodedPart>),
+    Loaded(Arc<ChargedPart>),
     NotFoundRace,
     Unusable,
     /// This part's header names a foreign tenant (ADR-0050 §2).
     IsolationBreach(CatalogError),
+    /// The memory budget refused this part's decode reservation.
+    MemoryExhausted(ravel_memory::MemoryExhausted),
 }
 
 /// The ADR-0052 section 5 acceptance predicate for a HEAD's `shard_count`
@@ -1559,7 +1629,7 @@ mod tests {
 
     // ---- ADR-0061 decision 3: literal-prefix range scan ----
 
-    use crate::snapshot_format::NamePostings;
+    use crate::snapshot_format::{DecodedPart, DecodedPostings, NamePostings};
     use ravel_proto::catalog::v1::{SnapshotPartHeader, SnapshotPostingsHeader};
 
     /// A `SnapshotWindow` with `part_count` empty parts and hand-built,
@@ -1589,17 +1659,17 @@ mod tests {
         };
         let parts = (0..part_count)
             .map(|_| {
-                Arc::new(DecodedPart {
+                Arc::new(Charged::for_test(DecodedPart {
                     header: SnapshotPartHeader::default(),
                     entries: Vec::new(),
-                })
+                }))
             })
             .collect();
         SnapshotWindow {
             watermark_hour: 0,
             parts,
             part_blake3,
-            postings: Some(Arc::new(postings)),
+            postings: Some(Arc::new(Charged::for_test(postings))),
         }
     }
 
@@ -1835,14 +1905,14 @@ mod tests {
             created_unix_ns: 0,
             declared_column_stats: Vec::new(),
         };
-        let part0 = Arc::new(DecodedPart {
+        let part0 = Arc::new(Charged::for_test(DecodedPart {
             header: SnapshotPartHeader::default(),
             entries: vec![mk(1, 1), mk(2, 2)],
-        });
-        let part1 = Arc::new(DecodedPart {
+        }));
+        let part1 = Arc::new(Charged::for_test(DecodedPart {
             header: SnapshotPartHeader::default(),
             entries: vec![mk(3, 3), mk(4, 4)],
-        });
+        }));
         let part_blake3 = vec![vec![0u8; 32], vec![1u8; 32]];
         let postings = DecodedPostings {
             header: SnapshotPostingsHeader {
@@ -1859,7 +1929,7 @@ mod tests {
             watermark_hour: 4,
             parts: vec![part0, part1],
             part_blake3,
-            postings: Some(Arc::new(postings)),
+            postings: Some(Arc::new(Charged::for_test(postings))),
         };
 
         let mut out = HashMap::new();

@@ -13,6 +13,22 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     async fn put(&self, key: &str, data: Bytes, opts: PutOptions) -> Result<PutOutcome, StoreError>;
     /// Read whole object or a byte range. Suffix(n) = last n bytes, n > 0.
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError>;
+    /// As get, but reading the version the pin selects and only if that
+    /// object still has the pinned ETag. The default implementation refuses
+    /// with `Unsupported`, never falling back to an unconditional get.
+    /// `PinnedRead` is the outcome plus the pin for the bytes served. See
+    /// "Conditional reads" below.
+    async fn get_pinned(&self, key: &str, range: GetRange, pin: &Pin)
+        -> Result<PinnedRead, StoreError>;
+    /// An unconditional get that also reports the pin for the bytes it read,
+    /// for a first read taken before any pin exists. The default
+    /// implementation reads through `get` and reports an ETag-only pin.
+    async fn get_with_pin(&self, key: &str, range: GetRange)
+        -> Result<PinnedRead, StoreError>;
+    /// A HEAD returning the object's metadata and its pin. The default
+    /// implementation reports an ETag-only pin; a versioned backend
+    /// overrides it to fill in the version.
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError>;
     /// Begin a multipart upload. Only backends reporting `multipart` provide
     /// it; the default implementation refuses. See "Multipart upload" below.
     async fn put_multipart<'a>(&'a self, key: &str)
@@ -33,6 +49,7 @@ pub enum PutMode { Overwrite, CreateIfAbsent, CasVersion(Version) }
 pub struct PutOptions { pub mode: PutMode, pub checksum: Option<UploadChecksum> }
 pub enum UploadChecksum { Crc32c(u32) /* extend per backend */ }
 pub enum GetRange { Full, Range(u64, u64) /* [start, end) */, Suffix(u64) }
+pub struct Pin { pub etag: String, pub version: Option<String> }
 pub struct PutOutcome { pub etag: Etag, pub version: Version }
 pub struct GetOutcome { pub data: Bytes, pub etag: Etag, pub version: Version, pub total_size: u64 }
 pub struct ObjectMeta { pub key: String, pub size: u64, pub etag: Etag, pub version: Version, pub last_modified_unix_ms: i64 }
@@ -58,12 +75,23 @@ coincide on S3 and differ elsewhere; commit-protocol code uses only
 `StoreError` variants (exhaustive for callers' retry logic):
 `NotFound`, `AlreadyExists`, `PreconditionFailed`, `AccessDenied`,
 `Throttled { retry_after_ms }`, `Timeout`, `Corrupted(msg)` (checksum or
-range mismatch), `InvalidRange(msg)`, `Transient(msg)`, `Permanent(msg)`.
+range mismatch), `InvalidRange(msg)`, `Transient(msg)`, `Permanent(msg)`,
+`Unsupported { operation }` (the backend does not implement the operation at
+all, so no argument and no retry can make it succeed, unlike `Permanent`,
+which reports a request the backend understood and rejected), `ReadOnly {
+operation, store }` (the store was opened read-only and the call would have
+mutated it), and the three a paged listing drain raises on a backend that
+breaks the listing contract: `ListRepeatedToken { prefix }`,
+`ListPageCeiling { prefix, ceiling }` and `ListOrderViolation { prefix,
+previous, offending }`.
 
 Retry classification: `Throttled`, `Timeout`, `Transient` are retryable with
 jittered exponential backoff. `AlreadyExists` on `CreateIfAbsent` is a
 *protocol signal*, not an error to retry. `AccessDenied` is permanent and
 alerts differently (misconfigured credentials or prefix policy).
+`PreconditionFailed`, `Unsupported` and `ReadOnly` are never retryable: a
+retry of a pinned read reads the same changed object, and neither an
+unimplemented operation nor a read-only store changes between attempts.
 
 ### HTTP client timeouts (S3 adapter)
 
@@ -94,9 +122,12 @@ comes from the connect, request, and pool-idle timeouts.
 request size is chosen by this crate except one: a whole-object read, whose size
 is whatever the object is. `max_l1_part_bytes` defaults to 256 MiB, 32x an 8 MiB
 multipart part, so no fixed timeout can cover both. `S3Store::get` therefore
-never issues an unranged GET: `GetRange::Full` is served as ranged requests of
-at most `S3HttpConfig::max_request_body_bytes()` bytes each, derived from the
-configured `request_timeout` as
+never reads more than `S3HttpConfig::max_request_body_bytes()` bytes from one
+request. `GetRange::Full` starts with one unranged GET (the only form an
+endpoint answers with the stored checksum; see "Read-side checksum
+verification"), reads its body up to the bound, and drops the rest of that
+response unread; whatever remains is fetched as ranged requests of at most the
+bound each. The bound is derived from the configured `request_timeout` as
 `(request_timeout - 6 s of connect/TLS/first-byte allowance) * 625 000 B/s`
 (a 5 Mbps floor rate), clamped to `[1 MiB, 8 MiB]`: the upper bound is the
 multipart part size, so read and write share one largest-request-on-the-wire,
@@ -113,11 +144,14 @@ Cost of the split, in requests and wire bytes as transferred, excluding
 
 | Object size | Requests | Wire bytes |
 |---|---|---|
-| 0 | 2 (one 416-refused ranged probe, then one unranged) | 0 body bytes |
-| 1 byte .. bound | 1 | the object |
-| above the bound | `ceil(size / bound)`, up to 4 in flight | the object, plus one response header set per additional request |
+| 0 .. bound | 1, unranged | the object |
+| above the bound | `ceil(size / bound)`: the unranged first, cut at the bound, then ranged ones up to 4 in flight | the object, plus one response header set per additional request, plus whatever the endpoint had already sent of the abandoned first body when its connection was dropped |
 
-The ranges partition the object exactly, so no byte is fetched twice. Every
+The ranges start where the cut first body stopped and partition the rest of the
+object, so no byte is read twice. Dropping the unread remainder of the first
+response closes its connection instead of returning it to the pool, which only
+an object above the bound pays. No request is issued before the first GET to
+learn the size, so a commit record read is exactly one request. Every
 request after the first carries the first's ETag as an `If-Match`, so an object
 overwritten mid-read fails the read (retryable) rather than splicing two
 versions together; data objects are immutable, and the mutable pointer keys are
@@ -197,6 +231,14 @@ trait honors cancellation by drop, so the query deadline (usually well under
   listed prefix excludes no key under it. Overriding the default (which
   lists from the prefix and drops `<= start_after` in the client) is a
   performance property only; the visible result set is identical.
+- `list` and `head` report one object's `etag` identically, byte for byte,
+  and report the same `size`. Quoting, casing and any weak-validator prefix
+  are passed through verbatim from the backend rather than normalized, so an
+  ETag read off a listing is spendable as a read precondition without a
+  second `head`. A caller that records an identity from a listing and pins a
+  later read to it depends on this; a test in `ravel-object-store`'s
+  conformance module asserts the agreement on every subject it runs and then
+  spends the listed ETag as a pin through `get_pinned`.
 - `Suffix(0)` and zero-length `Range` are `InvalidRange`.
 - `Range(start, end)` is half-open; the HTTP Range header is inclusive, so
   adapters emit `bytes=start-(end-1)`. Boundary conformance tests required
@@ -209,6 +251,162 @@ trait honors cancellation by drop, so the query deadline (usually well under
   load-bearing here -- an age decision read from this field may be wrong
   under skew or granularity, so it may only cost duplicated work, never
   correctness.
+
+### Conditional reads (ADR-2040 decision 1)
+
+Every object Ravel writes is immutable, so an unconditional `get` of one is
+already pinned by construction. A Parquet file Ravel did not write is not:
+the operator granted a bucket and a key, and whoever owns that bucket may
+overwrite the key at any time. `get_pinned(key, range, pin)` is the read for
+that case. `Pin` carries the identity the catalog recorded when the object
+was granted, and its two halves do different jobs:
+
+- `etag` is a **precondition**. The store compares it against the object it
+  is about to read and refuses the read when it does not match. On the wire
+  it is `If-Match`.
+- `version` is a **selector**. It names which version of the object to read,
+  and the store reads that one. On the wire it is S3's `versionId`, GCS's
+  `generation`, or Azure's `versionid`. It is `Some` only when the store
+  issues a version id distinct from the ETag; a store without versioning
+  reports none and the pin is then an ETag alone.
+
+A pin carrying both selects the named version and applies `If-Match` to it.
+Selecting is not a second precondition, and the difference shows in the
+outcome: an ETag that does not match is a failed condition on an object that
+is there, while a version the store does not have is an object that is not
+there.
+
+The precondition travels on the wire, not in the client, so a replaced
+object costs one refused request rather than a transferred body that the
+caller then has to reject.
+
+A pinned read is pinned on *every* request it issues. `GetRange::Full`
+against `S3Store` is one unranged request plus ranged ones for anything past
+`max_request_body_bytes` (see "Read-side checksum verification"), and the
+caller's pin rides on all of them, the unranged first included: a read whose
+first request dropped the pin would pay for a body from whatever version the
+key holds now and only then compare. The continuation requests of an
+*unpinned* whole-object read carry the first response's ETag as `If-Match`
+and nothing else, never a version id. Two reasons. Ravel's own bucket is
+versioned, and a GET carrying `versionId` needs `s3:GetObjectVersion`, which
+the shipped IAM templates do not grant. And a version id would select the
+first response's version, so an object overwritten mid-read would be
+finished silently from the old version instead of failing the `If-Match`
+and surfacing as the retryable `Transient` the unpinned read reports.
+
+Outcomes, in the order they are decided:
+
+| Object state | Result |
+|---|---|
+| No object at `key` | `NotFound`, never `PreconditionFailed` |
+| `pin.version` is `Some` and that version is unknown or deleted | `NotFound` |
+| The selected object's ETag differs from `pin.etag` | `PreconditionFailed` |
+| The selected object matches | `PinnedRead`: the `GetOutcome` `get` would return, whose `etag` is the pinned one, plus the `Pin` identifying the bytes served |
+
+Per backend, the same three rules:
+
+| Backend | Version selector | Unknown or deleted version | ETag mismatch |
+|---|---|---|---|
+| `S3Store` | `versionId` query parameter | `NotFound` | `PreconditionFailed` |
+| `ExternalStore` GCS | `generation` | `NotFound` | `PreconditionFailed` |
+| `ExternalStore` Azure | `versionid` | `NotFound` | `PreconditionFailed` |
+| `MemoryStore` | keeps only the current object, so any pinned version that is not the current one is gone | `NotFound` | `PreconditionFailed` |
+
+A full read (`GetRange::Full`) is bounded differently per backend. `S3Store`,
+and so the S3 kind of `ExternalStore`, splits it into requests of at most
+`max_get_chunk` bytes, so no single response outlives the request timeout.
+The GCS and Azure kinds of `ExternalStore` issue one unranged request and
+read its whole body. A caller reading a large GCS or Azure object in full
+must bound it with ranged reads itself. ADR-2040's Parquet reader is
+specified to read by range (the footer, then column chunks), so it is not
+meant to take the unsplit path.
+
+The rows above assume the three real backends answer a well-formed but
+absent version with a 404 and a failed `If-Match` with a 412; nothing in
+this crate verifies that against a live endpoint. A malformed or foreign
+version id can instead draw a 400, which `classify_generic` maps to a
+retryable `Transient`, not `NotFound`. A pin built from store metadata
+through `Pin::from_store` does not carry such an id. Both codes reach the rows above
+through `map_get_error`, which defers to `map_error_common` for everything
+but a 416: that maps `object_store`'s `NotFound` to `StoreError::NotFound`
+and its `Precondition` to `StoreError::PreconditionFailed`.
+
+`MemoryStore` is the oracle for this, and it models the rule rather than the
+storage: it does not retain superseded versions, so a pin naming one is
+answered `NotFound`, which is what a real backend answers once that version
+is deleted or expired. The conformance case
+`an_old_version_is_not_found_while_an_old_etag_is_a_precondition_failure`
+overwrites one object and spends two stale pins on it, the version pin and
+the ETag-only pin, and asserts the two different answers.
+
+The first row is a distinct answer, not a detail: a caller acts differently
+on a grant target that vanished and one that changed. `PreconditionFailed`
+here is not retryable, because a retry reads the same changed object; the
+caller's recourse is to re-resolve the object's identity, not to try again.
+
+A backend that cannot evaluate preconditions MUST refuse with `Unsupported`,
+which is what the default trait implementation does. It does not fall back
+to an unconditional `get`: silently dropping the precondition serves bytes
+from a replaced file, which is the exact failure the method exists to
+prevent. `MemoryStore`, `S3Store` and `ExternalStore` implement it.
+
+#### Learning the version of the bytes you read
+
+`get_pinned` returns `PinnedRead`, which is the read outcome plus the `Pin`
+identifying the bytes served, so a caller that has just read a Parquet
+footer can record the identity of what it read without a second request.
+`get_with_pin(key, range)` is the same thing for an unconditional first
+read, which is what `CREATE EXTERNAL TABLE` does before any pin exists.
+`pin_of(key)` is a HEAD that returns the object's metadata and its pin.
+
+`ObjectMeta.version` is NOT that pin's version. It is the compare-and-swap
+token a conditional write compares, which on S3 is the ETag. The two are
+different values with different jobs, which is why the version is reported
+through `Pin` and no field was added to `ObjectMeta`.
+
+Every pin is built from store metadata through one constructor,
+`Pin::from_store(etag, version)`, which drops a version equal to the ETag:
+that is an unversioned store reporting its ETag twice, not a selector.
+`S3Store::pin_of` fills the version from `object_store`'s `ObjectMeta`
+(`None` on an unversioned bucket), the external GCS and Azure path does the
+same, and the default implementations of `pin_of` and `get_with_pin` report
+an ETag-only pin, so a backend on an unversioned store needs no override.
+
+#### Which implementations forward these
+
+`get_pinned`, `get_with_pin` and `pin_of` are forwarded, with the pin
+intact, by every implementation in `ravel-object-store`:
+
+| Implementation | How it forwards |
+|---|---|
+| `impl ObjectStoreBackend for Arc<T>` | straight delegation |
+| `InstrumentedStore` | delegates, billing `get_pinned` and `get_with_pin` as one `StoreOp::Get` with their bytes and refused preconditions, and `pin_of` as one `StoreOp::Head` |
+| `ClassedStore`'s per-class handle | delegates, taking a scheduler permit of the same class and billing the same ops |
+| `FaultStore` | delegates, resolving `get_pinned` and `get_with_pin` against the same `Op::Get` rules and counters as `get`, and `pin_of` against `Op::Head` |
+| `KmsRoutingStore` | delegates all three to the default store, like every other read: reads never select a KMS key |
+| `ExternalStore` | delegates to `S3Store` on the S3 arm and to the `object_store` generic path on the GCS and Azure arms |
+
+`InstrumentedStore` and the scheduled handle bill a pinned read as a GET
+because it is one GET on the wire, and a caller's GET count must not depend
+on which read path it took.
+
+Wrappers OUTSIDE this crate do not forward them: `ravel-server`'s
+`SharedKmsStore`, `ravel-sim`'s store, and the `ravel-bench` wrappers
+implement the trait without overriding any of the three, so each falls
+through to the default implementation. `get_pinned` there is `Unsupported`,
+and `pin_of` and `get_with_pin` report an ETag-only pin from the wrapper's
+own `head`/`get`. That is a deliberate consequence of failing closed rather
+than an oversight: a pinned read through a wrapper that has not been
+qualified refuses instead of silently dropping the pin. An external table
+read must not be routed through one.
+
+`ScriptedFault::FailedPrecondition` is the one fault kind that applies to
+`get_pinned` and not to `get`, and it is scriptable only, never generated in
+random mode.
+
+`external::probe::probe_preconditions` is how a candidate store is qualified
+for this before any grant relies on it (see "Read-only external stores"
+below).
 
 ## Mandatory capabilities (production)
 
@@ -238,7 +436,8 @@ expiration, SSE/KMS headers.
 `required_capabilities(Mode::Maintain)` adds it, and no other mode requires it.
 That gate is **forward-looking**, not a description of current behavior: today
 `ravel-maintain` writes its compaction outputs as single-PUT content-addressed
-objects (its `build.rs` records this), and no production
+objects (`crates/ravel-maintain/src/build.rs`, a module of the crate and not a
+cargo build script, is where that `put` is issued), and no production
 caller invokes `put_multipart` yet. The maintain-mode requirement stands so
 that once compaction does stream large L1/L2 segments as multipart uploads, the
 backend is already known to serve the create/upload-part/complete/abort
@@ -441,6 +640,110 @@ reads `capabilities()`, not in this crate.
 backstop regardless: the footer/section/page crc32c hierarchy
 (docs/segment-format.md) verifies data on every read of format-bearing bytes,
 independent of whether a wire-level upload checksum existed.
+
+### Read-side checksum verification
+
+A full-object `get` verifies the bytes it received against the checksum the
+store recorded when the object was written, before they reach the caller
+(ADR-1696 decisions 2 to 5). A mismatch is `Corrupted`, the variant this
+document already reserves for a checksum mismatch, so no reader gains an error
+arm. This is the read-time check the commit family otherwise has nowhere to put:
+a commit record is a bare protobuf with no checksum of its own (ADR-1696
+decision 6 keeps it that way), so a flipped bit inside a stored record decodes
+as a valid record and a flip in `max_event_ts_ns` moves the segment out of a
+query's range with no error anywhere.
+
+**`MemoryStore`** records a CRC-32C beside each object on write and recomputes
+it on a full-object get. It is the oracle for this rule, and
+`MemoryStore::corrupt_stored_byte` (compiled only with the crate's
+`test-support` feature, which test builds enable through their
+dev-dependencies) is the only thing that can make an object's
+stored bytes and stored checksum disagree: it flips one bit of the stored object
+and leaves the checksum alone, which is bit rot, not a rewrite. The contract
+suite pins the rule with `full_object_get_of_a_corrupted_stored_object_is_refused`
+(the `FaultStore` `CorruptRange` counter proves the wrapper was in the path, and
+the refusal still comes from the backend underneath it) and its ranged
+counterpart below.
+
+**`S3Store`** asks the endpoint for the stored checksum with
+`x-amz-checksum-mode: ENABLED` and recomputes `x-amz-checksum-crc64nvme` or
+`-crc32c` over the body that arrived. Four properties shape how:
+
+- The endpoint returns the stored checksum only on a response to an *unranged*
+  GET. MinIO's GET and HEAD handlers attach `x-amz-checksum-*` only when
+  checksum mode is enabled and no `Range` header is present, and RustFS, which
+  derives from MinIO, does the same; a ranged GET comes back with no checksum
+  whatever bytes it covers. So the first request of a `GetRange::Full` read is
+  unranged, and its body is read up to `max_request_body_bytes` (see "HTTP
+  client timeouts"). An object that fits arrives whole in that one response,
+  with its checksum, and is verified.
+- An object above `max_request_body_bytes` is cut at the bound and finished
+  with ranged requests, and no single response then carries the whole object the
+  checksum covers. Such a read is counted unverified rather than verified. Every
+  commit-family record is orders of magnitude below that bound, so a record read
+  is always one request, and it is verified wherever the endpoint stored a
+  checksum this adapter can recompute.
+- The response headers are invisible above the HTTP layer in `object_store`
+  0.14 (`GetResult` carries `payload`, `meta`, `range`, `attributes`, and
+  nothing else), so the checksum is read in the counting HTTP connector the
+  adapter already installs below the retry loop and handed back to the adapter
+  per request.
+- That connector runs *after* SigV4 signing, and S3 requires every `x-amz-*`
+  header to be signed, so the request header cannot be added there. It rides on
+  `ClientOptions`' default headers instead, which `object_store` signs onto
+  PUT, GET, HEAD, DELETE and the multipart requests, where it is meaningless
+  and ignored on all but GET and HEAD. `object_store` does not sign it onto a
+  LIST, and a reqwest client built from the same options would add it there
+  after signing, which an S3 endpoint refuses with 403 `AccessDenied`; the
+  connector therefore builds its reqwest client without default headers, and a
+  LIST carries none.
+
+**`S3HttpConfig::request_stored_checksum`** (default `true`) is the switch for
+the request header. Set to `false`, no request carries `x-amz-checksum-mode`, the
+endpoint returns no stored checksum, and every full-object read is served and
+counted unverified. It exists for an endpoint that rejects the header outright.
+No server or CLI flag sets it yet; that is ADR-1696 follow-up task 2.
+
+**A read with no verifiable checksum is served and counted, never refused**
+(decision 3). The count is `StoreMetricsSnapshot::get_unverified` (also
+`S3Store::get_unverified`); it is meant to be exported as
+`ravel_store_get_unverified_total`, but `ravel-server` does not render it at
+`/metrics` yet (ADR-1696 follow-up task 2), so today it is readable only
+through those two accessors. Three things land there: a response with no
+`x-amz-checksum-*` header (an endpoint that stores no checksum, one that ignored
+checksum mode, or a store with `request_stored_checksum` off), a response
+carrying a digest this adapter cannot recompute (SHA-256, which has no
+implementation in this workspace, or a composite multipart digest, which
+digests part digests rather than the body), and the cut whole-object read
+above. The count moves once per logical full-object `get`, not once per HTTP
+request. Failing closed instead would make an upgrade an outage: every object
+written before upload integrity was enabled carries no stored checksum, and
+read-time integrity for data objects is the format crc hierarchy regardless. A
+non-zero and growing count against an endpoint that is supposed to store
+checksums is the signal that it is dropping them, which is the one thing the PUT
+side cannot detect.
+
+**A pinned full read is verified too.** `get_pinned` and `get_with_pin` with
+`GetRange::Full` run the same path as `get`, so the unranged first request
+carries the caller's pin *and* asks for the stored checksum, and an object
+that fits in one response is both pinned and verified. The two features are
+independent conditions on one request, not two paths. `MemoryStore` matches:
+every read path there recomputes its stored CRC-32C on a full read, whatever
+pin selected the bytes.
+
+**Ranged reads are not verified** (decision 4). An endpoint returns no stored
+checksum on a ranged response, and a slice could not be compared against the
+whole-object checksum if it did, so a caller-issued `GetRange::Range` or
+`GetRange::Suffix` is outside the check by construction: it is neither verified
+nor counted. Suffix and range reads of data objects keep the format's own crc32c
+hierarchy as their check, which is what they have today. `MemoryStore` matches
+this, so the oracle and the adapter agree about which reads are covered.
+
+The RustFS contract lane (`rustfs_contract` in
+`crates/ravel-object-store/tests/contract.rs`, run by CI's
+`object-store-contract` job) checks the real-endpoint half: a `Crc64Nvme` PUT
+read back with `GetRange::Full` moves the unverified count by exactly 0, and a
+ranged read of the same object is served.
 
 There is no per-part or whole-object upload checksum for a multipart upload:
 `object_store`'s `UploadPart` takes no checksum-algorithm value and `complete`
@@ -658,6 +961,17 @@ qualify` does that in place: a re-run overwrites a below-floor
 equal-or-newer record untouched. Re-recording is the only way to clear the
 refusal, because the record is written with `CreateIfAbsent` and cannot
 otherwise be replaced.
+
+Conditional reads are deliberately not a ninth gating property, and
+`CONFORMANCE_SUITE_VERSION` stays at `2` for them. The suite qualifies the
+bucket Ravel writes, and nothing on Ravel's own write or read path issues a
+pinned read: every object Ravel writes is immutable. The store that needs
+qualifying for `get_pinned` is a granted external bucket, which is a
+different store, qualified per grant by `external::probe::probe_preconditions`
+rather than once per bucket by this suite. Adding the property here would
+make every already-qualified bucket re-qualify against a property its own
+callers never exercise. The trait-level behavior is covered instead by tests
+in `conformance.rs` that run each subject through the pinned-read cases.
 
 This is a runtime, once-per-bucket check, not a replacement for the
 compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`
@@ -1117,6 +1431,172 @@ itself (a live per-tenant `S3Store` has no endpoint under test); routing is
 covered by `kms_routing`'s own unit tests instead, including key rotation
 and `put_multipart` routing.
 
+### Observed store time
+
+`ObjectStoreBackend::observed_store_time_ns() -> Option<i64>` reports the
+store's own clock, in unix nanoseconds, as the backend last observed it
+(ADR-1685 decision 1). It is a defaulted method returning `None`, so a backend
+with no remote store behind it implements nothing; adding it is not a contract
+change for a third-party implementation.
+
+The S3 adapter returns the `Date` header of the **latest** response it
+received, parsed as RFC 7231 IMF-fixdate, and `None` before its first response.
+The header is read by the same HTTP connector that counts billed requests and
+observes stored checksums, because `object_store` 0.14 exposes no response
+headers above it. Three properties follow, and callers depend on each:
+
+- **Every response, not only a successful one.** A 503 or a 403 carries the
+  store's clock as honestly as a 200, so a process being throttled keeps a
+  fresh observation.
+- **The latest response wins; it is never a running maximum.** An endpoint or
+  proxy that answers one request with a wrong `Date` moves the value, including
+  backwards, until the next response corrects it. A maximum would latch that
+  one bad header for the life of the process.
+- **A missing or unparseable `Date` changes nothing.** The previous
+  observation stands rather than being cleared, so a momentary bad header does
+  not read as "no observation".
+
+For a store whose `Date` is correct the value is a **lower bound** on the
+store's current time, never an estimate of it: the store stamped it before the
+response left, nothing advances it by elapsed time, and a leap second (`:60`)
+is clamped to `:59` rather than read as the next minute. A wrong `Date` moves
+it in the direction of its error. A caller may use it to bound how far *behind* the store its
+own clock is (ADR-1685 decision 2 refuses a flush whose reading lags it by more
+than the clock-skew allowance), and must not use it to bound how far ahead. It
+is arbitrarily stale in a process that has issued no requests, and it costs no
+extra request and no new object.
+
+`MemoryStore` returns `None` unless a test sets a value through
+`set_observed_store_time_ns`, which is behind the `test-support` feature: the
+oracle serves no responses, so it observes no store clock, and deriving one
+from the host clock would hand a caller the very clock it is trying to check.
+
+Every decorator in `ravel-object-store` delegates to the store it wraps ---
+`InstrumentedStore`, `FaultStore`, `KmsRoutingStore` (to its default store,
+which serves every read), the `ClassedStore` class handles, and the `Arc<T>`
+forwarding impl --- and so does ravel-server's `SharedKmsStore`, which sits
+between `InstrumentedStore` and `KmsRoutingStore` under `--tenant-kms-config`.
+A decorator that answered `None` instead would silently
+disable the caller's check, since production wraps its backend in several of
+them; each delegation is pinned by a test in its own module.
+
+### Read-only external stores (ADR-2040 decision 3)
+
+A Parquet table queried in place lives in a bucket Ravel does not own,
+reached with credentials Ravel was granted. `external::ExternalStore` is the
+`ObjectStoreBackend` for that bucket, and three properties hold by
+construction.
+
+**Identity is `(profile, bucket, key)`, not a URL.** An
+`external::ExternalProfile` is a name plus one `ExternalKind` (`S3` with the
+`S3Config` connection settings minus the bucket, `Gcs`, or `Azure`), and
+`ExternalStore::open(profile, bucket)` binds a profile to one bucket. A URL
+is a rendering of the triple, never the identity: two profiles can reach the
+same URL with different rights, and the same bytes under a different
+endpoint are not the same object. `load_profiles` therefore rejects an empty
+name and a duplicate name rather than resolving a duplicate last-one-wins,
+because the pinned cache key (`ravel_cache::CacheKey::pinned`) hashes the
+profile name and two profiles sharing one would collide two credential sets
+into one key.
+
+**A profile holds where a secret is, never the secret.** Every credential
+value a profile carries is a `SecretSource`: `Env { name }` or `File { path }`
+(trailing whitespace trimmed, so a mounted secret with a newline works
+unedited). The one credential Ravel never handles itself is the GCS
+service-account key file, whose path goes to `object_store`'s builder; it is
+still a path and never a key. `SecretSource`'s `Debug` renders
+`SecretSource(env, redacted)` or `SecretSource(file, redacted)`, and every
+credential enum around it renders its own redacted form
+(`GcsCredentials(service_account, redacted)` and so on), so neither a value
+nor its location reaches a log line or a panic message. The location is
+withheld deliberately: an environment variable's name and a key file's path
+are deployment facts, and printing them beside "redacted" hands a reader with
+log access the place to look. The `ProfileError::SecretUnavailable` message
+names only the kind of source for the same reason. Every `SecretSource`
+resolves once, at `open`, so an unreadable one fails there rather than on the
+first read. A builder or credential failure inside `ExternalStore::open`
+becomes one fixed message per store kind,
+`ProfileError::CredentialsRejected` ("gcs credentials could not be loaded for
+profile <name>"), and the underlying `object_store` error is dropped rather
+than carried as a source: it quotes what the builder was handed, and for GCS
+that is the service-account file path.
+
+**Read-only is enforced locally, in the type.** `put`, `put_multipart` and
+`delete` refuse with `StoreError::ReadOnly` without touching the network, so
+a misconfigured grant cannot become a request against someone else's bucket.
+`capabilities()` reports `create_if_absent: false`, `cas_version: false`,
+`upload_checksum: false` and `multipart: false`: a caller that selects a
+path by capability must never select a write path here. Those flags describe
+this store, not the bucket behind it. An external store is consequently
+never a candidate for the mandatory-capability check above, which governs
+the bucket Ravel writes.
+
+Two probes qualify a grant before anything reads through it, both in
+`external::probe`, both fail-closed, and both run at grant creation rather
+than on the request path:
+
+- `probe_preconditions(store, key)` qualifies the store for `get_pinned`. It
+  takes the object's pin with `pin_of(key)` (the same HEAD-based constructor
+  a caller would record, so the probe asserts the identity a caller would
+  use), then issues two 1-byte ranged reads, one pinned to that identity and
+  one pinned to a wrong ETag. It qualifies only if the first is served and
+  the second is refused with `PreconditionFailed`. The failure it returns
+  says which half failed: a store that serves the wrong pin ignores
+  preconditions (`WrongPinAccepted`), a store that refuses the matching pin
+  implements them incorrectly (`MatchingPinRefused`), a store that refuses
+  the wrong pin with some other error cannot be read through either
+  (`WrongPinWrongError`), and a HEAD that failed means the question was
+  never asked (`Head`). Only the object's own identity is pinned, and only
+  1 byte is read, because what is being measured is the header. The wrong
+  ETag is 16 random bytes rendered as quoted hex, drawn afresh on every
+  call, rather than a fixed literal: a store could refuse one known-bad
+  string and serve every other pinned read unconditionally, and the probe
+  would record that as precondition support. It is quoted because S3 ETags
+  are quoted strings, so an unquoted value could be rejected as malformed
+  instead of evaluated as a precondition, which would pass the probe for the
+  wrong reason. The probe writes nothing to the store it is qualifying.
+- `probe_not_ravel_bucket(ravel_store, candidate_store)` refuses a candidate
+  that is a Ravel bucket, which would let an external table read Ravel's
+  objects across tenants. It reads two keys from the candidate and both must
+  come back a clean `NotFound`.
+  - The identity read catches Ravel's own live bucket reached under another
+    name. The probe writes a random key under `sys/pq-probe/` with random
+    contents to Ravel's own bucket and reads that key from the candidate:
+    the probe bytes are `SameBucket`. The key is random so no candidate
+    holds it by coincidence and the contents are random so a store
+    answering every key with one placeholder cannot be mistaken for
+    Ravel's own.
+  - The tenancy-marker read catches what the identity read cannot: a copy,
+    a restore, or a replication target of a Ravel bucket is a different
+    bucket that still holds Ravel's objects, and the probe object written
+    after the copy was taken is not in it. The probe reads `sys/tenancy`
+    (the marker key of ADR-0050) from the candidate, and a candidate that
+    serves it at all is refused with `TenancyMarkerPresent`, whatever the
+    bytes are: the marker is not parsed, because holding the key is
+    already the answer.
+
+  Anything other than a clean `NotFound` or, for the identity read, the
+  exact probe payload (an access denial, a timeout, different bytes) is
+  `Inconclusive`, which is a refusal. Passing an inconclusive candidate
+  would qualify a grant on the strength of an error message. One
+  consequence is worth stating plainly: credentials scoped so tightly that
+  they cannot read `sys/` answer the marker read with an access denial
+  rather than a `NotFound`, so a grant offered under least-privilege
+  credentials of that shape is refused. That is the intended trade, because
+  the probe cannot tell "you may not ask" from "there is nothing there".
+  The probe issues a delete for its own object before returning, on every
+  path it returns through; a failed delete is logged and does not change the
+  verdict. Two paths never reach that delete and can leave an object behind:
+  a probe put that timed out after the object had landed, and a cancelled
+  probe (the future dropped before the delete is issued). Nothing in Ravel
+  reaps `sys/pq-probe/`, so what bounds the leak is whatever lifecycle rule
+  the operator sets on that prefix in the bucket itself. Each leaked object
+  is 32 bytes.
+
+Nothing in a shipping binary constructs an `ExternalStore` or calls either
+probe yet. The callers are the Parquet reader and the grant and
+`CREATE EXTERNAL TABLE` paths of ADR-2040, which have not landed.
+
 ## Rules for callers
 
 - Never infer visibility from a successful data PUT; only commit records
@@ -1126,3 +1606,9 @@ and `put_multipart` routing.
   `Corrupted` (data objects are created with CreateIfAbsent, so rewrites
   cannot produce differing content for one key).
 - Every caller passes a deadline; trait impls honor cancellation by drop.
+- Every read of an object Ravel did not write goes through `get_pinned`
+  carrying the identity the catalog recorded for it. A plain `get` of such an
+  object is a bug: the key is mutable from Ravel's point of view, so the
+  bytes may no longer match the recorded schema and statistics, and the
+  pinned cache key is only sound because the read that fills it asserted that
+  identity on the wire.

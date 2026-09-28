@@ -30,13 +30,20 @@
 //! ticket owns `EngineConfig`). Here the deadline is an opaque bound the
 //! codec round-trips and [`FlightTicket::is_expired`] checks.
 //!
-//! # Tenancy is not trusted from the ticket
+//! # Tenancy depends on the surface
 //!
-//! The ticket carries [`FlightTicket::tenant`] so `DoGet` can compare it
-//! against the tenant it resolves from authoritative gRPC metadata and
-//! reject on mismatch. The embedded field is the value to check against, not
-//! a source of authority: the ticket is never a tenancy trust boundary. That
-//! comparison is out of scope for this codec.
+//! A client whole-set ticket carries [`FlightTicket::tenant`] so `DoGet` can
+//! compare it against the tenant it resolves from authoritative gRPC metadata
+//! and reject on mismatch. There the embedded field is the value to check
+//! against, not a source of authority.
+//!
+//! A slice ticket is different (ADR-1689 decision 2): it is the capability. A
+//! coordinator mints it under the slice key after resolving the client's
+//! tenant itself, no client credential travels with it, and the worker
+//! executes the slice under the ticket's tenant. The two surfaces are MAC'd
+//! under different keys ([`SqlTicketKeys`]), so a client ticket can never be
+//! presented as a slice capability. Both checks live in [`crate::flight`], not
+//! in this codec.
 //!
 //! # Encoding choice: manual little-endian byte layout, not prost
 //!
@@ -115,11 +122,11 @@
 //! # Integrity: a keyed MAC, not a checksum
 //!
 //! [`FlightTicket::encode`] and [`FlightTicket::decode`] both take a
-//! [`TicketKey`]: a 32-byte secret, never sent to a client or persisted. A
-//! single-process deployment generates it once in memory; a distributed
-//! deployment derives it from the shared cluster secret so a coordinator and a
-//! worker verify with the same key (see [`TicketKey`] and
-//! [`derive_ticket_key`]).
+//! [`TicketKey`]: a 32-byte secret, never sent to a client or persisted. The
+//! Flight service holds one per surface per file key ([`SqlTicketKeys`]): a
+//! single-process deployment generates its file key once in memory; a
+//! distributed deployment shares it so a coordinator and a worker verify with
+//! the same keys (see [`TicketKey`] and [`derive_ticket_key`]).
 //! The trailing tag is `blake3::keyed_hash(key, payload)`, not a plain hash of
 //! the payload, so recomputing it requires the key. A client can still read
 //! and replay a ticket verbatim (that is the protocol), but cannot flip a
@@ -288,17 +295,160 @@ const TICKET_KEY_DERIVATION_CONTEXT: &str =
 /// A single-process deployment mints a random key. A distributed deployment
 /// cannot: a coordinator signs a slice ticket that a *different* worker process
 /// redeems, so all processes must key their MAC identically. Every process in an
-/// ADR-0071 cluster already holds one shared secret — the cluster-internal
-/// fragment auth token (`DistribSettings::auth_token`) — so deriving the ticket
-/// key from it gives cluster-wide agreement with no new key-distribution
-/// channel. `blake3::derive_key` with a fixed context is a proper KDF: it maps
-/// the arbitrary-length secret to a 32-byte key and never uses the secret as a
-/// MAC key directly, so the token and the ticket key are cryptographically
+/// ADR-0071 cluster already holds one shared secret, the first key of its
+/// `--fragment-key-file` (the server passes its lowercase hex,
+/// `DistribSettings::sql_ticket_secret`), so deriving the ticket key from it
+/// gives cluster-wide agreement with no new key-distribution channel.
+/// `blake3::derive_key` with a fixed context is a proper KDF: it maps the
+/// arbitrary-length secret to a 32-byte key and never uses the secret as a MAC
+/// key directly, so the fragment key and the ticket key are cryptographically
 /// independent. The result is still secret (never logged, sent, or persisted);
 /// it is merely reproducible across processes and restarts, which a distributed
 /// ticket requires.
+///
+/// ADR-1689 decision 2 moves the ticket MAC onto per-surface keys
+/// ([`SqlTicketKeys`]) read from `--sql-ticket-key-file`. This derivation is
+/// the release A fallback for a process started without that flag: the server
+/// passes its output as `DistributedFlightConfig::shared_ticket_key`, which the
+/// Flight service treats as one file key and derives both surface keys from.
 pub fn derive_ticket_key(shared_secret: &[u8]) -> TicketKey {
     blake3::derive_key(TICKET_KEY_DERIVATION_CONTEXT, shared_secret)
+}
+
+/// BLAKE3 context for the MAC key of client whole-set tickets (ADR-1689
+/// decision 2). Distinct from [`SLICE_KEY_CONTEXT`], so a ticket minted for one
+/// surface fails the MAC on the other.
+const CLIENT_KEY_CONTEXT: &str =
+    "ravel-sql flight client whole-set ticket MAC key 2026-09 (RFT1, ADR-1689)";
+
+/// BLAKE3 context for the MAC key of coordinator-minted slice capabilities
+/// (ADR-1689 decision 2).
+const SLICE_KEY_CONTEXT: &str =
+    "ravel-sql flight slice capability MAC key 2026-09 (RFT1, ADR-1689)";
+
+/// Which Flight surface a ticket is minted for and verified on (ADR-1689
+/// decision 2). The ticket layout is the same on both; only the MAC key
+/// differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketSurface {
+    /// The whole-set ticket `GetFlightInfo` hands an external client, redeemed
+    /// with that client's own credential.
+    Client,
+    /// A slice ticket a coordinator mints for a worker. It is the capability
+    /// itself: no client credential travels with it.
+    Slice,
+}
+
+/// Derive one surface's MAC key from a file key: `blake3::derive_key` under a
+/// context that names the surface.
+pub fn derive_surface_key(file_key: &[u8], surface: TicketSurface) -> TicketKey {
+    let context = match surface {
+        TicketSurface::Client => CLIENT_KEY_CONTEXT,
+        TicketSurface::Slice => SLICE_KEY_CONTEXT,
+    };
+    blake3::derive_key(context, file_key)
+}
+
+/// The Flight SQL ticket keys of one process (ADR-1689 decision 2): two MAC
+/// keys per file key, one per [`TicketSurface`]. The first file key mints; a
+/// ticket verifies under any of them, so a key file can rotate without a flag
+/// day, the same rule `--fragment-key-file` follows.
+#[derive(Clone)]
+pub struct SqlTicketKeys {
+    client_mint: TicketKey,
+    slice_mint: TicketKey,
+    client: Vec<TicketKey>,
+    slice: Vec<TicketKey>,
+}
+
+impl std::fmt::Debug for SqlTicketKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Key material is secret; print only how many keys are configured.
+        f.debug_struct("SqlTicketKeys")
+            .field("file_keys", &self.client.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SqlTicketKeys {
+    /// Derive both surface keys from one file key.
+    pub fn from_file_key(file_key: &[u8]) -> Self {
+        let client_mint = derive_surface_key(file_key, TicketSurface::Client);
+        let slice_mint = derive_surface_key(file_key, TicketSurface::Slice);
+        SqlTicketKeys {
+            client_mint,
+            slice_mint,
+            client: vec![client_mint],
+            slice: vec![slice_mint],
+        }
+    }
+
+    /// Derive both surface keys from each file key, in order. Returns `None`
+    /// for an empty key list: a process with no key can neither mint nor
+    /// verify, and refusing here keeps that from surfacing as a MAC failure on
+    /// every ticket.
+    pub fn from_file_keys<K: AsRef<[u8]>>(file_keys: impl IntoIterator<Item = K>) -> Option<Self> {
+        let (client, slice): (Vec<_>, Vec<_>) = file_keys
+            .into_iter()
+            .map(|key| {
+                (
+                    derive_surface_key(key.as_ref(), TicketSurface::Client),
+                    derive_surface_key(key.as_ref(), TicketSurface::Slice),
+                )
+            })
+            .unzip();
+        let client_mint = *client.first()?;
+        let slice_mint = *slice.first()?;
+        Some(SqlTicketKeys {
+            client_mint,
+            slice_mint,
+            client,
+            slice,
+        })
+    }
+
+    fn keys(&self, surface: TicketSurface) -> &[TicketKey] {
+        match surface {
+            TicketSurface::Client => &self.client,
+            TicketSurface::Slice => &self.slice,
+        }
+    }
+
+    /// The key `surface`'s tickets are minted with: the one derived from the
+    /// first file key.
+    pub fn mint_key(&self, surface: TicketSurface) -> &TicketKey {
+        match surface {
+            TicketSurface::Client => &self.client_mint,
+            TicketSurface::Slice => &self.slice_mint,
+        }
+    }
+
+    /// Sign `ticket` for `surface` with its mint key.
+    pub fn encode(
+        &self,
+        ticket: &FlightTicket,
+        surface: TicketSurface,
+    ) -> Result<Vec<u8>, FlightTicketError> {
+        ticket.encode(self.mint_key(surface))
+    }
+
+    /// Decode `bytes` as a `surface` ticket, accepting a MAC under any of that
+    /// surface's keys. [`FlightTicketError::MacMismatch`] when none verifies;
+    /// any other error is the first key's structural refusal, which does not
+    /// depend on the key.
+    pub fn decode(
+        &self,
+        bytes: &[u8],
+        surface: TicketSurface,
+    ) -> Result<FlightTicket, FlightTicketError> {
+        for key in self.keys(surface) {
+            match FlightTicket::decode(bytes, key) {
+                Err(FlightTicketError::MacMismatch) => continue,
+                other => return other,
+            }
+        }
+        Err(FlightTicketError::MacMismatch)
+    }
 }
 
 /// Smallest possible encoded ticket: the fixed header (including the
@@ -459,8 +609,9 @@ impl SegmentPin {
 /// security posture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlightTicket {
-    /// Tenant the ticket was minted for. Compared against the authoritative
-    /// gRPC-metadata tenant at `DoGet`; never trusted as authority here.
+    /// Tenant the ticket was minted for. On a client ticket, compared against
+    /// the authoritative gRPC-metadata tenant at `DoGet`; on a slice ticket,
+    /// the tenant the worker executes under (see the module docs).
     pub tenant: TenantHash,
     /// The single read-only SQL statement, capped at [`MAX_STATEMENT_LEN`].
     pub statement: String,
@@ -1029,6 +1180,62 @@ mod tests {
         let encoded = ticket.encode(&a).expect("encode");
         assert!(FlightTicket::decode(&encoded, &b).is_ok());
         assert!(FlightTicket::decode(&encoded, &other).is_err());
+    }
+
+    /// ADR-1689 decision 2: a ticket minted for one surface fails the MAC on
+    /// the other, under the same file key, in both directions.
+    #[test]
+    fn a_ticket_minted_for_one_surface_fails_the_mac_on_the_other() {
+        let keys = SqlTicketKeys::from_file_keys([b"file-key".as_slice()]).expect("one key");
+        assert_ne!(
+            keys.mint_key(TicketSurface::Client),
+            keys.mint_key(TicketSurface::Slice),
+            "the two surfaces derive distinct keys from one file key"
+        );
+        let ticket = sample_ticket();
+        for (mint, other) in [
+            (TicketSurface::Client, TicketSurface::Slice),
+            (TicketSurface::Slice, TicketSurface::Client),
+        ] {
+            let bytes = keys.encode(&ticket, mint).expect("encode");
+            assert_eq!(keys.decode(&bytes, mint), Ok(ticket.clone()));
+            assert_eq!(
+                keys.decode(&bytes, other),
+                Err(FlightTicketError::MacMismatch),
+                "a {mint:?} ticket must not verify as {other:?}"
+            );
+        }
+    }
+
+    /// The first file key mints; every configured key verifies, so a ticket
+    /// minted before a rotation still redeems after it. A key that was never
+    /// configured does not verify.
+    #[test]
+    fn the_first_file_key_mints_and_every_file_key_verifies() {
+        let old = SqlTicketKeys::from_file_keys([b"old".as_slice()]).expect("one key");
+        let rotated =
+            SqlTicketKeys::from_file_keys([b"new".as_slice(), b"old".as_slice()]).expect("keys");
+        let stranger = SqlTicketKeys::from_file_keys([b"other".as_slice()]).expect("one key");
+        let ticket = sample_ticket();
+        for surface in [TicketSurface::Client, TicketSurface::Slice] {
+            assert_eq!(
+                rotated.mint_key(surface),
+                &derive_surface_key(b"new", surface),
+                "the first file key mints"
+            );
+            let minted_before = old.encode(&ticket, surface).expect("encode");
+            assert_eq!(rotated.decode(&minted_before, surface), Ok(ticket.clone()));
+            let minted_after = rotated.encode(&ticket, surface).expect("encode");
+            assert_eq!(
+                old.decode(&minted_after, surface),
+                Err(FlightTicketError::MacMismatch)
+            );
+            assert_eq!(
+                stranger.decode(&minted_before, surface),
+                Err(FlightTicketError::MacMismatch)
+            );
+        }
+        assert!(SqlTicketKeys::from_file_keys(std::iter::empty::<&[u8]>()).is_none());
     }
 
     fn sample_token(seed: u64) -> CommitToken {

@@ -52,6 +52,8 @@ ravel-affinity = { path = "crates/ravel-affinity", version = "0.19.0" }
 ravel-memory = { path = "crates/ravel-memory", version = "0.19.0" }
 ravel-mcp = { path = "crates/ravel-mcp", version = "0.19.0" }
 ravel-cpu-gate = { path = "crates/ravel-cpu-gate", version = "0.19.0" }
+ravel-pqtable = { path = "crates/ravel-pqtable", version = "0.19.0" }
+ravel-parquet = { path = "crates/ravel-parquet", version = "0.19.0" }
 # Dev-only test scaffolding (ADR-1702). Every consumer takes it as a
 # dev-dependency; no shipping crate may depend on it.
 ravel-test-support = { path = "crates/ravel-test-support", version = "0.19.0" }
@@ -64,6 +66,10 @@ prost = "0.14"
 axum = "0.8"
 tower = "0.5"
 hyper = "1.11"
+# The operator's health listener (ADR-1731 decision 2), pinned at the versions
+# Cargo.lock already resolved through other crates' transitive graphs.
+hyper-util = { version = "0.1.20", default-features = false }
+http-body-util = { version = "0.1.4", default-features = false }
 futures = "0.3"
 async-trait = "0.1"
 # HTTP client. Used by services/ravel-server (alert/webhook sinks) and, for the
@@ -99,7 +105,7 @@ tikv-jemallocator = "0.7"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "metrics", "logs", "trace"] }
 
 # object storage
-object_store = { version = "0.14", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
 
 # arrow (isolated to ravel-otap for now; Phase 3 query work reuses it)
 arrow = { version = "59", default-features = false, features = ["ipc"] }

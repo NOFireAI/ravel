@@ -3,8 +3,9 @@
 //!
 //! A query-role process that participates in fan-out registers itself the same
 //! way a maintain worker does (ADR-0065 decision 1, [`crate::worker_set`]): it
-//! writes, every heartbeat interval `H`, a [`QueryWorkerRecord`] to a key it
-//! alone ever writes:
+//! writes, every heartbeat interval `H`, a [`QueryWorkerRecord`] to its own
+//! key (by convention; the query role's grant covers the whole prefix, see
+//! [`QueryWorkers::live_set`]):
 //!
 //! ```text
 //! sys/query/workers/<process_id>
@@ -88,18 +89,22 @@ use crate::worker_set::{
 /// role's `sys/maintain/workers/`. Fixed verbatim; #864 and #865 depend on it.
 pub const QUERY_WORKERS_PREFIX: &str = "sys/query/workers/";
 
-/// The heartbeat key one query-worker process owns and alone ever writes.
+/// The heartbeat key one query-worker process writes its own record to.
 pub fn query_worker_key(process_id: &str) -> String {
     format!("{QUERY_WORKERS_PREFIX}{process_id}")
 }
 
 /// The process id a heartbeat key names, or `None` if the key is not a
 /// well-formed `sys/query/workers/<uuid>` key. Worker identity is the key, not
-/// the record body (mirrors [`crate::worker_set`]'s `process_id_of`): the key
-/// is the one thing a single writer alone controls, so deriving identity from
-/// it means a record whose body disagrees with its key cannot smuggle a false
-/// identity into the live set. `list_all` yields the prefix itself and any
-/// unexpected nested key under it; both parse to `None` and are skipped.
+/// the record body (mirrors [`crate::worker_set`]'s `process_id_of`), so a
+/// record whose body disagrees with its key cannot claim another worker's
+/// identity. It does not stop a new identity: the shipped query-role IAM grant
+/// (`deploy/iam/query.json`) allows `PutObject` across the whole
+/// `sys/query/workers/` prefix and records
+/// carry no MAC, so any principal holding that role can write a
+/// self-consistent record at a fresh UUID key and join the live set.
+/// `list_all` yields the prefix itself and any unexpected nested key under it;
+/// both parse to `None` and are skipped.
 fn process_id_of(key: &str) -> Option<Uuid> {
     let raw = key.strip_prefix(QUERY_WORKERS_PREFIX)?;
     Uuid::parse_str(raw).ok()
@@ -300,9 +305,10 @@ impl QueryWorkers {
     /// so a draining query worker stops advertising itself to sibling
     /// coordinators immediately, rather than lingering in their live set until
     /// its stamp ages past the `3 * H` staleness window. Deletes only the one
-    /// key this process owns (`sys/query/workers/<process_id>`); a single writer
-    /// alone controls that key, so this never races another process. A missing
-    /// key is not an error (`delete` is idempotent).
+    /// key this process writes (`sys/query/workers/<process_id>`). By
+    /// convention no other process writes that key, so this does not race a
+    /// sibling's heartbeat; the query role's grant does not enforce that. A
+    /// missing key is not an error (`delete` is idempotent).
     pub async fn delete_heartbeat(&self, store: &dyn ObjectStoreBackend) -> Result<(), StoreError> {
         store
             .delete(&query_worker_key(&self.process_id.to_string()))
@@ -320,9 +326,11 @@ impl QueryWorkers {
     /// record body (mirrors [`crate::worker_set::WorkerSet::live_set`]): a key
     /// that is not a well-formed `sys/query/workers/<uuid>` is skipped, and a
     /// record whose body `process_id` disagrees with the id its key names is
-    /// skipped as malformed. A single writer alone controls its own key, so a
-    /// body/key mismatch means a corrupt or forged record and must not enter
-    /// the live set under either identity.
+    /// skipped as malformed, under either identity. That catches corruption and
+    /// a careless forgery. It does not establish that the writer was entitled
+    /// to the key: the shipped query-role IAM grant allows `PutObject` across
+    /// the whole prefix and records carry no MAC, so a self-consistent record
+    /// written at a fresh UUID key passes this check and enters the live set.
     ///
     /// A corrupt or mismatched sibling record is skipped (treated as absent,
     /// self-correcting next interval); only a failed LIST or GET is an `Err`,

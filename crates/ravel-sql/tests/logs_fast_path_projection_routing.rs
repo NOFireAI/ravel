@@ -537,13 +537,13 @@ async fn narrow_projection_reads_column_chunks_not_whole_objects() {
 
     let shape = measure(Some(narrow_projection()), Some(THRESHOLD_DIVISOR)).await;
 
-    // Exact request law: one suffix probe and five byte-range GETs per segment
-    // (front sections, then one coalesced run per projected column chunk), and
-    // NO whole-object GET.
+    // Exact request law: one suffix probe and four byte-range GETs per segment
+    // (STREAM_DIR and FIELD_DIR together in one GET, ADR-2066 decision 1, then
+    // one coalesced run per projected column chunk), and NO whole-object GET.
     assert_eq!(
         (shape.full_gets, shape.suffix_gets, shape.range_gets),
-        (0, SEGMENTS as u64, 5 * SEGMENTS as u64),
-        "exact request shape per segment: 0 full, 1 suffix probe, 5 ranges"
+        (0, SEGMENTS as u64, 4 * SEGMENTS as u64),
+        "exact request shape per segment: 0 full, 1 suffix probe, 4 ranges"
     );
 
     // Exact bytes: the projection reads three object columns of twenty, so the

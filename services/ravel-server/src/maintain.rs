@@ -89,9 +89,9 @@ use ravel_maintain::worker_set::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, run_bounded,
 };
 use ravel_maintain::{
-    Bucket, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureRewriteOutcome,
-    LeaseCheck, LegalHoldCheck, MaintainError, OrphanPass, PendingErasureRequest,
-    QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, erasure_rewrite_bucket,
+    Bucket, ClaimParticipant, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+    ErasureRewriteOutcome, LeaseCheck, LegalHoldCheck, MaintainError, OrphanPass,
+    PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, erasure_rewrite_bucket,
     pending_erasure_requests, read_all_memo_snapshots, scan_and_compact, sweep_audit_retention,
     sweep_erasure_requests, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
     sweep_unreferenced_catalog_objects, write_memo_snapshot,
@@ -113,6 +113,7 @@ pub const DEFAULT_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Delegates to `ravel-ingest`'s [`SystemClock`], the one blessed wall clock in
 /// this process, so no maintenance code path ever reads `SystemTime::now()`
 /// directly.
+#[derive(Clone, Copy)]
 pub(crate) struct WallClock;
 
 impl Clock for WallClock {
@@ -187,6 +188,27 @@ pub struct MaintenanceSafetyMetrics {
     objects_deleted_superseded_records_deleted: AtomicU64,
     objects_deleted_superseded_data_deleted: AtomicU64,
     objects_deleted_unreferenced_parts_deleted: AtomicU64,
+    /// Bytes reclaimed by the two sweep deletions whose object size is known
+    /// from the pass's own LIST, by signal, summed over every sweep pass since
+    /// process start: the quarantine reaper and rule 3's unreferenced-part
+    /// delete (issue #1729). Superseded and retention deletions are not
+    /// included; they delete by key without a listed size.
+    bytes_reclaimed: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// The published per-signal retention-lag gauge (issue #1729), paired with
+    /// `retention_lag_ns_accum` exactly as `l0_records_pending` is paired with
+    /// its accumulator: cleared by [`MaintenanceSafetyMetrics::begin_scan_cycle`],
+    /// raised to the per-unit maximum by
+    /// [`MaintenanceSafetyMetrics::record_scan`], and copied here by
+    /// [`MaintenanceSafetyMetrics::publish_scan_cycle`] once the cycle has
+    /// covered every unit this process owns, so a mid-cycle scrape reads the
+    /// previous cycle's complete value rather than a partial one.
+    retention_lag_ns: [AtomicI64; MAINTAINED_SIGNALS.len()],
+    /// The in-progress cycle's retention-lag accumulator. Unlike the summing
+    /// `l0_records_pending_accum`, this takes the MAXIMUM across the cycle's
+    /// units: the gauge reports the single oldest still-present expired bucket
+    /// this process observed, so a later unit with a smaller lag must not lower
+    /// it and units must not add together.
+    retention_lag_ns_accum: [AtomicI64; MAINTAINED_SIGNALS.len()],
 }
 
 impl MaintenanceSafetyMetrics {
@@ -361,6 +383,29 @@ impl MaintenanceSafetyMetrics {
             .load(Ordering::Relaxed)
     }
 
+    /// Bytes reclaimed for `signal` by the size-known sweep deletions (the
+    /// quarantine reaper and rule 3's unreferenced-part delete), summed since
+    /// process start ([`ravel_maintain::SweepReport::quarantine_reaped_bytes`]
+    /// plus [`ravel_maintain::SweepReport::unreferenced_parts_bytes`]). Backs
+    /// `ravel_maintain_bytes_reclaimed_total` (issue #1729).
+    pub fn bytes_reclaimed(&self, signal: Signal) -> u64 {
+        self.bytes_reclaimed[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// The retention lag for `signal` this process's most recent completed
+    /// maintenance cycle observed, in nanoseconds: for the oldest bucket that is
+    /// expired yet still physically present, how far the clock was past its
+    /// nominal retention deadline ([`MaintainReport::retention_lag_ns`]). `0`
+    /// when the cycle found no still-present expired bucket for the signal.
+    ///
+    /// A gauge like [`l0_records_pending`](Self::l0_records_pending), and the
+    /// per-cycle MAXIMUM over this process's units rather than a sum: it names
+    /// the single worst bucket. Backs `ravel_maintain_retention_lag_seconds`
+    /// (issue #1729), rendered in seconds.
+    pub fn retention_lag_ns(&self, signal: Signal) -> i64 {
+        self.retention_lag_ns[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
     pub fn record_legal_hold_refresh_failure(&self) {
         self.legal_hold_refresh_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -431,6 +476,17 @@ impl MaintenanceSafetyMetrics {
             .fetch_add(report.superseded_data_deleted as u64, Ordering::Relaxed);
         self.objects_deleted_unreferenced_parts_deleted
             .fetch_add(report.unreferenced_parts_deleted as u64, Ordering::Relaxed);
+
+        // The per-signal reclaimed-bytes counter (issue #1729): the two sweep
+        // deletions whose object size the pass already listed. Superseded and
+        // retention deletions delete by key without a size, so they contribute
+        // nothing here; the metric's HELP text says so.
+        self.bytes_reclaimed[index].fetch_add(
+            report
+                .quarantine_reaped_bytes
+                .saturating_add(report.unreferenced_parts_bytes),
+            Ordering::Relaxed,
+        );
     }
 
     /// One [`scan_and_maintain_with_memo`] result for `signal`, added to the
@@ -444,8 +500,13 @@ impl MaintenanceSafetyMetrics {
     /// [`begin_scan_cycle`](Self::begin_scan_cycle) cleared the accumulator at
     /// the top of the cycle.
     pub fn record_scan(&self, signal: Signal, report: &MaintainReport) {
-        self.l0_records_pending_accum[signal_index(signal)]
+        let index = signal_index(signal);
+        self.l0_records_pending_accum[index]
             .fetch_add(report.l0_records_pending as u64, Ordering::Relaxed);
+        // Retention lag takes the maximum, not the sum: the gauge names the
+        // single oldest still-present expired bucket, so a later unit with a
+        // smaller lag must not lower it and two units must not add together.
+        self.retention_lag_ns_accum[index].fetch_max(report.retention_lag_ns, Ordering::Relaxed);
     }
 
     /// Clear the L0-pending accumulator at the top of a maintenance cycle.
@@ -454,6 +515,9 @@ impl MaintenanceSafetyMetrics {
     /// still holds the previous cycle's complete total.
     pub fn begin_scan_cycle(&self) {
         for accum in &self.l0_records_pending_accum {
+            accum.store(0, Ordering::Relaxed);
+        }
+        for accum in &self.retention_lag_ns_accum {
             accum.store(0, Ordering::Relaxed);
         }
     }
@@ -473,6 +537,13 @@ impl MaintenanceSafetyMetrics {
             .l0_records_pending
             .iter()
             .zip(self.l0_records_pending_accum.iter())
+        {
+            published.store(accum.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for (published, accum) in self
+            .retention_lag_ns
+            .iter()
+            .zip(self.retention_lag_ns_accum.iter())
         {
             published.store(accum.load(Ordering::Relaxed), Ordering::Relaxed);
         }
@@ -1386,7 +1457,10 @@ pub async fn run_discovery_cycle(
         total.already_done += report.already_done;
         total.not_sealed += report.not_sealed;
         total.skipped_terminal += report.skipped_terminal;
+        total.claim_skipped += report.claim_skipped;
+        total.claim_cancelled += report.claim_cancelled;
         total.l0_records_pending += report.l0_records_pending;
+        total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
     }
 
     // Prune stall history to exactly this cycle's owned set (ADR-0065
@@ -1544,9 +1618,22 @@ fn orphans_present_total(report: &ravel_maintain::SweepReport) -> usize {
 /// `.done` write -- can advance it deterministically instead of sleeping or
 /// shrinking the horizon to zero (CLAUDE.md testing patterns: time is
 /// injected).
+///
+/// Unlike [`run_tick`] it does not open or publish the per-cycle gauges
+/// (`l0_records_pending`, `retention_lag_ns`): the caller brackets one or more
+/// tenant ticks with [`MaintenanceSafetyMetrics::begin_scan_cycle`] and
+/// [`MaintenanceSafetyMetrics::publish_scan_cycle`], as
+/// [`run_discovery_cycle`] does.
+///
+/// The clock is taken as a cloneable concrete type because the advisory-claim
+/// participant installed below keeps its own `Arc<dyn Clock>`: a clone of
+/// `clock` gives it the same time source the tick reads ([`FixedClock`]
+/// clones share one instant).
+///
+/// [`FixedClock`]: ravel_maintain::FixedClock
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_tick_with_clock(
-    clock: &dyn Clock,
+pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
+    clock: &C,
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     compactor: &CompactorConfig,
@@ -1558,6 +1645,29 @@ pub(crate) async fn run_tick_with_clock(
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
+    // Advisory-claim participation (ADR-1029 decision 5). The supervisor is one
+    // of the two actors the ADR names, so every per-unit tick below claims the
+    // buckets it merges, inside the ownership gate that already decides which
+    // units this process looks at. Claims still only cost anything on a bucket
+    // at or above `claim_min_input_bytes` with `coordination` on.
+    //
+    // It is installed only when the caller left the slot empty, and on a clone
+    // of this tick's own clock, so the claim decisions read the same time as
+    // the rest of the tick.
+    let coordinated;
+    let compactor = if compactor.claim_participant.is_none() {
+        coordinated = CompactorConfig {
+            claim_participant: Some(ClaimParticipant::new(
+                worker.process_id(),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            ..compactor.clone()
+        };
+        &coordinated
+    } else {
+        compactor
+    };
+
     // Record this tenant's owned units from the ownership gate alone, before
     // anything that can fail. Ownership is a pure function of
     // (live set, tenant, signal, shard) under the rendezvous hash, so it is
@@ -1786,6 +1896,13 @@ pub(crate) async fn run_tick_with_clock(
                         already_done = report.already_done,
                         not_sealed = report.not_sealed,
                         skipped_terminal = report.skipped_terminal,
+                        // Buckets another attempt holds the claim on, and runs
+                        // this process cancelled because its own claim was
+                        // taken over (ADR-1029). Neither is a compaction: the
+                        // `compacted` field above counts only merges this
+                        // process actually ran.
+                        claim_skipped = report.claim_skipped,
+                        claim_cancelled = report.claim_cancelled,
                         "maintenance: retention + compaction pass complete"
                     );
                     safety.record_scan(signal, &report);
@@ -1794,7 +1911,10 @@ pub(crate) async fn run_tick_with_clock(
                     total.already_done += report.already_done;
                     total.not_sealed += report.not_sealed;
                     total.skipped_terminal += report.skipped_terminal;
+                    total.claim_skipped += report.claim_skipped;
+                    total.claim_cancelled += report.claim_cancelled;
                     total.l0_records_pending += report.l0_records_pending;
+                    total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
                 }
                 Err(MaintainError::ConservationViolation {
                     input_sample_count,
@@ -2700,7 +2820,10 @@ mod tests {
     use ravel_commit::publish::RetryPolicy;
     use ravel_commit::record::NewCommitRecord;
     use ravel_commit::{keys, publish, record};
-    use ravel_maintain::{AUDIT_HOLD_SHARD, RetentionPolicy, shard_hold_scopes, write_hold_set};
+    use ravel_maintain::{
+        AUDIT_HOLD_SHARD, Coordination, FixedClock, RequestLedger, RetentionPolicy,
+        shard_hold_scopes, write_hold_set,
+    };
     use ravel_object_store::GetRange;
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
@@ -2895,6 +3018,511 @@ mod tests {
             SHARDS as usize,
             "the two memos partition the owned shards disjointly and completely"
         );
+    }
+
+    /// The ADR-1029 acceptance test: two supervisors whose ownership overlaps
+    /// merge one bucket ONCE when coordination is on, and twice when it is off.
+    ///
+    /// `two_replicas_partition_units_without_double_pay` above cannot show
+    /// this. It seeds one below-threshold bucket per shard and asserts only on
+    /// `already_done`, so it runs no merge at all and never reads
+    /// `MaintainReport::compacted` (ADR-1029's 2026-09-28 amendment, point 3).
+    /// The duplicate this ADR removes lives where ownership OVERLAPS, so this
+    /// test forces the overlap: each replica uses its own SOLO live set, so
+    /// each believes it owns every unit, which is exactly the membership
+    /// handoff window ADR-0065 accepts.
+    ///
+    /// The interleaving is deterministic rather than raced: the store pauses
+    /// the first L1 part PUT (replica A's) until replica B's whole tick has
+    /// finished, so B always reaches the bucket while A is mid-merge and no
+    /// compaction record exists yet. Without that, A would publish first and B
+    /// would stop at the already-compacted gate, which proves nothing about
+    /// claims. The fixture is four one-series inputs under a 1-byte part
+    /// target, so a full merge is FOUR part PUTs and a run cancelled at its
+    /// first part boundary is one: the difference is what makes the
+    /// merge-phase counters discriminating.
+    ///
+    /// Three phases, each asserting on summed `compacted` AND on the request
+    /// counters:
+    ///
+    /// 1. coordination off: `compacted` sums to 2 and both replicas pay a full
+    ///    four-part merge.
+    /// 2. coordination on, no steal: `compacted` sums to 1, only A's ledger
+    ///    shows part PUTs, B reports the bucket `claim_skipped`, and each
+    ///    replica's coordinate phase shows exactly the claim requests it made.
+    /// 3. coordination on, A's lease expires while it is paused and B steals
+    ///    the claim: B merges, and A cancels at the part boundary right after
+    ///    it resumes, having PUT exactly ONE part and published nothing.
+    ///
+    /// Phase 3 is what makes this test discriminating, shown failing against
+    /// both wrong implementations:
+    ///
+    /// - a guard that acquires and never checks (`claim_guard::checkpoint`'s
+    ///   body replaced by `Ok(())`): "still exactly one merge is credited"
+    ///   fails, left 2, right 1, because A finishes its merge and converges.
+    /// - a guard that cancels only at the publish checkpoint (the same
+    ///   function returning early for every other checkpoint): "A stopped at
+    ///   the part boundary right after it resumed" fails, left 4, right 1,
+    ///   because A pays the whole merge before stopping.
+    #[tokio::test]
+    async fn two_supervisors_with_overlapping_ownership_merge_once() {
+        // Phase 1, coordination off: the pre-ADR-1029 behaviour.
+        let off = overlapping_supervisor_tick(Coordination::Off, Interleave::Pause).await;
+        assert_eq!(
+            off.a.compacted + off.b.compacted,
+            2,
+            "without claims both replicas merge the same bucket"
+        );
+        assert_eq!(
+            (
+                off.a_ledger.part_put.requests,
+                off.b_ledger.part_put.requests
+            ),
+            (PARTS, PARTS),
+            "two sets of merge-phase part PUTs: both full merges were paid for"
+        );
+        assert_eq!(
+            off.a.claim_skipped + off.b.claim_skipped,
+            0,
+            "nothing is skipped when nothing is claimed"
+        );
+        assert_eq!(
+            off.a_ledger.coordinate.requests + off.b_ledger.coordinate.requests,
+            0,
+            "and the claim protocol issues no request at all"
+        );
+
+        // Phase 2, coordination on: exactly one merge runs.
+        let on = overlapping_supervisor_tick(Coordination::On, Interleave::Pause).await;
+        assert_eq!(
+            on.a.compacted + on.b.compacted,
+            1,
+            "with claims exactly one replica merges the bucket"
+        );
+        assert_eq!(on.a.compacted, 1, "A holds the claim and merges");
+        assert_eq!(on.b.compacted, 0, "B does not");
+        assert_eq!(
+            on.b.claim_skipped, 1,
+            "B reports the bucket skipped, with the reason, rather than compacted"
+        );
+        assert_eq!(
+            (on.a_ledger.part_put.requests, on.b_ledger.part_put.requests),
+            (PARTS, 0),
+            "exactly one merge ran: only A's ledger shows part PUTs"
+        );
+        assert_eq!(
+            on.a_ledger.coordinate.requests, 2,
+            "A's claim protocol: one acquisition and one completion"
+        );
+        assert_eq!(
+            on.b_ledger.coordinate.requests, 3,
+            "B's: the rejected CreateIfAbsent, and the one GET and one HEAD \
+             that observed the holder"
+        );
+        assert_eq!(
+            on.b_ledger.publish.requests, 0,
+            "and B never reached the publish protocol"
+        );
+
+        // Phase 3, coordination on with A's lease expiring under it: B steals
+        // the claim and merges, and A stops at its next checkpoint.
+        let stolen = overlapping_supervisor_tick(Coordination::On, Interleave::Steal).await;
+        assert_eq!(
+            stolen.a.compacted + stolen.b.compacted,
+            1,
+            "still exactly one merge is credited"
+        );
+        assert_eq!(stolen.b.compacted, 1, "the thief finished the merge");
+        assert_eq!(
+            stolen.a.claim_cancelled, 1,
+            "and the dispossessed owner cancelled rather than compacting"
+        );
+        assert_eq!(stolen.a.compacted, 0);
+        assert_eq!(
+            stolen.a_ledger.part_put.requests, 1,
+            "A stopped at the part boundary right after it resumed: one part \
+             PUT, not the {PARTS} a full merge pays"
+        );
+        assert_eq!(
+            stolen.b_ledger.part_put.requests, PARTS,
+            "B paid the one full merge"
+        );
+        assert_eq!(
+            stolen.a_ledger.publish.requests, 0,
+            "a cancelled run publishes nothing: zero record PUTs"
+        );
+        assert_eq!(
+            stolen.a_ledger.coordinate.requests, 2,
+            "A's claim protocol: the acquisition, and the renewal that \
+             discovered the steal; no completion, because it no longer owns it"
+        );
+        assert_eq!(
+            stolen.b_ledger.coordinate.requests, 5,
+            "B's: the rejected CreateIfAbsent, the GET and HEAD that observed \
+             the expired claim, the steal, and the completion"
+        );
+    }
+
+    /// The claim participant a tick installs for itself reads the tick's own
+    /// injected clock, so lease expiry is judged against that clock and not
+    /// against wall time.
+    ///
+    /// Another process holds the bucket's claim, written at a 2023 instant by
+    /// the store's clock. A tick whose fixed clock sits one second after that
+    /// write finds the lease live and skips the bucket; a second tick whose
+    /// clock is past the lease steals the claim and compacts. Wall time is
+    /// years past the lease either way, so a participant on the wall clock
+    /// steals on the first tick.
+    ///
+    /// Shown failing against the tick that installed its participant on
+    /// `WallClock`: "a lease live by the injected clock holds the bucket"
+    /// reads left 0, right 1.
+    #[tokio::test]
+    async fn a_ticks_own_claim_participant_reads_the_injected_clock() {
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
+        let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let store = MemoryStore::new();
+        store.set_clock_ms((written_ns / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        for seq in 1..=2 {
+            publish_compactable_input(&store, &tenant_id, 0, seq).await;
+        }
+
+        let clock = FixedClock::new(written_ns);
+        let holder = ravel_maintain::claim_guard::ClaimGuard::new(
+            &Bucket::new(tenant, Signal::Metrics, 0, 0),
+            &ClaimParticipant::new(
+                Uuid::from_u128(0xC1A1),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            ),
+            ravel_fleet::claim::ClaimConfig {
+                lease_duration: LEASE,
+                ..ravel_fleet::claim::ClaimConfig::default()
+            },
+            None,
+        );
+        assert!(matches!(
+            holder.acquire(&store).await.expect("holder acquires"),
+            ravel_maintain::claim_guard::Acquire::Acquired
+        ));
+
+        let worker = WorkerSet::with_defaults(written_ns).with_process_id(PINNED_WORKER_ID);
+        let live = worker.solo_live_set();
+        // No participant: the tick installs its own.
+        let config = CompactorConfig {
+            coordination: Coordination::On,
+            claim_min_input_bytes: 1,
+            claim_lease_duration: LEASE,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        clock.set(written_ns + 1_000_000_000);
+        let live_tick = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(
+            live_tick.claim_skipped, 1,
+            "a lease live by the injected clock holds the bucket"
+        );
+        assert_eq!(live_tick.compacted, 0);
+
+        clock.set(written_ns + LEASE.as_nanos() as i64 + 1_000_000_000);
+        let expired_tick = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(
+            (expired_tick.compacted, expired_tick.claim_skipped),
+            (1, 0),
+            "past the lease by the injected clock, the tick steals and compacts"
+        );
+    }
+
+    /// Parts a full merge of the acceptance fixture writes: one per input
+    /// series, under a part target of one byte.
+    const PARTS: u64 = 4;
+
+    /// How the second replica's tick is interleaved with the first's.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Interleave {
+        /// B runs while A is paused mid-merge, with A's claim still live.
+        Pause,
+        /// The same, but A's lease expires first, so B steals the claim.
+        Steal,
+    }
+
+    /// What one overlapping-ownership run produced, per replica.
+    struct OverlappingTick {
+        a: MaintainReport,
+        b: MaintainReport,
+        a_ledger: ravel_maintain::RunRequestReport,
+        b_ledger: ravel_maintain::RunRequestReport,
+    }
+
+    /// Drive two supervisors over one compactable bucket with overlapping
+    /// (solo) ownership, pausing A mid-merge so B reaches the bucket before any
+    /// record exists. Returns both ticks' reports and request ledgers.
+    async fn overlapping_supervisor_tick(
+        coordination: Coordination,
+        interleave: Interleave,
+    ) -> OverlappingTick {
+        const SHARDS: u32 = 1;
+        // A lease long enough that a `MemoryStore` merge never renews inside
+        // it, and short enough that the acquisition jitter (10% of the lease)
+        // costs the test milliseconds. The shipped 300 s default is pinned by
+        // ravel-maintain's `the_cost_gate_decides_whether_a_bucket_is_claimed_at_all`.
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
+        // A modern instant: ingest hour 0 is long sealed by it, and it is the
+        // store's clock too, so a claim written now is not already expired.
+        let now_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let store = Arc::new(PauseFirstPartPut {
+            inner: MemoryStore::new(),
+            a_at_part: tokio::sync::Notify::new(),
+            b_done: tokio::sync::Notify::new(),
+            paused: std::sync::atomic::AtomicBool::new(false),
+        });
+        store.inner.set_clock_ms((now_ns / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        // Four L0 inputs, one series each: over the default
+        // `min_compaction_inputs` of 2, so the bucket is compacted rather than
+        // classified `already_done`, and enough series to split into `PARTS`
+        // parts under the one-byte part target below.
+        for seq in 1..=PARTS {
+            publish_compactable_input(store.as_ref(), &tenant_id, 0, seq).await;
+        }
+
+        // One clock for both replicas: they model two processes on one host,
+        // and phase 3 advances it past A's lease while A is paused, which is
+        // what makes A's next checkpoint renew and discover the steal.
+        let clock = FixedClock::new(now_ns);
+        let a = WorkerSet::with_defaults(now_ns).with_process_id(PINNED_WORKER_ID);
+        let b = WorkerSet::with_defaults(now_ns).with_process_id(PINNED_PEER_ID);
+        // Solo live sets: each replica believes it owns every unit, which is
+        // the double-ownership window a membership change opens.
+        let live_a = a.solo_live_set();
+        let live_b = b.solo_live_set();
+
+        let a_ledger = RequestLedger::new();
+        let b_ledger = RequestLedger::new();
+        let config = |worker: &WorkerSet, ledger: &RequestLedger| CompactorConfig {
+            coordination,
+            // Every bucket clears this, so the fixture does not have to carry
+            // 64 MiB to exercise the claim (the gate itself is pinned by
+            // ravel-maintain's `compaction_claims.rs`).
+            claim_min_input_bytes: 1,
+            claim_lease_duration: LEASE,
+            claim_participant: Some(ClaimParticipant::new(
+                worker.process_id(),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            request_ledger: Some(ledger.clone()),
+            // One part per series, so a run cancelled at its first part
+            // boundary is distinguishable from one that merged everything.
+            max_l1_part_bytes: 1,
+            ..CompactorConfig::default()
+        };
+        let a_config = config(&a, &a_ledger);
+        let b_config = config(&b, &b_ledger);
+
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo_a = MaintainMemo::with_default_interval();
+        let mut memo_b = MaintainMemo::with_default_interval();
+
+        let a_store = Arc::clone(&store);
+        let b_store = Arc::clone(&store);
+        let a_tick = run_tick_with_clock(
+            &clock,
+            a_store.as_ref(),
+            &tenant,
+            &a_config,
+            &retention,
+            SHARDS,
+            &mut memo_a,
+            &safety,
+            &ownership,
+            &a,
+            &live_a,
+        );
+        let tick_clock = clock.clone();
+        let b_tick = async {
+            // B starts only once A is mid-merge, holding its claim with its
+            // first part already written and no record published.
+            b_store.a_at_part.notified().await;
+            if interleave == Interleave::Steal {
+                // Past A's lease, on the store's clock (the expiry base every
+                // contender shares) and on the node clock both read.
+                let expired_ns = now_ns + LEASE.as_nanos() as i64 + 1_000_000_000;
+                b_store.inner.set_clock_ms((expired_ns / 1_000_000) as u64);
+                tick_clock.set(expired_ns);
+            }
+            let report = run_tick_with_clock(
+                &tick_clock,
+                b_store.as_ref(),
+                &tenant,
+                &b_config,
+                &retention,
+                SHARDS,
+                &mut memo_b,
+                &safety,
+                &ownership,
+                &b,
+                &live_b,
+            )
+            .await;
+            b_store.b_done.notify_one();
+            report
+        };
+        let (a_report, b_report) = tokio::join!(a_tick, b_tick);
+
+        OverlappingTick {
+            a: a_report,
+            b: b_report,
+            a_ledger: a_ledger.report(),
+            b_ledger: b_ledger.report(),
+        }
+    }
+
+    /// Seed one real L0 metrics input into `(tenant, Metrics, shard)` at ingest
+    /// hour 0, with a distinct series per `seq` so the merge has content.
+    async fn publish_compactable_input(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        shard: u32,
+        seq: u64,
+    ) {
+        let tenant_hash = tenant.hash();
+        let metric = format!("up{seq}");
+        let label_set = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.clone(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, &metric, &label_set).expect("series id"),
+            labels: label_set,
+            samples: vec![Sample {
+                ts_ns: 1_000 * seq as i64,
+                value: seq as f64,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(u128::from(9_000 + seq));
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: u32::from(ravel_segment::VERSION_V7),
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// A store that pauses the first L1 part PUT until the second replica's
+    /// tick has finished. This is what makes the two-supervisor overlap
+    /// deterministic instead of a race: the paused replica is mid-merge,
+    /// holding its claim, with no compaction record published.
+    struct PauseFirstPartPut {
+        inner: MemoryStore,
+        a_at_part: tokio::sync::Notify,
+        b_done: tokio::sync::Notify,
+        paused: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for PauseFirstPartPut {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            let outcome = self.inner.put(key, data, opts).await;
+            if key.contains("/l1/")
+                && self
+                    .paused
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.a_at_part.notify_one();
+                self.b_done.notified().await;
+            }
+            outcome
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
     }
 
     /// The retention floor is validated against the catalog's max_ingest_lag,
@@ -5838,6 +6466,124 @@ mod tests {
             crate::metrics::MemoryBudgetSnapshot::default(),
             false,
         )
+    }
+
+    /// `bytes_reclaimed` sums the two size-known sweep deletions (quarantine
+    /// reap and unreferenced parts) per signal and accumulates across passes; a
+    /// quiet pass moves nothing and a different signal shares none of it (issue
+    /// #1729). Flip-line proof: drop either term from the `fetch_add` in
+    /// `record_sweep` and the rendered total changes.
+    #[test]
+    fn bytes_reclaimed_accumulates_size_known_deletions_per_signal() {
+        let safety = MaintenanceSafetyMetrics::default();
+        safety.record_sweep(
+            Signal::Metrics,
+            &ravel_maintain::SweepReport {
+                quarantine_reaped_bytes: 100,
+                unreferenced_parts_bytes: 20,
+                ..Default::default()
+            },
+        );
+        safety.record_sweep(
+            Signal::Metrics,
+            &ravel_maintain::SweepReport {
+                quarantine_reaped_bytes: 3,
+                unreferenced_parts_bytes: 4,
+                ..Default::default()
+            },
+        );
+        // A pass that reclaimed nothing must neither move nor drop the total.
+        safety.record_sweep(Signal::Metrics, &ravel_maintain::SweepReport::default());
+
+        assert_eq!(
+            safety.bytes_reclaimed(Signal::Metrics),
+            127,
+            "the sum of quarantine and unreferenced-part bytes over every pass"
+        );
+        assert_eq!(safety.bytes_reclaimed(Signal::Logs), 0);
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"metrics\"} 127"
+            ),
+            "the reclaimed-bytes sample must render the accumulated total:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+    }
+
+    /// `retention_lag_seconds` publishes the per-cycle MAXIMUM across a signal's
+    /// units, in seconds, reads the previous complete value mid-cycle, and is a
+    /// gauge a later shorter cycle lowers (issue #1729). Flip-line proof:
+    /// change the `fetch_max` in `record_scan` to `fetch_add` and cycle 1 sums
+    /// the two units to 240 instead of reporting the worse one, 150.
+    #[test]
+    fn retention_lag_publishes_per_cycle_maximum_in_seconds() {
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // Cycle 1: two metrics units at 90 s and 150 s; the gauge takes the max.
+        safety.begin_scan_cycle();
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 90_000_000_000,
+                ..Default::default()
+            },
+        );
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 150_000_000_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            0,
+            "mid-cycle, before publish, the gauge holds the previous complete value"
+        );
+        safety.publish_scan_cycle();
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            150_000_000_000,
+            "the published value is the cycle maximum, not the sum or the last unit"
+        );
+        assert_eq!(safety.retention_lag_ns(Signal::Logs), 0);
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"metrics\"} 150"
+            ),
+            "150 s of lag must render as 150:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+
+        // Cycle 2: a shorter lag replaces it; the gauge is not sticky.
+        safety.begin_scan_cycle();
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 30_000_000_000,
+                ..Default::default()
+            },
+        );
+        safety.publish_scan_cycle();
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            30_000_000_000,
+            "a later, smaller cycle maximum replaces the old one"
+        );
     }
 
     /// An `OrphanPass::Skip` pass never ran rule 1, so its zero orphan figures

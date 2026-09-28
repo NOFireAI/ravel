@@ -313,13 +313,76 @@ cmd_record() {
 # next dispatch: a task the index calls in-flight that the fleet never
 # pushed a ref for is exactly the silently-dead task CLAUDE.md's
 # reconciliation section exists to catch.
+# Asks the fleet control plane (GET /v1/tasks/<id>) what became of a task
+# that pushed a start ref and no result ref. Prints one line, "<VERDICT>
+# <detail>": RUNNING while it is queued or executing, DEAD once it is
+# terminal without a result on origin, UNRESOLVED when the question could
+# not be asked or the answer is not one of those. The URL comes from
+# FLEET_CP_URL, else FLEET_PUBLIC_URL, else the env file named by
+# RAVEL_FLEET_CP_ENV (default ~/.fleet/cp.env); the token from
+# FLEET_ENQUEUE_TOKEN or the same file. The token goes to curl on stdin,
+# never on its command line.
+fleet_task_verdict() {
+  local task="$1"
+  local env_file="${RAVEL_FLEET_CP_ENV:-${HOME}/.fleet/cp.env}"
+  local url="${FLEET_CP_URL:-${FLEET_PUBLIC_URL:-}}" token="${FLEET_ENQUEUE_TOKEN:-}"
+  if [[ -r "${env_file}" ]]; then
+    # Accepts `KEY=value` and `export KEY=value`, with or without indentation.
+    [[ -n "${url}" ]] || url="$(sed -E -n 's/^[[:space:]]*(export[[:space:]]+)?FLEET_PUBLIC_URL=//p' "${env_file}" | head -1 | tr -d "\"'")"
+    [[ -n "${token}" ]] || token="$(sed -E -n 's/^[[:space:]]*(export[[:space:]]+)?FLEET_ENQUEUE_TOKEN=//p' "${env_file}" | head -1 | tr -d "\"'")"
+  fi
+  if [[ -z "${url}" || -z "${token}" ]]; then
+    echo "UNRESOLVED no control-plane URL or token (set FLEET_CP_URL and FLEET_ENQUEUE_TOKEN)"
+    return
+  fi
+  local out code rc=0
+  out="$(mktemp)"
+  code="$(printf 'Authorization: Bearer %s\n' "${token}" |
+    curl -s --max-time 20 -H @- -o "${out}" -w '%{http_code}' "${url%/}/v1/tasks/${task}")" || rc=$?
+  if ((rc != 0)); then
+    rm -f "${out}"
+    echo "UNRESOLVED control plane at ${url} unreachable (curl exit ${rc}); FLEET_CP_URL overrides the URL"
+    return
+  fi
+  if [[ "${code}" == "404" ]]; then
+    rm -f "${out}"
+    echo "DEAD no such task (404)"
+    return
+  fi
+  if [[ "${code}" != "200" ]]; then
+    rm -f "${out}"
+    echo "UNRESOLVED control plane answered HTTP ${code}"
+    return
+  fi
+  local cp_status result_ref
+  cp_status="$(jq -r '.status // ""' "${out}" 2>/dev/null || true)"
+  result_ref="$(jq -r '.result_ref // ""' "${out}" 2>/dev/null || true)"
+  rm -f "${out}"
+  case "${cp_status}" in
+    queued | pending | waiting | claimed | running)
+      echo "RUNNING ${cp_status}"
+      ;;
+    failed | cancelled | canceled | expired)
+      echo "DEAD ${cp_status}"
+      ;;
+    done)
+      # Only reached with no result ref on origin: a done task whose ref
+      # never arrived lost its final push.
+      echo "DEAD done, but its result ref ${result_ref:-(none)} is not on origin"
+      ;;
+    *)
+      echo "UNRESOLVED control plane status '${cp_status}' is not one this script classifies"
+      ;;
+  esac
+}
+
 cmd_reconcile() {
   local epic="$1"
   local file
   file="$(state_path "${epic}")"
   require_state "${file}" "${epic}"
 
-  local body refs pr_rows blocking=0
+  local body refs blocking=0
   body="$(gh issue view "${epic}" --json body --jq .body)" ||
     die "could not read epic #${epic}; refusing to report reconciliation as clean" 65
   # Neither of these may degrade into an empty answer. An unreachable
@@ -331,14 +394,6 @@ cmd_reconcile() {
   if ((rc != 0)); then
     die "UNKNOWN: git ls-remote origin failed (exit ${rc}); task refs could not be read. Not reporting any task's state." 65
   fi
-  rc=0
-  pr_rows="$(gh pr list --state all --limit 200 \
-    --json number,state,headRefName,mergedAt,headRefOid \
-    --jq '.[] | "\(.headRefName)\t\(.number)\t\(.state)\t\(.headRefOid)"' 2>/dev/null)" || rc=$?
-  if ((rc != 0)); then
-    die "UNKNOWN: gh pr list failed (exit ${rc}); pull-request state could not be read." 65
-  fi
-
   local body_tasks
   body_tasks="$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' <<<"${body}" | sort -u || true)"
 
@@ -354,30 +409,51 @@ cmd_reconcile() {
     fi
   done
 
+  # Pass 1: one verdict per task from live state. Rows are
+  # task, ticket, state, pr, detail joined by the 0x1f unit separator, kept in
+  # a string because macOS bash 3.2 has no associative arrays. Not a tab:
+  # tab is IFS whitespace, so `read` would collapse an empty pr field and
+  # shift the detail into it.
+  local us=$'\x1f'
+  local verdicts=""
   for task in ${body_tasks}; do
-    local has_start=no has_result=no pr_line pr_num pr_state
+    local has_start=no has_result=no pr_row pr_num="" pr_state="" ticket detail=""
     grep -q "refs/heads/task/${task}/start$" <<<"${refs}" && has_start=yes
     grep -q "refs/heads/task/${task}/result$" <<<"${refs}" && has_result=yes
-    pr_line="$(awk -F'\t' -v b="task/${task}/merge" '$1 == b {print; exit}' <<<"${pr_rows}")"
-    pr_num=""
-    pr_state=""
-    if [[ -n "${pr_line}" ]]; then
-      pr_num="$(cut -f2 <<<"${pr_line}")"
-      pr_state="$(cut -f3 <<<"${pr_line}")"
+    # Asked per task by exact branch, never read out of a windowed listing:
+    # a `--limit N` sweep silently drops every older PR, and a landed task
+    # then reads LOST.
+    rc=0
+    pr_row="$(gh pr list --state all --head "task/${task}/merge" --limit 100 \
+      --json number,state --jq '.[] | "\(.number)\t\(.state)"' 2>/dev/null)" || rc=$?
+    if ((rc != 0)); then
+      die "UNKNOWN: gh pr list for task/${task}/merge failed (exit ${rc}); pull-request state could not be read." 65
     fi
+    if [[ -n "${pr_row}" ]]; then
+      # A merged PR wins over any other PR on the same branch.
+      if grep -q $'\tMERGED$' <<<"${pr_row}"; then
+        pr_row="$(grep $'\tMERGED$' <<<"${pr_row}" | head -1)"
+      else
+        pr_row="$(head -1 <<<"${pr_row}")"
+      fi
+      pr_num="$(cut -f1 <<<"${pr_row}")"
+      pr_state="$(cut -f2 <<<"${pr_row}")"
+    fi
+    ticket="$(grep -F "${task}" <<<"${body}" | grep -oE '#[0-9]+' | head -1 || true)"
 
-    # One word per task, and the four that matter are kept apart. RUNNING
-    # and LOST both look like "no result ref", and only fleet_status can
-    # separate them, so neither is asserted here: the pair is UNRESOLVED
-    # and it blocks. Reporting it as RUNNING is how a dead task's ticket
-    # sits unfixed for a session.
     local task_state
     if [[ "${pr_state}" == "MERGED" ]]; then
       task_state="LANDED"
     elif [[ "${has_result}" == "yes" ]]; then
       task_state="COMPLETE"
     elif [[ "${has_start}" == "yes" ]]; then
-      task_state="UNRESOLVED"
+      # A start ref with no result is RUNNING or dead, and refs cannot tell
+      # which. The control plane can; if it cannot be asked, the task stays
+      # UNRESOLVED and blocks.
+      local cp
+      cp="$(fleet_task_verdict "${task}")"
+      task_state="${cp%% *}"
+      detail="${cp#* }"
     else
       task_state="LOST"
     fi
@@ -386,24 +462,55 @@ cmd_reconcile() {
       '.tasks[$task] = ((.tasks[$task] // {}) + {start_ref: $start, result_ref: $result, pr: $pr, pr_state: $prstate, state: $state, reconciled_at: $now}) | .updated = $now' \
       --arg task "${task}" --arg start "${has_start}" --arg result "${has_result}" \
       --arg pr "${pr_num}" --arg prstate "${pr_state}" --arg state "${task_state}"
+    verdicts+="${task}${us}${ticket}${us}${task_state}${us}${pr_num}${us}${detail}"$'\n'
+  done
 
-    case "${task_state}" in
+  # Pass 2: a DEAD task is SUPERSEDED when another task on the same ticket
+  # landed, completed, or is running, because its ticket is already being
+  # served; otherwise it blocks until someone re-dispatches it.
+  local t_ticket t_state t_pr t_detail
+  while IFS="${us}" read -r task t_ticket t_state t_pr t_detail; do
+    [[ -n "${task}" ]] || continue
+    if [[ "${t_state}" == "DEAD" && -n "${t_ticket}" ]]; then
+      local successor
+      successor="$(awk -F"${us}" -v tk="${t_ticket}" -v self="${task}" \
+        '$2 == tk && $1 != self && ($3 == "LANDED" || $3 == "COMPLETE" || $3 == "RUNNING") {print $1; exit}' \
+        <<<"${verdicts}")"
+      if [[ -n "${successor}" ]]; then
+        t_state="SUPERSEDED"
+        t_detail="${t_detail}; ${t_ticket} is served by task ${successor}"
+        with_lock "${file}" mutate "${file}" \
+          '.tasks[$task].state = "SUPERSEDED" | .tasks[$task].superseded_by = $by | .updated = $now' \
+          --arg task "${task}" --arg by "${successor}"
+      fi
+    fi
+    case "${t_state}" in
       UNRESOLVED)
-        echo "UNRESOLVED task ${task}: start pushed, no result ref. Either RUNNING or LOST; fleet_status decides. No new dispatch until it does."
+        echo "UNRESOLVED task ${task}: start pushed, no result ref, and the control plane could not say whether it runs (${t_detail}). No new dispatch until it can."
+        blocking=1
+        ;;
+      DEAD)
+        echo "DEAD  task ${task}: start pushed, no result ref, and the control plane reports ${t_detail}. Re-dispatch ${t_ticket:-its ticket} from a fresh origin/main."
         blocking=1
         ;;
       LOST)
         echo "LOST  task ${task}: no start ref on origin. The dispatch never reached the executor; re-dispatch from a fresh origin/main."
         blocking=1
         ;;
+      RUNNING)
+        echo "OK    task ${task}: running (control plane: ${t_detail})"
+        ;;
+      SUPERSEDED)
+        echo "OK    task ${task}: dead (${t_detail})"
+        ;;
       COMPLETE)
         echo "OK    task ${task}: result ref present, no PR yet (inspect and merge, never re-dispatch)"
         ;;
       LANDED)
-        echo "OK    task ${task}: merged as #${pr_num}"
+        echo "OK    task ${task}: merged as #${t_pr}"
         ;;
     esac
-  done
+  done <<<"${verdicts}"
 
   # PR state for everything the index believes is open.
   local pr

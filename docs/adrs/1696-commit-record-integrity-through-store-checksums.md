@@ -100,6 +100,10 @@ records it together with what it does not cover.
    `object_store`'s retry loop (`AttemptCountingConnector`, `s3.rs:630-669`),
    which sees both; the verification lives there, as a body wrapper that
    hashes bytes as they stream and fails the stream on mismatch.
+   (Narrowed by the 2026-09-27 amendment below: a SHA-256 digest is counted
+   unverified rather than verified, the header is sent through a
+   configuration switch, and the check runs in the adapter over the body the
+   connector's observation belongs to.)
 
 3. **A GET that comes back with no checksum is served and counted, not
    refused.** An endpoint that stores no checksum, or ignores checksum mode,
@@ -117,6 +121,10 @@ records it together with what it does not cover.
    objects keep the format's own crc hierarchy as their check, which is what
    they have today. Commit-family records are always read whole
    (`GetRange::Full` at every decode site), so every record read is covered.
+   (Corrected by the 2026-09-27 amendment below: MinIO-style endpoints return
+   no checksum on a ranged response at all, so the first request of a full
+   read is unranged, and a record read is covered only where the endpoint
+   stored a checksum this adapter can recompute.)
 
 5. **The semantics oracle verifies on read too.** `MemoryStore` already
    verifies `PutOptions::checksum` on put (`crates/ravel-object-store/src/memory.rs:76-85`);
@@ -241,3 +249,52 @@ flowchart LR
      instead of "decode failed; skipping" (`services/ravel-server/src/scrub.rs:599-604`).
   5. Docs: the two contract documents above, the flags reference, and the
      operations guide's S3 endpoint section.
+
+## Amendment (2026-09-27, #1696): checksums come only from unranged responses
+
+<!-- amendment-applies: sections="Decision" pointer="2026-09-27 amendment" -->
+<!-- amendment-supersedes: phrase="so every record read is covered" pointer="2026-09-27 amendment" -->
+
+Decision 4's premise, that S3 returns the whole-object checksum on a range
+read and only the comparison is impossible, does not hold for the endpoints
+this repository runs against. MinIO's GET and HEAD handlers attach
+`x-amz-checksum-*` only when checksum mode is enabled and no `Range` header is
+present, and RustFS, which derives from MinIO, does the same. The first
+implementation issued every `GetRange::Full` read as `Range: bytes=0-(chunk-1)`
+to keep one request inside the request timeout, so on a real endpoint no read
+was ever verified and every one was counted unverified. Decision 2 also names
+SHA-256 as a verified digest, and no SHA-2 implementation is a workspace
+dependency. What the adapter does instead:
+
+- **Checksums are read only from unranged responses.** A ranged response
+  carries none, and the adapter does not look for one.
+- **The first request of a full-object read is unranged.** Its body is read up
+  to `S3HttpConfig::max_request_body_bytes` and the rest of the response is
+  dropped unread, so the per-request memory and timeout bound is the one the
+  ranged first request had. No HEAD precedes it, so a commit record read stays
+  exactly one store request.
+- **An object above one request body is counted unverified.** Its first body
+  is cut at the bound and the remainder fetched with ranged requests, and no
+  single response covers the object the stored checksum was computed over.
+  Every commit-family record is far below the bound.
+- **A SHA-256 stored checksum is counted unverified,** as a composite multipart
+  digest already was. `--s3-upload-integrity sha256` (follow-up task 2) then
+  gives server-side verification on PUT and none on read.
+- **The checksum-mode header is sent on every request `object_store` signs
+  default headers onto, with a configuration switch.** That is every request but
+  a LIST; a LIST carries no such header, because `object_store` does not sign
+  default headers onto it and an unsigned `x-amz-*` header is refused with 403.
+  `S3HttpConfig::request_stored_checksum` (default on) stops sending it, and a
+  store with it off counts every full-object read unverified. The server flag
+  for it belongs to follow-up task 2.
+
+Two smaller corrections to the same decisions. The verification is not a
+streaming body wrapper in the connector: the connector records the response's
+checksum header, and the adapter recomputes the digest over the body it read
+before returning it. And the count decision 3 names
+`ravel_store_get_unverified_total` is on `StoreMetricsSnapshot::get_unverified`
+and `S3Store::get_unverified`; `ravel-server` does not export it at `/metrics`
+until follow-up task 2.
+
+The RustFS contract lane now asserts the premise directly: a `Crc64Nvme` PUT
+read back whole moves the unverified count by exactly 0.

@@ -52,16 +52,21 @@
 //! fold side.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use prost::Message;
+use ravel_cpu_gate::ReadSite;
 use ravel_object_store::StoreError;
 use ravel_proto::catalog::v1::{ColumnStatsSegment, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
 
 use crate::EntryIdentity;
+use crate::charged::reserve_decoded;
 use crate::provisioning::AccountedRecordGet;
+use crate::read_gate::run_snapshot_decode;
 use crate::snapshot_format::{
-    ColumnStatsLimits, SnapshotFormatError, decode_column_stats, decode_head,
+    ColumnStatsLimits, SnapshotFormatError, decode_column_stats, decode_column_stats_header,
+    decode_head,
 };
 
 /// The owned column-statistics inputs a query-time metadata-only plan needs:
@@ -201,8 +206,9 @@ pub(crate) struct ResolvedStatsHead {
 /// object HEAD (or a covered part) points at is not ([`Self::DecodeRefused`])
 /// and the caller logs and counts it (issue #1400).
 pub(crate) enum FetchOutcome {
-    /// Fetched, hash-verified, tenant-checked, part-bound, and decoded.
-    Loaded(DecodedStats),
+    /// Fetched, hash-verified, tenant-checked, part-bound, and decoded, with
+    /// the reservation charging the decoded body (ADR-1702 decision 6).
+    Loaded(DecodedStats, ravel_memory::Reservation),
     /// No usable object, silently: the store GET returned `NotFound` or a
     /// retryable failure (`StoreError::is_retryable`: throttling, a timeout,
     /// a transient blip), the content hash did not match, a part hash was
@@ -266,6 +272,11 @@ pub enum LoadColumnStatsError {
         #[source]
         source: StoreError,
     },
+    /// The process memory budget refused the reservation for a stats object's
+    /// declared uncompressed body (ADR-1702 decision 6). Carries only the
+    /// budget's three figures.
+    #[error("column-stats decode refused: {0}")]
+    MemoryExhausted(#[from] ravel_memory::MemoryExhausted),
 }
 
 /// HEAD object key (docs/catalog-and-mvcc.md key layout, frozen format).
@@ -354,6 +365,8 @@ pub(crate) async fn fetch_stats_object(
     getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
     resolved: &ResolvedStatsRef,
+    budget: &Arc<ravel_memory::MemoryBudget>,
+    gate: Option<&ravel_cpu_gate::ReadGate>,
 ) -> Result<FetchOutcome, LoadColumnStatsError> {
     let data = match getter.accounted_get_full(&resolved.key).await {
         Ok(got) => got.data,
@@ -386,34 +399,34 @@ pub(crate) async fn fetch_stats_object(
     }
 
     let limits = ColumnStatsLimits::default();
-    let decoded = match decode_column_stats(&data, &limits) {
-        Ok(decoded) => decoded,
-        // Decode of an object the ref points at: the fold wrote it, so a
-        // failure to open it is never the ordinary not-covered case. Surface
-        // it for the caller to log once and count (issue #1400); the query
-        // still degrades to a miss and scans.
+    // Every header check runs on the peeked header, before the body is charged
+    // or decoded, so a foreign-tenant or stale-binding object is reported as
+    // what it is rather than as a budget refusal. A header that does not parse
+    // fails `decode_column_stats` the same way, so it takes the same refusal
+    // arm.
+    let header = match decode_column_stats_header(&data) {
+        Ok(peek) => peek.header,
         Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
     };
+
+    if header.tenant_hash != tenant.0.to_vec() {
+        return Err(LoadColumnStatsError::TenantHashMismatch {
+            key: resolved.key.clone(),
+            expected: tenant.to_hex(),
+            actual: hex::encode(&header.tenant_hash),
+        });
+    }
 
     // A part's field 7 promises a v3 envelope; `decode_column_stats` only
     // checks the envelope byte against the object's OWN header, never against
     // which slot named it. A mismatch here means the object at `resolved.key`
     // is not v3 (a stale object left behind by a downgrade, or a future writer
     // bug), so it must not be accepted: degrade like any other stale binding.
-    if decoded.header.tenant_hash != tenant.0.to_vec() {
-        return Err(LoadColumnStatsError::TenantHashMismatch {
-            key: resolved.key.clone(),
-            expected: tenant.to_hex(),
-            actual: hex::encode(&decoded.header.tenant_hash),
-        });
-    }
-
-    if decoded.header.format_version != resolved.expected_version {
+    if header.format_version != resolved.expected_version {
         return Ok(FetchOutcome::Absent);
     }
 
-    let actual_part_blake3: Result<Vec<[u8; 32]>, _> = decoded
-        .header
+    let actual_part_blake3: Result<Vec<[u8; 32]>, _> = header
         .part_blake3
         .iter()
         .map(|h| <[u8; 32]>::try_from(h.as_slice()))
@@ -424,6 +437,28 @@ pub(crate) async fn fetch_stats_object(
     if actual_part_blake3 != resolved.expected_part_blake3 {
         return Ok(FetchOutcome::Absent);
     }
+
+    // ADR-1702 decision 6: charge the declared body before decoding it.
+    let reservation = reserve_decoded(
+        budget,
+        header.body_uncompressed_len,
+        limits.max_column_stats_bytes,
+    )?;
+    let (decoded, reservation) = match run_snapshot_decode(
+        gate,
+        ReadSite::CatalogColumnStats,
+        header.body_uncompressed_len,
+        move || decode_column_stats(&data, &limits).map(|decoded| (decoded, reservation)),
+    )
+    .await
+    {
+        Ok(decoded) => decoded,
+        // Decode of an object the ref points at: the fold wrote it, so a
+        // failure to open it is never the ordinary not-covered case. Surface
+        // it for the caller to log once and count (issue #1400); the query
+        // still degrades to a miss and scans.
+        Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
+    };
 
     let mut segments = HashMap::new();
     let mut by_content_hash = HashMap::new();
@@ -452,8 +487,11 @@ pub(crate) async fn fetch_stats_object(
         }
     }
 
-    Ok(FetchOutcome::Loaded(DecodedStats {
-        segments,
-        by_content_hash,
-    }))
+    Ok(FetchOutcome::Loaded(
+        DecodedStats {
+            segments,
+            by_content_hash,
+        },
+        reservation,
+    ))
 }

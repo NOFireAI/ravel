@@ -1374,6 +1374,140 @@ async fn upload_checksum_store_rejects_corrupt_in_flight() {
     );
 }
 
+/// ADR-1696 decision 5, the read-side mirror of
+/// [`upload_checksum_store_rejects_corrupt_in_flight`]: a store that keeps a
+/// checksum beside an object must refuse a full-object get whose stored bytes
+/// no longer match it, rather than handing the caller a record that decodes
+/// cleanly with a wrong field in it.
+///
+/// The corruption is at rest --- `MemoryStore::corrupt_stored_byte` flips one
+/// bit of the stored object and leaves the checksum recorded at write time
+/// alone, which is bit rot, not a rewrite --- and the read goes through a
+/// `FaultStore` scripted to corrupt the *returned* bytes on top. That ordering
+/// is the point: the wrapper calls the backend first, so the backend's own
+/// verification refuses the read before the wrapper's flip can reach the
+/// caller. The fault counter proves the wrapper really was in the path (a plan
+/// that never matched would make this a plain `MemoryStore` test), and the
+/// error is the backend's, not the wrapper's.
+///
+/// Reverting the `GetRange::Full` check in `MemoryStore::get` makes the get
+/// return `Ok` with bit-flipped bytes, failing the first assertion.
+#[tokio::test]
+async fn full_object_get_of_a_corrupted_stored_object_is_refused() {
+    let inner = MemoryStore::new();
+    let key = "corrupt/at-rest";
+    let payload = Bytes::from_static(b"a stored record whose bytes rot in place");
+    inner
+        .put(key, payload.clone(), PutOptions::create_if_absent())
+        .await
+        .expect("seed the object");
+    inner
+        .corrupt_stored_byte(key, 3, 6)
+        .expect("flip one bit of the stored object");
+
+    let plan = FaultPlan::empty().with_rule(Rule::new(Op::Get, ScriptedFault::CorruptRange));
+    let store = FaultStore::new(inner, plan);
+
+    let err = store
+        .get(key, GetRange::Full)
+        .await
+        .expect_err("a full-object get of corrupted stored bytes must be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+    assert_eq!(
+        store.fault_count(Op::Get, FaultKind::CorruptRange),
+        1,
+        "the corruption fault must have fired exactly once"
+    );
+}
+
+/// The other half of ADR-1696 decision 4, stated as its own case so the two
+/// cannot drift: a *ranged* read of the same corrupted object is served. The
+/// stored checksum covers the whole object and a slice cannot be compared
+/// against it, so refusing here would fail every suffix read of every segment;
+/// those keep the format's own crc hierarchy as their check.
+#[tokio::test]
+async fn a_ranged_get_of_a_corrupted_stored_object_is_still_served() {
+    let store = MemoryStore::new();
+    let key = "corrupt/ranged";
+    store
+        .put(
+            key,
+            Bytes::from_static(b"0123456789abcdef"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed the object");
+    store
+        .corrupt_stored_byte(key, 0, 0)
+        .expect("flip one bit of the stored object");
+
+    let got = store
+        .get(key, GetRange::Range(8, 16))
+        .await
+        .expect("a ranged read is outside the whole-object check");
+    assert_eq!(
+        &got.data[..],
+        b"89abcdef",
+        "the ranged bytes must be served unchanged"
+    );
+    let err = store
+        .get(key, GetRange::Full)
+        .await
+        .expect_err("the same object read whole must still be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+}
+
+/// A pin decides which bytes are served, never whether they are checked: the
+/// pinned read paths refuse a corrupted stored object exactly as `get` does.
+/// The pin is taken before the corruption and still matches after it, because
+/// bit rot at rest changes neither the ETag nor the version, so the read gets
+/// past both halves of the pin and only the stored CRC-32C can refuse it.
+///
+/// Removing the `verify_full_read` call from `MemoryStore::get_pinned` makes
+/// the first `expect_err` below fail with the flipped bytes served; removing it
+/// from `MemoryStore::get_with_pin` does the same to the second.
+#[tokio::test]
+async fn pinned_full_reads_of_a_corrupted_stored_object_are_refused() {
+    let store = MemoryStore::new();
+    let key = "corrupt/pinned";
+    store
+        .put(
+            key,
+            Bytes::from_static(b"a pinned record whose bytes rot in place"),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed the object");
+    let (_, pin) = store.pin_of(key).await.expect("pin the seeded object");
+    assert!(
+        pin.version.is_some(),
+        "the oracle reports a version selector, so the pin exercises both halves"
+    );
+    store
+        .corrupt_stored_byte(key, 5, 2)
+        .expect("flip one bit of the stored object");
+
+    let err = store
+        .get_pinned(key, GetRange::Full, &pin)
+        .await
+        .expect_err("a pinned full read of corrupted stored bytes must be refused");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+
+    let err = store
+        .get_with_pin(key, GetRange::Full)
+        .await
+        .expect_err("a full read that reports its pin must also refuse corrupted bytes");
+    assert!(matches!(err, StoreError::Corrupted(_)), "got {err:?}");
+
+    // The pin still matches: a ranged pinned read is served, which is what
+    // shows the refusal above came from the checksum and not from the pin.
+    let got = store
+        .get_pinned(key, GetRange::Range(0, 2), &pin)
+        .await
+        .expect("a ranged pinned read is outside the whole-object check");
+    assert_eq!(&got.outcome.data[..], b"a ");
+}
+
 /// The startup gate `--mode maintain` applies, asserted against the real
 /// `S3Store` without an endpoint: `required_capabilities(Mode::
 /// Maintain)` is `mandatory()` with `multipart: true`, and this is the
@@ -1454,6 +1588,7 @@ async fn rustfs_contract() {
         auth: Default::default(),
         instance_metadata_endpoint: None,
     };
+    let checksum_config = config.clone();
     // A small page size, like `memory_store_paged_contract`, so the
     // pagination assertion exercises `list_with_offset` continuation
     // against the real bucket instead of fitting in a single page.
@@ -1476,6 +1611,11 @@ async fn rustfs_contract() {
     assert_multipart_composite_etag(&store, &format!("{root}/multipart-etag/")).await;
     assert_put_above_threshold_uses_multipart(&store, &format!("{root}/multipart-threshold/"))
         .await;
+    assert_full_read_is_verified_on_a_real_endpoint(
+        checksum_config,
+        &format!("{root}/read-checksum/"),
+    )
+    .await;
 
     let leftovers = list_all(&store, &format!("{root}/"))
         .await
@@ -1483,6 +1623,54 @@ async fn rustfs_contract() {
     for meta in leftovers {
         let _ = store.delete(&meta.key).await;
     }
+}
+
+/// ADR-1696 read-side verification against a real endpoint, which is the only
+/// place the fake-endpoint tests cannot speak for: whether the endpoint stores
+/// the checksum a `Crc64Nvme` PUT attached and returns it on a full-object GET.
+/// A `get_unverified` delta of exactly 0 means the read took the verified path;
+/// an endpoint that dropped the header, or an adapter that sent the first
+/// request ranged (MinIO-derived endpoints return no checksum then), moves it
+/// to 1. A caller-issued ranged read of the same object is served and does not
+/// count either way.
+async fn assert_full_read_is_verified_on_a_real_endpoint(config: S3Config, prefix: &str) {
+    let http = S3HttpConfig {
+        upload_integrity: UploadIntegrity::Crc64Nvme,
+        ..Default::default()
+    };
+    let store = S3Store::with_http_config(config, http)
+        .expect("an S3Store with Crc64Nvme upload integrity must build");
+    let key = format!("{prefix}record");
+    // Commit-record sized: one request, far below the read chunk bound.
+    let payload = Bytes::from((0..200u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    store
+        .put(&key, payload.clone(), PutOptions::create_if_absent())
+        .await
+        .expect("a Crc64Nvme put must be accepted by the endpoint");
+
+    let before = store.get_unverified();
+    let got = store
+        .get(&key, GetRange::Full)
+        .await
+        .expect("a full-object read of an intact object must be served");
+    assert_eq!(got.data, payload, "the full read returns the stored bytes");
+    assert_eq!(
+        store.get_unverified() - before,
+        0,
+        "the full read must be verified against the stored crc64nvme, not \
+         counted unverified"
+    );
+
+    let ranged = store
+        .get(&key, GetRange::Range(16, 48))
+        .await
+        .expect("a caller-issued ranged read must be served");
+    assert_eq!(&ranged.data[..], &payload[16..48], "the ranged bytes");
+    assert_eq!(
+        store.get_unverified() - before,
+        0,
+        "a caller-issued ranged read is outside the check and not counted"
+    );
 }
 
 /// Real floci conformance test: the capability gate ADR-0034 decision 8 makes

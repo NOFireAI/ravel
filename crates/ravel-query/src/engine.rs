@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use futures::stream::{self, StreamExt};
 use promql_parser::parser::{Expr, Offset};
 use ravel_catalog::{Catalog, SegmentRef, ShardGeneration, Snapshot};
+use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
     Annotations, Evaluator, FloatHistogram, HistogramSeriesData, LabelMatcher, MatchOp, PlanAnchor,
@@ -443,6 +444,11 @@ pub struct QueryEngine {
     /// is the default: an engine nobody asked for a live view from registers
     /// nothing. See [`QueryEngine::with_live_usage`].
     live_usage: Option<LiveQueryAccounting>,
+    /// The read CPU gate (ADR-1702 decisions 1 and 4) this engine's fetchers
+    /// decode on and a PromQL evaluation over the gate's evaluation floor runs
+    /// on. `None`, the default, keeps both inline. See
+    /// [`QueryEngine::with_read_gate`].
+    read_gate: Option<Arc<ReadGate>>,
 }
 
 impl QueryEngine {
@@ -513,7 +519,47 @@ impl QueryEngine {
             distributed: None,
             federation: None,
             live_usage: None,
+            read_gate: None,
         }
+    }
+
+    /// Runs this engine's CPU-bound read work on `gate` (ADR-1702 decisions 1
+    /// and 4): `fetcher`'s RSEG catalog decodes (`segment_section` and
+    /// `segment_sparse_catalog`), `log_fetcher`'s RLOG decodes as
+    /// [`LogSegmentFetcher::with_read_gate`] lists them (scan opens as
+    /// `log_postings`, blocks as `log_block`, block-range directory sections
+    /// as `log_section`), and each PromQL evaluation whose sample count, known
+    /// once the prefetch has returned, is at or above the gate's evaluation
+    /// floor. A smaller evaluation runs inline and counts as an inline job.
+    /// RSEG page decodes stay inline.
+    #[must_use]
+    pub fn with_read_gate(mut self, gate: Arc<ReadGate>) -> Self {
+        self.fetcher = self.fetcher.with_read_gate(Arc::clone(&gate));
+        self.log_fetcher = self.log_fetcher.with_read_gate(Arc::clone(&gate));
+        self.read_gate = Some(gate);
+        self
+    }
+
+    /// Evaluates over `source` with `eval`: on the read gate when one is set,
+    /// sized by the samples `source` holds, and inline otherwise.
+    async fn evaluate<R, F>(
+        &self,
+        source: MergedSource,
+        query: &str,
+        eval: F,
+    ) -> Result<R, QueryError>
+    where
+        F: FnOnce(&MergedSource, &str) -> Result<R, ravel_promql::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        let Some(gate) = &self.read_gate else {
+            return Ok(eval(&source, query)?);
+        };
+        let size = JobSize::Samples(source.sample_count());
+        let query = query.to_string();
+        Ok(gate
+            .run(ReadSite::PromqlEval, size, move || eval(&source, &query))
+            .await??)
     }
 
     /// Opts this engine into ADR-0071 distributed read fan-out.
@@ -618,6 +664,7 @@ impl QueryEngine {
             distributed: self.distributed.clone(),
             federation: self.federation.clone(),
             live_usage: self.live_usage.clone(),
+            read_gate: self.read_gate.clone(),
         }
     }
 
@@ -647,6 +694,7 @@ impl QueryEngine {
             distributed: self.distributed.clone(),
             federation: self.federation.clone(),
             live_usage: Some(live.clone()),
+            read_gate: self.read_gate.clone(),
         }
     }
 
@@ -799,8 +847,12 @@ impl QueryEngine {
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
             .with_deadline(eval_deadline);
-        let (value, annotations) = tracing::debug_span!("evaluate", eval_kind = "instant")
-            .in_scope(|| evaluator.eval_instant_annotated(&source, query, t_ms))?;
+        let span = tracing::debug_span!("evaluate", eval_kind = "instant");
+        let (value, annotations) = self
+            .evaluate(source, query, move |source, query| {
+                span.in_scope(|| evaluator.eval_instant_annotated(source, query, t_ms))
+            })
+            .await?;
         Ok((value, annotations, stats))
     }
 
@@ -1014,10 +1066,14 @@ impl QueryEngine {
         let evaluator = Evaluator::new()
             .with_default_step(self.config.default_evaluation_interval)?
             .with_deadline(eval_deadline);
-        let (value, annotations) =
-            tracing::debug_span!("evaluate", eval_kind = "range").in_scope(|| {
-                evaluator.eval_range_hist_annotated(&source, query, start_ms, end_ms, step_ms)
-            })?;
+        let span = tracing::debug_span!("evaluate", eval_kind = "range");
+        let (value, annotations) = self
+            .evaluate(source, query, move |source, query| {
+                span.in_scope(|| {
+                    evaluator.eval_range_hist_annotated(source, query, start_ms, end_ms, step_ms)
+                })
+            })
+            .await?;
         Ok((value, annotations, stats))
     }
 
@@ -4663,6 +4719,32 @@ struct MergedSource {
     precomputed_count: Option<PrecomputedCount>,
 }
 
+impl MergedSource {
+    /// Every sample an evaluation over this source can read, the figure the
+    /// read gate's evaluation floor is compared against (ADR-1702 decision 1).
+    /// A pushdown count table contributes one per series count it carries.
+    fn sample_count(&self) -> u64 {
+        let float = self
+            .series
+            .iter()
+            .chain(&self.log_series)
+            .map(|s| s.samples.len())
+            .sum::<usize>();
+        let histogram = self
+            .histogram_series
+            .iter()
+            .map(|s| s.samples.len())
+            .sum::<usize>();
+        let counted = self
+            .precomputed_count
+            .as_ref()
+            .map_or(0, |c| c.counts.len());
+        (float as u64)
+            .saturating_add(histogram as u64)
+            .saturating_add(counted as u64)
+    }
+}
+
 impl SeriesSource for MergedSource {
     fn query(
         &self,
@@ -7751,6 +7833,129 @@ mod prefetch_tests {
             None,
             "a different matcher set must not serve the stale table"
         );
+    }
+
+    /// ADR-1702 follow-up task 7, PromQL site: with the evaluation floor at 2
+    /// samples, a range evaluation over 3 samples (one over the floor) runs as
+    /// exactly one read gate job and an instant evaluation over 1 sample (one
+    /// under it) runs inline and counts exactly once as inline. Both values
+    /// equal the ungated engine's. The same 3-sample range evaluation is a
+    /// gate job at a floor of exactly 3 and inline at 4.
+    ///
+    /// FLIP, the boundary: running a sample count equal to the floor inline
+    /// (`<=` for `<` in `ravel-cpu-gate`'s `runs_inline`) reads
+    /// `left: (0, 1), right: (1, 0)` on the `evaluation floor 3` assertion.
+    ///
+    /// FLIP, one call site at a time (call the closure on `&source` directly
+    /// instead of through `self.evaluate(...)`, which is the pre-change code):
+    /// - `range_hist_inner`: the first `PromqlEval` assertion reads
+    ///   `left: (0, 0), right: (1, 0)`;
+    /// - `instant_inner`: the second reads `left: (1, 0), right: (1, 1)`.
+    #[tokio::test]
+    async fn promql_evaluation_over_the_floor_runs_through_the_read_gate() {
+        use crate::read_gate_test_support::{gate_with_eval_floor, site_counts};
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for (seq, minutes) in [(1, 1), (2, 2), (3, 3)] {
+            publish_metric(
+                &store,
+                tenant_hash,
+                seq,
+                "metric_big",
+                BASE_NS - minutes * NS_PER_MIN,
+                minutes as f64,
+            )
+            .await;
+        }
+        publish_metric(
+            &store,
+            tenant_hash,
+            4,
+            "metric_small",
+            BASE_NS - NS_PER_MIN,
+            7.0,
+        )
+        .await;
+        let deadline = Duration::from_secs(30);
+        let big = "count_over_time(metric_big[5m])";
+        let small = "metric_small";
+
+        let ungated = engine(Arc::clone(&store));
+        let (want_big, _) = ungated
+            .range(
+                tenant_hash,
+                big,
+                BASE_MS,
+                BASE_MS,
+                60_000,
+                &[],
+                BASE_NS,
+                deadline,
+            )
+            .await
+            .expect("ungated range");
+        let (want_small, _) = ungated
+            .instant(tenant_hash, small, BASE_MS, &[], BASE_NS, deadline)
+            .await
+            .expect("ungated instant");
+
+        let gate = gate_with_eval_floor(2);
+        let gated = engine(Arc::clone(&store)).with_read_gate(Arc::clone(&gate));
+        let (got_big, _) = gated
+            .range(
+                tenant_hash,
+                big,
+                BASE_MS,
+                BASE_MS,
+                60_000,
+                &[],
+                BASE_NS,
+                deadline,
+            )
+            .await
+            .expect("gated range");
+        assert_eq!(site_counts(&gate, ReadSite::PromqlEval), (1, 0));
+        let (got_small, _) = gated
+            .instant(tenant_hash, small, BASE_MS, &[], BASE_NS, deadline)
+            .await
+            .expect("gated instant");
+        assert_eq!(site_counts(&gate, ReadSite::PromqlEval), (1, 1));
+
+        assert_eq!(format!("{got_big:?}"), format!("{want_big:?}"));
+        assert_eq!(format!("{got_small:?}"), format!("{want_small:?}"));
+        assert!(
+            format!("{got_big:?}").contains("3.0"),
+            "the range evaluation counted all three samples: {got_big:?}"
+        );
+        // The engine's fetcher decodes on the same gate, under its own site:
+        // each of the two queries decodes all four segments' catalogs.
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSection), (8, 0));
+
+        // Exactly at the floor goes to the gate; one sample short of it runs
+        // inline, which also pins the range evaluation's count at 3.
+        for (floor, want) in [(3, (1, 0)), (4, (0, 1))] {
+            let gate = gate_with_eval_floor(floor);
+            let (got, _) = engine(Arc::clone(&store))
+                .with_read_gate(Arc::clone(&gate))
+                .range(
+                    tenant_hash,
+                    big,
+                    BASE_MS,
+                    BASE_MS,
+                    60_000,
+                    &[],
+                    BASE_NS,
+                    deadline,
+                )
+                .await
+                .expect("gated range");
+            assert_eq!(format!("{got:?}"), format!("{want_big:?}"));
+            assert_eq!(
+                site_counts(&gate, ReadSite::PromqlEval),
+                want,
+                "evaluation floor {floor}"
+            );
+        }
     }
 
     /// Two selectors for two disjoint metrics: the merged source must

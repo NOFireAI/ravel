@@ -6878,6 +6878,115 @@ mod tests {
         }
     }
 
+    /// Parse the shipped `deploy/k8s/operator/operator.yaml`'s `Deployment`
+    /// document. Reads the checked-in file rather than anything the
+    /// reconciler renders, so
+    /// [`shipped_operator_deployment_security_context_matches_rendered`]
+    /// below compares the manifest a cluster actually applies against
+    /// [`container_security_context`]/[`pod_security_context`], not those
+    /// functions against themselves.
+    fn shipped_operator_deployment() -> Deployment {
+        use serde::Deserialize;
+
+        let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/k8s/operator/operator.yaml");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", manifest_path.display()));
+        for document in serde_yaml_ng::Deserializer::from_str(&manifest) {
+            let value = serde_yaml_ng::Value::deserialize(document)
+                .expect("each YAML document in operator.yaml parses");
+            if value.get("kind").and_then(serde_yaml_ng::Value::as_str) == Some("Deployment") {
+                return serde_yaml_ng::from_value(value)
+                    .expect("the shipped Deployment document deserializes as a k8s Deployment");
+            }
+        }
+        panic!("deploy/k8s/operator/operator.yaml has no Deployment document");
+    }
+
+    #[test]
+    fn shipped_operator_deployment_security_context_matches_rendered() {
+        // Deliverable 1 (ADR-1731): the operator's OWN shipped Deployment
+        // must carry the exact container and pod SecurityContext
+        // `container_security_context`/`pod_security_context` render for
+        // every other container, not a hand-hardened approximation that can
+        // drift from them. Unlike
+        // `every_rendered_container_drops_all_capabilities_and_runs_non_root`
+        // above (which checks objects the reconciler renders), this parses
+        // the checked-in manifest file itself.
+        let dep = shipped_operator_deployment();
+        let pod = pod_spec_of(&dep);
+        let container = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "ravel-operator")
+            .expect("operator.yaml's Deployment has a ravel-operator container");
+
+        let shipped_container_sc = container
+            .security_context
+            .clone()
+            .expect("operator.yaml's ravel-operator container has a securityContext");
+        assert_eq!(
+            shipped_container_sc,
+            container_security_context(),
+            "deploy/k8s/operator/operator.yaml's container securityContext must equal \
+             container_security_context()'s output field-for-field"
+        );
+
+        let shipped_pod_sc = pod
+            .security_context
+            .clone()
+            .expect("operator.yaml's PodSpec has a securityContext");
+        assert_eq!(
+            shipped_pod_sc,
+            pod_security_context(),
+            "deploy/k8s/operator/operator.yaml's pod securityContext must equal \
+             pod_security_context()'s output field-for-field"
+        );
+    }
+
+    #[test]
+    fn shipped_operator_deployment_probes_match_rendered_server_tier_probes() {
+        // ADR-1731 decision 5: the operator's own probe cadence equals what
+        // `probes_on` renders for the server tiers. Only the port differs:
+        // the manifest names the operator's `health` container port, so the
+        // rendered probe is compared with its port replaced by that name.
+        let dep = shipped_operator_deployment();
+        let container = pod_spec_of(&dep)
+            .containers
+            .iter()
+            .find(|c| c.name == "ravel-operator")
+            .expect("operator.yaml's Deployment has a ravel-operator container");
+        let health_port = container
+            .ports
+            .as_ref()
+            .and_then(|ports| ports.iter().find(|p| p.name.as_deref() == Some("health")))
+            .expect("operator.yaml's container declares a `health` port");
+        assert_eq!(
+            health_port.container_port, 8080,
+            "the `health` port matches the --listen-health default"
+        );
+
+        let (rendered_liveness, rendered_readiness) = probes_on(HTTP_PORT);
+        let on_health_port = |mut probe: Probe| {
+            if let Some(http_get) = probe.http_get.as_mut() {
+                http_get.port = IntOrString::String("health".to_string());
+            }
+            probe
+        };
+        assert_eq!(
+            container.liveness_probe.clone(),
+            Some(on_health_port(rendered_liveness)),
+            "deploy/k8s/operator/operator.yaml's livenessProbe must equal the server \
+             tiers' rendered liveness probe on the `health` port"
+        );
+        assert_eq!(
+            container.readiness_probe.clone(),
+            Some(on_health_port(rendered_readiness)),
+            "deploy/k8s/operator/operator.yaml's readinessProbe must equal the server \
+             tiers' rendered readiness probe on the `health` port"
+        );
+    }
+
     #[test]
     fn each_tier_renders_a_pod_disruption_budget_and_anti_affinity() {
         // Deliverable 3 and 4, render-level. The PDB count equals the number of

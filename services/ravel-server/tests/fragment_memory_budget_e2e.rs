@@ -154,6 +154,7 @@ async fn publish_large_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId
 fn distrib_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
+        sql_ticket_keys: None,
         max_inflight_fragments: 8,
         max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {
@@ -183,6 +184,7 @@ async fn start_server(
         max_flush_delay: std::time::Duration::from_secs(2),
         max_flush_delay_idle: std::time::Duration::from_secs(40),
         min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
         mode: Mode::All,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),

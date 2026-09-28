@@ -24,7 +24,7 @@ pub use error::{
 };
 pub use handlers::include_log_metric_names;
 pub use metadata_cache::{
-    MetadataCache, MetadataCacheConfig, MetadataCacheCounters, MetadataSnapshot,
+    MetadataCache, MetadataCacheConfig, MetadataCacheCounters, MetadataRecord, MetadataSnapshot,
 };
 pub use service::{
     InstantOutcome, InstantRequest, LabelValuesOutcome, LabelsOutcome, LiveUsage, MSG_CONCURRENCY,

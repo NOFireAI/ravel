@@ -50,6 +50,11 @@ pub struct LogIngestMetrics {
     /// Flushes opened because the tenant buffer aged past `max_flush_delay`.
     /// Attempt-time, same as `flushes_by_size`.
     flushes_by_age: AtomicU64,
+    /// Flushes opened because a tenant buffer below a non-zero
+    /// `idle_flush_byte_floor` aged past the sub-floor hold,
+    /// `max_flush_lifetime` less one `flush_tick` ([`FlushTrigger::AgeFloor`],
+    /// ADR-1737 decision 6). Attempt-time.
+    flushes_by_age_floor: AtomicU64,
     /// Flushes opened by any [`FlushTrigger::Manual`] path. Attempt-time.
     flushes_manual: AtomicU64,
     /// Retried PUT attempts across both the data-object and commit-record
@@ -101,6 +106,38 @@ pub struct LogIngestMetrics {
     /// `clock_regressions` (absorbed). Intended for Prometheus export under the
     /// name `ravel_ingest_clock_regressions_refused_total` (#1473).
     clock_regressions_refused: AtomicU64,
+    /// Flushes refused because the raw flush-open reading lagged the object
+    /// store's observed clock by more than the clock-skew allowance (ADR-1685):
+    /// the writer's clock is slow enough to publish into a sealed ingest hour.
+    /// Intended for Prometheus export under the name
+    /// `ravel_ingest_clock_lag_refused_total`.
+    clock_lag_refused: AtomicU64,
+    /// Flush-open attempts that found no store-clock observation yet, so the
+    /// ADR-1685 lag check could not run and the flush proceeded unchecked. The
+    /// counter is cumulative and never resets, so the wiring-defect signal is a
+    /// value still GROWING past a process's first minute, not a nonzero one:
+    /// the attempts made before the first response was observed are expected,
+    /// and they stay in the total for the life of the process. Intended for
+    /// Prometheus export under the name
+    /// `ravel_ingest_clock_lag_unchecked_total`.
+    clock_lag_unchecked: AtomicU64,
+    /// Flush-open attempts on a teardown drain that found a lagging reading and
+    /// went on with the ADR-1685 check bypassed.
+    /// A lag refusal re-anchors nothing (unlike a regression refusal), so every
+    /// enforced pass of a drain reads the same lag and refuses again; on a
+    /// `Shutdown` or channel-close drain the bypass passes run the flush anyway
+    /// rather than strand acknowledged buffered-mode rows. It counts the
+    /// bypass, not the publication: the ADR-1307 floor still applies on a
+    /// bypass pass, so an over-bound backwards step the lag check had kept the
+    /// floor from seeing refuses one such attempt and re-anchors the floor, and
+    /// the attempt after it publishes. Those rows land in an ingest hour
+    /// the fold may already have sealed, invisible to token-less reads until a
+    /// HEAD rebuild, which is recoverable where the drop is not. Nonzero means a
+    /// writer was shut down with a lagging clock: fix the host clock, and rebuild
+    /// the catalog HEAD if a token-less read is missing the rows. Logged at WARN
+    /// beside this bump, naming the lag. Intended for Prometheus export under the
+    /// name `ravel_ingest_clock_lag_bypassed_at_shutdown_total`.
+    clock_lag_bypassed_at_shutdown: AtomicU64,
     /// Tenants still buffered after a TEARDOWN `flush_all` (`Shutdown`, channel
     /// close) exhausted its bounded retry passes (ADR-1307 finding F1): a lost
     /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
@@ -108,6 +145,19 @@ pub struct LogIngestMetrics {
     /// `FlushNow` drain is not counted here: the actor keeps running with those
     /// tenants buffered, so the next trigger retries them and nothing is lost
     /// (logged at WARN instead).
+    ///
+    /// An ADR-1685 lag refusal on its own never reaches here: a teardown
+    /// drain's bypass passes disable that check and publish
+    /// (`clock_lag_bypassed_at_shutdown`). Teardown residue needs every
+    /// enforced pass refused, by the lag check or by the ADR-1307 floor, and
+    /// every bypass pass refused by that floor. A lag refusal returns before
+    /// the floor is read, so what the bypass passes need is
+    /// [`crate::MAX_FLUSH_ALL_PASSES`] consecutive backwards steps past the
+    /// hold bound on their own readings, the same count the floor alone needed
+    /// for residue before this check existed. One such step is not enough even
+    /// when a lag refusal keeps the floor from seeing it until the first bypass
+    /// pass: that refusal re-anchors the floor, and the next bypass pass
+    /// publishes.
     flush_all_residue_tenants: AtomicU64,
     /// Multi-shard Strict writes that returned
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
@@ -249,6 +299,7 @@ pub struct LogIngestMetrics {
 pub struct LogIngestMetricsSnapshot {
     pub flushes_by_size: u64,
     pub flushes_by_age: u64,
+    pub flushes_by_age_floor: u64,
     pub flushes_manual: u64,
     pub put_retries: u64,
     pub abandoned_retry_exhausted: u64,
@@ -270,6 +321,21 @@ pub struct LogIngestMetricsSnapshot {
     /// bound (ADR-1307). Intended for export as
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     pub clock_regressions_refused: u64,
+    /// Flushes refused because the raw flush-open reading lagged the store's
+    /// observed clock beyond the clock-skew allowance (ADR-1685). Intended for
+    /// export as `ravel_ingest_clock_lag_refused_total`.
+    pub clock_lag_refused: u64,
+    /// Flush-open attempts made before any store-clock observation, so the
+    /// ADR-1685 lag check did not run. Intended for export as
+    /// `ravel_ingest_clock_lag_unchecked_total`.
+    pub clock_lag_unchecked: u64,
+    /// Flush-open attempts a teardown drain made with the ADR-1685 lag check
+    /// bypassed, rather than strand acknowledged buffered-mode rows the check
+    /// refuses on every enforced pass. Counts the bypass, not the publication:
+    /// the ADR-1307 floor still applies to such an attempt and can refuse it,
+    /// in which case a later bypass pass publishes. Intended for export as
+    /// `ravel_ingest_clock_lag_bypassed_at_shutdown_total`.
+    pub clock_lag_bypassed_at_shutdown: u64,
     /// Tenants left buffered after a teardown `flush_all` (`Shutdown`, channel
     /// close) exhausted its retry passes (ADR-1307 finding F1): a lost
     /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
@@ -342,7 +408,9 @@ pub struct FlushTriggerMix {
     pub size: u64,
     /// Flushes opened because the tenant buffer aged past `max_flush_delay`
     /// ([`FlushTrigger::Age`], and the metrics-only [`FlushTrigger::AgeAdaptive`]
-    /// the log actor never raises).
+    /// the log actor never raises) or, below a non-zero `idle_flush_byte_floor`,
+    /// past the sub-floor hold ([`FlushTrigger::AgeFloor`]). The process-wide
+    /// counters keep the floor case apart as `flushes_by_age_floor`.
     pub age: u64,
     /// Flushes opened by the final drain at close: a [`FlushTrigger::Manual`]
     /// shutdown drain, channel-close drain, or explicit flush request.
@@ -436,6 +504,7 @@ impl LogIngestMetrics {
             // this arm exists only so the shared `FlushTrigger` enum stays
             // exhaustive here, and is never reached from this actor.
             FlushTrigger::Age | FlushTrigger::AgeAdaptive => &self.flushes_by_age,
+            FlushTrigger::AgeFloor => &self.flushes_by_age_floor,
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -449,7 +518,9 @@ impl LogIngestMetrics {
         let entry = map.entry(shard).or_default();
         match trigger {
             FlushTrigger::Size => entry.size += 1,
-            FlushTrigger::Age | FlushTrigger::AgeAdaptive => entry.age += 1,
+            FlushTrigger::Age | FlushTrigger::AgeAdaptive | FlushTrigger::AgeFloor => {
+                entry.age += 1
+            }
             FlushTrigger::Manual => entry.final_drain += 1,
         }
     }
@@ -537,6 +608,28 @@ impl LogIngestMetrics {
     /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307).
     pub(crate) fn record_clock_regression_refused(&self) {
         self.clock_regressions_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush refused because its raw reading lagged the store's observed
+    /// clock beyond the clock-skew allowance (ADR-1685).
+    pub(crate) fn record_clock_lag_refused(&self) {
+        self.clock_lag_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush-open attempt that found no store-clock observation, so the
+    /// ADR-1685 lag check did not run.
+    pub(crate) fn record_clock_lag_unchecked(&self) {
+        self.clock_lag_unchecked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush-open attempt a teardown drain made with the ADR-1685 lag
+    /// check bypassed, so acknowledged buffered-mode rows were not stranded.
+    /// The ADR-1307 floor still applies to that attempt, so this counts the
+    /// bypass rather than a publication; a floor refusal there re-anchors the
+    /// floor and the next bypass pass publishes.
+    pub(crate) fn record_clock_lag_bypassed_at_shutdown(&self) {
+        self.clock_lag_bypassed_at_shutdown
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -677,6 +770,7 @@ impl LogIngestMetrics {
         LogIngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
             flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
+            flushes_by_age_floor: self.flushes_by_age_floor.load(Ordering::Relaxed),
             flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
             put_retries: self.put_retries.load(Ordering::Relaxed),
             abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
@@ -689,6 +783,11 @@ impl LogIngestMetrics {
             stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
             clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
             clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            clock_lag_refused: self.clock_lag_refused.load(Ordering::Relaxed),
+            clock_lag_unchecked: self.clock_lag_unchecked.load(Ordering::Relaxed),
+            clock_lag_bypassed_at_shutdown: self
+                .clock_lag_bypassed_at_shutdown
+                .load(Ordering::Relaxed),
             flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
@@ -821,6 +920,27 @@ mod tests {
             LogIngestMetrics::record_clock_regression_refused,
             LogIngestMetricsSnapshot {
                 clock_regressions_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_lag_refused,
+            LogIngestMetricsSnapshot {
+                clock_lag_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_lag_unchecked,
+            LogIngestMetricsSnapshot {
+                clock_lag_unchecked: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_lag_bypassed_at_shutdown,
+            LogIngestMetricsSnapshot {
+                clock_lag_bypassed_at_shutdown: 1,
                 ..Default::default()
             },
         );
@@ -997,6 +1117,30 @@ mod tests {
                 FlushTriggerMix {
                     size: 0,
                     age: 1,
+                    final_drain: 0
+                }
+            )]
+        );
+    }
+
+    /// The floor hold counts on its own process-wide counter and, like every
+    /// age cause, on the per-shard mix's `age`.
+    #[test]
+    fn age_floor_counts_separately_and_folds_into_the_age_cause() {
+        let metrics = LogIngestMetrics::default();
+        metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::AgeFloor);
+        metrics.record_flush(0, FlushTrigger::AgeFloor);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_by_age_floor, 2);
+        assert_eq!(
+            metrics.flush_trigger_mix_by_shard(),
+            vec![(
+                0,
+                FlushTriggerMix {
+                    size: 0,
+                    age: 3,
                     final_drain: 0
                 }
             )]

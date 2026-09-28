@@ -68,7 +68,8 @@ advanced by elapsed time in a way a test can drive.
 1. **The S3 backend observes the store's clock from response `Date` headers.**
    The `HttpService` that already counts attempts parses the `Date` header of
    every response it receives and stores the result, as unix nanoseconds, in
-   a process-shared atomic. The latest response wins; the value is never a
+   a process-shared atomic (per store, in an HTTP connector: see the
+   store-clock implementation amendment below). The latest response wins; the value is never a
    running maximum, so one bad header from a proxy affects at most the
    flushes before the next response. A response without a parseable `Date`
    changes nothing. `ObjectStoreBackend` gains a default method,
@@ -186,7 +187,9 @@ flowchart LR
   answers every write with a retryable error until its clock converges. In
   buffered mode the rows stay buffered and retry each tick under the
   ADR-0069 byte budget, so a host whose clock never converges eventually
-  sheds at the ceiling. That is the same operator surface as
+  sheds at the ceiling. On a graceful shutdown they are published instead,
+  with the check bypassed on the drain's bypass passes and counted: see the
+  teardown amendment below. That is the same operator surface as
   `clock_regressions_refused`: fix the host clock.
 - Two cases remain outside the check and are stated here rather than
   claimed closed. A process with no observation yet flushes unchecked and
@@ -213,7 +216,8 @@ flowchart LR
 - Follow-up work, as tasks:
   1. ravel-object-store: parse `Date` in the attempt-counting service, add
      the atomic and the default trait method, delegate in the three
-     decorators, add the `MemoryStore` test setter, and update
+     decorators (four, plus one in ravel-server, per the store-clock
+     implementation amendment below), add the `MemoryStore` test setter, and update
      docs/object-store-contract.md under "Implementations".
   2. ravel-ingest: add `FlushClockError::LagRefused`, the two counters, and
      the check in all three shard actors; land the two-clock acceptance test
@@ -225,3 +229,83 @@ flowchart LR
      troubleshooting table.
   4. docs: docs/ingest.md flush-open section and the consistency-model
      paragraph update described above.
+
+## Amendment (2026-09-28): store-clock implementation
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="store-clock implementation amendment" -->
+<!-- amendment-supersedes: phrase="a process-shared atomic" pointer="store-clock implementation amendment" -->
+
+Task 1 landed with three differences from decision 1 as written, none of
+which changes the check decisions 2 to 4 build on it.
+
+- **Per store, not per process.** Each `S3Store` holds its own observation.
+  Two stores pointed at different endpoints observe different clocks, and a
+  process-wide value would let one endpoint's `Date` stand in for another's.
+  `KmsRoutingStore` reports its default store's observation, since the
+  default serves every read and the startup probe.
+- **Read in the HTTP connector, not an `HttpService`.** The attempt counter
+  moved from an `HttpService` in `s3/attempts.rs` to an `HttpConnector` in
+  `s3/connector.rs` before this landed; the `Date` header is read there,
+  still below `object_store`'s retry loop, so every attempt's response is
+  observed.
+- **Every production decorator delegates.** Besides the three named, the
+  `ClassedStore` class handles and the `Arc<T>` forwarding impl delegate in
+  ravel-object-store, and ravel-server's `SharedKmsStore`, which sits
+  between `InstrumentedStore` and `KmsRoutingStore` under
+  `--tenant-kms-config`, delegates too. Without that last one the check would
+  be off for exactly the per-tenant KMS deployments.
+
+The parser also clamps a leap second (`:60`) to `:59`, so a correct `Date`
+still yields a value no later than the instant the store stamped, which is
+what decision 3's lower-bound argument needs. A wrong `Date` can move the
+observation in either direction, as the Consequences already state.
+
+## Amendment (2026-09-28): teardown with a lagging clock
+
+<!-- amendment-applies: sections="Consequences" pointer="teardown amendment" -->
+
+The Consequences name shedding at the byte-budget ceiling as the end state
+for a writer whose clock never converges, but not the graceful-shutdown
+path. A lag refusal is not self-clearing the way an over-bound regression
+is: a regression refusal re-anchors the monotonic floor, so the next pass
+stamps the raw reading and publishes, while a lag refusal changes neither
+the floor nor the store's observation, so every pass of a drain reads the
+same lag and refuses again. Enforcing the check on every pass therefore
+loses the buffered rows the drain exists to save, and in buffered mode
+those rows were already acknowledged. Before this decision the slow-writer
+direction cost visibility (a commit record in a sealed hour, recoverable by
+a HEAD rebuild); the refusal must not convert that into a loss of
+acknowledged writes.
+
+Durability wins at teardown. On the `Shutdown` and channel-close drains
+only, once the bounded retry passes leave a tenant still refused, the drain
+makes further passes with the lag check bypassed, while tenants remain and
+bounded by the same `MAX_FLUSH_ALL_PASSES`: the flush publishes with
+whatever stamp the ADR-1307 floor rules give it, which is the raw reading
+unless the floor absorbs a backwards step within the hold bound and holds
+the stamp there, and each bypassed flush-open attempt increments
+`clock_lag_bypassed_at_shutdown` and logs at WARN naming
+the measured lag. Those rows may land in an ingest hour the fold has
+sealed, invisible to token-less reads until a HEAD rebuild, exactly as they
+were before this ADR and recoverable in the same way. `FlushNow` and every
+size or age trigger keep refusing, because their actor keeps running and
+retries once the host clock converges.
+
+A regression refusal still refuses on a bypass pass, and that is why the
+drain makes those passes in a loop rather than one. A lag refusal returns
+before the floor is read, so a backwards step past the hold bound stays
+hidden behind it: the first bypass pass is where the floor sees that step
+and refuses, and that refusal re-anchors the floor, so the pass after it
+stamps and publishes. With a single bypass pass those acknowledged rows
+became residue, which is the durability hole this paragraph replaces. The
+residue path (ERROR plus `flush_all_residue_tenants`) therefore needs every
+enforced pass refused, by the lag check or by the floor, and every bypass
+pass refused by the floor. A lag refusal returns before the floor is read,
+so the enforced passes say nothing about the floor; what the bypass passes
+need is `MAX_FLUSH_ALL_PASSES` consecutive backwards steps past the hold
+bound on their own readings, the same count the floor alone needed for
+residue before this check existed. A lagging clock alone never reaches it,
+and neither does a lagging clock plus a single backwards step. The operator
+remedy is unchanged: fix the host clock before restarting a writer that is
+refusing flushes, and rebuild the catalog HEAD if a token-less read is
+missing rows a bypassed flush published.

@@ -27,7 +27,8 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use ravel_ingest::Clock;
 use ravel_query::http::TenantResolver;
 use ravel_sql::{
-    DistributedFlightConfig, FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService,
+    DistributedFlightConfig, FlightAuth, FlightClock, FlightListenerRole, FlightSqlConfig,
+    RavelFlightSqlService, SliceRejectCounters, SqlTicketKeys,
 };
 use ravel_types::{CommitToken, TenantHash};
 use tonic::Status;
@@ -40,8 +41,12 @@ use crate::sql::SqlState;
 /// Resolves the authoritative tenant and read-your-write tokens for a Flight
 /// SQL request from its gRPC metadata.
 ///
-/// The deployment's [`TenantResolver`] is the only authority. ravel-sql never
-/// sees a credential and never reads a tenant from a ticket.
+/// For every client request the deployment's [`TenantResolver`] is the only
+/// authority, and ravel-sql never sees a credential. A slice `DoGet`
+/// (ADR-1689 decision 2) is the one exception: on a listener that serves
+/// slices (the dedicated fragment listener, or the combined public listener of
+/// a process without one), a ticket that verifies under the slice key runs
+/// under the tenant it carries, and this resolver is never consulted for it.
 pub struct ResolverFlightAuth {
     tenant_resolver: Arc<dyn TenantResolver>,
 }
@@ -94,6 +99,54 @@ pub fn service(
     gc_ticket_ceiling: std::time::Duration,
     distributed: Option<DistributedFlightConfig>,
 ) -> FlightServiceServer<DeadlineBoundedFlightService<RavelFlightSqlService>> {
+    service_with_ticket_keys(state, gc_ticket_ceiling, distributed, None)
+}
+
+/// [`service`], with the ticket keys read from `--sql-ticket-key-file`
+/// (ADR-1689 decision 2) installed when `ticket_keys` is `Some`. They take
+/// precedence over any `shared_ticket_key` in `distributed`. `None` keeps the
+/// service's own per-process random keys, or the key `distributed` carries.
+pub fn service_with_ticket_keys(
+    state: &SqlState,
+    gc_ticket_ceiling: std::time::Duration,
+    distributed: Option<DistributedFlightConfig>,
+    ticket_keys: Option<SqlTicketKeys>,
+) -> FlightServiceServer<DeadlineBoundedFlightService<RavelFlightSqlService>> {
+    service_on_listener(
+        state,
+        gc_ticket_ceiling,
+        distributed,
+        ticket_keys,
+        FlightMount::default(),
+    )
+}
+
+/// Which listener a Flight SQL service is mounted on and how its coordinator
+/// dials worker slices (ADR-1689 decision 1). The default is the `Combined`
+/// public listener of a process without `--fragment-listener`, dialing
+/// plaintext.
+#[derive(Clone, Default)]
+pub struct FlightMount {
+    /// `Combined` without `--fragment-listener`; with it, `ClientOnly` on the
+    /// public gRPC listener and `SliceOnly` on the dedicated one.
+    pub role: FlightListenerRole,
+    /// The pinned-CA client configuration slices are dialed with, or `None`
+    /// to dial plaintext.
+    pub slice_client_tls: Option<tonic::transport::ClientTlsConfig>,
+    /// Counters shared by every service of one process, so its refusals are
+    /// counted once whichever listener refused them. `None` keeps the
+    /// service's own.
+    pub slice_rejects: Option<SliceRejectCounters>,
+}
+
+/// [`service_with_ticket_keys`], mounted as `mount` describes.
+pub fn service_on_listener(
+    state: &SqlState,
+    gc_ticket_ceiling: std::time::Duration,
+    distributed: Option<DistributedFlightConfig>,
+    ticket_keys: Option<SqlTicketKeys>,
+    mount: FlightMount,
+) -> FlightServiceServer<DeadlineBoundedFlightService<RavelFlightSqlService>> {
     let auth = Arc::new(ResolverFlightAuth {
         tenant_resolver: Arc::clone(&state.tenant_resolver),
     });
@@ -130,6 +183,16 @@ pub fn service(
     // Absent it, the service is byte-identical to the pre-distribution build.
     if let Some(config) = distributed {
         service = service.with_distributed_scan(config);
+    }
+    if let Some(keys) = ticket_keys {
+        service = service.with_ticket_keys(keys);
+    }
+    service = service.with_listener_role(mount.role);
+    if let Some(tls) = mount.slice_client_tls {
+        service = service.with_slice_client_tls(tls);
+    }
+    if let Some(counters) = mount.slice_rejects {
+        service = service.with_slice_reject_counters(counters);
     }
     // Bound every DoGet stream by the server ceiling so a client that opens the
     // stream and then reads nothing cannot pin its query-concurrency permit

@@ -47,6 +47,7 @@ doc-drift:
 # before a commit. Every finding fails the gate; there is no baseline file.
 check-docs:
 	python3 scripts/check_docs.py
+	python3 scripts/check-doc-claims.py
 
 build:
 	cargo build --workspace --release

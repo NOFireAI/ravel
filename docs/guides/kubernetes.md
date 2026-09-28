@@ -159,10 +159,30 @@ kubectl apply -f deploy/k8s/operator/operator.yaml
 Order matters: apply the CRD before the operator Deployment (its watch fails
 until the cluster serves the `RavelCluster` kind), and RBAC before it too
 (otherwise its API calls get 403). `operator.yaml` carries a placeholder
-`ravel-operator:latest` image tag; point it at a real one.
+`ravel-operator:latest` image tag; for a real cluster, pin it to a digest
+instead (`ghcr.io/nofireai/ravel-operator@sha256:<digest>`), not a moving
+tag: a tag can point at a different image after you have reviewed the
+manifest, a digest cannot.
 
 `crd.yaml` is generated from the Rust spec types, not hand-written. To
 regenerate it, run `cargo run -p ravel-operator -- --print-crd`.
+
+The operator runs as one replica with a `Recreate` strategy; raising the
+replica count is unsupported, because two active instances would race the
+`sys/auth` compare-and-swap. It ships its own `/healthz`,
+`/readyz`, and `/metrics` on the `health` container port (`8080` by
+default, `--listen-health` to change it). The listener binds before the
+controller starts: an address it cannot bind stops the operator with an
+error naming the address and the flag. `/healthz` answers `200` until
+its controller loop stops (the kubelet's liveness signal), `/readyz`
+answers `200` once its initial `RavelCluster` list has arrived, and
+`/metrics` renders `ravel_operator_reconciles_total`,
+`ravel_operator_reconcile_duration_seconds`,
+`ravel_operator_last_successful_reconcile_timestamp_seconds`, and
+`ravel_operator_watched_clusters` as Prometheus text exposition.
+`operator.yaml` wires liveness and readiness probes at those paths and a
+`prometheus.io/scrape` annotation for a Prometheus that discovers targets
+that way.
 
 The operator watches `RavelCluster` cluster-wide and manages Deployments and
 Services in whatever namespace each `RavelCluster` lives in. Its ClusterRole
@@ -748,3 +768,5 @@ per-tenant resharding is ADR-0052; ingest affinity and the Gateway API
 exposure are ADR-0076 decision 1 and ADR-0080. Idempotent maintenance
 ownership by heartbeat membership and rendezvous hashing, deliberately not a
 lease, which is why maintain can run more than one replica, is ADR-0065.
+The operator's own single-replica topology, health listener and metrics are
+[ADR-1731](../adrs/1731-operator-health-metrics-and-topology.md).

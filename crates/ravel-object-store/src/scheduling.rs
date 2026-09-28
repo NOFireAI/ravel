@@ -549,6 +549,50 @@ impl ObjectStoreBackend for ScheduledHandle {
         result
     }
 
+    /// Takes a permit and counts as a [`StoreOp::Get`], identically to
+    /// [`Self::get`]: a pinned read is one GET against the same request budget.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &crate::Pin,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        let start = self.clock.now_nanos();
+        let result = self.inner.get_pinned(key, range, pin).await;
+        let bytes = result
+            .as_ref()
+            .map_or(0, |read| read.outcome.data.len() as u64);
+        self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// One scheduled GET, like [`Self::get_pinned`], with the object's version
+    /// reported alongside the bytes.
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<crate::PinnedRead, StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        let start = self.clock.now_nanos();
+        let result = self.inner.get_with_pin(key, range).await;
+        let bytes = result
+            .as_ref()
+            .map_or(0, |read| read.outcome.data.len() as u64);
+        self.record(StoreOp::Get, start, bytes, &result);
+        result
+    }
+
+    /// One scheduled HEAD, counted like [`Self::head`].
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, crate::Pin), StoreError> {
+        let _permit = self.scheduler.acquire(self.class).await;
+        let start = self.clock.now_nanos();
+        let result = self.inner.pin_of(key).await;
+        self.record(StoreOp::Head, start, 0, &result);
+        result
+    }
+
     async fn put_multipart<'a>(
         &'a self,
         key: &str,
@@ -612,6 +656,12 @@ impl ObjectStoreBackend for ScheduledHandle {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
+
+    /// Passthrough, unscheduled (ADR-1685 decision 1): reading the inner
+    /// store's last observation issues no request, so it takes no permit.
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
+    }
 }
 
 #[cfg(test)]
@@ -633,6 +683,25 @@ mod tests {
             tokio::task::yield_now().await;
         }
         cond()
+    }
+
+    /// Both class handles report the inner store's store-clock observation
+    /// (ADR-1685 decision 1). A scheduled handle is what ravel-server hands to
+    /// its ingest path under ADR-0070, so the observation has to survive this
+    /// wrapper as well as the instrumentation one.
+    #[test]
+    fn observed_store_time_delegates_through_both_class_handles() {
+        let inner = MemoryStore::new();
+        inner.set_observed_store_time_ns(Some(1_700_000_000_123_456_789));
+        let classed = ClassedStore::scheduled(Arc::new(inner), SchedulerConfig::new(2, 2, 1));
+        assert_eq!(
+            classed.foreground().observed_store_time_ns(),
+            Some(1_700_000_000_123_456_789)
+        );
+        assert_eq!(
+            classed.background().observed_store_time_ns(),
+            Some(1_700_000_000_123_456_789)
+        );
     }
 
     /// The scheduler behind a scheduled [`ClassedStore`] (tests reach into the
@@ -817,6 +886,58 @@ mod tests {
         );
         assert_eq!(bg_m.delete.calls, 1, "one background delete");
         assert_eq!(bg_m.put.calls, 0, "no background put");
+    }
+
+    /// A pinned read spends a permit of its class and is counted in that
+    /// class's `get` block, bytes included: it is one GET on the wire and the
+    /// per-class request budget must see it as one.
+    #[tokio::test]
+    async fn get_pinned_is_scheduled_and_counted_as_a_get_of_its_class() {
+        let inner = Arc::new(MemoryStore::new());
+        inner
+            .put("a", Bytes::from_static(b"0123"), PutOptions::default())
+            .await
+            .expect("put");
+        let meta = inner.head("a").await.expect("head");
+        let pin = crate::Pin::etag(meta.etag.0.clone());
+
+        let cs = ClassedStore::scheduled(
+            Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
+            SchedulerConfig::new(4, 4, 1),
+        );
+        let fg = cs.foreground();
+        let bg = cs.background();
+
+        let got = fg
+            .get_pinned("a", GetRange::Range(0, 3), &pin)
+            .await
+            .expect("a matching pin is served through the handle");
+        assert_eq!(&got.outcome.data[..], b"012");
+        let err = bg
+            .get_pinned("a", GetRange::Range(0, 3), &crate::Pin::etag("\"0\""))
+            .await
+            .expect_err("a wrong pin is refused through the handle");
+        assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+
+        let fg_m = cs
+            .metrics(RequestClass::Foreground)
+            .expect("scheduled has metrics")
+            .snapshot();
+        let bg_m = cs
+            .metrics(RequestClass::Background)
+            .expect("scheduled has metrics")
+            .snapshot();
+        assert_eq!(fg_m.get.calls, 1, "the pinned read is a foreground get");
+        assert_eq!(fg_m.get.ok, 1);
+        assert_eq!(fg_m.get.bytes, 3, "only the served range is charged");
+        assert_eq!(bg_m.get.calls, 1, "the refused read is a background get");
+        assert_eq!(bg_m.get.ok, 0);
+        assert_eq!(bg_m.get.bytes, 0);
+        assert_eq!(
+            scheduler(&cs).fg_waiters.load(Ordering::SeqCst),
+            0,
+            "both permits released"
+        );
     }
 
     /// Weighted admission, foreground cap: with `fg_permits` foreground ops in

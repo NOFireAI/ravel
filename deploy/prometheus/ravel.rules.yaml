@@ -277,8 +277,9 @@ groups:
           description: >-
             Transitions are still being written durably, so no alert history is
             lost, but nothing is reaching Alertmanager or the configured
-            webhooks. Check the sink URLs and credentials, and the evaluator
-            logs for the per-sink delivery error.
+            webhooks: the sinks are refusing every attempt. Check the sink
+            URLs and credentials, and the evaluator logs for the per-sink
+            delivery error.
           runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
       - alert: RavelAlertRuleEvaluationFailing
         expr: |

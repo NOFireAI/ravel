@@ -65,6 +65,32 @@ blake3 = { workspace = true }
 # between them. Pinned to `ring` here, matching kube's existing selection, so
 # this is the only crate whose Cargo.toml needs to change.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# The operator's own `/healthz` `/readyz` `/metrics` listener (ADR-1731
+# decision 2). All three are workspace pins; `hyper-util` and
+# `http-body-util` entered the workspace table at the versions Cargo.lock
+# already resolved. Three fixed paths need no router (axum/tower are rejected
+# in the ADR), so only the low-level server pieces are pulled in: `http1`
+# (kubelet and Prometheus scrapers are HTTP/1.1) and `tokio` (for `TokioIo`),
+# not `client` or `http2`.
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util = { workspace = true }
+bytes = "1"
+
+[dev-dependencies]
+# Parses `deploy/k8s/operator/operator.yaml` in the render-parity test
+# (`shipped_operator_deployment_security_context_matches_rendered`) so the test
+# compares the checked-in manifest against the render functions rather than
+# comparing the render functions against themselves. Test-only: never links
+# into the shipped binary. Not a workspace dependency because no other crate
+# needs a YAML parser and this task's scope excludes the workspace root
+# Cargo.toml.
+#
+# serde_yaml_ng is the maintained fork of the deprecated serde_yaml, which
+# cargo-deny flags as unmaintained (RUSTSEC-2024-0320). It keeps the same
+# `Deserializer`/`Value`/`from_value` API, so the multi-document parse above is
+# unchanged.
+serde_yaml_ng = "0.10"
 
 [lints]
 workspace = true

@@ -302,6 +302,69 @@ pub fn build_catalog_for_server(
     )
 }
 
+/// The one place a `ServerConfig` and the catalog it built become the
+/// `EngineConfig` both query surfaces enforce (ADR-1306 follow-up task 5, and
+/// the `fold_interval` half the 2026-09-27 refusal-threshold amendment left
+/// open).
+///
+/// [`crate::start`] calls only this. The base it builds carries the deadline
+/// `main` validated against `sys/gc` (ADR-0050 section 4, EC4), the
+/// bytes-scanned budget resolved from `--limits-file`'s `[defaults]` table
+/// (ADR-0061 decision 1) and the derived S3 request budget (ADR-0075);
+/// [`crate::config::QueryBudgets::apply_to_engine`] then folds the ADR-0088
+/// budgets and the RESOLVED ADR-0996 logs fetch quantities onto it. Without
+/// that fold the engine would keep `EngineConfig::default()`'s compiled-in
+/// 8 / 1024 and `--logs-fetch-policy` would be inert.
+///
+/// The three ADR-1306 inputs of the fold-lag refusal threshold are read off
+/// their running sources rather than restated:
+///
+/// - `seal_margin` from `catalog_config`, the config of the `Catalog`
+///   [`build_catalog_for_server`] returned and `start` hands to both resolve
+///   and `fold::spawn`;
+/// - `fold_interval` from `config.fold`, the same [`crate::FoldTaskConfig`]
+///   value `start` passes to `fold::spawn`, so it is the interval the fold
+///   loop really sleeps;
+/// - `head_cache_ttl` from the same `catalog_config`, the TTL the HEAD cache
+///   a resolve reads its watermark through really runs on.
+///
+/// None of the three is `ravel_query`'s reference constant here. Those stay
+/// what an `EngineConfig` built with no deployment context falls back to
+/// ([`ravel_query::SealMargin::REFERENCE`],
+/// [`ravel_query::REFERENCE_FOLD_INTERVAL`],
+/// [`ravel_query::REFERENCE_HEAD_CACHE_TTL`]); a flag that later moves any of
+/// them on the fold or the catalog carries the threshold with it, with no
+/// second copy to update.
+///
+/// It exists as a function for the same reason
+/// [`build_catalog_for_server`] does: `start` builds a whole process and
+/// cannot be called from a test, so a mapping assembled inline there (a
+/// `head_cache_ttl` silently left at the reference constant) would type-check
+/// and leave every test green.
+/// `derived_engine_config_uses_the_running_fold_and_catalog_values` drives
+/// this function.
+///
+/// Fallible for the same reason [`crate::config::QueryBudgets::apply_to_engine`]
+/// is: a zero `--logs-max-fetch-run-bytes` is refused at startup rather than
+/// at a division inside the fetch layer.
+pub fn build_engine_config(
+    config: &ServerConfig,
+    catalog_config: &CatalogConfig,
+) -> Result<EngineConfig, ravel_query::EngineConfigError> {
+    config.query_budgets.apply_to_engine(EngineConfig {
+        deadline: config.query_deadline,
+        max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
+        // The shard-aware S3 request budget (ADR-0075, ADR-1306), resolved in
+        // `main` from `--max-s3-requests` (verbatim) or derived from
+        // `--shards`, the flush cadence and [`server_seal_margin`].
+        max_s3_requests: config.max_s3_requests,
+        seal_margin: ravel_query::SealMargin::from_catalog_config(catalog_config),
+        fold_interval: config.fold.fold_interval,
+        head_cache_ttl: Duration::from_nanos(catalog_config.head_cache_ttl_ns.unsigned_abs()),
+        ..EngineConfig::default()
+    })
+}
+
 /// Build the query `AppState`. `engine_config` carries the resolved query
 /// deadline (ADR-0050 section 4, EC4): the caller passes the SAME
 /// `EngineConfig` whose `deadline` was validated against `sys/gc` in `main`, so
@@ -987,6 +1050,7 @@ mod catalog_cache_tests {
             max_flush_delay: Duration::from_secs(2),
             max_flush_delay_idle: Duration::from_secs(40),
             min_flush_bytes: 256 * 1024,
+            idle_flush_byte_floor: 0,
             tenant_resolver: Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             mtls_listener: None,
             fold_tenants: Vec::new(),
@@ -1219,6 +1283,156 @@ mod catalog_cache_tests {
             ravel_query::RequestLimit::Bounded(999),
             "an explicit --max-s3-requests stays verbatim whatever seal margin the \
              resolution is handed"
+        );
+    }
+
+    /// ADR-1306 follow-up task 5 and the 2026-09-27 refusal-threshold
+    /// amendment's open half: the `EngineConfig` the server's query surfaces
+    /// enforce must carry the seal margin and HEAD cache TTL of the catalog
+    /// this process resolves through, and the fold interval the fold loop this
+    /// process spawns really sleeps. Those three are the terms of
+    /// `EngineConfig::fold_lag_threshold`, which decides whether a request
+    /// budget refusal names fold lag.
+    ///
+    /// Both halves go through the production path.
+    /// [`build_engine_config`] is the exact function `start` calls, and the
+    /// `CatalogConfig` handed to it here is the one
+    /// [`build_catalog_for_server`] returned, which `start` hands to resolve
+    /// and to `fold::spawn` alike.
+    ///
+    /// The production inputs cannot tell a wired value from the reference
+    /// constant on their own: `server_catalog_config_base` is
+    /// `CatalogConfig::default`, whose three seal durations are exactly
+    /// `SealMargin::REFERENCE` and whose `head_cache_ttl_ns` is exactly
+    /// `REFERENCE_HEAD_CACHE_TTL`, and `FoldTaskConfig::default`'s interval is
+    /// exactly `REFERENCE_FOLD_INTERVAL`. So each of the three is also driven
+    /// across a seam no production input produces, and required to follow it.
+    ///
+    /// RED, one per field, each the exact revert this test exists to catch:
+    /// in [`build_engine_config`], replace `seal_margin` with
+    /// `ravel_query::SealMargin::REFERENCE`, `fold_interval` with
+    /// `ravel_query::REFERENCE_FOLD_INTERVAL`, or `head_cache_ttl` with
+    /// `ravel_query::REFERENCE_HEAD_CACHE_TTL`. Each type-checks, each changes
+    /// no production number, and each fails exactly one of the three seam
+    /// assertions below.
+    #[test]
+    fn derived_engine_config_uses_the_running_fold_and_catalog_values() {
+        // The production path first: the running catalog's own config, and
+        // the fold config `start` hands `fold::spawn`.
+        let config = server_config();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &config, 7_200_000_000_000).expect("catalog builds");
+        let engine =
+            build_engine_config(&config, catalog.config()).expect("server defaults are valid");
+        assert_eq!(
+            engine.seal_margin,
+            ravel_query::SealMargin::from_catalog_config(catalog.config()),
+            "the engine must seal-margin off the catalog `build_catalog_for_server` returns"
+        );
+        assert_eq!(
+            engine.fold_interval, config.fold.fold_interval,
+            "the engine must take the interval of the `FoldTaskConfig` `start` spawns the \
+             fold with"
+        );
+        assert_eq!(
+            engine.head_cache_ttl,
+            Duration::from_nanos(catalog.config().head_cache_ttl_ns.unsigned_abs()),
+            "the engine must take the HEAD cache TTL the resolve path really reads through"
+        );
+
+        // The seam. Every value below differs from the reference constant the
+        // reverts above would substitute, so each assertion fails on exactly
+        // one of them.
+        let odd_catalog = CatalogConfig {
+            max_flush_lifetime_ns: 1_111_000_000_000,
+            clock_skew_allowance_ns: 222_000_000_000,
+            fold_safety_margin_ns: 333_000_000_000,
+            head_cache_ttl_ns: 77_000_000_000,
+            ..server_catalog_config_base()
+        };
+        let odd_fold_interval = Duration::from_secs(137);
+        assert_ne!(
+            odd_fold_interval,
+            ravel_query::REFERENCE_FOLD_INTERVAL,
+            "sanity: the seam's fold interval must differ from the reference constant, or the \
+             assertion below could not tell a wired value from a hardcoded one"
+        );
+        let odd_seal_margin = ravel_query::SealMargin::from_catalog_config(&odd_catalog);
+        assert_ne!(odd_seal_margin, ravel_query::SealMargin::REFERENCE);
+        let odd_head_cache_ttl = Duration::from_nanos(odd_catalog.head_cache_ttl_ns.unsigned_abs());
+        assert_ne!(odd_head_cache_ttl, ravel_query::REFERENCE_HEAD_CACHE_TTL);
+
+        let odd_config = crate::ServerConfig {
+            fold: crate::FoldTaskConfig {
+                fold_interval: odd_fold_interval,
+                ..config.fold
+            },
+            ..server_config()
+        };
+        let engine = build_engine_config(&odd_config, &odd_catalog).expect("still valid");
+        assert_eq!(
+            engine.seal_margin, odd_seal_margin,
+            "the seal margin must come from the `CatalogConfig` argument, not from \
+             SealMargin::REFERENCE"
+        );
+        assert_eq!(
+            engine.fold_interval, odd_fold_interval,
+            "the fold interval must come from the `ServerConfig`'s `FoldTaskConfig`, not from \
+             REFERENCE_FOLD_INTERVAL"
+        );
+        assert_eq!(
+            engine.head_cache_ttl, odd_head_cache_ttl,
+            "the HEAD cache TTL must come from the `CatalogConfig` argument, not from \
+             REFERENCE_HEAD_CACHE_TTL"
+        );
+
+        // The threshold those three feed, so the wiring is pinned to the
+        // quantity it exists for rather than only to three fields.
+        assert_eq!(
+            engine.fold_lag_threshold(),
+            ravel_query::fold_lag_tail_threshold(
+                odd_seal_margin,
+                odd_fold_interval,
+                odd_head_cache_ttl
+            ),
+            "the fold-lag refusal threshold must be the one this deployment's fold and \
+             catalog imply"
+        );
+    }
+
+    /// ADR-1306 follow-up task 3's drift guard. `ravel-query` cannot import
+    /// `ravel-server` (the dependency runs the other way), so
+    /// [`ravel_query::REFERENCE_FOLD_INTERVAL`] is a HAND COPY of this
+    /// crate's [`crate::fold::DEFAULT_FOLD_INTERVAL`], and
+    /// [`ravel_query::REFERENCE_HEAD_CACHE_TTL`] is the catalog default the
+    /// server's own catalog runs on. Both are what an `EngineConfig` built
+    /// with no deployment context falls back to, and a deployment that never
+    /// moves either flag is classified against exactly them.
+    ///
+    /// Moving `DEFAULT_FOLD_INTERVAL` here, or the catalog's
+    /// `head_cache_ttl_ns` under `server_catalog_config_base`, without moving
+    /// the `ravel-query` copy would leave every no-context `EngineConfig`
+    /// classifying refusals against a threshold this server does not run on,
+    /// and nothing in `ravel-query`'s own tests can see it. This is the test
+    /// that can.
+    ///
+    /// RED: change either constant on one side only.
+    #[test]
+    fn ravel_query_reference_durations_match_the_servers_running_ones() {
+        assert_eq!(
+            ravel_query::REFERENCE_FOLD_INTERVAL,
+            crate::fold::DEFAULT_FOLD_INTERVAL,
+            "ravel-query's hand copy of the fold interval must be this crate's own default"
+        );
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog_for_server(store, &server_config(), 7_200_000_000_000)
+            .expect("catalog builds");
+        assert_eq!(
+            ravel_query::REFERENCE_HEAD_CACHE_TTL,
+            Duration::from_nanos(catalog.config().head_cache_ttl_ns.unsigned_abs()),
+            "ravel-query's reference HEAD cache TTL must be the TTL the catalog the server \
+             resolves through really runs on"
         );
     }
 

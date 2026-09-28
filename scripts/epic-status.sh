@@ -59,12 +59,10 @@ task_ids=$(jq -r .body "${cache_file}" \
 if [[ -z "${task_ids}" ]]; then
   echo "No fleet task ids found in the issue body."
 else
-  # One remote round-trip for all task refs; one API call for all task PRs.
+  # One remote round-trip for all task refs. PRs are asked per task by exact
+  # branch: a windowed `gh pr list --limit N` drops every older PR, and an
+  # old landed task then shows no PR at all.
   remote_refs=$(git ls-remote origin 'refs/heads/task/*' 2>/dev/null || true)
-  pr_rows=$(gh pr list --state all --limit 100 \
-    --json number,state,headRefName,mergedAt \
-    --jq '.[] | select(.headRefName | startswith("task/")) | "\(.headRefName) #\(.number) \(.state)"' \
-    2>/dev/null || true)
 
   printf '%-38s %-6s %-7s %s\n' "task" "start" "result" "merge PR"
   while IFS= read -r tid; do
@@ -72,15 +70,21 @@ else
     have_result="no"
     grep -q "refs/heads/task/${tid}/start$" <<<"${remote_refs}" && have_start="yes"
     grep -q "refs/heads/task/${tid}/result$" <<<"${remote_refs}" && have_result="yes"
-    pr_info=$(grep "^task/${tid}/merge " <<<"${pr_rows}" | head -1 || true)
-    pr_info="${pr_info#task/${tid}/merge }"
-    [[ -z "${pr_info}" ]] && pr_info="-"
+    if pr_info=$(gh pr list --state all --head "task/${tid}/merge" --limit 100 \
+      --json number,state \
+      --jq '(map(select(.state == "MERGED")) + .)[0] // empty | "#\(.number) \(.state)"' \
+      2>/dev/null); then
+      [[ -z "${pr_info}" ]] && pr_info="-"
+    else
+      pr_info="? (PR query failed)"
+    fi
     printf '%-38s %-6s %-7s %s\n' "${tid}" "${have_start}" "${have_result}" "${pr_info}"
   done <<<"${task_ids}"
 
   echo
-  echo "Legend: start=yes result=no PR=-  -> in flight or dead (check fleet_status"
-  echo "        before a new dispatch); result=yes PR=-  -> ready to inspect/merge;"
+  echo "Legend: start=yes result=no PR=-  -> in flight or dead (epic-orchestrator.sh"
+  echo "        reconcile asks the control plane which, before a new dispatch);"
+  echo "        result=yes PR=-  -> ready to inspect/merge;"
   echo "        PR OPEN  -> waiting on checks or a stuck auto-merge."
 fi
 

@@ -48,7 +48,7 @@ use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::alerting::ALERT_SHARD;
 use ravel_server::sql::SqlState;
-use ravel_server::sql_distrib::distributed_flight_config;
+use ravel_server::sql_distrib::{SliceTransport, distributed_flight_config};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
 use ravel_sql::{
     DistributedFlightConfig, SqlConfig, SqlExecutor, StaticWorkerEndpoints, WorkerEndpoints,
@@ -384,7 +384,7 @@ fn sql_state_with_shards(
 
 /// Like [`sql_state_with_shards`], but the catalog resolves over
 /// `catalog_store` while every segment fetcher reads `data_store`. The
-/// distributed-listener proof ([`distributed_flight_sql_fetches_from_flight_endpoint_under_fragment_listener`])
+/// distributed-listener proof ([`distributed_flight_sql_plaintext_transport_fetches_from_flight_sql_endpoint`])
 /// uses this to give a coordinator a catalog that sees the two shards (so it
 /// engages distribution) but a local fetcher that holds no segment data: the
 /// coordinator's own fallback read of a slice then cannot mask a failed remote
@@ -983,6 +983,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
         max_flush_delay: std::time::Duration::from_secs(2),
         max_flush_delay_idle: std::time::Duration::from_secs(40),
         min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
         mode: Mode::Query,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
@@ -1196,7 +1197,13 @@ async fn distributed_flight_sql_reachable_end_to_end() {
     // own, so nothing is excluded from the roster. The coordinator's
     // self-exclusion has its own cases in `sql_distrib`.
     let self_id = Arc::new(std::sync::OnceLock::new());
-    let config = distributed_flight_config(live_workers, self_id, thresholds, "cluster-secret");
+    let config = distributed_flight_config(
+        live_workers,
+        self_id,
+        SliceTransport::PublicPlaintext,
+        thresholds,
+        Some("cluster-secret"),
+    );
     assert_eq!(
         config.workers.endpoints(),
         vec![format!("http://{worker_endpoint}")],
@@ -1360,19 +1367,19 @@ async fn distributed_flight_sql_scan_engages() {
     dist_server.stop().await;
 }
 
-/// Regression proof for #1296: a coordinator serving Flight SQL fans a slice out
-/// to a worker that runs `--fragment-listener`, and the fetch reaches the
-/// worker's Flight SQL listener (its public gRPC address), not its dedicated
-/// fragment listener (which serves only the `SeriesFetch` surface, no Flight
-/// `DoGet`).
+/// Regression proof for #1296, for the plaintext transport: a coordinator
+/// without `--fragment-listener` (release A, ADR-1689 decision 4) fans a slice
+/// out to a worker whose record names two different endpoints, and the fetch
+/// reaches the worker's Flight SQL listener (its public gRPC address), never
+/// `fragment_endpoint`.
 ///
-/// The worker advertises the record shape the server writes under
-/// `--fragment-listener`: `fragment_endpoint` names the dedicated listener (here
-/// a port that holds no Flight service, standing in for the TLS-only fragment
-/// listener), and `flight_sql_endpoint` names the public gRPC listener where
-/// Flight SQL `DoGet` lives. The real server roster surface
+/// Here `fragment_endpoint` is a port that holds no Flight service, and
+/// `flight_sql_endpoint` names the public gRPC listener where Flight SQL
+/// `DoGet` lives in the `Combined` layout. The real server roster surface
 /// ([`FleetWorkerEndpoints`], via [`distributed_flight_config`]) must resolve the
-/// worker to the latter.
+/// worker to the latter. With `--fragment-listener` the lane dials
+/// `fragment_endpoint` over TLS instead (ADR-1689 decision 1); that transport
+/// is driven end to end by `sql_slice_listener_e2e`.
 ///
 /// This exercises the production `FlightWorkerSliceClient` (built inside the
 /// coordinator's `do_get`) against a REAL worker listener, over a real Flight
@@ -1389,7 +1396,7 @@ async fn distributed_flight_sql_scan_engages() {
 /// (the `(cpu, ts=100)` duplicate makes cross-slice dedup observable: an
 /// undeduped union would be four rows, the deduped result is three).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn distributed_flight_sql_fetches_from_flight_endpoint_under_fragment_listener() {
+async fn distributed_flight_sql_plaintext_transport_fetches_from_flight_sql_endpoint() {
     let data_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
     publish_segment_on_shard(
@@ -1438,10 +1445,9 @@ async fn distributed_flight_sql_fetches_from_flight_endpoint_under_fragment_list
     .await;
     let flight_addr = worker.addr;
 
-    // The dedicated fragment listener stand-in: a port that accepts a connection
-    // and immediately closes it, so it hosts no Flight `DoGet`. This is what a
-    // `--fragment-listener` worker advertises as `fragment_endpoint` (TLS-only in
-    // production; either way, no Flight service behind it).
+    // A `fragment_endpoint` the plaintext transport must never dial: a port
+    // that accepts a connection and immediately closes it, so it hosts no
+    // Flight `DoGet`.
     let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind dead fragment listener");
@@ -1459,7 +1465,7 @@ async fn distributed_flight_sql_fetches_from_flight_endpoint_under_fragment_list
         }
     });
 
-    // The record exactly as the server writes it under `--fragment-listener`.
+    // A record whose two endpoints differ, so the one dialed is observable.
     let record = QueryWorkerRecord {
         process_id: "worker-b".to_string(),
         fragment_endpoint: dead_addr.to_string(),
@@ -1469,7 +1475,13 @@ async fn distributed_flight_sql_fetches_from_flight_endpoint_under_fragment_list
     };
     let live = Arc::new(parking_lot::RwLock::new(Arc::new(vec![record])));
     let self_id = Arc::new(std::sync::OnceLock::new());
-    let config = distributed_flight_config(live, self_id, thresholds, secret);
+    let config = distributed_flight_config(
+        live,
+        self_id,
+        SliceTransport::PublicPlaintext,
+        thresholds,
+        Some(secret),
+    );
     // The real roster surface must resolve the worker to its Flight SQL endpoint,
     // never the fragment listener. This is the crux of the #1296 fix.
     assert_eq!(

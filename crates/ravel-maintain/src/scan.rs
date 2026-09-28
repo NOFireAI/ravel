@@ -12,13 +12,14 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, Stor
 use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
+use crate::claim_guard::ClaimSkip;
 use crate::clock::Clock;
-use crate::compact::{CompactionOutcome, compact_bucket};
+use crate::compact::{ClaimedCompaction, CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::retention::{
     RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket_with_reach,
-    resolve_retention_window_ns,
+    resolve_retention_window_ns, retention_sweep_bucket_with_reach,
 };
 use crate::sweep::LeaseCheck;
 
@@ -152,6 +153,66 @@ pub struct MaintainReport {
     /// L0-record count compaction exposes without an extra listing, so it is
     /// the figure `ravel_maintain_l0_records_pending` renders (issue #1729).
     pub l0_records_pending: usize,
+    /// Buckets this pass did not compact because another attempt holds their
+    /// advisory compaction claim (ADR-1029 decision 5), plus the ones whose
+    /// compaction was skipped without a claim request because a previous
+    /// tick's observation put them on hold until the holder's lease expires.
+    /// Retention still evaluates a held bucket, and one it retires is counted
+    /// under `retired` instead. Never counted as compacted: this process did
+    /// no merge for them, and the holder may still be running one.
+    pub claim_skipped: usize,
+    /// Buckets whose merge started under a claim this process then lost, and
+    /// which cancelled at a checkpoint and published nothing (ADR-1029
+    /// decision 3). Also never counted as compacted.
+    pub claim_cancelled: usize,
+    /// The largest retention lag this pass observed, in nanoseconds: for the
+    /// oldest bucket that is expired (past `bucket_end + retention_window`) yet
+    /// still physically present (tombstoned, swept-partial, or blocked by a
+    /// HEAD snapshot), how far `now` is past that deadline. `0` when the pass
+    /// found no still-present expired bucket. A fully swept-empty bucket
+    /// contributes nothing: its data is gone, so there is no lag to report.
+    ///
+    /// The deadline is the hour's nominal expiry (`(hour + 1) * NS_PER_HOUR +
+    /// retention_window_ns`), the same instant [`classify_zone`] uses to open a
+    /// bucket's tail window, not the bucket's exact maximum-event expiry (which
+    /// needs decoded records). Buckets are grouped by ingest hour while expiry
+    /// follows the largest event timestamp, and an event can run past the end
+    /// of its ingest hour by the allowed future clock skew, so this nominal
+    /// deadline can be earlier than the true expiry by up to that skew and the
+    /// lag reported here can over-estimate by as much; otherwise it is at or
+    /// under the true lag. It is the figure `ravel_maintain_retention_lag_seconds`
+    /// renders (issue #1729).
+    pub retention_lag_ns: i64,
+}
+
+/// The claim hold a skipped bucket earns, as the injected clock reads it: the
+/// skip's reschedule point (one millisecond past the holder's expiry; the
+/// retry's own acquisition waits out this contender's jitter) converted from
+/// unix milliseconds to nanoseconds.
+/// Saturating, so an absurd observed expiry cannot wrap into the past.
+fn reschedule_ns(skip: &ClaimSkip) -> i64 {
+    skip.reschedule_after_unix_ms.saturating_mul(1_000_000)
+}
+
+/// Retention lag, in nanoseconds, of a bucket that is expired yet still present:
+/// how far `now_ns` is past the hour's nominal retention deadline
+/// (`(hour + 1) * NS_PER_HOUR + retention_window_ns`). `0` when the tenant has
+/// no retention policy, or `now` has not yet reached the deadline (which a
+/// still-present expired bucket has, so this clamps only a benign clock/rounding
+/// edge). Uses saturating arithmetic throughout, matching [`classify_zone`].
+fn expired_bucket_retention_lag_ns(
+    hour: u32,
+    now_ns: i64,
+    retention_window_ns: Option<i64>,
+) -> i64 {
+    let Some(window_ns) = retention_window_ns else {
+        return 0;
+    };
+    let bucket_end_ns = i64::from(hour)
+        .saturating_add(1)
+        .saturating_mul(NS_PER_HOUR);
+    let deadline_ns = bucket_end_ns.saturating_add(window_ns);
+    now_ns.saturating_sub(deadline_ns).max(0)
 }
 
 /// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
@@ -403,6 +464,16 @@ struct MemoEntry {
 #[derive(Debug, Clone)]
 pub struct MaintainMemo {
     entries: HashMap<BucketKey, MemoEntry>,
+    /// Buckets another attempt holds an advisory compaction claim on, and the
+    /// clock reading before which re-attempting one is pointless (one
+    /// millisecond past the observed expiry, ADR-1029 decision 1 step 2; the
+    /// retry pays this contender's jitter in its pre-acquisition wait).
+    ///
+    /// In memory only, never in the durable snapshot: it is a scheduling hint
+    /// whose whole lifetime is shorter than one lease, and a restarted worker
+    /// paying one extra claim request per bucket is cheaper than carrying a
+    /// stale hold across it.
+    claim_deferred_until_ns: HashMap<BucketKey, i64>,
     reverify_interval_ns: i64,
     /// When [`crate::sweep::sweep_shard`] (the full-keyspace safety-net pass,
     /// not [`crate::sweep::sweep_shard_zoned`]) last ran for a `(tenant,
@@ -422,6 +493,7 @@ impl MaintainMemo {
     pub fn new(reverify_interval_ns: i64) -> Self {
         MaintainMemo {
             entries: HashMap::new(),
+            claim_deferred_until_ns: HashMap::new(),
             reverify_interval_ns,
             last_full_sweep_ns: HashMap::new(),
         }
@@ -573,8 +645,19 @@ impl MaintainMemo {
         if let Some(ns) = self.last_full_sweep_ns.remove(&(tenant, signal, shard)) {
             moved_sweep.insert((tenant, signal, shard), ns);
         }
+        let mut moved_defer = HashMap::new();
+        self.claim_deferred_until_ns
+            .retain(|(t, s, sh, hour), until| {
+                if *t == tenant && *s == signal && *sh == shard {
+                    moved_defer.insert((*t, *s, *sh, *hour), *until);
+                    false
+                } else {
+                    true
+                }
+            });
         MaintainMemo {
             entries: moved,
+            claim_deferred_until_ns: moved_defer,
             reverify_interval_ns: self.reverify_interval_ns,
             last_full_sweep_ns: moved_sweep,
         }
@@ -585,7 +668,31 @@ impl MaintainMemo {
     /// this never overwrites another unit's entry.
     pub fn merge_unit(&mut self, unit: MaintainMemo) {
         self.entries.extend(unit.entries);
+        self.claim_deferred_until_ns
+            .extend(unit.claim_deferred_until_ns);
         self.last_full_sweep_ns.extend(unit.last_full_sweep_ns);
+    }
+
+    /// Hold `key` until `until_ns`: another attempt holds its advisory
+    /// compaction claim, so a re-attempt before the holder's lease can have
+    /// expired would spend a PUT-class request to learn the same thing
+    /// (ADR-1029 decision 1 step 2: never poll an active claim).
+    pub fn defer_claim_until(&mut self, key: BucketKey, until_ns: i64) {
+        self.claim_deferred_until_ns.insert(key, until_ns);
+    }
+
+    /// Whether `key` is still on hold behind another attempt's claim at
+    /// `now_ns`. Clears the hold once it lapses, so the entry does not outlive
+    /// the lease it was derived from.
+    pub fn claim_deferred(&mut self, key: &BucketKey, now_ns: i64) -> bool {
+        match self.claim_deferred_until_ns.get(key) {
+            Some(until) if now_ns < *until => true,
+            Some(_) => {
+                self.claim_deferred_until_ns.remove(key);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Whether a full-keyspace sweep pass ([`crate::sweep::sweep_shard`]) is
@@ -634,6 +741,9 @@ impl MaintainMemo {
         present: &HashSet<u32>,
     ) {
         self.entries.retain(|(t, s, sh, hour), _| {
+            *t != tenant || *s != signal || *sh != shard || present.contains(hour)
+        });
+        self.claim_deferred_until_ns.retain(|(t, s, sh, hour), _| {
             *t != tenant || *s != signal || *sh != shard || present.contains(hour)
         });
     }
@@ -1236,6 +1346,12 @@ pub async fn scan_and_maintain_with_memo(
         // interior bucket terminal and the entry is still fresh (within
         // `CompactorConfig::interior_reverify_ns`), so skip it without
         // listing or reading anything.
+        // A bucket another attempt holds the claim on is on hold until that
+        // claim can have expired. The hold covers compaction only: retention
+        // and the zone split run as for any other bucket, so a held head or
+        // tail hour still reaches `head_tail_hours`.
+        let claim_deferred = memo.claim_deferred(&key, now);
+
         let zone = classify_zone(hour, now, config, retention_window_ns);
         if zone != Zone::Interior {
             report.head_tail_hours.push(hour);
@@ -1252,49 +1368,96 @@ pub async fn scan_and_maintain_with_memo(
         }
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
-        let (retention_outcome, compaction) = maintain_bucket_with_reach(
-            &mut reach,
-            store,
-            clock,
-            config,
-            retention_window_ns,
-            lease,
-            &bucket,
-        )
-        .await?;
+        let (retention_outcome, compaction) = if claim_deferred {
+            let outcome = retention_sweep_bucket_with_reach(
+                &mut reach,
+                store,
+                clock,
+                config,
+                retention_window_ns,
+                lease,
+                &bucket,
+            )
+            .await?;
+            (outcome, None)
+        } else {
+            maintain_bucket_with_reach(
+                &mut reach,
+                store,
+                clock,
+                config,
+                retention_window_ns,
+                lease,
+                &bucket,
+            )
+            .await?
+        };
         match retention_outcome {
-            // The bucket is (being) retired; compaction was skipped by design.
-            RetentionOutcome::Tombstoned
-            | RetentionOutcome::Swept
-            | RetentionOutcome::SweptPartial => {
+            // Fully retired: the bucket's data is gone, so it is not a
+            // still-present expired bucket and contributes no retention lag.
+            RetentionOutcome::Swept => {
                 report.retired += 1;
+            }
+            // Expired but still present (tombstoned within the horizon, or
+            // horizon elapsed with residue left for the next pass); compaction
+            // was skipped by design. Its retention lag is a candidate for this
+            // pass's maximum.
+            RetentionOutcome::Tombstoned | RetentionOutcome::SweptPartial => {
+                report.retired += 1;
+                report.retention_lag_ns = report.retention_lag_ns.max(
+                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns),
+                );
             }
             // The expired bucket's physical sweep was blocked by HEAD
             // reachability (ADR-0020): count by reason and treat as retired
             // work-in-progress (compaction was skipped, same as a tombstone).
+            // The bucket is still present, so it contributes retention lag too.
             RetentionOutcome::BlockedBySnapshot(reason) => {
                 report.retired += 1;
                 match reason {
                     SnapshotBlock::Named => report.blocked_by_snapshot += 1,
                     SnapshotBlock::Unreadable => report.blocked_by_unreadable_head += 1,
                 }
+                report.retention_lag_ns = report.retention_lag_ns.max(
+                    expired_bucket_retention_lag_ns(hour, now, retention_window_ns),
+                );
             }
             // Retention left the bucket live; the compaction outcome classifies
-            // it (compaction always ran in these arms; see maintain_bucket).
+            // it (compaction ran in these arms unless the bucket is on a claim
+            // hold; see maintain_bucket).
             RetentionOutcome::NoPolicy
             | RetentionOutcome::NotSealed
-            | RetentionOutcome::NotExpired => match compaction {
-                Some(CompactionOutcome::NotSealed) => report.not_sealed += 1,
-                Some(CompactionOutcome::Compacted { .. }) => report.compacted += 1,
-                Some(CompactionOutcome::BelowMinInputs { count }) => {
+            | RetentionOutcome::NotExpired => match &compaction {
+                Some(ClaimedCompaction::Ran(CompactionOutcome::NotSealed)) => {
+                    report.not_sealed += 1
+                }
+                Some(ClaimedCompaction::Ran(CompactionOutcome::Compacted { .. })) => {
+                    report.compacted += 1
+                }
+                Some(ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs { count })) => {
                     report.already_done += 1;
                     report.l0_records_pending += count;
                 }
-                Some(
+                Some(ClaimedCompaction::Ran(
                     CompactionOutcome::AlreadyCompacted
                     | CompactionOutcome::RewritePresent
                     | CompactionOutcome::Tombstoned,
-                ) => report.already_done += 1,
+                )) => report.already_done += 1,
+                // Another attempt holds the claim: this process merged nothing
+                // and must not report a compaction. Hold the bucket until the
+                // holder's lease expires so the next tick does not re-issue
+                // the claim request, which is the polling the protocol exists
+                // to avoid.
+                Some(ClaimedCompaction::SkippedClaimed(skip)) => {
+                    report.claim_skipped += 1;
+                    memo.defer_claim_until(key, reschedule_ns(skip));
+                }
+                // The claim was lost mid-merge and the run cancelled without
+                // publishing. The holder that took it over is doing the work.
+                Some(ClaimedCompaction::Cancelled { .. }) => report.claim_cancelled += 1,
+                // Retention left a held bucket live, so compaction would have
+                // run here; the hold skipped it without a claim request.
+                None if claim_deferred => report.claim_skipped += 1,
                 None => {}
             },
         }
@@ -1302,12 +1465,20 @@ pub async fn scan_and_maintain_with_memo(
         // Update the memo from this fresh, authoritative evaluation: remember a
         // newly terminal bucket, and forget one that transitioned away from a
         // terminal state (e.g. a compacted bucket that just became expired).
-        match classify_terminal(&retention_outcome, &compaction) {
+        // A skipped or cancelled run observed nothing about the bucket, so it
+        // is classified on the retention outcome alone (which is `None` for
+        // compaction) and is never memoized as terminal on this process's
+        // behalf.
+        let ran = compaction
+            .as_ref()
+            .and_then(ClaimedCompaction::ran)
+            .cloned();
+        match classify_terminal(&retention_outcome, &ran) {
             Some(state) => {
                 memo.mark_terminal(key, state, now);
                 // Carry this evaluation's below-threshold population on the
                 // entry so the ticks that skip the bucket can still add it.
-                if let Some(CompactionOutcome::BelowMinInputs { count }) = compaction {
+                if let Some(CompactionOutcome::BelowMinInputs { count }) = ran {
                     memo.set_l0_records_pending(&key, count);
                 }
             }
@@ -2230,6 +2401,88 @@ mod invalidate_tests {
             memo.terminal_state(t, Signal::Spans, SHARD, HOUR),
             None,
             "a published spans rewrite must invalidate the memoized terminal state"
+        );
+    }
+
+    /// The pure lag function (issue #1729): the deadline is the hour's nominal
+    /// end plus the retention window, and the lag is `now` past it, clamped at
+    /// zero, and `0` with no policy.
+    #[test]
+    fn expired_bucket_retention_lag_ns_is_now_past_the_nominal_deadline() {
+        let window = 6 * NS_PER_HOUR;
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        let now = bucket_end + window + 5 * NS_PER_HOUR;
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, now, Some(window)),
+            5 * NS_PER_HOUR,
+            "lag is now minus (bucket_end + window)"
+        );
+        // Not yet at the deadline: clamped to zero, never negative.
+        assert_eq!(
+            expired_bucket_retention_lag_ns(HOUR, bucket_end, Some(window)),
+            0
+        );
+        // No retention policy: no deadline, no lag.
+        assert_eq!(expired_bucket_retention_lag_ns(HOUR, now, None), 0);
+    }
+
+    /// End to end through `scan_and_maintain` with an injected clock: a sealed,
+    /// expired, still-present (freshly tombstoned) bucket makes
+    /// `MaintainReport::retention_lag_ns` the exact distance from `now` to the
+    /// bucket's nominal retention deadline (issue #1729). Flip-line proof:
+    /// dropping the `retention_lag_ns` update from the Tombstoned arm leaves this
+    /// at `0`.
+    #[tokio::test]
+    async fn scan_reports_exact_retention_lag_for_a_still_present_expired_bucket() {
+        use crate::config::{DEFAULT_MAX_INGEST_LAG_NS, RetentionPolicy};
+
+        let store = MemoryStore::new();
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let config = CompactorConfig::default();
+        // A window at the ADR-0019 floor, so the fixture's near-epoch event is
+        // safely expired, and read the exact window back for the assertion.
+        let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: None,
+                tenants: vec![(TENANT.to_string(), window)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("valid retention config");
+        assert_eq!(retention.window_for(&t), Some(window));
+
+        let bucket_end = (i64::from(HOUR) + 1) * NS_PER_HOUR;
+        // Five hours past the deadline, and far enough in the future that the
+        // bucket is sealed.
+        let now = bucket_end + window + 5 * NS_PER_HOUR;
+        let clock = FixedClock::new(now);
+
+        let report = scan_and_maintain(
+            &store,
+            &clock,
+            &config,
+            &retention,
+            &NoLeases,
+            t,
+            Signal::Metrics,
+            SHARD,
+        )
+        .await
+        .expect("scan");
+
+        assert_eq!(report.retired, 1, "the expired bucket was tombstoned");
+        assert_eq!(
+            report.retention_lag_ns,
+            now - (bucket_end + window),
+            "lag is now past the nominal deadline"
+        );
+        assert_eq!(
+            report.retention_lag_ns,
+            5 * NS_PER_HOUR,
+            "the bucket is exactly five hours past its retention deadline"
         );
     }
 }

@@ -12,8 +12,8 @@ use clap::ValueEnum;
 use ravel_commit::keys;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, LegalHoldCheck,
-    MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport, Verification, compact_bucket,
-    migrate_family, sweep_shard,
+    MergeMemoryTracker, MigrateBudget, PublishOutcome, SweepReport, Verification, census_family,
+    compact_bucket, migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -893,6 +893,10 @@ pub async fn sweep(
         superseded_records_deleted,
         superseded_data_deleted,
         unreferenced_parts_deleted,
+        // Byte totals for the reclaimed-bytes metric (issue #1729); this CLI
+        // reports counts, not bytes, so they are not printed here.
+        quarantine_reaped_bytes: _,
+        unreferenced_parts_bytes: _,
         orphan_breaker_tripped,
         orphans_withheld,
         orphan_breaker_overridden,
@@ -1087,14 +1091,17 @@ async fn generation_scan_shards(
 /// are read from each surviving commit record's `segment_format_version` (an L0
 /// object's liveness == a surviving commit record) and each compaction
 /// record's parts (live L1 objects). Exits nonzero if any anomaly is found.
+///
+/// Beside each signal's histogram it classifies every recorded format floor of
+/// that (tenant, signal) against the records it just enumerated (ADR-1746
+/// decision 2, [`floor_evidence`]) and exits nonzero if any floor is
+/// `Contradicted`.
 pub async fn audit_versions(
     store: Arc<dyn ObjectStoreBackend>,
     selection: StoreSelection,
     tenant: &str,
     shards: u32,
 ) -> anyhow::Result<()> {
-    use std::collections::BTreeMap;
-
     let tenant_hash = TenantId::new(tenant).hash();
     selection.print_header();
     require_tenant_data_present(
@@ -1106,6 +1113,7 @@ pub async fn audit_versions(
     )
     .await?;
     let mut anomalies = 0usize;
+    let mut contradicted = 0usize;
     for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
         let window = signal_supported_versions(signal)?;
         // Generation-aware scan range (ADR-0052 section 4), not the static
@@ -1114,69 +1122,17 @@ pub async fn audit_versions(
         // silently skip live objects in the new range.
         let scan_shards =
             generation_scan_shards(store.as_ref(), &tenant_hash, signal, shards).await?;
-        // version -> (l0_count, l1_count)
-        let mut hist: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
-        for shard in 0..scan_shards {
-            let prefix = keys::commit_shard_prefix(&tenant_hash, signal, shard)
-                .map_err(|err| anyhow::anyhow!("failed to build shard prefix: {err}"))?;
-            let metas = list_all(store.as_ref(), &prefix)
-                .await
-                .map_err(|err| anyhow::anyhow!("failed to list {prefix}: {err}"))?;
-            for meta in metas {
-                match keys::partition_bucket_entry(&meta.key) {
-                    Ok(keys::BucketEntry::CommitRecord(_)) => {
-                        let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
-                            anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
-                        })?;
-                        let record = ravel_commit::record::decode(&got.data).map_err(|err| {
-                            anyhow::anyhow!("commit record {} is corrupt: {err}", meta.key)
-                        })?;
-                        hist.entry(record.segment_format_version).or_default().0 += 1;
-                    }
-                    Ok(keys::BucketEntry::CompactionRecord(_)) => {
-                        let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
-                            anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
-                        })?;
-                        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
-                            .map_err(|err| {
-                                anyhow::anyhow!("compaction record {} is corrupt: {err}", meta.key)
-                            })?;
-                        for part in &record.parts {
-                            hist.entry(part.segment_format_version).or_default().1 += 1;
-                        }
-                    }
-                    Ok(keys::BucketEntry::RewriteRecord(_)) => {
-                        // A selective-erasure rewrite record (ADR-0064) names
-                        // L1 output parts exactly as a compaction record does;
-                        // count their segment format versions the same way.
-                        let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
-                            anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
-                        })?;
-                        let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref())
-                            .map_err(|err| {
-                                anyhow::anyhow!("rewrite record {} is corrupt: {err}", meta.key)
-                            })?;
-                        for part in &record.parts {
-                            hist.entry(part.segment_format_version).or_default().1 += 1;
-                        }
-                    }
-                    Ok(keys::BucketEntry::Tombstone(_)) => {}
-                    Err(err) => {
-                        return Err(anyhow::anyhow!("unknown key shape {}: {err}", meta.key));
-                    }
-                }
-            }
-        }
+        let scan = enumerate_versions(store.as_ref(), &tenant_hash, signal, scan_shards).await?;
 
         println!(
             "== signal {:?} (supported versions: {}) ==",
             signal,
             window.display()
         );
-        if hist.is_empty() {
+        if scan.hist.is_empty() {
             println!("  no live objects");
         }
-        for (version, (l0, l1)) in &hist {
+        for (version, (l0, l1)) in &scan.hist {
             let flag = if window.contains(*version) {
                 ""
             } else {
@@ -1187,17 +1143,171 @@ pub async fn audit_versions(
                 anomalies += l0 + l1;
             }
         }
+
+        let floors =
+            floor_evidence(store.as_ref(), &tenant_hash, signal, scan_shards, &scan).await?;
+        if floors.is_empty() {
+            println!("  no format floors recorded");
+        }
+        for classified in &floors {
+            println!("  {}", classified.display());
+            if classified.evidence == ravel_catalog::FloorEvidence::Contradicted {
+                contradicted += 1;
+            }
+        }
     }
 
+    let mut failures = Vec::new();
     if anomalies > 0 {
-        anyhow::bail!(
+        failures.push(format!(
             "audit-versions found {anomalies} live object(s) at an unsupported version; there is \
              no dual-reader or migration path (ADR-0027 for RSEG, ADR-0032 and ADR-0095 for RLOG, \
              ADR-0041 for RSPAN)"
-        );
+        ));
+    }
+    if contradicted > 0 {
+        failures.push(format!(
+            "audit-versions found {contradicted} contradicted format floor(s): a live record sits \
+             below a recorded floor, so the floor is false and no reader may be deleted on it \
+             (ADR-1746 decision 2)"
+        ));
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("{}", failures.join("; "));
     }
     println!("audit-versions: all live objects are at a supported version");
     Ok(())
+}
+
+/// What one `audit-versions` enumeration pass over a (tenant, signal) saw.
+#[derive(Debug, Default)]
+struct VersionScan {
+    /// `segment_format_version` -> (L0 commit records, L1 compaction and
+    /// rewrite parts), counting every commit record the shards list,
+    /// superseded ones included.
+    hist: std::collections::BTreeMap<u32, (usize, usize)>,
+    /// The same enumeration's live population, which floor classification
+    /// reads: the liveness `migrate`'s re-audit raises a floor on.
+    census: ravel_maintain::FamilyCensus,
+}
+
+impl VersionScan {
+    /// Newest `created_unix_ns` among the live records; `None` when there are
+    /// none.
+    fn newest_created_unix_ns(&self) -> Option<i64> {
+        self.census.newest_live_created_unix_ns
+    }
+}
+
+/// Enumerate every commit-family record of a (tenant, signal) across
+/// `scan_shards` once, read fresh: the version histogram `audit-versions`
+/// prints and the live census floor classification runs on.
+async fn enumerate_versions(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+) -> anyhow::Result<VersionScan> {
+    let census = census_family(store, tenant_hash, signal, scan_shards)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("enumerating commit-family records for signal {signal:?} failed: {err}")
+        })?;
+    let mut hist: std::collections::BTreeMap<u32, (usize, usize)> = Default::default();
+    for (version, n) in census.live_l0.iter().chain(&census.superseded_l0) {
+        hist.entry(*version).or_default().0 += n;
+    }
+    for (version, n) in &census.parts {
+        hist.entry(*version).or_default().1 += n;
+    }
+    Ok(VersionScan { hist, census })
+}
+
+/// One recorded floor, the observation it was classified against, and the
+/// resulting [`ravel_catalog::FloorEvidence`].
+#[derive(Debug)]
+struct ClassifiedFloor {
+    floor: ravel_catalog::FormatFloor,
+    observed: ravel_catalog::FloorObservation,
+    evidence: ravel_catalog::FloorEvidence,
+}
+
+impl ClassifiedFloor {
+    /// One report line: the floor, its basis (printed field by field, or
+    /// "none"), what the audit observed now, and the classification.
+    fn display(&self) -> String {
+        let f = &self.floor;
+        let basis = match f.basis {
+            Some(b) => format!(
+                "observed_entries={} observed_newest_created_unix_ns={} observed_shards={}",
+                b.observed_entries, b.observed_newest_created_unix_ns, b.observed_shards
+            ),
+            None => "none".to_string(),
+        };
+        let newest = self
+            .observed
+            .newest_created_unix_ns
+            .map_or_else(|| "none".to_string(), |n| n.to_string());
+        format!(
+            "floor {} >= {} (raised_unix_ns={} raised_by={:?}; basis: {basis}): {} \
+             [live_below_floor={} newest_created_unix_ns={newest} scan_shards={}]",
+            f.family,
+            f.floor_version,
+            f.raised_unix_ns,
+            f.raised_by,
+            self.evidence.as_str(),
+            self.observed.live_below_floor,
+            self.observed.scan_shards,
+        )
+    }
+}
+
+/// Classify every recorded format floor of a (tenant, signal) against current
+/// records (ADR-1746 decision 2), in the record's append order.
+///
+/// Both halves of each observation come from `scan`'s one enumeration and its
+/// live population: "live below the floor" is a prefix sum over the live
+/// histogram, equal to [`ravel_maintain::count_below_target`] at the floor's
+/// version, and the newest creation time excludes a superseded commit record
+/// sweep has not reclaimed. An L0 record an authoritative compaction or rewrite
+/// already supersedes therefore neither contradicts a floor migrate raised
+/// over it nor makes that floor stale. Every floor is counted against this
+/// signal's commit-family records whatever its family string, as `migrate`
+/// does when it raises one. Fails closed on an unreadable provisioning record
+/// rather than reporting no floors.
+async fn floor_evidence(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    scan: &VersionScan,
+) -> anyhow::Result<Vec<ClassifiedFloor>> {
+    let floors = match ravel_catalog::read_floors_from_store(store, tenant_hash, signal).await {
+        Ok(Some(floors)) => floors,
+        Ok(None) => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "format-floor read failed for signal {signal:?}: {err}; refusing to report the \
+                 floors as absent (ADR-1746 decision 2)"
+            ));
+        }
+    };
+    let mut out = Vec::with_capacity(floors.len());
+    for floor in floors {
+        let live_below = scan.census.live_below(floor.floor_version);
+        let observed = ravel_catalog::FloorObservation {
+            live_below_floor: u64::try_from(live_below).unwrap_or(u64::MAX),
+            newest_created_unix_ns: scan.newest_created_unix_ns(),
+            scan_shards,
+        };
+        let evidence = ravel_catalog::classify_floor(&floor, &observed);
+        out.push(ClassifiedFloor {
+            floor,
+            observed,
+            evidence,
+        });
+    }
+    Ok(out)
 }
 
 /// The canonical format-family identifier for a signal's on-object format
@@ -2088,11 +2198,40 @@ mod tests {
         shard: u32,
         version: u32,
     ) {
-        const NS_PER_HOUR: i64 = 3_600_000_000_000;
-        let ingest_hour_bucket = 100u32;
-        // The commit builder cross-checks ingest_hour_bucket against
-        // created_unix_ns's hour, so keep them consistent.
-        let created_unix_ns = i64::from(ingest_hour_bucket) * NS_PER_HOUR;
+        publish_commit_in_hour(store, tenant_hash, shard, version, 100).await;
+    }
+
+    /// [`publish_commit_at`] with the record's ingest hour (and so its
+    /// `created_unix_ns`) chosen by the caller.
+    async fn publish_commit_in_hour(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        shard: u32,
+        version: u32,
+        ingest_hour_bucket: u32,
+    ) {
+        publish_commit_created_at(
+            store,
+            tenant_hash,
+            shard,
+            version,
+            i64::from(ingest_hour_bucket) * NS_PER_HOUR,
+        )
+        .await;
+    }
+
+    /// [`publish_commit_at`] with the record's `created_unix_ns` chosen by the
+    /// caller; its ingest hour is the hour that time falls in (the commit
+    /// builder cross-checks the two). Returns the published record.
+    async fn publish_commit_created_at(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        shard: u32,
+        version: u32,
+        created_unix_ns: i64,
+    ) -> ravel_proto::commit::v1::CommitRecord {
+        let ingest_hour_bucket =
+            u32::try_from(created_unix_ns / NS_PER_HOUR).expect("hour fits u32");
         let writer_id = Uuid::new_v4();
         let payload = format!("seg-{shard}-{writer_id}").into_bytes();
         let content_hash = *blake3::hash(&payload).as_bytes();
@@ -2123,6 +2262,7 @@ mod tests {
         publish::publish(store, &commit, &RetryPolicy::default())
             .await
             .expect("publish commit record");
+        commit
     }
 
     /// Finding 5: the CLI `maintain audit-versions` loop must visit the
@@ -2162,6 +2302,469 @@ mod tests {
             err.to_string().contains("unsupported version"),
             "expected an unsupported-version anomaly, got: {err}"
         );
+    }
+
+    /// Create a one-shard Metrics provisioning record for `tenant_hash`.
+    async fn provision_one_shard(store: &MemoryStore, tenant_hash: &TenantHash) {
+        ravel_catalog::validate_or_adopt(
+            store,
+            tenant_hash,
+            Signal::Metrics,
+            1,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+    }
+
+    /// Overwrite the Metrics provisioning record with the version-3 shape a
+    /// Release B `migrate` leaves behind (ADR-1746 decision 1): one `rseg`
+    /// floor at `floor_version` whose basis says the raising audit saw
+    /// `observed_entries` entries, the newest created at `newest_created_hour`,
+    /// over one shard.
+    async fn seed_v3_floor_with_basis(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        floor_version: u32,
+        observed_entries: u64,
+        newest_created_hour: i64,
+    ) {
+        use prost::Message;
+        use ravel_object_store::PutOptions;
+        use ravel_proto::sys::v1 as sysproto;
+
+        let key = ravel_catalog::provisioning_key(tenant_hash, Signal::Metrics);
+        let got = store.get(&key, GetRange::Full).await.expect("record");
+        let mut record =
+            sysproto::ProvisioningRecord::decode(got.data.as_ref()).expect("decode record");
+        record.format_version = 3;
+        record.format_floors = vec![sysproto::FormatFloor {
+            family: "rseg".to_string(),
+            floor_version,
+            raised_unix_ns: newest_created_hour * NS_PER_HOUR + 1,
+            raised_by: "migrate".to_string(),
+            observed_entries,
+            observed_newest_created_unix_ns: newest_created_hour * NS_PER_HOUR,
+            observed_shards: 1,
+        }];
+        store
+            .put(&key, record.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed version-3 record");
+    }
+
+    fn rseg_newest() -> u32 {
+        u32::from(ravel_segment::SUPPORTED_VERSIONS.newest())
+    }
+
+    /// Classify the tenant's Metrics floors the way `audit-versions` does: one
+    /// enumeration pass over the one-shard range, then [`floor_evidence`].
+    async fn classify_now(store: &MemoryStore, tenant_hash: &TenantHash) -> Vec<ClassifiedFloor> {
+        let scan = enumerate_versions(store, tenant_hash, Signal::Metrics, 1)
+            .await
+            .expect("enumerate");
+        floor_evidence(store, tenant_hash, Signal::Metrics, 1, &scan)
+            .await
+            .expect("classify")
+    }
+
+    /// ADR-1746 follow-up 1, first acceptance case: a floor is raised, then one
+    /// commit record lands with `segment_format_version` one below the floor
+    /// and a later `created_unix_ns`. The floor is `Contradicted`, and
+    /// `audit-versions` exits nonzero on that alone: the floor sits one above
+    /// the supported RSEG version so the record itself is no anomaly.
+    #[tokio::test]
+    async fn audit_versions_reports_a_contradicted_floor_and_exits_nonzero() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-floor-contradicted";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let floor = rseg_newest() + 1;
+        ravel_catalog::raise_format_floor(
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Metrics,
+            "rseg",
+            floor,
+            "migrate",
+            50 * NS_PER_HOUR,
+        )
+        .await
+        .expect("raise the floor");
+
+        publish_commit_in_hour(&store, &tenant_hash, 0, floor - 1, 100).await;
+
+        let evidence = classify_now(&store, &tenant_hash).await;
+        assert_eq!(evidence.len(), 1, "one recorded floor: {evidence:?}");
+        assert_eq!(evidence[0].floor.floor_version, floor);
+        assert_eq!(evidence[0].observed.live_below_floor, 1);
+        assert_eq!(
+            evidence[0].evidence,
+            ravel_catalog::FloorEvidence::Contradicted
+        );
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("a contradicted floor must fail the audit");
+        let msg = err.to_string();
+        assert!(msg.contains("contradicted"), "got: {msg}");
+        assert!(
+            !msg.contains("unsupported version"),
+            "the record is at a supported version, so the failure is the floor alone: {msg}"
+        );
+    }
+
+    /// ADR-1746 follow-up 1, second acceptance case: a floor with a basis, then
+    /// one commit record at the floor, created after the basis's newest
+    /// record. Nothing sits below the floor but the basis no longer covers
+    /// every record: `Stale`, and the audit passes.
+    #[tokio::test]
+    async fn audit_versions_reports_a_stale_floor_for_a_record_at_the_floor() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-floor-stale";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let floor = rseg_newest();
+        seed_v3_floor_with_basis(&store, &tenant_hash, floor, 1, 50).await;
+
+        publish_commit_in_hour(&store, &tenant_hash, 0, floor, 100).await;
+
+        let evidence = classify_now(&store, &tenant_hash).await;
+        assert_eq!(evidence.len(), 1, "one recorded floor: {evidence:?}");
+        assert_eq!(evidence[0].observed.live_below_floor, 0);
+        assert_eq!(evidence[0].evidence, ravel_catalog::FloorEvidence::Stale);
+
+        audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect("a stale floor is reported, not a failure");
+    }
+
+    /// The same record at the floor, with a basis whose newest record IS that
+    /// record: `Current`. Pins that the Stale case above is driven by the
+    /// record's creation time, not by the presence of a record.
+    #[tokio::test]
+    async fn floor_evidence_is_current_when_the_basis_covers_every_record() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-floor-current";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let floor = rseg_newest();
+        seed_v3_floor_with_basis(&store, &tenant_hash, floor, 1, 100).await;
+
+        publish_commit_in_hour(&store, &tenant_hash, 0, floor, 100).await;
+
+        let evidence = classify_now(&store, &tenant_hash).await;
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].evidence, ravel_catalog::FloorEvidence::Current);
+    }
+
+    /// The audit's own newest-`created_unix_ns` figure is what classification
+    /// runs on: the enumeration pass returns the newest record it saw.
+    #[tokio::test]
+    async fn audit_enumeration_reports_the_newest_created_unix_ns() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("cli-audit-newest").hash();
+        publish_commit_in_hour(&store, &tenant_hash, 0, rseg_newest(), 90).await;
+        publish_commit_in_hour(&store, &tenant_hash, 0, rseg_newest(), 120).await;
+        publish_commit_in_hour(&store, &tenant_hash, 0, rseg_newest(), 100).await;
+
+        let scan = enumerate_versions(store.as_ref(), &tenant_hash, Signal::Metrics, 1)
+            .await
+            .expect("enumerate");
+        assert_eq!(scan.newest_created_unix_ns(), Some(120 * NS_PER_HOUR));
+        assert_eq!(scan.hist.get(&rseg_newest()), Some(&(3, 0)));
+    }
+
+    /// PUT a compaction record over `inputs`' bucket naming each as an input,
+    /// with one part at `part_version`, created at `created_unix_ns`. No part
+    /// data object is written: the enumeration reads only records.
+    async fn put_compaction_over(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        inputs: &[&ravel_proto::commit::v1::CommitRecord],
+        created_unix_ns: i64,
+        part_version: u32,
+    ) -> String {
+        use prost::Message;
+        use ravel_object_store::PutOptions;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
+
+        let first = inputs.first().expect("at least one input");
+        let input_set_hash = vec![0x5a; 32];
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: first.shard,
+            ingest_hour_bucket: first.ingest_hour_bucket,
+            level: 1,
+            inputs: inputs
+                .iter()
+                .map(|c| CompactionInputIdentity {
+                    writer_id: c.writer_id.clone(),
+                    writer_epoch: c.writer_epoch,
+                    writer_seq: c.writer_seq,
+                })
+                .collect(),
+            input_set_hash: input_set_hash.clone(),
+            parts: vec![CompactionPart {
+                part_index: 0,
+                first_series_id: vec![0u8; 16],
+                last_series_id: vec![0xff; 16],
+                content_hash: vec![0x5a; 32],
+                object_size: 4096,
+                sample_count: 1,
+                series_count: 1,
+                run_count: 1,
+                min_event_ts_ns: created_unix_ns,
+                max_event_ts_ns: created_unix_ns,
+                segment_format_version: part_version,
+                declared_column_stats: Vec::new(),
+            }],
+            created_unix_ns,
+        };
+        let hash16: String = input_set_hash[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let key = keys::compaction_record_key(
+            tenant_hash,
+            Signal::Metrics,
+            first.shard,
+            first.ingest_hour_bucket,
+            &hash16,
+        )
+        .expect("compaction record key");
+        store
+            .put(
+                &key,
+                record.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        key
+    }
+
+    /// Seed one live commit record in hour 99 and a commit record in hour 100
+    /// that a compaction record created at hour 100 supersedes, all at
+    /// `version`. The superseded record was created half an hour after the
+    /// compaction record (writer clock skew), so it is the newest record the
+    /// shard lists while the compaction record is the newest live one.
+    async fn seed_live_and_unswept_superseded(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        version: u32,
+    ) {
+        publish_commit_in_hour(store, tenant_hash, 0, version, 99).await;
+        let superseded = publish_commit_created_at(
+            store,
+            tenant_hash,
+            0,
+            version,
+            100 * NS_PER_HOUR + NS_PER_HOUR / 2,
+        )
+        .await;
+        put_compaction_over(
+            store,
+            tenant_hash,
+            &[&superseded],
+            100 * NS_PER_HOUR,
+            version,
+        )
+        .await;
+    }
+
+    /// Both halves of a floor observation come from the live population: a
+    /// superseded L0 commit record sweep has not reclaimed, created after every
+    /// live record, neither sits below the floor nor makes a floor whose basis
+    /// covers the live population `Stale`.
+    #[tokio::test]
+    async fn floor_evidence_ignores_an_unswept_superseded_record_newer_than_the_basis() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-floor-superseded";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let floor = rseg_newest();
+        // The live population: one L0 record and one compaction part, the
+        // newest created at hour 100.
+        seed_v3_floor_with_basis(&store, &tenant_hash, floor, 2, 100).await;
+        seed_live_and_unswept_superseded(&store, &tenant_hash, floor).await;
+
+        let evidence = classify_now(&store, &tenant_hash).await;
+        assert_eq!(evidence.len(), 1, "one recorded floor: {evidence:?}");
+        assert_eq!(evidence[0].observed.live_below_floor, 0);
+        assert_eq!(
+            evidence[0].observed.newest_created_unix_ns,
+            Some(100 * NS_PER_HOUR),
+            "the newest live record is the compaction record, not the superseded commit"
+        );
+        assert_eq!(evidence[0].evidence, ravel_catalog::FloorEvidence::Current);
+    }
+
+    /// LIST and GET calls one `audit-versions` run issues against a tenant with
+    /// one shard of Metrics data and `floor_versions` recorded as `rseg`
+    /// floors, counted by the store's own instrumentation.
+    async fn audit_requests_with_floors(floor_versions: &[u32]) -> (u64, u64) {
+        use ravel_object_store::InstrumentedStore;
+
+        let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let tenant = "cli-audit-floor-requests";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let mem = store.inner();
+        provision_one_shard(mem, &tenant_hash).await;
+        for (i, version) in (0i64..).zip(floor_versions) {
+            ravel_catalog::raise_format_floor(
+                mem,
+                &tenant_hash,
+                Signal::Metrics,
+                "rseg",
+                *version,
+                "migrate",
+                (50 + i) * NS_PER_HOUR,
+            )
+            .await
+            .expect("raise the floor");
+        }
+        seed_live_and_unswept_superseded(mem, &tenant_hash, rseg_newest()).await;
+
+        let before = store.metrics().snapshot();
+        audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect("no floor is contradicted and every record is supported");
+        let after = store.metrics().snapshot();
+        (
+            after.list_calls() - before.list_calls(),
+            after.get.calls - before.get.calls,
+        )
+    }
+
+    /// `audit-versions` enumerates each signal's commit family once however
+    /// many floors are recorded: three floors on one signal cost exactly the
+    /// requests one floor does.
+    #[tokio::test]
+    async fn audit_versions_request_count_does_not_grow_with_recorded_floors() {
+        let newest = rseg_newest();
+        assert!(newest >= 3, "three distinct floors at or below {newest}");
+        // One shard listing per signal; per signal one generation read and one
+        // floor read of the provisioning record, plus the three Metrics
+        // records (two commit records and the compaction record), each read
+        // once.
+        const LISTS: u64 = 3;
+        const GETS: u64 = 3 + 3 + 3;
+        let one = audit_requests_with_floors(&[newest]).await;
+        let three = audit_requests_with_floors(&[newest - 2, newest - 1, newest]).await;
+        assert_eq!(one, (LISTS, GETS), "one floor: (LIST, GET)");
+        assert_eq!(three, (LISTS, GETS), "three floors: (LIST, GET)");
+    }
+
+    /// `audit-versions` over a commit record whose stored bytes do not decode
+    /// fails naming that record's key, so the operator can find the object.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_an_undecodable_commit_record() {
+        use ravel_object_store::PutOptions;
+
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-corrupt-commit";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let commit =
+            publish_commit_created_at(&store, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = keys::commit_key_for_record(&commit).expect("commit key");
+        store
+            .put(
+                &key,
+                bytes::Bytes::from_static(b"not a commit record"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite the commit record with undecodable bytes");
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("an undecodable commit record must fail the audit");
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(
+            msg.contains("is corrupt during format census"),
+            "got: {msg}"
+        );
+    }
+
+    /// `audit-versions` over a commit record deleted between the LIST and its
+    /// GET fails naming that record's key and saying it is no longer present.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_a_commit_record_gone_after_the_list() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let mem = MemoryStore::new();
+        let tenant = "cli-audit-vanished-commit";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&mem, &tenant_hash).await;
+        let commit =
+            publish_commit_created_at(&mem, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = keys::commit_key_for_record(&commit).expect("commit key");
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(&key));
+        let store = Arc::new(FaultStore::new(mem, plan));
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("a commit record gone after the listing must fail the audit");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the record's GET must have been faulted exactly once"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(msg.contains("no longer present"), "got: {msg}");
+    }
+
+    /// `audit-versions` over a compaction record deleted between the LIST and
+    /// its GET fails naming that record's key, the same as a commit record.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_a_compaction_record_gone_after_the_list() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let mem = MemoryStore::new();
+        let tenant = "cli-audit-vanished-compaction";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&mem, &tenant_hash).await;
+        let input =
+            publish_commit_created_at(&mem, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = put_compaction_over(
+            &mem,
+            &tenant_hash,
+            &[&input],
+            100 * NS_PER_HOUR,
+            rseg_newest(),
+        )
+        .await;
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(&key));
+        let store = Arc::new(FaultStore::new(mem, plan));
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("a compaction record gone after the listing must fail the audit");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the record's GET must have been faulted exactly once"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(msg.contains("compaction record"), "got: {msg}");
+        assert!(msg.contains("no longer present"), "got: {msg}");
     }
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;

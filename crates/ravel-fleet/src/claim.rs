@@ -57,11 +57,12 @@
 //! deliberately **excluded**:
 //!
 //! - `input_set_hash`. Two nodes whose listings diverge on a sealed bucket must
-//!   collide on ONE claim, run once, and surface the divergence through the
-//!   existing `InputSetHashDivergence` machinery. Hashing the input view into
-//!   the key would let both nodes run and publish under two separate claims,
-//!   which is the exact duplicate this module exists to prevent (ADR-1029
-//!   rejected alternative 3). It travels in the payload as forensics instead.
+//!   collide on ONE claim and run once. Hashing the input view into the key
+//!   would let both nodes run and publish under two separate claims, which is
+//!   the exact duplicate this module exists to prevent (ADR-1029 rejected
+//!   alternative 3). Divergent listings that do both run publish two separate
+//!   compaction records, not an `InputSetHashDivergence` error (ADR-1029's
+//!   2026-09-28 amendment). The hash travels in the payload as forensics.
 //! - Policy and geometry knobs (`max_l1_part_bytes`,
 //!   `l1_part_memory_target_bytes`, and any future compaction policy version).
 //!   They already change part sets without changing compaction record identity,

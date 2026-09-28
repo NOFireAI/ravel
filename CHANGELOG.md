@@ -6,6 +6,639 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The background supervisor now takes an advisory claim before compacting a
+  large bucket, so two processes whose ownership overlaps no longer both pay
+  for the same merge** (ADR-1029 decisions 3 to 5, issue #1033). The claim is
+  taken after the bucket's gates and before any read whose cost scales with the
+  bucket; a claimed run then consults it at the merge's quiescent points and
+  cancels without publishing once the claim is gone, leaving the parts it had
+  already written where they are. A supervisor refused a claim reports the
+  bucket skipped, with the holder and the reason, and holds its compaction
+  until that holder's lease can have expired rather than re-requesting the
+  claim every tick; retention and zone classification still run for a held
+  bucket. An uncontended claim is taken with no wait: the deterministic
+  jitter, by default up to 10% of the lease, is waited out only before
+  stealing an expired claim or retrying a create whose claim vanished before
+  it could be read. A supervisor tick's claim decisions read the tick's own clock.
+  Coordination is on by default and claims are taken only at or above 64 MiB
+  of listed input bytes (`claim_min_input_bytes`), so a small bucket is merged
+  exactly as before. The switch that turns claiming off is the
+  `CompactorConfig::coordination` field; no server flag or config file reaches
+  it yet, and its operator flag lands with #1035. Claims
+  stay advisory: the compaction record's `CreateIfAbsent` still decides which
+  output is published, so a stale owner that finishes after losing its claim
+  converges on the one record rather than publishing a second. For the same
+  reason a store error while marking a claim completed is logged and the
+  published compaction stands, and a claim object that cannot be decoded is
+  never stolen but, once older than one lease plus the contender's jitter, no
+  longer holds its bucket back: the bucket is compacted unclaimed. Claim
+  traffic is counted under a new `coordinate` phase in the compaction request
+  ledger, never pooled into the merge's own phases.
+
+- **This release reads provisioning record format 3 and still writes 2, and
+  `ravel-cli maintain audit-versions` now classifies every recorded format
+  floor** (ADR-1746 Release A, issue #1746). `FormatFloor` gains three basis
+  fields (`observed_entries`, `observed_newest_created_unix_ns`,
+  `observed_shards`, numbers 5 to 7) that a later release fills when
+  `migrate` raises a floor. Readers accept provisioning format versions
+  {1, 2, 3}; writers keep stamping 2, and `append_generation` and
+  `raise_format_floor` refuse a version-3 record with
+  `RefusingToRewriteNewerRecord` instead of rewriting it without the basis.
+  Roll this release out fleet-wide before any release that writes format 3.
+  `audit-versions` prints each floor with its basis and one of `current`,
+  `stale`, `contradicted` or `unknown`, and exits nonzero when a live record
+  sits below a recorded floor (`contradicted`). Every floor raised so far has
+  no basis and reports `unknown` unless it is contradicted.
+- **The query fetchers and PromQL evaluation can run their CPU-bound work on
+  the read CPU gate** (ADR-1702 follow-up task 7, issue #1702).
+  `SegmentFetcher`, `LogSegmentFetcher`, `SpanSegmentFetcher` and
+  `QueryEngine` gain `with_read_gate`. With a gate set, each RSEG catalog
+  decode (site `segment_section`, or `segment_sparse_catalog` for the chunked
+  catalog probe) is one gate job the size of its decoded catalog, with the
+  decode's memory reservation moved into the job and shrunk after the matcher
+  filter as before. On `LogSegmentFetcher`, every RLOG scan open (its
+  directory sections and the POSTINGS probe, which the reader runs inside the
+  open) is one `log_postings` job; every block `fetch_accounted` and
+  `fetch_accounted_with_tenant` decode, and every block a `LogSegmentScan`
+  hands out through `next_block_on_gate` (the LogQL series path), is one
+  `log_block` job covering all its pages; and every SKIP_IDX, PAGE_DIR,
+  FIELD_DIR and planning section the block-range path decodes on its own is
+  one `log_section` job. Each RSPAN block the span fetcher's row fetch
+  decodes, and every block a `SpanColumnarScan` hands out through
+  `next_block_on_gate`, is one `span_block` job. A PromQL evaluation whose
+  prefetched sample count is at or above the gate's evaluation floor runs on
+  the gate (`promql_eval`); a smaller one runs inline and counts as inline. A job that panicked is the fetcher's decode
+  error (`Corrupt`), a 500 on the HTTP API, and an evaluation that panicked
+  is the new `QueryError::CpuGate`, also a 500; a job the runtime dropped at
+  shutdown is a transient store error and a 503. A log or span scan whose
+  gated block decode failed refuses every later block rather than skip one,
+  and every later call reports the same error class the failed call reported,
+  so a panicked decode stays a 500 instead of degrading to a 503. Sizing an
+  object's `log_block` jobs reads its PAGE_DIR a second time, after the scan
+  open's own decode of it; that read is charged to the query's accounting
+  like every other, so a gated fetch reports the decompressed bytes it
+  actually produced. With no gate set every path runs inline exactly as
+  before, and the server does not
+  set one yet: wiring its read gate into the engine and fetchers it builds is
+  a later step. Still inline with a gate set: RSEG page decodes, a
+  `LogSegmentScan`'s `next_block` and `next_block_columnar` exits and a
+  `SpanColumnarScan`'s `next_block`, a direct `matching_streams` call, the
+  STREAM_DIR decode of `fetch_stream_dir`'s whole-object fallback, and the
+  RSPAN footer sections (`span_section`), which the span fetcher decodes
+  while opening a scan. The SQL logs and spans
+  scans still decode inside `poll_next` (task 8).
+- **The catalog can decode snapshot parts, postings and column statistics on
+  the read CPU gate** (ADR-1702 follow-up task 6, issue #1702).
+  `Catalog::with_read_gate` sends each decode to the gate at its declared
+  uncompressed length, with the decode's memory reservation moved into the
+  job. Units below the gate's inline floor still run inline and count as
+  inline. The new `read_metrics_meta_on_gate` and
+  `read_metrics_meta_for_serve_on_gate` run the metrics-meta body decode on
+  the gate the same way; only the serve reader moves a memory reservation
+  into the job, since the strict reader takes none. A job the gate cannot complete fails that decode with
+  `SnapshotFormatError::DecodeJob` or `MetricsMetaError::DecodeJob`, and the
+  read handles it like any other decode error. Without a gate every decode
+  runs inline as before. The server does not install the gate on its catalog
+  or the metadata cache yet, so no server read path runs on it in this
+  release.
+
+### Security
+
+- **A distributed SQL slice fetch no longer carries the client's credential**
+  (ADR-1689 decision 2, issues #1689 and #1690). The coordinator used to copy
+  the inbound request's gRPC metadata, bearer token included, onto every
+  worker `DoGet`, so the long-lived client token reached every worker that
+  served a slice. The slice ticket is now the whole credential: it is MAC'd
+  under a slice key of its own, derived from each SQL ticket file key beside
+  a separate key for client whole-set tickets, so a ticket minted for one
+  surface fails the MAC on the other. The worker verifies it without
+  consulting the tenant resolver (MAC under any configured key, deadline
+  against the injected clock, `slice_count > 1`, listener role) and runs the
+  slice under the ticket's tenant. Refusals are typed and counted in-process
+  under a closed reason (`missing`, `bad_mac`, `expired`, `wrong_surface`);
+  the counters are not exported at `/metrics` yet. On the combined listener
+  a node without `--fragment-listener` runs, a ticket that fails the slice
+  MAC falls through to the client path, which still requires the client
+  credential, so only `expired` and `wrong_surface` can fire there. Without
+  `--fragment-listener` the slice travels over the public gRPC listener in
+  plaintext; with it, the slice rides the dedicated TLS listener (the entry
+  after next). Both keys derive from the first fragment key unless
+  `--sql-ticket-key-file` is set (next entry). During the rolling upgrade
+  onto this release a coordinator drops workers on the other `queryfrag`
+  protocol version at routing time, with no round trip, and runs their
+  slices on the coordinator: parallelism drops for the rollout, results do
+  not change. Client whole-set tickets are now signed under a key derived
+  from the shared one, so with `--distributed-query` a `GetFlightInfo` and
+  its `DoGet` that land on an old and a new process fail with
+  `invalid_argument` until the rollout completes, and the query has to be
+  run again.
+
+- **The Flight SQL ticket keys come from `--sql-ticket-key-file`, not from the
+  fragment key** (ADR-1689 decision 2, issues #1689 and #1690). The new flag
+  takes the `--fragment-key-file` shape and rotation rule (the first key mints,
+  every key verifies) and requires `--distributed-query`. With it set, the
+  Flight SQL service keys every client and slice ticket off the file's keys and
+  nothing is derived from the fragment key file, so one key file no longer
+  covers both lanes. Without it, a node derives the SQL ticket secret from the
+  first fragment key as earlier releases did; the upgrade from an earlier
+  release still has the client-ticket window the previous entry describes,
+  because this release turns that secret into separate client and slice keys. A
+  `--distributed-query` process in `all` or `query` mode missing
+  `--sql-ticket-key-file` or `--fragment-listener` logs a startup warning that
+  release B (ADR-1689 decision 4) requires both. Every `--distributed-query`
+  process in `all` or `query` mode without `--fragment-listener` also logs that
+  SQL slice tickets travel in plaintext on the public gRPC listener and are a
+  replayable read capability until their deadline (next entry). Every node in a
+  cluster must read the same SQL ticket key set. A rolling switch straight onto
+  a new key file has a mixed window: a client ticket that `GetFlightInfo` minted
+  on a node on the file and that `DoGet` redeems on a node still on the derived
+  key (or the reverse) fails with `invalid_argument`, a client-visible query
+  failure, since a client ticket can be redeemed on any node behind a balancer,
+  and SQL slices between two such nodes run on the coordinator instead. The
+  deployment guide describes a switch without that window: first ship a key file
+  holding the key each node derives today, then rotate.
+
+- **SQL slice fetches ride the dedicated TLS fragment listener, and the
+  public gRPC listener refuses slice tickets once one is configured**
+  (ADR-1689 decisions 1 and 3, issues #1689 and #1690). With
+  `--fragment-listener`, the dedicated listener mounts the Flight service
+  beside `SeriesFetch` in a slice-only role: it serves `DoGet` for a slice
+  ticket and refuses every other Flight and Flight SQL method, and no method
+  other than a slice `DoGet` returns data. The client Flight SQL methods the
+  service implements answer `permission_denied`; the methods it does not
+  (prepared statements, `Handshake`, `ListFlights`, `PollFlightInfo`,
+  `GetSchema`, `DoPut`, `DoExchange`) answer `unimplemented`, as they do on
+  the public listener; `ListActions` returns its static list; a `DoGet` that is
+  not a valid slice capability answers `unauthenticated` (`missing`,
+  `bad_mac` or `expired`, where a handle too short to be a ticket is
+  `missing`) or, for a client ticket, `permission_denied` (`wrong_surface`),
+  counted on the same counters as the public listener. The public gRPC
+  listener keeps the client Flight SQL surface and refuses a slice ticket
+  whose MAC verifies under this node's slice keys with `permission_denied`,
+  counted as `wrong_surface`, the mirror of it refusing pinned fragment
+  fetches; a forged ticket, or one under a key this node lacks, takes the
+  client path and is refused there uncounted. The SQL lane dials each
+  worker's `fragment_endpoint` over the same pinned-CA mutual TLS the PromQL
+  lane uses, with the same certificate, so a peer without a client
+  certificate from `--fragment-tls-ca` fails the handshake; it no longer
+  dials `flight_sql_endpoint` for slices, and a worker whose record has no
+  fragment endpoint gets none. Without
+  `--fragment-listener` nothing changes: the public listener serves both
+  surfaces and slices travel there in plaintext, and the startup line saying
+  so is now logged only in that case (and only where Flight SQL is served).
+  In a build without Flight SQL the release B warning names only
+  `--fragment-listener`. The `queryfrag` protocol version moves from 4 to 5,
+  so during the one rolling deploy onto this release a coordinator drops
+  workers on the other version at routing time and runs their PromQL and SQL
+  slices coordinator-local: parallelism drops for the deploy, results do not
+  change. Federation requests carry the same protocol version and a remote
+  refuses a mismatch, so a cluster on this release and a remote cluster on
+  an earlier one fail federated queries with a `Federation` error (or, for a
+  remote with `skip-unavailable`, skip it with a partial-coverage warning)
+  until both run the same release.
+
+### Fixed
+
+- **A writer whose clock lags the object store's clock refuses its flush
+  instead of publishing into a sealed hour** (issue #1685, ADR-1685). At flush
+  open, every metrics, log, and span shard actor compares its raw clock reading
+  with the store's observed clock (the latest response `Date`). A reading more
+  than `DEFAULT_CLOCK_SKEW_ALLOWANCE_NS` (five minutes) behind it fails the
+  flush with the retryable `Abandoned` (503), re-buffers the rows, and counts
+  `clock_lag_refused`, where before the flush was acknowledged and its commit
+  record landed in an ingest hour a fold on a correct clock may already have
+  sealed, invisible to token-less reads. A flush with no observation yet
+  proceeds and counts `clock_lag_unchecked`. All three counters here
+  (`clock_lag_refused`, `clock_lag_unchecked`, and
+  `clock_lag_bypassed_at_shutdown` below) are on the `ravel-ingest` metrics
+  snapshots; `/metrics` renders none of them yet. A
+  graceful shutdown is the one exception, because a lag refusal re-anchors
+  nothing and so refuses every enforced pass of a drain: on the `Shutdown` and
+  channel-close drains the drain then makes bypass passes, under the same pass
+  cap, that skip the check and publish the buffered rows, counting each
+  bypassed flush-open attempt as
+  `clock_lag_bypassed_at_shutdown` and logging the lag at WARN. Those rows
+  can land in an already-sealed ingest hour, visible to token-less reads
+  after a HEAD rebuild, which is what they did before this change; enforcing
+  the refusal there would have dropped rows buffered mode had already
+  acknowledged. The monotonic floor (ADR-1307) still applies on a bypass
+  pass, and a lag refusal returns before the floor is read, so a backwards
+  step past the hold bound surfaces on the first bypass pass, re-anchors the
+  floor there, and publishes on the next one. Teardown residue now needs every
+  enforced pass refused (by the lag check or the floor) and every bypass pass
+  refused by the floor, so it takes as many consecutive over-bound backwards
+  steps on the bypass readings as the pass cap allows passes, the same count
+  the floor alone needed before this check existed. `FlushNow` and every size
+  or age trigger keep refusing. Fix the host clock before restarting a writer
+  that is refusing flushes.
+- **Alert sink delivery is bounded per evaluation tick, and ADR-0117's stated
+  per-tick publish bound is corrected** (issues #2063, #2064). The evaluator
+  delivered every undelivered notification to every sink sequentially with no
+  per-tick limit, so the delivery phase grew with the undelivered queue behind a
+  slow or unresponsive sink and delayed every later tick's rule evaluation.
+  Delivery is now bounded to half the evaluation interval, measured on the
+  evaluator's injected clock from the tick's own reading. The deadline is
+  checked before each attempt and the first attempt of a tick is unconditional,
+  so the delivery phase ends at the latest at `max(tick start + half the
+  interval, start of delivery)` plus the number of sinks times the sink HTTP
+  timeout. Delivery starts after whatever precedes it in the tick: the history
+  read, the lease acquire, and on the lease holder rule evaluation, the repeat
+  pass and the alert state memo write. None of that earlier work is bounded,
+  and a tick that overruns delays the next tick rather than overlapping it.
+  Previously every tick tried every queued notification in no defined order;
+  the pass now serves the oldest-queued notification first, an attempt some
+  sink refused moves to the back of the queue, and one the deadline never
+  reached keeps its place, so a sink that drains only a few notifications per
+  tick reaches every alert in turn. A notification still leaves the queue only
+  once every configured sink has accepted it, so one blackholed sink throttles
+  delivery for every sink to what fits in one tick's budget; what the rotation
+  guarantees is that a healthy sink receives all of them eventually. The new
+  `ravel_alert_notifications_deferred_total` counter reports how many were
+  deferred, once per notification per tick; it also rises when the work before
+  delivery alone runs past the deadline, since every notification after the
+  first is then deferred however fast the sinks answer. Separately, ADR-0117
+  stated the per-tick publish worst case for one rule as `MAX_ALERTS_PER_RULE`
+  (1000); the true worst case is `2 x MAX_ALERTS_PER_RULE`, because one tick
+  also writes a resolution for each previously-open alert that stopped
+  matching, and that holds for a tick following a fully successful one rather
+  than unconditionally: pre-upgrade history, a tick whose write path fails
+  partway through a rule, and two overlapping lease holders each leave more
+  open identities behind than the cap. A dated amendment to the ADR and the
+  alerting guide carry the corrected bound.
+
+- **A query's fold-lag refusal threshold is now sized from the fold and the
+  catalog the process is actually running** (issue #1306). The threshold that
+  decides whether a request-budget refusal names fold lag is the catalog's seal
+  margin plus the scheduled fold's interval plus the HEAD cache TTL, and
+  `EngineConfig` carried all three, but the server set none of them: every
+  deployment was classified against `ravel-query`'s compiled-in reference
+  durations no matter what its own fold and catalog ran on. The server now
+  builds that `EngineConfig` in one place, reading the seal margin and the HEAD
+  cache TTL off the `CatalogConfig` of the catalog it hands to both resolve and
+  the fold, and the fold interval off the `FoldTaskConfig` it spawns the fold
+  with. That fold interval is the real one only in `--mode all` and
+  `--mode maintain`, the processes that run the scheduled fold; a `query` or
+  `gateway` process keeps the 300 s default even when the `maintain` processes fold
+  on a longer interval, so a longer maintain interval can still make a query
+  node blame a fold that is keeping up. The compiled-in values stay what an `EngineConfig` built with no
+  deployment context falls back to, and a test pins `ravel-query`'s hand copy
+  of the fold interval against the server's own default so the two cannot drift
+  apart unnoticed.
+
+### Added
+
+- **`ravel-cli load` takes `--signal {metrics,logs,spans}` and loads the
+  metrics signal** (ADR-1751 decisions 1 and 2, follow-up task 1, issues
+  #1751 and #1712). The flag defaults to `logs`, so an invocation written
+  before this change is unaffected. A metrics load provisions or validates
+  the metrics signal, builds an `IngestRouter` from the same
+  `build_ingest_config` the logs load uses, and writes every batch in
+  `WriteMode::Strict`; ADR-0089's admission decisions apply per signal, with
+  the metrics OTLP limits (past event-time lag relaxed, future skew kept,
+  metric-name and label length caps kept, the loader per-record cap of 1024
+  in place of OTLP's `max_attributes_per_point`, the server's admission
+  controller bypassed by construction). `--signal spans` is refused with a
+  message naming ADR-1751 follow-up task 2 and never falls back to another
+  signal.
+
+  The `--mapping` TOML gains per-signal sections: exactly one of `[logs]`,
+  `[metrics]` and `[spans]` may be present and it must match `--signal`. A
+  mapping file written before this change needs no migration: its logs keys
+  sit at the document root with no section, and that shape is still read as
+  the `[logs]` section. Mixing the two spellings in one file is refused,
+  since which one wins would otherwise be an invisible precedence rule.
+
+  The `[metrics]` section names the metric (a literal `name` or a
+  `name_column`), `value_column`, `ts_column` and `ts_unit`, an optional
+  `unit`, `[[metrics.label]]` columns, an optional `kind` of `gauge` or
+  `counter` that sets `is_monotonic_sum`, and an optional
+  `[metrics.histogram]` classic shape (`le_column` plus `sum_column` and
+  `count_column`). A loaded metric lands on the same `SeriesId` as the same
+  metric admitted over OTLP: the metric name and every label name go through
+  the same sanitizers `ravel_otlp::normalize` applies, then the same
+  `prometheus_family_name` suffix pass, so `unit = "s"` stores `_seconds` and
+  `kind = "counter"` stores `_total` exactly as a monotonic OTLP `Sum` does.
+  A label cell holding the empty string is dropped from the series, as OTLP
+  drops an empty attribute value, so `{job=""}` and `{}` are one series on
+  both paths. `kind` may not be set together with `[metrics.histogram]`:
+  OTLP has no monotonic histogram, and the key would otherwise name a
+  behaviour the load cannot produce. With the
+  histogram shape one input row is one bucket, and its `value` column is that
+  bucket's own count (the OTLP `bucket_counts` convention, not an
+  already-cumulative Prometheus `_bucket` value): the loader groups a
+  contiguous run of rows sharing a metric name, label set and `ts` into one
+  data point and explodes it into `_bucket`/`_sum`/`_count` series mirroring
+  `ravel_otlp::normalize`'s `explode_histogram`, accumulating the per-bucket
+  counts, taking the `+Inf` bucket and `_count` from the `count` column
+  rather than from the accumulated total, and formatting `le` through
+  `ravel_otlp::promcompat::format_float`, so the same histogram lands on the
+  same `SeriesId` whichever surface admitted it. A mapping that names a
+  native (exponential) histogram is rejected. Rows of one data point must be
+  contiguous; interleaved rows are refused rather than exploded twice.
+
+  A metrics load reads one sequential cursor rather than the logs path's K
+  stride cursors, because a classic histogram's data point is a contiguous
+  run of rows a stride read would split, and it warns when `--read-cursors`
+  or `--decode-queue-batches` was set to a value it therefore ignores (0 is
+  still rejected for either, as on the logs path). A failed metrics load's
+  resume verdict names only `--pipeline-depth`, and its durable token list
+  equals what landed at any pipeline depth: a write that fails in the
+  end-of-load drain still collects every later write's tokens, and a row
+  rejection or batch failure that meets a failed earlier write keeps its own
+  reason and carries the drained tokens. A classic-histogram data point with
+  more explicit bounds than `max_histogram_buckets` (160) is refused as its
+  rows arrive rather than after the whole group is buffered, and a schema
+  error in a `--mapping` section names its line and column. Everything that
+  shapes the objects (`--shards`, `--batch-rows`,
+  `--target-bytes`, `--max-inflight-flushes`, `--max-flush-delay`,
+  `--pipeline-depth`) applies unchanged. A data point may span a batch
+  boundary; its rows are credited to the write that carries its points, so
+  `rows_written` and the `next --skip-rows` offset a failed load prints
+  always land on a data-point boundary and a resume loads the next data point
+  whole rather than a truncated one. As for logs, a historical sample buckets
+  by load time, so retention runs from the load hour and a query needs a
+  window that reaches it.
+- **A documentation claims registry and its gate** (ADR-1658, issue #1658).
+  `docs/review/claims.yaml` records, for each registered sentence of a normative
+  doc, what it claims, whether the code agrees, and the code or test that makes
+  it true; the seed holds 22 entries. `scripts/check-doc-claims.py` fails when a
+  registered quote no longer occurs once and only once, when a bound symbol or
+  test is no longer defined (a keyword inside a comment, a string or a type
+  position does not count), when a line of a normative doc carries one of the
+  fixed absence markers ("does not exist", "not implemented", "will land", and
+  five more) without an entry, or when a contradicted entry names no issue or a
+  not-implemented one's symbols have all landed. It runs in `make check-docs`
+  and CI's doc-scripts job. The seed registers two sentences in
+  `docs/query-engine.md` the code contradicts (#2082): the stamp carrier's write
+  side, which the logs flush and RLOG compaction paths now call, and per-key
+  `attrs['k']` projection, which ships.
+- **An alert-signal retention sweep that keeps every identity's current-state
+  record** (ADR-1688, issue #1688). The alert evaluator writes one object and
+  one commit record per transition and nothing ever removed them, so the
+  history grew for the life of the deployment and a cold start re-read all of
+  it. `ravel_maintain::sweep_alert_retention` bounds it: it lists the alert
+  shard's commit prefix, skips a record whose key-derived hour already proves
+  it cannot be expired, and deletes an expired, past-horizon record's commit
+  record before its data object, consulting the same legal-hold hook the other
+  sweeps use. It writes no tombstone, because the evaluator's fold refuses any
+  bucket entry that is not a commit or compaction record. A keep set built from
+  the alert state memo spares each identity's current-state record whatever its
+  age, so a firing alert older than the window keeps the one record that says
+  so and a cold-start fold over the survivors still recovers every identity's
+  state. The keep set is the `ts_ns` of those records, which is what the memo
+  carries and what each commit record's `max_event_ts_ns` equals, together with
+  the memo's watermark hour; a record is deleted only when its ingest hour is
+  strictly below that watermark, since the memo is complete only below it and a
+  late write into the watermark hour itself may be an identity's newest
+  transition. `CompactorConfig::alert_retention_window_ns` is the
+  window, default 90 days, the same value as the query-audit window; `0`
+  disables the sweep and keeps the previous grow-forever behaviour. Nothing in
+  the server calls the sweep yet: the driver that reads the memo, builds the
+  keep set and exposes `--alert-retention` is ADR-1688 follow-up task 2, so
+  this release changes no running deployment's behaviour.
+- **Catalog and PromQL decodes reserve their decoded output against the
+  process memory budget before they run** (ADR-1702 decision 6, issue #1702).
+  The catalog resolve reserves each snapshot part's, postings object's and
+  column-statistics object's header-declared uncompressed length, and the
+  reservation stays with the decoded value, in the decoded-part and postings
+  caches included, until it is dropped; the column-statistics reservation is
+  released when `load_column_stats` returns, since the loaded statistics do
+  not carry it. The PromQL fetcher reserves a segment's catalog sections
+  before `decode_selected` or `decode_sparse_catalog` decodes them, and the
+  `/api/v1/metadata` cache reserves a record's declared decompressed size. A
+  reservation that does not fit fails the read with a typed error
+  (`CatalogError::MemoryExhausted`, `LoadColumnStatsError::MemoryExhausted`,
+  `FetchMemoryExhausted`, `MetricsMetaError::MemoryExhausted`); a catalog
+  refusal never falls back to a listing pass, and a column-statistics refusal
+  reaches a SQL client as the same transient 503 a store fault does, never as
+  corrupt data. **The segment fetcher's reservations are live in a running
+  server now** wherever it runs under the process budget: PromQL evaluation,
+  cache warming and distributed query fragments, so a read whose catalog
+  decode does not fit is refused with 503 rather than decoding uncharged. The
+  SQL query path's fetchers still reserve against their own unlimited budget,
+  so a SQL scan's catalog decode is charged but never refused yet. The
+  catalog and the metadata cache take the budget through the new
+  `Catalog::with_memory_budget` and `MetadataCache::with_memory_budget`, and
+  both still default to an unlimited budget, so the part, postings,
+  column-statistics and metadata reservations refuse nothing until the server
+  wires the real budget into them. `read_metrics_meta_for_serve` now takes the
+  budget and returns the reservation alongside the entries.
+
+  A chunked (sparse) segment's catalog is charged what it inflates to, not
+  what it stores: SERIES_META_CHUNKS carries no section-level compression, so
+  its footer `uncompressed_len` is the stored zstd frames, and the reservation
+  instead sums the SERIES_IDX chunk directory's `frame_uncompressed_len`. Once
+  the matchers have run, the whole-catalog reservation is exchanged for one
+  sized to the entries that survived, so a selective query does not hold the
+  whole catalog's charge through its page fetches; the exchange never fails a
+  read, and a refused one keeps the whole-catalog reservation. A snapshot
+  part's tenant check, and a column-statistics object's tenant, version and
+  part-binding checks, now run before the reservation, so a cross-tenant object
+  is still reported as an isolation breach, and a stale-bound statistics object
+  still degrades to no statistics, under a budget too small to decode it.
+- **The `ravel-operator` Deployment itself now has a securityContext, a
+  metrics/health HTTP surface, and liveness/readiness probes** (issues #1731
+  and #1923). Its own Pod and container now carry the same hardened
+  `securityContext` every server container it renders already carries
+  (non-root, no privilege escalation, read-only root filesystem, every Linux
+  capability dropped), admitted under the `restricted` Pod Security Standard,
+  where it was previously rejected. A new `health` container port serves
+  `/healthz`, `/readyz`, and a hand-written `/metrics` Prometheus exposition
+  (`ravel_operator_reconciles_total`,
+  `ravel_operator_reconcile_duration_seconds`,
+  `ravel_operator_last_successful_reconcile_timestamp_seconds`,
+  `ravel_operator_watched_clusters`); `deploy/k8s/operator/operator.yaml`
+  wires liveness and readiness probes at those paths and a
+  `prometheus.io/scrape` annotation. `operator.yaml`'s header comment and
+  `docs/guides/kubernetes.md` now point real (non-`kind`) clusters at a
+  digest-pinned image rather than a moving tag. The listener binds before
+  the controller starts, so an address `--listen-health` cannot bind stops
+  the operator with an error naming both; `/readyz` answers `200` once the
+  initial `RavelCluster` list has arrived.
+
+- **An end-to-end proof that a stalled fold pages before it refuses a query**
+  (issue #1306, ADR-1306 follow-up task 3). ADR-1306 decision 2 states the
+  ordering as arithmetic over spans;
+  `fold_stall_alert_fires_before_first_request_budget_refusal` runs it. One
+  simulated timeline writes flushes at a scaled cadence, folds on a schedule,
+  then wedges the fold with a fault on its HEAD PUT, and at every simulated
+  minute evaluates the shipped `RavelCatalogFoldStalled` condition against the
+  rendered `/metrics` gauge and runs a cold last-6-hours query under the
+  derived budget. The alert fires nine minutes before the first
+  `RequestBudgetExceeded`; the same timeline replayed against the one-hour span
+  ADR-1306 replaced is refused at the first minute, before the fold has stalled
+  at all. Time is injected throughout: no step waits on the wall clock.
+
+- **`ravel_maintain_bytes_reclaimed_total` and
+  `ravel_maintain_retention_lag_seconds` render on `/metrics`** (issue #1729).
+  The first is a per-signal counter of bytes freed by the sweep, summed from the
+  listed object size of the two deletions that already carry one, the quarantine
+  reaper and the unreferenced-part delete; superseded and retention deletions
+  are excluded because they delete by key without a size, so the counter
+  undercounts the bytes freed and its HELP text says so (a unit swept by two
+  replicas during an ownership handoff can count one object twice). The second is a per-signal gauge of how
+  far past its retention deadline the oldest still-present expired bucket is, as
+  observed by this process's most recent completed maintenance cycle, from the
+  injected clock; it is a per-cycle maximum over the process's units and is 0
+  when no expired bucket is still present. Both sit next to the existing
+  `ravel_maintain_*` families under the same maintain-mode gate and carry only
+  the `mode` and `signal` labels. The troubleshooting and observability guides
+  gain alert suggestions for a retention lag that keeps climbing, and the
+  "storage keeps growing" row now names series an alert can read,
+  `absent(ravel_maintain_workers_live)` for a missing maintain process and the
+  pending, lag and deleted-objects series for one falling behind, before the
+  per-bucket `ravel-cli maintain status` call.
+- **A full-object GET now verifies the body against the checksum the store
+  recorded at upload** (ADR-1696, issue #1696). A commit record is a bare
+  protobuf with no checksum of its own, so a flipped bit inside a stored record
+  decoded as a valid record: a flip in `max_event_ts_ns` moved the segment out
+  of a query's range and the answer came back short and error-free. The record
+  layout is unchanged; the check moved to the transport that stores the bytes.
+  The S3 adapter asks the endpoint for the stored checksum with
+  `x-amz-checksum-mode: ENABLED` and recomputes `x-amz-checksum-crc64nvme` or
+  `-crc32c` over the body that arrived, failing a mismatch with the `Corrupted`
+  error the contract already reserves for one, so no reader needed a new error
+  arm. MinIO-style endpoints, RustFS included, return the checksum only on an
+  unranged GET, so the first request of a full-object read is unranged; its body
+  is read up to the per-request bound and the rest of the response dropped, so
+  the memory and timeout bound on one request is unchanged, and a commit record
+  read is still exactly one request. Because the request header must be signed
+  and the HTTP connector that reads the response header runs after signing, the
+  header rides on the client's default headers, which `object_store` signs onto
+  every request but a LIST; a LIST carries no such header.
+  `S3HttpConfig::request_stored_checksum` (default on) stops sending it; no
+  server flag sets it yet. `MemoryStore` keeps a CRC-32C beside each object and
+  checks it the same way, so the semantics oracle matches;
+  `MemoryStore::corrupt_stored_byte`, which makes that testable, sits behind a
+  new `test-support` crate feature that production builds leave off. A read
+  with no verifiable checksum is served and counted, never refused: that covers
+  an endpoint that returns no `x-amz-checksum-*` header, a digest this adapter
+  cannot recompute (SHA-256, or a composite multipart digest), and an object
+  larger than one request body. The count is
+  `StoreMetricsSnapshot::get_unverified` (and `S3Store::get_unverified`); it is
+  not yet exported at `/metrics`. Caller-issued ranged reads are outside the
+  check entirely, since the endpoint returns no checksum on them; they keep the
+  format's own crc32c hierarchy as their check. Write-side upload integrity
+  still defaults to off and is unchanged here.
+- **`ravel-ingest` has an opt-in idle flush byte floor, off by default**
+  (ADR-1737, issue #1737). `IngestConfig::idle_flush_byte_floor` defaults to
+  0, which changes nothing: every buffer flushes on the same clocks as before.
+  When set to a value below `min_flush_bytes` (`IngestConfig::validate`
+  refuses anything else), a metrics, log, or span buffer with no strict-mode
+  waiter that would write fewer object bytes than the floor waits for the
+  sub-floor hold, one `flush_tick` short of `max_flush_lifetime`, instead of
+  the 40 s idle clock, and each such flush is counted as
+  `flushes_by_age_floor` in the pipeline's metrics snapshot. The hold gives up
+  that tick because the age check runs on a tick, so the buffer is at most
+  `max_flush_lifetime` old when its flush opens, which is the figure
+  `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is derived from. A
+  buffer that reaches the floor goes back to the idle clock, and strict-mode
+  writes keep the fast clock. `ravel-server` does not expose the knob yet, so
+  no deployment's flush cadence or buffered-mode loss window changes with this
+  release.
+- **The S3 adapter observes the store's own clock from response `Date`
+  headers** (ADR-1685 decision 1, issue #1685). A writer stamps its
+  ingest-hour bucket from its own clock and has had no second time source to
+  check that reading against, so a host lagging the folder's clock publishes
+  acknowledged commit records into an hour the fold has already sealed. Every
+  S3 response carries the store's clock in its `Date` header, and the HTTP
+  connector this adapter installs below `object_store`'s retry loop is the
+  only layer that sees it. `ObjectStoreBackend` gains a defaulted
+  `observed_store_time_ns() -> Option<i64>` returning `None`; `S3Store`
+  returns the latest response's `Date` as unix nanoseconds, or `None` before
+  its first response. Every response counts, an error one included; the latest
+  response wins rather than a running maximum, so one wrong header from a
+  proxy is corrected by the next response instead of latching for the life of
+  the process; and a missing or unparseable `Date` leaves the previous
+  observation standing. For a store whose `Date` is correct the value is a
+  lower bound on the store's current time, never an estimate of it (a leap
+  second is clamped to `:59` to keep it one), and it costs no extra request
+  and no new object. Every decorator in the crate delegates to the store it
+  wraps, as does `ravel-server`'s `--tenant-kms-config` wrapper, and
+  `MemoryStore` reports `None` unless a test sets one through the
+  `test-support` setter. Nothing consults the observation yet: the writer's
+  clock-lag refusal (ADR-1685 decision 2) lands separately, so no flush
+  behavior changes with this release.
+  writes keep the fast clock. The `ravel-server` flag that turns it on is the
+  next entry.
+- **`ravel-server --idle-flush-byte-floor` exposes that floor, and
+  `/metrics` reports what it holds** (ADR-1737, issue #1737). The flag takes a
+  byte count, defaults to 0 (the sub-floor hold disabled), and reaches the
+  `IngestConfig` of all three ingest pipelines, so a deployment that does not
+  set it keeps today's flush cadence and buffered-mode loss window exactly.
+  `IngestConfig::validate` now runs on each pipeline's config before its
+  router is built, so a floor at or above `--min-flush-bytes` refuses startup
+  with a message naming both flags rather than silently putting every
+  sub-`min_flush_bytes` buffer on the hour-long hold. The new
+  `ravel_ingest_flushes_by_age_floor_total` family renders for every signal
+  beside `ravel_ingest_flushes_by_age_total`, which is how an operator sees
+  the floor holding buffers and sizes the buffered-mode loss window they
+  accepted: a row acknowledged in buffered mode in a buffer below the floor
+  can sit in memory for up to an hour before its flush opens, and a crash in
+  that window loses it. Strict mode is unaffected at any setting. The
+  ravel-bench PUT-count estimates count the new trigger too.
+- **`ObjectStoreBackend::get_pinned` reads exactly the bytes a recorded pin
+  names, and `ravel-object-store` gains read-only external stores per
+  credential profile** (ADR-2040, issue #2065).
+  - A pin's ETag is sent as `If-Match`, so a replaced object is refused with
+    `PreconditionFailed`. A pin's version, when the store reported one, is
+    sent as a version selector, so the pinned version keeps being served
+    after an overwrite, and a deleted version is `NotFound`. A caller's pin
+    rides every request of a split whole-object read, the unranged first
+    one included, and such a read is still verified against the store's
+    upload checksum when the endpoint returns one.
+  - `get_pinned` returns a `PinnedRead` carrying the pin of the bytes
+    served. `pin_of` and `get_with_pin` report an object's pin, including
+    S3's `x-amz-version-id` when the bucket has versioning on. The default
+    implementation refuses with the new `Unsupported` error rather than
+    falling back to an unconditional read.
+  - `external::ExternalStore` opens one granted bucket per `ExternalProfile`
+    and refuses every write with the new `ReadOnly` error. A profile names
+    where its secrets live and never holds their values, and a credential
+    failure is reported as `CredentialsRejected` without the path or secret.
+  - `external::probe` qualifies a candidate bucket: it must honour
+    preconditions, and it must not be Ravel's own bucket, whether under
+    another name or as a copy that holds Ravel's `sys/tenancy` marker.
+  - `ravel_cache::CacheKey::pinned` keys such an object by profile, bucket,
+    key, ETag, version and size.
+
+  No shipping binary reaches any of it yet; the callers are #2052, #2051
+  and #2054.
+- **Parquet table location grants and in-place manifest format** (ADR-2040,
+  issue #2050): the new `ravel-pqtable` crate and
+  `proto/ravel/parquet_table.proto`. A per-tenant grants record at
+  `t/<tenant_hash>/pq/grants` holds the locations an operator admitted, each
+  with the credential profile to read it under, and resolves a `LOCATION` URL
+  to exactly one grant. A table manifest version pins the tenant's own
+  Parquet files in place, by bucket and object key with the ETag and store
+  version read at the time, rather than copying them into Ravel's bucket; a
+  key that object_store's `Path` would rewrite is refused. Both records carry
+  the tenant hash they were written for, and a grants record or manifest read
+  under another tenant's key is refused as `Misfiled` rather than read as that
+  tenant's. No shipping binary calls it yet.
+
+### Changed
+
+- **A ranged log read's chunk-run GETs against one L0 RLOG object are now
+  bounded at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4)** (ADR-2066 decision 1).
+  A projection whose coalesced candidate runs exceed the cap bridges the
+  smallest remaining gaps between them down to it, the same bound already
+  applied to L0 metrics flushes (ADR-1306); the whole-object coverage
+  crossover is computed against that bridged run set, so bridging can itself
+  push a projection over the 75% threshold and convert it to one whole-object
+  GET. A compacted L1 log part is exempt, as an L1 metrics part is: it can be
+  far larger than a flush, so bridging would move most of the object, and its
+  crossover is computed against its unbridged runs. When neither front section
+  (STREAM_DIR/FIELD_DIR) is resident, the two are fetched in one combined GET,
+  including on the narrow-projection path that resolves column ids before
+  choosing candidates; a front section a plan-phase read already cached is
+  served from cache instead of re-fetched into that GET, and a combined GET
+  admits each section under its own cache key, so while those entries stay
+  resident the next read of the object serves both from cache. No default or
+  config surface changes.
+
 ## [0.19.0] - 2026-09-27
 
 ### Fixed

@@ -9,8 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
@@ -31,7 +32,11 @@ use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_types::{Signal, TenantHash, TenantHashScheme, TenantId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::net::TcpListener;
 use tracing::{info, warn};
+
+use crate::health::{self, HealthState};
+use crate::metrics::{ReconcileMetrics, ReconcileResult};
 
 use crate::crd::{
     AffinityBackend, Condition, LocalSecretRef, MIN_RESHARD_LEAD_HOURS, RavelCluster,
@@ -159,6 +164,20 @@ pub enum Error {
     /// misconfigured CR fails visibly at reconcile time.
     #[error("invalid spec: {0}")]
     Render(#[from] RenderError),
+
+    /// The spawned controller task ended by panicking rather than by its
+    /// stream completing (ADR-1731 decision 5 consequence: the task is
+    /// spawned, not awaited inline, so the health listener can observe its
+    /// termination; `run` still surfaces a panic as a process failure, same
+    /// as before the task was spawned).
+    #[error("controller task panicked: {0}")]
+    ControllerTaskPanicked(#[from] tokio::task::JoinError),
+
+    /// The `/healthz` `/readyz` `/metrics` listener could not bind
+    /// `--listen-health` (ADR-1731 decision 2). Returned by [`run`] before
+    /// the controller starts.
+    #[error(transparent)]
+    HealthListenerBind(#[from] health::BindError),
 }
 
 /// Shared reconcile context.
@@ -172,6 +191,9 @@ pub struct Context {
     /// that case, so a transient `/version` failure cannot flap the condition
     /// across reconciles.
     pub kubernetes_version: Option<Info>,
+    /// Reconcile counters `/metrics` renders (ADR-1731 decision 3), shared
+    /// with the health listener through the same `Arc`.
+    pub metrics: Arc<ReconcileMetrics>,
 }
 
 impl Context {
@@ -1229,13 +1251,41 @@ fn degraded_extra_conditions(
 
 /// Reconcile one `RavelCluster` to its desired Deployments and Services.
 ///
+/// Times [`reconcile_timed`] and records the outcome into `ctx.metrics`
+/// (ADR-1731 decision 3): `ravel_operator_reconciles_total{result}`,
+/// `ravel_operator_reconcile_duration_seconds`, and, on success,
+/// `ravel_operator_last_successful_reconcile_timestamp_seconds`. This
+/// function, not [`reconcile_timed`], is what is passed to
+/// [`kube_runtime::controller::Controller::run`], so it is the one point
+/// every reconcile attempt (including the early `MissingNamespace` return)
+/// passes through.
+async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, Error> {
+    let start = Instant::now();
+    let outcome = reconcile_timed(obj, Arc::clone(&ctx)).await;
+    let result = if outcome.is_ok() {
+        ReconcileResult::Ok
+    } else {
+        ReconcileResult::Error
+    };
+    let now_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    ctx.metrics
+        .record(result, start.elapsed(), now_unix_seconds);
+    outcome
+}
+
+/// The reconcile pass proper (ADR-1731 decision 3 wraps this with the
+/// `ravel_operator_reconciles_total`/`..._duration_seconds` recording above).
+///
 /// Wraps [`reconcile_inner`] so that any failure before the success-path status
 /// write still leaves a visible `Degraded` condition on `.status` (finding 3):
 /// otherwise a missing Secret or an apply error leaves `.status` empty forever
 /// and `kubectl wait --for=condition=Available` just times out with no reason.
 /// The original error is still returned so [`error_policy`]'s retry/backoff is
 /// unchanged.
-async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, Error> {
+async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, Error> {
     let namespace = obj.namespace().ok_or(Error::MissingNamespace)?;
     let instance = obj.name_any();
     let client = &ctx.client;
@@ -2771,7 +2821,14 @@ fn error_policy(_obj: Arc<RavelCluster>, error: &Error, _ctx: Arc<Context>) -> A
 /// Run the controller until the process is signalled. Builds a client from the
 /// in-cluster or kubeconfig environment, watches `RavelCluster` cluster-wide,
 /// and owns the Deployments and Services it creates.
-pub async fn run() -> Result<(), Error> {
+///
+/// `listen_addr` is where [`crate::health::serve`] answers `/healthz`,
+/// `/readyz`, and `/metrics` (ADR-1731 decisions 2 and 4). It is bound first,
+/// before any API call, so an occupied or unbindable address fails startup
+/// with [`Error::HealthListenerBind`] instead of leaving a controller running
+/// with no probe surface.
+pub async fn run(listen_addr: SocketAddr) -> Result<(), Error> {
+    let listener = health::bind(listen_addr).await?;
     let client = Client::try_default().await?;
 
     // Read the apiserver version once at startup, not per reconcile: a
@@ -2826,13 +2883,33 @@ pub async fn run() -> Result<(), Error> {
         }
     };
 
+    run_on(listener, client, kubernetes_version).await
+}
+
+/// The part of [`run`] after the listener is bound and the client and
+/// apiserver version are resolved: serves `listener`, then runs the
+/// controller until its stream ends. Public so an integration test can drive
+/// the same wiring against a fake apiserver.
+///
+/// The controller runs as a spawned task, not inline, so this function's own
+/// `.await` below is on that task's `JoinHandle`, letting the health
+/// listener's `/healthz` observe the controller's termination as the
+/// liveness signal.
+pub async fn run_on(
+    listener: TcpListener,
+    client: Client,
+    kubernetes_version: Option<Info>,
+) -> Result<(), Error> {
+    let listen_addr = listener.local_addr().ok();
     let clusters: Api<RavelCluster> = Api::all(client.clone());
     let deployments: Api<Deployment> = Api::all(client.clone());
     let services: Api<Service> = Api::all(client.clone());
     let ingresses: Api<Ingress> = Api::all(client.clone());
+    let metrics = Arc::new(ReconcileMetrics::new());
     let context = Arc::new(Context {
         client,
         kubernetes_version,
+        metrics: Arc::clone(&metrics),
     });
 
     // Scope the owned-object watches to this operator's objects only. Without a
@@ -2852,28 +2929,54 @@ pub async fn run() -> Result<(), Error> {
     // `Controller::new`, which also drives the primary off `applied_objects`).
     // The reflector store feeds the same owner lookups `.owns()` needs.
     let (reader, writer) = reflector::store();
+    let health_state = Arc::new(HealthState::new(reader.clone(), metrics));
+
+    // Readiness (decision 4) flips on the reflected stream's first `InitDone`,
+    // once the initial list is in the store. Not `Store::wait_until_ready`:
+    // its one-shot keeps a single waker, and the controller waits on the same
+    // store, so a second waiter is never woken.
+    let ready_state = Arc::clone(&health_state);
     let cluster_events = watcher(clusters, watcher::Config::default())
         .default_backoff()
         .reflect(writer)
+        .inspect(move |event| {
+            if matches!(event, Ok(watcher::Event::InitDone)) {
+                ready_state.mark_ready();
+            }
+        })
         .applied_objects()
         .predicate_filter(predicates::generation, Default::default());
 
+    tokio::spawn(health::serve(listener, Arc::clone(&health_state)));
+
     info!(
         minimum_kubernetes_minor_version = MIN_KUBERNETES_MINOR_VERSION,
+        listen_addr = ?listen_addr,
         "starting ravel-operator controller"
     );
-    Controller::for_stream(cluster_events, reader)
-        .owns(deployments, managed.clone())
-        .owns(services, managed.clone())
-        .owns(ingresses, managed)
-        .run(reconcile, error_policy, context)
-        .for_each(|result| async move {
-            match result {
-                Ok((obj, _action)) => info!(object = ?obj, "reconciled"),
-                Err(error) => warn!(%error, "reconcile stream error"),
-            }
-        })
-        .await;
+
+    // Spawned rather than awaited inline (ADR-1731 decision 5 consequence)
+    // so `health_state.mark_controller_stopped()` below runs once this task
+    // ends, whether by the stream completing or by a panic surfaced through
+    // `JoinError`.
+    let controller_task = tokio::spawn(async move {
+        Controller::for_stream(cluster_events, reader)
+            .owns(deployments, managed.clone())
+            .owns(services, managed.clone())
+            .owns(ingresses, managed)
+            .run(reconcile, error_policy, context)
+            .for_each(|result| async move {
+                match result {
+                    Ok((obj, _action)) => info!(object = ?obj, "reconciled"),
+                    Err(error) => warn!(%error, "reconcile stream error"),
+                }
+            })
+            .await;
+    });
+
+    let join_result = controller_task.await;
+    health_state.mark_controller_stopped();
+    join_result?;
     Ok(())
 }
 
@@ -3463,6 +3566,7 @@ mod tests {
         let ctx = Context {
             client,
             kubernetes_version: Some(version_info("29", "v1.29.5")),
+            metrics: Arc::new(ReconcileMetrics::new()),
         };
         let spec = spec_with_affinity(None);
 
