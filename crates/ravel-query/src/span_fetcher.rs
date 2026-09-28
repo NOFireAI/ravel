@@ -42,11 +42,12 @@
 
 use std::sync::Arc;
 
-use crate::fetcher::ReadCache;
+use crate::fetcher::{ReadCache, gate_store_error};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
+use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_rspan::block::{DEFAULT_MAX_UNCOMP, DecodedBlock, read_block, read_block_projected};
 use ravel_rspan::footer::kind;
@@ -208,6 +209,9 @@ pub struct SpanSegmentFetcher {
     /// (never refuses); [`Self::with_memory_budget`] wires the shared one,
     /// mirroring [`Self::with_get_limiter`].
     memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// The read CPU gate the row exits' block decodes run on (ADR-1702
+    /// decision 4). `None`, the default, decodes inline.
+    read_gate: Option<Arc<ReadGate>>,
 }
 
 impl SpanSegmentFetcher {
@@ -220,7 +224,18 @@ impl SpanSegmentFetcher {
                 crate::fetcher::DEFAULT_MAX_CONCURRENT_GETS,
             )),
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            read_gate: None,
         }
+    }
+
+    /// Runs the block decodes of [`fetch`](Self::fetch) and
+    /// [`fetch_accounted`](Self::fetch_accounted), and of a columnar scan
+    /// drained through [`SpanColumnarScan::next_block_on_gate`], on `gate`
+    /// (ADR-1702 decision 4). Each block, with all its pages, is one job.
+    #[must_use]
+    pub fn with_read_gate(mut self, gate: Arc<ReadGate>) -> Self {
+        self.read_gate = Some(gate);
+        self
     }
 
     /// Wires this fetcher to a caller-owned [`ravel_memory::MemoryBudget`]
@@ -413,7 +428,7 @@ impl SpanSegmentFetcher {
             BlockProjection::All,
             QueryAccounting::new(),
         )?;
-        Ok(Some(drain_rows(scan)?))
+        Ok(Some(drain_rows(scan).await?))
     }
 
     /// Accounted, tenant-checked counterpart of [`fetch`](Self::fetch):
@@ -478,7 +493,7 @@ impl SpanSegmentFetcher {
             BlockProjection::All,
             accounting.clone(),
         )?;
-        Ok(Some(drain_rows(scan)?))
+        Ok(Some(drain_rows(scan).await?))
     }
 
     /// Columnar sibling of [`fetch_accounted`](Self::fetch_accounted) (ADR-0110
@@ -584,6 +599,7 @@ impl SpanSegmentFetcher {
             pages_decoded: 0,
             pages_skipped: 0,
             finished: false,
+            read_gate: self.read_gate.clone(),
         })
     }
 
@@ -805,6 +821,9 @@ pub struct SpanColumnarScan {
     pages_skipped: usize,
     /// Set once the accounting fold has run, so it runs exactly once.
     finished: bool,
+    /// The read CPU gate [`next_block_on_gate`](Self::next_block_on_gate)
+    /// decodes on; `None` decodes inline.
+    read_gate: Option<Arc<ReadGate>>,
 }
 
 impl SpanColumnarScan {
@@ -839,30 +858,70 @@ impl SpanColumnarScan {
     /// candidate block can survive pruning yet hold no row inside the ts window.
     /// Only `None` ends the scan and triggers the accounting fold.
     pub fn next_block(&mut self) -> Result<Option<ColumnarBlock>, SpanFetchError> {
+        let Some((block_bytes, crc)) = self.next_candidate()? else {
+            return Ok(None);
+        };
+        let decoded = decode_block_rows(&block_bytes, crc, &self.projection, &self.query);
+        self.record_block(decoded).map(Some)
+    }
+
+    /// [`next_block`](Self::next_block) with the block decode run on the
+    /// fetcher's read gate (ADR-1702 decision 4): the whole block, all its
+    /// pages, is one job sized by the uncompressed lengths its header lists.
+    /// Without a gate this is `next_block`. Reaching exhaustion submits no
+    /// job.
+    pub async fn next_block_on_gate(&mut self) -> Result<Option<ColumnarBlock>, SpanFetchError> {
+        let Some(gate) = self.read_gate.clone() else {
+            return self.next_block();
+        };
+        let Some((block_bytes, crc)) = self.next_candidate()? else {
+            return Ok(None);
+        };
+        let size = JobSize::Bytes(block_uncompressed_len(&block_bytes));
+        let projection = self.projection.clone();
+        let query = self.query;
+        let decoded = gate
+            .run(ReadSite::SpanBlock, size, move || {
+                decode_block_rows(&block_bytes, crc, &projection, &query)
+            })
+            .await
+            .map_err(|err| SpanFetchError::Store {
+                key: self.key.clone(),
+                source: gate_store_error(err),
+            })?;
+        self.record_block(decoded).map(Some)
+    }
+
+    /// Advances to the next candidate block and returns its bytes, or `None`
+    /// (after the accounting fold) once every candidate has been taken.
+    fn next_candidate(&mut self) -> Result<Option<(Bytes, u32)>, SpanFetchError> {
         let Some(&(start, end, crc)) = self.candidates.get(self.cursor) else {
             self.finish();
             return Ok(None);
         };
         self.cursor += 1;
-        let block_bytes = self.bytes.get(start..end).ok_or_else(|| {
-            corrupt(
+        if self.bytes.get(start..end).is_none() {
+            return Err(corrupt(
                 &self.key,
                 SpanSegError::Corrupted("block out of bounds".into()),
-            )
-        })?;
-        let decoded = decode_block_accounted(block_bytes, crc, &self.projection)
-            .map_err(|source| corrupt(&self.key, source))?;
+            ));
+        }
+        Ok(Some((self.bytes.slice(start..end), crc)))
+    }
+
+    /// Folds one decoded block into the scan's counters and hands it out.
+    fn record_block(&mut self, decoded: DecodedRows) -> Result<ColumnarBlock, SpanFetchError> {
+        let (decoded, rows) = decoded.map_err(|source| corrupt(&self.key, source))?;
         self.page_bytes_fetched += decoded.page_bytes_fetched;
         self.page_bytes_decoded += decoded.page_bytes_decoded;
         self.pages_decoded += decoded.block.pages_decoded();
         self.pages_skipped += decoded.block.pages_skipped();
         self.stats.blocks_scanned += 1;
-        let rows = surviving_rows(&decoded.block, &self.query)
-            .map_err(|source| corrupt(&self.key, source))?;
-        Ok(Some(ColumnarBlock {
+        let rows = rows.map_err(|source| corrupt(&self.key, source))?;
+        Ok(ColumnarBlock {
             block: decoded.block,
             rows,
-        }))
+        })
     }
 
     /// Folds this scan's accumulated page-byte counters into the query's
@@ -897,6 +956,7 @@ impl Drop for SpanColumnarScan {
 ///
 /// [`All`]: BlockProjection::All
 /// [`Only`]: BlockProjection::Only
+#[derive(Clone)]
 enum BlockProjection {
     All,
     Only(Vec<u32>),
@@ -1010,6 +1070,49 @@ fn page_needed(cols: &[u32], col: u32) -> bool {
     }
 }
 
+/// A block decode's outcome: the decoded block and, separately, its surviving
+/// rows, so the scan counts a decoded block even when its row filter fails.
+type DecodedRows = Result<(DecodedAccounted, Result<Vec<usize>, SpanSegError>), SpanSegError>;
+
+/// Decodes one candidate block under `projection` and computes its surviving
+/// rows: the unit a gated decode runs as one job.
+fn decode_block_rows(
+    block_bytes: &[u8],
+    crc: u32,
+    projection: &BlockProjection,
+    query: &SpanQuery,
+) -> DecodedRows {
+    let decoded = decode_block_accounted(block_bytes, crc, projection)?;
+    let rows = surviving_rows(&decoded.block, query);
+    Ok((decoded, rows))
+}
+
+/// The sum of the uncompressed page lengths a block's header lists, which is
+/// what its decode inflates to. The header is not yet crc-checked here, so the
+/// walk allocates nothing, and a header it cannot read sizes the block at
+/// `u64::MAX`: the decode that follows reports the same bytes as corrupt.
+fn block_uncompressed_len(block_bytes: &[u8]) -> u64 {
+    let walk = || -> Result<u64, SpanSegError> {
+        let mut pos = 0usize;
+        let _record_count = get_uvarint(block_bytes, &mut pos)?;
+        let page_count = get_uvarint(block_bytes, &mut pos)?;
+        let mut total = 0u64;
+        for _ in 0..page_count {
+            let _column_id = get_uvarint(block_bytes, &mut pos)?;
+            pos = pos
+                .checked_add(2)
+                .filter(|p| *p <= block_bytes.len())
+                .ok_or_else(|| {
+                    SpanSegError::Corrupted("block truncated at page enc/comp".into())
+                })?;
+            let _len = get_uvarint(block_bytes, &mut pos)?;
+            total = total.saturating_add(get_uvarint(block_bytes, &mut pos)?);
+        }
+        Ok(total)
+    };
+    walk().unwrap_or(u64::MAX)
+}
+
 /// The `(column_id, stored_len)` of every page in a block, read from the block
 /// header's page-descriptor table (docs/segment-format.md). `rspan` decodes this
 /// table internally but exposes only page *counts*
@@ -1109,9 +1212,9 @@ fn build_span_row(block: &DecodedBlock, row: usize) -> Result<SpanRow, SpanSegEr
 /// The scan's page counts ride out on the output next to `stats`, so the row
 /// exit's caller can publish the same `pages_decoded`/`pages_skipped` figures
 /// the columnar exit's caller reads off each [`ColumnarBlock`] (#669).
-fn drain_rows(mut scan: SpanColumnarScan) -> Result<SpanFetchOutput, SpanFetchError> {
+async fn drain_rows(mut scan: SpanColumnarScan) -> Result<SpanFetchOutput, SpanFetchError> {
     let mut records = Vec::new();
-    while let Some(block) = scan.next_block()? {
+    while let Some(block) = scan.next_block_on_gate().await? {
         for &row in &block.rows {
             records.push(
                 build_span_row(&block.block, row).map_err(|source| corrupt(&scan.key, source))?,
@@ -1916,5 +2019,98 @@ mod tests {
         assert_eq!(a1.records.len(), 1);
         assert_eq!(a2.records.len(), 1);
         assert_eq!(b.records.len(), 1);
+    }
+
+    /// ADR-1702 follow-up task 7, RSPAN site: with the byte floor at 0, the
+    /// accounted row exit decodes each candidate block as exactly one
+    /// `SpanBlock` job, reaching exhaustion submits none, nothing runs inline,
+    /// and the rows equal the ungated fetch's. Six records at two per block
+    /// make three blocks.
+    ///
+    /// FLIP: in `next_block_on_gate`, read the gate as `None` so every block
+    /// takes the inline `next_block`; the `SpanBlock` assertion then reads
+    /// `left: (0, 0), right: (3, 0)`.
+    #[tokio::test]
+    async fn span_block_decodes_run_through_the_read_gate() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts, total_inline};
+        let store = Arc::new(MemoryStore::new());
+        let records: Vec<SpanRecord> = (0..6)
+            .map(|i| {
+                span_with_attrs_and_events(
+                    trace(i + 1),
+                    span(i + 1),
+                    100 + i64::from(i),
+                    200 + i64::from(i),
+                )
+            })
+            .collect();
+        let seg = write_object(&store, 0, &records).await;
+        let query = all_query();
+
+        let inline = SpanSegmentFetcher::new(store.clone())
+            .fetch_accounted(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("ungated fetch")
+            .expect("relevant");
+        let gate = floor_zero_gate();
+        let gated = SpanSegmentFetcher::new(store)
+            .with_read_gate(gate.clone())
+            .fetch_accounted(
+                &seg,
+                TENANT,
+                &query,
+                None,
+                None,
+                &[],
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("gated fetch")
+            .expect("relevant");
+        assert_eq!(inline.stats.blocks_scanned, 3);
+        assert_eq!(gated.records, inline.records);
+        assert_eq!(gated.stats, inline.stats);
+        assert_eq!(site_counts(&gate, ReadSite::SpanBlock), (3, 0));
+        assert_eq!(total_inline(&gate), 0);
+    }
+
+    /// A block's job size is the uncompressed lengths its header lists, and a
+    /// header that does not parse sizes the block as unbounded.
+    #[test]
+    fn span_block_job_size_reads_the_header() {
+        let records = [bare_span(trace(1), span(1), 100, 200)];
+        let mut writer = RspanWriter::new(
+            RspanConfig::default(),
+            ObjectIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: [4u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for r in &records {
+            writer.push(r.clone());
+        }
+        let bytes = writer.finish().expect("finish");
+        let reader = RspanReader::new(&bytes, &RspanConfig::default()).expect("reader");
+        let entry = reader.skip_index().blocks[0].clone();
+        let footer = open(&bytes).expect("footer");
+        let blocks = footer.section(kind::BLOCKS).expect("BLOCKS");
+        let (start, end) = abs_block_range(blocks.offset, blocks.len, &entry).expect("range");
+        let block =
+            read_block(&bytes[start..end], entry.block_crc32c, DEFAULT_MAX_UNCOMP).expect("decode");
+        let sized = block_uncompressed_len(&bytes[start..end]);
+        assert!(sized > 0 && sized < u64::MAX, "{sized}");
+        assert_eq!(block.record_count(), 1);
+        assert_eq!(block_uncompressed_len(&[0x80]), u64::MAX);
     }
 }

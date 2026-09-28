@@ -16,6 +16,8 @@ mod log_fetcher;
 pub mod log_series;
 mod phase_accounting;
 mod query_admission;
+#[cfg(test)]
+pub(crate) mod read_gate_test_support;
 mod request_budgets;
 mod reserved_bytes;
 mod segment_admission;

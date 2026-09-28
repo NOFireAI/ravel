@@ -156,7 +156,11 @@ impl From<QueryError> for ApiError {
             // exactly one worker. A repeat is a server-side gate violation the
             // query fails closed on rather than keeping one of two values; its
             // message carries only a series id, redacted to the fixed message.
-            | QueryError::DuplicatePushdownSeries { .. } => {
+            | QueryError::DuplicatePushdownSeries { .. }
+            // An evaluation the read CPU gate could not run (it panicked, or
+            // the runtime dropped it at shutdown) is a server-side fault that
+            // carries nothing of the client's query.
+            | QueryError::CpuGate(_) => {
                 ApiError::Unavailable(MSG_UNAVAILABLE.to_string())
             }
         }
