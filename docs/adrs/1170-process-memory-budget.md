@@ -190,7 +190,8 @@ where the byte count is known before the GET:
 
 - RSEG: the sum of coalesced run lengths in `ensure_ranges`, reserved once
   before the `join_all`, guard stored alongside `FetchedRegions`.
-- RLOG block-range: the object size at `ObjectAssembler` construction, guard
+- RLOG block-range, as first decided (the 2026-09-28 ranged-read amendment
+  below retires it): the object size at `ObjectAssembler` construction, guard
   owned by the assembler; and the summed range lengths before the `join_all`
   in `fetch_blocks` and `fetch_chunk_ranges`.
 - RLOG whole-object: the object size at the `GetRange::Full` sites in
@@ -340,7 +341,9 @@ marked):
   briefly two, until the pool hands that buffer to the next read or evicts it.
   Anything comparing `resident_t` against reserved totals, decision 4's
   acceptance assertion included, must count the pool's idle bytes on the
-  resident side or it will read the difference as an accounting error.
+  resident side or it will read the difference as an accounting error. (The
+  pool is gone since the 2026-09-28 ranged-read amendment below, and this gap
+  with it.)
 
 #### Amendment (2026-09-13, Refs: #1170)
 
@@ -435,7 +438,8 @@ above (also still unmarked, and larger in call-site count than either of the
 two sites this round closed), not the SQL boundary alone. The reserve
 derivation must account for both terms, or close the `ObjectAssembler` class,
 before decision 3's `1.25 x d` sizing can be measured against a value smaller
-than what the calibration run linked from decision 2 already computes.
+than what the calibration run linked from decision 2 already computes. (The
+2026-09-28 ranged-read amendment below closes the `ObjectAssembler` class.)
 
 ### 3. A static carve under one number
 
@@ -481,7 +485,8 @@ every call site, and so are `covering_read`'s cache-insert branch and RSEG's
 overlap remain unmarked: the SQL cross-boundary one, where the fetch guard and
 the scan's `try_grow` both cover the buffer, and every `ObjectAssembler`-based
 multi-GET reservation in `log_fetcher.rs` (also the second amendment), a
-larger class than either site just closed. Until both are marked, `unique` is
+larger class than either site just closed. (The 2026-09-28 ranged-read
+amendment below marks that class.) Until both are marked, `unique` is
 an upper bound, the reserve derived from it is undersized by roughly 1.25
 times their combined residual, and the calibration run must either mark them
 first or measure the residual and widen the multiplier. The margin covers
@@ -733,3 +738,61 @@ against the concurrent phase before it ships (ADR-2023, #2014).
 `--cache-max-bytes` bounds the fetch cache only; the catalog byte cache derives
 at its own share unless `--catalog-cache-max-bytes` sets it. The refusal of a
 combination whose caps exceed `memory_budget_bytes` is unchanged.
+
+## Amendment (2026-09-28): a ranged read reserves what it holds
+
+<!-- amendment-applies: sections="2. A fetch byte reservation at the points where the unit is known|Amendment (2026-09-06, Refs: #1254)|Amendment (2026-09-13, second pass, Refs: #1170)|3. A static carve under one number" pointer="2026-09-28 ranged-read amendment" -->
+<!-- amendment-supersedes: phrase="the object size at `ObjectAssembler` construction" pointer="2026-09-28 ranged-read amendment" -->
+
+Issue #2066 measured what decision 2's object-sized reservation stood for. As
+measured in that issue's heap profile, on a tenant of roughly 16 MB log objects
+read byte-minimal on S3, 2,948 MiB of the 4,011 MiB live at q29's peak sat in
+the assembly buffers of about 180 ranged reads in flight across 32 partitions,
+each buffer the length of the whole object however few bytes the read placed in
+it. None of it was cache, and ten concurrent queries pushed the server into
+swap. That profile is not in this repository: the figures above are its report,
+not something a checked-in fixture reproduces.
+
+A ranged RLOG read now holds only the regions it placed. `ObjectAssembler`
+keeps each placed region as the `Bytes` it was given, at its absolute offset,
+with no copy (the version-4 runs and sections are the fetched buffers
+themselves; version 3's per-block split still copies each verified block out
+of its run), and hands the reader a source over exactly those regions
+(`ravel_logseg::SparseObject`); a read of any other range inside the object
+fails typed with `LogSegError::Unplaced`. There is no object-sized buffer and no buffer pool,
+so the idle-buffer gap recorded under the 2026-09-06 amendment is gone with
+them. The RLOG block-range bullet of decision 2 becomes:
+
+- Each GET that places bytes reserves its own length before it is issued: the
+  suffix probe, a footer chase, each directory section or section span, and
+  the tail placed for a carried footer. The version-4 chunk runs reserve their
+  summed length once before the `join_all` in `fetch_chunk_ranges`, as
+  before; that guard is now the durable one, because the run buffers are the
+  placed regions. The version-3 `fetch_blocks` reserves the summed length of
+  the blocks it places and, transiently, the summed run length, both before
+  its `join_all`. A cache hit placed with no GET reserves its length before it
+  is placed.
+- The guards travel with the placed regions, in the assembler and then in the
+  bytes it hands the reader, and release when the last clone of those bytes
+  drops. A refusal is a typed `FetchMemoryExhausted` and the refused GET is
+  never issued; the regions the read had already placed release as the
+  assembler drops.
+- The coverage crossover still drops the assembler before the covering read
+  reserves the object. `covering_read`'s segmented branch keeps its
+  whole-object reservation, since a covering read holds every byte, but keeps
+  each sub-range as fetched instead of copying it into an object-sized buffer.
+
+With a cache configured every placed region is offered to the cache, so every
+assembler guard is marked handed off whether or not the cache admitted it,
+the same convention the whole-object funnel already follows. A hit and an
+admitted miss really are the cache's own entry held under both ledgers; a
+value the cache refused (over its single-entry cap) and a disk-tier hit that
+allocated afresh are not, so `handoff_overlap` bounds the overlap from above
+rather than counting it exactly. That closes the `ObjectAssembler`-based class
+the 2026-09-13 second amendment left unmarked; the SQL cross-boundary overlap
+is the residual that remains.
+
+`BlockRangeFetcher::assembly_buffer_stats` keeps its gauge with the new
+meaning: `live_bytes` is the placed bytes assembled reads hold, and
+`peak_live_bytes` its high-water mark. The pool counters (`allocated`,
+`reused`, `zeroed_bytes`) are retired.

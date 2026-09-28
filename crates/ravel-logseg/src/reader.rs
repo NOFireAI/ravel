@@ -8,6 +8,7 @@
 //! (scan the skip survivors) and surfaces a counter; corrupt BLOCKS data is a
 //! loud `Corrupted` error.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use ravel_types::logstream::AttrValue;
@@ -18,7 +19,7 @@ use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
-use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open};
+use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open_source};
 use crate::page::{DEFAULT_MAX_UNCOMP, read_page};
 use crate::page_dir::{PageDir, PageLoc};
 use crate::postings::{POSTINGS_VERSION_V1, PostingsSection, term_key};
@@ -27,6 +28,7 @@ use crate::record::{
     COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate, resolve_value,
 };
 use crate::skip_index::{NumRangeArm, SkipIndex};
+use crate::source::ByteSource;
 use crate::stream_dir::StreamDir;
 use crate::tokenizer::tokens;
 use crate::writer::RlogConfig;
@@ -81,8 +83,12 @@ pub struct ScanStats {
 }
 
 /// An opened RLOG object ready to scan.
-pub struct RlogReader<'a> {
-    bytes: &'a [u8],
+///
+/// `S` is where the object's bytes come from ([`ByteSource`]): the whole object
+/// by default, or a [`crate::SparseObject`] holding only the regions a ranged
+/// read placed, opened with [`RlogReader::from_source`].
+pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
+    source: &'a S,
     stream_dir: StreamDir,
     field_dir: FieldDir,
     skip: SkipIndex,
@@ -115,18 +121,30 @@ impl<'a> RlogReader<'a> {
     /// (unlike a corrupt BLOOM) is a loud `Corrupted` error rather than a
     /// degrade: without it no block can be located.
     pub fn new(bytes: &'a [u8], cfg: &RlogConfig) -> Result<Self, LogSegError> {
-        let footer = open(bytes)?;
+        RlogReader::from_source(bytes, cfg)
+    }
+}
+
+impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
+    /// [`RlogReader::new`] over any [`ByteSource`]. Every byte the open and the
+    /// later scans address is read through `source`, so a sparse source must
+    /// hold the footer and trailer, STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR,
+    /// BLOOM, POSTINGS when present, and the pages of every block a scan
+    /// decodes. A range it does not hold fails with
+    /// [`LogSegError::Unplaced`].
+    pub fn from_source(source: &'a S, cfg: &RlogConfig) -> Result<Self, LogSegError> {
+        let footer = open_source(source)?;
         let mut open_decompressed_bytes = 0u64;
         let stream_desc = *section(&footer, kind::STREAM_DIR)?;
-        let stream_raw = read_section(bytes, &stream_desc, cfg)?;
+        let stream_raw = read_section_from(source, &stream_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
         let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
         let field_desc = *section(&footer, kind::FIELD_DIR)?;
-        let field_raw = read_section(bytes, &field_desc, cfg)?;
+        let field_raw = read_section_from(source, &field_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
         let field_dir = FieldDir::decode(&field_raw, MAX_FIELDS)?;
         let skip_desc = *section(&footer, kind::SKIP_IDX)?;
-        let skip_raw = read_section(bytes, &skip_desc, cfg)?;
+        let skip_raw = read_section_from(source, &skip_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&skip_desc, &skip_raw);
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
         let blocks = *section(&footer, kind::BLOCKS)?;
@@ -141,12 +159,12 @@ impl<'a> RlogReader<'a> {
             let desc = *footer
                 .section(kind::PAGE_DIR)
                 .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
-            let raw = read_section(bytes, &desc, cfg)?;
+            let raw = read_section_from(source, &desc, cfg)?;
             open_decompressed_bytes += section_decompressed_len(&desc, &raw);
             Arc::new(PageDir::decode_validated(&raw, blocks.len, skip.l0.len())?)
         };
         Ok(RlogReader {
-            bytes,
+            source,
             stream_dir,
             field_dir,
             skip,
@@ -234,7 +252,7 @@ impl<'a> RlogReader<'a> {
     ) -> Result<(Vec<LogRecord>, ScanStats), LogSegError> {
         let mut cursor = self.scan_blocks(content, prune, &ColumnSelection::all())?;
         let mut out = Vec::new();
-        while let Some(rows) = cursor.next_block(self.bytes)? {
+        while let Some(rows) = cursor.next_block(self.source)? {
             out.extend(rows);
         }
         Ok((out, cursor.stats()))
@@ -347,9 +365,16 @@ impl<'a> RlogReader<'a> {
             let content_arms = self.postings_arms(&arms);
             let prune_arms = self.prune_postings_arms(&prune_arms);
             if !content_arms.is_empty() || !prune_arms.is_empty() {
-                match self
-                    .postings_section_verified(desc)
-                    .and_then(PostingsSection::parse)
+                // A section the source never held is not a corrupt one: degrading
+                // would widen the survivors past what a ranged fetch placed.
+                let stored = self.postings_section_verified(desc);
+                if let Err(LogSegError::Unplaced { start, end }) = stored {
+                    return Err(LogSegError::Unplaced { start, end });
+                }
+                match stored
+                    .as_deref()
+                    .map_err(|_| ())
+                    .and_then(|s| PostingsSection::parse(s).map_err(|_| ()))
                 {
                     Ok(section) => {
                         // A version 1 POSTINGS list indexes the per-record
@@ -396,7 +421,7 @@ impl<'a> RlogReader<'a> {
 
         // Bloom pruning. A parse failure degrades to no bloom pruning.
         let bloom_bytes = self.section_stored(&self.bloom)?;
-        let bloom_section = match BloomSection::parse(bloom_bytes) {
+        let bloom_section = match BloomSection::parse(&bloom_bytes) {
             Ok(s) => Some(s),
             Err(_) => {
                 stats.bloom_degraded = true;
@@ -693,14 +718,14 @@ impl<'a> RlogReader<'a> {
     /// over the whole section (same as STREAM_DIR/FIELD_DIR/SKIP_IDX) but was
     /// never consulted here, so a single corrupted header byte that
     /// redirects a probe to a different, still crc-valid term block passed
-    /// silently. Checking it costs nothing extra: the whole object is
+    /// silently. Checking it costs no fetch: the whole section is
     /// already resident. [`PostingsSection::probe`]'s own structural check
     /// (a decoded block's first term must match the sparse entry that
     /// pointed at it) is the complementary guard that still holds under a
     /// future ranged reader that fetches less than the whole section.
-    fn postings_section_verified(&self, desc: &SectionDesc) -> Result<&'a [u8], LogSegError> {
+    fn postings_section_verified(&self, desc: &SectionDesc) -> Result<Cow<'a, [u8]>, LogSegError> {
         let stored = self.section_stored(desc)?;
-        if crc32c::crc32c(stored) != desc.crc32c {
+        if crc32c::crc32c(&stored) != desc.crc32c {
             return Err(LogSegError::Corrupted(
                 "postings section crc mismatch".into(),
             ));
@@ -709,18 +734,34 @@ impl<'a> RlogReader<'a> {
     }
 
     /// Absolute slice of a section's stored bytes.
-    fn section_stored(&self, desc: &SectionDesc) -> Result<&'a [u8], LogSegError> {
-        let start = usize::try_from(desc.offset)
-            .map_err(|_| LogSegError::Corrupted("section offset range".into()))?;
-        let len = usize::try_from(desc.len)
-            .map_err(|_| LogSegError::Corrupted("section len range".into()))?;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| LogSegError::Corrupted("section range overflow".into()))?;
-        self.bytes
-            .get(start..end)
-            .ok_or_else(|| LogSegError::Corrupted("section out of bounds".into()))
+    fn section_stored(&self, desc: &SectionDesc) -> Result<Cow<'a, [u8]>, LogSegError> {
+        source_extent(self.source, desc.offset, desc.len, "section")
     }
+}
+
+/// The stored bytes of `[offset, offset + len)` from `source`, with the range
+/// checks every whole-object slice here has always made, each naming `what`
+/// ("section", "page"): a range past the object's end is `Corrupted("<what>
+/// out of bounds")` whatever the source, and only an in-bounds range reaches
+/// [`ByteSource::read`], so a whole-object source can fail no other way and a
+/// sparse one adds only [`LogSegError::Unplaced`].
+fn source_extent<'s, S: ByteSource + ?Sized>(
+    source: &'s S,
+    offset: u64,
+    len: u64,
+    what: &str,
+) -> Result<Cow<'s, [u8]>, LogSegError> {
+    let start = usize::try_from(offset)
+        .map_err(|_| LogSegError::Corrupted(format!("{what} offset range")))?;
+    let n =
+        usize::try_from(len).map_err(|_| LogSegError::Corrupted(format!("{what} len range")))?;
+    let end = start
+        .checked_add(n)
+        .ok_or_else(|| LogSegError::Corrupted(format!("{what} range overflow")))?;
+    if end as u64 > source.object_len() {
+        return Err(LogSegError::Corrupted(format!("{what} out of bounds")));
+    }
+    source.read(offset, len)
 }
 
 /// Which surviving block to decode: its whole-object block index, resolved to
@@ -805,17 +846,18 @@ impl BlockScan {
     /// Decode the next surviving block and return the rows of it that match the
     /// exact filter, or `None` once every surviving block has been decoded.
     ///
-    /// `object_bytes` MUST be the whole RLOG object the [`RlogReader`] this
-    /// cursor came from was opened on: block extents are absolute offsets into
-    /// it. A block whose extent falls outside the buffer is a typed
-    /// `Corrupted` error, never a panic.
+    /// `object_bytes` MUST be the RLOG object the [`RlogReader`] this cursor
+    /// came from was opened on, or a [`ByteSource`] over it: block extents are
+    /// absolute offsets into it. A block whose extent falls outside the object
+    /// is a typed `Corrupted` error, and one whose pages the source does not
+    /// hold is [`LogSegError::Unplaced`], never a panic.
     ///
     /// Returning `Some(vec![])` is normal and distinct from `None`: a block can
     /// survive pruning and still have no row matching the exact filter. Only
     /// `None` means the scan is finished.
-    pub fn next_block(
+    pub fn next_block<S: ByteSource + ?Sized>(
         &mut self,
-        object_bytes: &[u8],
+        object_bytes: &S,
     ) -> Result<Option<Vec<LogRecord>>, LogSegError> {
         if !self.decode_block(object_bytes)? {
             return Ok(None);
@@ -860,9 +902,9 @@ impl BlockScan {
     /// The returned view borrows this cursor, so it must be dropped before the
     /// next call. The decoded block is released on the next call to either
     /// exit.
-    pub fn next_block_columnar(
+    pub fn next_block_columnar<S: ByteSource + ?Sized>(
         &mut self,
-        object_bytes: &[u8],
+        object_bytes: &S,
     ) -> Result<Option<ColumnarBlockView<'_>>, LogSegError> {
         if !self.decode_block(object_bytes)? {
             return Ok(None);
@@ -912,7 +954,10 @@ impl BlockScan {
     /// surviving row set is computed once, by one predicate evaluation, so a
     /// columnar view cannot disagree with the records `next_block` would have
     /// produced for the same block.
-    fn decode_block(&mut self, object_bytes: &[u8]) -> Result<bool, LogSegError> {
+    fn decode_block<S: ByteSource + ?Sized>(
+        &mut self,
+        object_bytes: &S,
+    ) -> Result<bool, LogSegError> {
         // Release the previous block before decoding the next, so peak resident
         // decoded memory stays one block rather than two.
         self.current = None;
@@ -937,9 +982,8 @@ impl BlockScan {
                 .checked_add(p.offset)
                 .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
         }
-        let decoded = decode_v4_block(
-            object_bytes,
-            0,
+        let decoded = decode_v4_block_with(
+            |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
             loc.record_count,
             loc.crc32c,
             &pages,
@@ -1006,6 +1050,26 @@ pub(crate) fn decode_v4_block(
     plans: &[ColumnPlan],
     columns: Option<&ColumnIdSet>,
 ) -> Result<DecodedBlock, LogSegError> {
+    let page = |p: &PageLoc| {
+        let rel = p
+            .offset
+            .checked_sub(base)
+            .ok_or_else(|| LogSegError::Corrupted("page before fetched range".into()))?;
+        source_extent(bytes, rel, p.desc.len, "page")
+    };
+    decode_v4_block_with(page, record_count, block_crc32c, pages, plans, columns)
+}
+
+/// [`decode_v4_block`] with each kept page's stored bytes supplied by `page`,
+/// which is only called for a page the projection keeps.
+fn decode_v4_block_with<'s>(
+    page: impl Fn(&PageLoc) -> Result<Cow<'s, [u8]>, LogSegError>,
+    record_count: usize,
+    block_crc32c: u32,
+    pages: &[PageLoc],
+    plans: &[ColumnPlan],
+    columns: Option<&ColumnIdSet>,
+) -> Result<DecodedBlock, LogSegError> {
     let wanted = |cid: u32| match columns {
         None => true,
         Some(set) => set.contains(&cid),
@@ -1024,20 +1088,8 @@ pub(crate) fn decode_v4_block(
             page_bytes.push(None);
             continue;
         }
-        let rel = p
-            .offset
-            .checked_sub(base)
-            .ok_or_else(|| LogSegError::Corrupted("page before fetched range".into()))?;
-        let start =
-            usize::try_from(rel).map_err(|_| LogSegError::Corrupted("page offset range".into()))?;
-        let len = usize::try_from(p.desc.len)
-            .map_err(|_| LogSegError::Corrupted("page len range".into()))?;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| LogSegError::Corrupted("page range overflow".into()))?;
-        let stored = bytes
-            .get(start..end)
-            .ok_or_else(|| LogSegError::Corrupted("page out of bounds".into()))?;
+        let stored = page(p)?;
+        let stored: &[u8] = &stored;
         if crc32c::crc32c(stored) != p.crc32c {
             return Err(LogSegError::Corrupted(format!(
                 "page crc mismatch for column {}",
@@ -1329,7 +1381,20 @@ pub fn read_section(
     desc: &SectionDesc,
     cfg: &RlogConfig,
 ) -> Result<Vec<u8>, LogSegError> {
-    decode_section(section_slice(bytes, desc)?, desc, cfg)
+    read_section_from(bytes, desc, cfg)
+}
+
+/// [`read_section`] over any [`ByteSource`].
+pub fn read_section_from<S: ByteSource + ?Sized>(
+    source: &S,
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+) -> Result<Vec<u8>, LogSegError> {
+    decode_section(
+        &source_extent(source, desc.offset, desc.len, "section")?,
+        desc,
+        cfg,
+    )
 }
 
 /// [`read_section`], additionally charging the bytes zstd produced to
@@ -1342,24 +1407,22 @@ pub fn read_section_accounted(
     cfg: &RlogConfig,
     accounting: &ravel_types::accounting::QueryAccounting,
 ) -> Result<Vec<u8>, LogSegError> {
-    decode_section_accounted(section_slice(bytes, desc)?, desc, cfg, accounting)
+    read_section_accounted_from(bytes, desc, cfg, accounting)
 }
 
-/// The section's stored bytes, sliced out of a whole-object buffer at
-/// `[desc.offset, desc.offset + desc.len)`. Shared by [`read_section`] and
-/// [`read_section_accounted`], which differ only in whether the decode that
-/// follows charges `decompressed_bytes`.
-fn section_slice<'b>(bytes: &'b [u8], desc: &SectionDesc) -> Result<&'b [u8], LogSegError> {
-    let start = usize::try_from(desc.offset)
-        .map_err(|_| LogSegError::Corrupted("section offset range".into()))?;
-    let len = usize::try_from(desc.len)
-        .map_err(|_| LogSegError::Corrupted("section len range".into()))?;
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| LogSegError::Corrupted("section range overflow".into()))?;
-    bytes
-        .get(start..end)
-        .ok_or_else(|| LogSegError::Corrupted("section out of bounds".into()))
+/// [`read_section_accounted`] over any [`ByteSource`].
+pub fn read_section_accounted_from<S: ByteSource + ?Sized>(
+    source: &S,
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+    accounting: &ravel_types::accounting::QueryAccounting,
+) -> Result<Vec<u8>, LogSegError> {
+    decode_section_accounted(
+        &source_extent(source, desc.offset, desc.len, "section")?,
+        desc,
+        cfg,
+        accounting,
+    )
 }
 
 /// The crc-and-decompress half of [`read_section`], taking a section's stored
@@ -1707,6 +1770,7 @@ fn decode_attr_value(bytes: &[u8], pos: &mut usize, depth: u32) -> Result<AttrVa
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::footer::open;
     use crate::record::LogRecord;
     use crate::writer::{ObjectIdentity, RlogWriter};
     use ravel_types::accounting::QueryAccounting;
