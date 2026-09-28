@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tonic::Status;
 
-use crate::flight_ticket::{FlightTicket, SqlTicketKeys, TicketSurface};
+use crate::flight_ticket::{FlightTicket, FlightTicketError, SqlTicketKeys, TicketSurface};
 
 /// Which Flight surfaces a listener serves (ADR-1689 decision 1). The server
 /// supplies it when it mounts the service.
@@ -47,7 +47,8 @@ impl FlightListenerRole {
 /// fragment capability counter's shape. Every refusal increments exactly one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SliceReject {
-    /// The `DoGet` carried no slice ticket at all.
+    /// The `DoGet` carried no slice ticket at all, or a handle too short or
+    /// too malformed to be one, so no MAC was ever checked.
     Missing,
     /// The ticket did not verify under any configured slice key, and not
     /// under a client key either.
@@ -128,7 +129,10 @@ impl SliceRejectCounters {
 
 /// Verify `handle` as a slice capability at `now_ns`. The checks run in a
 /// fixed order (present, MAC, expiry, slice count) so a ticket that fails
-/// several ways is attributed to the first. The role is checked by the caller,
+/// several ways is attributed to the first. A handle the decoder reports as
+/// truncated is counted as missing, not as a bad MAC: before the MAC is
+/// checked that means shorter than the smallest ticket, and after it only a
+/// payload that verified yet ends early. The role is checked by the caller,
 /// which decides whether a `DoGet` is a slice fetch at all.
 pub(super) fn verify_slice(
     keys: &SqlTicketKeys,
@@ -140,6 +144,7 @@ pub(super) fn verify_slice(
     }
     let ticket = match keys.decode(handle, TicketSurface::Slice) {
         Ok(ticket) => ticket,
+        Err(FlightTicketError::Truncated) => return Err(SliceReject::Missing),
         Err(_) if keys.decode(handle, TicketSurface::Client).is_ok() => {
             return Err(SliceReject::WrongSurface);
         }
@@ -161,4 +166,63 @@ pub(super) fn check_slice_claims(
         return Err(SliceReject::WrongSurface);
     }
     Ok(ticket)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    const NOW_NS: i64 = 1_000;
+
+    fn slice_ticket() -> FlightTicket {
+        FlightTicket {
+            tenant: ravel_types::TenantId::new("acme").hash(),
+            statement: String::new(),
+            segments: Vec::new(),
+            min_commit_tokens: Vec::new(),
+            now_ns: NOW_NS,
+            deadline_ns: NOW_NS + 1_000,
+            slice_index: 0,
+            slice_count: 2,
+            pending_erasure: Vec::new(),
+            declared_columns: Vec::new(),
+        }
+    }
+
+    /// A handle cut short of the smallest possible ticket never reaches a MAC
+    /// check, so it is counted as missing; the same ticket at full length with
+    /// its MAC flipped is the bad MAC case.
+    #[test]
+    fn a_truncated_slice_handle_is_missing_not_bad_mac() {
+        let keys = SqlTicketKeys::from_file_key(&[0x42; 32]);
+        let encoded = keys
+            .encode(&slice_ticket(), TicketSurface::Slice)
+            .expect("encode");
+        assert_eq!(
+            verify_slice(&keys, &encoded, NOW_NS).expect("the full handle verifies"),
+            slice_ticket()
+        );
+
+        // A ticket with no statement, pins or columns is the smallest one the
+        // decoder accepts, so 97 bytes is the full handle verified above and
+        // 96 is the longest length the guard still refuses.
+        assert_eq!(encoded.len(), 97, "the fixture sits on the length guard");
+        for len in [1, 4, 16, 32, 96] {
+            assert_eq!(
+                verify_slice(&keys, &encoded[..len], NOW_NS),
+                Err(SliceReject::Missing),
+                "a {len}-byte prefix of a slice ticket"
+            );
+        }
+
+        let mut forged = encoded.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert_eq!(
+            verify_slice(&keys, &forged, NOW_NS),
+            Err(SliceReject::BadMac),
+            "a 97-byte handle clears the length guard, so its MAC is checked"
+        );
+    }
 }

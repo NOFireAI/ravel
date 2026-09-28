@@ -1783,8 +1783,8 @@ Reachable end to end: `QueryEngine::prefetch` runs the eligibility gate,
 computes the pushdown target, and sends the resulting request live on the
 wire for the one eligible plan; `MergedSource` overrides
 `SeriesSource::query_precomputed_count` to serve the collected partials back
-to the PromQL fast path, and `PROTOCOL_VERSION` 4 carries the wire opt-in. A
-worker's `count: Some(0)` (a real,
+to the PromQL fast path, and `PROTOCOL_VERSION` 4 and later carry the wire opt-in.
+A worker's `count: Some(0)` (a real,
 correctly-computed zero-in-window count) is dropped before it reaches
 `MergedSource`, never surfaced as a phantom zero-valued series, the same
 absence-of-output-sample contract the raw path already has.

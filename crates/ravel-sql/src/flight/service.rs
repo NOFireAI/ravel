@@ -249,6 +249,14 @@ impl RavelFlightSqlService {
         self
     }
 
+    /// Count refused slice capabilities into `counters` instead of this
+    /// service's own, so a server that mounts one service per listener
+    /// reports one set of counts.
+    pub fn with_slice_reject_counters(mut self, counters: SliceRejectCounters) -> Self {
+        self.slice_rejects = counters;
+        self
+    }
+
     /// The key this service signs client whole-set tickets with.
     ///
     /// Exposed so a test can decode a ticket outside the normal `DoGet` path
