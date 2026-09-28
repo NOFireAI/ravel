@@ -202,6 +202,7 @@ async fn start_server_configured(
 fn always_distribute_settings() -> DistribSettings {
     DistribSettings {
         fragment_keys: vec![FRAGMENT_KEY],
+        sql_ticket_keys: None,
         max_inflight_fragments: 32,
         max_inflight_federated_resolves: 8,
         thresholds: DistribThresholds {

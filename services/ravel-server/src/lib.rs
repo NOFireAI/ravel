@@ -1793,6 +1793,50 @@ fn validated_ingest_config(config: IngestConfig, signal: Signal) -> anyhow::Resu
     Ok(config)
 }
 
+/// Set once the ADR-1689 release A warning has been logged, so a process that
+/// calls [`start`] more than once logs it once.
+static RELEASE_B_WARNING_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The ADR-1689 decision 4 release A warning for a `--distributed-query`
+/// process, or `None` when both flags release B requires are already set.
+fn release_b_requirements_warning(settings: &config::DistribSettings) -> Option<String> {
+    let mut missing = Vec::new();
+    if settings.fragment_listener.is_none() {
+        missing.push("--fragment-listener");
+    }
+    if settings.sql_ticket_keys.is_none() {
+        missing.push("--sql-ticket-key-file");
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "--distributed-query is running without {}. Release B (ADR-1689 decision 4) refuses to \
+         start --distributed-query without both --fragment-listener and --sql-ticket-key-file. \
+         Until then, fragment and SQL slice fetches without --fragment-listener travel in \
+         plaintext on the public gRPC listener, and the SQL ticket key without \
+         --sql-ticket-key-file is derived from the first --fragment-key-file key.",
+        missing.join(" and ")
+    ))
+}
+
+/// Log [`release_b_requirements_warning`] at most once per `logged` flag.
+/// Returns whether this call logged it.
+fn warn_release_b_requirements_once(
+    logged: &std::sync::atomic::AtomicBool,
+    settings: &config::DistribSettings,
+) -> bool {
+    let Some(message) = release_b_requirements_warning(settings) else {
+        return false;
+    };
+    if logged.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!("{message}");
+    true
+}
+
 /// Binds both listeners (as configured by `mode`) and starts serving in the
 /// background. Returns immediately; call [`Running::shutdown`] to stop.
 ///
@@ -2346,6 +2390,9 @@ pub async fn start(
     let distrib_live_workers: Arc<
         parking_lot::RwLock<Arc<Vec<ravel_fleet::query_workers::QueryWorkerRecord>>>,
     > = Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new())));
+    if let Some(settings) = config.distrib.as_ref() {
+        warn_release_b_requirements_once(&RELEASE_B_WARNING_LOGGED, settings);
+    }
     if let (Some(settings), true) = (
         config.distrib.as_ref(),
         matches!(config.mode, Mode::All | Mode::Query),
@@ -3205,25 +3252,28 @@ pub async fn start(
             .as_ref()
             .filter(|_| matches!(config.mode, Mode::All | Mode::Query))
             .map(|settings| {
-                // The Flight SQL lane derives its ticket-signing key from a
-                // stable cluster secret; feed it the fragment-key-derived secret
-                // so the whole cluster agrees (ADR-0071 amendment, decision 2).
-                // The self-id cell keeps this coordinator out of its own SQL
-                // roster: it reads its own slices locally, so a slice
+                // The ticket keys come from `--sql-ticket-key-file` (ADR-1689
+                // decision 2), or, without it in release A, from the
+                // fragment-key-derived secret, so the whole cluster agrees
+                // either way. The self-id cell keeps this coordinator out of its
+                // own SQL roster: it reads its own slices locally, so a slice
                 // dispatched to itself over Flight is a wasted hop. The cell is
                 // filled below, once the gRPC listener has bound and the
                 // heartbeat identity exists; the roster resolves per query, so
                 // the exclusion takes effect from that point on.
-                sql_distrib::distributed_flight_config(
+                sql_distrib::distributed_flight_setup(
                     distrib_live_workers.clone(),
                     distrib_self_id.clone(),
-                    settings.thresholds,
-                    &settings.sql_ticket_secret(),
+                    settings,
                 )
             });
-        let service = sql_state
-            .as_ref()
-            .map(|state| flight::service(state, ceiling, distributed));
+        let (distributed, ticket_keys) = match distributed {
+            Some((config, keys)) => (Some(config), keys),
+            None => (None, None),
+        };
+        let service = sql_state.as_ref().map(|state| {
+            flight::service_with_ticket_keys(state, ceiling, distributed, ticket_keys)
+        });
         if service.is_some() {
             tracing::info!(
                 "Flight SQL registered on the gRPC listener; ad-hoc statements are served, \
@@ -4604,5 +4654,121 @@ mod ingest_readiness_tests {
         );
 
         drain_router(Some(router), "span").await;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod release_b_warning_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use super::*;
+
+    /// Collects the message of every WARN event emitted on this thread.
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().push(message.0);
+        }
+    }
+
+    fn settings(fragment_listener: bool, sql_ticket_key_file: bool) -> config::DistribSettings {
+        config::DistribSettings {
+            fragment_keys: vec![[0x11; 32]],
+            sql_ticket_keys: sql_ticket_key_file.then(|| vec![[0x22; 32]]),
+            max_inflight_fragments: 1,
+            max_inflight_federated_resolves: 1,
+            thresholds: ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+            fragment_listener: fragment_listener.then(|| config::FragmentListenerSettings {
+                addr: "127.0.0.1:0".parse().expect("addr"),
+                tls_cert_pem: Vec::new(),
+                tls_key_pem: Vec::new(),
+                tls_ca_pem: Vec::new(),
+            }),
+            advertise_endpoint: None,
+        }
+    }
+
+    /// Run `calls` startups against one fresh once-flag, returning the WARN
+    /// messages they logged.
+    fn warnings_over(calls: &[config::DistribSettings]) -> Vec<String> {
+        let capture = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let logged = AtomicBool::new(false);
+        tracing::subscriber::with_default(subscriber, || {
+            for settings in calls {
+                warn_release_b_requirements_once(&logged, settings);
+            }
+        });
+        capture.0.lock().clone()
+    }
+
+    #[test]
+    fn release_a_warning_logs_once_per_process_when_a_flag_is_missing() {
+        for (fragment_listener, sql_ticket_key_file, missing) in [
+            (
+                false,
+                false,
+                "--fragment-listener and --sql-ticket-key-file",
+            ),
+            (true, false, "--sql-ticket-key-file"),
+            (false, true, "--fragment-listener"),
+        ] {
+            let startup = settings(fragment_listener, sql_ticket_key_file);
+            let lines = warnings_over(&[startup.clone(), startup.clone(), startup]);
+            assert_eq!(lines.len(), 1, "exactly one warning per process: {lines:?}");
+            assert!(
+                lines[0].starts_with(&format!(
+                    "--distributed-query is running without {missing}."
+                )),
+                "names what is missing: {}",
+                lines[0]
+            );
+            assert!(
+                lines[0].contains("Release B")
+                    && lines[0]
+                        .contains("without both --fragment-listener and --sql-ticket-key-file"),
+                "names release B and both flags it requires: {}",
+                lines[0]
+            );
+        }
+    }
+
+    #[test]
+    fn release_a_warning_is_silent_with_both_flags_set() {
+        let startup = settings(true, true);
+        assert_eq!(release_b_requirements_warning(&startup), None);
+        let lines = warnings_over(&[startup.clone(), startup]);
+        assert!(lines.is_empty(), "no warning with both flags: {lines:?}");
     }
 }
