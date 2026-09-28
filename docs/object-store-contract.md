@@ -312,6 +312,15 @@ Per backend, the same three rules:
 | `ExternalStore` Azure | `versionid` | `NotFound` | `PreconditionFailed` |
 | `MemoryStore` | keeps only the current object, so any pinned version that is not the current one is gone | `NotFound` | `PreconditionFailed` |
 
+A full read (`GetRange::Full`) is bounded differently per backend. `S3Store`,
+and so the S3 kind of `ExternalStore`, splits it into requests of at most
+`max_get_chunk` bytes, so no single response outlives the request timeout.
+The GCS and Azure kinds of `ExternalStore` issue one unranged request and
+read its whole body. A caller reading a large GCS or Azure object in full
+must bound it with ranged reads itself. ADR-2040's Parquet reader is
+specified to read by range (the footer, then column chunks), so it is not
+meant to take the unsplit path.
+
 The rows above assume the three real backends answer a well-formed but
 absent version with a 404 and a failed `If-Match` with a 412; nothing in
 this crate verifies that against a live endpoint. A malformed or foreign
@@ -1585,8 +1594,8 @@ than on the request path:
   is 32 bytes.
 
 Nothing in a shipping binary constructs an `ExternalStore` or calls either
-probe yet. The callers are the ravel-parquet reader (#2052) and the grant
-CLI and `CREATE EXTERNAL TABLE` paths (#2051, #2054).
+probe yet. The callers are the Parquet reader and the grant and
+`CREATE EXTERNAL TABLE` paths of ADR-2040, which have not landed.
 
 ## Rules for callers
 
