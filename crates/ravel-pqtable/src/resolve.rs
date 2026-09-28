@@ -3,10 +3,14 @@
 //! stores no data objects of its own for a Parquet table, so resolving a table
 //! never lists anything but that prefix.
 
+use std::collections::BTreeMap;
+
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_types::TenantHash;
 
-use crate::keys::{KeyError, manifest_key, manifest_prefix, parse_manifest_key};
+use crate::keys::{
+    KeyError, manifest_key, manifest_prefix, parse_manifest_key, tenant_manifest_prefix,
+};
 use crate::manifest::{Manifest, ManifestError, decode_manifest};
 
 /// How many times [`newest`] re-lists when the version it listed is gone by
@@ -76,6 +80,44 @@ pub async fn versions(
     }
     out.sort_unstable();
     out.dedup();
+    Ok(out)
+}
+
+/// Every table of `tenant` that has at least one manifest version, with that
+/// table's version numbers ascending.
+///
+/// One LIST of `t/<tenant_hash>/pq/t/` answers for every table, so an
+/// inspection of a whole tenant costs the same listing a sweep does rather
+/// than one per table. A key under that prefix that is not a manifest key is
+/// [`ResolveError::ForeignKey`], the same refusal [`versions`] makes.
+pub async fn tables(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> Result<BTreeMap<String, Vec<u64>>, ResolveError> {
+    let prefix = tenant_manifest_prefix(tenant);
+    let listed = list_all(store, &prefix)
+        .await
+        .map_err(|e| store_error(&prefix, e))?;
+    let mut out: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for meta in listed {
+        let parsed = parse_manifest_key(&meta.key).map_err(|e| ResolveError::ForeignKey {
+            key: meta.key.clone(),
+            prefix: prefix.clone(),
+            reason: e.to_string(),
+        })?;
+        if parsed.tenant_hash != *tenant {
+            return Err(ResolveError::ForeignKey {
+                key: meta.key,
+                prefix,
+                reason: "belongs to another tenant".into(),
+            });
+        }
+        out.entry(parsed.table).or_default().push(parsed.version);
+    }
+    for versions in out.values_mut() {
+        versions.sort_unstable();
+        versions.dedup();
+    }
     Ok(out)
 }
 
@@ -195,6 +237,33 @@ mod tests {
         let got = newest(&store, &TENANT_A, "hits").await.expect("resolve");
         assert_eq!(got, Some(live_manifest("hits", 2, &[2])));
         assert_eq!(store.list_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn tables_groups_every_version_by_table_and_skips_other_tenants() {
+        let store = MemoryStore::with_page_size(2);
+        assert!(tables(&store, &TENANT_A).await.expect("tables").is_empty());
+        for v in [1, 2, 10] {
+            put_version(&store, &TENANT_A, v).await;
+        }
+        for v in [3, 4] {
+            let m = live_manifest("clicks", v, &[v as u8]);
+            let key = manifest_key(&TENANT_A, "clicks", v).expect("key");
+            let bytes = encode_manifest(&TENANT_A, &m).expect("encode");
+            store
+                .put(&key, Bytes::from(bytes), PutOptions::create_if_absent())
+                .await
+                .expect("put");
+        }
+        put_version(&store, &TENANT_B, 99).await;
+        let got = tables(&store, &TENANT_A).await.expect("tables");
+        assert_eq!(
+            got,
+            BTreeMap::from([
+                ("clicks".to_string(), vec![3, 4]),
+                ("hits".to_string(), vec![1, 2, 10]),
+            ])
+        );
     }
 
     #[tokio::test]
