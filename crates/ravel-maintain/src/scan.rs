@@ -19,7 +19,7 @@ use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::retention::{
     RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket_with_reach,
-    resolve_retention_window_ns,
+    resolve_retention_window_ns, retention_sweep_bucket_with_reach,
 };
 use crate::sweep::LeaseCheck;
 
@@ -153,12 +153,13 @@ pub struct MaintainReport {
     /// L0-record count compaction exposes without an extra listing, so it is
     /// the figure `ravel_maintain_l0_records_pending` renders (issue #1729).
     pub l0_records_pending: usize,
-    /// Buckets this pass did not evaluate because another attempt holds their
-    /// advisory compaction claim (ADR-1029 decision 5), plus the ones skipped
-    /// without a store request because a previous tick's observation put them
-    /// on hold until the holder's lease expires. Never counted as compacted:
-    /// this process did no merge for them, and the holder may still be
-    /// running one.
+    /// Buckets this pass did not compact because another attempt holds their
+    /// advisory compaction claim (ADR-1029 decision 5), plus the ones whose
+    /// compaction was skipped without a claim request because a previous
+    /// tick's observation put them on hold until the holder's lease expires.
+    /// Retention still evaluates a held bucket, and one it retires is counted
+    /// under `retired` instead. Never counted as compacted: this process did
+    /// no merge for them, and the holder may still be running one.
     pub claim_skipped: usize,
     /// Buckets whose merge started under a claim this process then lost, and
     /// which cancelled at a checkpoint and published nothing (ADR-1029
@@ -1346,13 +1347,10 @@ pub async fn scan_and_maintain_with_memo(
         // `CompactorConfig::interior_reverify_ns`), so skip it without
         // listing or reading anything.
         // A bucket another attempt holds the claim on is on hold until that
-        // claim can have expired. Checked before the zone split, because a
-        // head or tail hour is evaluated every tick and is exactly the bucket
-        // a contender would otherwise re-request a claim for on every one.
-        if memo.claim_deferred(&key, now) {
-            report.claim_skipped += 1;
-            continue;
-        }
+        // claim can have expired. The hold covers compaction only: retention
+        // and the zone split run as for any other bucket, so a held head or
+        // tail hour still reaches `head_tail_hours`.
+        let claim_deferred = memo.claim_deferred(&key, now);
 
         let zone = classify_zone(hour, now, config, retention_window_ns);
         if zone != Zone::Interior {
@@ -1370,16 +1368,30 @@ pub async fn scan_and_maintain_with_memo(
         }
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
-        let (retention_outcome, compaction) = maintain_bucket_with_reach(
-            &mut reach,
-            store,
-            clock,
-            config,
-            retention_window_ns,
-            lease,
-            &bucket,
-        )
-        .await?;
+        let (retention_outcome, compaction) = if claim_deferred {
+            let outcome = retention_sweep_bucket_with_reach(
+                &mut reach,
+                store,
+                clock,
+                config,
+                retention_window_ns,
+                lease,
+                &bucket,
+            )
+            .await?;
+            (outcome, None)
+        } else {
+            maintain_bucket_with_reach(
+                &mut reach,
+                store,
+                clock,
+                config,
+                retention_window_ns,
+                lease,
+                &bucket,
+            )
+            .await?
+        };
         match retention_outcome {
             // Fully retired: the bucket's data is gone, so it is not a
             // still-present expired bucket and contributes no retention lag.
@@ -1411,7 +1423,8 @@ pub async fn scan_and_maintain_with_memo(
                 );
             }
             // Retention left the bucket live; the compaction outcome classifies
-            // it (compaction always ran in these arms; see maintain_bucket).
+            // it (compaction ran in these arms unless the bucket is on a claim
+            // hold; see maintain_bucket).
             RetentionOutcome::NoPolicy
             | RetentionOutcome::NotSealed
             | RetentionOutcome::NotExpired => match &compaction {
@@ -1442,6 +1455,9 @@ pub async fn scan_and_maintain_with_memo(
                 // The claim was lost mid-merge and the run cancelled without
                 // publishing. The holder that took it over is doing the work.
                 Some(ClaimedCompaction::Cancelled { .. }) => report.claim_cancelled += 1,
+                // Retention left a held bucket live, so compaction would have
+                // run here; the hold skipped it without a claim request.
+                None if claim_deferred => report.claim_skipped += 1,
                 None => {}
             },
         }
