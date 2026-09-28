@@ -2002,7 +2002,12 @@ impl MetadataCollector {
     }
 }
 
-fn sanitize_metric_name(name: &str) -> String {
+/// Rewrite a metric name into the Prometheus metric-name character set,
+/// replacing every disallowed character with `_`. Public so a non-OTLP ingest
+/// surface (`ravel-cli load --signal metrics`) can put a mapped name through
+/// the same rewrite before [`prometheus_family_name`], which is what makes the
+/// same metric land on the same `SeriesId` whichever surface admitted it.
+pub fn sanitize_metric_name(name: &str) -> String {
     sanitize(
         name.to_owned(),
         is_metric_name_start,
@@ -2010,7 +2015,11 @@ fn sanitize_metric_name(name: &str) -> String {
     )
 }
 
-fn sanitize_label_name(name: String) -> String {
+/// Rewrite a label name into the Prometheus label-name character set, as
+/// [`sanitize_metric_name`] does for metric names, and public for the same
+/// reason: every ingest surface must hand `SeriesId::compute` the same label
+/// names for one logical series.
+pub fn sanitize_label_name(name: String) -> String {
     sanitize(name, is_label_name_start, is_label_name_continue)
 }
 

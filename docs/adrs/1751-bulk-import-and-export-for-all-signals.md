@@ -69,7 +69,9 @@ types across that boundary.
 2. **The mapping TOML gains a per-signal section; exactly one section must
    be present and it must match `--signal`.** Metrics: `name` (a column or a
    literal), `value` column, `ts` column and unit, `[[label]]` columns,
-   an optional `kind = "gauge" | "counter"` that sets `is_monotonic_sum`,
+   an optional `kind = "gauge" | "counter"` that sets `is_monotonic_sum`
+   (names and the metric's own unit follow the OTLP series-identity
+   amendment below),
    and an optional classic-histogram shape (`le` column plus `sum` and
    `count` columns) that the loader explodes into `_bucket`, `_sum` and
    `_count` series exactly as OTLP does. Spans: `trace_id`, `span_id`,
@@ -204,3 +206,23 @@ claim about two.
 If the build cost becomes a problem, the fix is to split the fetch and
 erasure layer out of `ravel-query` into a crate that does not carry the
 serving surfaces, not to give `ravel-cli` its own copy of the rules.
+
+## Amendment (2026-09-28): loaded metrics share OTLP series identity
+
+<!-- amendment-applies: sections="Decision" pointer="OTLP series-identity amendment" -->
+
+Follow-up task 1 showed that decision 2's mapping, taken literally, stores
+metric and label names as written, so a metric loaded from Parquet and the
+same metric sent over OTLP land on different series. The loader now applies
+the OTLP path's identity rules, so both surfaces agree on the `SeriesId`:
+
+- The metric name goes through the same sanitizer and
+  `prometheus_family_name` as OTLP, so a `[metrics]` mapping carries an
+  optional `unit` key (the metric's UCUM unit, distinct from the `ts`
+  column's unit) that adds the same unit suffix, and `kind = "counter"`
+  adds `_total` exactly as a monotonic OTLP Sum does.
+- Label names go through the same label sanitizer, and an empty label
+  value is dropped as OTLP drops an empty attribute value, so an empty cell
+  and a missing one name the same series.
+- Two mapped labels that sanitize to one name are refused rather than
+  merged.
