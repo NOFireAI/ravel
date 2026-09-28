@@ -39,6 +39,7 @@ pub mod audit_retention;
 mod audit_write;
 pub mod bucket;
 pub mod build;
+pub mod claim_guard;
 pub mod clock;
 pub mod codec;
 pub mod compact;
@@ -72,12 +73,13 @@ pub use alert_retention::{AlertKeepSet, AlertRetentionOutcome, sweep_alert_reten
 pub use audit_pipeline::{AuditEvent, AuditPipeline, NoopQueryAuditSink, QueryAuditSink};
 pub use audit_retention::{AuditRetentionOutcome, sweep_audit_retention};
 pub use bucket::Bucket;
+pub use claim_guard::{Acquire, Checkpoint, ClaimGuard, ClaimSkip, ClaimSkipReason, Verdict};
 pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
-pub use compact::{CompactionOutcome, compact_bucket};
+pub use compact::{ClaimedCompaction, CompactionOutcome, compact_bucket, compact_bucket_claimed};
 pub use config::{
-    AdmissionMode, AuditMode, AuditPipelineConfig, CompactorConfig, MergeMemoryTracker,
-    MergePhasePeaks, RetentionConfig, RetentionConfigError, RetentionPolicy,
+    AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
+    MergeMemoryTracker, MergePhasePeaks, RetentionConfig, RetentionConfigError, RetentionPolicy,
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{

@@ -550,6 +550,16 @@ pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_L1_PART_MEMORY_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Default minimum L0 records for a bucket to be worth compacting.
 pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
+/// Default `claim_min_input_bytes`: 64 MiB of listed input bytes (ADR-1029
+/// decision 4). Below it a duplicated merge is cheaper than the PUT-class
+/// claim traffic that would prevent it, so the bucket runs unclaimed.
+pub const DEFAULT_CLAIM_MIN_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Default `claim_lease_duration`: 300 s (ADR-1029 decision 3), the same
+/// figure [`ravel_fleet::claim::DEFAULT_LEASE_DURATION`] carries. The lease
+/// must exceed the longest stage a run cannot be cancelled inside (one
+/// stream's cursor drain, one part encode plus PUT), not the whole merge: the
+/// owner renews at the cancellation checkpoints.
+pub const DEFAULT_CLAIM_LEASE_DURATION: Duration = ravel_fleet::claim::DEFAULT_LEASE_DURATION;
 /// Default footer suffix-probe size. 64 KiB covers the footer + catalog of a
 /// typical L0 flush in one GET (docs/segment-format.md reader protocol).
 pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
@@ -793,6 +803,94 @@ impl Default for AuditPipelineConfig {
             audit_mode: AuditMode::Required,
             channel_capacity: DEFAULT_AUDIT_CHANNEL_CAPACITY,
         }
+    }
+}
+
+/// Whether this process takes advisory compaction claims at all (ADR-1029
+/// decision 5's escape hatch).
+///
+/// [`Coordination::Off`] is the fleet-wide fallback for a store whose
+/// qualification record predates the CAS probes, or an emergency. It is not a
+/// separate code path: an unclaimed run is the same pipeline with no claim
+/// taken, exactly what a bucket below
+/// [`CompactorConfig::claim_min_input_bytes`] does, so the unclaimed path is
+/// the one this crate's default tests exercise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Coordination {
+    /// Claim buckets at or above the cost gate. The default.
+    #[default]
+    On,
+    /// Never claim. Racing runs still converge at the compaction record's
+    /// `CreateIfAbsent`, which is what makes claims advisory (ADR-1029
+    /// decision 2); the loser just pays its merge first.
+    Off,
+}
+
+/// Who this process claims as, and the clock its claim decisions read.
+///
+/// Installed by the caller that drives a coordinated compaction
+/// ([`crate::compact::compact_bucket_claimed`]); `None` means this caller takes
+/// no claims whatever [`CompactorConfig::coordination`] says, which is the
+/// state every existing direct caller of [`crate::compact::compact_bucket`] is
+/// in. `ravel-cli` adopts it in wave 3 (#1034).
+///
+/// The clock is held as an `Arc` rather than borrowed because the guard is
+/// consulted deep inside the merge, at call sites that take no clock
+/// ([`crate::codec::SegmentCodec::build_parts`] and the per-signal merges
+/// below it). Library logic never reads `SystemTime::now()`: a test installs a
+/// [`crate::clock::FixedClock`] here and drives every renewal and expiry
+/// decision deterministically. The pre-acquisition jitter wait goes through
+/// the participant's [`ClaimSleeper`] for the same reason: tokio's timer by
+/// default, and a recording or no-op sleeper in a test.
+///
+/// [`ClaimSleeper`]: crate::claim_guard::ClaimSleeper
+#[derive(Clone)]
+pub struct ClaimParticipant {
+    process_id: Uuid,
+    clock: Arc<dyn crate::clock::Clock>,
+    sleeper: Arc<dyn crate::claim_guard::ClaimSleeper>,
+}
+
+impl std::fmt::Debug for ClaimParticipant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimParticipant")
+            .field("process_id", &self.process_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClaimParticipant {
+    /// A participant claiming as `process_id` (the ADR-0057/0065 startup uuid,
+    /// the same identity this process's `sys/maintain/workers/<id>` heartbeat
+    /// is keyed under), reading `clock` for every claim decision and waiting
+    /// out the acquisition jitter on tokio's timer.
+    pub fn new(process_id: Uuid, clock: Arc<dyn crate::clock::Clock>) -> Self {
+        ClaimParticipant {
+            process_id,
+            clock,
+            sleeper: Arc::new(crate::claim_guard::TokioSleeper),
+        }
+    }
+
+    /// This participant, waiting out the acquisition jitter through `sleeper`
+    /// instead of tokio's timer.
+    pub fn with_sleeper(self, sleeper: Arc<dyn crate::claim_guard::ClaimSleeper>) -> Self {
+        ClaimParticipant { sleeper, ..self }
+    }
+
+    /// The sleeper the acquisition jitter is waited out on.
+    pub fn sleeper(&self) -> &Arc<dyn crate::claim_guard::ClaimSleeper> {
+        &self.sleeper
+    }
+
+    /// The process id claims are written under.
+    pub fn process_id(&self) -> Uuid {
+        self.process_id
+    }
+
+    /// The injected clock every claim decision reads.
+    pub fn clock(&self) -> &Arc<dyn crate::clock::Clock> {
+        &self.clock
     }
 }
 
@@ -1093,6 +1191,41 @@ pub struct CompactorConfig {
     /// [`DEFAULT_INTERIOR_REVERIFY_NS`] (6 h); non-positive disables the
     /// safety net (every interior bucket is always due).
     pub interior_reverify_ns: i64,
+    /// Whether this process takes advisory compaction claims (ADR-1029
+    /// decision 5). Default [`Coordination::On`]; [`Coordination::Off`]
+    /// disables claiming fleet-wide. Claims are advisory either way: the
+    /// compaction record's `CreateIfAbsent` remains the only serialization
+    /// point that decides anything durable.
+    pub coordination: Coordination,
+    /// The cost gate (ADR-1029 decision 4): a bucket is claimed only when its
+    /// listed input bytes (the summed `object_size` of the L0 commit records
+    /// the bucket listing found) reach this. Below it, a duplicated merge
+    /// costs less than the PUT-class claim traffic that would prevent it, so
+    /// the bucket runs unclaimed through the same pipeline. Default
+    /// [`DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB).
+    pub claim_min_input_bytes: u64,
+    /// How long a claim this process takes stays live without a renewal
+    /// (ADR-1029 decision 3). Held as a [`Duration`] rather than this struct's
+    /// usual nanoseconds because it is passed straight to
+    /// [`ravel_fleet::claim::ClaimConfig`], which the claim primitive reads.
+    /// Default [`DEFAULT_CLAIM_LEASE_DURATION`] (300 s).
+    pub claim_lease_duration: Duration,
+    /// Who this process claims as, and the clock its claim decisions read.
+    /// `None` (the default) means this caller takes no claims at all, whatever
+    /// [`Self::coordination`] says; the background supervisor installs one per
+    /// tick. See [`ClaimParticipant`].
+    pub claim_participant: Option<ClaimParticipant>,
+    /// The live claim of the run in progress, installed by
+    /// [`crate::compact::compact_bucket_claimed`] into its own per-run clone of
+    /// this config once the bucket's claim is taken, and read by the
+    /// cancellation checkpoints inside the merge
+    /// ([`crate::claim_guard::checkpoint`]). It is per RUN, never per process:
+    /// two buckets compacted concurrently under one base config each get their
+    /// own clone carrying their own guard, so a renewal for one bucket can
+    /// never be mistaken for the other's. A caller never sets this; setting it
+    /// by hand claims nothing, because the acquisition happens in the driver.
+    /// Default `None`, which makes every checkpoint a single `Option` check.
+    pub claim_guard: Option<crate::claim_guard::ClaimGuard>,
 }
 
 impl Default for CompactorConfig {
@@ -1122,6 +1255,11 @@ impl Default for CompactorConfig {
             merge_memory_tracker: None,
             request_ledger: None,
             interior_reverify_ns: DEFAULT_INTERIOR_REVERIFY_NS,
+            coordination: Coordination::On,
+            claim_min_input_bytes: DEFAULT_CLAIM_MIN_INPUT_BYTES,
+            claim_lease_duration: DEFAULT_CLAIM_LEASE_DURATION,
+            claim_participant: None,
+            claim_guard: None,
         }
     }
 }

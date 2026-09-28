@@ -101,17 +101,24 @@ pub enum RequestPhase {
     /// post-publish HEAD verification of `AlreadyExists` parts, and, on the
     /// converging path, the winner-record GET and its per-part HEADs.
     Publish,
+    /// The advisory claim protocol (ADR-1029 decision 4): the acquisition
+    /// `CreateIfAbsent` PUT, the contention path's claim GET and `head()`, each
+    /// renewal and steal CAS, and the completion CAS. Claim traffic is counted
+    /// here and never pooled into the merge's own phases, so a bucket's merge
+    /// cost stays comparable between a claimed and an unclaimed run.
+    Coordinate,
 }
 
 impl RequestPhase {
     /// Every phase, in report order.
-    pub const ALL: [RequestPhase; 6] = [
+    pub const ALL: [RequestPhase; 7] = [
         RequestPhase::List,
         RequestPhase::RecordRead,
         RequestPhase::CatalogRead,
         RequestPhase::BlockRead,
         RequestPhase::PartPut,
         RequestPhase::Publish,
+        RequestPhase::Coordinate,
     ];
 
     /// Stable snake_case name, used as the tracing field prefix.
@@ -123,6 +130,7 @@ impl RequestPhase {
             RequestPhase::BlockRead => "block_read",
             RequestPhase::PartPut => "part_put",
             RequestPhase::Publish => "publish",
+            RequestPhase::Coordinate => "coordinate",
         }
     }
 
@@ -134,6 +142,7 @@ impl RequestPhase {
             RequestPhase::BlockRead => 3,
             RequestPhase::PartPut => 4,
             RequestPhase::Publish => 5,
+            RequestPhase::Coordinate => 6,
         }
     }
 }
@@ -177,6 +186,8 @@ pub struct RunRequestReport {
     pub part_put: PhaseRequests,
     /// The publish protocol ([`RequestPhase::Publish`]).
     pub publish: PhaseRequests,
+    /// The advisory claim protocol ([`RequestPhase::Coordinate`]).
+    pub coordinate: PhaseRequests,
 }
 
 impl RunRequestReport {
@@ -189,6 +200,7 @@ impl RunRequestReport {
             RequestPhase::BlockRead => self.block_read,
             RequestPhase::PartPut => self.part_put,
             RequestPhase::Publish => self.publish,
+            RequestPhase::Coordinate => self.coordinate,
         }
     }
 
@@ -374,6 +386,7 @@ impl RequestLedger {
             block_read: read(RequestPhase::BlockRead),
             part_put: read(RequestPhase::PartPut),
             publish: read(RequestPhase::Publish),
+            coordinate: read(RequestPhase::Coordinate),
         }
     }
 }
