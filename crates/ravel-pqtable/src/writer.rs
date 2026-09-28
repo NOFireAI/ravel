@@ -16,20 +16,24 @@
 //! Two mechanisms make a refused or failed write decidable. Every call carries
 //! an apply nonce, so two callers that would otherwise encode byte-identical
 //! manifests still produce different bodies and only the caller whose bytes
-//! are there reads the version as its own. A re-resolve that finds this call's
-//! nonce on the newest version also reports that version as this call's
-//! commit.
+//! are there reads the version as its own. Before re-planning, a call reads
+//! every version key it has already attempted and reports the one carrying its
+//! own nonce as its commit. Reading only the newest version is not enough: a
+//! put the store received but never acknowledged can land after `apply` moved
+//! on, and another writer can commit on top of it in the meantime, which
+//! leaves this call's write in place with someone else's above it.
 //!
-//! The manifest a writer resolved ages. Half of `min_grace_ms`, less
-//! [`PUT_SKEW_ALLOWANCE_MS`], is the budget from a resolve to the end of the
-//! put that follows it. `apply` re-resolves rather than putting when that
-//! budget is already spent by the time it would put, and otherwise waits on
-//! the put with `tokio::time::timeout` for what is left of it. A put that
-//! times out is treated as not committed: `apply` reads the key to see
-//! whether its bytes landed and, if not, re-resolves. The timeout bounds how
-//! long `apply` waits, not the request itself: a request the store already
-//! received can still land after it, and the nonce is how a later resolve
-//! recognises that write.
+//! The manifest a writer resolved ages. Half of `min_grace_ms` is the budget
+//! from a resolve to the end of the put that follows it. Both ends are read
+//! from this call's own clock, so no allowance for the difference between this
+//! process's clock and the store's comes off it. `apply` re-resolves rather
+//! than putting when that budget is already spent by the time it would put,
+//! and otherwise waits on the put with `tokio::time::timeout` for what is left
+//! of it. A put that times out is treated as not committed: `apply` reads the
+//! key to see whether its bytes landed and, if not, re-resolves. The timeout
+//! bounds how long `apply` waits, not the request itself: a request the store
+//! already received can still land after it, and the nonce is how a later
+//! resolve recognises that write.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -50,11 +54,6 @@ use crate::resolve::{self, ResolveError};
 /// resolve aged past the budget before the put, or when the put timed out
 /// without landing. A non-retryable store error ends the call at once.
 pub const MAX_APPLY_ATTEMPTS: usize = 8;
-
-/// Taken off the resolve-to-put budget (half of `min_grace_ms`) to cover the
-/// difference between this process's clock and the store's, which stamps the
-/// `last_modified` a sweep measures grace from.
-pub const PUT_SKEW_ALLOWANCE_MS: u64 = 30_000;
 
 /// A parsed DDL statement, applied by [`apply`]. The files are external: they
 /// live in the tenant's own bucket and Ravel only records where they are and
@@ -110,12 +109,9 @@ pub enum WriteError {
     EmptyFileList { table: String },
     #[error("table {table:?}: gave up after {attempts} attempts without committing")]
     RetriesExhausted { table: String, attempts: usize },
-    /// Half of `min_grace_ms` is no larger than [`PUT_SKEW_ALLOWANCE_MS`], so
-    /// no put could finish inside the resolve-to-put budget.
-    #[error(
-        "min_grace_ms {min_grace_ms} leaves no resolve-to-put budget after the \
-         {PUT_SKEW_ALLOWANCE_MS} ms skew allowance"
-    )]
+    /// Half of `min_grace_ms` rounds down to zero, so no put could finish
+    /// inside the resolve-to-put budget.
+    #[error("min_grace_ms {min_grace_ms} leaves no resolve-to-put budget")]
     NoPutBudget { min_grace_ms: u64 },
     #[error("table {table:?}: version {version} has no successor")]
     VersionOverflow { table: String, version: u64 },
@@ -262,13 +258,34 @@ async fn holds_own_write(
     }
 }
 
+/// The newest version among `attempted` that carries this call's `nonce`, if
+/// any. Every version this call put is read, not only the newest in the table:
+/// a put whose acknowledgement never arrived can land after `apply` moved on,
+/// and another writer can commit on top of it before `apply` looks again.
+async fn own_commit(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    table: &str,
+    attempted: &[u64],
+    nonce: &[u8],
+) -> Result<Option<u64>, WriteError> {
+    for &version in attempted.iter().rev() {
+        if let Some(manifest) = resolve::read_version(store, tenant, table, version).await?
+            && manifest.apply_nonce == nonce
+        {
+            return Ok(Some(version));
+        }
+    }
+    Ok(None)
+}
+
 /// Apply `intent` to `table` as its next manifest version. See the module docs
 /// for the race semantics. `Create` and `CreateOrReplace` with an empty file
 /// list are refused before any store call.
 ///
 /// `min_grace_ms` is the deployment's sweep floor ([`crate::sweep`]). Half of
-/// it, less [`PUT_SKEW_ALLOWANCE_MS`], is the budget from this call's resolve
-/// to the end of its put; see the module docs for what happens past it.
+/// it is the budget from this call's resolve to the end of its put; see the
+/// module docs for what happens past it.
 pub async fn apply(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -286,20 +303,19 @@ pub async fn apply(
         });
     }
     let nonce = apply_nonce();
-    let budget_ms = (min_grace_ms / 2).saturating_sub(PUT_SKEW_ALLOWANCE_MS);
+    let budget_ms = min_grace_ms / 2;
     if budget_ms == 0 {
         return Err(WriteError::NoPutBudget { min_grace_ms });
     }
     let budget_ns = i64::try_from(budget_ms)
         .unwrap_or(i64::MAX)
         .saturating_mul(1_000_000);
+    let mut attempted: Vec<u64> = Vec::new();
     for _ in 0..MAX_APPLY_ATTEMPTS {
         let resolved_at = clock.now_ns();
         let newest = resolve::newest(store, tenant, table).await?;
-        if let Some(m) = &newest
-            && m.apply_nonce == nonce
-        {
-            return Ok(Outcome::Committed { version: m.version });
+        if let Some(version) = own_commit(store, tenant, table, &attempted, &nonce).await? {
+            return Ok(Outcome::Committed { version });
         }
         let manifest = match plan_step(table, &intent, newest.as_ref(), clock.now_ns(), &nonce)? {
             Step::Done(outcome) => return Ok(outcome),
@@ -313,6 +329,9 @@ pub async fn apply(
         };
         if remaining_ns == 0 {
             continue;
+        }
+        if !attempted.contains(&manifest.version) {
+            attempted.push(manifest.version);
         }
         let put = store.put(
             &key,
@@ -343,14 +362,18 @@ pub async fn apply(
             Err(source) => {
                 // A retryable failure says nothing about whether the write
                 // landed, so ask the store before reporting it.
-                if source.is_retryable() && holds_own_write(store, &key, &bytes).await? {
-                    return Ok(Outcome::Committed {
-                        version: manifest.version,
-                    });
+                if source.is_retryable()
+                    && let Some(version) =
+                        own_commit(store, tenant, table, &attempted, &nonce).await?
+                {
+                    return Ok(Outcome::Committed { version });
                 }
                 return Err(WriteError::Store { key, source });
             }
         }
+    }
+    if let Some(version) = own_commit(store, tenant, table, &attempted, &nonce).await? {
+        return Ok(Outcome::Committed { version });
     }
     Err(WriteError::RetriesExhausted {
         table: table.to_string(),
@@ -370,7 +393,7 @@ mod tests {
     use super::*;
     use crate::clock::FixedClock;
     use crate::resolve::read_version;
-    use crate::test_util::{CountingStore, TENANT_A, file_for};
+    use crate::test_util::{CountingStore, TENANT_A, file_for, live_manifest};
 
     type Store = CountingStore<FaultStore<MemoryStore>>;
 
@@ -853,9 +876,9 @@ mod tests {
         assert_eq!(nonces.len(), 64);
     }
 
-    /// Half the grace floor less the skew allowance, in nanoseconds.
+    /// Half the grace floor, in nanoseconds: the whole resolve-to-put budget.
     fn budget_ns() -> i64 {
-        i64::try_from((GRACE_MS / 2 - PUT_SKEW_ALLOWANCE_MS) * 1_000_000).expect("fits")
+        i64::try_from(GRACE_MS / 2 * 1_000_000).expect("fits")
     }
 
     #[tokio::test(start_paused = true)]
@@ -899,8 +922,9 @@ mod tests {
         .await
         .expect("apply returned");
         // The own-write GET read nothing, then the stalled request landed;
-        // the re-resolve finds this call's nonce on version 1. Without that
-        // check the CREATE would see its own table and report TableExists.
+        // the next attempt reads the version this call put and finds its own
+        // nonce. Without that check the CREATE would see its own table and
+        // report TableExists.
         assert_eq!(got.expect("create"), Outcome::Committed { version: 1 });
         assert_eq!(
             resolve::versions(&store, &TENANT_A, "hits")
@@ -912,9 +936,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_grace_floor_with_no_room_past_the_skew_allowance_is_refused() {
+    async fn a_grace_floor_with_no_room_for_any_put_is_refused() {
         let store = MemoryStore::new();
-        for grace in [0, 2 * PUT_SKEW_ALLOWANCE_MS] {
+        for grace in [0, 1] {
             let got = apply(
                 &store,
                 &TENANT_A,
@@ -936,11 +960,102 @@ mod tests {
                 "hits",
                 create(false, &[1], "a"),
                 &FixedClock::new(0),
-                2 * PUT_SKEW_ALLOWANCE_MS + 2,
+                2,
             )
             .await
             .expect("one ms of budget"),
             Outcome::Committed { version: 1 }
         );
+    }
+
+    #[tokio::test]
+    async fn the_45_s_sweep_floor_leaves_a_usable_put_budget() {
+        // 45 s is the smallest grace floor `sweep` accepts. The budget is
+        // measured end to end on this call's own clock, so nothing is taken
+        // off it for the difference between that clock and the store's.
+        let store = MemoryStore::new();
+        assert_eq!(
+            apply(
+                &store,
+                &TENANT_A,
+                "hits",
+                create(false, &[1], "a"),
+                &FixedClock::new(0),
+                45_000,
+            )
+            .await
+            .expect("45 s grace leaves a budget"),
+            Outcome::Committed { version: 1 }
+        );
+    }
+
+    /// Put `rival` at its own version just before the `nth` LIST, so a caller
+    /// whose own write landed late finds someone else's version on top of it.
+    fn supersede_on_list(store: &CountingStore<MemoryStore>, nth: usize, rival: &Manifest) {
+        let key = manifest_key(&TENANT_A, &rival.table, rival.version).expect("key");
+        let bytes = encode_manifest(&TENANT_A, rival).expect("encode");
+        store.put_on_nth_list(nth, key, Bytes::from(bytes));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_landing_write_another_writer_built_on_is_still_this_writers_commit() {
+        // This call's put of version 1 stalls, so it times out, reads the key,
+        // finds nothing, and re-resolves. The request lands in between, and
+        // another writer commits version 2 on top of it before this call's
+        // second LIST is answered. The newest version is then not this call's,
+        // but version 1 is.
+        for intent in [create(false, &[1], "a"), replace(&[1], "a")] {
+            let mut store = CountingStore::new(MemoryStore::new());
+            store.stall_then_land_late = Some("/pq/t/".into());
+            supersede_on_list(&store, 2, &live_manifest("hits", 2, &[7]));
+            let got = tokio::time::timeout(
+                Duration::from_secs(3_600),
+                apply_at(&store, "hits", intent, 1),
+            )
+            .await
+            .expect("apply returned");
+            assert_eq!(got.expect("apply"), Outcome::Committed { version: 1 });
+            // No version 3: the intent was not applied a second time on top
+            // of the rival's version 2.
+            assert_eq!(
+                resolve::versions(&store, &TENANT_A, "hits")
+                    .await
+                    .expect("versions"),
+                vec![1, 2]
+            );
+            assert_each_version_written_once(&store);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_landing_drop_another_writer_built_on_is_not_applied_twice() {
+        let mut store = CountingStore::new(MemoryStore::new());
+        apply_at(&store, "hits", create(false, &[1], "a"), 1)
+            .await
+            .expect("create");
+        // The DROP's own put of version 2 stalls and lands late; the rival's
+        // version 3 is in place before the re-resolve.
+        store.stall_then_land_late = Some("/pq/t/".into());
+        let lists_before = store.list_count();
+        supersede_on_list(&store, lists_before + 2, &live_manifest("hits", 3, &[7]));
+        let got = tokio::time::timeout(
+            Duration::from_secs(3_600),
+            apply_at(&store, "hits", drop_table(false, "a"), 2),
+        )
+        .await
+        .expect("apply returned");
+        assert_eq!(got.expect("drop"), Outcome::Committed { version: 2 });
+        assert_eq!(
+            resolve::versions(&store, &TENANT_A, "hits")
+                .await
+                .expect("versions"),
+            vec![1, 2, 3]
+        );
+        assert!(read_version(&store, &TENANT_A, "hits", 2)
+            .await
+            .expect("read")
+            .expect("present")
+            .dropped);
+        assert_each_version_written_once(&store);
     }
 }

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use bytes::Bytes;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutMode, PutOptions, PutOutcome, StoreError,
+    ObjectStoreBackend, PageToken, Pin, PinnedRead, PutMode, PutOptions, PutOutcome, StoreError,
 };
 use ravel_types::TenantHash;
 
@@ -59,12 +59,17 @@ pub fn live_manifest(table: &str, version: u64, seeds: &[u8]) -> Manifest {
 /// With `stall_then_land_late` set, the first matching `CreateIfAbsent` put
 /// never returns and the object lands only after the next `get` of its key
 /// has answered: a request the store received and applied after the writer
-/// stopped waiting and checked for it.
+/// stopped waiting and checked for it. With
+/// [`CountingStore::put_on_nth_list`] set, one object is written just before
+/// a chosen LIST is answered, which is how a test puts another writer's
+/// commit between a caller's put and its next resolve.
 pub struct CountingStore<S> {
     pub inner: S,
     accepted_puts: Mutex<HashMap<String, usize>>,
     listed_prefixes: Mutex<Vec<String>>,
     list_bumps: Mutex<(Option<FixedClock>, VecDeque<i64>)>,
+    list_write: Mutex<Option<(usize, String, Bytes)>>,
+    list_deletes: Mutex<VecDeque<String>>,
     pub replay_create_if_absent: Option<String>,
     pub stall_then_land_late: Option<String>,
     stalled: Mutex<Option<(String, Bytes)>>,
@@ -78,6 +83,8 @@ impl<S> CountingStore<S> {
             accepted_puts: Mutex::new(HashMap::new()),
             listed_prefixes: Mutex::new(Vec::new()),
             list_bumps: Mutex::new((None, VecDeque::new())),
+            list_write: Mutex::new(None),
+            list_deletes: Mutex::new(VecDeque::new()),
             replay_create_if_absent: None,
             stall_then_land_late: None,
             stalled: Mutex::new(None),
@@ -106,6 +113,18 @@ impl<S> CountingStore<S> {
         *self.list_bumps.lock().expect("lock") = (Some(clock), bumps.into_iter().collect());
     }
 
+    /// Write `bytes` at `key` just before the `nth` `list` call (1-based) is
+    /// answered, so the listing that follows already sees it.
+    pub fn put_on_nth_list(&self, nth: usize, key: String, bytes: Bytes) {
+        *self.list_write.lock().expect("lock") = Some((nth, key, bytes));
+    }
+
+    /// Delete one of `keys` after each `list` is answered, in order: an object
+    /// that is listed and then gone before the caller can read it.
+    pub fn delete_after_each_list(&self, keys: impl IntoIterator<Item = String>) {
+        *self.list_deletes.lock().expect("lock") = keys.into_iter().collect();
+    }
+
     fn record_put(&self, key: &str) {
         *self
             .accepted_puts
@@ -115,18 +134,50 @@ impl<S> CountingStore<S> {
             .or_insert(0) += 1;
     }
 
-    fn record_list(&self, prefix: &str) {
-        self.listed_prefixes
-            .lock()
-            .expect("lock")
-            .push(prefix.to_string());
-        let mut bumps = self.list_bumps.lock().expect("lock");
-        let (Some(clock), queue) = &mut *bumps else {
-            return;
+    /// Records the call and returns its 1-based index.
+    fn record_list(&self, prefix: &str) -> usize {
+        let nth = {
+            let mut listed = self.listed_prefixes.lock().expect("lock");
+            listed.push(prefix.to_string());
+            listed.len()
         };
-        if let Some(delta) = queue.pop_front() {
+        let mut bumps = self.list_bumps.lock().expect("lock");
+        if let (Some(clock), queue) = &mut *bumps
+            && let Some(delta) = queue.pop_front()
+        {
             clock.advance(delta);
         }
+        nth
+    }
+}
+
+impl<S: ObjectStoreBackend> CountingStore<S> {
+    /// Applies the [`CountingStore::put_on_nth_list`] write when `nth` is its
+    /// call.
+    async fn write_before_list(&self, nth: usize) -> Result<(), StoreError> {
+        let due = {
+            let mut pending = self.list_write.lock().expect("lock");
+            match &*pending {
+                Some((n, _, _)) if *n == nth => pending.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, key, data)) = due {
+            self.inner
+                .put(&key, data, PutOptions::create_if_absent())
+                .await?;
+            self.record_put(&key);
+        }
+        Ok(())
+    }
+
+    /// Applies the next [`CountingStore::delete_after_each_list`] deletion.
+    async fn delete_after_list(&self) -> Result<(), StoreError> {
+        let due = self.list_deletes.lock().expect("lock").pop_front();
+        if let Some(key) = due {
+            self.inner.delete(&key).await?;
+        }
+        Ok(())
     }
 }
 
@@ -185,6 +236,27 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingStore<S> {
         out
     }
 
+    /// Forwarded so the wrapped backend's pinned-read semantics are the ones
+    /// under test; the trait default would refuse with `Unsupported`. The
+    /// late-landing and accepted-put bookkeeping above is tied to `put` and
+    /// `get`, so a pinned read is not counted.
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        self.inner.get_pinned(key, range, pin).await
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        self.inner.get_with_pin(key, range).await
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        self.inner.pin_of(key).await
+    }
+
     async fn put_multipart<'a>(
         &'a self,
         key: &str,
@@ -197,13 +269,19 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingStore<S> {
     }
 
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        self.record_list(prefix);
-        self.inner.list(prefix, page).await
+        let nth = self.record_list(prefix);
+        self.write_before_list(nth).await?;
+        let out = self.inner.list(prefix, page).await;
+        self.delete_after_list().await?;
+        out
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        self.record_list(prefix);
-        self.inner.list_delimited(prefix).await
+        let nth = self.record_list(prefix);
+        self.write_before_list(nth).await?;
+        let out = self.inner.list_delimited(prefix).await;
+        self.delete_after_list().await?;
+        out
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
