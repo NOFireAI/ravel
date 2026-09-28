@@ -465,7 +465,7 @@ impl RecordingStore {
         self.ranges
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(range.clone());
+            .push(*range);
     }
 }
 

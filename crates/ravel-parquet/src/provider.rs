@@ -230,7 +230,7 @@ impl ParquetTableProvider {
         }
         let raw_schema = Arc::new(schema);
 
-        for (column, _) in &options.casts {
+        for column in options.casts.keys() {
             let field =
                 raw_schema
                     .field_with_name(column)
@@ -250,7 +250,7 @@ impl ParquetTableProvider {
             }
         }
 
-        let paths: Vec<(String, u64, Option<String>, Option<String>, u32)> = manifest
+        let paths: Vec<ScanFile> = manifest
             .files
             .iter()
             .enumerate()
@@ -377,14 +377,16 @@ impl TableProvider for ParquetTableProvider {
     }
 }
 
+/// One manifest file as the scan names it: its scan path, size, ETag, version
+/// and footer length.
+type ScanFile = (String, u64, Option<String>, Option<String>, u32);
+
 /// The Parquet scan itself, before any cast.
 struct RawParquetScan {
     table: String,
     schema: SchemaRef,
     url: ObjectStoreUrl,
-    /// Per manifest file: its scan path, size, ETag, version and footer
-    /// length.
-    files: Vec<(String, u64, Option<String>, Option<String>, u32)>,
+    files: Vec<ScanFile>,
     factory: Arc<PinnedReaderFactory>,
     options: TableParquetOptions,
     parallel: bool,
