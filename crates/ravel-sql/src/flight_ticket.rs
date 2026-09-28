@@ -295,21 +295,22 @@ const TICKET_KEY_DERIVATION_CONTEXT: &str =
 /// A single-process deployment mints a random key. A distributed deployment
 /// cannot: a coordinator signs a slice ticket that a *different* worker process
 /// redeems, so all processes must key their MAC identically. Every process in an
-/// ADR-0071 cluster already holds one shared secret — the cluster-internal
-/// fragment auth token (`DistribSettings::auth_token`) — so deriving the ticket
-/// key from it gives cluster-wide agreement with no new key-distribution
-/// channel. `blake3::derive_key` with a fixed context is a proper KDF: it maps
-/// the arbitrary-length secret to a 32-byte key and never uses the secret as a
-/// MAC key directly, so the token and the ticket key are cryptographically
+/// ADR-0071 cluster already holds one shared secret, the first key of its
+/// `--fragment-key-file` (the server passes its lowercase hex,
+/// `DistribSettings::sql_ticket_secret`), so deriving the ticket key from it
+/// gives cluster-wide agreement with no new key-distribution channel.
+/// `blake3::derive_key` with a fixed context is a proper KDF: it maps the
+/// arbitrary-length secret to a 32-byte key and never uses the secret as a MAC
+/// key directly, so the fragment key and the ticket key are cryptographically
 /// independent. The result is still secret (never logged, sent, or persisted);
 /// it is merely reproducible across processes and restarts, which a distributed
 /// ticket requires.
 ///
 /// ADR-1689 decision 2 moves the ticket MAC onto per-surface keys
-/// ([`SqlTicketKeys`]). The server still passes this function's output as
-/// `DistributedFlightConfig::shared_ticket_key`, which the Flight service now
-/// treats as one file key and derives both surface keys from, until the server
-/// reads `--sql-ticket-key-file` instead.
+/// ([`SqlTicketKeys`]) read from `--sql-ticket-key-file`. This derivation is
+/// the release A fallback for a process started without that flag: the server
+/// passes its output as `DistributedFlightConfig::shared_ticket_key`, which the
+/// Flight service treats as one file key and derives both surface keys from.
 pub fn derive_ticket_key(shared_secret: &[u8]) -> TicketKey {
     blake3::derive_key(TICKET_KEY_DERIVATION_CONTEXT, shared_secret)
 }
