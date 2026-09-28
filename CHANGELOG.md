@@ -402,21 +402,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `abort-multipart`, `rule-scope`, `no-foreign-rule`,
   `delete-marker-replication`, `object-lock`, `object-retention`); `Unknown`
   covers no API, access denied, and an unparseable response, and is never
-  `Fail`. A condition is `Pass` only when a response proves it: lifecycle and
-  replication conditions are proven only by enabled rules whose filter covers
-  every key under `t/` (a tag- or object-size-narrowed rule never does, and an
-  unrecognised filter or status, or a day count that does not parse, is
-  `Unknown`), while any enabled rule that reaches only part of `t/`, or `sys/`,
-  can still fail them: a `NoncurrentDays` shorter than the expected value fails
-  both `noncurrent-expiration` and `no-foreign-rule`, and
-  `DeleteMarkerReplication` `Disabled` on a rule over part of `t/` fails
-  `delete-marker-replication`. A 404 is "not configured" only when its
-  `<Error><Code>` is that call's own code (`NoSuchLifecycleConfiguration`,
-  `ReplicationConfigurationNotFoundError`,
+  `Fail`. The sanctioned lifecycle and replication conditions pass only on an
+  enabled rule whose filter covers every key under `t/` (a tag- or
+  object-size-narrowed rule never does, and an unrecognised filter or status, a
+  repeated `NoncurrentVersionExpiration`, or a day count that does not parse,
+  is `Unknown`); `no-foreign-rule` passes only when no rule that can reach `t/`
+  or `sys/` carries a transition, a current-version expiration, or a
+  `NoncurrentDays` shorter than the reference (the expected value, else the one
+  value the covering rules agree on). A `NoncurrentDays` below the reference
+  fails `no-foreign-rule`, and also `noncurrent-expiration` when the rule
+  reaches part of `t/`; with no reference to compare against, the same rule is
+  `Unknown` there instead. `DeleteMarkerReplication` `Disabled` on a rule over
+  part of `t/` fails `delete-marker-replication`. A 404 is "not configured"
+  only when its `<Error><Code>` is that call's own code
+  (`NoSuchLifecycleConfiguration`, `ReplicationConfigurationNotFoundError`,
   `ObjectLockConfigurationNotFoundError`, or `NoSuchObjectLockConfiguration`
   for retention); any other 404, redirect, body over 1 MiB (with or without a
-  `Content-Length`), or `ObjectLockConfiguration` without an
-  `ObjectLockEnabled` element is `Unknown`. `object-retention` samples the
+  `Content-Length`), `ObjectLockConfiguration` without an `ObjectLockEnabled`
+  element, or `?versions` page without `IsTruncated` or with a version lacking
+  a `VersionId` is `Unknown`. `object-retention` samples the
   newest (by `LastModified`) current and noncurrent version under each
   protected prefix and requires compliance mode with a `RetainUntilDate` still
   in the future; the `?versions` listing is followed for at most 10 pages, and

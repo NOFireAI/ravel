@@ -776,8 +776,13 @@ impl BucketProtectionReport {
 pub struct BucketProtectionParams {
     /// Expected noncurrent-version expiration days (`E_v`). `Some` requires the
     /// enabled rule's `NoncurrentDays` to equal it (the CLI's
-    /// `--expected-noncurrent-days`); `None` checks only that an enabled
-    /// noncurrent-expiration rule is present (the server, decision 5).
+    /// `--expected-noncurrent-days`). `None` (the server, decision 5) needs an
+    /// enabled noncurrent-expiration rule covering `t/` and fixes no value, but
+    /// covering rules that disagree on `NoncurrentDays` still fail, as does a
+    /// `NewerNoncurrentVersions` on a covering rule; the value the covering
+    /// rules agree on is the reference any other rule's `NoncurrentDays` is
+    /// measured against, and a narrower or `sys/` rule carrying one with no
+    /// reference to compare against is `Unknown`.
     pub expected_noncurrent_days: Option<u32>,
     /// Whether to sample objects for the `object-retention` condition. Off for
     /// the server (retention is CLI-only, decision 5); the CLI turns it on with

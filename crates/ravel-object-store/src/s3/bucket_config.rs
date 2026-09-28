@@ -787,13 +787,11 @@ impl RuleScope {
         }
     }
 
-    fn targets_ravel(&self) -> Tri {
+    /// Whether the rule can apply to a key under any of `roots`.
+    fn targets(&self, roots: &[&str]) -> Tri {
         match self {
             RuleScope::Prefix(prefix) | RuleScope::Narrowed { prefix, .. } => {
-                if RAVEL_ROOTS
-                    .iter()
-                    .any(|root| prefix_intersects(prefix, root))
-                {
+                if roots.iter().any(|root| prefix_intersects(prefix, root)) {
                     Tri::Yes
                 } else {
                     Tri::No
@@ -857,6 +855,9 @@ fn filter_scope(filter: &XmlElement) -> RuleScope {
 }
 
 fn and_scope(and: &XmlElement) -> RuleScope {
+    if and.children.is_empty() {
+        return RuleScope::Unrecognized("an empty <And>".to_string());
+    }
     let mut prefix: Option<String> = None;
     let mut narrowing: Vec<String> = Vec::new();
     for child in &and.children {
@@ -1024,6 +1025,11 @@ fn lifecycle_rule(rule: &XmlElement) -> LifecycleRule {
             other => out.unrecognized_action = Some(format!("<{other}>")),
         }
     }
+    if rule.count("NoncurrentVersionExpiration") > 1 {
+        out.noncurrent_days = Some(Days::Invalid(
+            "a repeated <NoncurrentVersionExpiration>".to_string(),
+        ));
+    }
     out
 }
 
@@ -1078,7 +1084,11 @@ pub(crate) fn parse_object_versions(
     let mut listing = ObjectVersionListing {
         is_truncated: match root.child("IsTruncated") {
             Some(element) => parse_bool(element)?,
-            None => false,
+            None => {
+                return Err(ControlPlaneError::Parse(
+                    "versions listing carries no IsTruncated element".to_string(),
+                ));
+            }
         },
         next_key_marker: root.child("NextKeyMarker").map(|m| m.text.clone()),
         next_version_id_marker: root
@@ -1092,10 +1102,14 @@ pub(crate) fn parse_object_versions(
                 .child("Key")
                 .map(|k| k.text.clone())
                 .unwrap_or_default(),
-            version_id: version
-                .child("VersionId")
-                .map(|v| v.value().to_string())
-                .unwrap_or_default(),
+            version_id: match version.child("VersionId").map(XmlElement::value) {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => {
+                    return Err(ControlPlaneError::Parse(
+                        "a listed version carries no VersionId".to_string(),
+                    ));
+                }
+            },
             is_latest: match version.child("IsLatest") {
                 Some(element) => parse_bool(element)?,
                 None => false,
@@ -1915,30 +1929,36 @@ fn covering_noncurrent_days(rules: &[LifecycleRule]) -> Option<u32> {
 }
 
 /// A rule's `NoncurrentVersionExpiration` when it deletes noncurrent versions
-/// sooner than `reference` days (`Ok`) or carries a day count that does not
-/// parse (`Err`), each as a description; `None` otherwise. S3 applies the
-/// shortest of overlapping expirations, so a longer one is harmless.
+/// sooner than `reference` days (`Ok`), or when it cannot be judged (`Err`): a
+/// day count that does not parse, or no reference to compare it against. Each
+/// is a description; `None` otherwise. S3 applies the shortest of overlapping
+/// expirations, so a longer one is harmless.
 fn early_noncurrent(
     rule: &LifecycleRule,
     reference: Option<u32>,
 ) -> Option<Result<String, String>> {
     match rule.noncurrent_days.as_ref()? {
-        Days::Value(days) => {
-            let reference = reference?;
-            (*days < reference).then(|| {
+        Days::Value(days) => match reference {
+            Some(reference) => (*days < reference).then(|| {
                 Ok(format!(
                     "noncurrent-version expiration after {days} days, sooner than {reference}"
                 ))
-            })
-        }
+            }),
+            None => Some(Err(format!(
+                "noncurrent-version expiration after {days} days, with no reference to compare \
+                 it against (no expected E_v, and no single NoncurrentDays on the rules covering \
+                 t/)"
+            ))),
+        },
         Days::Invalid(raw) => Some(Err(format!("NoncurrentDays {raw:?} that does not parse"))),
     }
 }
 
-/// Rules that can delete a Ravel object's noncurrent versions early and that
+/// Rules that can delete noncurrent versions under `t/` early and that
 /// [`evaluate_action`] does not already judge by value: every rule not
-/// `Disabled` whose scope can reach `t/` or `sys/`, except an enabled rule
-/// covering all of `t/`. Returns the definite findings and the uncertain ones.
+/// `Disabled` whose scope can reach `t/`, except an enabled rule covering all
+/// of `t/`. A rule on `sys/` alone is `no-foreign-rule`'s to judge. Returns the
+/// definite findings and the uncertain ones.
 fn early_noncurrent_rules(
     rules: &[LifecycleRule],
     reference: Option<u32>,
@@ -1947,7 +1967,7 @@ fn early_noncurrent_rules(
     let mut unknowns: Vec<String> = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
         let active = rule.status.active();
-        let targets = rule.scope.targets_ravel();
+        let targets = rule.scope.targets(&[DATA_ROOT]);
         if active == Tri::No || targets == Tri::No {
             continue;
         }
@@ -2107,7 +2127,8 @@ fn evaluate_action<T: Copy + fmt::Display>(
 /// transition, a current-version expiration (by days or by date), or a
 /// noncurrent-version expiration sooner than `reference_noncurrent_days`. An
 /// expiration or action the reader cannot classify, a day count that does not
-/// parse, or a rule whose filter or status is unrecognised makes it `Unknown`.
+/// parse, a `NoncurrentDays` with no reference to compare it against, or a rule
+/// whose filter or status is unrecognised makes it `Unknown`.
 fn no_foreign_rule_state(
     rules: &[LifecycleRule],
     reference_noncurrent_days: Option<u32>,
@@ -2116,7 +2137,7 @@ fn no_foreign_rule_state(
     let mut unknowns: Vec<String> = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
         let active = rule.status.active();
-        let targets = rule.scope.targets_ravel();
+        let targets = rule.scope.targets(&RAVEL_ROOTS);
         if active == Tri::No || targets == Tri::No {
             continue;
         }
@@ -2224,7 +2245,7 @@ fn delete_marker_replication_state(config: &ReplicationConfig) -> ConditionState
             continue;
         }
         match (active, coverage) {
-            (_, Coverage::None) => {}
+            (_, Coverage::None) if !partial => {}
             (Tri::Yes, Coverage::Full) => match &rule.delete_marker_replication {
                 Some(RuleStatus::Enabled) => enabled.push(label),
                 Some(RuleStatus::Disabled) => disabled.push(label),

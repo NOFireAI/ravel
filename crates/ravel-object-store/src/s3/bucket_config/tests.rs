@@ -397,6 +397,8 @@ fn every_lifecycle_filter_form_is_read() {
         "<Filter><Prefix>t/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></Filter>",
         "<Filter><And><Prefix>t/</Prefix><Prefix>sys/</Prefix></And></Filter>",
         "<Filter><And><Frobnicate/></And></Filter>",
+        "<Filter><And></And></Filter>",
+        "<Filter><And/></Filter>",
         "<Prefix>t/</Prefix><Filter/>",
         "<Filter>text</Filter>",
     ] {
@@ -467,10 +469,31 @@ fn parses_object_versions() {
     assert_eq!(listing.next_version_id_marker.as_deref(), Some("v0"));
     assert!(
         parse_object_versions(
-            br#"<ListVersionsResult><Version><IsLatest>maybe</IsLatest></Version></ListVersionsResult>"#
+            br#"<ListVersionsResult><IsTruncated>false</IsTruncated><Version><IsLatest>maybe</IsLatest></Version></ListVersionsResult>"#
         )
         .is_err()
     );
+}
+
+/// A page that does not say whether it is truncated is not read as complete,
+/// and a version without a VersionId cannot address its retention.
+#[test]
+fn listing_without_is_truncated_or_version_id_is_a_parse_error() {
+    let version = "<Version><Key>t/a</Key><VersionId>v1</VersionId><IsLatest>true</IsLatest>\
+                   <LastModified>2013-05-01T00:00:00.000Z</LastModified></Version>";
+    let complete = format!(
+        "<ListVersionsResult><IsTruncated>false</IsTruncated>{version}</ListVersionsResult>"
+    );
+    assert!(parse_object_versions(complete.as_bytes()).is_ok());
+    let no_truncation = format!("<ListVersionsResult>{version}</ListVersionsResult>");
+    assert!(parse_object_versions(no_truncation.as_bytes()).is_err());
+    let no_version_id = "<ListVersionsResult><IsTruncated>false</IsTruncated>\
+                         <Version><Key>t/a</Key><IsLatest>true</IsLatest>\
+                         <LastModified>2013-05-01T00:00:00.000Z</LastModified></Version>\
+                         </ListVersionsResult>";
+    assert!(parse_object_versions(no_version_id.as_bytes()).is_err());
+    let empty_version_id = complete.replace("<VersionId>v1</VersionId>", "<VersionId></VersionId>");
+    assert!(parse_object_versions(empty_version_id.as_bytes()).is_err());
 }
 
 #[test]
@@ -821,9 +844,10 @@ fn absent_lifecycle_fails_sanctioned_rules_and_passes_no_foreign() {
 }
 
 /// S3 applies the shortest of overlapping expirations, so a rule on part of t/
-/// or on sys/ with a NoncurrentDays below E_v deletes old versions early even
-/// beside a covering rule that carries E_v exactly: both conditions fail. A
-/// longer count on the same rule deletes nothing early.
+/// with a NoncurrentDays below E_v deletes old versions early even beside a
+/// covering rule that carries E_v exactly: both conditions fail. On sys/ only
+/// no-foreign-rule fails, since sys/ is outside noncurrent-expiration's scope.
+/// A longer count on the same rule deletes nothing early.
 #[test]
 fn shorter_noncurrent_days_on_a_partial_or_sys_rule_fails() {
     let covering = rule(
@@ -831,9 +855,26 @@ fn shorter_noncurrent_days_on_a_partial_or_sys_rule_fails() {
         "<Filter/>",
         &format!("{}{MARKER}{ABORT_7}", noncurrent("30")),
     );
+    for sys_filter in [
+        "<Filter><Prefix>sys/</Prefix></Filter>",
+        "<Filter><And><Prefix>sys/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></And></Filter>",
+    ] {
+        let early = rule("early", sys_filter, &noncurrent("1"));
+        for rules in [format!("{covering}{early}"), format!("{early}{covering}")] {
+            let v = evaluate(&rules);
+            assert!(v.noncurrent.is_pass(), "{sys_filter}: {:?}", v.noncurrent);
+            assert!(v.no_foreign.is_fail(), "{sys_filter}: {:?}", v.no_foreign);
+            assert!(
+                v.no_foreign
+                    .detail()
+                    .contains("after 1 days, sooner than 30"),
+                "{sys_filter}: {:?}",
+                v.no_foreign
+            );
+        }
+    }
     for filter in [
         "<Filter><Prefix>t/x/</Prefix></Filter>",
-        "<Filter><Prefix>sys/</Prefix></Filter>",
         "<Filter><Tag><Key>tier</Key><Value>hot</Value></Tag></Filter>",
         "<Filter><And><Prefix>t/</Prefix><ObjectSizeGreaterThan>0</ObjectSizeGreaterThan></And></Filter>",
     ] {
@@ -885,6 +926,144 @@ fn shorter_noncurrent_days_fail_against_the_covering_value_without_e_v() {
     let v = lifecycle_conditions(&FetchOutcome::Present(config), None);
     assert!(v.noncurrent.is_fail(), "{:?}", v.noncurrent);
     assert!(v.no_foreign.is_fail(), "{:?}", v.no_foreign);
+}
+
+fn evaluate_without_e_v(rules: &str) -> LifecycleVerdicts {
+    let body = format!("<LifecycleConfiguration>{rules}</LifecycleConfiguration>");
+    let config = parse_lifecycle(body.as_bytes()).expect("parse");
+    lifecycle_conditions(&FetchOutcome::Present(config), None)
+}
+
+/// With no E_v and no single covering value, a narrower rule's NoncurrentDays
+/// has nothing to be measured against: both conditions are Unknown and name the
+/// rule and its days.
+#[test]
+fn narrower_noncurrent_rules_without_a_reference_are_unknown() {
+    let v = evaluate_without_e_v(&format!(
+        "{}{}",
+        rule(
+            "half-a",
+            "<Filter><Prefix>t/0</Prefix></Filter>",
+            &noncurrent("30")
+        ),
+        rule(
+            "early",
+            "<Filter><Prefix>t/1</Prefix></Filter>",
+            &noncurrent("1")
+        ),
+    ));
+    for (name, state) in [("no-foreign", &v.no_foreign), ("noncurrent", &v.noncurrent)] {
+        assert!(state.is_unknown(), "{name}: {state:?}");
+        assert!(
+            state
+                .detail()
+                .contains("rule \"early\" on prefix \"t/1\" (Status Enabled) carries noncurrent-version expiration after 1 days, with no reference"),
+            "{name}: {state:?}"
+        );
+    }
+}
+
+/// Covering rules that disagree leave no reference, so a sys/ rule's early
+/// expiry cannot be judged by value: no-foreign-rule is Unknown, not Pass, and
+/// noncurrent-expiration fails on the disagreement without judging sys/.
+#[test]
+fn sys_noncurrent_rule_beside_disagreeing_covering_rules_is_unknown() {
+    let v = evaluate_without_e_v(&format!(
+        "{}{}{}",
+        rule("a", "<Filter/>", &noncurrent("30")),
+        rule("b", "<Filter/>", &noncurrent("14")),
+        rule(
+            "sys-early",
+            "<Filter><Prefix>sys/</Prefix></Filter>",
+            &noncurrent("1")
+        ),
+    ));
+    assert!(v.noncurrent.is_fail(), "{:?}", v.noncurrent);
+    assert!(
+        v.noncurrent.detail().contains("disagree") && !v.noncurrent.detail().contains("sys-early"),
+        "{:?}",
+        v.noncurrent
+    );
+    assert!(v.no_foreign.is_unknown(), "{:?}", v.no_foreign);
+    assert!(
+        v.no_foreign
+            .detail()
+            .contains("rule \"sys-early\" on prefix \"sys/\" (Status Enabled) carries noncurrent-version expiration after 1 days, with no reference"),
+        "{:?}",
+        v.no_foreign
+    );
+}
+
+/// Removing the sanctioned covering rule can only take away proof: the early
+/// rule that failed beside it stays uncertain without it, never Pass.
+#[test]
+fn deleting_the_covering_rule_never_turns_no_foreign_into_pass() {
+    let covering = rule("ravel", "<Filter/>", &noncurrent("30"));
+    for (filter, noncurrent_without) in [
+        ("<Filter><Prefix>t/x/</Prefix></Filter>", "unknown"),
+        ("<Filter><Prefix>sys/</Prefix></Filter>", "fail"),
+    ] {
+        let early = rule("early", filter, &noncurrent("1"));
+        let with = evaluate_without_e_v(&format!("{covering}{early}"));
+        assert!(with.no_foreign.is_fail(), "{filter}: {:?}", with.no_foreign);
+        let without = evaluate_without_e_v(&early);
+        assert!(
+            without.no_foreign.is_unknown(),
+            "{filter}: {:?}",
+            without.no_foreign
+        );
+        let state = &without.noncurrent;
+        match noncurrent_without {
+            "unknown" => assert!(state.is_unknown(), "{filter}: {state:?}"),
+            _ => assert!(state.is_fail(), "{filter}: {state:?}"),
+        }
+    }
+}
+
+/// A rule repeating NoncurrentVersionExpiration has no single day count: it is
+/// Unknown rather than whichever element came last.
+#[test]
+fn repeated_noncurrent_expiration_is_unknown() {
+    for (first, second) in [("1", "30"), ("30", "1")] {
+        let v = evaluate(&rule(
+            "twice",
+            "<Filter/>",
+            &format!(
+                "{}{}{MARKER}{ABORT_7}",
+                noncurrent(first),
+                noncurrent(second)
+            ),
+        ));
+        assert!(
+            v.noncurrent.is_unknown(),
+            "{first},{second}: {:?}",
+            v.noncurrent
+        );
+        assert!(
+            v.no_foreign.is_unknown(),
+            "{first},{second}: {:?}",
+            v.no_foreign
+        );
+    }
+}
+
+/// An empty And names no condition at all, so it is not read as the whole
+/// bucket.
+#[test]
+fn empty_and_filter_is_unknown_not_the_whole_bucket() {
+    let v = evaluate(&rule(
+        "empty-and",
+        "<Filter><And></And></Filter>",
+        &format!("{}{MARKER}{ABORT_7}", noncurrent("30")),
+    ));
+    for (name, state) in [
+        ("noncurrent", &v.noncurrent),
+        ("marker", &v.expired_marker),
+        ("abort", &v.abort),
+        ("rule-scope", &v.rule_scope),
+    ] {
+        assert!(state.is_unknown(), "{name}: {state:?}");
+    }
 }
 
 /// An early expiry on a rule whose scope or status cannot be classified, or
@@ -1046,6 +1225,9 @@ fn partial_replication_rule_without_delete_markers_fails() {
         assert!(state.is_pass(), "{filter}: {state:?}");
         let unstated = replication_rule("Enabled", filter, "Sometimes");
         let state = dmr_state(&format!("{covering}{unstated}"));
+        assert!(state.is_unknown(), "{filter}: {state:?}");
+        let paused = replication_rule("Paused", filter, "Disabled");
+        let state = dmr_state(&format!("{covering}{paused}"));
         assert!(state.is_unknown(), "{filter}: {state:?}");
     }
     // A rule on sys/ only, or a disabled one, touches no key under t/.
@@ -1987,7 +2169,7 @@ fn listing_body(versions: &[String]) -> (StatusCode, String) {
     (
         StatusCode::OK,
         format!(
-            "<ListVersionsResult>{}</ListVersionsResult>",
+            "<ListVersionsResult><IsTruncated>false</IsTruncated>{}</ListVersionsResult>",
             versions.concat()
         ),
     )
