@@ -81,7 +81,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ravel_alert_notifications_deferred_total` counter reports how many were
   deferred, once per notification per tick; it also rises when the work before
   delivery alone runs past the deadline, since every notification after the
-  first is then deferred however fast the sinks answer. Separately, ADR-0117 stated the
+  first is then deferred however fast the sinks answer. The shipped
+  `RavelAlertNotificationsAllFailing` rule now fires on either that counter or
+  the failure counter rising while deliveries sit at zero: a tick that defers
+  without attempting leaves `ravel_alert_notifications_failed_total` flat, and
+  the old expression read that as healthy. Separately, ADR-0117 stated the
   per-tick publish worst case for one rule as `MAX_ALERTS_PER_RULE` (1000); the
   true worst case is `2 x MAX_ALERTS_PER_RULE`, because one tick also writes a
   resolution for each previously-open alert that stopped matching, and that

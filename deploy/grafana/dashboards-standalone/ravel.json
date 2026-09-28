@@ -2233,7 +2233,7 @@
           "id": 33,
           "type": "timeseries",
           "title": "Notification delivery",
-          "description": "Deliveries against failures. Failures rising while deliveries sit at zero is the shape RavelAlertNotificationsAllFailing pages on.",
+          "description": "Deliveries against failures and deferrals. Either failures or deferrals rising while deliveries sit at zero is the shape RavelAlertNotificationsAllFailing pages on; a deferral is a notification the tick never attempted, because the per-tick delivery deadline elapsed first.",
           "gridPos": {
             "h": 8,
             "w": 12,
@@ -2268,6 +2268,15 @@
               },
               "legendFormat": "failed",
               "expr": "sum(rate(ravel_alert_notifications_failed_total[$__rate_interval]))"
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${ds}"
+              },
+              "legendFormat": "deferred",
+              "expr": "sum(rate(ravel_alert_notifications_deferred_total[$__rate_interval]))"
             }
           ]
         },

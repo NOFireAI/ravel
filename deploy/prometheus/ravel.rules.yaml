@@ -264,8 +264,16 @@ groups:
             This gauge is process-wide liveness and not per-tenant.
           runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
       - alert: RavelAlertNotificationsAllFailing
+        # Two counters, not one: a tick already past its delivery deadline when
+        # delivery begins attempts one notification and defers the rest, which
+        # advances deferred_total and leaves failed_total flat. `or`, not `+`,
+        # so a fleet not yet exporting deferred_total still fires on failures.
         expr: |
-          increase(ravel_alert_notifications_failed_total[15m]) > 0
+          (
+            increase(ravel_alert_notifications_failed_total[15m]) > 0
+            or
+            increase(ravel_alert_notifications_deferred_total[15m]) > 0
+          )
           and
           increase(ravel_alert_notifications_delivered_total[15m]) == 0
         for: 15m
@@ -277,8 +285,11 @@ groups:
           description: >-
             Transitions are still being written durably, so no alert history is
             lost, but nothing is reaching Alertmanager or the configured
-            webhooks. Check the sink URLs and credentials, and the evaluator
-            logs for the per-sink delivery error.
+            webhooks. Either the sinks are refusing every attempt, or the tick
+            is spending its whole delivery deadline before it reaches them and
+            deferring instead. Check the sink URLs and credentials, the
+            evaluator logs for the per-sink delivery error, and
+            ravel_alert_notifications_deferred_total to tell the two apart.
           runbook: docs/guides/observability.md#the-alerting-pipeline-alerts
       - alert: RavelAlertRuleEvaluationFailing
         expr: |

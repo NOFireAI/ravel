@@ -84,7 +84,7 @@ const GUIDE_FILE: &str = concat!(
 /// no longer resolves) would otherwise leave every assertion below passing
 /// vacuously over an empty set. Adding a rule that names a new metric fails
 /// here until this number is updated.
-const EXPECTED_METRIC_NAMES: usize = 40;
+const EXPECTED_METRIC_NAMES: usize = 41;
 
 /// Groups and alert rules in the shipped file, counted off the parsed
 /// structure. Pinned for the same reason as the name count: a file that lost
@@ -132,8 +132,8 @@ const DASHBOARD_FILE: &str = concat!(
 /// nothing. `deploy/README.md` states the row and name figures.
 const EXPECTED_DASHBOARD_ROWS: usize = 6;
 const EXPECTED_DASHBOARD_PANELS: usize = 36;
-const EXPECTED_DASHBOARD_TARGETS: usize = 107;
-const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 110;
+const EXPECTED_DASHBOARD_TARGETS: usize = 108;
+const EXPECTED_DASHBOARD_METRIC_NAMES: usize = 111;
 
 /// Families the dashboard graphs that no shipped rule alerts on.
 ///
