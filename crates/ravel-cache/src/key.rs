@@ -19,9 +19,19 @@
 //! states the residual weakness it accepts (a forged MD5 on an unversioned
 //! bucket) and why `tenant_hash` bounds it; that argument is not repeated here.
 
-/// Domain separator, so a pinned `content_hash` cannot coincide with the
-/// BLAKE3 of any object's bytes: that hash is taken over the bytes
-/// themselves, this one over a string that starts with this tag.
+/// Context string for BLAKE3's derived-key mode, so a pinned `content_hash`
+/// cannot coincide with the BLAKE3 of any object's bytes.
+///
+/// It keys the hash function rather than prefixing its input. A tag written
+/// into the input separates the two spaces only if no object's bytes can
+/// begin with that tag, and an object's bytes are whatever its owner wrote:
+/// a file starting with this string in the same length-prefixed encoding
+/// would hash into the pinned space under a plain BLAKE3. Derived-key mode
+/// has no such precondition. No input to `blake3::hash` produces an output of
+/// `new_derive_key(PINNED_DOMAIN)`, whatever its bytes are.
+///
+/// Fixed for the lifetime of the key format: changing it changes every pinned
+/// key, which is a cache-wide miss, not a correctness problem.
 const PINNED_DOMAIN: &str = "ravel-cache/pinned-key/v1";
 
 /// The recorded identity of an external object, hashed into the
@@ -50,7 +60,8 @@ pub struct PinnedIdentity<'a> {
 }
 
 impl PinnedIdentity<'_> {
-    /// BLAKE3 over a length-prefixed encoding of every field.
+    /// BLAKE3 in derived-key mode, under [`PINNED_DOMAIN`], over a
+    /// length-prefixed encoding of every field.
     ///
     /// Length-prefixed rather than delimited or concatenated: with a
     /// separator, a field containing the separator shifts the split, and with
@@ -61,12 +72,11 @@ impl PinnedIdentity<'_> {
     /// presence byte and then, when present, the same length-prefixed form, so
     /// `None` and `Some("")` differ.
     fn content_hash(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = blake3::Hasher::new_derive_key(PINNED_DOMAIN);
         let mut field = |bytes: &[u8]| {
             hasher.update(&(bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         };
-        field(PINNED_DOMAIN.as_bytes());
         field(self.profile.as_bytes());
         field(self.bucket.as_bytes());
         field(self.key);
@@ -237,24 +247,34 @@ mod tests {
         assert_ne!(hash_of(&left), hash_of(&right));
     }
 
+    /// The separation between a pinned hash and the BLAKE3 of an object's
+    /// bytes is the hash function, not the input. This hashes the identical
+    /// field sequence with a plain BLAKE3, so the only difference left between
+    /// the two values is derived-key mode: if `content_hash` stopped keying
+    /// the hasher with [`PINNED_DOMAIN`], these two would be equal.
     #[test]
     fn a_pinned_key_differs_from_a_content_addressed_key_over_the_same_bytes() {
-        // The domain tag is what separates the two kinds: without it a pinned
-        // hash and the BLAKE3 of an object's bytes are drawn from the same
-        // space, and nothing stops one object's bytes hashing to another
-        // object's identity.
         let identity = identity();
-        let mut encoded = Vec::new();
-        for field in [
-            identity.profile.as_bytes(),
-            identity.bucket.as_bytes(),
-            identity.key,
-            identity.etag.as_bytes(),
-        ] {
-            encoded.extend_from_slice(&(field.len() as u64).to_le_bytes());
-            encoded.extend_from_slice(field);
+
+        let mut plain = blake3::Hasher::new();
+        let mut field = |bytes: &[u8]| {
+            plain.update(&(bytes.len() as u64).to_le_bytes());
+            plain.update(bytes);
+        };
+        field(identity.profile.as_bytes());
+        field(identity.bucket.as_bytes());
+        field(identity.key);
+        field(identity.etag.as_bytes());
+        match identity.version {
+            Some(version) => {
+                field(&[1]);
+                field(version.as_bytes());
+            }
+            None => field(&[0]),
         }
-        let undomained = *blake3::hash(&encoded).as_bytes();
+        field(&identity.size.to_le_bytes());
+        let undomained = *plain.finalize().as_bytes();
+
         assert_ne!(hash_of(&identity), undomained);
     }
 
