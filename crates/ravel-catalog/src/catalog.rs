@@ -30,7 +30,9 @@ use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::cache::{CompactionRecordCache, HeadCache, PartCache, PostingsCache, RecordCache};
+use crate::cache::{
+    CompactionRecordCache, DecodedCaches, HeadCache, PartCache, PostingsCache, RecordCache,
+};
 use crate::column_stats_resolve::{self, LoadColumnStatsError, LoadedColumnStats};
 use crate::config::CatalogConfig;
 use crate::declared_stats::DeclaredColumnStats;
@@ -390,8 +392,12 @@ pub struct Catalog {
     cache: RecordCache,
     compaction_cache: CompactionRecordCache,
     head_cache: HeadCache,
-    part_cache: PartCache,
-    postings_cache: PostingsCache,
+    /// The decoded snapshot-part and name-postings caches. Grouped because
+    /// each of their entries holds the memory reservation for its own decoded
+    /// bytes, so both give memory back together when
+    /// [`Catalog::reserve_decoded`] is refused (see [`crate::cache::DecodedCache`]'s
+    /// eviction rule).
+    decoded: DecodedCaches,
     /// The byte cache (ADR-0046 decisions 1-3): raw bytes of content-addressed
     /// objects (snapshot parts, postings), keyed by
     /// `(tenant_hash, content_hash, offset, len)`, consulted at
@@ -586,6 +592,11 @@ pub struct Catalog {
     /// [`ravel_memory::MemoryBudget::unlimited`], so nothing is refused until a
     /// caller installs a finite budget with [`Catalog::with_memory_budget`].
     memory_budget: Arc<ravel_memory::MemoryBudget>,
+    /// Decode reservations refused once, then retried after the decoded-output
+    /// caches gave memory back ([`Catalog::reserve_decoded`]). Counts the
+    /// retry, not its outcome. Surfaced by
+    /// [`Catalog::decode_reserve_retries`].
+    decode_reserve_retries: AtomicU64,
     /// The read CPU gate the part, postings and column-stats decodes run on
     /// (ADR-1702 decision 4). `None` from [`Catalog::new`]: every decode runs
     /// inline on the calling task until a caller installs one with
@@ -746,8 +757,7 @@ impl Catalog {
             cache: RecordCache::default(),
             compaction_cache: CompactionRecordCache::default(),
             head_cache: HeadCache::default(),
-            part_cache: PartCache::default(),
-            postings_cache: PostingsCache::default(),
+            decoded: DecodedCaches::default(),
             byte_cache,
             interlock_violations: AtomicU64::new(0),
             compaction_input_set_conflicts: AtomicU64::new(0),
@@ -768,6 +778,7 @@ impl Catalog {
             column_stats_decode_refusals: AtomicU64::new(0),
             column_stats_part_ceiling_override: None,
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            decode_reserve_retries: AtomicU64::new(0),
             read_gate: None,
         })
     }
@@ -787,13 +798,74 @@ impl Catalog {
         self
     }
 
-    /// [`crate::charged::reserve_decoded`] against this catalog's budget.
+    /// [`crate::charged::reserve_decoded`] against this catalog's budget, with
+    /// the decoded-output caches made to give memory back before a refusal is
+    /// final.
+    ///
+    /// The part and postings caches hold each decoded value together with its
+    /// reservation, so under a finite budget other tenants' cached entries can
+    /// hold the whole of it. A first refusal therefore evicts cached entries
+    /// least-recently-used across every tenant of both caches
+    /// ([`DecodedCaches::evict_until_fits`]) and retries the reservation
+    /// EXACTLY once. The retry cannot spin: the eviction pass is bounded by
+    /// the entries it removes, and one refused retry is the answer.
+    ///
+    /// Every resolve-path decode reserves here: parts, postings, and
+    /// column-statistics objects, the last through
+    /// [`crate::charged::DecodeReserver`]. A site holding the budget directly
+    /// instead would fail while these caches still held memory it could have
+    /// had (issue #2107).
+    ///
+    /// The refusal the caller sees is the one the retry produced, so its
+    /// figures describe the budget as it stands after eviction. An entry a
+    /// live resolve still holds an `Arc` to is charged in those figures even
+    /// though the cache has dropped it: eviction only ends a cache's claim on
+    /// a value, never a reader's.
+    ///
+    /// A decode wanting more than the budget's whole limit skips the pass
+    /// entirely and keeps its first refusal: no eviction could ever admit it,
+    /// and evicting anyway flushes every tenant's decoded caches on each such
+    /// query. That refusal is a refusal like any other, counted in neither
+    /// [`Catalog::decoded_cache_memory_evictions`] nor
+    /// [`Catalog::decode_reserve_retries`].
+    ///
+    /// Eviction and retry are NOT atomic against each other or against other
+    /// resolves. Another task can take the freed bytes between the two, so a
+    /// retry can be refused against a budget this pass did make room in; and
+    /// two refusals evicting concurrently each stop at their own need, so
+    /// together they can free less than either then reserves. Both cases end
+    /// in the ordinary typed refusal, which the caller's resolve already
+    /// handles; neither is retried a second time.
     pub(crate) fn reserve_decoded(
         &self,
         declared: u64,
         ceiling: u64,
     ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+        let refusal = match crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
+        {
+            Ok(reservation) => return Ok(reservation),
+            Err(refusal) => refusal,
+        };
+        let want = declared.min(ceiling);
+        if want > self.memory_budget.limit() {
+            return Err(refusal);
+        }
+        self.decoded.evict_until_fits(&self.memory_budget, want);
+        self.decode_reserve_retries.fetch_add(1, Ordering::Relaxed);
         crate::charged::reserve_decoded(&self.memory_budget, declared, ceiling)
+    }
+
+    /// Decoded-output cache entries dropped to make room for a refused decode
+    /// reservation, cumulative (ADR-1702 decision 6).
+    pub fn decoded_cache_memory_evictions(&self) -> u64 {
+        self.decoded.memory_evictions()
+    }
+
+    /// Decode reservations retried after such an eviction pass, cumulative.
+    /// Exactly one per refused reservation, whether or not the retry
+    /// succeeded.
+    pub fn decode_reserve_retries(&self) -> u64 {
+        self.decode_reserve_retries.load(Ordering::Relaxed)
     }
 
     /// Run this catalog's snapshot part, postings and column-statistics
@@ -1383,7 +1455,7 @@ impl Catalog {
 
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-part cache.
     pub(crate) fn part_cache(&self) -> &PartCache {
-        &self.part_cache
+        self.decoded.parts()
     }
 
     /// Resolve exact per-segment column statistics for `(tenant, signal)`
@@ -1496,7 +1568,7 @@ impl Catalog {
                     &getter,
                     tenant,
                     &resolved,
-                    &self.memory_budget,
+                    self,
                     self.read_gate(),
                 )
                 .await?
@@ -1666,8 +1738,7 @@ impl Catalog {
             self.cache.evict_tenant(tenant);
             self.compaction_cache.evict_tenant(tenant);
             self.head_cache.evict_tenant(tenant);
-            self.part_cache.evict_tenant(tenant);
-            self.postings_cache.evict_tenant(tenant);
+            self.decoded.evict_tenant(tenant);
         }
         if let Some(cache) = self
             .column_stats_cache
@@ -1682,7 +1753,7 @@ impl Catalog {
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-postings
     /// cache.
     pub(crate) fn postings_cache(&self) -> &PostingsCache {
-        &self.postings_cache
+        self.decoded.postings()
     }
 
     /// The byte cache's counters handle (ADR-0046), or `None` when the byte
@@ -4505,6 +4576,23 @@ pub fn resolve_rewrite_supersession(
     }
 }
 
+/// Every resolve-path decode reserves through the catalog, so a refusal takes
+/// the decoded-output caches' evict-then-retry pass wherever it is raised. The
+/// part and postings paths call the inherent
+/// [`Catalog::reserve_decoded`] directly; the column-statistics path
+/// ([`crate::column_stats_resolve::fetch_stats_object`]) reaches it through
+/// this trait, since it is a free function with no `Catalog` of its own
+/// (issue #2107).
+impl crate::charged::DecodeReserver for Catalog {
+    fn reserve_decoded(
+        &self,
+        declared: u64,
+        ceiling: u64,
+    ) -> Result<ravel_memory::Reservation, ravel_memory::MemoryExhausted> {
+        Catalog::reserve_decoded(self, declared, ceiling)
+    }
+}
+
 fn build_segment_ref(key: &str, record: &CommitRecord) -> Result<SegmentRef, CatalogError> {
     let data_object_key =
         keys::verify_object_key(record).map_err(|source| CatalogError::Reconstruction {
@@ -4640,11 +4728,39 @@ mod tests {
         min_event_ts_ns: i64,
         max_event_ts_ns: i64,
     ) -> CommitRecord {
+        publish_segment_for_tenant(
+            store,
+            tenant(),
+            signal,
+            shard,
+            seq,
+            ingest_hour_bucket,
+            created_unix_ns,
+            min_event_ts_ns,
+            max_event_ts_ns,
+        )
+        .await
+    }
+
+    /// [`publish_segment_for`] for an arbitrary tenant, so a fixture can hold
+    /// several tenants' data in one store.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_segment_for_tenant(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        shard: u32,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        min_event_ts_ns: i64,
+        max_event_ts_ns: i64,
+    ) -> CommitRecord {
         let writer_id = Uuid::new_v4();
         let payload = format!("segment-{shard}-{seq}-{writer_id}").into_bytes();
         let content_hash = content_hash_for(&payload);
         let record = record::build(NewCommitRecord {
-            tenant_hash: tenant(),
+            tenant_hash,
             signal,
             shard,
             writer_id,
@@ -11002,7 +11118,19 @@ mod tests {
     /// pruned resolve for `any_metric` decodes it. Returns its declared
     /// `body_uncompressed_len`.
     async fn install_fixture_postings(store: &MemoryStore) -> u64 {
-        let head_key = crate::fold::head_object_key(&tenant(), Signal::Metrics);
+        install_postings_for(store, tenant(), 1).await
+    }
+
+    /// [`install_fixture_postings`] for an arbitrary tenant and entry count:
+    /// one `any_metric` posting over `entry_count` entries of that tenant's
+    /// one folded part, under a postings key of its own so several tenants
+    /// share one store. Returns its declared `body_uncompressed_len`.
+    async fn install_postings_for(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        entry_count: u64,
+    ) -> u64 {
+        let head_key = crate::fold::head_object_key(&tenant_hash, Signal::Metrics);
         let head_bytes = store
             .get(&head_key, GetRange::Full)
             .await
@@ -11010,21 +11138,21 @@ mod tests {
             .data;
         let mut head = crate::snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
 
-        // A postings object bound to the fixture's one part (one entry), under
-        // a HEAD that references it.
+        // A postings object bound to the fixture's one part, under a HEAD that
+        // references it.
         let part_blake3: [u8; 32] = head.parts[0]
             .blake3
             .clone()
             .try_into()
             .expect("32-byte part blake3");
         let postings_bytes = crate::snapshot_format::encode_postings(
-            tenant().0,
+            tenant_hash.0,
             signal::to_proto(Signal::Metrics) as u32,
             &[part_blake3],
-            1,
+            entry_count,
             &[crate::snapshot_format::NamePostings {
                 name: "any_metric".to_string(),
-                ordinals: vec![0],
+                ordinals: (0..entry_count).collect(),
             }],
         )
         .expect("encode postings");
@@ -11032,7 +11160,7 @@ mod tests {
             .expect("postings header decodes")
             .body_uncompressed_len;
         assert!(postings_len > 0);
-        let postings_key = "postings-reserve".to_string();
+        let postings_key = format!("postings-reserve-{}", tenant_hash.to_hex());
         store
             .put(
                 &postings_key,
@@ -11097,6 +11225,354 @@ mod tests {
         }
     }
 
+    /// The `now_ns` at which `sealed_hour` is foldable and resolvable.
+    fn fold_now_ns(sealed_hour: u32) -> i64 {
+        (i64::from(sealed_hour) + 1) * NS_PER_HOUR
+            + crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS
+    }
+
+    /// A query window covering exactly `sealed_hour`.
+    fn sealed_hour_range(sealed_hour: u32) -> TimeRange {
+        TimeRange {
+            start_ns: i64::from(sealed_hour) * NS_PER_HOUR,
+            end_ns: (i64::from(sealed_hour) + 1) * NS_PER_HOUR - 1,
+        }
+    }
+
+    /// [`folded_one_part_fixture`] for an arbitrary tenant and segment count:
+    /// `segments` flushes in `sealed_hour`, folded into one snapshot part.
+    /// Returns the part's declared `entries_uncompressed_len`, which grows
+    /// with `segments` so a fixture can build a part no budget will admit.
+    async fn fold_one_part_for(
+        store: &Arc<MemoryStore>,
+        tenant_hash: TenantHash,
+        sealed_hour: u32,
+        segments: u64,
+    ) -> u64 {
+        let created = (i64::from(sealed_hour) + 1) * NS_PER_HOUR - 1_000;
+        for seq in 1..=segments {
+            publish_segment_for_tenant(
+                store,
+                tenant_hash,
+                Signal::Metrics,
+                0,
+                seq,
+                sealed_hour,
+                created,
+                created - 1_000,
+                created,
+            )
+            .await;
+        }
+        Catalog::new(store.clone(), config(1))
+            .expect("fold catalog")
+            .fold(
+                &tenant_hash,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                fold_now_ns(sealed_hour),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold produces a snapshot HEAD");
+
+        let head_bytes = store
+            .get(
+                &crate::fold::head_object_key(&tenant_hash, Signal::Metrics),
+                GetRange::Full,
+            )
+            .await
+            .expect("HEAD present")
+            .data;
+        let head = crate::snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
+        assert_eq!(head.parts.len(), 1, "the fixture folds exactly one part");
+        let part_bytes = store
+            .get(&head.parts[0].key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        crate::snapshot_format::decode_part_header(&part_bytes)
+            .expect("part header decodes")
+            .entries_uncompressed_len
+    }
+
+    /// The key of the one snapshot part `tenant_hash`'s HEAD references.
+    async fn fixture_part_key(store: &MemoryStore, tenant_hash: TenantHash) -> String {
+        let head_bytes = store
+            .get(
+                &crate::fold::head_object_key(&tenant_hash, Signal::Metrics),
+                GetRange::Full,
+            )
+            .await
+            .expect("HEAD present")
+            .data;
+        crate::snapshot_format::decode_head(&head_bytes)
+            .expect("HEAD decodes")
+            .parts[0]
+            .key
+            .clone()
+    }
+
+    /// Issue #2088 acceptance, ADR-1702 decision 6. The decoded-part and
+    /// postings caches hold each entry together with its memory reservation,
+    /// so under a finite budget other tenants' cached entries can hold the
+    /// whole of it. A new tenant's resolve must then still succeed: the caches
+    /// give memory back, least-recently-used first across every tenant of
+    /// both, and the refused reservation is retried.
+    ///
+    /// FLIP (pre-fix demonstration): make `Catalog::reserve_decoded`
+    /// (catalog.rs) the bare `crate::charged::reserve_decoded(...)` call it
+    /// was, with no eviction pass and no retry. The fourth tenant's resolve
+    /// then fails with `CatalogError::MemoryExhausted` and the `expect` below
+    /// panics with "the caches must give way to a new tenant's decode".
+    #[tokio::test]
+    async fn a_full_cache_gives_way_to_a_new_tenants_decode() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        // Three tenants fill the caches, the fourth is the one that must not
+        // be refused.
+        let tenants: Vec<TenantHash> = (0..4u8).map(|i| TenantHash([0x40 + i; 16])).collect();
+        let mut charges = Vec::new();
+        for tenant_hash in &tenants {
+            let part_len = fold_one_part_for(&store, *tenant_hash, sealed_hour, 1).await;
+            let postings_len = install_postings_for(&store, *tenant_hash, 1).await;
+            charges.push(part_len + postings_len);
+        }
+        let per_tenant = charges[0];
+        assert!(
+            charges.iter().all(|charge| *charge == per_tenant),
+            "the fixture charges every tenant the same, so the budget arithmetic is exact: \
+             {charges:?}"
+        );
+
+        // Exactly three tenants' decoded parts and postings fit.
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(3 * per_tenant));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+
+        for tenant_hash in &tenants[..3] {
+            let snapshot = catalog
+                .resolve_pruned(
+                    tenant_hash,
+                    Signal::Metrics,
+                    range,
+                    &[],
+                    now_ns,
+                    Some("any_metric"),
+                )
+                .await
+                .expect("a filling tenant resolves within the budget");
+            assert_eq!(snapshot.segments.len(), 1);
+        }
+        assert_eq!(
+            budget.reserved(),
+            3 * per_tenant,
+            "the budget is held entirely by the three filling tenants' cached entries"
+        );
+        assert_eq!(catalog.part_cache().total_entries(), 3);
+        assert_eq!(catalog.postings_cache().total_entries(), 3);
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 0);
+        assert_eq!(catalog.decode_reserve_retries(), 0);
+
+        let snapshot = catalog
+            .resolve_pruned(
+                &tenants[3],
+                Signal::Metrics,
+                range,
+                &[],
+                now_ns,
+                Some("any_metric"),
+            )
+            .await
+            .expect("the caches must give way to a new tenant's decode");
+        assert_eq!(
+            snapshot.segments.len(),
+            1,
+            "the new tenant's one folded segment is resolved, not a degraded window"
+        );
+
+        // The least-recently-used tenant's part and postings are the two
+        // entries that went, one per cache, and nothing else moved.
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 2);
+        assert_eq!(
+            catalog.decode_reserve_retries(),
+            2,
+            "one retry for the part, one for the postings, and no spinning"
+        );
+        assert_eq!(catalog.part_cache().entry_count(&tenants[0]), 0);
+        assert_eq!(catalog.postings_cache().entry_count(&tenants[0]), 0);
+        for tenant_hash in &tenants[1..] {
+            assert_eq!(catalog.part_cache().entry_count(tenant_hash), 1);
+            assert_eq!(catalog.postings_cache().entry_count(tenant_hash), 1);
+        }
+        assert_eq!(catalog.part_cache().total_entries(), 3);
+        assert_eq!(catalog.postings_cache().total_entries(), 3);
+        assert_eq!(
+            budget.reserved(),
+            3 * per_tenant,
+            "the evicted tenant's bytes were returned and the new tenant's charged in their \
+             place, so the budget is exactly as full as before"
+        );
+    }
+
+    /// Eviction ends the cache's claim on a decoded value, never a reader's:
+    /// an entry a live resolve still holds an `Arc` to keeps its reservation
+    /// until that `Arc` drops, so an eviction pass can empty a cache and free
+    /// nothing. The retry is still exactly one, which is what stops it
+    /// spinning against memory it cannot reclaim.
+    ///
+    /// FLIP: make `DecodedTenantCache::remove_lru` (cache.rs) skip an entry a
+    /// reader still holds -- put the entry back and return `None` when
+    /// `Arc::strong_count(&entry.value) > 1` -- the "do not evict what frees
+    /// nothing" rule this test rejects. The pass then drops nothing, so
+    /// `decoded_cache_memory_evictions()` below reads 0 instead of 1 and
+    /// `part_cache().total_entries()` reads 1 instead of 0.
+    #[tokio::test]
+    async fn an_evicted_entry_stays_charged_while_a_reader_holds_it() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let holder = TenantHash([0x51; 16]);
+        let newcomer = TenantHash([0x52; 16]);
+        let held = fold_one_part_for(&store, holder, sealed_hour, 1).await;
+        let arriving = fold_one_part_for(&store, newcomer, sealed_hour, 1).await;
+
+        // Room for exactly one decoded part.
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(held));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        catalog
+            .resolve(&holder, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("the holder resolves within the budget");
+        assert_eq!(budget.reserved(), held);
+
+        // A live reader of the cached part, standing in for a resolve still
+        // holding its `Arc` when the eviction pass runs.
+        let part_key = fixture_part_key(&store, holder).await;
+        let live = catalog
+            .part_cache()
+            .get(&holder, &part_key, &QueryAccounting::new())
+            .expect("the holder's part is cached");
+
+        let err = catalog
+            .resolve(&newcomer, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("no memory can be reclaimed while the reader holds the only entry");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, arriving);
+                assert_eq!(
+                    exhausted.reserved, held,
+                    "the evicted entry is still charged: the reader holds it"
+                );
+                assert_eq!(exhausted.limit, held);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        assert_eq!(catalog.decode_reserve_retries(), 1, "one retry, not a spin");
+        assert_eq!(
+            catalog.part_cache().total_entries(),
+            0,
+            "the pass dropped the entry even though it could not free its bytes"
+        );
+        assert_eq!(budget.reserved(), held, "still charged, to the live reader");
+
+        drop(live);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation is released when the last Arc drops, not when the cache \
+             forgets the entry"
+        );
+        let snapshot = catalog
+            .resolve(&newcomer, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("the freed budget admits the newcomer");
+        assert_eq!(snapshot.segments.len(), 1);
+        assert_eq!(budget.reserved(), arriving);
+    }
+
+    /// A decode no budget could ever admit fails on its FIRST refusal, with no
+    /// eviction pass and no retry: nothing the caches could give back would
+    /// make a part larger than the whole limit fit, so a pass would flush
+    /// every tenant's decoded entries on each such query and still refuse.
+    ///
+    /// FLIP: drop the `want > self.memory_budget.limit()` early return from
+    /// `Catalog::reserve_decoded` (catalog.rs) and the pass runs anyway: the
+    /// small tenant's cached part is evicted, so
+    /// `decoded_cache_memory_evictions()` and `decode_reserve_retries()` below
+    /// read 1 instead of 0, `part_cache().total_entries()` reads 0 instead of
+    /// 1, and the refusal reports `reserved` 0 instead of the cached part's
+    /// bytes.
+    #[tokio::test]
+    async fn a_decode_larger_than_the_budget_fails_without_evicting() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let now_ns = fold_now_ns(sealed_hour);
+        let range = sealed_hour_range(sealed_hour);
+        let small = TenantHash([0x61; 16]);
+        let oversized = TenantHash([0x62; 16]);
+        let small_len = fold_one_part_for(&store, small, sealed_hour, 1).await;
+        let oversized_len = fold_one_part_for(&store, oversized, sealed_hour, 8).await;
+        assert!(
+            oversized_len > small_len,
+            "the second tenant's part must not fit a budget sized for the first: \
+             {oversized_len} vs {small_len}"
+        );
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(small_len));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        catalog
+            .resolve(&small, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect("the small tenant resolves within the budget");
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+
+        let err = catalog
+            .resolve(&oversized, Signal::Metrics, range, &[], now_ns)
+            .await
+            .expect_err("a part larger than the whole budget can never be admitted");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, oversized_len);
+                assert_eq!(
+                    exhausted.reserved, small_len,
+                    "the first refusal, reported while the small tenant's part is still cached"
+                );
+                assert_eq!(exhausted.limit, small_len);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            catalog.decoded_cache_memory_evictions(),
+            0,
+            "no eviction pass: no amount of eviction admits a part larger than the limit"
+        );
+        assert_eq!(
+            catalog.decode_reserve_retries(),
+            0,
+            "and so nothing to retry: the first refusal is the answer"
+        );
+        assert_eq!(
+            catalog.part_cache().total_entries(),
+            1,
+            "the unrelated tenant's cached part survives the refusal"
+        );
+        assert_eq!(budget.reserved(), small_len);
+    }
+
     /// The declared `body_uncompressed_len` of the one-segment, one-column v3
     /// object [`install_stats`] writes: length-delimited protobuf, so a fixed
     /// figure for a fixed fixture.
@@ -11141,6 +11617,87 @@ mod tests {
             other => panic!("expected LoadColumnStatsError::MemoryExhausted, got {other:?}"),
         }
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #2107. A column-statistics decode is charged against the same
+    /// process budget the decoded part and postings caches hold, so a refusal
+    /// must take the same evict-then-retry pass the part and postings decodes
+    /// take. Reserved against the bare budget it did not: the load failed with
+    /// `LoadColumnStatsError::MemoryExhausted` while cached decoded parts held
+    /// memory an eviction would have handed straight back.
+    ///
+    /// FLIP: make the `DecodeReserver` impl for `Catalog` (catalog.rs) call
+    /// `crate::charged::reserve_decoded(&self.memory_budget, declared,
+    /// ceiling)`, the bare-budget reservation this replaced. Nothing is then
+    /// evicted, and the `expect` below panics with "the caches must give
+    /// memory back to a column-statistics decode".
+    #[tokio::test]
+    async fn a_column_stats_load_makes_the_caches_give_memory_back() {
+        let store = Arc::new(MemoryStore::new());
+        let sealed_hour = 500_000u32;
+        let holder = TenantHash([0x71; 16]);
+        let part_len = fold_one_part_for(&store, holder, sealed_hour, 8).await;
+        let declared =
+            install_logs_stats(&store, *blake3::hash(b"part-cstat-evict").as_bytes(), 1).await;
+        assert!(
+            part_len >= declared,
+            "the cached part must be worth at least the stats body, so dropping it is enough: \
+             {part_len} vs {declared}"
+        );
+
+        // Room for exactly the holding tenant's decoded part: the statistics
+        // body fits only once the part cache gives that part back.
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(part_len));
+        let catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_memory_budget(budget.clone());
+        catalog
+            .resolve(
+                &holder,
+                Signal::Metrics,
+                sealed_hour_range(sealed_hour),
+                &[],
+                fold_now_ns(sealed_hour),
+            )
+            .await
+            .expect("the holding tenant resolves within the budget");
+        assert_eq!(
+            budget.reserved(),
+            part_len,
+            "the cached decoded part holds the whole budget"
+        );
+        assert_eq!(catalog.part_cache().total_entries(), 1);
+
+        let (range, now_ns) = full_window();
+        let loaded = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("the caches must give memory back to a column-statistics decode")
+            .expect("the fixture's one part carries statistics");
+        assert_eq!(loaded_value(&loaded), 1);
+
+        assert_eq!(
+            catalog.decoded_cache_memory_evictions(),
+            1,
+            "exactly the one cached part, and nothing more than the load needed"
+        );
+        assert_eq!(catalog.part_cache().total_entries(), 0);
+        assert_eq!(
+            catalog.decode_reserve_retries(),
+            1,
+            "one refusal, one pass, one retry"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the load's own reservation is released once the merged result is built"
+        );
     }
 
     /// Installs the default logs fixture for [`tenant`], then replaces its

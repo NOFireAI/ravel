@@ -245,6 +245,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The catalog's decoded-part and postings caches give memory back to a
+  refused decode** (ADR-1702 decision 6, issue #2088). Both caches hold each
+  decoded value together with its memory reservation and were bounded only by
+  an entry cap per tenant, so once a finite memory budget is wired into the
+  catalog, other tenants' cached entries could hold the whole budget and every
+  later decode would be refused with nothing able to release the memory. A
+  refused reservation now evicts cached entries least recently used across
+  every tenant of both caches until it would fit or the caches are empty, then
+  retries the reservation a single time. An entry a live resolve still holds
+  keeps its reservation until that resolve drops it, so a pass can empty a
+  cache and free nothing; the pass is bounded by the entries it removes rather
+  than by the bytes it frees. A decode wanting more than the budget's whole
+  limit skips the pass and keeps its first refusal, since no eviction could
+  admit it and running the pass anyway flushed every tenant's decoded entries
+  on each such query (issue #2107). A column-statistics load takes the same
+  pass: it reserves its declared body against the same budget these caches
+  hold, and used to fail with `MemoryExhausted` while a cached decoded part
+  held memory that one eviction would have handed back (issue #2107). The
+  column-statistics CACHE is still unaffected: its entries carry no
+  reservation and it is already bounded in bytes. The server does not yet pass
+  a finite budget to the catalog, so no deployment sees the eviction pass in
+  this release; one deployed change does land with it, on every catalog
+  including one on the unlimited default budget, because the two caches' own
+  per-tenant entry cap now evicts least recently used rather than oldest
+  inserted. A tenant whose hot part or postings object is re-read on every
+  query keeps it past the cap instead of losing it to a wide scan.
 - **A writer whose clock lags the object store's clock refuses its flush
   instead of publishing into a sealed hour** (issue #1685, ADR-1685). At flush
   open, every metrics, log, and span shard actor compares its raw clock reading

@@ -51,17 +51,15 @@
 //! [`crate::column_stats_build::decode_previous_column_stats`] does on the
 //! fold side.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use prost::Message;
 use ravel_cpu_gate::ReadSite;
 use ravel_object_store::StoreError;
 use ravel_proto::catalog::v1::{ColumnStatsSegment, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
+use std::collections::HashMap;
 
 use crate::EntryIdentity;
-use crate::charged::reserve_decoded;
+use crate::charged::DecodeReserver;
 use crate::provisioning::AccountedRecordGet;
 use crate::read_gate::run_snapshot_decode;
 use crate::snapshot_format::{
@@ -365,7 +363,7 @@ pub(crate) async fn fetch_stats_object(
     getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
     resolved: &ResolvedStatsRef,
-    budget: &Arc<ravel_memory::MemoryBudget>,
+    reserver: &impl DecodeReserver,
     gate: Option<&ravel_cpu_gate::ReadGate>,
 ) -> Result<FetchOutcome, LoadColumnStatsError> {
     let data = match getter.accounted_get_full(&resolved.key).await {
@@ -439,11 +437,14 @@ pub(crate) async fn fetch_stats_object(
     }
 
     // ADR-1702 decision 6: charge the declared body before decoding it.
-    let reservation = reserve_decoded(
-        budget,
-        header.body_uncompressed_len,
-        limits.max_column_stats_bytes,
-    )?;
+    // Through `reserver` rather than against the budget directly, so a refusal
+    // takes the decoded-output caches' evict-then-retry pass (issue #2107):
+    // those caches hold parts and postings together with their reservations,
+    // so under a finite budget they can hold the whole of it and a
+    // bare-budget reservation here fails with memory nothing else would have
+    // released.
+    let reservation =
+        reserver.reserve_decoded(header.body_uncompressed_len, limits.max_column_stats_bytes)?;
     let (decoded, reservation) = match run_snapshot_decode(
         gate,
         ReadSite::CatalogColumnStats,

@@ -23,12 +23,34 @@ pub(crate) type ChargedPostings = Charged<DecodedPostings>;
 /// Reserves the bytes a decode may allocate: the object's declared
 /// uncompressed length, clamped to the decoder's own ceiling, since the
 /// decoder refuses a declared length over its ceiling before allocating.
+///
+/// This is the bare reservation. Every resolve-path decode reaches it through
+/// [`DecodeReserver`] instead, so that a refusal gets the decoded-output
+/// caches a chance to hand memory back first.
 pub(crate) fn reserve_decoded(
     budget: &Arc<MemoryBudget>,
     declared: u64,
     ceiling: u64,
 ) -> Result<Reservation, MemoryExhausted> {
     budget.reserve(declared.min(ceiling))
+}
+
+/// What a decode site reserves its declared output bytes through.
+///
+/// The one implementation is [`Catalog::reserve_decoded`](crate::Catalog),
+/// which answers a refusal by evicting decoded-output cache entries and
+/// retrying once. A resolve helper takes this rather than the bare
+/// `MemoryBudget` because the two are not interchangeable under memory
+/// pressure: a site holding the budget directly fails while cached decoded
+/// parts and postings still hold memory that would have let it through, which
+/// is what the column-statistics path did (issue #2107).
+///
+/// `Sync` so a `&dyn`/`&impl` of it can be held across an await in a `Send`
+/// future, which every resolve helper's is.
+pub(crate) trait DecodeReserver: Sync {
+    /// [`reserve_decoded`]'s contract, with whatever the implementation does
+    /// about a refusal.
+    fn reserve_decoded(&self, declared: u64, ceiling: u64) -> Result<Reservation, MemoryExhausted>;
 }
 
 /// A decoded value and the reservation that charges its bytes. Derefs to the
