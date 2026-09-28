@@ -322,11 +322,15 @@ async fn main() -> anyhow::Result<()> {
     let interior_reverify_ns = cli
         .parse_maintain_interior_reverify()
         .context("failed to parse --maintain-interior-reverify")?;
+    let alert_retention_window_ns = cli
+        .parse_alert_retention()
+        .context("failed to parse --alert-retention")?;
     let compactor = CompactorConfig {
         protection_horizon_ns: gc_runtime.protection_horizon_ns,
         grace_ns: gc_runtime.grace_ns,
         max_flush_lifetime_ns: gc_runtime.max_flush_lifetime_ns,
         interior_reverify_ns,
+        alert_retention_window_ns,
         ..CompactorConfig::default()
     };
     // The catalog listing window and the OTLP admission bound are one

@@ -368,6 +368,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The maintenance loop sweeps alert history older than `--alert-retention`,
+  default 90 days** (ADR-1688 follow-up task 2, issue #1688). After upgrade
+  the first tick deletes every alert transition older than 90 days except each
+  alert identity's current-state record, so the `alerts` SQL table then
+  answers for the window plus current states rather than for all history. Set
+  `--alert-retention` before upgrading to keep more, or `--alert-retention 0`
+  to keep every record as before. The worker that owns a tenant's
+  `(alerts, 0)` unit reads the tenant's alert state memo, keeps the `ts_ns` of
+  every record it names together with its watermark hour, and runs
+  `ravel_maintain::sweep_alert_retention`. A tenant whose memo is absent,
+  undecodable, of an unsupported version, or has a watermark below the expiry
+  floor is skipped for that tick and counted under the new
+  `ravel_alert_retention_skipped_total{reason}` family, whose `reason` is one
+  of `absent`, `undecodable`, `unsupported_version` and
+  `watermark_below_floor`; a sustained nonzero rate means that tenant's
+  evaluator is not running or cannot write its memo. The same tick runs the
+  shard sweep over the alerts shard, so a data object left behind by a crash
+  between the retention sweep's record delete and its data delete is moved to
+  quarantine by orphan GC like any other signal's.
 - **`/metrics` renders `ravel_health_heartbeat_age_seconds`** (ADR-1702
   decision 11, issue #2048). The gauge is the time since the main runtime's
   heartbeat task last ran, labelled `mode`, in every mode. The heartbeat now
@@ -481,10 +500,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   late write into the watermark hour itself may be an identity's newest
   transition. `CompactorConfig::alert_retention_window_ns` is the
   window, default 90 days, the same value as the query-audit window; `0`
-  disables the sweep and keeps the previous grow-forever behaviour. Nothing in
-  the server calls the sweep yet: the driver that reads the memo, builds the
-  keep set and exposes `--alert-retention` is ADR-1688 follow-up task 2, so
-  this release changes no running deployment's behaviour.
+  disables the sweep and keeps the previous grow-forever behaviour. The
+  maintenance loop runs it through the driver described in the
+  `--alert-retention` entry above.
 - **Catalog and PromQL decodes reserve their decoded output against the
   process memory budget before they run** (ADR-1702 decision 6, issue #1702).
   The catalog resolve reserves each snapshot part's, postings object's and

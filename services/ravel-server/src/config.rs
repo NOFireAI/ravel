@@ -646,6 +646,16 @@ pub struct Cli {
     #[arg(long = "maintain-interior-reverify", value_name = "DURATION")]
     pub maintain_interior_reverify: Option<String>,
 
+    /// Age past which the maintenance loop deletes alert transition records,
+    /// as a humantime duration (e.g. `90d`), ADR-1688 decision 5. Each alert
+    /// identity's current-state record is kept whatever its age, and a tenant
+    /// whose alert state memo is missing or stale is not swept. `0` disables
+    /// the sweep and keeps every alert record. Omitted defaults to
+    /// `ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS` (90 days).
+    /// (default: 90d)
+    #[arg(long, value_name = "DURATION")]
+    pub alert_retention: Option<String>,
+
     /// Default age-based retention window applied to every tenant with no
     /// explicit `--retention-tenant` override, as a humantime duration
     /// (e.g. `30d`, `720h`). Omitted means no default retention: nothing is
@@ -5289,6 +5299,21 @@ impl Cli {
                 let dur = humantime::parse_duration(s).map_err(|e| {
                     anyhow::anyhow!("invalid --maintain-interior-reverify '{s}': {e}")
                 })?;
+                Ok(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX))
+            }
+        }
+    }
+
+    /// Parse `--alert-retention` into nanoseconds (ADR-1688 decision 5),
+    /// defaulting to [`ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS`].
+    /// Zero is accepted and returned verbatim: it is the documented "disable
+    /// the sweep" value. Only an unparseable duration fails startup.
+    pub fn parse_alert_retention(&self) -> anyhow::Result<i64> {
+        match self.alert_retention.as_deref() {
+            None => Ok(ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --alert-retention '{s}': {e}"))?;
                 Ok(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX))
             }
         }
@@ -11295,6 +11320,37 @@ mod tests {
         let mut argv = vec!["ravel-server"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("flags parse")
+    }
+
+    /// `--alert-retention` defaults to 90 days, accepts `0` as the opt-out,
+    /// parses a humantime window, and refuses an unparseable one (ADR-1688
+    /// decision 5).
+    #[test]
+    fn alert_retention_parses_default_zero_and_window() {
+        assert_eq!(
+            cli(&[]).parse_alert_retention().expect("default"),
+            ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS
+        );
+        assert_eq!(
+            ravel_maintain::config::DEFAULT_ALERT_RETENTION_NS,
+            90 * 24 * 3_600_000_000_000
+        );
+        assert_eq!(
+            cli(&["--alert-retention", "0"])
+                .parse_alert_retention()
+                .expect("zero"),
+            0
+        );
+        assert_eq!(
+            cli(&["--alert-retention", "30d"])
+                .parse_alert_retention()
+                .expect("30d"),
+            30 * 24 * 3_600_000_000_000
+        );
+        let err = cli(&["--alert-retention", "soon"])
+            .parse_alert_retention()
+            .expect_err("unparseable");
+        assert!(err.to_string().contains("--alert-retention"), "{err}");
     }
 
     /// The identity the qualification gate compares against is the exact string
