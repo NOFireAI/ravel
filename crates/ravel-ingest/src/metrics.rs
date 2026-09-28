@@ -173,14 +173,59 @@ pub struct IngestMetrics {
     /// separately. Intended for Prometheus export under the name
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     clock_regressions_refused: AtomicU64,
+    /// Flushes refused because the raw flush-open reading lagged the object
+    /// store's observed clock by more than the clock-skew allowance (ADR-1685):
+    /// the writer's clock is slow enough to publish into a sealed ingest hour.
+    /// Intended for Prometheus export under the name
+    /// `ravel_ingest_clock_lag_refused_total`.
+    clock_lag_refused: AtomicU64,
+    /// Flush-open attempts that found no store-clock observation yet, so the
+    /// ADR-1685 lag check could not run and the flush proceeded unchecked. The
+    /// counter is cumulative and never resets, so the wiring-defect signal is a
+    /// value still GROWING past a process's first minute, not a nonzero one:
+    /// the attempts made before the first response was observed are expected,
+    /// and they stay in the total for the life of the process. Intended for
+    /// Prometheus export under the name
+    /// `ravel_ingest_clock_lag_unchecked_total`.
+    clock_lag_unchecked: AtomicU64,
+    /// Flush-open attempts on a teardown drain that found a lagging reading and
+    /// went on with the ADR-1685 check bypassed.
+    /// A lag refusal re-anchors nothing (unlike a regression refusal), so every
+    /// enforced pass of a drain reads the same lag and refuses again; on a
+    /// `Shutdown` or channel-close drain the bypass passes run the flush anyway
+    /// rather than strand acknowledged buffered-mode rows. It counts the
+    /// bypass, not the publication: the ADR-1307 floor still applies on a
+    /// bypass pass, so an over-bound backwards step the lag check had kept the
+    /// floor from seeing refuses one such attempt and re-anchors the floor, and
+    /// the attempt after it publishes. Those rows land in an ingest hour
+    /// the fold may already have sealed, invisible to token-less reads until a
+    /// HEAD rebuild, which is recoverable where the drop is not. Nonzero means a
+    /// writer was shut down with a lagging clock: fix the host clock, and rebuild
+    /// the catalog HEAD if a token-less read is missing the rows. Logged at WARN
+    /// beside this bump, naming the lag. Intended for Prometheus export under the
+    /// name `ravel_ingest_clock_lag_bypassed_at_shutdown_total`.
+    clock_lag_bypassed_at_shutdown: AtomicU64,
     /// Tenants still buffered after a TEARDOWN `flush_all` exhausted its
     /// bounded retry passes (ADR-1307 finding F1). A graceful drain re-buffers
     /// a clock-refused flush and retries it in the same call; this counts the
     /// residue that survived every pass on a drain the actor does not outlive
     /// (`Shutdown`, channel close), which is a lost acknowledged buffered-mode
-    /// write (a pathological clock that steps back on every reading). Nonzero
-    /// is a durability defect, logged at ERROR beside this bump so the residue
-    /// is never silent.
+    /// write (a pathological clock that steps back past the hold bound on every
+    /// bypass pass's reading). Nonzero is a durability defect, logged at ERROR
+    /// beside this bump so the residue is never silent.
+    ///
+    /// An ADR-1685 lag refusal on its own never reaches here: a teardown
+    /// drain's bypass passes disable that check and publish
+    /// (`clock_lag_bypassed_at_shutdown`). Teardown residue needs every
+    /// enforced pass refused, by the lag check or by the ADR-1307 floor, and
+    /// every bypass pass refused by that floor. A lag refusal returns before
+    /// the floor is read, so what the bypass passes need is
+    /// [`crate::MAX_FLUSH_ALL_PASSES`] consecutive backwards steps past the
+    /// hold bound on their own readings, the same count the floor alone needed
+    /// for residue before this check existed. One such step is not enough even
+    /// when a lag refusal keeps the floor from seeing it until the first bypass
+    /// pass: that refusal re-anchors the floor, and the next bypass pass
+    /// publishes.
     ///
     /// Residue on a `FlushNow` drain is deliberately NOT counted here: that
     /// arm leaves the actor running with the tenants still buffered and their
@@ -677,6 +722,21 @@ pub struct IngestMetricsSnapshot {
     /// bound (ADR-1307). Intended for export as
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     pub clock_regressions_refused: u64,
+    /// Flushes refused because the raw flush-open reading lagged the store's
+    /// observed clock beyond the clock-skew allowance (ADR-1685). Intended for
+    /// export as `ravel_ingest_clock_lag_refused_total`.
+    pub clock_lag_refused: u64,
+    /// Flush-open attempts made before any store-clock observation, so the
+    /// ADR-1685 lag check did not run. Intended for export as
+    /// `ravel_ingest_clock_lag_unchecked_total`.
+    pub clock_lag_unchecked: u64,
+    /// Flush-open attempts a teardown drain made with the ADR-1685 lag check
+    /// bypassed, rather than strand acknowledged buffered-mode rows the check
+    /// refuses on every enforced pass. Counts the bypass, not the publication:
+    /// the ADR-1307 floor still applies to such an attempt and can refuse it,
+    /// in which case a later bypass pass publishes. Intended for export as
+    /// `ravel_ingest_clock_lag_bypassed_at_shutdown_total`.
+    pub clock_lag_bypassed_at_shutdown: u64,
     /// Tenants left buffered after a teardown `flush_all` (`Shutdown`, channel
     /// close) exhausted its retry passes (ADR-1307 finding F1): a lost
     /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
@@ -954,6 +1014,28 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush refused because its raw reading lagged the store's observed
+    /// clock beyond the clock-skew allowance (ADR-1685).
+    pub(crate) fn record_clock_lag_refused(&self) {
+        self.clock_lag_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush-open attempt that found no store-clock observation, so the
+    /// ADR-1685 lag check did not run.
+    pub(crate) fn record_clock_lag_unchecked(&self) {
+        self.clock_lag_unchecked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush-open attempt a teardown drain made with the ADR-1685 lag
+    /// check bypassed, so acknowledged buffered-mode rows were not stranded.
+    /// The ADR-1307 floor still applies to that attempt, so this counts the
+    /// bypass rather than a publication; a floor refusal there re-anchors the
+    /// floor and the next bypass pass publishes.
+    pub(crate) fn record_clock_lag_bypassed_at_shutdown(&self) {
+        self.clock_lag_bypassed_at_shutdown
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `count` tenants still buffered after a teardown `flush_all` drained
     /// (ADR-1307 finding F1). Called once per teardown drain that leaves a
     /// residue, with the residual tenant count; never from the `FlushNow`
@@ -1058,6 +1140,11 @@ impl IngestMetrics {
             series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
             clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
             clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            clock_lag_refused: self.clock_lag_refused.load(Ordering::Relaxed),
+            clock_lag_unchecked: self.clock_lag_unchecked.load(Ordering::Relaxed),
+            clock_lag_bypassed_at_shutdown: self
+                .clock_lag_bypassed_at_shutdown
+                .load(Ordering::Relaxed),
             flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
@@ -1108,6 +1195,10 @@ mod tests {
         metrics.record_series_id_collision();
         metrics.record_clock_regression();
         metrics.record_clock_regression_refused();
+        metrics.record_clock_lag_refused();
+        metrics.record_clock_lag_unchecked();
+        metrics.record_clock_lag_unchecked();
+        metrics.record_clock_lag_bypassed_at_shutdown();
         metrics.record_flush_all_residue(2);
         metrics.record_partial_write();
         metrics.record_shard_death();
@@ -1130,6 +1221,9 @@ mod tests {
         assert_eq!(snap.series_id_collisions, 1);
         assert_eq!(snap.clock_regressions, 1);
         assert_eq!(snap.clock_regressions_refused, 1);
+        assert_eq!(snap.clock_lag_refused, 1);
+        assert_eq!(snap.clock_lag_unchecked, 2);
+        assert_eq!(snap.clock_lag_bypassed_at_shutdown, 1);
         assert_eq!(snap.flush_all_residue_tenants, 2);
         assert_eq!(snap.partial_writes, 1);
         assert_eq!(snap.shard_deaths, 1);
