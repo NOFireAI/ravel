@@ -76,8 +76,9 @@ identity, and the window bounds both the corpus and the cold start.
    and no alert record is ever compacted.
 
 2. **The sweep keeps every identity's current-state record, whatever its
-   age.** Before deleting, the sweep holds a keep set of `(epoch, seq)` pairs,
-   one per identity, naming the record the memo holds as that identity's
+   age.** Before deleting, the sweep holds a keep set of `(epoch, seq)` pairs
+   (now `ts_ns` values plus the memo watermark: see the keep-set amendment
+   below), one per identity, naming the record the memo holds as that identity's
    latest. An expired commit record whose key parses to a pair in the keep set
    is kept, and counted as kept. Everything else older than the window is
    deleted. So a firing alert that has been firing for a year keeps the one
@@ -92,7 +93,8 @@ identity, and the window bounds both the corpus and the cold start.
    and passes it to the sweep. The memo names each identity's latest record
    only up to its `watermark_hour`; records at or after the watermark are
    inside the window by construction, because the sweep additionally requires
-   `watermark_hour >= expiry floor hour`. When the memo is absent,
+   `watermark_hour >= expiry floor hour` (the keep-set amendment below makes
+   this strict and moves it into the sweep). When the memo is absent,
    undecodable, of an unsupported version, or its watermark sits below the
    expiry floor, the driver skips the sweep for that tenant this tick, logs
    it, and counts it under a new `ravel_alert_retention_skipped_total{reason}`
@@ -194,7 +196,8 @@ flowchart LR
   makes the evaluator correct only under that invariant; this ADR adds a
   deleter to its consumers, which raises the cost of breaking it from a wrong
   evaluation to a lost current-state record. Issue #1438's pruning must keep
-  the pruned identity's `(epoch, seq)` in the compact form, or release its
+  the pruned identity's `(epoch, seq)` in the compact form (its `ts_ns`, per
+  the keep-set amendment below), or release its
   kept record deliberately, so the keep set stays derivable from the memo.
 - The audit window still has no flag (ADR-0062 promised one; the server
   builds `CompactorConfig` with `..Default::default()` at
@@ -215,3 +218,44 @@ flowchart LR
      map equals the pre-sweep fold for every identity.
   4. `docs/guides/alerting.md` "Cost and retention", `docs/deletion-and-gc.md`,
      and the flags reference, in the same change.
+
+## Amendment (2026-09-28): the keep set is ts_ns plus the watermark
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="keep-set amendment" -->
+<!-- amendment-supersedes: phrase="a keep set of `(epoch, seq)` pairs" pointer="keep-set amendment" -->
+<!-- amendment-supersedes: phrase="`watermark_hour >= expiry floor hour`" pointer="keep-set amendment" -->
+
+Implementing follow-up task 1 showed that decisions 2 and 3 cannot be built as
+written, and that decision 3's boundary is off by one hour.
+
+- **The memo has no `(epoch, seq)`.** The memo's records carry `alert_id`,
+  `rule_id`, `state`, `generation`, `ts_ns`, labels, annotations and body, and
+  no commit identity, so a keep set of `(epoch, seq)` pairs has no source. The
+  pair is not unique either: the evaluator writes a constant epoch and a `seq`
+  that restarts at 1 in every evaluator process, so one pair names a record
+  from every process lifetime, and keeping by it grows the kept set with
+  restarts.
+- **The keep set is the memo's `ts_ns` values.** Every alert commit record's
+  `max_event_ts_ns` equals its RLOG row's `ts_ns`, because the evaluator
+  stamps both from the same value, and the sweep already decodes the commit
+  record, so testing `max_event_ts_ns` against the set costs no request and
+  needs no memo format change. It can only over-keep, when another record
+  shares an identity's exact `ts_ns` (records written in the same tick share
+  one stamp), and that surplus is bounded by one tick's records per kept
+  identity, not by history length. A test pins `max_event_ts_ns == ts_ns` for
+  a written transition, so a change to the stamping breaks it loudly.
+- **The watermark travels with the keep set and the sweep enforces it,
+  strictly.** The memo is complete only for hours strictly below its
+  `watermark_hour`: a late write from an overlapping lease holder can land in
+  the watermark hour after the memo was written. With the old `>=` rule a
+  record in that hour, expired and absent from the memo, was deleted, and a
+  cold-start fold then returned the identity's older kept record. The keep
+  set is now `{ watermark_hour, ts_ns }`; the sweep deletes a record only when
+  its ingest hour is strictly below `watermark_hour`, and an absent keep set is
+  a distinct value the sweep refuses, not an empty set that would delete every
+  expired record.
+- **A crash between the two deletes leaves an orphan data object.** Deleting
+  the commit record first is right (no reference can dangle), but no orphan
+  sweep runs on `Signal::Alerts` today, so the object would leak. Follow-up
+  task 2 runs the orphan sweep over the alerts shard beside the retention
+  sweep, the way the audit shard already has one.
