@@ -207,6 +207,12 @@ pub struct BelowTargetReport {
     /// `migrate` reports the same figure. Their buckets are not named in
     /// [`Self::blocked`]; whether they should be is #2093's decision, not this
     /// type's.
+    ///
+    /// Like [`Self::rewrite_parts`], this is a count over LISTED records: a
+    /// compaction record that a later rewrite record superseded stays listed
+    /// until `sweep` deletes it and its parts, so its parts are in this figure
+    /// while it is there, and a `sweep` lowers the figure even though no
+    /// `migrate` run can.
     pub l1: usize,
     /// Below-target parts of the rewrite records a bucket LISTS, which this job
     /// never migrates. A superseded predecessor stays listed until `sweep`
@@ -221,8 +227,13 @@ pub struct BelowTargetReport {
 }
 
 impl BelowTargetReport {
-    /// Every live entry below the target: a nonzero total refuses the floor
-    /// raise.
+    /// Every object that still exists below the target, some of which queries
+    /// still read: a nonzero total refuses the floor raise. Not every entry is
+    /// live to a reader. Both part figures are counts over LISTED records:
+    /// `rewrite_parts` includes a superseded predecessor a later rewrite
+    /// replaced, and `l1` includes a compaction record a later rewrite
+    /// superseded. The resolver serves neither, and `sweep` deletes both, but
+    /// they are in the total for as long as the bucket lists them.
     pub fn total(&self) -> usize {
         self.l0 + self.l1 + self.rewrite_parts
     }
