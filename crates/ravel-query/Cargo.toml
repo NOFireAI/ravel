@@ -52,6 +52,10 @@ ravel-cache = { workspace = true }
 # is exhausted. `MemoryBudget::unlimited()` is the default, so the edge is
 # inert until a server task installs a finite budget.
 ravel-memory = { workspace = true }
+# The read CPU gate (ADR-1702 decisions 2 and 4): the fetchers' section and
+# block decodes and a PromQL evaluation over the evaluation floor run on it
+# when a caller installs one. Unset by default, so decode stays inline.
+ravel-cpu-gate = { workspace = true }
 # The evidential query-audit sink (QueryAuditSink/AuditEvent) the PromQL HTTP
 # handlers submit through and await durability on (ADR-0062 §2a).
 # ravel-maintain does not depend on ravel-query, so this edge is

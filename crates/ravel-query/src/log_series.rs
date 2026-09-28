@@ -759,7 +759,7 @@ pub async fn fetch_log_series(
         segments_fetched += 1;
         fetched_segments.push(seg_idx);
 
-        while let Some(records) = scan.next_block()? {
+        while let Some(records) = scan.next_block_on_gate().await? {
             if let Some(err) = deadline_exceeded(req.deadline) {
                 return Err(err);
             }

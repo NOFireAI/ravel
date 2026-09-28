@@ -17,6 +17,7 @@ use ravel_segment::{
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
 use crate::phase_accounting::PhaseAccounting;
+use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 use tracing::Instrument;
 
@@ -249,6 +250,14 @@ fn ordinal_equals(matchers: &[LabelMatcher]) -> Option<Vec<(&str, &str)>> {
         }
     }
     Some(equals)
+}
+
+/// The decoded catalog entries whose label set satisfies `matchers`.
+fn filter_matching(entries: Vec<SeriesEntryV4>, matchers: &[LabelMatcher]) -> Vec<SeriesEntryV4> {
+    entries
+        .into_iter()
+        .filter(|e| matches_series(matchers, &e.entry.labels))
+        .collect()
 }
 
 /// Default suffix length fetched on the first GET of a segment object.
@@ -863,6 +872,10 @@ pub struct SegmentFetcher {
     /// fetcher built with plain `new` behaves as it did before this budget
     /// existed.
     memory_budget: std::sync::Arc<ravel_memory::MemoryBudget>,
+    /// The read CPU gate the catalog decodes run on (ADR-1702 decisions 2 and
+    /// 4). `None`, the default, decodes inline on the calling task exactly as
+    /// before the gate existed.
+    read_gate: Option<std::sync::Arc<ReadGate>>,
 }
 
 impl SegmentFetcher {
@@ -880,7 +893,17 @@ impl SegmentFetcher {
             suffix_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             label_sets_materialized: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             memory_budget: std::sync::Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            read_gate: None,
         }
+    }
+
+    /// Runs this fetcher's catalog decodes on `gate` (ADR-1702 decision 4):
+    /// each one is a job of its decoded catalog's size, which the gate runs
+    /// inline below its byte floor and on its blocking pool otherwise.
+    #[must_use]
+    pub fn with_read_gate(mut self, gate: std::sync::Arc<ReadGate>) -> Self {
+        self.read_gate = Some(gate);
+        self
     }
 
     /// Number of catalog label sets materialized across every
@@ -1702,27 +1725,28 @@ impl SegmentFetcher {
                 // (issue #1076); otherwise materialize the whole catalog and
                 // filter it.
                 let reservation = self.reserve_catalog_decode(footer, regions)?;
-                let entries = if let Some(equals) = ordinal_equals(matchers) {
-                    let matched = decode_catalog_matching_v4(
-                        footer,
-                        &dict,
-                        &ids,
-                        &meta,
-                        &equals,
-                        self.limits,
-                    )
-                    .map_err(|source| corrupt(key, source))?;
-                    self.record_materialized(matched.len());
-                    matched
-                } else {
-                    let entries = decode_catalog_v4(footer, &dict, &ids, &meta, self.limits)
-                        .map_err(|source| corrupt(key, source))?;
-                    self.record_materialized(entries.len());
-                    entries
-                        .into_iter()
-                        .filter(|e| matches_series(matchers, &e.entry.labels))
-                        .collect()
+                let limits = self.limits;
+                let (decoded, reservation) = match &self.read_gate {
+                    None => (
+                        decode_series_meta_catalog(footer, &dict, &ids, &meta, matchers, limits),
+                        reservation,
+                    ),
+                    Some(gate) => {
+                        let size = JobSize::Bytes(reservation.size());
+                        let footer = footer.clone();
+                        let matchers = matchers.to_vec();
+                        gate.run(ReadSite::SegmentSection, size, move || {
+                            let decoded = decode_series_meta_catalog(
+                                &footer, &dict, &ids, &meta, &matchers, limits,
+                            );
+                            (decoded, reservation)
+                        })
+                        .await
+                        .map_err(|err| gate_failed(key, err))?
+                    }
                 };
+                let (entries, materialized) = decoded.map_err(|source| corrupt(key, source))?;
+                self.record_materialized(materialized);
                 DecodedCatalog {
                     entries,
                     reservation: Some(reservation),
@@ -1742,10 +1766,7 @@ impl SegmentFetcher {
                     .into_parts();
                 self.record_materialized(entries.len());
                 DecodedCatalog {
-                    entries: entries
-                        .into_iter()
-                        .filter(|e| matches_series(matchers, &e.entry.labels))
-                        .collect(),
+                    entries: filter_matching(entries, matchers),
                     reservation,
                 }
             } else {
@@ -1763,14 +1784,29 @@ impl SegmentFetcher {
                     .slice(0, total_size)
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
                 let reservation = self.reserve_catalog_decode(footer, regions)?;
-                let entries = decode_catalog_v5(footer, &object, self.limits)
-                    .map_err(|source| corrupt(key, source))?;
-                self.record_materialized(entries.len());
+                let limits = self.limits;
+                let (decoded, reservation) = match &self.read_gate {
+                    None => (
+                        decode_whole_object_catalog(footer, &object, matchers, limits),
+                        reservation,
+                    ),
+                    Some(gate) => {
+                        let size = JobSize::Bytes(reservation.size());
+                        let footer = footer.clone();
+                        let matchers = matchers.to_vec();
+                        gate.run(ReadSite::SegmentSection, size, move || {
+                            let decoded =
+                                decode_whole_object_catalog(&footer, &object, &matchers, limits);
+                            (decoded, reservation)
+                        })
+                        .await
+                        .map_err(|err| gate_failed(key, err))?
+                    }
+                };
+                let (entries, materialized) = decoded.map_err(|source| corrupt(key, source))?;
+                self.record_materialized(materialized);
                 DecodedCatalog {
-                    entries: entries
-                        .into_iter()
-                        .filter(|e| matches_series(matchers, &e.entry.labels))
-                        .collect(),
+                    entries,
                     reservation: Some(reservation),
                 }
             };
@@ -1882,8 +1918,25 @@ impl SegmentFetcher {
             .slice(ranges.meta_chunks.0, ranges.meta_chunks.1)
             .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
         let reservation = self.reserve_catalog_decode(footer, regions)?;
-        let entries = decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, self.limits)
-            .map_err(|source| corrupt(key, source))?;
+        let limits = self.limits;
+        let (decoded, reservation) = match &self.read_gate {
+            None => (
+                decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, limits),
+                reservation,
+            ),
+            Some(gate) => {
+                let size = JobSize::Bytes(reservation.size());
+                let footer = footer.clone();
+                gate.run(ReadSite::SegmentSparseCatalog, size, move || {
+                    let decoded =
+                        decode_catalog_v5_chunked(&footer, &dict, &ids, &idx, &chunks, limits);
+                    (decoded, reservation)
+                })
+                .await
+                .map_err(|err| gate_failed(key, err))?
+            }
+        };
+        let entries = decoded.map_err(|source| corrupt(key, source))?;
         Ok(DecodedCatalog {
             entries,
             reservation: Some(reservation),
@@ -3018,6 +3071,67 @@ fn expected_identity(tenant_hash: TenantHash, seg_ref: &SegmentRef) -> ExpectedI
         writer_id: seg_ref.writer_id.to_string(),
         writer_epoch: seg_ref.writer_epoch,
         writer_seq: seg_ref.writer_seq,
+    }
+}
+
+/// The SERIES_META branch's catalog decode: resolve positive equalities to
+/// dictionary ordinals when every matcher is one (issue #1076), otherwise
+/// materialize the whole catalog and filter it. Returns the matched entries
+/// and how many were materialized.
+fn decode_series_meta_catalog(
+    footer: &Footer,
+    dict: &[u8],
+    ids: &[u8],
+    meta: &[u8],
+    matchers: &[LabelMatcher],
+    limits: ReaderLimits,
+) -> Result<(Vec<SeriesEntryV4>, usize), ravel_segment::SegmentError> {
+    if let Some(equals) = ordinal_equals(matchers) {
+        decode_catalog_matching_v4(footer, dict, ids, meta, &equals, limits).map(|matched| {
+            let materialized = matched.len();
+            (matched, materialized)
+        })
+    } else {
+        decode_catalog_v4(footer, dict, ids, meta, limits).map(|entries| {
+            let materialized = entries.len();
+            (filter_matching(entries, matchers), materialized)
+        })
+    }
+}
+
+/// The whole-object branch's catalog decode, filtered to `matchers`. Returns
+/// the matched entries and how many were materialized.
+fn decode_whole_object_catalog(
+    footer: &Footer,
+    object: &[u8],
+    matchers: &[LabelMatcher],
+    limits: ReaderLimits,
+) -> Result<(Vec<SeriesEntryV4>, usize), ravel_segment::SegmentError> {
+    decode_catalog_v5(footer, object, limits).map(|entries| {
+        let materialized = entries.len();
+        (filter_matching(entries, matchers), materialized)
+    })
+}
+
+/// The store error a gate job that never ran reports: the runtime dropped it
+/// at shutdown, or the gate was closed. Either is transient.
+pub(crate) fn gate_not_run(err: CpuGateError) -> StoreError {
+    StoreError::Transient(format!("read CPU gate: {err}"))
+}
+
+/// A failed catalog decode job (ADR-1702 decision 2). A panic is the decode's
+/// own failure, so it is the decode error a corrupt catalog reports, and it
+/// fails the same way on every retry; a job that never ran is transient.
+pub(crate) fn gate_failed(key: &str, err: CpuGateError) -> FetchError {
+    match err {
+        CpuGateError::Panicked => FetchError::Corrupt {
+            key: key.to_string(),
+            source: ravel_segment::SegmentError::Decompress(format!("read CPU gate: {err}")),
+        },
+        CpuGateError::Cancelled | CpuGateError::Closed => FetchError::Store {
+            key: key.to_string(),
+            source: gate_not_run(err),
+        },
     }
 }
 
@@ -4925,6 +5039,121 @@ mod tests {
         assert_eq!(budget.reserved(), 7, "back to exactly the starting figure");
         drop(starting);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// ADR-1702 follow-up task 7, RSEG sites: with the byte floor at 0, each
+    /// of `decode_selected`'s three catalog decodes is exactly one read gate
+    /// job under its site, nothing runs inline, and every fetch returns what
+    /// the ungated fetcher returns.
+    ///
+    /// FLIP, one wrap at a time (pass `None` instead of
+    /// `self.read_gate.as_ref()` to that `run_on_read_gate` call, so it runs
+    /// the closure inline as the pre-change code did):
+    /// - the SERIES_META branch of `decode_selected`: the first
+    ///   `SegmentSection` assertion reads `left: (0, 0), right: (1, 0)`;
+    /// - the whole-object branch of `decode_selected`: the second
+    ///   `SegmentSection` assertion reads `left: (1, 0), right: (2, 0)`;
+    /// - `decode_sparse_catalog`: the `SegmentSparseCatalog` assertion reads
+    ///   `left: (0, 0), right: (1, 0)`.
+    #[tokio::test]
+    async fn segment_catalog_decodes_run_through_the_read_gate() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts, total_inline};
+        let gate = floor_zero_gate();
+
+        // Below the sparse threshold: the whole SERIES_META branch.
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let inline = SegmentFetcher::new(backend.clone())
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("ungated fetch");
+        let gated = SegmentFetcher::new(backend)
+            .with_read_gate(gate.clone())
+            .fetch(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("gated fetch");
+        assert_eq!(format!("{gated:?}"), format!("{inline:?}"));
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSection), (1, 0));
+
+        // A sparse object with no matcher does not qualify for the catalog
+        // probe, so it takes the whole-object branch.
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher = fetcher.with_whole_object_threshold(0);
+        let gated_fetcher = fetcher.clone().with_read_gate(gate.clone());
+        let (inline, _) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("ungated whole-object fetch");
+        let (gated, _) = gated_fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("gated whole-object fetch");
+        assert_eq!(gated.len(), 4096);
+        assert_eq!(format!("{gated:?}"), format!("{inline:?}"));
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSection), (2, 0));
+
+        // The same object under a matcher takes the sparse catalog probe.
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let (inline, _) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &matchers)
+            .await
+            .expect("ungated probe fetch");
+        let (gated, _) = gated_fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &matchers)
+            .await
+            .expect("gated probe fetch");
+        assert_eq!(gated.len(), 1);
+        assert_eq!(format!("{gated:?}"), format!("{inline:?}"));
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSparseCatalog), (1, 0));
+        assert_eq!(site_counts(&gate, ReadSite::SegmentSection), (2, 0));
+        assert_eq!(total_inline(&gate), 0);
+    }
+
+    /// A gated catalog decode that produces no result fails the fetch with the
+    /// typed `FetchError::Store`, never a panic and never an inline retry. The
+    /// fetch is polled inside a runtime that has already shut down, whose
+    /// blocking pool cancels the decode job the moment the gate dispatches it.
+    ///
+    /// FLIP: move `CpuGateError::Cancelled` into the `Panicked` arm of
+    /// `gate_failed` and the match below panics with the `Corrupt` error.
+    #[test]
+    fn a_cancelled_gate_job_fails_the_fetch_typed() {
+        use crate::read_gate_test_support::{floor_zero_gate, site_counts};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let (store, tenant_hash, seg_ref) = rt.block_on(write_test_segment());
+        let handle = rt.handle().clone();
+        rt.shutdown_background();
+        let gate = floor_zero_gate();
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = SegmentFetcher::new(backend).with_read_gate(gate.clone());
+        let result = {
+            let _entered = handle.enter();
+            futures::executor::block_on(fetcher.fetch(tenant_hash, &seg_ref, &[]))
+        };
+        assert_eq!(
+            site_counts(&gate, ReadSite::SegmentSection),
+            (1, 0),
+            "the decode reached the gate as a job and nothing ran inline"
+        );
+        let err = match result {
+            Err(
+                err @ FetchError::Store {
+                    source: StoreError::Transient(_),
+                    ..
+                },
+            ) => err,
+            other => panic!("expected a transient FetchError::Store, got {other:?}"),
+        };
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        let response = crate::http::ApiError::from(crate::QueryError::Fetch(err)).into_parts();
+        assert_eq!(
+            response.status.as_u16(),
+            503,
+            "a job that never ran is retryable"
+        );
     }
 
     /// `ensure_ranges`'s reservation covers a coalesced-run batch, not one
