@@ -4694,6 +4694,11 @@ mod tests {
     /// The pinned-read cases below run against both the memory oracle and the
     /// same oracle behind `FaultStore` with no rules armed, so a decorator that
     /// silently dropped the pin would fail them too.
+    ///
+    /// They are unit tests, not part of `run_conformance_suite`, on purpose:
+    /// whether a real bucket evaluates `If-Match` on a GET is qualified per
+    /// grant by `external::probe::probe_preconditions`, and only external
+    /// buckets are read with a pin.
     fn pinned_read_subjects() -> Vec<(&'static str, Box<dyn ObjectStoreBackend>)> {
         vec![
             ("MemoryStore", Box::new(MemoryStore::new())),
