@@ -812,6 +812,11 @@ pub(crate) async fn merge_catalogs(
     // `Vec<LogRecord>` and no per-stream dedup: distinct submissions of
     // identical content are distinct records (ADR-0032).
     for stream_id in merged.keys() {
+        // Cancellation checkpoint 3 (ADR-1029 decision 3): the per-stream merge
+        // loop head, the point at which no cursor is open and nothing is
+        // half-merged.
+        crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::MergeLoop)
+            .await?;
         merge_stream_into_parts(
             store,
             catalogs,
@@ -1035,6 +1040,16 @@ impl PartSink<'_> {
                 self.retain_bytes,
                 &declared_accum,
                 self.config.request_ledger.as_ref(),
+            )
+            .await?;
+            // Cancellation checkpoint 4 (ADR-1029 decision 3): a part
+            // boundary, after the part PUT returned. The erasure rewrite
+            // shares this sink and installs no claim, so for it this is one
+            // `Option` check.
+            crate::claim_guard::checkpoint(
+                self.config,
+                self.store,
+                crate::claim_guard::Checkpoint::PartBoundary,
             )
             .await?;
             // Only bytes actually retained past PUT count toward the

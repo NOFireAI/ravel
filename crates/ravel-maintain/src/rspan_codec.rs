@@ -449,6 +449,16 @@ pub(crate) async fn merge(
         // the target by up to one trace, and unbounded for one trace larger
         // than the target.
         if current_trace != Some(trace_id) {
+            // Cancellation checkpoint 3 (ADR-1029 decision 3): this signal's
+            // merge loop head. A trace is RSPAN's unit of merge progress (a
+            // trace never straddles two parts), so the trace transition is the
+            // quiescent point here, the way a stream boundary is RLOG's.
+            crate::claim_guard::checkpoint(
+                config,
+                store,
+                crate::claim_guard::Checkpoint::MergeLoop,
+            )
+            .await?;
             if let Some(part) = &current {
                 let over_cap =
                     part.estimate >= config.l1_part_memory_target_bytes && !part.is_empty();
@@ -456,6 +466,14 @@ pub(crate) async fn merge(
                     let built = builder
                         .finish(store, bucket, input_set_hash, part_index, dry_run, ledger)
                         .await?;
+                    // Cancellation checkpoint 4: a part boundary, after the
+                    // part PUT returned.
+                    crate::claim_guard::checkpoint(
+                        config,
+                        store,
+                        crate::claim_guard::Checkpoint::PartBoundary,
+                    )
+                    .await?;
                     parts.push(built);
                     part_index += 1;
                     if let Some(t) = tracker {
@@ -479,6 +497,9 @@ pub(crate) async fn merge(
     {
         let built = part
             .finish(store, bucket, input_set_hash, part_index, dry_run, ledger)
+            .await?;
+        // Cancellation checkpoint 4 for the tail part.
+        crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
             .await?;
         parts.push(built);
         if let Some(t) = tracker {

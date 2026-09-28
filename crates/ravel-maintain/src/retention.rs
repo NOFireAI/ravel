@@ -82,7 +82,7 @@ use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
 use crate::clock::Clock;
-use crate::compact::{CompactionOutcome, compact_bucket};
+use crate::compact::{ClaimedCompaction, compact_bucket_claimed};
 use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::reachability::SnapshotGate;
@@ -326,6 +326,11 @@ pub async fn retention_sweep_bucket_with_reach(
 /// (no policy / not sealed / not expired). Returns the retention outcome and
 /// the compaction outcome, if compaction ran.
 ///
+/// The compaction goes through [`compact_bucket_claimed`], so a caller that
+/// installed a [`crate::config::ClaimParticipant`] takes the bucket's advisory
+/// claim here and a caller that did not runs exactly as before (ADR-1029
+/// decision 5).
+///
 /// This is the efficiency-preferred ordering, not the correctness guarantee
 /// (see the module docs and [`crate::compact::compact_bucket`]'s own
 /// tombstone check).
@@ -336,7 +341,7 @@ pub async fn maintain_bucket(
     retention: &RetentionConfig,
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
-) -> Result<(RetentionOutcome, Option<CompactionOutcome>)> {
+) -> Result<(RetentionOutcome, Option<ClaimedCompaction>)> {
     let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
     let mut reach = SnapshotReachability::new();
     maintain_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket).await
@@ -356,7 +361,7 @@ pub async fn maintain_bucket_with_reach(
     window_ns: Option<i64>,
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
-) -> Result<(RetentionOutcome, Option<CompactionOutcome>)> {
+) -> Result<(RetentionOutcome, Option<ClaimedCompaction>)> {
     let outcome =
         retention_sweep_bucket_with_reach(reach, store, clock, config, window_ns, lease, bucket)
             .await?;
@@ -368,7 +373,7 @@ pub async fn maintain_bucket_with_reach(
         | RetentionOutcome::SweptPartial
         | RetentionOutcome::BlockedBySnapshot(_) => None,
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
-            Some(compact_bucket(store, clock, config, bucket).await?)
+            Some(compact_bucket_claimed(store, clock, config, bucket).await?)
         }
     };
     Ok((outcome, compaction))

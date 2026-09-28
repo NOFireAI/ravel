@@ -170,7 +170,8 @@ The merge gains a `ClaimGuard` consulted at the five natural quiescent
 points the pipeline already has:
 
 1. after the seal/tombstone/already-compacted/min-input gates, before
-   any read (`compact.rs:60-71`);
+   any read (`compact.rs:60-71`); the claim is in fact taken after the input
+   commit-record reads, see the amendment on where the claim is taken;
 2. after input listing and `input_set_hash`, before catalog fan-out
    (`rewrite.rs:112-134`);
 3. at the per-stream merge loop head (`rlog.rs:777-788`);
@@ -405,3 +406,35 @@ authoritative-record selection keep reads correct either way. The leak of a
 losing record's parts (#1155) is separate work that claims make rarer but do
 not fix.
 
+
+## Amendment (2026-09-28): where the claim is taken
+
+<!-- amendment-applies: sections="Decision" pointer="amendment on where the claim is taken" -->
+<!-- amendment-supersedes: phrase="before any read" pointer="amendment on where the claim is taken" -->
+
+Decision 3 item 1 places the claim acquisition "before any read". The
+implementation (`compact_bucket_scoped` in
+`crates/ravel-maintain/src/compact.rs`) takes it later: after the bucket
+LIST and the gates it feeds, and after the input commit records are read, one
+GET per L0 input. Decision 4 forces that order. The cost gate compares the
+inputs' stored bytes with `claim_min_input_bytes`, and those bytes are the
+`object_size` each commit record carries; the bucket listing names the
+records, not their sizes. The claim still precedes every catalog and block
+read and every PUT.
+
+This is safe because the reads before the claim are read-only: a run refused
+the claim has written nothing, so it has nothing to abandon, and the claim
+stays advisory (decision 2) whenever it is taken.
+
+The cost falls on a contender that is refused the claim. Before its claim
+request it pays the bucket LIST plus one commit-record GET per input, on top
+of the rejected PUT, the GET and the HEAD that Consequences lists for the
+contention path. Those commit-record GETs are counted under the record-read
+phase of the request ledger, not under `coordinate`. The background
+supervisor then holds the bucket until the holder's expiry
+(`MaintainMemo::claim_deferred`, checked before the bucket is listed), so it
+pays them once per observed claim rather than once per tick.
+`a_held_claim_skips_the_bucket_without_merging_it`
+(`crates/ravel-maintain/tests/compaction_claims.rs`) pins the figures for a
+two-input bucket: two record reads, zero catalog and block reads, three
+coordinate requests.

@@ -8,6 +8,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The background supervisor now takes an advisory claim before compacting a
+  large bucket, so two processes whose ownership overlaps no longer both pay
+  for the same merge** (ADR-1029 decisions 3 to 5, issue #1033). The claim is
+  taken after the bucket's gates and before any read whose cost scales with the
+  bucket; a claimed run then consults it at the merge's quiescent points and
+  cancels without publishing once the claim is gone, leaving the parts it had
+  already written where they are. A supervisor refused a claim reports the
+  bucket skipped, with the holder and the reason, and holds it until that
+  holder's lease can have expired rather than re-requesting it every tick.
+  Coordination is on by default and claims are taken only at or above 64 MiB
+  of listed input bytes (`claim_min_input_bytes`), so a small bucket is merged
+  exactly as before. The switch that turns claiming off is the
+  `CompactorConfig::coordination` field; no server flag or config file reaches
+  it yet, and its operator flag lands with #1035. Claims
+  stay advisory: the compaction record's `CreateIfAbsent` still decides which
+  output is published, so a stale owner that finishes after losing its claim
+  converges on the one record rather than publishing a second. For the same
+  reason a store error while marking a claim completed is logged and the
+  published compaction stands, and a claim object that cannot be decoded is
+  never stolen but, once older than one lease plus the contender's jitter, no
+  longer holds its bucket back: the bucket is compacted unclaimed. Claim
+  traffic is counted under a new `coordinate` phase in the compaction request
+  ledger, never pooled into the merge's own phases.
+
 - **This release reads provisioning record format 3 and still writes 2, and
   `ravel-cli maintain audit-versions` now classifies every recorded format
   floor** (ADR-1746 Release A, issue #1746). `FormatFloor` gains three basis
