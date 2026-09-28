@@ -366,22 +366,27 @@ memory three ways:
    cargo build --release -p ravel-server --features "sql heap-profiling"
    ```
 
-2. Start that binary with profiling turned on. The vendored jemalloc is
-   built with an `_rjem_` symbol prefix, so it reads `_RJEM_MALLOC_CONF`,
-   not `MALLOC_CONF`. `prof_gdump` writes a dump at every new memory peak,
-   and `lg_prof_sample:17` samples about every 128 KiB allocated. jemalloc
-   does not create the dump directory, so make an empty one for each run:
+2. Start that binary with profiling turned on, fresh for each reproduction.
+   The vendored jemalloc is built with an `_rjem_` symbol prefix, so it
+   reads `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`. `prof_gdump` writes a dump
+   each time the process's total virtual memory exceeds its previous
+   maximum. That tracks the live peak only while nothing earlier in the
+   process mapped more, which is why each reproduction starts a fresh
+   server. `lg_prof_sample:17` samples about every 128 KiB allocated.
+   jemalloc does not create the dump directory, so start each run from an
+   empty one:
 
    ```sh
-   mkdir -p /tmp/ravel-heap
+   rm -rf /tmp/ravel-heap && mkdir -p /tmp/ravel-heap
    _RJEM_MALLOC_CONF=prof:true,lg_prof_sample:17,prof_gdump:true,prof_prefix:/tmp/ravel-heap/g \
      target/release/ravel-server ...
    ```
 
-3. Reproduce the workload, then read the last dump, which is the highest
-   peak, with `jeprof` (Debian and Ubuntu ship it in `libjemalloc-dev`). A
-   dump is named `g.<pid>.<seq>.u<n>.heap`, so the version sort below picks
-   the latest peak only while the directory holds a single run:
+3. Reproduce the workload, then read the last dump, the one written at the
+   run's virtual-memory high-water, with `jeprof` (Debian and Ubuntu ship it
+   in `libjemalloc-dev`). A dump is named `g.<pid>.<seq>.u<n>.heap`, so the
+   version sort below picks the last dump only while the directory holds a
+   single run:
 
    ```sh
    jeprof --text --inuse_space target/release/ravel-server "$(ls -1v /tmp/ravel-heap/g.*.heap | tail -1)"
@@ -389,11 +394,12 @@ memory three ways:
    ```
 
    `--collapsed` gives full stacks for grouping by the innermost Ravel frame.
-   Compare the dump's in-use total with `ravel_process_allocator_bytes`
-   `stat="allocated"` sampled at the same time: a large gap means the sample
-   interval is too coarse to attribute from.
+   Before trusting the dump, compare its in-use total with
+   `ravel_process_allocator_bytes` `stat="allocated"` observed at the
+   workload's peak. A large gap means either the sample interval is too
+   coarse to attribute from, or the dump was not taken at the live peak.
 
-Profiling with a dump at every peak slows allocation-heavy statements, so
+Profiling with a dump at every new high-water slows allocation-heavy statements, so
 measure timings on a build without it.
 
 ## Background
