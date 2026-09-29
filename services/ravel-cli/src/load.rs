@@ -15891,4 +15891,208 @@ type = "str"
             assert!(list_data_objects(store.as_ref()).await.is_empty());
         }
     }
+
+    mod empty_dictionary_chunk_file {
+        use std::path::PathBuf;
+
+        use parquet::column::page::{CompressedPage, Page, PageWriteSpec, PageWriter};
+        use parquet::column::writer::{get_column_writer, get_typed_column_writer};
+        use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::{SerializedFileWriter, SerializedPageWriter, TrackedWrite};
+        use parquet::schema::parser::parse_message_type;
+        use ravel_object_store::memory::MemoryStore;
+
+        use super::*;
+
+        /// Passes every page through except the dictionary page, which it
+        /// replaces with one holding no values. The data pages still carry the
+        /// keys the real dictionary answered, so a non-null key names a value
+        /// the written dictionary does not have.
+        struct EmptyDictionaryPage<P> {
+            inner: P,
+            empty: bool,
+        }
+
+        impl<P: PageWriter> PageWriter for EmptyDictionaryPage<P> {
+            fn write_page(
+                &mut self,
+                page: CompressedPage,
+            ) -> parquet::errors::Result<PageWriteSpec> {
+                let Page::DictionaryPage {
+                    encoding,
+                    is_sorted,
+                    ..
+                } = page.compressed_page()
+                else {
+                    return self.inner.write_page(page);
+                };
+                if !self.empty {
+                    return self.inner.write_page(page);
+                }
+                let empty = Page::DictionaryPage {
+                    buf: bytes::Bytes::new(),
+                    num_values: 0,
+                    encoding: *encoding,
+                    is_sorted: *is_sorted,
+                };
+                self.inner.write_page(CompressedPage::new(empty, 0))
+            }
+
+            fn close(&mut self) -> parquet::errors::Result<()> {
+                self.inner.close()
+            }
+        }
+
+        /// A three-row file: `ts` plain, and `svc` dictionary-encoded with keys
+        /// `[0, null, 0]`, under an empty dictionary page when `empty_dictionary`
+        /// is set and under its real one-value dictionary otherwise. The `svc`
+        /// chunk is written by a column writer over [`EmptyDictionaryPage`] and
+        /// spliced into the row group whole.
+        fn write_file(empty_dictionary: bool) -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pq = dir.path().join("in.parquet");
+            let schema = Arc::new(
+                parse_message_type(
+                    "message log { required int64 ts; optional binary svc (UTF8); }",
+                )
+                .expect("schema"),
+            );
+            let props = Arc::new(
+                WriterProperties::builder()
+                    .set_dictionary_enabled(true)
+                    .build(),
+            );
+            let file = std::fs::File::create(&pq).expect("create parquet");
+            let mut writer =
+                SerializedFileWriter::new(file, schema, Arc::clone(&props)).expect("file writer");
+            let svc_descr = writer.schema_descr().column(1);
+            let mut rg = writer.next_row_group().expect("row group");
+
+            let mut ts = rg.next_column().expect("ts column").expect("ts writer");
+            ts.typed::<Int64Type>()
+                .write_batch(&[NOW_NS, NOW_NS + 1, NOW_NS + 2], None, None)
+                .expect("write ts");
+            ts.close().expect("close ts");
+
+            let mut chunk = TrackedWrite::new(Vec::new());
+            let close = {
+                let pages = EmptyDictionaryPage {
+                    inner: SerializedPageWriter::new(&mut chunk),
+                    empty: empty_dictionary,
+                };
+                let mut svc = get_typed_column_writer::<ByteArrayType>(get_column_writer(
+                    svc_descr,
+                    props,
+                    Box::new(pages),
+                ));
+                svc.write_batch(
+                    &[ByteArray::from("api"), ByteArray::from("api")],
+                    Some(&[1, 0, 1]),
+                    None,
+                )
+                .expect("write svc");
+                svc.close().expect("close svc")
+            };
+            let chunk = bytes::Bytes::from(chunk.into_inner().expect("chunk bytes"));
+            rg.append_column(&chunk, close).expect("splice svc");
+            rg.close().expect("close row group");
+            writer.close().expect("close file");
+            (dir, pq)
+        }
+
+        fn svc_mapping() -> Mapping {
+            let mut m = base_mapping();
+            m.resource_attributes = vec![attr("service.name", "svc", ColType::Str)];
+            m
+        }
+
+        async fn load_on(
+            path: LoadPath,
+            pq: &Path,
+        ) -> (Result<LoadReport, LoadError>, Arc<dyn ObjectStoreBackend>) {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let result = load_instrumented(
+                Arc::clone(&store),
+                pq,
+                "acme",
+                &svc_mapping(),
+                1,
+                1_000,
+                0,
+                None,
+                1,
+                DEFAULT_MAX_INFLIGHT_FLUSHES,
+                DEFAULT_DECODE_QUEUE_BATCHES,
+                DEFAULT_TARGET_BYTES,
+                None,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+                path,
+                None,
+                None,
+            )
+            .await;
+            (result, store)
+        }
+
+        /// The loader reads `svc` as a dictionary column, so the batch this
+        /// file would decode to is the shape `str_src` and
+        /// `resolve_dictionary_column` answer differently.
+        fn assert_read_as_dictionary(pq: &Path) {
+            let schema = reader_schema_for(pq).expect("a dictionary-preserving schema");
+            assert_eq!(
+                schema
+                    .field_with_name("svc")
+                    .expect("svc field")
+                    .data_type(),
+                &DataType::Dictionary(Box::new(DICT_KEY_TYPE), Box::new(DataType::Utf8)),
+            );
+        }
+
+        /// An empty dictionary page under a non-null key never reaches either
+        /// load path as a batch: the Parquet reader itself fails the decode,
+        /// with the same batch refusal on the row path and the columnar path,
+        /// and nothing is stored by either.
+        #[tokio::test]
+        async fn both_paths_refuse_an_empty_dictionary_page_under_a_key() {
+            let (_dir, pq) = write_file(true);
+            assert_read_as_dictionary(&pq);
+
+            let mut reasons = Vec::new();
+            for path in [LoadPath::Row, LoadPath::Columnar] {
+                let (result, store) = load_on(path, &pq).await;
+                let err = result.expect_err("the corrupt file is refused");
+                let LoadError::BatchFailed { reason, .. } = &err else {
+                    panic!("expected BatchFailed on {path:?}, got {err:?}");
+                };
+                assert!(
+                    reason.starts_with("failed to read Parquet batch: ")
+                        && reason.contains("insufficient values read from column"),
+                    "the reader refuses the chunk on {path:?}: {reason}"
+                );
+                assert!(list_data_objects(store.as_ref()).await.is_empty());
+                reasons.push(reason.clone());
+            }
+            assert_eq!(reasons[0], reasons[1], "both paths refuse identically");
+        }
+
+        /// The control: the same writer with the dictionary page left intact
+        /// loads all three rows on both paths, so the refusal above comes from
+        /// the emptied dictionary and not from the spliced chunk.
+        #[tokio::test]
+        async fn the_same_file_with_its_dictionary_loads_on_both_paths() {
+            let (_dir, pq) = write_file(false);
+            assert_read_as_dictionary(&pq);
+
+            let mut stored = Vec::new();
+            for path in [LoadPath::Row, LoadPath::Columnar] {
+                let (result, store) = load_on(path, &pq).await;
+                let report = result.expect("the intact file loads");
+                assert_eq!(report.rows_processed, 3, "every row loads on {path:?}");
+                stored.push(decoded_records(store.as_ref()).await);
+            }
+            assert_eq!(stored[0], stored[1], "both paths store the same records");
+        }
+    }
 }
