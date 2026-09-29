@@ -212,6 +212,31 @@ pub struct MaintenanceSafetyMetrics {
     /// this process observed, so a later unit with a smaller lag must not lower
     /// it and units must not add together.
     retention_lag_ns_accum: [AtomicI64; MAINTAINED_SIGNALS.len()],
+    /// Claim acquisitions per signal since process start, from every unit's
+    /// `MaintainReport::claims_acquired` (ADR-1029 decision 3, issue #1035):
+    /// this run took the claim, fresh or stolen. Backs
+    /// `ravel_maintain_claims_acquired_total`.
+    claims_acquired: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Subset of `claims_acquired` above taken over from an expired holder
+    /// rather than created fresh (`MaintainReport::claims_stolen`, ADR-1029
+    /// decision 3). Backs `ravel_maintain_claims_stolen_total`.
+    claims_stolen: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Claims this process held and then lost -- stolen out from under it, or
+    /// cancelled at a checkpoint -- per signal since process start
+    /// (`MaintainReport::claim_cancelled`, ADR-1029 decision 3). Backs
+    /// `ravel_maintain_claims_lost_total`.
+    claims_lost: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Claim renewals that failed with a genuine object-store error rather
+    /// than losing the claim (`MaintainError::ClaimRenewFailed`, ADR-1029
+    /// decision 3), per signal since process start. Backs
+    /// `ravel_maintain_claim_renew_failures_total`.
+    claim_renew_failures: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Buckets this process declined to work on because another run already
+    /// held the claim, per signal since process start
+    /// (`MaintainReport::claim_skipped`, ADR-1029 decision 3; this is the
+    /// Consequences list's `claimed_buckets_skipped`). Backs
+    /// `ravel_maintain_claims_skipped_total`.
+    claims_skipped: [AtomicU64; MAINTAINED_SIGNALS.len()],
     /// Tenant ticks whose alert retention sweep was skipped for want of a
     /// usable alert state memo (ADR-1688 decision 3 and its store-error
     /// amendment), indexed by [`AlertRetentionSkipReason::index`].
@@ -516,6 +541,38 @@ impl MaintenanceSafetyMetrics {
         self.retention_lag_ns[signal_index(signal)].load(Ordering::Relaxed)
     }
 
+    /// Claim acquisitions for `signal` since process start, fresh or stolen
+    /// (ADR-1029 decision 3). Backs `ravel_maintain_claims_acquired_total`.
+    pub fn claims_acquired(&self, signal: Signal) -> u64 {
+        self.claims_acquired[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Subset of [`claims_acquired`](Self::claims_acquired) taken over from
+    /// an expired holder rather than created fresh. Backs
+    /// `ravel_maintain_claims_stolen_total`.
+    pub fn claims_stolen(&self, signal: Signal) -> u64 {
+        self.claims_stolen[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Claims this process held and then lost for `signal` since process
+    /// start. Backs `ravel_maintain_claims_lost_total`.
+    pub fn claims_lost(&self, signal: Signal) -> u64 {
+        self.claims_lost[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Claim renewals for `signal` that failed with a genuine store error
+    /// since process start. Backs `ravel_maintain_claim_renew_failures_total`.
+    pub fn claim_renew_failures(&self, signal: Signal) -> u64 {
+        self.claim_renew_failures[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Buckets skipped for `signal` because another run already held the
+    /// claim, since process start. Backs
+    /// `ravel_maintain_claims_skipped_total`.
+    pub fn claims_skipped(&self, signal: Signal) -> u64 {
+        self.claims_skipped[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
     pub fn record_legal_hold_refresh_failure(&self) {
         self.legal_hold_refresh_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -523,6 +580,14 @@ impl MaintenanceSafetyMetrics {
 
     pub fn record_conservation_abort(&self, signal: Signal) {
         self.conservation_aborts[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One [`MaintainError::ClaimRenewFailed`] for `signal` (ADR-1029
+    /// decision 3): a renewal at a cancellation checkpoint failed with a
+    /// genuine store error rather than losing the claim. Backs
+    /// `ravel_maintain_claim_renew_failures_total`.
+    pub fn record_claim_renew_failure(&self, signal: Signal) {
+        self.claim_renew_failures[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// One `sweep_shard` result for `signal`, taken whole so no figure the
@@ -617,6 +682,13 @@ impl MaintenanceSafetyMetrics {
         // single oldest still-present expired bucket, so a later unit with a
         // smaller lag must not lower it and two units must not add together.
         self.retention_lag_ns_accum[index].fetch_max(report.retention_lag_ns, Ordering::Relaxed);
+        // Claim counters (ADR-1029 decision 3, issue #1035): plain running
+        // totals, unlike the two accumulators above, so they need no
+        // begin/publish pairing and are visible on the next scrape.
+        self.claims_acquired[index].fetch_add(report.claims_acquired as u64, Ordering::Relaxed);
+        self.claims_stolen[index].fetch_add(report.claims_stolen as u64, Ordering::Relaxed);
+        self.claims_lost[index].fetch_add(report.claim_cancelled as u64, Ordering::Relaxed);
+        self.claims_skipped[index].fetch_add(report.claim_skipped as u64, Ordering::Relaxed);
     }
 
     /// Clear the L0-pending accumulator at the top of a maintenance cycle.
@@ -1569,6 +1641,8 @@ pub async fn run_discovery_cycle(
         total.skipped_terminal += report.skipped_terminal;
         total.claim_skipped += report.claim_skipped;
         total.claim_cancelled += report.claim_cancelled;
+        total.claims_acquired += report.claims_acquired;
+        total.claims_stolen += report.claims_stolen;
         total.l0_records_pending += report.l0_records_pending;
         total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
     }
@@ -2013,6 +2087,8 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                         // process actually ran.
                         claim_skipped = report.claim_skipped,
                         claim_cancelled = report.claim_cancelled,
+                        claims_acquired = report.claims_acquired,
+                        claims_stolen = report.claims_stolen,
                         "maintenance: retention + compaction pass complete"
                     );
                     safety.record_scan(signal, &report);
@@ -2023,6 +2099,8 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                     total.skipped_terminal += report.skipped_terminal;
                     total.claim_skipped += report.claim_skipped;
                     total.claim_cancelled += report.claim_cancelled;
+                    total.claims_acquired += report.claims_acquired;
+                    total.claims_stolen += report.claims_stolen;
                     total.l0_records_pending += report.l0_records_pending;
                     total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
                 }
@@ -2044,6 +2122,18 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                          retried next tick"
                     );
                     safety.record_conservation_abort(signal);
+                }
+                Err(MaintainError::ClaimRenewFailed { at, source }) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        checkpoint = at,
+                        error = %source,
+                        "maintenance: compaction claim renewal failed with a store error \
+                         (not a lost claim); retried next tick"
+                    );
+                    safety.record_claim_renew_failure(signal);
                 }
                 Err(err) => {
                     tracing::warn!(

@@ -560,6 +560,28 @@ pub const DEFAULT_CLAIM_MIN_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// stream's cursor drain, one part encode plus PUT), not the whole merge: the
 /// owner renews at the cancellation checkpoints.
 pub const DEFAULT_CLAIM_LEASE_DURATION: Duration = ravel_fleet::claim::DEFAULT_LEASE_DURATION;
+/// Conservative encode+PUT throughput assumed by [`claim_lease_below_warn_threshold`]
+/// (ADR-1029 decision 3): 10 MiB/s, well under real object-store PUT
+/// throughput even on the smallest supported host, so the startup warning
+/// fires only when the configured lease is genuinely too short for the
+/// largest L1 part, not on ordinary variance.
+pub const CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC: u64 = 10 * 1024 * 1024;
+
+/// Whether `claim_lease_duration` is below ADR-1029 decision 3's startup
+/// warning threshold: 2x the time to encode and PUT one `max_l1_part_bytes`
+/// part at [`CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC`]. A lease
+/// this short can expire, and be stolen, before a run still encoding its
+/// largest part reaches its own next renewal checkpoint. Integer seconds are
+/// coarse enough for a startup warning; the assumed rate is already a
+/// deliberate underestimate.
+pub fn claim_lease_below_warn_threshold(
+    claim_lease_duration: Duration,
+    max_l1_part_bytes: u64,
+) -> bool {
+    let encode_seconds = max_l1_part_bytes / CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC;
+    let threshold = Duration::from_secs(encode_seconds.saturating_mul(2));
+    claim_lease_duration < threshold
+}
 /// Default footer suffix-probe size. 64 KiB covers the footer + catalog of a
 /// typical L0 flush in one GET (docs/segment-format.md reader protocol).
 pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
