@@ -60,9 +60,9 @@ struct Cli {
 
     /// Path to the external credential profile file (ADR-2040 decision D1),
     /// the JSON list of named profiles `tenant parquet-grant add` resolves
-    /// `--profile` against. Same file and same name ravel-server reads for
-    /// its own Parquet-table paths. A top-level flag, given before the
-    /// subcommand, like the tenant-hash flags above.
+    /// `--profile` against. ravel-server will read the same file for its
+    /// Parquet-table paths once issue #2053 wires them. A top-level flag,
+    /// given before the subcommand, like the tenant-hash flags.
     #[arg(long, value_name = "PATH", env = "RAVEL_PARQUET_PROFILES")]
     parquet_profiles: Option<std::path::PathBuf>,
 
@@ -824,8 +824,11 @@ enum ParquetCommand {
     /// Deletes nothing outside `t/<tenant_hash>/pq/t/`: the Parquet files a
     /// table names live in the tenant's own bucket and a sweep never touches
     /// them. A grace below the deployment's stored `max_query_duration`
-    /// (`sys/gc`) is refused, since a query resolved under that deadline may
-    /// still be reading the version it would delete.
+    /// (`sys/gc`) is refused. That floor protects a writer's resolve-to-put
+    /// window: a writer finishes its put within half of the floor after its
+    /// resolve, so while it is in flight no sweep can free the version key
+    /// its create-if-absent put targets. A query needs no protection here,
+    /// since it reads a table's manifest once, when it resolves.
     Sweep {
         /// The tenant whose superseded manifest versions to delete.
         #[arg(long)]
