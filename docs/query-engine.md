@@ -3286,9 +3286,11 @@ returns (the record cell, or the resource or scope value a row falls back to).
 A `.cstat` entry alone never skips a segment, because it tallies only the
 record-level cells and a row whose value lives only in the resource or scope
 attributes can match outside its `[min, max]`. A segment with no stamp for the
-column, or whose `.cstat` entry disagrees with its stamp (the conflict rule
-the declared-column MIN/MAX shortcut uses), is never skipped by that column's
-arm; another column's arm or the ts window can still drop it. A segment whose
+column is never skipped by that column's arm; another column's arm or the ts
+window can still drop it. When the scan has loaded the segment's `.cstat`
+entry and it disagrees with the stamp, the segment is not skipped either (the
+conflict rule the declared-column MIN/MAX shortcut uses). A filtered scan
+usually does not load `.cstat`, so in practice the stamp alone decides. A segment whose
 column is NULL in every row is skipped for any arm, since its stamp proves the
 NULL count equal to the row count. The comparison runs in signed `i64` order
 (`false < true` for `bool`), never on the arms' unsigned bit patterns.

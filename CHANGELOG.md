@@ -1269,9 +1269,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before any fetch, so the segment costs no GET. A `.cstat` entry alone never
   skips a segment: it tallies only the record-level cells, and a row whose
   value lives only in the resource or scope attributes can match outside its
-  min/max. A segment with no stamp for the column, or whose `.cstat` entry
-  disagrees with its stamp, is never skipped by that column's arm; another
-  column's arm or the ts window can still drop it. A Flight SQL `DoGet`
+  min/max. A segment with no stamp for the column is never skipped by that
+  column's arm, and neither is one whose loaded `.cstat` entry disagrees
+  with its stamp; another column's arm or the ts window can still drop it. A Flight SQL `DoGet`
   rebuilds segments from its ticket, which carries no stamps, so it skips
   nothing by statistics. The
   count is reported as `segments_pruned_by_stats` on the logs scan's `EXPLAIN
