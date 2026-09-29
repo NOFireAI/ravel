@@ -447,9 +447,11 @@ and the CAS read/write helpers.
   check (`catalog verify`, scrub) recomputes each compaction record's hash for
   its own version: the version 1 hash over `inputs` for a version 1 record,
   the version 2 hash over `(inputs, superseded_record_key)` for a version 2
-  record. No writer produces a version 2 record yet, and
-  resolution does not yet honour its supersession; both are later steps of
-  the amendment's task list.
+  record. Resolution honours its supersession (step 3 of "Snapshot
+  resolution" below), and refuses a bucket where a version 2 record's inputs
+  differ from those of the present record it names. No writer produces a
+  version 2 record yet, and the sweep reclaims nothing on account of its
+  supersession yet; both are later steps of the amendment's task list.
 - Selective-erasure request and completion records (ADR-0064 decision 1) live
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
@@ -1220,10 +1222,44 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      whole is added to `superseded_records`.
    - A **version 2 compaction record** names, in `superseded_record_key`, the
      compaction record it re-encodes and supersedes (ADR-0066 force 2
-     amendment). Decoding validates that key, but resolution does not yet
-     exclude the named record, and until it does no writer produces a
-     version 2 record (the amendment orders the selector change before the
-     writer).
+     amendment). Every compaction record a present version 2 record names is
+     excluded before the overlap components below are formed: its parts are
+     not included and its inputs do not join `excluded` on its account (the
+     version 2 record names the same inputs). Decoding sees one record and
+     cannot check that equality, so resolution does: a version 2 record
+     whose deduplicated input set differs from that of the present record it
+     names is a typed error naming both keys, never an exclusion, since
+     excluding the predecessor would stop covering an input only it names.
+     The check runs before erasure dominance as well as in the overlap
+     selection, so a dominated version 2 record cannot bypass it. Resolve,
+     the token fallback, the index fold, the erasure completion gate and
+     `migrate` fail with it; scrub logs it and scrubs every record of that
+     hour, and the sweep treats none of the bucket's inputs as superseded.
+     Chains are followed (C3
+     supersedes C2 supersedes C1 leaves only C3), with the same bounded,
+     cycle-checked walk the rewrite chase uses: a cycle or a chain longer
+     than the bound is a typed error, never a guess about which record is
+     live. A version 2 record naming a key that is not present excludes
+     nothing. The rewrite chase treats a version 2 record as a link, not an
+     end: a rewrite that names one also supersedes the record it names.
+   - **Erasure dominance.** A version 2 record whose predecessor a live
+     rewrite record supersedes (directly or through its chain, whether or not
+     the predecessor is still present), or whose predecessor is itself
+     dominated, is excluded as a whole: its parts re-encode the pre-erasure
+     data and may still hold an erased subject, so the rewrite wins. The
+     overlap selection sees only compaction records, so this rule is applied
+     first, wherever rewrite and compaction records are both in view:
+     resolution, the token fallback (step 5), the index fold, scrub, the
+     erasure completion gate and `migrate`. The superseded-input sweep
+     reclaims nothing on account of version 2 supersession or dominance yet:
+     a superseded predecessor or a dominated version 2 record is reclaimed
+     only where a rule that predates version 2 records reaches it, such as a
+     rewrite chain that names it. The sweep treats an input as superseded
+     only where an authoritative record names it both with and without
+     version 2 supersession applied, and treats none of a bucket's inputs as
+     superseded when that bucket's supersession does not resolve (a cycle,
+     an over-deep chain, or a version 2 record whose inputs differ from its
+     predecessor's).
    - Include each compaction record's parts and each rewrite record's output
      parts as segment refs, filtered by per-part event bounds, UNLESS that
      record's key is in `superseded_records`. A superseded record's parts are
@@ -1240,7 +1276,10 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    either (correct under overlap harmlessness; ADR-0018); overlapping input
    sets resolve to one authoritative record per overlap group, whose parts
    are included and whose inputs are excluded, with every input only a losing
-   record names served as a raw L0. Either way, alarm loudly.
+   record names served as a raw L0. The groups are formed after the version
+   2 and dominance exclusions above, so a predecessor and the version 2
+   record that re-encodes it are one record, not a conflict. Either way,
+   alarm loudly.
 4. Filter the remaining L0 commit records: [min_event_ts, max_event_ts]
    overlaps the query range.
 5. For each `min_token`: reconstruct its commit key and GET it directly

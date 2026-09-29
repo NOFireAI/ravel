@@ -73,7 +73,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use ravel_catalog::{current_floor_from_store, select_authoritative_compaction_records};
+use ravel_catalog::{
+    current_floor_from_store, erasure_dominated_compaction_records,
+    select_authoritative_compaction_records,
+};
 use ravel_commit::{keys, record};
 use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum, Version,
@@ -774,6 +777,7 @@ async fn read_shard_family(
     let mut superseded_commits: HashSet<String> = HashSet::new();
     let mut records = Vec::new();
     let mut compaction_by_bucket: HashMap<u32, Vec<(String, CompactionRecord)>> = HashMap::new();
+    let mut rewrite_by_bucket: HashMap<u32, Vec<(String, RewriteRecord)>> = HashMap::new();
     for meta in metas {
         let entry = keys::partition_bucket_entry(&meta.key).map_err(MaintainError::Key)?;
         let key = meta.key;
@@ -838,6 +842,10 @@ async fn read_shard_family(
                     shard,
                     &rec,
                 )?);
+                rewrite_by_bucket
+                    .entry(rec.ingest_hour_bucket)
+                    .or_default()
+                    .push((key, rec));
             }
             keys::BucketEntry::Tombstone(_) => {}
         }
@@ -847,13 +855,15 @@ async fn read_shard_family(
     // authoritative record per overlap component and take only a winner's
     // inputs as superseded. An input a loser alone names has no live successor
     // -- the loser's parts are ignored -- so it is still served raw and still
-    // counts as live.
-    for bucket_records in compaction_by_bucket.values() {
-        let losing = select_authoritative_compaction_records(bucket_records);
-        for (key, rec) in bucket_records {
-            if losing.contains(key.as_str()) {
-                continue;
-            }
+    // counts as live. The same holds for a record a present version 2 record
+    // supersedes and for a version 2 record a live rewrite dominates.
+    for (hour, bucket_records) in &compaction_by_bucket {
+        let bucket = Bucket::new(*tenant_hash, signal, shard, *hour);
+        let rewrites = rewrite_by_bucket
+            .get(hour)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for (_, rec) in authoritative_compaction_records(&bucket, bucket_records, rewrites)? {
             superseded_commits.extend(superseded_input_commit_keys(
                 tenant_hash,
                 signal,
@@ -868,6 +878,66 @@ async fn read_shard_family(
         superseded_commits,
         records,
     })
+}
+
+/// The compaction records of one bucket whose inputs the resolver treats as
+/// superseded: a version 2 record a live rewrite dominates is dropped
+/// ([`ravel_catalog::erasure_dominated_compaction_records`]), and the selector
+/// then excludes every record a present version 2 record supersedes and every
+/// overlap loser. Both halves of this module ask the question here, so the walk
+/// and the re-audit agree with `Catalog::resolve` and with each other.
+fn authoritative_compaction_records<'a>(
+    bucket: &Bucket,
+    compaction_records: &'a [(String, CompactionRecord)],
+    rewrite_records: &[(String, RewriteRecord)],
+) -> Result<Vec<&'a (String, CompactionRecord)>> {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )?;
+    let unresolvable = |err: ravel_catalog::CatalogError| {
+        MaintainError::Invariant(format!(
+            "bucket {prefix} has an unresolvable supersession chain: {err}"
+        ))
+    };
+    let dominated =
+        erasure_dominated_compaction_records(compaction_records, rewrite_records, &prefix)
+            .map_err(unresolvable)?;
+    let candidates: Vec<&(String, CompactionRecord)> = compaction_records
+        .iter()
+        .filter(|(key, _)| !dominated.contains(key.as_str()))
+        .collect();
+    let candidate_pairs: Vec<(&str, &CompactionRecord)> = candidates
+        .iter()
+        .map(|(key, rec)| (key.as_str(), rec))
+        .collect();
+    let selection =
+        select_authoritative_compaction_records(&candidate_pairs).map_err(unresolvable)?;
+    Ok(candidates
+        .into_iter()
+        .filter(|(key, _)| !selection.is_excluded(key))
+        .collect())
+}
+
+/// The most compaction records any one overlap component of a bucket holds,
+/// counted after excluding every record a present version 2 record supersedes
+/// (ADR-0066 force 2 amendment, item 4). A predecessor and the version 2
+/// record that re-encodes it are one record here, not two; a bucket answering
+/// more than one holds genuinely contested records and is not re-encoded,
+/// because a new record's hash could lose the tie-break to the old loser.
+/// A cycle or an over-deep chain of version 2 records, or a version 2 record
+/// whose inputs differ from the record it names, is an
+/// [`MaintainError::Invariant`] naming the selector's typed error.
+pub fn largest_overlap_component(records: &[(String, CompactionRecord)]) -> Result<usize> {
+    select_authoritative_compaction_records(records)
+        .map(|selection| selection.largest_component())
+        .map_err(|err| {
+            MaintainError::Invariant(format!(
+                "compaction records have an unresolvable supersession chain: {err}"
+            ))
+        })
 }
 
 /// The commit keys of `listing`'s L0 records that its compaction and rewrite
@@ -981,23 +1051,11 @@ async fn raw_served_commit_keys(
         compaction_records.push((key.clone(), rec));
     }
 
-    let mut superseded: HashSet<String> = HashSet::new();
-    let losing = select_authoritative_compaction_records(&compaction_records);
-    for (key, rec) in &compaction_records {
-        if losing.contains(key.as_str()) {
-            continue;
-        }
-        superseded.extend(superseded_input_commit_keys(
-            &bucket.tenant_hash,
-            bucket.signal,
-            bucket.shard,
-            rec,
-        )?);
-    }
-
     // A rewrite record has no overlapping peer to lose to (ADR-0064 decision 3
     // point 5 keeps one record set per bucket), so its whole input list
     // supersedes, exactly as the re-audit treats it.
+    let mut rewrite_records: Vec<(String, RewriteRecord)> =
+        Vec::with_capacity(listing.rewrite_record_keys.len());
     for key in &listing.rewrite_record_keys {
         // Same race and same reasoning as the compaction records above.
         let got = match store.get(key, GetRange::Full).await {
@@ -1011,11 +1069,25 @@ async fn raw_served_commit_keys(
             ))
         })?;
         records_read += 1;
+        rewrite_records.push((key.clone(), rec));
+    }
+
+    let mut superseded: HashSet<String> = HashSet::new();
+    for (_, rec) in authoritative_compaction_records(bucket, &compaction_records, &rewrite_records)?
+    {
         superseded.extend(superseded_input_commit_keys(
             &bucket.tenant_hash,
             bucket.signal,
             bucket.shard,
-            &rec,
+            rec,
+        )?);
+    }
+    for (_, rec) in &rewrite_records {
+        superseded.extend(superseded_input_commit_keys(
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+            rec,
         )?);
     }
 

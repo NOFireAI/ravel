@@ -1477,6 +1477,12 @@ async fn load_compaction_records(
 /// record exists (the reference map does not distinguish winners from losers,
 /// and a node that has not adopted this rule may still serve them), so this
 /// pass reclaims nothing of the loser's.
+///
+/// The same holds for a record a present version 2 record supersedes, which
+/// the selector excludes like a loser: this pass reclaims nothing of it, and
+/// gives a version 2 record no rule of its own, so an erasure-dominated one
+/// and its parts stay too. Reclaiming either needs horizon, reachability and
+/// hold rules this pass does not apply to them yet.
 #[derive(Default)]
 struct AuthoritativeInputs {
     by_bucket: HashMap<u32, HashSet<(String, u64, u64)>>,
@@ -1495,20 +1501,71 @@ impl AuthoritativeInputs {
         }
         let mut by_bucket: HashMap<u32, HashSet<(String, u64, u64)>> = HashMap::new();
         for (bucket, in_bucket) in per_bucket {
-            let losing = select_authoritative_compaction_records(&in_bucket);
-            let mut identities: HashSet<(String, u64, u64)> = HashSet::new();
-            for (key, record) in &in_bucket {
-                if losing.contains(key) {
+            // Reclaiming what a version 2 record supersedes needs the horizon,
+            // reachability and hold rules this pass does not apply to it yet,
+            // so an input is superseded here only where an authoritative record
+            // names it both with version 2 supersession honoured (the rule the
+            // resolver serves by) and with it ignored (the rule this pass
+            // deleted by before the resolver honoured it). Neither view can
+            // then widen what this pass deletes. A bucket whose version 2
+            // supersession does not resolve (a cycle, a chain past the depth
+            // bound, or a version 2 record whose inputs differ from the record
+            // it names) fails every resolve over it; this pass treats none of
+            // its inputs as superseded rather than guess, and leaves the other
+            // buckets alone.
+            let honoured = match select_authoritative_compaction_records(&in_bucket) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    tracing::error!(
+                        ingest_hour_bucket = bucket,
+                        %error,
+                        "superseded-input sweep: unresolvable compaction supersession; \
+                         no input of this bucket is treated as superseded"
+                    );
+                    by_bucket.insert(bucket, HashSet::new());
                     continue;
                 }
-                for input in &record.inputs {
-                    identities.insert((
-                        input.writer_id.clone(),
-                        input.writer_epoch,
-                        input.writer_seq,
-                    ));
+            };
+            let ignored: Vec<(&str, CompactionRecord)> = in_bucket
+                .iter()
+                .map(|(key, record)| {
+                    (
+                        *key,
+                        CompactionRecord {
+                            superseded_record_key: String::new(),
+                            ..(*record).clone()
+                        },
+                    )
+                })
+                .collect();
+            // With every `superseded_record_key` cleared there is no chain to
+            // walk, so this selection cannot fail; an error here would still
+            // mean "treat nothing as superseded".
+            let Ok(ignored_selection) = select_authoritative_compaction_records(&ignored) else {
+                by_bucket.insert(bucket, HashSet::new());
+                continue;
+            };
+            let named = |selection: &ravel_catalog::AuthoritativeSelection<'_>| {
+                let mut identities: HashSet<(String, u64, u64)> = HashSet::new();
+                for (key, record) in &in_bucket {
+                    if selection.is_excluded(key) {
+                        continue;
+                    }
+                    for input in &record.inputs {
+                        identities.insert((
+                            input.writer_id.clone(),
+                            input.writer_epoch,
+                            input.writer_seq,
+                        ));
+                    }
                 }
-            }
+                identities
+            };
+            let ignored_named = named(&ignored_selection);
+            let identities = named(&honoured)
+                .into_iter()
+                .filter(|identity| ignored_named.contains(identity))
+                .collect();
             by_bucket.insert(bucket, identities);
         }
         Self { by_bucket }

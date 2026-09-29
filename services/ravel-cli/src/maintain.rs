@@ -2465,24 +2465,41 @@ pub async fn check_noncurrent_versions<S: NoncurrentVersionSource + ?Sized>(
 pub fn decode_compaction_record(bytes: &[u8]) -> anyhow::Result<()> {
     let record = ravel_commit::record::decode_compaction(bytes)
         .map_err(|err| anyhow::anyhow!("failed to decode compaction record: {err}"))?;
-    println!("format_version: {}", record.format_version);
-    println!("tenant_hash: {}", hex::encode(&record.tenant_hash));
-    println!("signal: {}", record.signal);
-    println!("shard: {}", record.shard);
-    println!("ingest_hour_bucket: {}", record.ingest_hour_bucket);
-    println!("level: {}", record.level);
-    println!("input_set_hash: {}", hex::encode(&record.input_set_hash));
-    println!("created_unix_ns: {}", record.created_unix_ns);
-    println!("inputs: {}", record.inputs.len());
+    for line in compaction_record_lines(&record) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The lines [`decode_compaction_record`] prints for a decoded record. A
+/// version 2 record also names the compaction record it supersedes.
+fn compaction_record_lines(record: &ravel_proto::commit::v1::CompactionRecord) -> Vec<String> {
+    let mut lines = vec![
+        format!("format_version: {}", record.format_version),
+        format!("tenant_hash: {}", hex::encode(&record.tenant_hash)),
+        format!("signal: {}", record.signal),
+        format!("shard: {}", record.shard),
+        format!("ingest_hour_bucket: {}", record.ingest_hour_bucket),
+        format!("level: {}", record.level),
+        format!("input_set_hash: {}", hex::encode(&record.input_set_hash)),
+    ];
+    if !record.superseded_record_key.is_empty() {
+        lines.push(format!(
+            "superseded_record_key: {}",
+            record.superseded_record_key
+        ));
+    }
+    lines.push(format!("created_unix_ns: {}", record.created_unix_ns));
+    lines.push(format!("inputs: {}", record.inputs.len()));
     for input in &record.inputs {
-        println!(
+        lines.push(format!(
             "  writer_id={} writer_epoch={} writer_seq={}",
             input.writer_id, input.writer_epoch, input.writer_seq
-        );
+        ));
     }
-    println!("parts: {}", record.parts.len());
+    lines.push(format!("parts: {}", record.parts.len()));
     for part in &record.parts {
-        println!(
+        lines.push(format!(
             "  part_index={} first_series_id={} last_series_id={} content_hash={} \
              object_size={} sample_count={} series_count={} run_count={} \
              min_event_ts_ns={} max_event_ts_ns={} segment_format_version={}",
@@ -2497,9 +2514,9 @@ pub fn decode_compaction_record(bytes: &[u8]) -> anyhow::Result<()> {
             part.min_event_ts_ns,
             part.max_event_ts_ns,
             part.segment_format_version,
-        );
+        ));
     }
-    Ok(())
+    lines
 }
 
 /// Decode and print a `RetentionTombstone` (proto).
@@ -3511,6 +3528,68 @@ mod tests {
                 && msg.contains("format_version")
                 && msg.contains('3'),
             "the error names the record kind, the gate, and the version seen: {msg}"
+        );
+    }
+
+    /// `maintain inspect` names the record a version 2 compaction record
+    /// supersedes, beside its `format_version`, and prints no such line for a
+    /// version 1 record.
+    #[test]
+    fn inspect_prints_a_version_2_compaction_records_superseded_key() {
+        use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionRecord};
+
+        let tenant = TenantHash([0x3c; 16]);
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(7).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let v1_hash = ravel_commit::erasure::compute_compaction_input_set_hash(&inputs);
+        let predecessor = keys::compaction_record_key(
+            &tenant,
+            Signal::Metrics,
+            0,
+            5,
+            &hex::encode(&v1_hash[..8]),
+        )
+        .expect("predecessor key");
+        let v1 = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 5,
+            level: 1,
+            inputs: inputs.clone(),
+            input_set_hash: v1_hash.to_vec(),
+            ..Default::default()
+        };
+        let v2 = CompactionRecord {
+            format_version: 2,
+            input_set_hash: ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+                &inputs,
+                &predecessor,
+            )
+            .to_vec(),
+            superseded_record_key: predecessor.clone(),
+            ..v1.clone()
+        };
+        let decoded = record::decode_compaction(record::encode_compaction(&v2).as_ref())
+            .expect("the fixture is a valid version 2 record");
+        let lines = compaction_record_lines(&decoded);
+        assert!(lines.iter().any(|l| l == "format_version: 2"), "{lines:?}");
+        let expected = format!("superseded_record_key: {predecessor}");
+        assert_eq!(
+            lines.iter().filter(|l| **l == expected).count(),
+            1,
+            "{lines:?}"
+        );
+
+        let lines = compaction_record_lines(&v1);
+        assert!(lines.iter().any(|l| l == "format_version: 1"), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("superseded_record_key")),
+            "{lines:?}"
         );
     }
 

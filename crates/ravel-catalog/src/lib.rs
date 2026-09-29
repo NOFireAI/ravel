@@ -41,7 +41,10 @@ pub use auth_token_map::{
 };
 pub use catalog::Catalog;
 pub use catalog::resolve_rewrite_supersession;
-pub use catalog::select_authoritative_compaction_records;
+pub use catalog::{
+    AuthoritativeSelection, erasure_dominated_compaction_records,
+    select_authoritative_compaction_records,
+};
 pub use column_stats_resolve::{LoadColumnStatsError, LoadedColumnStats, unique_column_stat};
 pub use config::{
     CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
