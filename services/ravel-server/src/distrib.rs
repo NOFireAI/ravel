@@ -2080,17 +2080,15 @@ fn decode_tenant_hash(bytes: &[u8]) -> Option<TenantHash> {
 /// after startup.
 ///
 /// The loop stops when `shutdown` fires (graceful shutdown holds the sender on
-/// `Running`). On stop it DELETES its own `sys/query/workers/<uuid>` record
-/// before returning, so a draining process drops out of every sibling
-/// coordinator's live set at once rather than lingering until its stamp ages
-/// past the `3 * H` staleness window. Without this a coordinator keeps dialing
-/// a worker that has already stopped serving for up to the staleness window.
+/// `Running`). On stop it overwrites its own `sys/query/workers/<uuid>` record
+/// with a drained stamp ([`QueryWorkers::mark_drained`]) before returning, so a
+/// draining process drops out of every sibling coordinator's live set on that
+/// sibling's next read rather than lingering until its stamp ages past the
+/// `3 * H` staleness window.
 ///
-/// That delete runs on a graceful drain alone, so a process lost to a panic, a
-/// kill or a node loss leaves its key behind. The same tick therefore reaps
-/// every key past the reap horizon, taken from the listing the membership read
-/// already made (issue #1761), which bounds the prefix to the live fleet
-/// instead of to every query worker that ever ran.
+/// The loop deletes nothing: the query role holds no delete grant (ADR-0055
+/// section 1). Dead records, drained or left behind by a panic, a kill or a
+/// node loss, are reaped by the maintain role.
 pub fn spawn_heartbeat(
     workers: Arc<QueryWorkers>,
     store: Arc<dyn ObjectStoreBackend>,
@@ -2105,18 +2103,9 @@ pub fn spawn_heartbeat(
             if let Err(err) = workers.write_heartbeat(store.as_ref(), now_ns).await {
                 tracing::warn!(error = %err, "query worker heartbeat write failed");
             }
-            match workers.live_set_read(store.as_ref(), now_ns).await {
-                Ok(read) => {
-                    // One listing serves both: the membership view the
-                    // routing fetcher reads, and the keys past the reap
-                    // horizon. Reaping from that same read is what keeps the
-                    // prefix bounded without a second LIST, which is how the
-                    // maintain tier does it too.
-                    let reaped = workers.reap_keys(store.as_ref(), &read.reapable).await;
-                    if reaped > 0 {
-                        tracing::info!(reaped, "reaped dead query worker heartbeat keys");
-                    }
-                    *live_workers.write() = Arc::new(read.live);
+            match workers.live_set(store.as_ref(), now_ns).await {
+                Ok(live) => {
+                    *live_workers.write() = Arc::new(live);
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "query worker live_set read failed; keeping prior membership")
@@ -2125,11 +2114,11 @@ pub fn spawn_heartbeat(
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = &mut shutdown => {
-                    // Draining: remove our own record so coordinators stop
-                    // dialing us immediately. A failed delete self-corrects as
-                    // the stamp ages out, so it is a warning, not fatal.
-                    if let Err(err) = workers.delete_heartbeat(store.as_ref()).await {
-                        tracing::warn!(error = %err, "query worker heartbeat delete on shutdown failed");
+                    // Draining: stamp our own record drained so coordinators
+                    // stop dialing us. A failed write self-corrects as the
+                    // last stamp ages out, so it is a warning, not fatal.
+                    if let Err(err) = workers.mark_drained(store.as_ref()).await {
+                        tracing::warn!(error = %err, "query worker drain write on shutdown failed");
                     }
                     return;
                 }
@@ -3538,6 +3527,113 @@ mod tests {
                 .iter()
                 .any(|r| r.process_id == workers.process_id().to_string()),
             "the stale worker has aged out of the live set"
+        );
+    }
+
+    /// The query coordinator's heartbeat loop issues no delete under
+    /// `sys/query/workers/`, neither on its ticks with dead records present nor
+    /// on its drain: the query role holds no delete grant, and the maintain
+    /// tier reaps. The drain still takes the coordinator out of another
+    /// reader's live set at once, at the same reader clock.
+    ///
+    /// Every delete under the prefix is scripted to fail, so any delete the
+    /// loop issued shows up as a fired fault.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_loop_deletes_nothing_and_drains_by_stamp() {
+        use ravel_fleet::query_workers::QUERY_WORKERS_PREFIX;
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        const H_NS: i64 = 60 * 1_000_000_000;
+        const H_MS: u64 = 60 * 1_000;
+        let now_ns = 1_000 * H_NS;
+        let now_ms = 1_000 * H_MS;
+
+        let memory = MemoryStore::new();
+        // Three dead coordinators, well past the reap horizon by both their
+        // stamp and their modification time.
+        memory.set_clock_ms(now_ms - 10 * H_MS);
+        for port in 0..3u16 {
+            let dead = QueryWorkers::with_defaults(
+                format!("127.0.0.1:{}", 7200 + port),
+                format!("127.0.0.1:{}", 7300 + port),
+                codec::PROTOCOL_VERSION,
+            );
+            dead.write_heartbeat(&memory, now_ns - 10 * H_NS)
+                .await
+                .expect("seed a dead record");
+        }
+        memory.set_clock_ms(now_ms);
+        let faults = Arc::new(FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Delete,
+                    ScriptedFault::Transient("a query-side delete".into()),
+                )
+                .with_key_contains(QUERY_WORKERS_PREFIX),
+            ),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+
+        let workers = Arc::new(QueryWorkers::with_defaults(
+            "127.0.0.1:7000",
+            "127.0.0.1:7100",
+            codec::PROTOCOL_VERSION,
+        ));
+        let interval = workers.heartbeat_interval();
+        let live_workers = Arc::new(RwLock::new(Arc::new(Vec::new())));
+        let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        let handle = spawn_heartbeat(
+            workers.clone(),
+            store.clone(),
+            Arc::new(FixedClock(now_ns)),
+            live_workers,
+            stop_rx,
+        );
+        for _ in 0..5 {
+            tokio::time::sleep(interval).await;
+        }
+
+        let observer = QueryWorkers::with_defaults(
+            "127.0.0.1:7001",
+            "127.0.0.1:7101",
+            codec::PROTOCOL_VERSION,
+        );
+        let self_id = workers.process_id().to_string();
+        let live = observer
+            .live_set(store.as_ref(), now_ns)
+            .await
+            .expect("live set before the drain");
+        assert!(
+            live.iter().any(|r| r.process_id == self_id),
+            "the beating coordinator is live before the drain"
+        );
+
+        stop.send(()).expect("the loop is still running");
+        handle.await.expect("the loop exits cleanly");
+
+        assert_eq!(
+            faults.fault_count(Op::Delete, FaultKind::Transient),
+            0,
+            "the heartbeat loop must issue no delete under sys/query/workers/"
+        );
+        let live = observer
+            .live_set(store.as_ref(), now_ns)
+            .await
+            .expect("live set after the drain");
+        assert!(
+            !live.iter().any(|r| r.process_id == self_id),
+            "a drained coordinator is out of another reader's live set at once"
+        );
+        let keys = ravel_object_store::list_all(store.as_ref(), QUERY_WORKERS_PREFIX)
+            .await
+            .expect("list the prefix");
+        assert_eq!(
+            keys.len(),
+            4,
+            "the three dead records and the drained one all remain for the maintain role"
         );
     }
 

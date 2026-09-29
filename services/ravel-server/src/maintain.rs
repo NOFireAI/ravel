@@ -83,10 +83,13 @@ use std::time::Duration;
 use futures::FutureExt;
 use ravel_commit::keys;
 use ravel_commit::rng::{RngSource, SystemRng};
+use ravel_fleet::query_workers::{
+    QUERY_WORKERS_PREFIX, ReapPass, default_liveness_window_ns, reap_dead_query_workers,
+};
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
 use ravel_maintain::worker_set::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, run_bounded,
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, owns, run_bounded,
 };
 use ravel_maintain::{
     AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
@@ -1563,6 +1566,51 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
     }
 }
 
+/// The rendezvous unit key of the one-per-deployment query-worker reap. Not a
+/// `(tenant, signal, shard)` unit, since the prefix belongs to no tenant, but
+/// owned by the same rendezvous rule over the same live set, so exactly one
+/// maintain process per membership view reaps it.
+pub const QUERY_WORKER_REAP_UNIT: &[u8] = QUERY_WORKERS_PREFIX.as_bytes();
+
+/// Reap dead query-worker heartbeat records under `sys/query/workers/`, if
+/// this process owns [`QUERY_WORKER_REAP_UNIT`] under `live_set`. Returns
+/// `None` when it does not own the unit (and then issues no store call at
+/// all), or when the listing failed.
+///
+/// The maintain role reaps this prefix because it holds the delete grant and
+/// the query role does not (ADR-0055 section 1). The horizon is the query
+/// workers' own ([`default_liveness_window_ns`], widened by
+/// `ravel_fleet::query_workers::reap_dead_query_workers`), judged from LIST
+/// metadata alone, so no record is read.
+pub async fn reap_query_worker_heartbeats(
+    store: &dyn ObjectStoreBackend,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    now_ns: i64,
+) -> Option<ReapPass> {
+    if !owns(QUERY_WORKER_REAP_UNIT, worker.process_id(), live_set) {
+        return None;
+    }
+    match reap_dead_query_workers(store, now_ns, default_liveness_window_ns()).await {
+        Ok(pass) => {
+            if pass.reaped > 0 {
+                tracing::info!(
+                    reaped = pass.reaped,
+                    "maintenance: reaped dead query worker heartbeat keys"
+                );
+            }
+            Some(pass)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "maintenance: query worker heartbeat listing failed; reap retried next cycle"
+            );
+            None
+        }
+    }
+}
+
 /// One discovery cycle: re-enumerate tenants from storage, narrow by lifecycle
 /// state and the flag fallback, then run [`run_tick`] for each tenant in the
 /// result (ADR-0048 decision 3, ADR-0066 decision 6).
@@ -1573,6 +1621,9 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
 /// cycle (no tenant's tick runs) and only bumps the failure counter, never
 /// falling back to an empty set. Falling back would render identically to
 /// "storage has no tenants," the exact silent failure this avoids.
+///
+/// Before discovery the cycle runs the one-per-deployment query-worker reap
+/// ([`reap_query_worker_heartbeats`]), gated on this process owning it.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_discovery_cycle(
     store: &dyn ObjectStoreBackend,
@@ -1587,6 +1638,10 @@ pub async fn run_discovery_cycle(
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
+    // Before discovery, so a failed tenant listing does not also stall the
+    // query-worker prefix.
+    reap_query_worker_heartbeats(store, worker, live_set, WallClock.now_ns()).await;
+
     let outcome = match discover_and_restrict_by_lifecycle(store, fallback_allow).await {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -10065,5 +10120,282 @@ mod alert_retention_tests {
             skipped_once(AlertRetentionSkipReason::Absent)
         );
         assert_eq!(alert_keys(&store, &tenant).await, keys_of(&[&written]));
+    }
+}
+
+/// The one-per-deployment reap of dead query-worker heartbeat records under
+/// `sys/query/workers/`, which the maintain role runs because the query role
+/// holds no delete grant (ADR-0055 section 1).
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod query_worker_reap_tests {
+    use std::sync::atomic::AtomicU64;
+
+    use bytes::Bytes;
+    use parking_lot::Mutex;
+    use ravel_fleet::query_workers::{QueryWorkers, query_worker_key};
+    use ravel_maintain::owner;
+    use ravel_object_store::instrument::InstrumentedStore;
+    use ravel_object_store::list_all;
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    const H_NS: i64 = 60 * 1_000_000_000;
+    const H_MS: u64 = 60 * 1_000;
+    const NOW_NS: i64 = 1_000 * H_NS;
+    const NOW_MS: u64 = 1_000 * H_MS;
+
+    /// Write one query worker's record so the store reports `mtime_ms` as its
+    /// modification time, then put the store clock back at `restore_ms`.
+    async fn seed(memory: &MemoryStore, mtime_ms: u64, restore_ms: u64, stamp_ns: i64) -> String {
+        let worker = QueryWorkers::with_defaults("10.0.0.1:9443", "10.0.0.1:9000", 1);
+        memory.set_clock_ms(mtime_ms);
+        worker
+            .write_heartbeat(memory, stamp_ns)
+            .await
+            .expect("seed a query worker record");
+        memory.set_clock_ms(restore_ms);
+        query_worker_key(&worker.process_id().to_string())
+    }
+
+    async fn query_worker_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+        let mut keys: Vec<String> = list_all(store, QUERY_WORKERS_PREFIX)
+            .await
+            .expect("list the query worker prefix")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Two maintain processes share one live set. The one that owns the reap
+    /// unit deletes exactly the records past the reap horizon and keeps a live
+    /// one and one inside the clock-skew margin; the other issues no LIST and
+    /// no delete under the prefix at all.
+    #[tokio::test]
+    async fn only_the_reap_unit_owner_reaps_dead_query_worker_keys() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(NOW_MS);
+        let live_key = seed(&memory, NOW_MS, NOW_MS, NOW_NS).await;
+        let margin_key = seed(&memory, NOW_MS - 4 * H_MS, NOW_MS, NOW_NS - 4 * H_NS).await;
+        for _ in 0..2 {
+            seed(&memory, NOW_MS - 10 * H_MS, NOW_MS, NOW_NS - 10 * H_NS).await;
+        }
+        let store = InstrumentedStore::new(memory);
+
+        let a = WorkerSet::with_defaults(NOW_NS).with_process_id(Uuid::from_u128(1));
+        let b = WorkerSet::with_defaults(NOW_NS).with_process_id(Uuid::from_u128(2));
+        let live_set = vec![a.process_id(), b.process_id()];
+        let owner_id = owner(QUERY_WORKER_REAP_UNIT, &live_set).expect("a non-empty live set");
+        let (owning, other) = if owner_id == a.process_id() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+
+        let before = store.metrics().snapshot();
+        let pass = reap_query_worker_heartbeats(&store, other, &live_set, NOW_NS).await;
+        let after = store.metrics().snapshot();
+        assert_eq!(pass, None, "the non-owner does not reap");
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            0,
+            "the non-owner lists nothing"
+        );
+        assert_eq!(
+            after.delete.calls - before.delete.calls,
+            0,
+            "the non-owner deletes nothing"
+        );
+
+        let before = store.metrics().snapshot();
+        let pass = reap_query_worker_heartbeats(&store, owning, &live_set, NOW_NS).await;
+        let after = store.metrics().snapshot();
+        assert_eq!(
+            pass,
+            Some(ReapPass {
+                reaped: 2,
+                access_denied: false
+            }),
+            "the owner reaps exactly the two dead records"
+        );
+        assert!(after.list_calls() > before.list_calls(), "the owner listed");
+        assert_eq!(after.delete.calls - before.delete.calls, 2);
+
+        let mut expected = vec![live_key, margin_key];
+        expected.sort();
+        assert_eq!(query_worker_keys(&store).await, expected);
+    }
+
+    /// The maintain tick is the caller: one discovery cycle on a single
+    /// maintain process reaps a dead query-worker record, over a store holding
+    /// no tenant at all.
+    #[tokio::test]
+    async fn a_discovery_cycle_reaps_dead_query_worker_keys() {
+        let now_ms = u64::try_from(WallClock.now_ns() / 1_000_000).expect("a positive clock");
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(now_ms);
+        let live_key = seed(&memory, now_ms, now_ms, WallClock.now_ns()).await;
+        seed(&memory, now_ms - 10 * H_MS, now_ms, 0).await;
+
+        let worker = WorkerSet::with_defaults(0);
+        let mut memo = MaintainMemo::with_default_interval();
+        run_discovery_cycle(
+            &memory,
+            None,
+            &CompactorConfig::default(),
+            &RetentionConfig::default(),
+            1,
+            &mut memo,
+            &TenantDiscoveryMetrics::default(),
+            &MaintenanceSafetyMetrics::default(),
+            &MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS),
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert_eq!(query_worker_keys(&memory).await, vec![live_key]);
+    }
+
+    /// A store that refuses every delete as `AccessDenied`, as S3 does for a
+    /// credential without `s3:DeleteObject`, and counts the deletes.
+    struct DenyDeletes {
+        inner: MemoryStore,
+        deletes: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for DenyDeletes {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::AccessDenied("no s3:DeleteObject".to_string()))
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Every event at WARN or above, as `(level, fields)`.
+    struct EventCapture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let level = *event.metadata().level();
+            if level > tracing::Level::WARN {
+                return;
+            }
+            #[derive(Default)]
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            self.0.lock().push((level, visitor.0));
+        }
+    }
+
+    /// Under a credential with no delete grant, a reap pass over five dead
+    /// records issues exactly one delete, logs the denial once at error with
+    /// the prefix and the undeleted count, logs no per-key warning, and
+    /// returns with the denial reported.
+    #[tokio::test]
+    async fn a_denied_reap_issues_one_delete_and_logs_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(NOW_MS);
+        for _ in 0..5 {
+            seed(&memory, NOW_MS - 10 * H_MS, NOW_MS, NOW_NS - 10 * H_NS).await;
+        }
+        let store = DenyDeletes {
+            inner: memory,
+            deletes: AtomicU64::new(0),
+        };
+        let worker = WorkerSet::with_defaults(NOW_NS);
+
+        let captured: Arc<Mutex<Vec<(tracing::Level, String)>>> = Arc::default();
+        let subscriber = tracing_subscriber::registry().with(EventCapture(captured.clone()));
+        let pass = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            reap_query_worker_heartbeats(&store, &worker, &worker.solo_live_set(), NOW_NS).await
+        };
+
+        assert_eq!(
+            pass,
+            Some(ReapPass {
+                reaped: 0,
+                access_denied: true
+            })
+        );
+        assert_eq!(
+            store.deletes.load(Ordering::SeqCst),
+            1,
+            "the pass stops at the first denied delete"
+        );
+        let events = captured.lock().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one event at warn or above: {events:?}"
+        );
+        let (level, fields) = &events[0];
+        assert_eq!(*level, tracing::Level::ERROR);
+        assert!(
+            fields.contains("prefix=\"sys/query/workers/\"") && fields.contains("undeleted=5"),
+            "the error names the prefix and the undeleted count: {fields}"
+        );
+        assert_eq!(query_worker_keys(&store).await.len(), 5);
     }
 }

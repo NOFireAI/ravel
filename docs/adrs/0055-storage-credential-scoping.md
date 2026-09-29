@@ -61,7 +61,9 @@ per-role grants below. Two facts from that inventory drive this ADR's shape:
    `catalog/*`: the unreferenced-catalog sweep deletes `snap/` and `idx/`
    objects; see the 2026-09-23 amendment below. Nor of `sys/*`: the
    dead-worker reaper deletes `sys/maintain/workers/*`; see the
-   worker-heartbeat amendment below.) This means a
+   worker-heartbeat amendment below. The maintain role also deletes dead
+   query-worker records under `sys/query/workers/*`; see the query-worker
+   reap amendment below.) This means a
    deny-delete policy on the first four prefixes costs no legitimate
    operation anything today — it is a precise fit to what the code already
    guarantees it never needs, not a speculative restriction.
@@ -156,8 +158,8 @@ to reject an in-process authorization side channel.
 | Role | Process | Read | Write (create/mutate) | Delete |
 |---|---|---|---|---|
 | **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | none |
-| **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `admission/query/**` (fleet-global query concurrency reconciliation, ADR-0061 decision 2: LIST the bucket-root `admission/query/` prefix and GET each sibling process's snapshot), `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `admission/query/<process_id>.snapshot` (Overwrite, this process's own fleet-concurrency snapshot, ADR-0061 decision 2 — a bucket-root key, deliberately **not** under a `t/<hash>/` prefix since the ceiling is fleet-global, not per-tenant); `sys/tenancy` (CreateIfAbsent, first-boot race) | none |
-| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see the query-audit shard amendment below), `sys/maintain/workers/*` (dead-worker heartbeat reap, see the worker-heartbeat amendment below) — **the only role with durable-data deletion** |
+| **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `admission/query/**` (fleet-global query concurrency reconciliation, ADR-0061 decision 2: LIST the bucket-root `admission/query/` prefix and GET each sibling process's snapshot), `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `admission/query/<process_id>.snapshot` (Overwrite, this process's own fleet-concurrency snapshot, ADR-0061 decision 2 — a bucket-root key, deliberately **not** under a `t/<hash>/` prefix since the ceiling is fleet-global, not per-tenant); `sys/tenancy` (CreateIfAbsent, first-boot race) | none (a draining query worker overwrites its own `sys/query/workers/<process_id>` record instead of deleting it; see the query-worker reap amendment below) |
+| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see the query-audit shard amendment below), `sys/maintain/workers/*` (dead-worker heartbeat reap, see the worker-heartbeat amendment below), `sys/query/workers/*` (dead query-worker record reap, see the query-worker reap amendment below) — **the only role with durable-data deletion** |
 | **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see the `c/**cmt` write amendment below) | the qualification scratch prefix `sys/qualify/*` only, so `store qualify` can exercise the delete probe (see the qualification scratch delete amendment below); Admin still never deletes tenant data or any protected key |
 
 **Correction:**
@@ -265,7 +267,8 @@ and only over
 `l0/`, `l1/`, `c/`, `idem/`, the query-audit shard `u/0001/**`
 (query-audit shard amendment below), and `del/*.dreq` (selective-erasure
 `del/` amendment below) — never `sys/` (other than the heartbeat keys of the
-worker-heartbeat amendment below), `prov`, `catalog/` (narrowed to
+worker-heartbeat amendment below and the query-worker records of the
+query-worker reap amendment below), `prov`, `catalog/` (narrowed to
 `catalog/*/HEAD` for `maintain.json` by the 2026-09-23 amendment below), or
 the legal-hold shard `u/0000/**` of the audit prefix. The last of those holds for a
 different reason than the other three. Take the delete `Allow` patterns of
@@ -581,7 +584,7 @@ Before/after, expressed as the operations.md IAM wildcards:
 - Deny-delete (all four roles): `t/*/u/*` → `t/*/u/*/0000/*`.
 - Maintain delete grant (`MaintainDelete` only): add `t/*/u/*/0001/*`.
 
-This does not weaken the brick-the-deployment protection or the delete-deny asks: `sys/*` (less the heartbeat keys of the worker-heartbeat amendment below), `prov`,
+This does not weaken the brick-the-deployment protection or the delete-deny asks: `sys/*` (less the heartbeat keys of the worker-heartbeat amendment below and the query-worker records of the query-worker reap amendment below), `prov`,
 `catalog/*` (narrowed to `catalog/*/HEAD` by the 2026-09-23 amendment below),
 and the legal-hold shard remain undeletable by any role. It only
 lets the one role that already owns every delete (Maintain) reclaim the
@@ -707,7 +710,7 @@ Net effect on §1's role table: Admin's write column gains `t/*/*/del/*`
 (create-only); Query's and Maintain's read columns gain `t/*/*/del/*`;
 Maintain's delete column (`MaintainDelete`) gains `t/*/*/del/*.dreq`; and §3's
 `DenyDeleteProtected` deny list gains `t/*/*/del/*.done` for every role. This
-does not weaken the brick-the-deployment protection or any prior delete-deny ask: `sys/*` (less the heartbeat keys of the worker-heartbeat amendment below), `prov`,
+does not weaken the brick-the-deployment protection or any prior delete-deny ask: `sys/*` (less the heartbeat keys of the worker-heartbeat amendment below and the query-worker records of the query-worker reap amendment below), `prov`,
 `catalog/*` (narrowed to `catalog/*/HEAD` by the 2026-09-23 amendment below),
 the legal-hold shard, and now `.done` completion markers remain
 undeletable by any role, and the one new deletable object (`.dreq`) is deleted
@@ -905,10 +908,52 @@ or `prov` is reachable by the new pattern, so the brick-the-deployment
 protection of §2 and §3 is unchanged.
 
 The Query role has the same shape at `sys/query/workers/` and no delete
-grant at all; that is tracked in issue #1995 and not decided here.
+grant at all; that is tracked in issue #1995 and not decided here. The
+query-worker reap amendment below decides it.
 
 Recorded as an appended amendment, with an inline pointer added to each
 place that states Maintain, or every role, deletes nothing under `sys/`:
 the context's list of what the code deletes, §1's Maintain delete column,
 §2's list of what a compromised Maintain credential can delete, and the
 recaps in the query-audit and `del/` amendments.
+
+## Amendment (2026-09-29): Maintain deletes dead query-worker records under `sys/query/workers/`
+
+<!-- amendment-applies: sections="What each role actually does, read from the code|1. Four roles, mapped to existing process boundaries|2. Durable-data delete stays exclusively with Maintain|Amendment: the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete|Amendment: the selective-erasure `del/` paths|Amendment (2026-09-24): Maintain deletes dead-worker heartbeat keys under `sys/maintain/workers/`" pointer="query-worker reap amendment" -->
+
+Issues #1828 and #1995 (item 1). Each query process that takes part in
+distributed fan-out writes its membership record at
+`sys/query/workers/<process_id>`. The query coordinator's heartbeat loop
+used to delete every record past the reap horizon, and a draining
+coordinator deleted its own record. `deploy/iam/query.json` grants no
+delete, so under the shipped template every one of those deletes was
+refused and the prefix grew with every query worker that ever ran.
+
+Owner decision (2026-09-28, on #1828): the reap moves to the maintain role,
+which already holds `s3:DeleteObject`, and the Query role keeps deleting
+nothing. Concretely:
+
+- One maintain process per deployment, the owner of a fixed rendezvous unit
+  over the maintain live set, lists `sys/query/workers/` on its tick and
+  deletes the keys past the reap horizon, judged from LIST metadata alone.
+  `MaintainList` and `MaintainDelete` gain `sys/query/workers/*`, and
+  nothing wider. The reap reads and writes no record, so `MaintainRead` and
+  `MaintainWrite` are unchanged.
+- A draining query coordinator overwrites its own record with a heartbeat
+  stamp no reader accepts as live, using the `PutObject` it already holds,
+  so it leaves every sibling's live set on that sibling's next read without
+  a delete. The record format is unchanged.
+- A reap delete refused as access denied is logged once per pass at error,
+  and the pass issues no further delete, rather than one warning per key.
+
+`deploy/iam/query.json` is unchanged: the Query role still has no delete
+grant, and §2's statement that a Query credential cannot delete an object
+holds as written. None of `sys/tenancy`, `sys/qualification`, `sys/gc` or
+`prov` is reachable by the new pattern, so the brick-the-deployment
+protection of §2 and §3 is unchanged.
+
+Recorded as an appended amendment, with an inline pointer added to the
+context's list of what the code deletes, §1's Query and Maintain delete
+columns, §2's list of what a compromised Maintain credential can delete, the
+recaps in the query-audit and `del/` amendments, and the worker-heartbeat
+amendment's sentence that left this case undecided.

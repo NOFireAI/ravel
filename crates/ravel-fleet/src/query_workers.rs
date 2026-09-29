@@ -36,12 +36,14 @@
 //!
 //! # Bounding the prefix (issue #1761)
 //!
-//! [`QueryWorkers::delete_heartbeat`] removes a key on a graceful drain and on
-//! no other path, so a worker lost to a panic, a kill, an out-of-memory event
-//! or a node loss left its key behind forever and every later [`live_set`] paid
-//! a GET for it. The two bounds [`crate::worker_set`] applies to the maintain
-//! prefix for issue #1679 apply here unchanged, over the same shared
-//! predicates:
+//! The query role deletes nothing (ADR-0055 section 1: `deploy/iam/query.json`
+//! grants no `s3:DeleteObject`), so no query-side path removes a key. A
+//! graceful drain overwrites the process's own record with
+//! [`DRAINED_STAMP_NS`] instead ([`QueryWorkers::mark_drained`]), which every
+//! reader judges stale at once, and a worker lost to a panic, a kill, an
+//! out-of-memory event or a node loss leaves its last record behind. The two
+//! bounds [`crate::worker_set`] applies to the maintain prefix apply here over
+//! the same shared predicates:
 //!
 //! - [`live_set`] skips the GET for a key the LIST result already shows as
 //!   older than the liveness window (`worker_set::mtime_stale`). A record's
@@ -52,20 +54,12 @@
 //!   window widened by `worker_set::REAP_WINDOW_FACTOR`) is deleted, which
 //!   bounds the LIST itself. The extra width is the clock-skew margin between
 //!   the object store's clock (which sets the modification time) and the
-//!   reader's. [`QueryWorkers::live_set_read`] returns those keys from the SAME
-//!   listing it makes for the live set, and the heartbeat loop deletes them
-//!   through [`QueryWorkers::reap_keys`], so the reap costs no listing of its
-//!   own. [`QueryWorkers::reap_dead_workers`] is the standalone form for a
-//!   caller that is not already reading the live set, and it does pay one
-//!   listing. Reaping is idempotent and costs a live-but-skewed worker at most
-//!   one heartbeat interval of invisibility, since it rewrites its key every
-//!   `H`.
-//!
-//! The reap needs `s3:DeleteObject` on this prefix, which the shipped query
-//! role does not have: `deploy/iam/query.json` grants no delete at all. Under
-//! that template every delete here is denied and logged, the GET-skip still
-//! applies, and the prefix stays as large as it was. See issue #1995 before
-//! relying on the bound.
+//!   reader's. The deleter is the maintain role, which holds the delete grant
+//!   on this prefix: one maintain process per deployment calls
+//!   [`reap_dead_query_workers`] on its tick. The reap judges only the LIST
+//!   metadata, so it reads no record. Reaping is idempotent and costs a
+//!   live-but-skewed worker at most one heartbeat interval of invisibility,
+//!   since it rewrites its key every `H`.
 //!
 //! A backend reporting no usable modification time (`<= 0`) gets neither
 //! treatment: its keys are read as before and never reaped. The same holds for
@@ -88,6 +82,27 @@ use crate::worker_set::{
 /// additive control-plane prefix under `sys/query/`, sibling to the maintain
 /// role's `sys/maintain/workers/`. Fixed verbatim; #864 and #865 depend on it.
 pub const QUERY_WORKERS_PREFIX: &str = "sys/query/workers/";
+
+/// The heartbeat stamp a draining worker writes over its own record
+/// ([`QueryWorkers::mark_drained`]). `worker_set::is_stale` saturates, so this
+/// stamp is past the liveness window for every reader clock and every window.
+pub const DRAINED_STAMP_NS: i64 = i64::MIN;
+
+/// The liveness window, in nanoseconds, for a heartbeat interval and liveness
+/// factor: `liveness_factor * H`, the factor clamped to at least 1. The one
+/// computation [`QueryWorkers`] judges siblings by and [`reap_dead_query_workers`]
+/// derives its reap horizon from.
+pub fn liveness_window_ns(heartbeat_interval: Duration, liveness_factor: u32) -> i64 {
+    let h = i64::try_from(heartbeat_interval.as_nanos()).unwrap_or(i64::MAX);
+    h.saturating_mul(i64::from(liveness_factor.max(1)))
+}
+
+/// The liveness window of a query worker built by [`QueryWorkers::with_defaults`],
+/// which is how every query-role process is built. The maintain role reaps
+/// against it, since it runs no query worker of its own to ask.
+pub fn default_liveness_window_ns() -> i64 {
+    liveness_window_ns(DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR)
+}
 
 /// The heartbeat key one query-worker process writes its own record to.
 pub fn query_worker_key(process_id: &str) -> String {
@@ -176,18 +191,6 @@ pub struct QueryWorkers {
     liveness_factor: u32,
 }
 
-/// What one listing of `sys/query/workers/` yields: the live set, and the keys
-/// past the reap horizon. Returned together because the heartbeat loop needs
-/// both on the same cadence over the same prefix, so a second listing would be
-/// pure cost. Mirrors [`crate::worker_set::LiveSetRead`].
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct LiveSetRead {
-    /// Workers inside the liveness window, including this process.
-    pub live: Vec<QueryWorkerRecord>,
-    /// Keys past the reap horizon, for [`QueryWorkers::reap_keys`] to delete.
-    pub reapable: Vec<String>,
-}
-
 impl QueryWorkers {
     /// A query worker with an explicit timing configuration. `liveness_factor`
     /// is clamped to at least 1, matching [`crate::worker_set::WorkerSet::new`].
@@ -259,8 +262,7 @@ impl QueryWorkers {
     /// The staleness window in nanoseconds: `liveness_factor * H` (identical
     /// computation to [`crate::worker_set::WorkerSet`]).
     fn liveness_window_ns(&self) -> i64 {
-        let h = i64::try_from(self.heartbeat_interval.as_nanos()).unwrap_or(i64::MAX);
-        h.saturating_mul(i64::from(self.liveness_factor))
+        liveness_window_ns(self.heartbeat_interval, self.liveness_factor)
     }
 
     /// The record this process advertises at `now_ns` (`started_unix_ns` is the
@@ -283,7 +285,26 @@ impl QueryWorkers {
         store: &dyn ObjectStoreBackend,
         now_ns: i64,
     ) -> Result<(), StoreError> {
-        let record = self.record_at(now_ns);
+        self.put_record(store, now_ns).await
+    }
+
+    /// Overwrite this process's own record with [`DRAINED_STAMP_NS`] as its
+    /// heartbeat stamp. Called on graceful shutdown so a draining query worker
+    /// drops out of every sibling coordinator's live set on that sibling's next
+    /// read, rather than lingering until its last stamp ages past the `3 * H`
+    /// staleness window. A PUT, not a delete: the query role holds
+    /// `PutObject` on this prefix and no delete (ADR-0055 section 1). The key
+    /// itself stays until the maintain role reaps it past the reap horizon.
+    pub async fn mark_drained(&self, store: &dyn ObjectStoreBackend) -> Result<(), StoreError> {
+        self.put_record(store, DRAINED_STAMP_NS).await
+    }
+
+    async fn put_record(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        stamp_ns: i64,
+    ) -> Result<(), StoreError> {
+        let record = self.record_at(stamp_ns);
         let bytes = record
             .encode()
             .map_err(|e| StoreError::Permanent(format!("encode query worker heartbeat: {e}")))?;
@@ -299,20 +320,6 @@ impl QueryWorkers {
             )
             .await?;
         Ok(())
-    }
-
-    /// Delete this process's own heartbeat record. Called on graceful shutdown
-    /// so a draining query worker stops advertising itself to sibling
-    /// coordinators immediately, rather than lingering in their live set until
-    /// its stamp ages past the `3 * H` staleness window. Deletes only the one
-    /// key this process writes (`sys/query/workers/<process_id>`). By
-    /// convention no other process writes that key, so this does not race a
-    /// sibling's heartbeat; the query role's grant does not enforce that. A
-    /// missing key is not an error (`delete` is idempotent).
-    pub async fn delete_heartbeat(&self, store: &dyn ObjectStoreBackend) -> Result<(), StoreError> {
-        store
-            .delete(&query_worker_key(&self.process_id.to_string()))
-            .await
     }
 
     /// Compute the live query-worker set (ADR-0071): this process plus every
@@ -345,27 +352,9 @@ impl QueryWorkers {
         store: &dyn ObjectStoreBackend,
         now_ns: i64,
     ) -> Result<Vec<QueryWorkerRecord>, StoreError> {
-        Ok(self.live_set_read(store, now_ns).await?.live)
-    }
-
-    /// The live set AND the keys past the reap horizon, from ONE listing
-    /// (issue #1761).
-    ///
-    /// The heartbeat loop needs both every interval, and the prefix is the
-    /// same. Returning them together is what makes the reap free rather than a
-    /// second LIST; [`crate::worker_set::WorkerSet::live_set_read`] is the same
-    /// shape for the same reason. A caller that wants only one of the two still
-    /// pays one listing, never two.
-    pub async fn live_set_read(
-        &self,
-        store: &dyn ObjectStoreBackend,
-        now_ns: i64,
-    ) -> Result<LiveSetRead, StoreError> {
         let window = self.liveness_window_ns();
-        let horizon = reap_horizon_ns(window);
         let objects = list_all(store, QUERY_WORKERS_PREFIX).await?;
         let mut live = vec![self.record_at(now_ns)];
-        let mut reapable = Vec::new();
         for meta in objects {
             let Some(pid) = process_id_of(&meta.key) else {
                 tracing::debug!(
@@ -380,12 +369,7 @@ impl QueryWorkers {
             if mtime_stale(now_ns, meta.last_modified_unix_ms, window) {
                 // Already past the liveness window by the LIST's own metadata:
                 // the body could only be older still, so it costs no GET
-                // (issue #1761). Past the wider reap horizon it is also this
-                // listing's reap candidate, collected here so the delete needs
-                // no listing of its own.
-                if mtime_stale(now_ns, meta.last_modified_unix_ms, horizon) {
-                    reapable.push(meta.key.clone());
-                }
+                // (issue #1761).
                 continue;
             }
             let got = store.get(&meta.key, GetRange::Full).await?;
@@ -413,66 +397,91 @@ impl QueryWorkers {
         }
         live.sort_unstable_by(|a, b| a.process_id.cmp(&b.process_id));
         live.dedup_by(|a, b| a.process_id == b.process_id);
-        Ok(LiveSetRead { live, reapable })
+        Ok(live)
     }
+}
 
-    /// Delete the keys a [`live_set_read`] already identified. Issues no
-    /// listing of its own, which is the whole point of taking them as an
-    /// argument.
-    ///
-    /// `delete` is idempotent, so several coordinators reaping the same dead
-    /// key concurrently is not a race. A failed individual delete is logged and
-    /// retried by whichever process next lists the prefix, since a key that
-    /// outlives one tick costs one listing entry and nothing else.
-    ///
-    /// [`live_set_read`]: Self::live_set_read
-    pub async fn reap_keys(&self, store: &dyn ObjectStoreBackend, keys: &[String]) -> u64 {
-        let mut reaped = 0;
-        for key in keys {
-            match store.delete(key).await {
-                Ok(()) => reaped += 1,
-                Err(err) => tracing::warn!(
-                    key = %key,
-                    error = %err,
-                    "query_workers: reaping a dead worker record failed; retried next tick"
-                ),
+/// What one reap pass over `sys/query/workers/` did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReapPass {
+    /// Keys deleted.
+    pub reaped: u64,
+    /// Whether the store refused a delete as [`StoreError::AccessDenied`],
+    /// which ended the pass.
+    pub access_denied: bool,
+}
+
+/// Delete `keys`, each a dead query-worker record, and report what happened.
+///
+/// `delete` is idempotent, so two passes over the same dead key are not a race.
+/// A transient failure on one key is logged per key and retried by the next
+/// pass, since a key that outlives one tick costs one listing entry and nothing
+/// else. An [`StoreError::AccessDenied`] is not per key: it means the caller's
+/// credential lacks the delete grant on the whole prefix, so every remaining
+/// delete would be refused the same way. The pass logs it once at error, with
+/// the prefix and the number of keys left undeleted, and issues no further
+/// delete.
+pub async fn reap_keys(store: &dyn ObjectStoreBackend, keys: &[String]) -> ReapPass {
+    let mut pass = ReapPass::default();
+    for (index, key) in keys.iter().enumerate() {
+        match store.delete(key).await {
+            Ok(()) => pass.reaped += 1,
+            Err(StoreError::AccessDenied(reason)) => {
+                tracing::error!(
+                    prefix = QUERY_WORKERS_PREFIX,
+                    undeleted = keys.len().saturating_sub(index),
+                    error = %reason,
+                    "query_workers: the store denied deleting a dead query-worker record; \
+                     this reap pass issues no further delete, and the prefix grows until the \
+                     reaping credential is granted s3:DeleteObject on it"
+                );
+                pass.access_denied = true;
+                break;
             }
+            Err(err) => tracing::warn!(
+                key = %key,
+                error = %err,
+                "query_workers: reaping a dead worker record failed; retried next tick"
+            ),
         }
-        reaped
     }
+    pass
+}
 
-    /// Delete every record under `sys/query/workers/` that is past the reap
-    /// horizon (issue #1761), judged from the modification time the LIST result
-    /// already carries, and return how many were deleted.
-    ///
-    /// This is the standalone form and it costs one listing. The heartbeat loop
-    /// does NOT use it: that loop already calls [`live_set_read`], which returns
-    /// the same candidates from the listing it was making anyway, so it reaps
-    /// through [`reap_keys`] and pays nothing extra. Use this where no live-set
-    /// read is happening.
-    ///
-    /// Never deletes this process's own key, never deletes a key that does not
-    /// parse as `sys/query/workers/<uuid>` (something else's key under a prefix
-    /// this process does not own is not this function's to reap), and never
-    /// deletes a key whose modification time the backend reports as unknown or
-    /// as being in the future. The horizon is `reap_horizon_ns` of the liveness
-    /// window, so a worker whose record merely aged out of the live set keeps a
-    /// full extra window of grace against clock skew before it is reaped.
-    ///
-    /// A failed LIST is an `Err` the caller can treat fail-open; a failed
-    /// individual delete is logged and retried by whichever process next lists
-    /// the prefix.
-    ///
-    /// [`live_set_read`]: Self::live_set_read
-    /// [`reap_keys`]: Self::reap_keys
-    pub async fn reap_dead_workers(
-        &self,
-        store: &dyn ObjectStoreBackend,
-        now_ns: i64,
-    ) -> Result<u64, StoreError> {
-        let read = self.live_set_read(store, now_ns).await?;
-        Ok(self.reap_keys(store, &read.reapable).await)
-    }
+/// Delete every record under `sys/query/workers/` past the reap horizon of
+/// `liveness_window_ns` (issue #1761), judged from the modification time the
+/// LIST result already carries. Costs one listing and reads no record.
+///
+/// The maintain role is the caller: it holds the delete grant on this prefix
+/// and the query role does not (ADR-0055 section 1). Pass
+/// [`default_liveness_window_ns`] unless the query workers were built with a
+/// non-default timing.
+///
+/// Never deletes a key that does not parse as `sys/query/workers/<uuid>`
+/// (something else's key under this prefix is not this function's to reap),
+/// and never deletes a key whose modification time the backend reports as
+/// unknown or as being in the future. The horizon is `reap_horizon_ns` of the
+/// liveness window, so a worker whose record merely aged out of the live set
+/// keeps a full extra window of grace against clock skew before it is reaped.
+///
+/// A failed LIST is an `Err` the caller can treat fail-open; the deletes go
+/// through [`reap_keys`].
+pub async fn reap_dead_query_workers(
+    store: &dyn ObjectStoreBackend,
+    now_ns: i64,
+    liveness_window_ns: i64,
+) -> Result<ReapPass, StoreError> {
+    let horizon = reap_horizon_ns(liveness_window_ns);
+    let reapable: Vec<String> = list_all(store, QUERY_WORKERS_PREFIX)
+        .await?
+        .into_iter()
+        .filter(|meta| {
+            process_id_of(&meta.key).is_some()
+                && mtime_stale(now_ns, meta.last_modified_unix_ms, horizon)
+        })
+        .map(|meta| meta.key)
+        .collect();
+    Ok(reap_keys(store, &reapable).await)
 }
 
 #[cfg(test)]
@@ -674,12 +683,24 @@ mod tests {
         );
     }
 
-    /// After a worker deletes its own heartbeat, a sibling's live set stops
-    /// including it immediately, without waiting for the `3 * H` staleness
-    /// window to age the record out.
+    /// After a worker marks itself drained, a sibling's live set stops
+    /// including it on the sibling's next read, without waiting for the `3 * H`
+    /// staleness window to age the record out, and the drain issued no delete:
+    /// the query role holds no delete grant. The key itself stays for the
+    /// maintain role to reap.
+    ///
+    /// Every delete under the prefix is scripted to fail, so a drain that
+    /// deleted anything shows up as a fired fault.
     #[tokio::test]
-    async fn deleted_heartbeat_drops_from_the_live_set_immediately() {
-        let store = MemoryStore::new();
+    async fn drained_worker_drops_from_the_live_set_without_a_delete() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Delete,
+                ScriptedFault::Transient("a query-side delete".into()),
+            )
+            .with_key_contains(QUERY_WORKERS_PREFIX),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
         let now = 1_000 * H_NS;
         let a = worker();
         let b = worker();
@@ -689,29 +710,26 @@ mod tests {
 
         // Both fresh: `a` sees both, at the same reader clock.
         let live = a.live_set(&store, now).await.expect("live set");
-        assert_eq!(live.len(), 2, "both workers live before delete");
+        assert_eq!(live.len(), 2, "both workers live before the drain");
 
-        // `b` drains and deletes its record; `a` re-reads at the SAME clock, so
-        // only the deletion (not staleness) can drop `b`.
-        b.delete_heartbeat(&store).await.expect("b delete");
+        // `b` drains; `a` re-reads at the SAME clock, so only the drain (not
+        // staleness) can drop `b`.
+        b.mark_drained(&store).await.expect("b drain");
         let live = a.live_set(&store, now).await.expect("live set");
-        assert_eq!(
-            live.len(),
-            1,
-            "only self survives after the sibling deletes"
-        );
+        assert_eq!(live.len(), 1, "only self survives after the sibling drains");
         assert_eq!(live[0].process_id, a.process_id().to_string());
-        assert!(
-            !live
-                .iter()
-                .any(|r| r.process_id == b.process_id().to_string()),
-            "a deleted worker must not read as live even within its window"
-        );
 
-        // Idempotent: deleting an already-absent key is not an error.
-        b.delete_heartbeat(&store)
-            .await
-            .expect("second delete is a no-op");
+        assert_eq!(
+            store.fault_count(Op::Delete, FaultKind::Transient),
+            0,
+            "the drain must issue no delete under sys/query/workers/"
+        );
+        assert!(
+            query_worker_keys(&store)
+                .await
+                .contains(&query_worker_key(&b.process_id().to_string())),
+            "the drained record is still there, for the maintain role to reap"
+        );
     }
 
     /// A far-future-dated record must be excluded exactly like a far-past one,
@@ -804,9 +822,9 @@ mod tests {
 
     /// The reaper deletes exactly the keys past the reap horizon (issue #1761):
     /// dead workers go, a worker inside the clock-skew margin stays even though
-    /// it is already out of the live set, a fresh worker stays, a key whose
-    /// modification time is in the future stays, this process's own key stays,
-    /// and a key that is not `sys/query/workers/<uuid>` is left alone.
+    /// it is already out of the live set, fresh workers stay, a key whose
+    /// modification time is in the future stays, and a key that is not
+    /// `sys/query/workers/<uuid>` is left alone.
     async fn reap_case(memory: MemoryStore) {
         let now_ns = 1_000 * H_NS;
         let now_ms = 1_000 * H_MS;
@@ -860,8 +878,18 @@ mod tests {
             .expect("seed foreign key");
         store.set_clock_ms(now_ms);
 
-        let reaped = me.reap_dead_workers(&store, now_ns).await.expect("reap");
-        assert_eq!(reaped, 3, "exactly the three keys past the horizon");
+        let window = default_liveness_window_ns();
+        let pass = reap_dead_query_workers(&store, now_ns, window)
+            .await
+            .expect("reap");
+        assert_eq!(
+            pass,
+            ReapPass {
+                reaped: 3,
+                access_denied: false
+            },
+            "exactly the three keys past the horizon"
+        );
 
         let mut expected = vec![
             query_worker_key(&me.process_id().to_string()),
@@ -879,9 +907,10 @@ mod tests {
 
         // Reaping again is idempotent: nothing left is past the horizon.
         assert_eq!(
-            me.reap_dead_workers(&store, now_ns)
+            reap_dead_query_workers(&store, now_ns, window)
                 .await
-                .expect("second reap"),
+                .expect("second reap")
+                .reaped,
             0
         );
     }
@@ -898,59 +927,47 @@ mod tests {
         reap_case(MemoryStore::with_page_size(2)).await;
     }
 
-    /// The tick's listing serves both purposes: `live_set_read` returns the
-    /// live set AND the reap candidates from ONE listing, so reaping costs no
-    /// second LIST of the same prefix.
-    ///
-    /// Asserted through the FaultStore's LIST counter, because that is the
-    /// claim: one listing, not two.
+    /// A transient failure on one delete is per key: the pass logs it, goes on
+    /// to the remaining keys, and does not report a denial. Only
+    /// `AccessDenied` ends a pass early.
     #[tokio::test]
-    async fn one_listing_serves_both_the_live_set_and_the_reap() {
+    async fn a_transient_delete_failure_does_not_end_the_reap_pass() {
         let now_ns = 1_000 * H_NS;
         let now_ms = 1_000 * H_MS;
         let memory = MemoryStore::new();
         memory.set_clock_ms(now_ms);
-
-        let me = worker();
-        let dead = worker();
-
-        // Seed through the memory store directly: the rule below matches
-        // `list`, and seeding is `put`, but going through the plain store
-        // keeps the scripted occurrence counting only the read path.
-        beat_with_mtime(&memory, &memory, &me, now_ms, now_ms, now_ns).await;
-        beat_with_mtime(
-            &memory,
-            &memory,
-            &dead,
-            now_ms - 10 * H_MS,
-            now_ms,
-            now_ns - 10 * H_NS,
-        )
-        .await;
-
-        // Fault the SECOND listing of this prefix: a shape that called
-        // `live_set` and then `reap_dead_workers` would list twice and trip it.
+        for _ in 0..3 {
+            beat_with_mtime(
+                &memory,
+                &memory,
+                &worker(),
+                now_ms - 10 * H_MS,
+                now_ms,
+                now_ns - 10 * H_NS,
+            )
+            .await;
+        }
         let store = FaultStore::new(
             memory,
             FaultPlan::empty().with_rule(
-                Rule::new(
-                    Op::List,
-                    ScriptedFault::Transient("a second listing".into()),
-                )
-                .with_occurrence(Occurrence::Nth(2)),
+                Rule::new(Op::Delete, ScriptedFault::Transient("a blip".into()))
+                    .with_occurrence(Occurrence::Nth(1)),
             ),
         );
 
-        let read = me.live_set_read(&store, now_ns).await.expect("one read");
-        let reaped = me.reap_keys(&store, &read.reapable).await;
+        let pass = reap_dead_query_workers(&store, now_ns, default_liveness_window_ns())
+            .await
+            .expect("reap");
 
+        assert_eq!(store.fault_count(Op::Delete, FaultKind::Transient), 1);
         assert_eq!(
-            store.fault_count(Op::List, FaultKind::Transient),
-            0,
-            "the live set and the reap must come from one listing, not two"
+            pass,
+            ReapPass {
+                reaped: 2,
+                access_denied: false
+            },
+            "the two keys after the failed one were still deleted"
         );
-        assert_eq!(reaped, 1, "the dead worker's key was reaped");
-        assert_eq!(read.live.len(), 1, "only this process is live");
-        assert_eq!(read.live[0].process_id, me.process_id().to_string());
+        assert_eq!(query_worker_keys(&store).await.len(), 1);
     }
 }
