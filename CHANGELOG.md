@@ -297,6 +297,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ravel-cli load --signal logs` and `--signal metrics` name the unit a
+  negative timestamp was read in** (issue #2133). For a native Arrow
+  `Timestamp` ts column the loader scales by the column's own unit, but the
+  refusal named the declared `ts_unit` instead; a `Timestamp(Second)` cell of
+  -5 under `ts_unit = "nanos"` reported "read as ts_unit = nanos". It now
+  reports "read in the column's own Timestamp unit, seconds". An integer column
+  still names `ts_unit`.
 - **`ravel-cli load --signal logs` loads a dictionary-encoded hex `trace_id` or
   `span_id` column** (issue #2116). A default Parquet writer dictionary-encodes
   string columns, and the columnar logs path refused such an id column with

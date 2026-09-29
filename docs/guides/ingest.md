@@ -781,14 +781,17 @@ key layout, strict-ack contract, and the RLOG format itself are unchanged: this
 is a CPU path, and a columnar load writes byte-for-byte the same objects a
 record-path load would.
 
-When a mapped string column arrives **dictionary-encoded** -- an Arrow
-`Dictionary` column, which a Parquet file carries when its writer embedded Arrow
-dictionary schema metadata -- the loader passes the dictionary through so the
-writer pays string encoding and token-bloom cost once per distinct value instead
-of once per row. A plain `BYTE_ARRAY` string column (the common case for a
-Parquet file not written by Arrow, including a dictionary-page-encoded one whose
-file carries no Arrow schema) decodes to a plain Arrow string column and stays on
-the per-row string path; both produce identical output.
+When a mapped string column arrives **dictionary-encoded**, the loader passes
+the dictionary through so the writer pays string encoding and token-bloom cost
+once per distinct value instead of once per row. A column arrives that way when
+the file's embedded Arrow schema already types it as an Arrow `Dictionary`, and
+also when it is a top-level UTF-8 `BYTE_ARRAY` column whose every data page, in
+every row group, is dictionary-encoded: the loader reads such a column as an
+Arrow `Dictionary` whether or not the file carries an Arrow schema. A string
+column with any plainly encoded page (a writer's dictionary that outgrew its
+page limit and fell back to plain, as a unique-per-row column does) or nested
+below the top level decodes to a plain Arrow string column and stays on the
+per-row string path; both produce identical output.
 
 A mapped `trace_id` or `span_id` column loads whether it is plain or
 dictionary-encoded: a hex id column that a default Parquet writer
@@ -990,9 +993,12 @@ costs every later query the bulk objects' fetch.
   undiscoverable.
 - **A negative timestamp: refused, for all three signals.** OTLP's timestamps
   are unsigned and have no negative to express. A logs or metrics row whose
-  `ts`, read in the declared `ts_unit`, falls before the Unix epoch is a row
-  rejection that names `ts_unit`, as the spans load's refusal of a negative
-  start or end names both of its units. Converting a unit never turns a
+  `ts` falls before the Unix epoch is a row rejection that names the unit the
+  value was read in: the declared `ts_unit` for an integer column, the
+  column's own unit for a native Arrow `Timestamp` column, which the declared
+  `ts_unit` does not rescale. A timestamp of exactly 0 is the epoch itself and
+  loads. The spans load's refusal of a negative start or end names both of
+  its declared units. Converting a unit never turns a
   positive value negative, so the refusal always means the column holds a
   negative cell; a mis-declared unit instead lands rows at the wrong time
   without a refusal.
