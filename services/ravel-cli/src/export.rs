@@ -1,19 +1,15 @@
 //! `ravel-cli export`: bulk read-out of a tenant's stored records into a
 //! Parquet file, the inverse of `ravel-cli load` (ADR-1751 decision 4).
 //!
-//! Only `--signal logs` is implemented. Bulk import for metrics and for spans
-//! has landed (`load --signal metrics`, `load --signal spans`), so what an
-//! export of either now waits on is its own follow-up, ADR-1751 follow-up
-//! task 3, which is where each signal's read path and the round trip back
-//! through `load` are worked out. The output columns are not open: decision 4
-//! already says the same mapping TOML names them.
-//! [`unsupported_signal_message`] refuses those two by name rather than
-//! producing an empty file.
+//! `--signal logs` and `--signal metrics` are implemented. Spans export is the
+//! remaining part of ADR-1751 follow-up task 3, and
+//! [`unsupported_signal_message`] refuses it by name rather than producing an
+//! empty file.
 //!
 //! # What makes this a store read rather than a query
 //!
 //! The export resolves the catalog once, at a single snapshot, and reads the
-//! RLOG objects that snapshot names. It plans no SQL and contacts no
+//! RLOG (logs) or RSEG (metrics) objects that snapshot names. It plans no SQL and contacts no
 //! `ravel-server`; it does read object storage directly, one LIST wave per
 //! resolve and a GET per surviving segment, so against S3 it is as remote as
 //! any other read. What it shares with a query is the visibility layer: the
@@ -31,7 +27,11 @@
 //!   [`ravel_query::erasure::retain_unerased_log_records`], the same function
 //!   the SQL scan's exclusion calls. That second pass matches the merged
 //!   resource + scope + record attributes, so a subject named only in a
-//!   resource or scope attribute is excluded too.
+//!   resource or scope attribute is excluded too. A metrics export runs the
+//!   same predicates over the fetched series with
+//!   [`ravel_query::erasure::retain_series_soa`] and
+//!   [`ravel_query::erasure::retain_histogram_series`], the functions the
+//!   query engine calls on its own fetch.
 //!
 //! # Memory and mid-export store changes
 //!
@@ -49,11 +49,13 @@
 //! # Window semantics
 //!
 //! `--start`/`--end` are a half-open event-time window `[start, end)`: a
-//! record at exactly `--end` is not exported. `LogQuery`'s own range is
-//! inclusive on both ends, so the fetch asks for `[start, end - 1]`
+//! record at exactly `--end` is not exported. For logs, `LogQuery`'s own
+//! range is inclusive on both ends, so the fetch asks for `[start, end - 1]`
 //! ([`fetch_range_end_ns`]), and the half-open bound is applied a second time
 //! over the decoded rows ([`in_export_window`]) so the two spellings of the
-//! same bound cannot drift apart unnoticed.
+//! same bound cannot drift apart unnoticed. For metrics, the segment fetch
+//! takes no range, so [`in_export_window`] over the decoded samples is the
+//! only place the window is applied.
 //!
 //! # Round-tripping through `ravel-cli load`
 //!
@@ -63,7 +65,38 @@
 //! is `ts_unit`: the stored event time is nanoseconds and the `ts` column is
 //! written in the mapping's unit, so a mapping declaring `millis` truncates
 //! sub-millisecond precision. A file exported under the same mapping it was
-//! loaded with never has sub-unit precision to lose.
+//! loaded with never has sub-unit precision to lose. A metrics export refuses
+//! a sample with sub-unit precision instead of truncating it, because a
+//! truncated timestamp re-loads as a different sample.
+//!
+//! # Metrics: duplicates and series identity
+//!
+//! The query path serves one sample per `(series, ts)`: the candidate with the
+//! greatest `(created_unix_ns, writer_epoch, writer_seq, in_page_index)`
+//! provenance, ties broken by the greatest `f64::to_bits` of the value
+//! (docs/catalog-and-mvcc.md). The export writes exactly that sample and
+//! counts every other candidate as `samples_deduplicated`, so two loads of one
+//! sample export as one row whatever their bit patterns.
+//!
+//! Loading a metrics file does not store names as written: it sanitizes the
+//! metric and label names, appends the unit suffix and, for `kind =
+//! "counter"`, `_total`, and drops an empty label value. A stored name already
+//! carries those suffixes, so the export writes, for each series, the name the
+//! load maps back onto the stored one: the stored name itself when the load
+//! leaves it unchanged (every suffix the load would add is already there),
+//! otherwise the stored name less its trailing `_total` (a counter with a
+//! unit, where the unit suffix sits before `_total`), less its unit suffix, or
+//! less both (a name the suffixes took past the metric-name length cap, which
+//! the load applies to the name as written). Each candidate is checked
+//! by running the load's own naming rule over it, so an export never writes a
+//! name that re-loads onto a different series; a series no candidate
+//! reproduces is refused by name. A `name` literal mapping writes no name
+//! column, since the load names every row from the literal, and exports only
+//! the series that literal names. A series carrying a label the mapping does
+//! not name is refused, because the re-load would drop it. A
+//! `[metrics.histogram]` mapping is refused outright
+//! ([`HISTOGRAM_MAPPING_REFUSAL`]): export the exploded series with a scalar
+//! mapping instead.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -74,17 +107,23 @@ use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder,
     MapBuilder, StringBuilder,
 };
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use ravel_logseg::record::{attr_value_to_string, decode_stream_attrs};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_query::erasure::{retain_unerased_log_records, snapshot_pending_erasure_predicates};
-use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_otlp::IngestLimits;
+use ravel_otlp::normalize::prometheus_family_name;
+use ravel_query::erasure::{
+    retain_histogram_series, retain_series_soa, retain_unerased_log_records,
+    snapshot_pending_erasure_predicates,
+};
+use ravel_query::{FetchedSeriesSoa, LogQuery, LogSegmentFetcher, SegmentFetcher};
 use ravel_types::accounting::QueryAccounting;
-use ravel_types::{Signal, TenantId, TimeRange};
+use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 
-use crate::load::{ColType, Mapping};
+use crate::load::{ColType, Mapping, MetricsMapping, normalized_family_name};
 use crate::maintain::SignalArg;
 use crate::store::{StoreSelection, require_tenant_data_present};
 
@@ -110,32 +149,68 @@ pub struct ExportReport {
     pub erasure_predicates: usize,
 }
 
+/// What one `export --signal metrics` run did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsExportReport {
+    /// Rows written to the output file: one per `(series, ts)` in
+    /// `[start_ns, end_ns)` that survived erasure exclusion, after
+    /// deduplication.
+    pub rows_written: u64,
+    /// Series that contributed at least one row.
+    pub series_written: u64,
+    /// Series with samples in the window that a `name` literal mapping does
+    /// not select, because their metric name is not the one the literal
+    /// loads as. Always zero for a `name_column` mapping, which selects every
+    /// series or refuses.
+    pub series_skipped: u64,
+    /// Segments the resolved snapshot named and the fetcher read.
+    pub segments_read: u64,
+    /// Segments `Catalog::resolve` pruned by event-time range before any
+    /// object was fetched.
+    pub segments_pruned: u64,
+    /// Pending selective-erasure predicates applied to this read.
+    pub erasure_predicates: usize,
+    /// In-window samples of a selected series that lost the per-`(series,
+    /// ts)` duplicate resolution to another sample and were not written.
+    pub samples_deduplicated: u64,
+}
+
+/// The refusal a `[metrics.histogram]` mapping gets from `export --signal
+/// metrics`.
+pub const HISTOGRAM_MAPPING_REFUSAL: &str = "export --signal metrics cannot write a mapping with \
+     [metrics.histogram]: a load explodes each of its rows into _bucket, _sum and _count series \
+     and accumulates the bucket counts, and the stored series do not record which of them were \
+     one data point, so no file in that shape re-loads onto the same series. Export the exploded \
+     series with a scalar mapping instead (no [metrics.histogram], no unit, no kind, name_column \
+     for the metric name and a [[metrics.label]] for le); loading that file with the same scalar \
+     mapping reproduces the same series and samples.";
+
 /// Why `signal` cannot be exported yet, or `None` when it can.
 ///
-/// `logs` is the only supported signal. Bulk import for metrics (follow-up 1)
-/// and for spans (follow-up 2) has landed, so the missing piece each of them
-/// now waits on is export itself, ADR-1751 follow-up task 3. The message names
-/// that and stops there: ADR-1751 decision 4 already settles the output
-/// columns (the same mapping TOML names them), so a refusal saying the
-/// follow-up decides them contradicts the decision record. Refusing by name
-/// keeps naming what is missing rather than reporting an empty file.
+/// `logs` and `metrics` are supported. Bulk import for spans has landed, so
+/// the missing piece spans export waits on is export itself, the rest of
+/// ADR-1751 follow-up task 3. The message names that and stops there:
+/// ADR-1751 decision 4 already settles the output columns (the same mapping
+/// TOML names them), so a refusal saying the follow-up decides them
+/// contradicts the decision record.
 pub fn unsupported_signal_message(signal: SignalArg) -> Option<String> {
-    let (name, loader) = match signal {
-        SignalArg::Logs => return None,
-        SignalArg::Metrics => ("metrics", "load --signal metrics"),
-        SignalArg::Spans => ("spans", "load --signal spans"),
-    };
-    Some(format!(
-        "export --signal {name} is not available: it is ADR-1751 follow-up task 3. Bulk import \
-         for {name} has landed (`{loader}`), so this is the remaining half of that round trip. \
-         Only --signal logs is supported."
-    ))
+    match signal {
+        SignalArg::Logs | SignalArg::Metrics => None,
+        SignalArg::Spans => Some(
+            "export --signal spans is not available: it is ADR-1751 follow-up task 3. Bulk \
+             import for spans has landed (`load --signal spans`), so this is the remaining half \
+             of that round trip. Only --signal logs and --signal metrics are supported."
+                .to_string(),
+        ),
+    }
 }
 
 /// Parse the `--mapping` file and run the export, or refuse the signal.
 ///
 /// The signal check runs before the mapping file is opened, so refusing an
-/// unsupported signal does not first fail on an unrelated path error.
+/// unsupported signal does not first fail on an unrelated path error. The
+/// mapping section read is the one `--signal` names, under the same section
+/// rules `load` applies.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: Arc<dyn ObjectStoreBackend>,
@@ -155,6 +230,32 @@ pub async fn run(
     }
     let text = std::fs::read_to_string(mapping_path)
         .with_context(|| format!("failed to read --mapping {}", mapping_path.display()))?;
+    if signal == SignalArg::Metrics {
+        let mapping = crate::load::parse_metrics_mapping(&text)?;
+        selection.print_header();
+        let report = export_metrics(
+            store,
+            selection,
+            tenant,
+            start_ns,
+            end_ns,
+            &mapping,
+            out,
+            shards,
+            max_ingest_lag_ns,
+            now_ns,
+        )
+        .await?;
+        println!("output: {}", out.display());
+        println!("rows_written: {}", report.rows_written);
+        println!("series_written: {}", report.series_written);
+        println!("series_skipped: {}", report.series_skipped);
+        println!("segments_read: {}", report.segments_read);
+        println!("segments_pruned: {}", report.segments_pruned);
+        println!("erasure_predicates: {}", report.erasure_predicates);
+        println!("samples_deduplicated: {}", report.samples_deduplicated);
+        return Ok(());
+    }
     let mapping = crate::load::parse_mapping(&text)?;
     selection.print_header();
     let report = export_logs(
@@ -210,35 +311,22 @@ pub async fn export_logs(
     max_ingest_lag_ns: Option<i64>,
     now_ns: i64,
 ) -> anyhow::Result<ExportReport> {
-    if end_ns <= start_ns {
-        anyhow::bail!(
-            "--end must be after --start: the export window is half-open [start, end), and \
-             [{start_ns}, {end_ns}) is empty"
-        );
-    }
+    check_window(start_ns, end_ns)?;
     check_output_path(out)?;
     let tenant_hash = TenantId::new(tenant).hash();
     require_tenant_data_present(selection, store.as_ref(), "export", tenant, &tenant_hash).await?;
 
-    // Enforcing, matching the server's query path and `catalog list`: the
-    // tenant's real shard-generation history decides which shards each hour is
-    // scanned across, instead of short-circuiting to generation 0 and
-    // under-scanning `0..--shards` after a reshard-increase.
-    let mut catalog_config = ravel_catalog::CatalogConfig {
-        shard_count: shards,
-        ..ravel_catalog::CatalogConfig::default()
-    };
-    if let Some(ns) = max_ingest_lag_ns {
-        catalog_config.max_ingest_lag_ns = ns;
-    }
-    let catalog = ravel_catalog::Catalog::new(Arc::clone(&store), catalog_config)
-        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
-        .with_provisioning_enforcement();
-    let range = TimeRange { start_ns, end_ns };
-    let snapshot = catalog
-        .resolve(&tenant_hash, Signal::Logs, range, &[], now_ns)
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to resolve catalog: {err}"))?;
+    let snapshot = resolve_snapshot(
+        &store,
+        &tenant_hash,
+        Signal::Logs,
+        start_ns,
+        end_ns,
+        shards,
+        max_ingest_lag_ns,
+        now_ns,
+    )
+    .await?;
 
     let predicates = snapshot_pending_erasure_predicates(&snapshot);
     let erasure_predicates = predicates.len();
@@ -307,6 +395,572 @@ fn in_export_window(ts_ns: i64, start_ns: i64, end_ns: i64) -> bool {
     ts_ns >= start_ns && ts_ns < end_ns
 }
 
+fn check_window(start_ns: i64, end_ns: i64) -> anyhow::Result<()> {
+    if end_ns <= start_ns {
+        anyhow::bail!(
+            "--end must be after --start: the export window is half-open [start, end), and \
+             [{start_ns}, {end_ns}) is empty"
+        );
+    }
+    Ok(())
+}
+
+/// Resolves the tenant's `signal` catalog for `[start_ns, end_ns)` at one
+/// snapshot.
+///
+/// Enforcing, matching the server's query path and `catalog list`: the
+/// tenant's real shard-generation history decides which shards each hour is
+/// scanned across, instead of short-circuiting to generation 0 and
+/// under-scanning `0..--shards` after a reshard-increase.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_snapshot(
+    store: &Arc<dyn ObjectStoreBackend>,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    start_ns: i64,
+    end_ns: i64,
+    shards: u32,
+    max_ingest_lag_ns: Option<i64>,
+    now_ns: i64,
+) -> anyhow::Result<ravel_catalog::Snapshot> {
+    let mut catalog_config = ravel_catalog::CatalogConfig {
+        shard_count: shards,
+        ..ravel_catalog::CatalogConfig::default()
+    };
+    if let Some(ns) = max_ingest_lag_ns {
+        catalog_config.max_ingest_lag_ns = ns;
+    }
+    let catalog = ravel_catalog::Catalog::new(Arc::clone(store), catalog_config)
+        .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
+        .with_provisioning_enforcement();
+    let range = TimeRange { start_ns, end_ns };
+    catalog
+        .resolve(tenant_hash, signal, range, &[], now_ns)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to resolve catalog: {err}"))
+}
+
+/// Export the metric samples a tenant holds in `[start_ns, end_ns)` to a
+/// Parquet file laid out by `mapping`: one row per `(series, ts)`, sorted by
+/// event time, carrying the columns the `[metrics]` section names.
+///
+/// `shards`, `max_ingest_lag_ns` and `out` mean what they mean for
+/// [`export_logs`]. A mapping shape the export refuses (a
+/// `[metrics.histogram]`, an unusable `name` literal, two fields sharing one
+/// output column), and an unusable `out`, are all refused before any
+/// object-store request.
+///
+/// The whole export is refused, and nothing is written, when a series in the
+/// window cannot be written so that `load` with the same mapping lands it on
+/// the same series (see the module documentation): a stored name no
+/// `name_column` spelling loads back as, a label the mapping does not name, a
+/// native-histogram series, or a sample whose timestamp is not a whole number
+/// of the mapping's `ts_unit`.
+#[allow(clippy::too_many_arguments)]
+pub async fn export_metrics(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    start_ns: i64,
+    end_ns: i64,
+    mapping: &MetricsMapping,
+    out: &Path,
+    shards: u32,
+    max_ingest_lag_ns: Option<i64>,
+    now_ns: i64,
+) -> anyhow::Result<MetricsExportReport> {
+    check_window(start_ns, end_ns)?;
+    if mapping.is_histogram() {
+        anyhow::bail!(HISTOGRAM_MAPPING_REFUSAL);
+    }
+    check_metrics_output_columns(mapping)?;
+    let limits = IngestLimits::default();
+    let literal_family_name = match &mapping.name {
+        Some(literal) => Some(reloaded_family_name(literal, mapping, &limits).ok_or_else(
+            || {
+                anyhow::anyhow!(
+                    "--mapping [metrics] name {literal:?} is unusable: it is empty or longer \
+                     than the metric-name limit of {}",
+                    limits.max_metric_name_len
+                )
+            },
+        )?),
+        None => None,
+    };
+    check_output_path(out)?;
+    let tenant_hash = TenantId::new(tenant).hash();
+    require_tenant_data_present(selection, store.as_ref(), "export", tenant, &tenant_hash).await?;
+
+    let snapshot = resolve_snapshot(
+        &store,
+        &tenant_hash,
+        Signal::Metrics,
+        start_ns,
+        end_ns,
+        shards,
+        max_ingest_lag_ns,
+        now_ns,
+    )
+    .await?;
+    let predicates = snapshot_pending_erasure_predicates(&snapshot);
+    let erasure_predicates = predicates.len();
+    let fetcher = SegmentFetcher::new(Arc::clone(&store));
+    let accounting = QueryAccounting::new();
+    let selects = |labels: &LabelSet| match &literal_family_name {
+        Some(family) => labels.get(METRIC_NAME_LABEL) == Some(family.as_str()),
+        None => true,
+    };
+
+    let mut by_series: HashMap<SeriesId, SeriesCandidates> = HashMap::new();
+    let mut skipped: HashSet<SeriesId> = HashSet::new();
+    let mut segments_read = 0u64;
+    for seg_ref in &snapshot.segments {
+        let (mut scalar, _stats, mut histograms) = fetcher
+            .fetch_soa_and_histograms_accounted(tenant_hash, seg_ref, &[], &accounting)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to read metric segment {}: {err}",
+                    seg_ref.data_object_key
+                )
+            })?;
+        segments_read += 1;
+        retain_series_soa(&mut scalar, &predicates);
+        retain_histogram_series(&mut histograms, &predicates);
+        for series in &histograms {
+            if !series
+                .timestamps
+                .iter()
+                .any(|ts_ns| in_export_window(*ts_ns, start_ns, end_ns))
+            {
+                continue;
+            }
+            if !selects(&series.labels) {
+                skipped.insert(series.series_id);
+                continue;
+            }
+            anyhow::bail!(
+                "series {} holds native (exponential) histogram samples in [{start_ns}, \
+                 {end_ns}), which a [metrics] mapping cannot carry: native histograms are not \
+                 mappable in this version, and an export that left them out would not round-trip \
+                 the window. Export a window that holds none{}.",
+                describe_series(&series.labels),
+                if literal_family_name.is_some() {
+                    ""
+                } else {
+                    ", or name one metric with a name literal"
+                }
+            );
+        }
+        for run in scalar {
+            collect_run(&mut by_series, run, start_ns, end_ns)?;
+        }
+    }
+
+    let label_index: HashMap<String, usize> = mapping
+        .sanitized_label_names()
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (name, i))
+        .collect();
+    let factor = mapping.ts_unit.factor();
+    let mut samples_deduplicated = 0u64;
+    let mut series_out: Vec<OutputSeries> = Vec::new();
+    for (series_id, candidates) in by_series {
+        if candidates.samples.is_empty() {
+            continue;
+        }
+        if !selects(&candidates.labels) {
+            skipped.insert(series_id);
+            continue;
+        }
+        let stored_name = candidates.labels.get(METRIC_NAME_LABEL).ok_or_else(|| {
+            anyhow::anyhow!(
+                "series {} carries no {METRIC_NAME_LABEL} label, so no mapping can name it",
+                describe_series(&candidates.labels)
+            )
+        })?;
+        let written_name = match literal_family_name {
+            Some(_) => None,
+            None => Some(
+                written_metric_name(stored_name, mapping, &limits)
+                    .ok_or_else(|| unwritable_name(&candidates.labels, mapping, &limits))?,
+            ),
+        };
+        let label_values = mapped_label_values(&candidates.labels, mapping, &label_index)?;
+        let (samples, dropped) = resolve_duplicates(candidates.samples);
+        samples_deduplicated += dropped;
+        if let Some((ts_ns, _)) = samples.iter().find(|(ts_ns, _)| ts_ns % factor != 0) {
+            anyhow::bail!(
+                "a sample of series {} is at {ts_ns} ns, which is not a whole number of {} (the \
+                 mapping's ts_unit); writing it in {} would move it onto a different timestamp. \
+                 Export with a finer ts_unit.",
+                describe_series(&candidates.labels),
+                mapping.ts_unit.as_str(),
+                mapping.ts_unit.as_str()
+            );
+        }
+        series_out.push(OutputSeries {
+            sort_key: candidates
+                .labels
+                .iter()
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect(),
+            written_name,
+            label_values,
+            samples,
+        });
+    }
+    // Rows sort by event time, then by label set, so the file is the same for
+    // the same store contents whatever order the segments were fetched in.
+    series_out.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    let mut rows: Vec<MetricRow> = series_out
+        .iter()
+        .enumerate()
+        .flat_map(|(series, s)| {
+            s.samples
+                .iter()
+                .enumerate()
+                .map(move |(sample, (ts_ns, _))| MetricRow {
+                    ts_ns: *ts_ns,
+                    series,
+                    sample,
+                })
+        })
+        .collect();
+    rows.sort_by_key(|row| (row.ts_ns, row.series));
+
+    let empty = build_metrics_batch(mapping, &series_out, &[])?;
+    let rows_written = write_output(out, empty.schema(), |writer| {
+        let mut rows_written = 0u64;
+        for chunk in rows.chunks(EXPORT_BATCH_ROWS) {
+            let batch = build_metrics_batch(mapping, &series_out, chunk)?;
+            writer
+                .write(&batch)
+                .with_context(|| format!("failed to write a batch to {}", out.display()))?;
+            rows_written += batch.num_rows() as u64;
+        }
+        Ok(rows_written)
+    })?;
+
+    Ok(MetricsExportReport {
+        rows_written,
+        series_written: series_out.len() as u64,
+        series_skipped: skipped.len() as u64,
+        segments_read,
+        segments_pruned: snapshot.segments_pruned,
+        erasure_predicates,
+        samples_deduplicated,
+    })
+}
+
+/// One in-window sample of a series before duplicate resolution, with the
+/// provenance key the query path's merge orders duplicates by.
+struct SampleCandidate {
+    ts_ns: i64,
+    priority: (i64, u64, u64, u32),
+    value: f64,
+}
+
+/// Every in-window candidate sample of one series, across all the runs and
+/// segments that hold it.
+struct SeriesCandidates {
+    labels: LabelSet,
+    samples: Vec<SampleCandidate>,
+}
+
+/// One series as it is written: the name for the `name_column` (`None` under a
+/// `name` literal), one value per `[[metrics.label]]` in mapping order (`None`
+/// writes a null, which the load reads as an absent label), and the
+/// deduplicated `(ts_ns, value)` samples in ascending `ts_ns`.
+struct OutputSeries {
+    sort_key: Vec<(String, String)>,
+    written_name: Option<String>,
+    label_values: Vec<Option<String>>,
+    samples: Vec<(i64, f64)>,
+}
+
+/// One output row: sample `sample` of `series_out[series]`.
+struct MetricRow {
+    ts_ns: i64,
+    series: usize,
+    sample: usize,
+}
+
+/// Adds the in-window samples of one fetched run to its series' candidates.
+///
+/// A sample's key is the run's per-sample priority when it carries a column,
+/// otherwise the run-wide `(created_unix_ns, writer_epoch, writer_seq)` plus
+/// the sample's position in the run, which is how the query path's merge keys
+/// the same run.
+fn collect_run(
+    by_series: &mut HashMap<SeriesId, SeriesCandidates>,
+    run: FetchedSeriesSoa,
+    start_ns: i64,
+    end_ns: i64,
+) -> anyhow::Result<()> {
+    let samples = run.timestamps.len();
+    if run.values.len() != samples {
+        anyhow::bail!(
+            "series {} decoded {samples} timestamps but {} values in one run",
+            describe_series(&run.labels),
+            run.values.len()
+        );
+    }
+    if let Some(column) = &run.per_sample_priorities
+        && column.len() != samples
+    {
+        anyhow::bail!(
+            "series {} decoded {samples} samples but {} dedup priorities in one run",
+            describe_series(&run.labels),
+            column.len()
+        );
+    }
+    let entry = by_series
+        .entry(run.series_id)
+        .or_insert_with(|| SeriesCandidates {
+            labels: run.labels.clone(),
+            samples: Vec::new(),
+        });
+    for (pos, (&ts_ns, &value)) in run.timestamps.iter().zip(&run.values).enumerate() {
+        if !in_export_window(ts_ns, start_ns, end_ns) {
+            continue;
+        }
+        let priority = match run
+            .per_sample_priorities
+            .as_ref()
+            .and_then(|column| column.get(pos))
+        {
+            Some(priority) => priority.as_tuple(),
+            None => (
+                run.created_unix_ns,
+                run.writer_epoch,
+                run.writer_seq,
+                u32::try_from(pos).unwrap_or(u32::MAX),
+            ),
+        };
+        entry.samples.push(SampleCandidate {
+            ts_ns,
+            priority,
+            value,
+        });
+    }
+    Ok(())
+}
+
+/// Resolves duplicate timestamps the way the query path's merge does: at each
+/// `ts`, the candidate with the greatest `(priority, value.to_bits())` wins.
+/// Returns the winners in ascending `ts` and the number of candidates dropped.
+fn resolve_duplicates(mut samples: Vec<SampleCandidate>) -> (Vec<(i64, f64)>, u64) {
+    samples.sort_by_key(|c| (c.ts_ns, c.priority, c.value.to_bits()));
+    let total = samples.len();
+    let mut winners: Vec<(i64, f64)> = Vec::with_capacity(total);
+    for candidate in samples {
+        // Ascending order puts the greatest candidate of a timestamp last, so
+        // the last one seen replaces every earlier one.
+        match winners.last_mut() {
+            Some(last) if last.0 == candidate.ts_ns => *last = (candidate.ts_ns, candidate.value),
+            _ => winners.push((candidate.ts_ns, candidate.value)),
+        }
+    }
+    let dropped = (total - winners.len()) as u64;
+    (winners, dropped)
+}
+
+/// The family name `load` gives a row whose name cell is `raw` under
+/// `mapping`, or `None` where the load refuses the name.
+fn reloaded_family_name(
+    raw: &str,
+    mapping: &MetricsMapping,
+    limits: &IngestLimits,
+) -> Option<String> {
+    let (kind, is_monotonic_sum) = mapping.metric_kind();
+    normalized_family_name(raw, mapping, kind, is_monotonic_sum, limits).ok()
+}
+
+/// The `name_column` value that loads back as `stored` under `mapping`: the
+/// stored name itself, else the stored name less a trailing `_total`, less
+/// the mapping's unit suffix, or less both. The last two reach a name the
+/// suffixes took past the metric-name length cap. Each candidate is checked
+/// against [`reloaded_family_name`], so `None` means no candidate reproduces
+/// the series.
+fn written_metric_name(
+    stored: &str,
+    mapping: &MetricsMapping,
+    limits: &IngestLimits,
+) -> Option<String> {
+    let (kind, _) = mapping.metric_kind();
+    // The unit suffix as a load spells it after a name, `_seconds` for `s`.
+    let with_unit = prometheus_family_name("a", mapping.unit(), kind, false);
+    let unit_suffix = with_unit.strip_prefix('a').filter(|s| !s.is_empty());
+    let less_total = stored.strip_suffix("_total");
+    let less_unit = unit_suffix.and_then(|suffix| stored.strip_suffix(suffix));
+    let less_both = less_total
+        .zip(unit_suffix)
+        .and_then(|(name, suffix)| name.strip_suffix(suffix));
+    [Some(stored), less_total, less_unit, less_both]
+        .into_iter()
+        .flatten()
+        .find(|candidate| {
+            reloaded_family_name(candidate, mapping, limits).as_deref() == Some(stored)
+        })
+        .map(str::to_string)
+}
+
+/// The refusal for a series whose stored name no `name_column` value loads
+/// back as.
+fn unwritable_name(
+    labels: &LabelSet,
+    mapping: &MetricsMapping,
+    limits: &IngestLimits,
+) -> anyhow::Error {
+    let stored = labels.get(METRIC_NAME_LABEL).unwrap_or_default();
+    let kind = if mapping.metric_kind().1 {
+        "counter"
+    } else {
+        "gauge"
+    };
+    let as_written = match reloaded_family_name(stored, mapping, limits) {
+        Some(name) => format!("names it {name:?}"),
+        None => "refuses it".to_string(),
+    };
+    anyhow::anyhow!(
+        "series {} cannot be exported under this mapping: no name_column value loads back as \
+         {stored:?} with unit = {:?} and kind = {kind:?} (written as {stored:?}, a load \
+         {as_written}), so the exported file would re-load onto a different series. Export it \
+         with the unit and kind it was loaded with; a mapping with neither loads every sanitized \
+         metric name back unchanged.",
+        describe_series(labels),
+        mapping.unit(),
+    )
+}
+
+/// One output value per `[[metrics.label]]`, in mapping order, for a series'
+/// stored labels. Refuses a stored label the mapping does not name, and a
+/// stored empty value, since the load drops both and would land the samples on
+/// a different series.
+fn mapped_label_values(
+    labels: &LabelSet,
+    mapping: &MetricsMapping,
+    label_index: &HashMap<String, usize>,
+) -> anyhow::Result<Vec<Option<String>>> {
+    let mut values: Vec<Option<String>> = vec![None; mapping.labels.len()];
+    for label in labels.iter() {
+        if label.name == METRIC_NAME_LABEL {
+            continue;
+        }
+        let Some(&i) = label_index.get(label.name.as_str()) else {
+            anyhow::bail!(
+                "series {} carries the label {:?}, which no [[metrics.label]] in the mapping \
+                 names; a load of the exported file would drop it and land the samples on a \
+                 different series. Add a [[metrics.label]] for it.",
+                describe_series(labels),
+                label.name
+            );
+        };
+        if label.value.is_empty() {
+            anyhow::bail!(
+                "series {} carries the label {:?} with an empty value, which a load drops, so the \
+                 exported file would re-load onto a different series",
+                describe_series(labels),
+                label.name
+            );
+        }
+        if let Some(slot) = values.get_mut(i) {
+            *slot = Some(label.value.clone());
+        }
+    }
+    Ok(values)
+}
+
+/// `name{label="value", ...}` for a refusal message.
+fn describe_series(labels: &LabelSet) -> String {
+    let name = labels.get(METRIC_NAME_LABEL).unwrap_or_default();
+    let rest: Vec<String> = labels
+        .iter()
+        .filter(|l| l.name != METRIC_NAME_LABEL)
+        .map(|l| format!("{}={:?}", l.name, l.value))
+        .collect();
+    format!("{name}{{{}}}", rest.join(", "))
+}
+
+/// Refuses a mapping that writes two fields to one output column, the columns
+/// [`build_metrics_batch`] writes, before the export reads anything.
+fn check_metrics_output_columns(mapping: &MetricsMapping) -> anyhow::Result<()> {
+    let columns = std::iter::once(&mapping.ts_column)
+        .chain(&mapping.name_column)
+        .chain(std::iter::once(&mapping.value_column))
+        .chain(mapping.labels.iter().map(|label| &label.column));
+    let mut seen: HashSet<&str> = HashSet::new();
+    for name in columns {
+        if !seen.insert(name.as_str()) {
+            anyhow::bail!(
+                "the mapping writes two different fields to the output column {name:?}; give \
+                 each one its own column name"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Builds the output batch for `rows`: the `ts` column in the mapping's
+/// `ts_unit`, the `name_column` when the mapping has one, the `value` column,
+/// and one `Utf8` column per `[[metrics.label]]`, null where the series lacks
+/// the label. These are the Arrow types the metrics `--mapping` reader accepts.
+fn build_metrics_batch(
+    mapping: &MetricsMapping,
+    series: &[OutputSeries],
+    rows: &[MetricRow],
+) -> anyhow::Result<RecordBatch> {
+    let factor = mapping.ts_unit.factor();
+    let mut columns: Vec<(String, ArrayRef)> = Vec::new();
+
+    let mut ts = Int64Builder::with_capacity(rows.len());
+    let mut value = Float64Builder::with_capacity(rows.len());
+    for row in rows {
+        ts.append_value(row.ts_ns / factor);
+        let sample = series
+            .get(row.series)
+            .and_then(|s| s.samples.get(row.sample))
+            .ok_or_else(|| anyhow::anyhow!("internal error: an export row names no sample"))?;
+        value.append_value(sample.1);
+    }
+    columns.push((mapping.ts_column.clone(), Arc::new(ts.finish())));
+
+    if let Some(name_column) = &mapping.name_column {
+        let mut names = StringBuilder::new();
+        for row in rows {
+            names.append_option(
+                series
+                    .get(row.series)
+                    .and_then(|s| s.written_name.as_deref()),
+            );
+        }
+        columns.push((name_column.clone(), Arc::new(names.finish())));
+    }
+
+    columns.push((mapping.value_column.clone(), Arc::new(value.finish())));
+
+    for (i, label) in mapping.labels.iter().enumerate() {
+        let mut values = StringBuilder::new();
+        for row in rows {
+            values.append_option(
+                series
+                    .get(row.series)
+                    .and_then(|s| s.label_values.get(i))
+                    .and_then(Option::as_deref),
+            );
+        }
+        columns.push((label.column.clone(), Arc::new(values.finish())));
+    }
+
+    // Declared nullable explicitly, for the reason `build_batch` gives.
+    RecordBatch::try_from_iter_with_nullable(
+        columns.into_iter().map(|(name, array)| (name, array, true)),
+    )
+    .context("failed to build the export record batch")
+}
+
 /// One decoded resource attribute set per distinct stream, so a stream's
 /// `stream_attrs` blob is decoded once rather than once per record.
 fn decode_resources(
@@ -356,9 +1010,42 @@ fn check_output_path(out: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Writes `records` to `out` in `EXPORT_BATCH_ROWS`-row batches and returns
-/// the row count written. An empty export still writes a schema-only file, so
-/// a loader pointed at it reads zero rows rather than failing to open it.
+/// Writes `records` to `out` in `EXPORT_BATCH_ROWS`-row batches through
+/// [`write_output`] and returns the row count written.
+fn write_parquet(
+    mapping: &Mapping,
+    records: &[LogRecord],
+    resource_by_stream: &HashMap<LogStreamId, Vec<(String, AttrValue)>>,
+    out: &Path,
+) -> anyhow::Result<u64> {
+    let empty = build_batch(mapping, &[])?;
+    write_output(out, empty.schema(), |writer| {
+        let mut rows_written = 0u64;
+        for chunk in records.chunks(EXPORT_BATCH_ROWS) {
+            let rows: Vec<ExportRow<'_>> = chunk
+                .iter()
+                .map(|record| ExportRow {
+                    record,
+                    resource: resource_by_stream
+                        .get(&record.stream_id)
+                        .map_or(&[][..], Vec::as_slice),
+                })
+                .collect();
+            let batch = build_batch(mapping, &rows)?;
+            writer
+                .write(&batch)
+                .with_context(|| format!("failed to write a batch to {}", out.display()))?;
+            rows_written += batch.num_rows() as u64;
+        }
+        Ok(rows_written)
+    })
+}
+
+/// Opens a Parquet writer of `schema` on a temporary file beside `out`, hands
+/// it to `write_rows`, and moves the finished file into place; returns the row
+/// count `write_rows` reports. An export that writes no batch still produces a
+/// schema-only file, so a loader pointed at it reads zero rows rather than
+/// failing to open it.
 ///
 /// `out` is only ever replaced by a `rename` of a finished file. The rows are
 /// written to a sibling temporary file named `.<file name>.<pid>.<n>.tmp` in
@@ -376,27 +1063,16 @@ fn check_output_path(out: &Path) -> anyhow::Result<()> {
 /// pointed to is left unchanged; the new file's mode comes from the default
 /// creation mode and the umask, not from the file it replaces, and the old
 /// file's owner and ACLs are not carried over.
-fn write_parquet(
-    mapping: &Mapping,
-    records: &[LogRecord],
-    resource_by_stream: &HashMap<LogStreamId, Vec<(String, AttrValue)>>,
+fn write_output(
     out: &Path,
+    schema: SchemaRef,
+    write_rows: impl FnOnce(&mut ArrowWriter<std::fs::File>) -> anyhow::Result<u64>,
 ) -> anyhow::Result<u64> {
-    let empty = build_batch(mapping, &[])?;
     let (tmp_path, file) = create_temp_output(out)?;
     let written = file
         .try_clone()
         .context("failed to duplicate the temporary export file handle")
-        .and_then(|writer_file| {
-            write_batches(
-                writer_file,
-                &empty,
-                mapping,
-                records,
-                resource_by_stream,
-                out,
-            )
-        })
+        .and_then(|writer_file| write_batches(writer_file, schema, write_rows, out))
         .and_then(|rows| {
             file.sync_all().with_context(|| {
                 format!(
@@ -487,31 +1163,13 @@ fn create_temp_output(out: &Path) -> anyhow::Result<(std::path::PathBuf, std::fs
 /// temporary name it is on its way through.
 fn write_batches(
     file: std::fs::File,
-    empty: &RecordBatch,
-    mapping: &Mapping,
-    records: &[LogRecord],
-    resource_by_stream: &HashMap<LogStreamId, Vec<(String, AttrValue)>>,
+    schema: SchemaRef,
+    write_rows: impl FnOnce(&mut ArrowWriter<std::fs::File>) -> anyhow::Result<u64>,
     out: &Path,
 ) -> anyhow::Result<u64> {
-    let mut writer = ArrowWriter::try_new(file, empty.schema(), None)
+    let mut writer = ArrowWriter::try_new(file, schema, None)
         .with_context(|| format!("failed to open a Parquet writer on {}", out.display()))?;
-    let mut rows_written = 0u64;
-    for chunk in records.chunks(EXPORT_BATCH_ROWS) {
-        let rows: Vec<ExportRow<'_>> = chunk
-            .iter()
-            .map(|record| ExportRow {
-                record,
-                resource: resource_by_stream
-                    .get(&record.stream_id)
-                    .map_or(&[][..], Vec::as_slice),
-            })
-            .collect();
-        let batch = build_batch(mapping, &rows)?;
-        writer
-            .write(&batch)
-            .with_context(|| format!("failed to write a batch to {}", out.display()))?;
-        rows_written += batch.num_rows() as u64;
-    }
+    let rows_written = write_rows(&mut writer)?;
     writer
         .close()
         .with_context(|| format!("failed to finish writing {}", out.display()))?;
@@ -803,40 +1461,26 @@ mod tests {
         build_batch(mapping, &rows).expect("batch builds")
     }
 
-    /// The refusal names what each signal's export waits on NOW. Both bulk
-    /// imports have landed, so a message still naming one of them as the
-    /// missing piece is stale, and the assertions below say so by name.
+    /// Logs and metrics export; spans is refused with the follow-up it waits
+    /// on, and the refusal lists both supported signals.
     #[test]
-    fn unsupported_signal_message_names_the_follow_up_each_signal_waits_on() {
+    fn unsupported_signal_message_refuses_only_spans() {
         assert_eq!(unsupported_signal_message(SignalArg::Logs), None);
-        let metrics =
-            unsupported_signal_message(SignalArg::Metrics).expect("metrics is unsupported");
-        assert_eq!(
-            metrics,
-            "export --signal metrics is not available: it is ADR-1751 follow-up task 3. Bulk \
-             import for metrics has landed (`load --signal metrics`), so this is the remaining \
-             half of that round trip. Only --signal logs is supported."
-        );
+        assert_eq!(unsupported_signal_message(SignalArg::Metrics), None);
         let spans = unsupported_signal_message(SignalArg::Spans).expect("spans is unsupported");
         assert_eq!(
             spans,
             "export --signal spans is not available: it is ADR-1751 follow-up task 3. Bulk import \
              for spans has landed (`load --signal spans`), so this is the remaining half of that \
-             round trip. Only --signal logs is supported."
+             round trip. Only --signal logs and --signal metrics are supported."
         );
-        for message in [&metrics, &spans] {
-            assert!(
-                !message.contains("does not exist yet"),
-                "neither import is the missing piece any more: {message}"
-            );
-            // ADR-1751 decision 4 already settles the output columns: the same
-            // mapping TOML names them. A refusal claiming the follow-up decides
-            // them contradicts the decision record.
-            assert!(
-                !message.contains("column layout"),
-                "the follow-up does not decide the column layout: {message}"
-            );
-        }
+        // ADR-1751 decision 4 already settles the output columns: the same
+        // mapping TOML names them. A refusal claiming the follow-up decides
+        // them contradicts the decision record.
+        assert!(
+            !spans.contains("column layout"),
+            "the follow-up does not decide the column layout: {spans}"
+        );
     }
 
     /// The window is half-open at both spellings of its end: the last
