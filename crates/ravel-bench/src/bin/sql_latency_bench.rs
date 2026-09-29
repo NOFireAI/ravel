@@ -747,6 +747,9 @@ fn print_human_table(report: &SqlLatencyReport) {
     // objects (issue #767). The warm columns are `-` for a single-run report or
     // the Flight lane (no per-run accounting on the wire).
     //
+    // `seg_st` is the cold run's segments skipped before any fetch by
+    // declared-column statistics (ADR-2121 D1), `-` on the Flight lane.
+    //
     // `pmiss` is the cold run's uncovered tail SECTIONS, plan phase plus scan
     // phase (issue #883) -- not a GET count. A short version-4 probe can miss
     // SKIP_IDX and PAGE_DIR both and count twice while the fetcher coalesces
@@ -756,7 +759,7 @@ fn print_human_table(report: &SqlLatencyReport) {
     // flat is not. The per-phase split is in the report JSON's
     // `per_run_accounting`.
     eprintln!(
-        "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
+        "  {:<32} | {:>9} | {:>9} | {:>9} | {:>9} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
         "id",
         "min ms",
         "med ms",
@@ -765,6 +768,7 @@ fn print_human_table(report: &SqlLatencyReport) {
         "rows",
         "blk_tot",
         "blk_scn",
+        "seg_st",
         "get",
         "pmiss",
         "w_get",
@@ -772,20 +776,26 @@ fn print_human_table(report: &SqlLatencyReport) {
         "w_hit"
     );
     eprintln!(
-        "  {:-<32}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<9}-+-{:-<7}",
-        "", "", "", "", "", "", "", "", "", "", "", "", ""
+        "  {:-<32}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<7}-+-{:-<9}-+-{:-<7}",
+        "", "", "", "", "", "", "", "", "", "", "", "", "", ""
     );
     for e in &report.entries {
         // The Flight lane has no scan diagnostics to print (they are executor
         // counters, and nothing carries them over the wire). `-` says absent;
         // a `0` would read as "scanned nothing".
-        let (blocks_total, blocks_scanned, gets) = match &e.scan {
+        let (blocks_total, blocks_scanned, segments_pruned_by_stats, gets) = match &e.scan {
             Some(scan) => (
                 scan.blocks_total.to_string(),
                 scan.blocks_scanned.to_string(),
+                scan.segments_pruned_by_stats.to_string(),
                 scan.object_store_get_requests.to_string(),
             ),
-            None => ("-".to_string(), "-".to_string(), "-".to_string()),
+            None => (
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+            ),
         };
         // The warm run is run index 1. Absent when the run had fewer than two
         // executions, or on the Flight lane which carries no per-run accounting.
@@ -804,7 +814,7 @@ fn print_human_table(report: &SqlLatencyReport) {
             _ => "-".to_string(),
         };
         eprintln!(
-            "  {:<32} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
+            "  {:<32} | {:>9.3} | {:>9.3} | {:>9.3} | {:>9.3} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>9} | {:>7}",
             e.id,
             e.min_ms,
             e.median_ms,
@@ -813,6 +823,7 @@ fn print_human_table(report: &SqlLatencyReport) {
             e.rows_returned,
             blocks_total,
             blocks_scanned,
+            segments_pruned_by_stats,
             gets,
             probe_misses,
             warm_gets,
