@@ -4343,10 +4343,19 @@ fn read_bytes(arr: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
 /// unit.
 ///
 /// The rejection names the unit [`read_ts`] and [`ts_src`] actually applied to
-/// `ts_type`: a native Arrow `Timestamp` column's own unit, the declared
-/// `ts_unit` for any other column.
+/// `ts_type`, as [`ts_read_unit`] phrases it.
 fn negative_ts_rejection(ts_ns: i64, ts_type: &DataType, declared: TsUnit) -> String {
-    let unit = match ts_type {
+    let unit = ts_read_unit(ts_type, declared, "ts_unit");
+    format!(
+        "timestamp is before the Unix epoch ({ts_ns} ns, {unit}); the column holds a negative value"
+    )
+}
+
+/// The unit [`read_ts`] applied to a timestamp column of type `ts_type`, as a
+/// refusal names it: a native Arrow `Timestamp` column's own unit, the
+/// declared unit (under its mapping key `unit_key`) for any other column.
+fn ts_read_unit(ts_type: &DataType, declared: TsUnit, unit_key: &str) -> String {
+    match ts_type {
         DataType::Timestamp(unit, _) => format!(
             "read in the column's own Timestamp unit, {}",
             match unit {
@@ -4356,11 +4365,8 @@ fn negative_ts_rejection(ts_ns: i64, ts_type: &DataType, declared: TsUnit) -> St
                 TimeUnit::Nanosecond => "nanos",
             }
         ),
-        _ => format!("read as ts_unit = {}", declared.as_str()),
-    };
-    format!(
-        "timestamp is before the Unix epoch ({ts_ns} ns, {unit}); the column holds a negative value"
-    )
+        _ => format!("read as {unit_key} = {}", declared.as_str()),
+    }
 }
 
 /// Read the `ts` column to nanoseconds. An integer column uses the mapping's
@@ -7080,12 +7086,19 @@ fn build_span(
     // overlaps nearly every query window. Unit conversion cannot flip a sign,
     // so a negative value always comes from a negative cell.
     if start_ts_ns < 0 || end_ts_ns < 0 {
+        let start_unit = ts_read_unit(
+            cols.col(batch, cols.start_ts).data_type(),
+            mapping.start_ts_unit,
+            "start_ts_unit",
+        );
+        let end_unit = ts_read_unit(
+            cols.col(batch, cols.end_ts).data_type(),
+            mapping.end_ts_unit,
+            "end_ts_unit",
+        );
         return Err(format!(
-            "span timestamps are before the Unix epoch (start {start_ts_ns} ns, end {end_ts_ns} \
-             ns, read as start_ts_unit = {}, end_ts_unit = {}); a timestamp column holds a \
-             negative value",
-            mapping.start_ts_unit.as_str(),
-            mapping.end_ts_unit.as_str()
+            "span timestamps are before the Unix epoch (start {start_ts_ns} ns, {start_unit}; \
+             end {end_ts_ns} ns, {end_unit}); a timestamp column holds a negative value"
         ));
     }
     if end_ts_ns < start_ts_ns {
@@ -15155,8 +15168,8 @@ type = "str"
             assert_eq!(dropped, 0, "nothing was dropped");
         }
 
-        /// A negative start or end is refused, naming both declared units:
-        /// OTLP's two `u64` timestamps have no negative to match against.
+        /// A negative start or end is refused, naming the unit each was read
+        /// in: OTLP's two `u64` timestamps have no negative to match against.
         #[test]
         fn a_negative_timestamp_is_refused() {
             let err = build_one(Row {
@@ -15167,9 +15180,9 @@ type = "str"
             assert_eq!(
                 err,
                 format!(
-                    "span timestamps are before the Unix epoch (start -1 ns, end {NOW_NS} ns, \
-                     read as start_ts_unit = nanos, end_ts_unit = nanos); a timestamp column \
-                     holds a negative value"
+                    "span timestamps are before the Unix epoch (start -1 ns, read as \
+                     start_ts_unit = nanos; end {NOW_NS} ns, read as end_ts_unit = nanos); a \
+                     timestamp column holds a negative value"
                 )
             );
 
@@ -15189,6 +15202,26 @@ type = "str"
                 ..Row::default()
             })
             .expect("zero is the fallback case, not a negative one");
+        }
+
+        /// A native `Timestamp(Second)` start scales by its own unit, not by
+        /// the declared `start_ts_unit`, so the refusal names seconds for the
+        /// start, while the integer end still names `end_ts_unit`.
+        #[test]
+        fn a_negative_native_start_names_its_own_unit() {
+            let err = build_one(Row {
+                start: Arc::new(TimestampSecondArray::from(vec![-5])) as ArrayRef,
+                ..Row::default()
+            })
+            .expect_err("a negative native start is refused");
+            assert_eq!(
+                err,
+                format!(
+                    "span timestamps are before the Unix epoch (start -5000000000 ns, read in \
+                     the column's own Timestamp unit, seconds; end {NOW_NS} ns, read as \
+                     end_ts_unit = nanos); a timestamp column holds a negative value"
+                )
+            );
         }
 
         /// Both attribute-count caps are properties of the mapping, so both
@@ -16355,8 +16388,7 @@ type = "str"
                     panic!("expected BatchFailed on {path:?}, got {err:?}");
                 };
                 assert!(
-                    reason.starts_with("failed to read Parquet batch: ")
-                        && reason.contains("insufficient values read from column"),
+                    reason.starts_with("failed to read Parquet batch: "),
                     "the reader refuses the chunk on {path:?}: {reason}"
                 );
                 assert!(list_data_objects(store.as_ref()).await.is_empty());

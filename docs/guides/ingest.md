@@ -793,7 +793,11 @@ writer's dictionary that outgrew its page limit and fell back to plain, as a
 unique-per-row column does), one the file's Arrow schema types as `LargeUtf8`
 or `Utf8View` (a common polars output), or one nested below the top level
 decodes to a plain Arrow string column and stays on the per-row string path;
-both produce identical output.
+both produce identical output. The one exception is a file whose footer records
+no page encoding statistics: the loader then has only the chunk's encodings
+list, which names the dictionary encoding for a chunk that fell back to plain
+too, so such a chunk is read as an Arrow `Dictionary` (with identical values;
+only the per-block work differs).
 
 A mapped `trace_id` or `span_id` column loads whether it is plain or
 dictionary-encoded: a hex id column that a default Parquet writer
@@ -999,8 +1003,10 @@ costs every later query the bulk objects' fetch.
   value was read in: the declared `ts_unit` for an integer column, the
   column's own unit for a native Arrow `Timestamp` column, which the declared
   `ts_unit` does not rescale. A timestamp of exactly 0 is the epoch itself and
-  loads. The spans load's refusal of a negative start or end names both of
-  its declared units. Converting a unit never turns a
+  loads. The spans load's refusal of a negative start or end names each of
+  the two in the unit it was read in, by the same rule: `start_ts_unit` or
+  `end_ts_unit` for an integer column, the column's own unit for a native
+  Arrow `Timestamp` column. Converting a unit never turns a
   positive value negative, so the refusal always means the column holds a
   negative cell; a mis-declared unit instead lands rows at the wrong time
   without a refusal.
