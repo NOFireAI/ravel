@@ -14,8 +14,9 @@
 //!    kind. `s3://` needs an `s3` profile, `gs://` a `gcs` one, `az://` an
 //!    `azure` one. A profile of the wrong kind would reach a different service
 //!    with the same bucket name.
-//! 2. The granted prefix holds at least one object, and
-//!    [`probe_preconditions`] qualifies the store on it. A store that serves a
+//! 2. The granted location holds at least one object (the object itself, for
+//!    a location naming one), and [`probe_preconditions`] qualifies the store
+//!    on it. A store that serves a
 //!    read carrying an ETag it never issued cannot pin a Parquet file, so a
 //!    manifest over it would name bytes that can change underneath a query. A
 //!    prefix with no object is refused too: there is nothing to probe, so the
@@ -50,7 +51,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use ravel_object_store::external::probe::{probe_not_ravel_bucket, probe_preconditions};
 use ravel_object_store::external::{ExternalKind, ExternalProfile, ExternalStore, load_profiles};
-use ravel_object_store::{ObjectStoreBackend, PageToken};
+use ravel_object_store::{ObjectStoreBackend, PageToken, StoreError};
 use ravel_pqtable::clock::Clock;
 use ravel_pqtable::grants::{self, Grant};
 use ravel_types::{TenantHash, TenantId};
@@ -108,13 +109,29 @@ fn kind_admits_scheme(kind: &ExternalKind, scheme: &str) -> bool {
 /// The key of one object the candidate grant admits, or `None` when the
 /// prefix holds none within [`MAX_PROBE_LIST_PAGES`] listing pages.
 ///
+/// A location that did not end in `/` (`directory` false) may name one object,
+/// so its key is probed with a HEAD first: `object_store` appends `/` to every
+/// non-empty list prefix, so a listing of `data/x.parquet` never returns
+/// `data/x.parquet` itself. Without an object at that key the location is
+/// listed as a prefix.
+///
 /// Admission is decided by [`grants::contains_key`], the same segment-wise
 /// rule the read path applies, so a listing prefix of `data` cannot offer
 /// `data2/x.parquet` as the object to probe.
 async fn one_object_under(
     store: &dyn ObjectStoreBackend,
     candidate: &Grant,
+    directory: bool,
 ) -> anyhow::Result<Option<String>> {
+    if !directory && !candidate.prefix.is_empty() {
+        match store.head(&candidate.prefix).await {
+            Ok(_) => return Ok(Some(candidate.prefix.clone())),
+            Err(StoreError::NotFound) => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", candidate.url()));
+            }
+        }
+    }
     let mut page: Option<PageToken> = None;
     for _ in 0..MAX_PROBE_LIST_PAGES {
         let listed = store
@@ -176,10 +193,12 @@ pub async fn add_grant(
         created_by: created_by.to_string(),
     };
 
-    let Some(probe_key) = one_object_under(external.as_ref(), &candidate).await? else {
+    let Some(probe_key) =
+        one_object_under(external.as_ref(), &candidate, parsed.key.directory).await?
+    else {
         anyhow::bail!(
-            "the prefix {url:?} holds no object, so the store's preconditions could not be \
-             probed on it: grant a prefix that already holds at least one object"
+            "the location {url:?} holds no object, so the store's preconditions could not be \
+             probed on it: grant a location that already holds at least one object"
         );
     };
     probe_preconditions(external.as_ref(), &probe_key)
@@ -426,6 +445,137 @@ mod tests {
         }
     }
 
+    /// Forwards everything to the inner store, but lists the way
+    /// `object_store` does behind `S3Store` and `ExternalStore`: a non-empty
+    /// prefix is a directory, so `/` is appended to it before listing.
+    struct ListsUnderSlash<S>(S);
+
+    impl<S> ListsUnderSlash<S> {
+        fn directory(prefix: &str) -> String {
+            if prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", prefix.trim_end_matches('/'))
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for ListsUnderSlash<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.0.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.0.get(key, range).await
+        }
+
+        async fn get_pinned(
+            &self,
+            key: &str,
+            range: GetRange,
+            pin: &Pin,
+        ) -> Result<PinnedRead, StoreError> {
+            self.0.get_pinned(key, range, pin).await
+        }
+
+        async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+            self.0.get_with_pin(key, range).await
+        }
+
+        async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+            self.0.pin_of(key).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.0.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.0.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.0.list(&Self::directory(prefix), page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.0.list_delimited(&Self::directory(prefix)).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.0.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.0.capabilities()
+        }
+    }
+
+    /// A location naming one object is granted through a store that lists
+    /// the way `object_store` does, where listing the object's own key as a
+    /// prefix returns nothing.
+    #[tokio::test]
+    async fn a_grant_of_one_object_finds_it_through_an_object_store_listing() {
+        let ravel = MemoryStore::new();
+        let external: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ListsUnderSlash(external_bucket().await));
+        let listed = external
+            .list("data/part-0.parquet", None)
+            .await
+            .expect("list");
+        assert!(listed.objects.is_empty(), "{:?}", listed.objects);
+
+        let grant = add_grant(
+            &ravel,
+            &TenantId::new("acme").hash(),
+            &s3_profile("prod"),
+            "s3://customer/data/part-0.parquet",
+            "ravel-cli",
+            &AtNs(NOW),
+            &opener(external),
+        )
+        .await
+        .expect("grant");
+        assert_eq!(grant.prefix, "data/part-0.parquet");
+    }
+
+    /// Through the same store a prefix location still lists, with or without
+    /// its trailing `/`: `s3://customer/data` names no object, so its HEAD
+    /// finds nothing and the prefix is listed.
+    #[tokio::test]
+    async fn a_prefix_grant_lists_through_an_object_store_listing() {
+        for url in ["s3://customer/data/", "s3://customer/data"] {
+            let ravel = MemoryStore::new();
+            let external: Arc<dyn ObjectStoreBackend> =
+                Arc::new(ListsUnderSlash(external_bucket().await));
+            let grant = add_grant(
+                &ravel,
+                &TenantId::new("acme").hash(),
+                &s3_profile("prod"),
+                url,
+                "ravel-cli",
+                &AtNs(NOW),
+                &opener(external),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{url}: {err:#}"));
+            assert_eq!(grant.prefix, "data", "{url}");
+        }
+    }
+
     /// The reachability test for issue #2051: `add` drives the profile, both
     /// probes and the grants record end to end, over two in-memory stores, and
     /// the grant it wrote is the one `ls` reads back.
@@ -640,7 +790,9 @@ mod tests {
             created_by: "ravel-cli".into(),
         };
         assert_eq!(
-            one_object_under(&store, &candidate).await.expect("list"),
+            one_object_under(&store, &candidate, true)
+                .await
+                .expect("list"),
             None
         );
     }
