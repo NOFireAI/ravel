@@ -654,16 +654,11 @@ mod tests {
         ));
     }
 
-    /// A well-formed native-histogram frame plus a terminal summary decodes
-    /// through the live `decode_slice_frames` path (ADR-0096 decision 3 step 4):
-    /// `SliceResponse.histogram` carries the decoded series, proving the coordinator
-    /// consumes `Hist` frames as real data rather than refusing them. This exercises
-    /// the production decode arm, not just the unit-level codec function.
-    #[test]
-    fn histogram_frame_round_trips_through_decode_slice_frames() {
+    /// A two-sample native-histogram series with integer counts.
+    fn histogram_series() -> FetchedHistogramSeries {
         use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 
-        let hs = FetchedHistogramSeries {
+        FetchedHistogramSeries {
             series_id: SeriesId([2u8; 16]),
             labels: label_set(),
             timestamps: vec![10, 20],
@@ -709,12 +704,26 @@ mod tests {
             writer_epoch: 1,
             writer_seq: 2,
             per_sample_priorities: None,
-        };
-        let hist = pb::FetchResponse {
+        }
+    }
+
+    fn histogram_frame(hs: &FetchedHistogramSeries) -> pb::FetchResponse {
+        pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::Hist(
-                codec::encode_histogram_frame(&hs),
+                codec::encode_histogram_frame(hs),
             )),
-        };
+        }
+    }
+
+    /// A well-formed native-histogram frame plus a terminal summary decodes
+    /// through the live `decode_slice_frames` path (ADR-0096 decision 3 step 4):
+    /// `SliceResponse.histogram` carries the decoded series, proving the coordinator
+    /// consumes `Hist` frames as real data rather than refusing them. This exercises
+    /// the production decode arm, not just the unit-level codec function.
+    #[test]
+    fn histogram_frame_round_trips_through_decode_slice_frames() {
+        let hs = histogram_series();
+        let hist = histogram_frame(&hs);
         let response = decode_slice_frames(vec![hist, summary_frame(pb::status::Code::Ok)])
             .expect("a well-formed histogram frame decodes");
         assert!(response.scalar.is_empty());
@@ -734,12 +743,12 @@ mod tests {
     /// `SliceStreamDecoder`, `push`/`finish` repeat this function's match rather
     /// than calling into it, so the frames a slice may carry are decoded in two
     /// places. This feeds identical sequences to both and asserts they agree, on
-    /// the accepted response and on the typed error, over the SERIES and
-    /// SUMMARY frames only. The sequences below do not cover a malformed
-    /// `Hist` or `PartialAggregate` frame, the two `FrameSignalUnsupported`
-    /// arms (`LogRecord` and `Span`), or an unknown status code, so drift on
-    /// those arms is not caught here. Widening the pin to the arms this
-    /// function names is issue #1933.
+    /// the accepted response and on the typed error, for every arm of the
+    /// per-frame match and of the summary fold: `Series`, `Hist` and
+    /// `PartialAggregate` frames both well-formed and malformed, the two
+    /// `FrameSignalUnsupported` arms (`LogRecord` and `Span`), an empty frame, a
+    /// missing and a duplicate summary, a summary with no status, and an
+    /// unknown status code.
     ///
     /// `SliceResponse` and `DistribError` are `Debug` but neither is `PartialEq`,
     /// so the comparison is over their `Debug` rendering, which covers every
@@ -777,40 +786,154 @@ mod tests {
                 raw_f64_bytes: 0,
             })),
         };
+        let hs = histogram_series();
+        let bad_hist_id = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Hist(pb::HistogramFrame {
+                series_id: vec![0u8; 15],
+                ..codec::encode_histogram_frame(&hs)
+            })),
+        };
+        let mut short_run = codec::encode_histogram_frame(&hs);
+        short_run
+            .runs
+            .first_mut()
+            .expect("the fixture encodes one run")
+            .records
+            .pop();
+        let bad_hist_run = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Hist(short_run)),
+        };
+        let bad_partial = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::PartialAggregate(
+                pb::PartialAggregate {
+                    series_id: vec![0u8; 15],
+                    labels: Vec::new(),
+                    count: Some(1),
+                    min_bits: None,
+                    max_bits: None,
+                },
+            )),
+        };
+        let log_record = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::LogRecord(
+                pb::LogRecordFrame::default(),
+            )),
+        };
+        let span = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Span(pb::SpanFrame::default())),
+        };
+        let mut unknown_code = summary_frame(pb::status::Code::Ok);
+        if let Some(pb::fetch_response::Frame::Summary(s)) = unknown_code.frame.as_mut() {
+            s.status = Some(pb::Status {
+                code: -1,
+                message: String::new(),
+            });
+        }
 
-        let sequences: Vec<(&str, Vec<pb::FetchResponse>)> = vec![
+        // Each sequence names a fragment of the whole-sequence decode's `Debug`
+        // rendering, so a sequence that stopped reaching its arm (a fixture
+        // that no longer fails, or fails earlier for another reason) fails
+        // here instead of passing as agreement on some other outcome.
+        let sequences: Vec<(&str, Vec<pb::FetchResponse>, &str)> = vec![
             (
                 "series then summary",
                 vec![series_frame(&soa), summary_frame(pb::status::Code::Ok)],
+                "Ok(SliceResponse",
             ),
             (
                 "summary alone",
                 vec![summary_frame(pb::status::Code::BudgetExceeded)],
+                "status: BudgetExceeded",
             ),
-            ("no summary at all", vec![series_frame(&soa)]),
+            ("no summary at all", vec![series_frame(&soa)], "NoSummary"),
             (
                 "two summaries",
                 vec![
                     summary_frame(pb::status::Code::Ok),
                     summary_frame(pb::status::Code::Ok),
                 ],
+                "MultipleSummaries",
             ),
             (
                 "a malformed series frame",
                 vec![bad_series, summary_frame(pb::status::Code::Ok)],
+                "BadSeriesId { got: 15 }",
             ),
-            ("an empty frame", vec![pb::FetchResponse { frame: None }]),
-            ("a summary with no status", vec![no_status]),
+            (
+                "an empty frame",
+                vec![pb::FetchResponse { frame: None }],
+                "EmptyFrame",
+            ),
+            ("a summary with no status", vec![no_status], "MissingStatus"),
+            (
+                "a histogram frame then summary",
+                vec![histogram_frame(&hs), summary_frame(pb::status::Code::Ok)],
+                "Ok(SliceResponse",
+            ),
+            (
+                "a histogram frame with a bad series id",
+                vec![bad_hist_id, summary_frame(pb::status::Code::Ok)],
+                "BadSeriesId { got: 15 }",
+            ),
+            (
+                "a histogram run with fewer records than timestamps",
+                vec![bad_hist_run, summary_frame(pb::status::Code::Ok)],
+                "HistogramRunLengthMismatch",
+            ),
+            (
+                "a partial aggregate then summary",
+                vec![partial_frame(), summary_frame(pb::status::Code::Ok)],
+                "Ok(SliceResponse",
+            ),
+            (
+                "a malformed partial aggregate",
+                vec![bad_partial, summary_frame(pb::status::Code::Ok)],
+                "BadSeriesId { got: 15 }",
+            ),
+            (
+                "every accepted data frame kind then summary",
+                vec![
+                    series_frame(&soa),
+                    histogram_frame(&hs),
+                    partial_frame(),
+                    series_frame(&soa),
+                    summary_frame_with_counts(pb::status::Code::Ok, 2, 6),
+                ],
+                "Ok(SliceResponse",
+            ),
+            (
+                "a log-record frame",
+                vec![
+                    series_frame(&soa),
+                    log_record,
+                    summary_frame(pb::status::Code::Ok),
+                ],
+                "FrameSignalUnsupported(\"log-record\")",
+            ),
+            (
+                "a span frame",
+                vec![
+                    series_frame(&soa),
+                    span,
+                    summary_frame(pb::status::Code::Ok),
+                ],
+                "FrameSignalUnsupported(\"span\")",
+            ),
+            (
+                "an unknown status code",
+                vec![series_frame(&soa), unknown_code],
+                "UnknownStatusCode(-1)",
+            ),
         ];
 
-        for (what, frames) in sequences {
-            let whole = decode_slice_frames(frames.clone());
-            let streamed = incremental(frames);
-            assert_eq!(
-                format!("{whole:?}"),
-                format!("{streamed:?}"),
-                "the two decoders disagree on {what}"
+        for (what, frames, expected) in sequences {
+            let whole = format!("{:?}", decode_slice_frames(frames.clone()));
+            let streamed = format!("{:?}", incremental(frames));
+            assert!(
+                whole.contains(expected),
+                "{what}: expected {expected} in the whole-sequence decode, got {whole}"
             );
+            assert_eq!(whole, streamed, "the two decoders disagree on {what}");
         }
     }
 
