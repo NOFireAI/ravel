@@ -1658,8 +1658,9 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 /// operator can do about each reason present, which is never re-running this
 /// command (ADR-1331 decisions 2 and 3). A `rewrite_parts` block can be lowered
 /// by `ravel-cli maintain sweep` when it lists a superseded predecessor; a
-/// `loser_only_inputs` block clears only with retention. Each reason's
-/// paragraph prints only when a bucket with that reason is in the list.
+/// `loser_only_inputs` block and a `losing_record_parts` block clear only with
+/// retention. Each reason's paragraph prints only when a bucket with that
+/// reason is in the list.
 ///
 /// The prose lines carry a leading `# ` because the rest of this command's
 /// output is `key: value` and the prose contains its own colons; without the
@@ -1679,6 +1680,9 @@ fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
                 format!("rewrite_parts below_target={below_target}")
             }
             BlockedReason::LoserOnlyInputs => "loser_only_inputs".to_string(),
+            BlockedReason::LosingRecordParts { below_target } => {
+                format!("losing_record_parts below_target={below_target}")
+            }
         };
         out.push_str(&format!(
             "blocked_bucket: shard={} hour={} reason={reason}\n",
@@ -1691,6 +1695,9 @@ fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
     let has_loser_only = blocked
         .iter()
         .any(|b| matches!(b.reason, BlockedReason::LoserOnlyInputs));
+    let has_losing_parts = blocked
+        .iter()
+        .any(|b| matches!(b.reason, BlockedReason::LosingRecordParts { .. }));
     if has_rewrite_parts {
         out.push_str(
             "# Re-running migrate does not clear any blocked bucket above; it reports the same \
@@ -1716,6 +1723,19 @@ fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
             "# A loser_only_inputs bucket clears only when retention ages those inputs out: no \
              later compaction covers them, because compaction refuses a bucket that already \
              carries a compaction record. That is not a command you run.",
+        );
+    }
+    if has_losing_parts {
+        if has_rewrite_parts || has_loser_only {
+            out.push('\n');
+        }
+        out.push_str(
+            "# A losing_record_parts bucket's authoritative compaction records are at the \
+             target, but compaction records that lost their overlap still carry below_target \
+             parts below it. Re-running migrate does not clear it: neither migrate nor sweep \
+             reclaims a losing record's parts, and they keep counting in l1_compaction_parts. \
+             It clears when retention ages the bucket out (subject to the format-version hold, \
+             which keeps an object this build cannot read). That is not a command you run.",
         );
     }
     out
@@ -1787,8 +1807,11 @@ fn migrate_report_text(
 /// rewrites them (ADR-1331). Each such bucket this invocation examined is
 /// printed on its own `blocked_bucket` line with its reason, and
 /// `buckets_blocked` is how many there are. A below-target compaction part
-/// blocks the floor too and gets no line, because nothing migrates one either
-/// (issue #2093); it shows up as `l1_compaction_parts` alone.
+/// blocks the floor too, because nothing migrates one either (issue #2093); it
+/// shows up in `l1_compaction_parts`, and its bucket gets a
+/// `losing_record_parts` line only when the parts belong to compaction records
+/// that lost their overlap while the bucket's authoritative records are at the
+/// target.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -1898,7 +1921,9 @@ pub async fn migrate(
                  does. The {} blocked_bucket line(s) above name every such \
                  bucket THIS INVOCATION EXAMINED with its reason -- a walk that resumed from a \
                  cursor does not re-report the loser-only buckets an earlier invocation found, \
-                 and a below-target compaction part gets no line at all. If there are any, \
+                 and a below-target compaction part gets a line only when it belongs to a \
+                 compaction record that lost its overlap in a bucket whose authoritative \
+                 records are at the target (losing_record_parts). If there are any, \
                  re-running is not the remedy.",
                 blocked.len()
             )
@@ -2782,6 +2807,70 @@ mod tests {
             blocked_bucket_report(&[]),
             "",
             "nothing blocked prints nothing, not a blank line"
+        );
+    }
+
+    /// A `losing_record_parts` bucket prints its line with the exact count and
+    /// one comment line saying re-running does not clear it and retention
+    /// does, and that comment prints only when such a bucket is listed.
+    ///
+    /// Prove-the-test: before `BlockedReason::LosingRecordParts` existed there
+    /// was no line or comment to render; drop the `if has_losing_parts` block
+    /// and the first `assert_eq!` fails with the comment line missing.
+    #[test]
+    fn migrate_prints_a_losing_record_parts_bucket_and_how_it_clears() {
+        let losing = BlockedBucket {
+            shard: 2,
+            ingest_hour: 7,
+            reason: BlockedReason::LosingRecordParts { below_target: 3 },
+        };
+        assert_eq!(
+            blocked_bucket_report(std::slice::from_ref(&losing)),
+            "blocked_bucket: shard=2 hour=7 reason=losing_record_parts below_target=3\n\
+             # A losing_record_parts bucket's authoritative compaction records are at the \
+             target, but compaction records that lost their overlap still carry below_target \
+             parts below it. Re-running migrate does not clear it: neither migrate nor sweep \
+             reclaims a losing record's parts, and they keep counting in l1_compaction_parts. \
+             It clears when retention ages the bucket out (subject to the format-version hold, \
+             which keeps an object this build cannot read). That is not a command you run."
+        );
+
+        let loser_only = blocked_bucket_report(&[BlockedBucket {
+            shard: 3,
+            ingest_hour: 47,
+            reason: BlockedReason::LoserOnlyInputs,
+        }]);
+        assert!(
+            !loser_only.contains("losing_record_parts"),
+            "a report without such a bucket does not carry its comment: {loser_only}"
+        );
+
+        let both = blocked_bucket_report(&[
+            BlockedBucket {
+                shard: 3,
+                ingest_hour: 47,
+                reason: BlockedReason::LoserOnlyInputs,
+            },
+            losing.clone(),
+        ]);
+        assert!(
+            both.contains("That is not a command you run.\n# A losing_record_parts bucket's"),
+            "the comment starts on its own line after the loser_only_inputs one: {both}"
+        );
+
+        // Drop `has_rewrite_parts ||` from the newline condition and this
+        // fails: the comment runs on from the end of the rewrite_parts one.
+        let with_rewrite = blocked_bucket_report(&[
+            BlockedBucket {
+                shard: 0,
+                ingest_hour: 100,
+                reason: BlockedReason::RewriteParts { below_target: 2 },
+            },
+            losing,
+        ]);
+        assert!(
+            with_rewrite.contains("protection horizon.\n# A losing_record_parts bucket's"),
+            "the comment starts on its own line after the rewrite_parts one: {with_rewrite}"
         );
     }
 

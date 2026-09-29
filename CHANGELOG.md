@@ -57,8 +57,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   otherwise clear it. `buckets_blocked` is the number of those lines, covers
   both permanent cases, and covers the buckets the invocation examined (a walk
   resumed from a cursor does not re-report loser-only buckets an earlier
-  invocation found). A below-target compaction part blocks the floor too and is
-  reported as an `l1_compaction_parts` count with no `blocked_bucket` line:
+  invocation found). A below-target part of an authoritative compaction record
+  blocks the floor too and is reported as an `l1_compaction_parts` count with no
+  `blocked_bucket` line (a losing record's parts get one when the bucket's
+  authoritative records are at the target and it lists no rewrite record; see
+  the next entry):
   nothing migrates one either, because compaction and the migration rewrite
   both refuse a bucket that already carries a compaction record, so ADR-0066
   decision 4 force 2 is unimplemented (issue #2093). The explanatory prose
@@ -68,6 +71,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Verification::Stragglers` carries the three counts and the list, and
   `FamilyMigrateReport::buckets_blocked` is a method over `blocked_buckets`
   rather than a separate counter.
+- **`ravel-cli maintain migrate` names a bucket held below the target only by
+  a losing compaction record's parts** (ADR-0066, force 2 amendment item 9,
+  issue #2093). When every authoritative compaction record of a bucket has its
+  parts at the target and records that lost their overlap still carry parts
+  below it, the report prints
+  `blocked_bucket: ... reason=losing_record_parts below_target=<n>`, where
+  `<n>` sums the losing records' below-target parts, with a comment line saying
+  re-running `migrate` does not clear it and retention ageing the bucket out,
+  under the format-version hold, does. Those parts still count in
+  `l1_compaction_parts`, so the floor is still refused over them; only the
+  naming is new. A bucket whose authoritative records are below the target is
+  not named this way, a bucket that lists a rewrite record is never named this
+  way (it gets a `rewrite_parts` line only when its rewrite parts are below the
+  target), and a record a version 2 record supersedes is not a loser. A bucket
+  the walk names `loser_only_inputs` that also qualifies here gets this line
+  only, since the two clear the same way. `BlockedReason` gains
+  `LosingRecordParts { below_target }`.
 - **The background supervisor now takes an advisory claim before compacting a
   large bucket, so two processes whose ownership overlaps no longer both pay
   for the same merge** (ADR-1029 decisions 3 to 5, issue #1033). The claim is
