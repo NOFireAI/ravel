@@ -536,16 +536,10 @@ The sweep runs on the process that owns the tenant's alert unit, on the ordinary
 maintenance tick. It learns which record is each identity's current state from
 the tenant's alert state memo, which the evaluator rewrites on every tick it
 runs. A tenant whose memo is missing, unreadable, or too far behind the window
-is not swept at all that tick rather than swept without that protection, and
-`ravel_alert_retention_skipped_total` counts those ticks by `reason`: `absent`
-(no memo, while the tenant does have alert records), `undecodable`,
-`unsupported_version`, `watermark_below_floor` (the memo is complete only for
-hours older than the retention floor), or `store_error` (object storage failed
-the memo read, or the listing that tells an unused alert keyspace from a lost
-memo). A tenant that has never written an alert transition is not counted.
-The family carries no tenant label, so a sustained nonzero rate says some
-tenant is not being swept, not which one: look at the evaluator for every
-reason but `store_error`, and at object-storage access for that one.
+is not swept at all that tick rather than swept without that protection;
+`ravel_alert_retention_skipped_total` counts those ticks by `reason`, and the
+[observability guide](observability.md#alert-retention-skips-ravel_alert_retention_skipped_total)
+lists each reason and where to look for its remedy.
 
 Set `--alert-retention` to a longer window before upgrading if you need more
 history, or `--alert-retention 0` to keep every transition forever, which is
