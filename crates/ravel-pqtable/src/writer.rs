@@ -1051,11 +1051,13 @@ mod tests {
                 .expect("versions"),
             vec![1, 2, 3]
         );
-        assert!(read_version(&store, &TENANT_A, "hits", 2)
-            .await
-            .expect("read")
-            .expect("present")
-            .dropped);
+        assert!(
+            read_version(&store, &TENANT_A, "hits", 2)
+                .await
+                .expect("read")
+                .expect("present")
+                .dropped
+        );
         assert_each_version_written_once(&store);
     }
 }
